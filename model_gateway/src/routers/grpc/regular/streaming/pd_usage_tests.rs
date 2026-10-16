@@ -32,6 +32,7 @@ fn dispatch() -> context::DispatchMetadata {
         model: "pd-usage-test".to_string(),
         created: 1,
         weight_version: None,
+        tenant_key: None,
     }
 }
 

@@ -354,6 +354,7 @@ impl ConfigValidator {
         Self::validate_kv_index(config)?;
         Self::validate_prefill_admission(config)?;
         Self::validate_priority_scheduler(config)?;
+        Self::validate_tenant_usage_accounting(config)?;
         if let Some(discovery) = &config.discovery {
             Self::validate_discovery(discovery, &config.mode)?;
         }
@@ -470,6 +471,21 @@ impl ConfigValidator {
                 value: e.value,
                 reason: e.reason,
             })
+    }
+
+    /// With usage accounting on, a maximum of zero tracked tenants would book
+    /// every request under `other`: the operator who turned the table on
+    /// meant a number.
+    fn validate_tenant_usage_accounting(config: &RouterConfig) -> ConfigResult<()> {
+        if config.tenant_usage_accounting_enabled && config.tenant_usage_accounting_max_tenants == 0
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "tenant_usage_accounting_max_tenants".to_string(),
+                value: "0".to_string(),
+                reason: "must be at least 1 when tenant usage accounting is enabled".to_string(),
+            });
+        }
+        Ok(())
     }
 
     fn validate_model_aliases(config: &RouterConfig) -> ConfigResult<()> {
@@ -2444,6 +2460,36 @@ mod tests {
             }) if field == "priority_scheduler_config" => (value, reason),
             other => panic!("expected a priority_scheduler_config error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn usage_accounting_refuses_a_maximum_of_zero_tenants_only_when_enabled() {
+        let off = RouterConfig {
+            tenant_usage_accounting_enabled: false,
+            tenant_usage_accounting_max_tenants: 0,
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&off).is_ok());
+
+        let on = RouterConfig {
+            tenant_usage_accounting_enabled: true,
+            tenant_usage_accounting_max_tenants: 0,
+            ..Default::default()
+        };
+        match ConfigValidator::validate(&on) {
+            Err(ConfigError::InvalidValue { field, value, .. }) => {
+                assert_eq!(field, "tenant_usage_accounting_max_tenants");
+                assert_eq!(value, "0");
+            }
+            other => panic!("expected an invalid-value error, got {other:?}"),
+        }
+
+        let one = RouterConfig {
+            tenant_usage_accounting_enabled: true,
+            tenant_usage_accounting_max_tenants: 1,
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&one).is_ok());
     }
 
     #[test]

@@ -62,7 +62,7 @@ use crate::{
         inflight_tracker::InFlightRequestTracker,
         logging::{self, LoggingConfig},
         metrics::{self, PrometheusConfig},
-        metrics_server, otel_trace, runtime_metrics,
+        metrics_server, otel_trace, runtime_metrics, tenant_usage,
     },
     routers::{
         common::realtime::ws::RealtimeQueryParams,
@@ -815,6 +815,20 @@ async fn stop_profile(
 /// `POST /heap_profile`: a heap profile of this gateway process, written
 /// under `--jemalloc-prof-dir` by a `jemalloc-profiling` build (see
 /// [`heap_profile`]).
+/// The per-tenant usage table (`tenant_usage_accounting_enabled`): every
+/// tracked tenant's requests, tokens and time by model, and the `other` row.
+/// 404 while accounting is off, so a poller can tell the feature apart from
+/// an empty table.
+async fn v1_usage_tenants() -> Response {
+    match tenant_usage::installed() {
+        Some(table) => Json(table.snapshot()).into_response(),
+        None => route_error::not_found(
+            "usage_accounting_disabled",
+            "Per-tenant usage accounting is off: start the gateway with --tenant-usage-accounting-enabled",
+        ),
+    }
+}
+
 async fn dump_heap_profile(State(state): State<Arc<AppState>>) -> Response {
     heap_profile::dump_blocking(state.context.router_config.jemalloc_prof_dir.clone())
         .await
@@ -1286,6 +1300,7 @@ pub fn build_apps(
         .route("/start_profile", post(start_profile))
         .route("/stop_profile", post(stop_profile))
         .route("/heap_profile", post(dump_heap_profile))
+        .route("/v1/usage/tenants", get(v1_usage_tenants))
         // Deprecated alias of the public `/loads`.
         .route("/get_loads", get(get_loads))
         .route("/parse/function_call", post(parse_function_call))
@@ -1681,6 +1696,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.policy,
         config.max_payload_size / (1024 * 1024)
     );
+
+    // The per-tenant usage table, before the first request can be booked to
+    // it: process-wide, like the recorder; nothing when accounting is off.
+    if config.router_config.tenant_usage_accounting_enabled {
+        tenant_usage::install(Arc::new(tenant_usage::TenantUsage::new(
+            usize::try_from(config.router_config.tenant_usage_accounting_max_tenants)
+                .unwrap_or(usize::MAX),
+        )));
+    }
 
     let app_context = Arc::new(
         AppContext::from_config(

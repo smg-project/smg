@@ -610,6 +610,8 @@ struct Router {
     tenant_header_name: String,
     tenant_rate_limit_config: Option<String>,
     tenant_rate_limit_enabled: bool,
+    tenant_usage_accounting_enabled: bool,
+    tenant_usage_accounting_max_tenants: u32,
     tokenizer_cache_enable_l0: bool,
     tokenizer_cache_enable_l1: bool,
     tokenizer_cache_l0_max_entries: usize,
@@ -1109,6 +1111,8 @@ impl Router {
             .priority_scheduler_tenant_metric_top_n(self.priority_scheduler_tenant_metric_top_n)
             .tenant_rate_limit_enabled(self.tenant_rate_limit_enabled)
             .tenant_rate_limit_config(self.tenant_rate_limit_config.clone())
+            .tenant_usage_accounting_enabled(self.tenant_usage_accounting_enabled)
+            .tenant_usage_accounting_max_tenants(self.tenant_usage_accounting_max_tenants)
             .prefill_max_inflight_requests_per_worker(self.prefill_max_inflight_requests_per_worker)
             .prefill_queue_size(self.prefill_queue_size)
             .prefill_queue_timeout_secs(self.prefill_queue_timeout_secs)
@@ -1430,6 +1434,8 @@ impl Router {
         tenant_header_name = String::from("x-smg-tenant-id"),
         tenant_rate_limit_config = None,
         tenant_rate_limit_enabled = false,
+        tenant_usage_accounting_enabled = false,
+        tenant_usage_accounting_max_tenants = 128,
         tokenizer_cache_enable_l0 = false,
         tokenizer_cache_enable_l1 = false,
         tokenizer_cache_l0_max_entries = 10000,
@@ -1637,6 +1643,8 @@ impl Router {
         tenant_header_name: String,
         tenant_rate_limit_config: Option<String>,
         tenant_rate_limit_enabled: bool,
+        tenant_usage_accounting_enabled: bool,
+        tenant_usage_accounting_max_tenants: u32,
         tokenizer_cache_enable_l0: bool,
         tokenizer_cache_enable_l1: bool,
         tokenizer_cache_l0_max_entries: usize,
@@ -1874,6 +1882,8 @@ impl Router {
             tenant_header_name,
             tenant_rate_limit_config,
             tenant_rate_limit_enabled,
+            tenant_usage_accounting_enabled,
+            tenant_usage_accounting_max_tenants,
             tokenizer_cache_enable_l0,
             tokenizer_cache_enable_l1,
             tokenizer_cache_l0_max_entries,

@@ -601,6 +601,12 @@ class RouterArgs:
     tenant_rate_limit_config: str | None = None
     tenant_rate_limit_enabled: bool = False
     # Tokenizer cache configuration
+    # Per-tenant usage accounting (requests, prompt and completion tokens and time by
+    # tenant and model, the smg_tenant_usage_* families and GET /v1/usage/tenants): off
+    # by default, and the maximum of tenants with rows of their own
+    # the same reason
+    tenant_usage_accounting_enabled: bool = False
+    tenant_usage_accounting_max_tenants: int = 128
     tokenizer_cache_enable_l0: bool = False
     tokenizer_cache_enable_l1: bool = False
     tokenizer_cache_l0_max_entries: int = 10000
@@ -744,6 +750,9 @@ class RouterArgs:
         )
         tenant_rate_limit_group = parser.add_argument_group(
             "Tenant Rate Limit", "Per-tenant token and request rate limiting"
+        )
+        usage_accounting_group = parser.add_argument_group(
+            "Usage Accounting", "Per-tenant usage accounting"
         )
 
         if use_router_prefix:
@@ -2097,6 +2106,27 @@ class RouterArgs:
             help=(
                 "Path to the tenant-rate-limit YAML. Required when"
                 " --tenant-rate-limit-enabled is set."
+            ),
+        )
+
+        # Usage accounting
+        usage_accounting_group.add_argument(
+            f"--{prefix}tenant-usage-accounting-enabled",
+            action="store_true",
+            default=False,
+            help=(
+                "Account requests, prompt and completion tokens and dispatch-to-last-token"
+                " time by tenant and model: the smg_tenant_usage_* families on /metrics and"
+                " the snapshot at GET /v1/usage/tenants. Off by default."
+            ),
+        )
+        usage_accounting_group.add_argument(
+            f"--{prefix}tenant-usage-accounting-max-tenants",
+            type=int,
+            default=RouterArgs.tenant_usage_accounting_max_tenants,
+            help=(
+                "Distinct tenants with usage rows of their own; every later tenant is"
+                ' booked under "other".'
             ),
         )
 

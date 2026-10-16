@@ -2943,6 +2943,7 @@ mod tests {
             multimodal_inflight: None,
             pd_prefill_guard: None,
             response: Default::default(),
+            tenant_key: None,
         }
     }
 

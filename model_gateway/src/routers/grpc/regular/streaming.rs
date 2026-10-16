@@ -38,6 +38,7 @@ use tracing::{debug, error, warn};
 
 use super::symphony::{engine_finish, finished, reasoning_text_tokens, Reader};
 use crate::{
+    middleware::TenantKey,
     observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
     rate_limit::{SharedReservationHandle, UsageSettlement},
     routers::{
@@ -189,6 +190,8 @@ struct GenerateStreamContext {
     return_logprob: bool,
     backend_type: &'static str,
     model: String,
+    /// The caller's tenant key, for the usage row the stream is booked to.
+    tenant_key: Option<TenantKey>,
     /// Number of choices (`sampling_params.n`) this request expects to
     /// complete -- a clean EOF with fewer `Complete` messages than this has
     /// only partial usage, not authoritative usage for the whole request.
@@ -503,6 +506,7 @@ impl StreamingProcessor {
             return_logprob: generate_request.return_logprob,
             backend_type: self.backend_type,
             model: dispatch.model.clone(),
+            tenant_key: dispatch.tenant_key.clone(),
             expected_choices: generate_request.expected_choices,
         };
 
@@ -1023,6 +1027,7 @@ impl StreamingProcessor {
             generation_duration: stream_base.elapsed(),
             input_tokens: None, // generate endpoint doesn't expose prompt tokens in streaming
             output_tokens: total_completion as u64,
+            tenant: context::usage_tenant(ctx.tenant_key.as_ref()),
         });
     }
 
@@ -2653,6 +2658,7 @@ impl StreamingProcessor {
             generation_duration: start_time.elapsed(),
             input_tokens: Some(u64::from(prompt_tokens)),
             output_tokens: u64::from(completion_tokens.total()),
+            tenant: dispatch.usage_tenant(),
         });
 
         Ok(())
@@ -2903,6 +2909,7 @@ impl StreamingProcessor {
                         generation_duration: start_time.elapsed(),
                         input_tokens: Some(total_prompt as u64),
                         output_tokens: total_completion as u64,
+                        tenant: dispatch.usage_tenant(),
                     });
                 }
             }
@@ -4495,6 +4502,7 @@ impl<'a> ChatStream<'a> {
             generation_duration: stream_base.elapsed(),
             input_tokens: Some(total_prompt as u64),
             output_tokens: total_completion as u64,
+            tenant: self.dispatch.usage_tenant(),
         });
     }
 }

@@ -595,6 +595,7 @@ impl HarmonyStreamingProcessor {
             generation_duration: start_time.elapsed(),
             input_tokens: Some(counts.prompt as u64),
             output_tokens: counts.completion as u64,
+            tenant: dispatch.usage_tenant(),
         });
 
         Ok(())
