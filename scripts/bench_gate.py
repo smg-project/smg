@@ -16,7 +16,9 @@ only when both hold:
 
 A change beyond the threshold whose runs overlap is reported as suspect, not failed. An id
 no gate pattern matches is reported, never failed. A gated id the base has and the pull
-request lacks fails (the gate file names it; a rename updates the file).
+request lacks fails: a benchmark that is removed or renamed on purpose is excluded from the
+group pattern that matches its old id (a negative lookahead such as
+`^(?!latency/encode_4KB$)(encode_throughput|latency)/`) in the same change.
 
 The repeat count, the id filter and the thresholds come from a TOML file
 (.github/bench-gates/<bench>.toml); the measured spreads that justify each threshold are
@@ -80,9 +82,19 @@ class Gates:
         return None
 
 
+GATE_FILE_KEYS = {"repeats", "filter", "bench_args", "gate"}
+GATE_ENTRY_KEYS = {"pattern", "threshold", "note"}
+
+
 def load_gates(path: Path) -> Gates:
+    """The gate file, checked: an unknown key, a `[[gate]]` without `pattern` or `threshold`, a
+    pattern or filter that does not compile, a threshold outside (0, 1) or a repeat count under 1
+    is a `ValueError` (exit 2, a usage error), never a silent default or a traceback."""
     with path.open("rb") as handle:
         raw = tomllib.load(handle)
+    unknown = set(raw) - GATE_FILE_KEYS
+    if unknown:
+        raise ValueError(f"{path}: unknown keys {sorted(unknown)}; known: {sorted(GATE_FILE_KEYS)}")
     gates = Gates(
         repeats=int(raw.get("repeats", 3)),
         filter=raw.get("filter"),
@@ -90,11 +102,26 @@ def load_gates(path: Path) -> Gates:
     )
     if gates.repeats < 1:
         raise ValueError(f"{path}: repeats must be at least 1")
-    for entry in raw.get("gate", []):
+    if gates.filter is not None:
+        try:
+            re.compile(gates.filter)
+        except re.error as err:
+            raise ValueError(f"{path}: filter {gates.filter!r} does not compile: {err}") from err
+    for index, entry in enumerate(raw.get("gate", []), start=1):
+        if not isinstance(entry, dict) or "pattern" not in entry or "threshold" not in entry:
+            raise ValueError(f"{path}: [[gate]] entry {index} needs pattern and threshold")
+        unknown = set(entry) - GATE_ENTRY_KEYS
+        if unknown:
+            raise ValueError(f"{path}: [[gate]] entry {index}: unknown keys {sorted(unknown)}")
         threshold = float(entry["threshold"])
         if not 0 < threshold < 1:
             raise ValueError(f"{path}: threshold {threshold} must be a fraction in (0, 1)")
-        re.compile(entry["pattern"])
+        try:
+            re.compile(entry["pattern"])
+        except re.error as err:
+            raise ValueError(
+                f"{path}: pattern {entry['pattern']!r} does not compile: {err}"
+            ) from err
         gates.gates.append(Gate(entry["pattern"], threshold, str(entry.get("note", ""))))
     return gates
 
@@ -385,8 +412,9 @@ def markdown(results: dict, rows: list[Row]) -> str:
     for row in failed:
         if row.verdict == "missing":
             lines.append(
-                f"- `{row.bench_id}` is gated but the pull request's run has no such id; "
-                "rename it in the gate file or restore the benchmark."
+                f"- `{row.bench_id}` is gated but the pull request's run has no such id: "
+                "restore the benchmark, or exclude the old id from the gate pattern that "
+                "matches it (a negative lookahead in the group pattern)."
             )
         else:
             lines.append(

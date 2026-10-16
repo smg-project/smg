@@ -82,6 +82,22 @@ def test_gate_file_rejects_bad_values(mod, tmp_path):
     path.write_text("repeats = 0\n")
     with pytest.raises(ValueError):
         mod.load_gates(path)
+    # A bad gate file is a usage error (ValueError, exit 2), never a traceback or a silent
+    # default: an unknown key, an entry without its pattern or threshold, a pattern or a
+    # filter that does not compile.
+    for text, named in [
+        ('filters = "^encode/"\n', "unknown keys"),
+        ("repeat = 5\n", "unknown keys"),
+        ("[[gate]]\nthreshold = 0.1\n", "needs pattern and threshold"),
+        ('[[gate]]\npattern = "x"\n', "needs pattern and threshold"),
+        ('[[gate]]\npattern = "x"\nthreshold = 0.1\nthreshhold = 0.2\n', "unknown keys"),
+        ('[[gate]]\npattern = "(unclosed"\nthreshold = 0.1\n', "does not compile"),
+        ('filter = "(unclosed"\n', "does not compile"),
+    ]:
+        path.write_text(text)
+        with pytest.raises(ValueError, match=named):
+            mod.load_gates(path)
+    assert mod.main(["compare", "--gates", str(path), str(path)]) == 2
 
 
 # ---------------------------------------------------------------- verdicts
