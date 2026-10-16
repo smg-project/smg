@@ -121,7 +121,6 @@ fn the_l0_exact_match_cache_matches_the_plain_encode_on_render_prompts() {
         for add_special_tokens in [false, true] {
             let off = cached(&inner, false);
             let on = cached(&inner, true);
-            let before = on.cache_stats().map_or(0, |s| s.hits);
             for text in &texts {
                 let twin = near_twin(text);
                 let want = inner.encode(text, add_special_tokens);
@@ -161,9 +160,9 @@ fn the_l0_exact_match_cache_matches_the_plain_encode_on_render_prompts() {
             if let Some(stats) = on.cache_stats() {
                 // Every warm encode hit; a prompt recorded twice hits cold too.
                 assert!(
-                    stats.hits - before >= 2 * texts.len() as u64,
+                    stats.hits >= 2 * texts.len() as u64,
                     "{name}: {} hits for {} prompts",
-                    stats.hits - before,
+                    stats.hits,
                     texts.len()
                 );
                 hits += stats.hits;
@@ -179,6 +178,13 @@ fn the_l0_exact_match_cache_matches_the_plain_encode_on_render_prompts() {
     }
     println!(
         "L0-PARITY-TOTAL vocabularies {vocabularies} compared {compared} mismatches {mismatches} l0 hits {hits} misses {misses}"
+    );
+    // The variable is set: something must have been compared, or the run
+    // would pass having checked nothing (a vocabulary that does not load, a
+    // wrong root, a missing render directory).
+    assert!(
+        vocabularies > 0 && compared > 0,
+        "{DIRS_ENV} is set but no vocabulary produced prompts to compare"
     );
     assert_eq!(
         mismatches, 0,

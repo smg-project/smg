@@ -31,10 +31,7 @@ pub mod tiktoken;
 mod tests;
 
 // Re-export types used outside this module
-pub use cache::{
-    CacheConfig, CacheStats, CachedTokenizer, L0Cache, L0Lookup, L0Miss, L1Cache,
-    TokenizerFingerprint,
-};
+pub use cache::{CacheConfig, CacheStats, CachedTokenizer, L0Cache, L1Cache, TokenizerFingerprint};
 pub use chat_template::ChatTemplateState;
 pub use decode_activity::{decode_activity_stats, DecodeActivityStats};
 pub use encode_path::{

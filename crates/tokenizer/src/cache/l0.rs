@@ -84,7 +84,7 @@ struct CachedEntry {
 
 /// What a [`L0Cache::lookup`] found: the ids, or what the [`L0Cache::fill`]
 /// after a miss needs.
-pub enum L0Lookup {
+pub(crate) enum L0Lookup {
     Hit(Arc<Encoding>),
     Miss(L0Miss),
 }
@@ -92,7 +92,7 @@ pub enum L0Lookup {
 /// A miss: the key the lookup computed, carried to [`L0Cache::fill`] so the
 /// text is hashed once per request.
 #[derive(Debug)]
-pub struct L0Miss {
+pub(crate) struct L0Miss {
     hash: u64,
     add_special_tokens: bool,
 }
@@ -161,7 +161,7 @@ impl L0Cache {
     /// that [`L0Cache::fill`] completes once the text is encoded. A hit is an
     /// entry whose text equals `text` byte for byte.
     #[inline]
-    pub fn lookup(&self, text: &str, add_special_tokens: bool) -> L0Lookup {
+    pub(crate) fn lookup(&self, text: &str, add_special_tokens: bool) -> L0Lookup {
         let hash = self.key(text, add_special_tokens);
         if let Some(entry) = self.map.get(&hash) {
             if entry.add_special_tokens == add_special_tokens && *entry.text == *text {
@@ -243,7 +243,7 @@ impl L0Cache {
     /// key that lookup computed: `text` must be the text given to it. The
     /// text is copied once, into the entry. An entry that would exceed a
     /// quarter of the byte budget is not cached.
-    pub fn fill(&self, miss: L0Miss, text: &str, ids: Vec<TokenIdType>) {
+    pub(crate) fn fill(&self, miss: L0Miss, text: &str, ids: Vec<TokenIdType>) {
         let L0Miss {
             hash,
             add_special_tokens,
