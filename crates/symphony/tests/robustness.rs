@@ -11,10 +11,14 @@
 //! is cut into deltas, with or without token spans, and with spans every token counted once, in
 //! the event that carries its first byte.
 //!
-//! A surrogate escape broken inside a top-level string is left out of the vocabulary on purpose:
+//! A surrogate escape broken inside a top-level string is left out of the outputs on purpose:
 //! a string-valued arguments streams as written, and the JSON prefix judge refuses such a string
 //! whole, so there the pieces say the string's bytes before the break where the whole says
 //! nothing; the one stated exception to the chunking rule, held by the assemblers' own tests.
+//! No piece holds a broken escape, and an output in which a concatenation (a lone `\` before an
+//! escape) or a corruption (a cut inside an escape) built one anyway is skipped under its seed (a
+//! few per cent of the outputs; the count is on the diagnostic line), so a long audit never
+//! reports the known exception as a failure.
 //!
 //! `SYMPHONY_SCRAMBLE_CASES=n` sets the outputs per table, variant and declaration (one hundred
 //! by default; a longer run for an audit), `SYMPHONY_SCRAMBLE_SEED=n` the first seed, so a run can
@@ -738,6 +742,96 @@ fn subjects() -> Vec<(Table, Variant, bool)> {
 }
 
 /// The scrambles of one subject, each in its own seed: the failures, each naming what replays it.
+/// Outputs skipped for holding a broken surrogate escape (the stated exception), for the
+/// diagnostic line.
+static SKIPPED: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether `text` holds a JSON surrogate escape that is broken: a high surrogate (`\ud800` to
+/// `\udbff`) not followed by a low one (`\udc00` to `\udfff`), or a low one not preceded by a
+/// high one. An escape begins at a backslash that is not itself escaped; an escape cut short
+/// (the tail cut mid-escape) is not a broken one, as whole and pieces hold it alike.
+fn holds_a_broken_surrogate_escape(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let escape_at = |at: usize| -> Option<u32> {
+        // `\uXXXX` at `at`, the backslash unescaped: its code unit.
+        if bytes.get(at) != Some(&b'\\') || bytes.get(at + 1) != Some(&b'u') {
+            return None;
+        }
+        let preceding = bytes[..at]
+            .iter()
+            .rev()
+            .take_while(|b| **b == b'\\')
+            .count();
+        if preceding % 2 == 1 {
+            return None;
+        }
+        let digits = bytes.get(at + 2..at + 6)?;
+        let digits = std::str::from_utf8(digits).ok()?;
+        u32::from_str_radix(digits, 16).ok()
+    };
+    let mut at = 0;
+    let mut after_high = false;
+    while at < bytes.len() {
+        match escape_at(at) {
+            Some(unit) if (0xD800..0xDC00).contains(&unit) => {
+                if after_high {
+                    return true;
+                }
+                after_high = true;
+                at += 6;
+            }
+            Some(unit) if (0xDC00..0xE000).contains(&unit) => {
+                if !after_high {
+                    return true;
+                }
+                after_high = false;
+                at += 6;
+            }
+            Some(_) => {
+                if after_high {
+                    return true;
+                }
+                at += 6;
+            }
+            None => {
+                if after_high {
+                    return true;
+                }
+                at += 1;
+            }
+        }
+    }
+    false
+}
+
+#[test]
+fn a_broken_surrogate_escape_is_told_from_a_whole_one() {
+    for whole in [
+        "",
+        "plain text",
+        r"\ud83c\ude00",
+        r#"{"e": "\ud83c\ude00"}"#,
+        r"\u00e9 \n \\",
+        r"\ud83",
+        r"ab\udc0",
+        // A high escape the text ends on: cut short, held alike by whole and pieces.
+        r"\ud83c",
+    ] {
+        assert!(!holds_a_broken_surrogate_escape(whole), "{whole:?}");
+    }
+    for broken in [
+        r"\udc00",
+        r#""ab\udc00""#,
+        r"\\ud83c\ude00",
+        r#"\ud83c""#,
+        r"\ud83c\x",
+        r"\ud83c\ud83c\ude00",
+        r"\ud83c ",
+    ] {
+        assert!(holds_a_broken_surrogate_escape(broken), "{broken:?}");
+    }
+}
+
 fn scramble(
     table: Table,
     variant: Variant,
@@ -761,6 +855,11 @@ fn scramble(
         );
         let prompt_text = prompt(&mut random, &format);
         let text = output(&mut random, &vocabulary);
+        // The stated exception (see the module doc) stays out of the outputs.
+        if holds_a_broken_surrogate_escape(&text) {
+            SKIPPED.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         let finish = finish(&mut random);
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             check(
@@ -829,9 +928,11 @@ fn every_table_reads_every_scramble_without_a_panic_and_keeps_the_contract() {
             })
             .collect()
     });
+    let skipped = SKIPPED.load(Ordering::Relaxed) as u64;
     println!(
-        "{} scrambles read: {} tables x {} variants x 2 declarations x {cases} seeds from {first}",
-        subjects.len() as u64 * cases,
+        "{} scrambles read: {} tables x {} variants x 2 declarations x {cases} seeds from {first}, \
+         {skipped} skipped for a broken surrogate escape (the stated exception)",
+        subjects.len() as u64 * cases - skipped,
         Table::ALL.len(),
         Variant::ALL.len()
     );
