@@ -4738,7 +4738,8 @@ mod request_release_tests {
             ..Default::default()
         };
         let prefill_port = spawn_stub(prefill_scheduler.clone()).await;
-        let decode_port = spawn_stub(GatedScheduler::default()).await;
+        let decode_scheduler = GatedScheduler::default();
+        let decode_port = spawn_stub(decode_scheduler.clone()).await;
         let worker_registry = Arc::new(WorkerRegistry::new());
         let prefill = register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
         let decode = register_worker(&worker_registry, decode_port, WorkerType::Decode);
@@ -4767,7 +4768,9 @@ mod request_release_tests {
         drop(response);
 
         let deadline = Instant::now() + Duration::from_secs(2);
+        // Both legs drop unmarked: each engine receives the abort.
         wait_for_abort(&prefill_scheduler, deadline).await;
+        wait_for_abort(&decode_scheduler, deadline).await;
         while prefill.load() != 0 || decode.load() != 0 {
             assert!(
                 Instant::now() < deadline,
