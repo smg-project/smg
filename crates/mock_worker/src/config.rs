@@ -419,7 +419,8 @@ fn usage() -> String {
        --gen-ms <ms>            canned per-request latency (default 0)\n\
        --output-tokens <n>      output tokens per request when unspecified (default 8)\n\
        --output-prefix-ids <a,b,..>  token ids every output starts with, before the synthetic ids\n\
-                                (a stream shaped for a gateway that parses the engine's tokens; default none)\n\
+                                (a stream shaped for a gateway that parses the engine's tokens, in every\n\
+                                mode: canned HTTP/gRPC/ZMQ and the realistic engine; default none)\n\
        --capture <path>         append each gRPC Generate request to <path> as a JSON line\n\
      \n\
      Realistic engine simulator (vLLM pass loop over a block-level KV pool; opt-in):\n\

@@ -107,8 +107,8 @@ async fn a_client_that_leaves_while_the_engine_is_parked_ends_the_iteration_at_o
     assert_eq!(error, "Client disconnected");
     assert!(saw_text, "the answer was under way when the client left");
     assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "the read ended with the client, not with the engine"
+        started.elapsed() < Duration::from_secs(1),
+        "the read ended with the client's leaving (100 ms in), not with the engine"
     );
     server.abort();
 }
