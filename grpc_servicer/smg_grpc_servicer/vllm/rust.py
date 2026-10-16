@@ -59,6 +59,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     EngineProcess,
     EngineProcessGroup,
     RustLauncher,
+    ServicerConfigError,
     apply_kv_events_default,
     resolve_tokenizer_dir,
     servicer_switch,
@@ -589,6 +590,26 @@ def require_python_impl(environ: Mapping[str, str] | None = None) -> None:
             "Start through `vllm serve <model> --grpc`, or unset the flag; a silent "
             "Python fallback would report Rust coverage that never ran."
         )
+
+
+def require_python_media_mode(
+    args: argparse.Namespace | None = None, environ: Mapping[str, str] | None = None
+) -> str:
+    """The ``--mm-processor`` mode the Python servicer will serve, checked
+    before the launcher builds the engine: ``smg`` is the Rust servicer's own
+    pipeline, and the Python servicer's own refusal of it comes only once the
+    engine exists, after the whole model loaded (under a restart policy a
+    crash loop that pays a full load per turn). The mode is known from the
+    flags and the environment here, so the switch refuses it now, as a
+    :class:`~smg_grpc_servicer.rust_lifecycle.ServicerConfigError` with the
+    servicer's own message."""
+    from smg_grpc_servicer.vllm.mm_processor import MmSettings, require_python_servicer_mode
+
+    settings = MmSettings.from_args(args) if args is not None else MmSettings()
+    try:
+        return require_python_servicer_mode(settings, os.environ if environ is None else environ)
+    except ValueError as error:
+        raise ServicerConfigError(str(error)) from None
 
 
 def upstream_hook_installed(vllm_root: str | None = None) -> bool:

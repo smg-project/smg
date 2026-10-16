@@ -1549,3 +1549,74 @@ def test_the_switch_answers_a_configuration_error_with_exit_code_2(monkeypatch, 
         asyncio.run(switched(argparse.Namespace(servicer_impl="rust")))
     assert raised.value.code == 2 and calls == []
     assert "SMG_VLLM_SERVICER_DRAIN_SECS='abc' is not a number" in caplog.text
+
+
+def test_the_switch_refuses_the_rust_pipeline_before_the_python_launcher_builds_the_engine(
+    monkeypatch, caplog
+):
+    """`--mm-processor smg` on the Python servicer: the servicer's own refusal
+    comes after the engine is built and the model loaded (a crash loop under a
+    restart policy, a full load per turn); the switch refuses it first, from
+    the flags and the environment, with the servicer's message, one ERROR line
+    and exit code 2, and the launcher's coroutine never runs."""
+    import logging
+
+    from smg_grpc_servicer.vllm import launcher_switch
+    from smg_grpc_servicer.vllm.mm_processor import SMG_MODE_REFUSAL
+
+    monkeypatch.delenv("SMG_VLLM_MM_PROCESSOR", raising=False)
+    calls = []
+
+    async def serve_grpc(args):
+        calls.append(args)
+        return "python ran"
+
+    switched = launcher_switch.with_servicer_switch(serve_grpc)
+    caplog.set_level(logging.ERROR)
+    # The flag form.
+    with pytest.raises(SystemExit) as raised:
+        asyncio.run(switched(argparse.Namespace(servicer_impl="python", mm_processor="smg")))
+    assert raised.value.code == 2 and calls == []
+    assert SMG_MODE_REFUSAL in caplog.text
+    # The environment form, on a launcher without the flag.
+    monkeypatch.setenv("SMG_VLLM_MM_PROCESSOR", "smg")
+    with pytest.raises(SystemExit) as raised:
+        asyncio.run(switched(argparse.Namespace(servicer_impl="python")))
+    assert raised.value.code == 2 and calls == []
+    # Any other `--mm-*` value the servicer would refuse is refused here too.
+    with pytest.raises(SystemExit) as raised:
+        asyncio.run(switched(argparse.Namespace(servicer_impl="python", mm_max_inflight=0)))
+    assert raised.value.code == 2 and calls == []
+    assert "--mm-max-inflight=0 must be positive" in caplog.text
+    # A mode the Python servicer serves runs the launcher's coroutine; the flag
+    # wins over an exported `smg`.
+    inprocess = argparse.Namespace(servicer_impl="python", mm_processor="inprocess")
+    assert asyncio.run(switched(inprocess)) == "python ran" and calls == [inprocess]
+    # The Rust path serves `smg`: not refused there.
+    rust_calls = []
+
+    async def fake_serve_rust(args):
+        rust_calls.append(args)
+        return 0
+
+    monkeypatch.setattr(rust, "serve_rust", fake_serve_rust)
+    smg_on_rust = argparse.Namespace(servicer_impl="rust", mm_processor="smg")
+    with pytest.raises(SystemExit) as raised:
+        asyncio.run(switched(smg_on_rust))
+    assert raised.value.code == 0 and rust_calls == [smg_on_rust] and calls == [inprocess]
+
+
+def test_require_python_media_mode_is_the_servicers_refusal_as_a_configuration_error():
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="Rust servicer") as refused:
+        rust.require_python_media_mode(argparse.Namespace(mm_processor="smg"), environ={})
+    from smg_grpc_servicer.vllm.mm_processor import SMG_MODE_REFUSAL
+
+    assert str(refused.value) == SMG_MODE_REFUSAL
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="Rust servicer"):
+        rust.require_python_media_mode(None, environ={"SMG_VLLM_MM_PROCESSOR": "smg"})
+    assert rust.require_python_media_mode(argparse.Namespace(), environ={}) == "off"
+    assert rust.require_python_media_mode(None, environ={"SMG_VLLM_MM_PROCESSOR": "redis"}) == (
+        "redis"
+    )
+    # A launcher namespace without the flags (no plugin loaded) reads the environment.
+    assert rust.require_python_media_mode(argparse.Namespace(model="org/m"), environ={}) == "off"

@@ -256,7 +256,9 @@ Worker-side media processing uses the same `--mm-processor` /
   takes raw `uint8` pixels, and the pipeline writes those for it; a model
   whose processor cannot emit raw pixels is refused at startup under that
   setting (start the engine with `--mm-device-do-normalize=false` or use
-  `inprocess`). The Python servicer refuses `smg`: it has no such processor.
+  `inprocess`). The Python servicer refuses `smg`: it has no such processor, and
+  the launcher's switch refuses it before the engine is built and the model
+  loaded (one configuration-error line, exit code 2), not after.
 
 The in-flight cap, the saturation refusal, the advertised `mm_processor` /
 `mm_media_ref_schemes` / `mm_processor_source` and the PD prefill leg's

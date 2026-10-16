@@ -206,6 +206,59 @@ class TestBuildProcessor:
         with pytest.raises(ValueError, match="Rust servicer"):
             mm_processor.build_mm_processor(self._Engine(), env={"SMG_VLLM_MM_PROCESSOR": "smg"})
 
+    def test_smg_mode_is_refused_before_any_engine_exists(self, caplog):
+        # The launcher's settings alone decide: the same refusal, with no
+        # engine built and no model loaded, in the flag and the env form.
+        MmSettings = mm_processor.MmSettings
+        check = mm_processor.require_python_servicer_mode
+        with pytest.raises(ValueError, match="Rust servicer") as flagged:
+            check(MmSettings(processor="smg"), env={})
+        with pytest.raises(ValueError, match="Rust servicer") as exported:
+            check(MmSettings(), env={"SMG_VLLM_MM_PROCESSOR": "smg"})
+        with pytest.raises(ValueError, match="Rust servicer") as late:
+            mm_processor.build_mm_processor(self._Engine(), env={"SMG_VLLM_MM_PROCESSOR": "smg"})
+        assert str(flagged.value) == str(exported.value) == str(late.value)
+        assert str(late.value) == mm_processor.SMG_MODE_REFUSAL
+        # A resolved settings object gets the same verdict.
+        with pytest.raises(ValueError, match="Rust servicer"):
+            check(MmSettings(processor="smg").resolve(env={}), env={})
+        # The modes the Python servicer serves pass, flag over env, default off.
+        assert check(MmSettings(processor="inprocess"), env={}) == "inprocess"
+        assert check(MmSettings(processor="inprocess"), env={"SMG_VLLM_MM_PROCESSOR": "smg"}) == (
+            "inprocess"
+        )
+        assert check(MmSettings(), env={"SMG_VLLM_MM_PROCESSOR": "redis"}) == "redis"
+        assert check(MmSettings(), env={}) == "off"
+        assert check(None, env={}) == "off"
+        with pytest.raises(ValueError, match="is not one of"):
+            check(MmSettings(), env={"SMG_VLLM_MM_PROCESSOR": "sidecar"})
+        # Every other setting is validated as the servicer's constructor
+        # validates it, whatever the mode: a knob it cannot use is refused
+        # before the load too.
+        with pytest.raises(ValueError, match="--mm-max-inflight=0 must be positive"):
+            check(MmSettings(processor="off", max_inflight=0), env={})
+        with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_ITEM_BYTES='abc' is not an integer"):
+            check(MmSettings(), env={"SMG_VLLM_MM_MAX_ITEM_BYTES": "abc"})
+        with pytest.raises(ValueError, match="SMG_VLLM_MM_SIDECAR_MAX_QUEUE='-1' must be positive"):
+            check(MmSettings(processor="inprocess"), env={"SMG_VLLM_MM_SIDECAR_MAX_QUEUE": "-1"})
+        assert check(MmSettings(processor="off", max_inflight=8), env={}) == "off"
+        # So is the frame budget the processors read at construction, for the
+        # modes that read it.
+        frames = "SMG_VLLM_MM_MAX_VIDEO_FRAMES"
+        with pytest.raises(ValueError, match=f"{frames}='abc' is not an integer"):
+            check(MmSettings(processor="inprocess"), env={frames: "abc"})
+        with pytest.raises(ValueError, match=f"{frames}='-1' must be at least 0"):
+            check(MmSettings(processor="redis"), env={frames: "-1"})
+        assert check(MmSettings(processor="inprocess"), env={frames: "0"}) == "inprocess"
+        assert check(MmSettings(processor="off"), env={frames: "abc"}) == "off"
+        # No deprecation line of its own for the variable behind a defined
+        # flag: the servicer's own resolve logs that once, later.
+        caplog.set_level(logging.WARNING)
+        ns = argparse.Namespace(mm_processor=None, mm_max_items=None)
+        env = {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_ITEMS": "2"}
+        assert check(MmSettings.from_args(ns), env=env) == "inprocess"
+        assert "deprecated" not in caplog.text
+
     def test_invalid_item_cap_is_rejected_before_construction(self):
         env = {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_ITEM_BYTES": "0"}
         with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_ITEM_BYTES"):

@@ -53,6 +53,7 @@ def with_servicer_switch(
         from smg_grpc_servicer.rust_lifecycle import ServicerConfigError, configuration_exit
         from smg_grpc_servicer.vllm.rust import (
             configure_logging,
+            require_python_media_mode,
             resolve_servicer_impl,
             serve_rust,
         )
@@ -60,6 +61,11 @@ def with_servicer_switch(
         try:
             if resolve_servicer_impl(args) == "rust":
                 raise SystemExit(await serve_rust(args))
+            # The Python servicer's media mode is known here, from the flags
+            # and the environment: one it cannot serve is refused now, before
+            # the launcher's own coroutine builds the engine and loads the
+            # model (the servicer's own refusal would come after that load).
+            require_python_media_mode(args)
         except ServicerConfigError as error:
             # A knob the servicer cannot use: one named ERROR line and exit
             # code 2, not the launcher's traceback.
