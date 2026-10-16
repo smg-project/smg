@@ -1002,35 +1002,30 @@ pub const TOKIO_WORKER_THREADS: &str = "TOKIO_WORKER_THREADS";
 /// [`DEFAULT_RUNTIME_WORKER_THREADS_CAP`], never below 1, and the cap when
 /// the parallelism cannot be read.
 pub fn runtime_worker_threads(explicit: Option<usize>) -> Result<usize, String> {
-    // Set but not UTF-8 is a setting, not an absence: refused as tokio refuses it.
-    let env_setting = match std::env::var(TOKIO_WORKER_THREADS) {
-        Ok(value) => Some(value),
-        Err(std::env::VarError::NotPresent) => None,
-        Err(std::env::VarError::NotUnicode(raw)) => {
-            return Err(format!(
-                "{TOKIO_WORKER_THREADS}={raw:?} is not a positive integer"
-            ));
-        }
-    };
     runtime_worker_threads_from(
         explicit,
-        env_setting.as_deref(),
+        std::env::var_os(TOKIO_WORKER_THREADS).as_deref(),
         std::thread::available_parallelism().ok(),
     )
 }
 
-/// The rule behind [`runtime_worker_threads`], over the values it reads.
+/// The rule behind [`runtime_worker_threads`], over the values it reads; the
+/// variable comes in as read, so that a set-but-not-UTF-8 value is a setting
+/// (refused by name) and not an absence.
 fn runtime_worker_threads_from(
     explicit: Option<usize>,
-    env_setting: Option<&str>,
+    env_setting: Option<&std::ffi::OsStr>,
     parallelism: Option<std::num::NonZeroUsize>,
 ) -> Result<usize, String> {
+    // An explicit count is the setting, and the variable is not read under
+    // it (tokio, given a count, does not read it either): a malformed value,
+    // UTF-8 or not, cannot refuse a pinned runtime.
     if let Some(count) = explicit {
         return Ok(count);
     }
     if let Some(value) = env_setting {
-        return match value.parse::<usize>() {
-            Ok(count) if count >= 1 => Ok(count),
+        return match value.to_str().and_then(|text| text.parse::<usize>().ok()) {
+            Some(count) if count >= 1 => Ok(count),
             _ => Err(format!(
                 "{TOKIO_WORKER_THREADS}={value:?} is not a positive integer"
             )),
@@ -2689,26 +2684,28 @@ mod tests {
     /// available parallelism capped at `DEFAULT_RUNTIME_WORKER_THREADS_CAP`,
     /// never below 1, and the cap when the parallelism cannot be read; the
     /// variable, as tokio reads it, comes before the budget; an explicit
-    /// `--runtime-worker-threads` comes first, above the cap included.
+    /// `--runtime-worker-threads` comes first, above the cap included, and
+    /// the variable, well-formed or not, is not read under it.
     #[test]
     fn the_runtime_size_follows_the_gateway_budget_unless_pinned() {
         let cap = DEFAULT_RUNTIME_WORKER_THREADS_CAP;
         let cores = |n: usize| std::num::NonZeroUsize::new(n);
+        let var = |value: &'static str| Some(std::ffi::OsStr::new(value));
         assert_eq!(runtime_worker_threads_from(None, None, cores(16)), Ok(cap));
         assert_eq!(runtime_worker_threads_from(None, None, cores(cap)), Ok(cap));
         assert_eq!(runtime_worker_threads_from(None, None, cores(2)), Ok(2));
         assert_eq!(runtime_worker_threads_from(None, None, cores(1)), Ok(1));
         assert_eq!(runtime_worker_threads_from(None, None, None), Ok(cap));
         assert_eq!(
-            runtime_worker_threads_from(None, Some("12"), cores(2)),
+            runtime_worker_threads_from(None, var("12"), cores(2)),
             Ok(12)
         );
         assert_eq!(
-            runtime_worker_threads_from(None, Some("1"), cores(16)),
+            runtime_worker_threads_from(None, var("1"), cores(16)),
             Ok(1)
         );
         assert_eq!(
-            runtime_worker_threads_from(Some(3), Some("12"), cores(16)),
+            runtime_worker_threads_from(Some(3), var("12"), cores(16)),
             Ok(3)
         );
         assert_eq!(
@@ -2716,10 +2713,27 @@ mod tests {
             Ok(cap * 4)
         );
         for bad in ["0", "-1", "eight", "8 ", ""] {
-            let err = runtime_worker_threads_from(None, Some(bad), cores(16)).unwrap_err();
+            let err = runtime_worker_threads_from(None, var(bad), cores(16)).unwrap_err();
             assert!(
                 err.contains(TOKIO_WORKER_THREADS) && err.contains(bad),
                 "{bad:?}: {err}"
+            );
+            assert_eq!(
+                runtime_worker_threads_from(Some(3), var(bad), cores(16)),
+                Ok(3)
+            );
+        }
+        // Set but not UTF-8 is a setting, not an absence: refused by name when
+        // it would be read, and not read under an explicit count.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = std::ffi::OsStr::from_bytes(b"\xff");
+            let err = runtime_worker_threads_from(None, Some(raw), cores(16)).unwrap_err();
+            assert!(err.contains(TOKIO_WORKER_THREADS), "{err}");
+            assert_eq!(
+                runtime_worker_threads_from(Some(3), Some(raw), cores(16)),
+                Ok(3)
             );
         }
         // The reading wrapper: an explicit count needs neither the variable
