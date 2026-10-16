@@ -1644,6 +1644,13 @@ mod tests {
                 .unwrap(),
             ConditionalStore::Missing
         ));
+        assert!(matches!(
+            store
+                .update_response_object_if_open(&ResponseId::from("resp_1"), moved.clone())
+                .await
+                .unwrap(),
+            ConditionalStore::Missing
+        ));
         assert_eq!(stores(), 0, "nothing is written under a missing id");
 
         *store.read.lock() = Read::Answers(Some(Box::new(record("queued"))));
