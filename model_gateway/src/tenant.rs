@@ -51,12 +51,6 @@ impl DataPlaneCaller {
     pub fn tenant_key(&self) -> &TenantKey {
         &self.tenant_key
     }
-
-    #[inline]
-    #[must_use]
-    pub fn authenticated_from_sha256(hash: [u8; 32]) -> Self {
-        Self::new(authenticated_tenant_key_from_sha256(hash))
-    }
 }
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
