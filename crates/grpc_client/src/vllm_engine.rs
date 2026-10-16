@@ -738,6 +738,7 @@ impl From<proto::GetLoadsResponse> for openai_protocol::worker::WorkerLoadRespon
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channel::test_support::refused_endpoint;
 
     /// Minimal valid CompletionRequest for tests that only care about
     /// sampling-param passthrough. CompletionRequest doesn't derive Default,
@@ -1015,8 +1016,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_client_connect_invalid_endpoint() {
-        let result = VllmEngineClient::connect("invalid://endpoint").await;
+    async fn test_client_connect_refused_endpoint() {
+        let (_reserved, endpoint) = refused_endpoint();
+        let result = VllmEngineClient::connect(&endpoint).await;
         assert!(result.is_err());
     }
 

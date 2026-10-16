@@ -910,6 +910,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::channel::test_support::refused_endpoint;
 
     #[test]
     fn score_request_uses_unscaled_prefill_only_logprobs() {
@@ -1230,8 +1231,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_client_connect_invalid_endpoint() {
-        let result = SglangSchedulerClient::connect("invalid://endpoint").await;
+    async fn test_client_connect_refused_endpoint() {
+        let (_reserved, endpoint) = refused_endpoint();
+        let result = SglangSchedulerClient::connect(&endpoint).await;
         assert!(result.is_err());
     }
 
