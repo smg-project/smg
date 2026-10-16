@@ -230,11 +230,12 @@ pub async fn serve_until(
                     }),
                     None => {
                         let delay = cfg.gen_delay;
+                        let prefix = cfg.engine.output_prefix.clone();
                         #[expect(
                             clippy::disallowed_methods,
                             reason = "canned producer self-terminates after Done"
                         )]
-                        let _canned = tokio::spawn(canned_generate(gen_tx, max_new, delay));
+                        let _canned = tokio::spawn(canned_generate(gen_tx, max_new, delay, prefix));
                     }
                 }
 
@@ -437,19 +438,20 @@ async fn scripted_request(
     }
 }
 
-/// Canned generator for non-realistic mode: emit `output_tokens` synthetic
-/// tokens then a terminal Done.
+/// Canned generator for non-realistic mode: emit `output_tokens` tokens (the
+/// configured prefix first, then synthetic ids) then a terminal Done.
 async fn canned_generate(
     gen_tx: mpsc::UnboundedSender<GenEvent>,
     output_tokens: u32,
     gen_delay: Duration,
+    output_prefix: Vec<u32>,
 ) {
     for i in 0..output_tokens {
         if !gen_delay.is_zero() {
             tokio::time::sleep(gen_delay).await;
         }
         let event = GenEvent::Token {
-            token_id: 100 + i,
+            token_id: output_prefix.get(i as usize).copied().unwrap_or(100 + i),
             prompt_tokens: 1,
             cached_tokens: 0,
         };
