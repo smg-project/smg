@@ -546,7 +546,7 @@ fn is_reference(key: &str) -> bool {
 }
 
 /// Whether `schema` points anywhere inside its own document.
-fn has_local_reference(schema: &Value) -> bool {
+pub(super) fn has_local_reference(schema: &Value) -> bool {
     match schema {
         Value::Object(map) => map.iter().any(|(key, value)| {
             is_reference(key)
