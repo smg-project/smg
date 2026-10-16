@@ -65,7 +65,7 @@ use crate::{
             body_policy::{
                 decide_body_path, BodyPath, BodyPathInputs, BODY_PATH_BUFFERED, BODY_PATH_STREAMED,
                 REASON_MODEL_AMBIGUOUS, REASON_MODEL_SELECTION, REASON_NO_AVAILABLE_WORKER,
-                REASON_WORKER_MUTATES_BODY,
+                REASON_PROVIDER_PROFILE, REASON_WORKER_MUTATES_BODY,
             },
             decisions::{SglangDecisionAdapter, UPSTREAM_ROUTE},
             header_utils, overload,
@@ -1889,10 +1889,31 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
 
 use async_trait::async_trait;
 
+/// Whether a chat completion to this worker's served model is shaped by a
+/// provider profile ([`ProviderProfile::normalizes_chat`]), the way request
+/// validation shapes it on the buffered path. The streamed path reads no
+/// body, so the served model stands in for the one the request names: it is
+/// the model a single-model fleet answers for, and an alias resolves to the
+/// same profile as the served name (see [`ProviderProfile::for_model`]). A
+/// worker serving no named model is the default profile, which shapes
+/// nothing a relay has to type for.
+fn serves_profile_shaped_chat(worker: &dyn Worker) -> bool {
+    ProviderProfile::for_model(worker.model_id()).normalizes_chat()
+}
+
 impl Router {
     /// Gather this router's per-request state for the shared decision matrix
-    /// in [`crate::routers::common::body_policy`].
-    fn request_body_path(&self, headers: &HeaderMap, wasm_request_hooks: bool) -> BodyPath {
+    /// in [`crate::routers::common::body_policy`]. `route` is the request's
+    /// route: a chat completion bound for a served model whose provider
+    /// profile shapes requests must be typed, or the profile's contract
+    /// defaults (a stream's usage chunk, sampling, thinking) and merges never
+    /// reach the upstream; every other route forwards as before.
+    fn request_body_path(
+        &self,
+        headers: &HeaderMap,
+        wasm_request_hooks: bool,
+        route: &'static str,
+    ) -> BodyPath {
         let candidates = self
             .worker_registry
             .get_routing_pool(crate::worker::UNKNOWN_MODEL_ID, RoutingPool::HttpRegular);
@@ -1903,6 +1924,10 @@ impl Router {
                 .any_policy_needs_request_text(Some(headers)),
             model_ambiguous: self.worker_registry.model_count() > 1,
             worker_mutates_body: candidates.iter().any(|w| w.mutates_request()),
+            profile_normalizes_body: route == "/v1/chat/completions"
+                && candidates
+                    .iter()
+                    .any(|w| serves_profile_shaped_chat(w.as_ref())),
             wasm_request_hooks,
             content_length: header_utils::content_length(Some(headers)).map(|len| len as u64),
             // The model sits inside the unread body, so any per-model retry
@@ -1919,14 +1944,16 @@ impl Router {
     /// Streamed pass-through: select a worker from headers alone and
     /// forward the raw body verbatim (JSON validation and normalization
     /// defer to the worker). `Err` hands the request back untouched —
-    /// body unconsumed — for the buffered typed path.
+    /// body unconsumed — for the buffered typed path; a chat completion to a
+    /// served model whose provider profile shapes requests always goes back,
+    /// since only the typed path applies the profile.
     pub(crate) async fn route_streaming_request(
         &self,
         req: Request<Body>,
         route: &'static str,
         wasm_request_hooks: bool,
     ) -> Result<Response, Request<Body>> {
-        let stream_reason = match self.request_body_path(req.headers(), wasm_request_hooks) {
+        let stream_reason = match self.request_body_path(req.headers(), wasm_request_hooks, route) {
             BodyPath::Buffer(reason) => {
                 Metrics::record_request_body_path(BODY_PATH_BUFFERED, reason);
                 return Err(req);
@@ -1956,10 +1983,15 @@ impl Router {
         };
         // Guard the registration races the decision left open: a mutating
         // worker that joined after the fleet check must not receive an
-        // unmutated stream, and a second model appearing re-opens
-        // wrong-model selection.
+        // unmutated stream, a profile-shaped served model that joined must
+        // not receive an unshaped chat request, and a second model appearing
+        // re-opens wrong-model selection.
         if worker.mutates_request() {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_WORKER_MUTATES_BODY);
+            return Err(req);
+        }
+        if route == "/v1/chat/completions" && serves_profile_shaped_chat(worker.as_ref()) {
+            Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_PROVIDER_PROFILE);
             return Err(req);
         }
         if self.worker_registry.model_count() > 1 {
@@ -3514,7 +3546,7 @@ mod tests {
             vec![plain_worker("http://worker1:8080")],
         );
         assert_eq!(
-            router.request_body_path(&headers_with_content_length(Some("64")), false),
+            router.request_body_path(&headers_with_content_length(Some("64")), false, "/generate"),
             BodyPath::Buffer(REASON_POLICY_NEEDS_TEXT)
         );
 
@@ -3522,7 +3554,7 @@ mod tests {
         let mut headers = headers_with_content_length(Some("64"));
         headers.insert("x-smg-routing-tokens", "1,2,3".parse().unwrap());
         assert_eq!(
-            router.request_body_path(&headers, false),
+            router.request_body_path(&headers, false, "/generate"),
             BodyPath::Stream(REASON_RETRY_FORFEITED)
         );
     }
@@ -3536,7 +3568,7 @@ mod tests {
             .build();
         let router = streaming_router(least_load_policy(), 1024 * 1024, vec![worker]);
         assert_eq!(
-            router.request_body_path(&headers_with_content_length(Some("64")), false),
+            router.request_body_path(&headers_with_content_length(Some("64")), false, "/generate"),
             BodyPath::Buffer(REASON_WORKER_MUTATES_BODY)
         );
     }
@@ -3549,7 +3581,7 @@ mod tests {
             vec![plain_worker("http://worker1:8080")],
         );
         assert_eq!(
-            router.request_body_path(&headers_with_content_length(Some("64")), true),
+            router.request_body_path(&headers_with_content_length(Some("64")), true, "/generate"),
             BodyPath::Buffer(REASON_WASM_REQUEST_HOOK)
         );
     }
@@ -3566,7 +3598,7 @@ mod tests {
             headers_with_content_length(Some("not-a-number")),
         ] {
             assert_eq!(
-                router.request_body_path(&headers, false),
+                router.request_body_path(&headers, false, "/generate"),
                 BodyPath::Buffer(REASON_NO_CONTENT_LENGTH)
             );
         }
@@ -3592,7 +3624,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            router.request_body_path(&headers_with_content_length(Some("64")), false),
+            router.request_body_path(&headers_with_content_length(Some("64")), false, "/generate"),
             BodyPath::Buffer(REASON_MODEL_AMBIGUOUS)
         );
 
@@ -3606,9 +3638,97 @@ mod tests {
             ],
         );
         assert_eq!(
-            router.request_body_path(&headers_with_content_length(Some("64")), false),
+            router.request_body_path(&headers_with_content_length(Some("64")), false, "/generate"),
             BodyPath::Stream(REASON_RETRY_FORFEITED)
         );
+    }
+
+    /// A served model whose provider profile shapes chat requests (the
+    /// stream usage default, MiniMax's root merge, sampling and thinking
+    /// defaults) decides the buffered path for chat completions, so the
+    /// profile's normalization reaches the upstream; the fleet's other routes
+    /// and a served model under the default or OpenAI profile keep the
+    /// pass-through. A served model aliased under a vendor name takes the
+    /// vendor's decision for its own name (alias names unique to this test:
+    /// the table is process-wide).
+    #[test]
+    fn profile_shaped_served_model_decides_buffer_for_chat_only() {
+        let worker_for = |model: &str| {
+            BasicWorkerBuilder::new("http://worker1:8080")
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .models(vec![crate::worker::ModelCard::new(model)])
+                .build()
+        };
+        let headers = headers_with_content_length(Some("64"));
+        ProviderProfile::register_model_aliases([(
+            "minimax-m3-body-path-alias",
+            "served-body-path-model",
+        )]);
+        for model in [
+            "MiniMax-M3",
+            "kimi-k2",
+            "glm-5",
+            "deepseek-v4-pro",
+            "served-body-path-model",
+        ] {
+            let router =
+                streaming_router(least_load_policy(), 1024 * 1024, vec![worker_for(model)]);
+            assert_eq!(
+                router.request_body_path(&headers, false, "/v1/chat/completions"),
+                BodyPath::Buffer(REASON_PROVIDER_PROFILE),
+                "{model}"
+            );
+            for route in ["/v1/completions", "/generate", "/v1/embeddings"] {
+                assert_eq!(
+                    router.request_body_path(&headers, false, route),
+                    BodyPath::Stream(REASON_RETRY_FORFEITED),
+                    "{model} {route}"
+                );
+            }
+        }
+        for model in ["self-hosted-model", "gpt-4o"] {
+            let router =
+                streaming_router(least_load_policy(), 1024 * 1024, vec![worker_for(model)]);
+            assert_eq!(
+                router.request_body_path(&headers, false, "/v1/chat/completions"),
+                BodyPath::Stream(REASON_RETRY_FORFEITED),
+                "{model}"
+            );
+        }
+        // A worker serving no named model is the default profile.
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![plain_worker("http://worker1:8080")],
+        );
+        assert_eq!(
+            router.request_body_path(&headers, false, "/v1/chat/completions"),
+            BodyPath::Stream(REASON_RETRY_FORFEITED)
+        );
+    }
+
+    /// The hand-back for a profile-shaped chat leaves the body unconsumed for
+    /// the typed path, retries disabled and the body of any size.
+    #[tokio::test]
+    async fn profile_shaped_chat_falls_back_to_buffered_with_body_intact() {
+        let worker = BasicWorkerBuilder::new("http://worker1:8080")
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .models(vec![crate::worker::ModelCard::new("kimi-k2")])
+            .build();
+        let mut router = streaming_router(least_load_policy(), 1024 * 1024, vec![worker]);
+        router.retry_config = RetryConfig {
+            max_retries: 1,
+            ..Default::default()
+        };
+        let body: &'static [u8] = b"{\"model\":\"kimi-k2\",\"messages\":[],\"stream\":true}";
+        let req = router
+            .route_streaming_request(streamed_request(&[body]), "/v1/chat/completions", false)
+            .await
+            .unwrap_err();
+        let handed_back = to_bytes(req.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(handed_back.as_ref(), body);
     }
 
     #[test]
@@ -3632,7 +3752,7 @@ mod tests {
             true,
         );
         assert_eq!(
-            router.request_body_path(&headers_with_content_length(Some("64")), false),
+            router.request_body_path(&headers_with_content_length(Some("64")), false, "/generate"),
             BodyPath::Buffer(REASON_RETRYABLE)
         );
     }
@@ -3966,7 +4086,7 @@ mod tests {
         tokens_hint.insert("x-smg-routing-tokens", "1,2,3".parse().unwrap());
         for headers in [&no_hint, &key_hint, &tokens_hint] {
             assert_eq!(
-                cache_aware.request_body_path(headers, false),
+                cache_aware.request_body_path(headers, false, "/generate"),
                 BodyPath::Buffer(REASON_ROUTING_KEY_OVERRIDE)
             );
         }
@@ -3977,7 +4097,7 @@ mod tests {
             vec![plain_worker("http://worker1:8080")],
         );
         assert_eq!(
-            text_free.request_body_path(&no_hint, false),
+            text_free.request_body_path(&no_hint, false, "/generate"),
             BodyPath::Buffer(REASON_ROUTING_KEY_OVERRIDE)
         );
     }

@@ -1196,13 +1196,14 @@ struct ServingArgs {
 
     /// Most bytes the router may hold for a request it buffers only to keep
     /// it retryable. The router decides per request: a request it must parse
-    /// (text-routing policy without a routing hint, body-mutating worker,
-    /// WASM request hooks, missing Content-Length, PD/batch backends) always
-    /// buffers, bounded by max-payload-size; an eligible request buffers up
-    /// to this many bytes when router retries are enabled, and otherwise
-    /// streams to the worker verbatim — forfeiting router-level retries,
-    /// with JSON validation deferring to the worker. 0 never buffers for
-    /// retries
+    /// (text-routing policy without a routing hint, body-mutating worker, a
+    /// chat completion to a served model whose provider profile shapes
+    /// requests, WASM request hooks, missing Content-Length, PD/batch
+    /// backends) always buffers, bounded by max-payload-size; an eligible
+    /// request buffers up to this many bytes when router retries are
+    /// enabled, and otherwise streams to the worker verbatim — forfeiting
+    /// router-level retries, with JSON validation deferring to the worker. 0
+    /// never buffers for retries
     #[arg(long, default_value_t = 1_048_576, help_heading = "Request Handling")]
     max_buffered_request_bytes: u64,
 
