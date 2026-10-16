@@ -399,13 +399,19 @@ pub(crate) fn grammar_start_from(start: WorkerGrammarStart) -> GrammarStart {
 }
 
 /// Where the model's `workers` start a grammar, before one is selected: the start every one of
-/// them names in its `constrained_decoding_start` label, a prefill worker left out since it
-/// generates no token a grammar constrains; unknown when none says or they differ, and the tag
-/// takes the prefix that fits either kind of engine.
+/// them names in its `constrained_decoding_start` label, a prefill or encode worker left out
+/// since it generates no token a grammar constrains (the roles that do are allow-listed, so a
+/// role added later is left out until it is named); unknown when none says or they differ, and
+/// the tag takes the prefix that fits either kind of engine.
 pub(crate) fn grammar_start_of(workers: &[Arc<dyn Worker>]) -> GrammarStart {
     let mut starts = workers
         .iter()
-        .filter(|worker| *worker.worker_type() != WorkerType::Prefill)
+        .filter(|worker| {
+            matches!(
+                worker.worker_type(),
+                WorkerType::Regular | WorkerType::Decode
+            )
+        })
         .map(|worker| {
             WorkerGrammarStart::from_label(
                 worker
@@ -1336,6 +1342,23 @@ mod tests {
                 prefill(Some("first_token"))
             ]),
             symphony::GrammarStart::AfterReasoning
+        );
+        // An encode worker (EPD) generates none either: its label does not count.
+        let encode = |start: Option<&str>| -> Arc<dyn Worker> {
+            let mut builder =
+                BasicWorkerBuilder::new("grpc://encode:50051").worker_type(WorkerType::Encode);
+            if let Some(start) = start {
+                builder = builder.label(WorkerGrammarStart::LABEL, start);
+            }
+            Arc::new(builder.build())
+        };
+        assert_eq!(
+            grammar_start_of(&[worker(Some("after_reasoning")), encode(Some("first_token"))]),
+            symphony::GrammarStart::AfterReasoning
+        );
+        assert_eq!(
+            grammar_start_of(&[encode(Some("first_token"))]),
+            symphony::GrammarStart::Unknown
         );
         assert_eq!(
             grammar_start_of(&[worker(Some("after_reasoning")), prefill(None)]),
