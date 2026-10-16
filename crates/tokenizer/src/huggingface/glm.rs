@@ -1,5 +1,9 @@
-//! Checkpoint-specific GLM behavior. Only the GLM-5.3 reminder template
-//! opts out of media processing; serving aliases and vision labels do not.
+//! Checkpoint-specific GLM behavior. A GLM MoE DSA checkpoint (`model_type`
+//! `glm_moe_dsa` with the `GlmMoeDsaForCausalLM` architecture, which the
+//! text-only GLM-5.2 and GLM-5.3 releases carry) opts out of media processing
+//! while its active template renders every media part as the official
+//! `<reminder>` text; serving aliases, vision labels and the vision
+//! checkpoints (`glm5_next`, `glm4v_moe`) do not.
 
 use std::path::Path;
 
@@ -9,7 +13,8 @@ use crate::{
 };
 
 /// Presence identifies the GLM MoE DSA checkpoint family. Media reminders
-/// additionally require the active template's GLM-5.3 rendering semantics.
+/// additionally require the active template to render them: the family's own
+/// templates do, a replacement template may not.
 pub(super) struct Checkpoint;
 
 impl Checkpoint {
@@ -44,23 +49,20 @@ impl Checkpoint {
 /// Compare actual renders with the official text substitution. No template
 /// source matching and no probes on the request path. Reject media anchors,
 /// dropped media, or lost surrounding text, even within the same model family.
+///
+/// The probes carry the part kinds a template is handed: the gateway rewrites
+/// a request's media parts (`image_url`, `video_url`, `audio_url`,
+/// `input_audio`) to the bare `image`, `video` and `audio` kinds before it
+/// renders, so how a template treats the request spellings never decides.
 fn renders_media_reminders(template: &ChatTemplateState) -> bool {
-    for (kind, modality) in [
-        ("image", "image"),
-        ("image_url", "image"),
-        ("video", "video"),
-        ("video_url", "video"),
-        ("audio", "audio"),
-        ("audio_url", "audio"),
-        ("input_audio", "audio"),
-    ] {
+    for modality in ["image", "video", "audio"] {
         let visible_text = format!(
             "before<reminder>You are unable to process this {modality} because you don't have \
              multi-modal input ability. Try different methods.</reminder>after"
         );
         for role in ["user", "tool"] {
             let media = [serde_json::json!({"role": role, "content": [
-                {"type": "text", "text": "before"}, {"type": kind},
+                {"type": "text", "text": "before"}, {"type": modality},
                 {"type": "text", "text": "after"}
             ]})];
             let text = [serde_json::json!({"role": role, "content": [
@@ -111,8 +113,13 @@ mod tests {
                 serde_json::json!({"model_type": "glm_moe_dsa", "architectures": ["GlmMoeDsaForCausalLM"]}),
                 TemplateText,
             ),
+            // The vision checkpoints as the hub publishes them: GLM-5.3-Flash and GLM-4.5V.
             (
-                serde_json::json!({"model_type": "glm53_flash", "architectures": ["Glm53FlashForConditionalGeneration"]}),
+                serde_json::json!({"model_type": "glm5_next", "architectures": ["Glm5NextForConditionalGeneration"], "text_config": {"model_type": "glm5_next_text"}}),
+                Preprocess,
+            ),
+            (
+                serde_json::json!({"model_type": "glm4v_moe", "architectures": ["Glm4vMoeForConditionalGeneration"], "text_config": {"model_type": "glm4v_moe_text"}}),
                 Preprocess,
             ),
             (
@@ -160,5 +167,35 @@ mod tests {
             let nested = CachedTokenizer::new(std::sync::Arc::new(cached), CacheConfig::default());
             assert_eq!(nested.renderer_capabilities().media_handling, expected);
         }
+    }
+
+    /// The probes ask about the bare `image` / `video` / `audio` parts a template
+    /// is handed, not about the request spellings the gateway rewrites.
+    #[test]
+    fn media_policy_follows_the_part_kinds_a_template_is_handed() {
+        use MediaHandling::{Preprocess, TemplateText};
+
+        const KINDS: &str =
+            "['image', 'image_url', 'video', 'video_url', 'audio', 'audio_url', 'input_audio']";
+        assert!(TEMPLATE.contains(KINDS));
+        let mut tokenizer = tokenizer(
+            serde_json::json!({"model_type": "glm_moe_dsa", "architectures": ["GlmMoeDsaForCausalLM"]}),
+        );
+        // A template that renders only the bare kinds renders every request.
+        tokenizer
+            .set_chat_template(TEMPLATE.replace(KINDS, "['image', 'video', 'audio']"))
+            .unwrap();
+        assert_eq!(
+            tokenizer.renderer_capabilities().media_handling,
+            TemplateText
+        );
+        // One that renders only the request spellings is never handed them.
+        tokenizer
+            .set_chat_template(TEMPLATE.replace(
+                KINDS,
+                "['image_url', 'video_url', 'audio_url', 'input_audio']",
+            ))
+            .unwrap();
+        assert_eq!(tokenizer.renderer_capabilities().media_handling, Preprocess);
     }
 }
