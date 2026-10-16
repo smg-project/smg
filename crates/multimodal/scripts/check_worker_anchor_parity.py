@@ -56,6 +56,35 @@ MODELS = {
         # deliberately absent: vLLM targets a three-token block for it.
         "anchors": {"image": ("config_id", "image_token_id")},
     },
+    "llava": {
+        "model_id": "llava-hf/llava-1.5-7b-hf",
+        # Anchor = the literal <image> token (config image_token_index when present).
+        "anchors": {"image": ("literal", "<image>")},
+    },
+    "llava_next": {
+        "model_id": "llava-hf/llava-v1.6-mistral-7b-hf",
+        "anchors": {"image": ("literal", "<image>")},
+    },
+    "qwen3_omni": {
+        "model_id": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        # Anchor = tokenizer token for the thinker config's <modality>_token_id
+        # (config_int reads one level into the sub-configs).
+        "anchors": {
+            "image": ("config_id", "image_token_id"),
+            "video": ("config_id", "video_token_id"),
+            "audio": ("config_id", "audio_token_id"),
+        },
+    },
+    "qwen3_asr": {
+        "model_id": "Qwen/Qwen3-ASR-1.7B",
+        "anchors": {"audio": ("config_id", "audio_token_id")},
+    },
+    "deepseek_v41": {
+        "model_id": "deepseek-ai/DeepSeek-V4.1-Flash",
+        # Anchor = tokenizer token for the config's image_token_id (the
+        # checkpoint's image placeholder).
+        "anchors": {"image": ("config_id", "image_token_id")},
+    },
 }
 
 PREFIX_TEXT = "Describe what you see."

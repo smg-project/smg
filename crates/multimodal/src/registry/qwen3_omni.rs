@@ -58,6 +58,16 @@ impl ModelProcessorSpec for Qwen3OmniSpec {
         "qwen3_omni"
     }
 
+    /// `<|image_pad|>`, `<|video_pad|>` and `<|audio_pad|>` (the thinker
+    /// config's token ids) are the single-token targets the serving engine's
+    /// prompt updates expand, so a worker can expand them itself.
+    fn worker_expandable(&self, modality: Modality) -> bool {
+        matches!(
+            modality,
+            Modality::Image | Modality::Video | Modality::Audio
+        )
+    }
+
     fn matches(&self, metadata: &ModelMetadata) -> bool {
         let model_id = metadata.model_id.to_ascii_lowercase();
         model_id.contains("qwen3-omni")
@@ -288,6 +298,17 @@ mod tests {
                 .unwrap();
             assert_eq!(replacements[0].tokens, vec![expected; 3]);
         }
+    }
+
+    /// Every modality's anchor is the one token the serving engine expands,
+    /// so images, video and audio may all be forwarded to a worker that
+    /// processes media itself.
+    #[test]
+    fn omni_media_can_be_expanded_by_a_worker() {
+        for modality in [Modality::Image, Modality::Video, Modality::Audio] {
+            assert!(Qwen3OmniSpec.worker_expandable(modality), "{modality}");
+        }
+        assert!(!Qwen3OmniSpec.worker_expandable(Modality::ImageEmbeds));
     }
 
     #[test]
