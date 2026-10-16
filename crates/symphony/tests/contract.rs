@@ -30,7 +30,7 @@ use common::{bytes_of, chunkings, delta, prompt};
 use openai_protocol::common::{Function, Tool};
 use serde_json::json as value;
 use symphony::{
-    formats,
+    formats::{self, Table},
     json::PartialJson,
     shape::{
         self, Arguments, Atom, CallShape, Class, Dialect, End, NameSource, Path, Pattern, Slot,
@@ -41,11 +41,14 @@ use symphony::{
     Format, Input, MalformedReason, ParseError, Parser, TokenSpan,
 };
 
-/// A subject under test: how to make its parser, and the outputs it is checked over.
+/// A subject under test: how to make its parser, the outputs it is checked over, and the registry
+/// table it stands for, when it is one ([`every_registry_table_has_a_subject`] keeps every table
+/// of [`Table::ALL`] in the contract).
 struct Subject {
     name: &'static str,
     new: fn() -> Box<dyn Parser>,
     outputs: &'static [&'static str],
+    table: Option<Table>,
 }
 
 fn qwen3() -> Box<dyn Parser> {
@@ -323,6 +326,90 @@ fn forced() -> Box<dyn Parser> {
 
 fn plain() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::plain(), Declared::default()))
+}
+
+/// A tool of bellwether's common set, by name and parameters.
+fn tool(name: &str, parameters: serde_json::Value) -> Tool {
+    Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: name.to_string(),
+            description: None,
+            parameters,
+            strict: None,
+            extra: Default::default(),
+        },
+    }
+}
+
+/// The tools of bellwether's common set, which type the values of the outputs recorded with them
+/// under the tagged, keyed and attributed syntaxes.
+fn recorded_tools() -> Declared {
+    Declared::of(&[
+        tool(
+            "get_weather",
+            value!({"type": "object", "properties": {
+                "city": {"type": "string"},
+                "unit": {"type": "string"},
+            }}),
+        ),
+        tool(
+            "get_stock_price",
+            value!({"type": "object", "properties": {"ticker": {"type": "string"}}}),
+        ),
+        tool(
+            "save_note",
+            value!({"type": "object", "properties": {
+                "title": {"type": "string"},
+                "body": {"type": "string"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "meta": {"type": "object"},
+            }}),
+        ),
+    ])
+}
+
+fn qwen3_tagged_direct() -> Box<dyn Parser> {
+    Box::new(Engine::new(
+        formats::qwen3(CallSyntax::Tagged(Spelling::Json, Placement::Direct)),
+        recorded_tools(),
+    ))
+}
+
+fn deepseek_v4() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::deepseek_v4(), Declared::default()))
+}
+
+fn json() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::json(), Declared::default()))
+}
+
+fn minimax_m2() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::minimax_m2(), recorded_tools()))
+}
+
+fn minicpm5() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::minicpm5(), recorded_tools()))
+}
+
+fn dots3() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::dots3(), recorded_tools()))
+}
+
+fn glm4() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::glm4(), recorded_tools()))
+}
+
+fn k2_horizon() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::k2_horizon(), recorded_tools()))
+}
+
+fn gemma4() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::gemma4(), Declared::default()))
+}
+
+fn inkling() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::inkling(), Declared::default()))
 }
 
 /// `\w` as these outputs need it: the ASCII letters, digits and `_` their names are written in.
@@ -662,161 +749,253 @@ const FORMATS: &[Subject] = &[
         name: "qwen3",
         new: qwen3,
         outputs: QWEN3_OUTPUTS,
+        table: Some(Table::Qwen3),
     },
     Subject {
         name: "qwen3 tagged",
         new: qwen3_tagged,
         outputs: QWEN3_TAGGED_OUTPUTS,
+        table: Some(Table::Qwen3Tagged),
     },
     Subject {
         name: "qwen2.5",
         new: qwen2_5,
         outputs: QWEN3_OUTPUTS,
+        table: Some(Table::Qwen2_5),
     },
     Subject {
         name: "deepseek v4.1",
         new: deepseek_v4_1,
         outputs: DSML_OUTPUTS,
+        table: Some(Table::DeepSeekV4_1),
     },
     Subject {
         name: "seed-oss",
         new: seed_oss,
         outputs: SEED_OUTPUTS,
+        table: Some(Table::SeedOss),
     },
     Subject {
         name: "hy4",
         new: hy4,
         outputs: HY4_OUTPUTS,
+        table: Some(Table::Hy4),
     },
     Subject {
         name: "ling",
         new: ling,
         outputs: LING_OUTPUTS,
+        table: Some(Table::Ling),
     },
     Subject {
         name: "glm",
         new: glm,
         outputs: GLM_OUTPUTS,
+        table: Some(Table::Glm),
     },
     Subject {
         name: "glm, closed at stop",
         new: glm_closed_at_stop,
         outputs: GLM_STOPPED_OUTPUTS,
+        table: None,
     },
     Subject {
         name: "muse messages, framed",
         new: muse_messages,
         outputs: MUSE_OUTPUTS,
+        table: None,
     },
     Subject {
         name: "ernie, started in the thought",
         new: ernie,
         outputs: ERNIE_OUTPUTS,
+        table: None,
     },
     Subject {
         name: "gemma 4 template, trimmed",
         new: gemma4_template,
         outputs: GEMMA4_TEMPLATE_OUTPUTS,
+        table: None,
     },
     Subject {
         name: "inkling template, framed",
         new: inkling_template,
         outputs: INKLING_TEMPLATE_OUTPUTS,
+        table: None,
     },
     Subject {
         name: "iquest",
         new: iquest,
         outputs: IQUEST_OUTPUTS,
+        table: Some(Table::IQuest),
     },
     Subject {
         name: "olmo3",
         new: olmo3,
         outputs: OLMO3_OUTPUTS,
+        table: Some(Table::Olmo3),
     },
     Subject {
         name: "lfm2.5",
         new: lfm2_5,
         outputs: LFM_OUTPUTS,
+        table: Some(Table::Lfm2_5),
     },
     Subject {
         name: "xlam",
         new: xlam,
         outputs: XLAM_OUTPUTS,
+        table: Some(Table::Xlam),
     },
     Subject {
         name: "minimax m3",
         new: minimax_m3,
         outputs: M3_OUTPUTS,
+        table: Some(Table::MinimaxM3),
     },
     Subject {
         name: "kimi k3",
         new: kimi_k3,
         outputs: KIMI_K3_OUTPUTS,
+        table: Some(Table::KimiK3),
     },
     Subject {
         name: "muse spark",
         new: muse_spark,
         outputs: MUSE_SPARK_OUTPUTS,
+        table: Some(Table::MuseSpark),
     },
     Subject {
         name: "plain",
         new: plain,
         outputs: PLAIN_OUTPUTS,
+        table: Some(Table::Plain),
+    },
+    Subject {
+        name: "qwen3 tagged, the value between the tags",
+        new: qwen3_tagged_direct,
+        outputs: QWEN3_TAGGED_DIRECT_OUTPUTS,
+        table: Some(Table::Qwen3TaggedDirect),
+    },
+    Subject {
+        name: "deepseek v4",
+        new: deepseek_v4,
+        outputs: DEEPSEEK_V4_OUTPUTS,
+        table: Some(Table::DeepSeekV4),
+    },
+    Subject {
+        name: "json",
+        new: json,
+        outputs: JSON_OUTPUTS,
+        table: Some(Table::Json),
+    },
+    Subject {
+        name: "minimax m2",
+        new: minimax_m2,
+        outputs: MINIMAX_M2_OUTPUTS,
+        table: Some(Table::MinimaxM2),
+    },
+    Subject {
+        name: "minicpm5",
+        new: minicpm5,
+        outputs: MINICPM5_OUTPUTS,
+        table: Some(Table::MiniCpm5),
+    },
+    Subject {
+        name: "dots3",
+        new: dots3,
+        outputs: DOTS3_OUTPUTS,
+        table: Some(Table::Dots3),
+    },
+    Subject {
+        name: "glm4",
+        new: glm4,
+        outputs: GLM4_OUTPUTS,
+        table: Some(Table::Glm4),
+    },
+    Subject {
+        name: "k2 horizon",
+        new: k2_horizon,
+        outputs: K2_HORIZON_OUTPUTS,
+        table: Some(Table::K2Horizon),
+    },
+    Subject {
+        name: "gemma 4",
+        new: gemma4,
+        outputs: GEMMA4_OUTPUTS,
+        table: Some(Table::Gemma4),
+    },
+    Subject {
+        name: "inkling",
+        new: inkling,
+        outputs: INKLING_OUTPUTS,
+        table: Some(Table::Inkling),
     },
     Subject {
         name: "mistral v13",
         new: mistral_v13,
         outputs: MISTRAL_OUTPUTS,
+        table: Some(Table::MistralV13),
     },
     Subject {
         name: "llama nemotron",
         new: llama_nemotron,
         outputs: LLAMA_NEMOTRON_OUTPUTS,
+        table: Some(Table::LlamaNemotron),
     },
     Subject {
         name: "function gemma",
         new: function_gemma,
         outputs: FUNCTION_GEMMA_OUTPUTS,
+        table: Some(Table::FunctionGemma),
     },
     Subject {
         name: "qwen3, its calls as a shape",
         new: qwen3_shaped,
         outputs: QWEN3_OUTPUTS,
+        table: None,
     },
     Subject {
         name: "gpt-oss test template, its calls as a shape",
         new: gpt_oss_template,
         outputs: GPT_OSS_OUTPUTS,
+        table: None,
     },
     Subject {
         name: "shaped calls on abstract tags",
         new: shaped_tags,
         outputs: SHAPED_TAGS_OUTPUTS,
+        table: None,
     },
     Subject {
         name: "qwen 3.5 serve template, its calls as a shape",
         new: qwen3_5_serve_shaped,
         outputs: QWEN3_5_SERVE_OUTPUTS,
+        table: None,
     },
     Subject {
         name: "qwen 3.5 serve template, its calls as a shape, closed at stop",
         new: qwen3_5_serve_closed_at_stop,
         outputs: QWEN3_5_SERVE_OUTPUTS,
+        table: None,
     },
     Subject {
         name: "muse glimmer template, its calls as a shape",
         new: muse_shaped,
         outputs: MUSE_CALLS_OUTPUTS,
+        table: None,
     },
     Subject {
         name: "parameters on abstract tags",
         new: params_tags,
         outputs: PARAMS_TAGS_OUTPUTS,
+        table: None,
     },
     Subject {
         name: "forced",
         new: forced,
         outputs: FORCED_OUTPUTS,
+        table: None,
     },
 ];
 
@@ -1402,6 +1581,119 @@ const QWEN3_OUTPUTS: &[&str] = &[
     "<tool_call>{\"name\": \"f\", \"arguments\": {}}x y</tool_call>",
 ];
 
+/// The outputs bellwether's common set records for MiMo-V2.5 (Qwen 3.5's tags, the value between
+/// them), and one cut short.
+const QWEN3_TAGGED_DIRECT_OUTPUTS: &[&str] = &[
+    "<think>The user asks about Paris.</think><tool_call>\n<function=get_weather>\n<parameter=city>Paris</parameter>\n</function>\n</tool_call>",
+    "Let me check.<tool_call>\n<function=get_weather>\n<parameter=city>Paris</parameter>\n<parameter=unit>celsius</parameter>\n</function>\n</tool_call>",
+    "<tool_call>\n<function=get_weather>\n<parameter=city>Paris</parameter>\n</function>\n</tool_call><tool_call>\n<function=get_stock_price>\n<parameter=ticker>AAPL</parameter>\n</function>\n</tool_call>",
+    "<tool_call>\n<function=save_note>\n<parameter=title>Plan</parameter>\n<parameter=body>Line one\nLine two with \"quotes\" and a backslash \\</parameter>\n<parameter=tags>[\"a\", \"b\"]</parameter>\n<parameter=meta>{\"nested\": {\"deep\": [1, 2.5, true, null]}}</parameter>\n</function>\n</tool_call>",
+    "<tool_call>\n<function=get_stock_price>\n</function>\n</tool_call>",
+    "<think>97 is not divisible by 2, 3, 5 or 7.</think>Yes, 97 is prime.",
+    "Hello!",
+    "<tool_call>\n<function=get_weather>\n<parameter=city>Par",
+];
+
+/// DeepSeek V4's DSML as its reference encoder renders it (the thought the prompt opens written
+/// here, since the replay starts from an empty prompt), and one cut short.
+const DEEPSEEK_V4_OUTPUTS: &[&str] = &[
+    "<think>The user asks.</think>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Beijing</｜DSML｜parameter>\n<｜DSML｜parameter name=\"unit\" string=\"true\">celsius</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+    "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"add_integers\">\n<｜DSML｜parameter name=\"a\" string=\"false\">17</｜DSML｜parameter>\n<｜DSML｜parameter name=\"b\" string=\"false\">25</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+    "Sure.\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Rome</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+    "<think>still thinking",
+    "Hello!",
+    "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Par",
+];
+
+/// Llama 3.1's bare call object, a list of them, content, and one cut short.
+const JSON_OUTPUTS: &[&str] = &[
+    "{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}",
+    "[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}, {\"name\": \"get_stock_price\", \"arguments\": {\"ticker\": \"AAPL\"}}]",
+    "{\"name\": \"save_note\", \"parameters\": {\"title\": \"計画 🌍\", \"body\": \"a \\\"q\\\" \\\\ b\\nc\"}}",
+    "Hello!",
+    "",
+    "{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Par",
+    "{\"name\": \"f\", \"arguments\": {}} and then some",
+];
+
+/// The outputs bellwether's common set records for MiniMax M2 (the thought the prompt opens
+/// written here), and one cut short.
+const MINIMAX_M2_OUTPUTS: &[&str] = &[
+    "<think>\nThe user asks about Paris.\n</think>\n\n\n<minimax:tool_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">Paris</parameter>\n</invoke>\n</minimax:tool_call>",
+    "<think>\n97 is not divisible by 2, 3, 5 or 7.\n</think>\n\nYes, 97 is prime.",
+    "<think>\nplan\n</think>\n\n<minimax:tool_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">Paris</parameter>\n<parameter name=\"unit\">celsius</parameter>\n</invoke>\n<invoke name=\"get_stock_price\">\n<parameter name=\"ticker\">AAPL</parameter>\n</invoke>\n</minimax:tool_call>",
+    "<think>\nplan\n</think>\n\n<minimax:tool_call>\n<invoke name=\"save_note\">\n<parameter name=\"title\">Plan</parameter>\n<parameter name=\"body\">Line one\nLine two with \"quotes\" and a backslash \\</parameter>\n<parameter name=\"tags\">[\"a\", \"b\"]</parameter>\n<parameter name=\"meta\">{\"nested\": {\"deep\": [1, 2.5, true, null]}}</parameter>\n</invoke>\n</minimax:tool_call>",
+    "<think>\n</think>\n<minimax:tool_call>\n<invoke name=\"get_stock_price\">\n</invoke>\n</minimax:tool_call>",
+    "<think>\nplan\n</think>\n<minimax:tool_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">Par",
+];
+
+/// The outputs bellwether's common set records for MiniCPM5, and one cut short.
+const MINICPM5_OUTPUTS: &[&str] = &[
+    "<think>\nThe user asks about Paris.\n</think>\n\n<function name=\"get_weather\"><param name=\"city\">Paris</param></function>",
+    "Let me check.\n<function name=\"get_weather\"><param name=\"city\">Paris</param><param name=\"unit\">celsius</param></function>",
+    "<function name=\"get_weather\"><param name=\"city\">Paris</param></function>\n<function name=\"get_stock_price\"><param name=\"ticker\">AAPL</param></function>",
+    "<function name=\"save_note\"><param name=\"title\">Plan</param><param name=\"body\"><![CDATA[Line one\nLine two with \"quotes\" and a backslash \\]]></param><param name=\"tags\">['a', 'b']</param><param name=\"meta\">{'nested': {'deep': [1, 2.5, True, None]}}</param></function>",
+    "<function name=\"get_stock_price\"></function>",
+    "<think>\n97 is not divisible by 2, 3, 5 or 7.\n</think>\n\nYes, 97 is prime.",
+    "<function name=\"save_note\"><param name=\"body\"><![CDATA[Line one\nLine two",
+];
+
+/// The outputs bellwether's common set records for dots3, and one cut short.
+const DOTS3_OUTPUTS: &[&str] = &[
+    "<think>\nThe user asks about Paris.\n</think>\n\n\n<dots_function_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">\nParis\n</parameter>\n</invoke>\n</dots_function_call>",
+    "Let me check.\n<dots_function_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">\nParis\n</parameter>\n<parameter name=\"unit\">\ncelsius\n</parameter>\n</invoke>\n</dots_function_call>",
+    "\n<dots_function_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">\nParis\n</parameter>\n</invoke>\n</dots_function_call>\n<dots_function_call>\n<invoke name=\"get_stock_price\">\n<parameter name=\"ticker\">\nAAPL\n</parameter>\n</invoke>\n</dots_function_call>",
+    "\n<dots_function_call>\n<invoke name=\"save_note\">\n<parameter name=\"title\">\nPlan\n</parameter>\n<parameter name=\"body\">\nLine one\nLine two with \"quotes\" and a backslash \\\n</parameter>\n<parameter name=\"tags\">\n[\"a\", \"b\"]\n</parameter>\n<parameter name=\"meta\">\n{\"nested\": {\"deep\": [1, 2.5, true, null]}}\n</parameter>\n</invoke>\n</dots_function_call>",
+    "\n<dots_function_call>\n<invoke name=\"get_stock_price\">\n</invoke>\n</dots_function_call>",
+    "<think>\n97 is not divisible by 2, 3, 5 or 7.\n</think>\n\nYes, 97 is prime.",
+    "<dots_function_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">\nPar",
+];
+
+/// The outputs bellwether's common set records for GLM 4.6, and one cut short.
+const GLM4_OUTPUTS: &[&str] = &[
+    "\n<think>The user asks about Paris.</think>\n<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\n</tool_call>",
+    "\nLet me check.\n<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\n<arg_key>unit</arg_key>\n<arg_value>celsius</arg_value>\n</tool_call>",
+    "\n<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\n</tool_call>\n<tool_call>get_stock_price\n<arg_key>ticker</arg_key>\n<arg_value>AAPL</arg_value>\n</tool_call>",
+    "\n<tool_call>save_note\n<arg_key>title</arg_key>\n<arg_value>Plan</arg_value>\n<arg_key>body</arg_key>\n<arg_value>Line one\nLine two with \"quotes\" and a backslash \\</arg_value>\n<arg_key>tags</arg_key>\n<arg_value>[\"a\", \"b\"]</arg_value>\n<arg_key>meta</arg_key>\n<arg_value>{\"nested\": {\"deep\": [1, 2.5, true, null]}}</arg_value>\n</tool_call>",
+    "\n<tool_call>get_stock_price\n</tool_call>",
+    "\nHello!",
+    "\n<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Par",
+];
+
+/// The outputs bellwether's common set records for K2-Horizon (the thought the prompt opens
+/// written here), and one cut short.
+const K2_HORIZON_OUTPUTS: &[&str] = &[
+    "<ifm|think>The user asks about Paris.</ifm|think><ifm|tool_calls>\n<ifm|tool_call>get_weather\n<ifm|arg_key>city</ifm|arg_key>\n<ifm|arg_value>Paris</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>",
+    "<ifm|think>97 is not divisible by 2, 3, 5 or 7.</ifm|think>Yes, 97 is prime.",
+    "<ifm|think>plan</ifm|think><ifm|tool_calls>\n<ifm|tool_call>get_weather\n<ifm|arg_key>city</ifm|arg_key>\n<ifm|arg_value>Paris</ifm|arg_value>\n<ifm|arg_key>unit</ifm|arg_key>\n<ifm|arg_value>celsius</ifm|arg_value>\n</ifm|tool_call>\n<ifm|tool_call>get_stock_price\n<ifm|arg_key>ticker</ifm|arg_key>\n<ifm|arg_value>AAPL</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>",
+    "<ifm|think>plan</ifm|think><ifm|tool_calls>\n<ifm|tool_call>save_note\n<ifm|arg_key>title</ifm|arg_key>\n<ifm|arg_value>Plan</ifm|arg_value>\n<ifm|arg_key>tags</ifm|arg_key>\n<ifm|arg_value>[\"a\", \"b\"]</ifm|arg_value>\n<ifm|arg_key>meta</ifm|arg_key>\n<ifm|arg_value>{\"nested\": {\"deep\": [1, 2.5, true, null]}}</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>",
+    "<ifm|think>still thinking",
+    "<ifm|think>plan</ifm|think><ifm|tool_calls>\n<ifm|tool_call>get_weather\n<ifm|arg_key>city</ifm|arg_key>\n<ifm|arg_value>Par",
+];
+
+/// The outputs bellwether's common set records for Gemma 4, and one cut short.
+const GEMMA4_OUTPUTS: &[&str] = &[
+    "<|channel>thought\nThe user asks about Paris.\n<channel|><|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>",
+    "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,unit:<|\"|>celsius<|\"|>}<tool_call|>Let me check.",
+    "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|><|tool_call>call:get_stock_price{ticker:<|\"|>AAPL<|\"|>}<tool_call|>",
+    "<|tool_call>call:save_note{body:<|\"|>Line one\nLine two with \"quotes\" and a backslash \\<|\"|>,meta:{nested:{deep:[1,2.5,true,null]}},tags:[<|\"|>a<|\"|>,<|\"|>b<|\"|>],title:<|\"|>Plan<|\"|>}<tool_call|>",
+    "<|tool_call>call:get_stock_price{}<tool_call|>",
+    "<|channel>thought\n97 is not divisible by 2, 3, 5 or 7.\n<channel|>Yes, 97 is prime.",
+    "Hello!",
+    "<|tool_call>call:get_weather{city:<|\"|>Par",
+];
+
+/// The outputs bellwether's common set records for Inkling, and one cut short.
+const INKLING_OUTPUTS: &[&str] = &[
+    "<|content_thinking|>The user asks about Paris.<|end_message|><|message_model|><|content_text|><|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|>",
+    "<|content_text|>Let me check.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"unit\":\"celsius\"}}<|end_message|>",
+    "<|content_text|><|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|><|message_model|>get_stock_price<|content_invoke_tool_json|>{\"name\":\"get_stock_price\",\"args\":{\"ticker\":\"AAPL\"}}<|end_message|>",
+    "<|content_text|><|end_message|><|message_model|>save_note<|content_invoke_tool_json|>{\"name\":\"save_note\",\"args\":{\"body\":\"Line one\\nLine two with \\\"quotes\\\" and a backslash \\\\\",\"meta\":{\"nested\":{\"deep\":[1,2.5,true,null]}},\"tags\":[\"a\",\"b\"],\"title\":\"Plan\"}}<|end_message|>",
+    "<|content_text|>Hello!<|end_message|>",
+    "<|content_thinking|>97 is not divisible by 2, 3, 5 or 7.<|end_message|><|message_model|><|content_text|>Yes, 97 is prime.<|end_message|>",
+    "<|content_text|><|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"ci",
+];
+
 /// Every subject with each of its outputs.
 fn corpus() -> impl Iterator<Item = (&'static Subject, &'static str)> {
     FORMATS
@@ -1575,6 +1867,19 @@ fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event]) {
     assert!(finished, "{place}: no Finish");
     assert!(!reasoning_open, "{place}: reasoning left open");
     assert_eq!(started.len(), ended.len(), "{place}: a call without an end");
+}
+
+/// Every table of the registry is a subject here, so that a new table joins the contract with its
+/// outputs before it reads a model's.
+#[test]
+fn every_registry_table_has_a_subject() {
+    for table in Table::ALL {
+        assert!(
+            FORMATS.iter().any(|subject| subject.table == Some(table)),
+            "{} has no subject in FORMATS",
+            table.name()
+        );
+    }
 }
 
 #[test]
