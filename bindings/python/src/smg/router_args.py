@@ -341,11 +341,11 @@ class RouterArgs:
     consul_address: str | None = None
     consul_datacenter: str | None = None
     consul_service: str | None = None
-    # API keys for control plane auth (list of tuples: id, name, key, role)
     # Cut a grammar-constrained streamed generation that produces no token for this many
     # seconds after its first one: aborted on the engine, its slot freed, the client answered a
     # constrained_no_progress error; 0 disables
     constrained_no_progress_secs: int = 0
+    # API keys for control plane auth (list of tuples: id, name, key, role)
     control_plane_api_keys: list[tuple] = dataclasses.field(default_factory=list)
     control_plane_audit_enabled: bool = False
     cors_allowed_origins: list[str] = dataclasses.field(default_factory=list)
