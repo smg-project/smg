@@ -71,7 +71,7 @@ use crate::{
         spec::scans_for_tool_calls,
         utils::{Names, WorkerDecoding},
     },
-    worker::Worker,
+    worker::{Worker, WorkerType},
 };
 
 /// The request header that names the parser for one request, `legacy` or `symphony`, over the
@@ -399,19 +399,23 @@ pub(crate) fn grammar_start_from(start: WorkerGrammarStart) -> GrammarStart {
 }
 
 /// Where the model's `workers` start a grammar, before one is selected: the start every one of
-/// them names in its `constrained_decoding_start` label; unknown when none says or they differ,
-/// and the tag takes the prefix that fits either kind of engine.
+/// them names in its `constrained_decoding_start` label, a prefill worker left out since it
+/// generates no token a grammar constrains; unknown when none says or they differ, and the tag
+/// takes the prefix that fits either kind of engine.
 pub(crate) fn grammar_start_of(workers: &[Arc<dyn Worker>]) -> GrammarStart {
-    let mut starts = workers.iter().map(|worker| {
-        WorkerGrammarStart::from_label(
-            worker
-                .metadata()
-                .spec
-                .labels
-                .get(WorkerGrammarStart::LABEL)
-                .map(String::as_str),
-        )
-    });
+    let mut starts = workers
+        .iter()
+        .filter(|worker| *worker.worker_type() != WorkerType::Prefill)
+        .map(|worker| {
+            WorkerGrammarStart::from_label(
+                worker
+                    .metadata()
+                    .spec
+                    .labels
+                    .get(WorkerGrammarStart::LABEL)
+                    .map(String::as_str),
+            )
+        });
     let Some(first) = starts.next() else {
         return GrammarStart::Unknown;
     };
@@ -1315,6 +1319,30 @@ mod tests {
         );
         assert_eq!(
             grammar_start_of(&[worker(Some("after_reasoning")), worker(None)]),
+            symphony::GrammarStart::Unknown
+        );
+        // A prefill worker generates no token a grammar constrains: its label does not count.
+        let prefill = |start: Option<&str>| -> Arc<dyn Worker> {
+            let mut builder =
+                BasicWorkerBuilder::new("grpc://prefill:50051").worker_type(WorkerType::Prefill);
+            if let Some(start) = start {
+                builder = builder.label(WorkerGrammarStart::LABEL, start);
+            }
+            Arc::new(builder.build())
+        };
+        assert_eq!(
+            grammar_start_of(&[
+                worker(Some("after_reasoning")),
+                prefill(Some("first_token"))
+            ]),
+            symphony::GrammarStart::AfterReasoning
+        );
+        assert_eq!(
+            grammar_start_of(&[worker(Some("after_reasoning")), prefill(None)]),
+            symphony::GrammarStart::AfterReasoning
+        );
+        assert_eq!(
+            grammar_start_of(&[prefill(Some("first_token"))]),
             symphony::GrammarStart::Unknown
         );
         assert_eq!(
@@ -2524,7 +2552,8 @@ mod tests {
                 &tools(),
                 false,
                 symphony::GrammarStart::Unknown,
-                &templates(),)
+                &templates(),
+            )
             .expect("read")
             .is_none(),
             "the Qwen3 table's answer tag is the schema alone, the engine's own constraint, so the \

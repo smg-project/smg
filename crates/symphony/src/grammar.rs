@@ -773,9 +773,14 @@ impl Format {
         // The thought's close and what the layout writes after a thought, then the rows into the
         // answer, what the layout writes before an answer standing right before the last of them,
         // the terminal that opens it. An engine that starts the grammar after its reasoning
-        // parser has seen the close has consumed it: the tag starts with what follows, else the
-        // model would be made to write the close again, spelled into its answer.
-        let consumed = reasoning_open && start == GrammarStart::AfterReasoning;
+        // parser has seen the close has consumed it, and so has the closed thought that leads the
+        // tag for an engine starting at the first token ([`Self::led`]): the tag starts with what
+        // follows, else the model would be made to write the close again, spelled into its answer.
+        let consumed = reasoning_open
+            && matches!(
+                start,
+                GrammarStart::AfterReasoning | GrammarStart::FirstToken
+            );
         let mut begin = match way.close {
             Some(close) if !consumed => close.to_string(),
             _ => String::new(),
@@ -814,7 +819,10 @@ impl Format {
 
     /// `body` after what the model writes before it. With the prompt's thought open, the prefix
     /// for a tag that takes one (`prefixed`, [`Self::after_the_thought`]), and nothing for a tag
-    /// whose ways in close the thought themselves. With the thought not open, the thought itself
+    /// whose ways in close the thought themselves, when the engine does not say where it starts
+    /// the grammar; nothing either way for one that starts after its reasoning parser, and the
+    /// thought closed by its own marker either way for one that starts at the first token
+    /// ([`Self::after_the_closed_thought`]). With the thought not open, the thought itself
     /// where the table writes one before every call and answer ([`Format::thinks_first`]): the
     /// thought's opener, its text, which writes none of the table's terminals nor the call
     /// syntax's inner tags, and its close; `None` when the thought does not open from the turn's
@@ -831,12 +839,16 @@ impl Format {
     ) -> Option<Grammar> {
         if reasoning_open {
             return match start {
-                _ if !prefixed => Some(body),
                 // The engine starts the grammar where the thought's close left it: nothing of
                 // the thought precedes `body`, as nothing precedes it at the engine's own server.
                 GrammarStart::AfterReasoning => Some(body),
+                // The engine runs the grammar from the first token, the model inside its thought:
+                // the thought, closed by its own marker, comes first whether or not the tag takes
+                // a prefix, else the engine would force the tag's first text (a way in restating
+                // the close, or the body itself) before the model has thought.
                 GrammarStart::FirstToken => self.after_the_closed_thought(body),
-                GrammarStart::Unknown => self.after_the_thought(body),
+                GrammarStart::Unknown if prefixed => self.after_the_thought(body),
+                GrammarStart::Unknown => Some(body),
             };
         }
         if !self.writes_thought_first() {
@@ -3161,6 +3173,47 @@ mod tests {
         assert_eq!(gated_begin, &begin[close.len()..]);
         assert_eq!(gated["format"]["content"], unknown["format"]["content"]);
         assert_eq!(gated["format"]["end"], unknown["format"]["end"]);
+        // From the first token the engine runs the grammar with the model inside its thought:
+        // the thought, closed by its own marker, comes first, and the answer's tag follows as it
+        // does after the gate, the close consumed, so the model thinks before it answers and is
+        // not made to spell the close.
+        let first = kimi
+            .answer_grammar_for(&answer_schema(), true, GrammarStart::FirstToken)
+            .expect("an answer")
+            .payload();
+        assert_eq!(first["format"]["type"], "sequence", "{first}");
+        assert_eq!(first["format"]["elements"][0]["type"], "tag");
+        assert_eq!(first["format"]["elements"][0]["begin"], "");
+        assert_eq!(first["format"]["elements"][0]["end"], close);
+        assert_eq!(first["format"]["elements"][1], gated["format"]);
+        // The forced calls the same way: Kimi K3's block has its own ways in, so the tag takes no
+        // prefix when the engine does not say or starts after the gate, and the closed thought
+        // still leads it from the first token.
+        let calls_for = |start| {
+            kimi.grammar_for(
+                &tools,
+                Options {
+                    at_least_one: true,
+                    reasoning_open: true,
+                    one_call: false,
+                    start,
+                },
+            )
+            .expect("a tag")
+            .payload()
+        };
+        let unknown_calls = calls_for(GrammarStart::Unknown);
+        assert_eq!(calls_for(GrammarStart::AfterReasoning), unknown_calls);
+        let first_calls = calls_for(GrammarStart::FirstToken);
+        assert_eq!(first_calls["format"]["type"], "sequence", "{first_calls}");
+        assert_eq!(
+            first_calls["format"]["elements"][0],
+            first["format"]["elements"][0]
+        );
+        assert_eq!(
+            first_calls["format"]["elements"][1],
+            unknown_calls["format"]
+        );
         // A table whose turn closes the thought itself takes no prefix, whatever the start.
         let closed = formats::minimax_m3();
         assert!(!closed.reasoning_open("]~b]ai\n"));
