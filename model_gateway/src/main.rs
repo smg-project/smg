@@ -321,8 +321,30 @@ fn parse_job_queue_concurrency(value: &str) -> Result<usize, String> {
 // --sticky-sessions (--routing-key-override) and --worker-auto-recovery
 // (--remove-unhealthy-workers); the hidden ones: --model (--model-path),
 // --runtime (--backend), and `start` for the `launch` subcommand.
+// Keep clap's generated construction functions on sibling stack frames. In
+// debug builds, deriving all flags together exceeds a 2 MiB thread stack.
+// Add flags to their responsibility's group so construction stays bounded;
+// flatten and declaration order preserve the existing CLI and help layout.
 #[derive(Parser, Debug)]
+#[group(skip)]
 struct CliArgs {
+    #[command(flatten)]
+    routing: RoutingArgs,
+    #[command(flatten)]
+    workers: WorkerArgs,
+    #[command(flatten)]
+    discovery: DiscoveryArgs,
+    #[command(flatten)]
+    serving: ServingArgs,
+    #[command(flatten)]
+    model: ModelArgs,
+    #[command(flatten)]
+    integrations: IntegrationArgs,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(skip)]
+struct RoutingArgs {
     // ==================== Worker Configuration ====================
     /// Host address to bind the router server: an IP literal, IPv6 with or
     /// without brackets (`0.0.0.0`, `::`, `[::]`, `[fd00::1]`)
@@ -689,7 +711,11 @@ struct CliArgs {
     /// refused.
     #[arg(long, value_parser = parse_kv_index, help_heading = "Routing Policy")]
     kv_index: Option<String>,
+}
 
+#[derive(clap::Args, Debug)]
+#[group(skip)]
+struct WorkerArgs {
     // ==================== RL Control Plane ====================
     /// Mount the RL control plane under /v1/rl (worker discovery,
     /// engine-route passthrough, fan-out). Off by default; when off, no RL
@@ -907,7 +933,11 @@ struct CliArgs {
     /// `SMG_LOG_MM_TIMING`.
     #[arg(long, action = ArgAction::SetTrue, help_heading = "Multimodal")]
     log_mm_timing: bool,
+}
 
+#[derive(clap::Args, Debug)]
+#[group(skip)]
+struct DiscoveryArgs {
     // ==================== Service Discovery (Kubernetes) ====================
     /// Enable Kubernetes service discovery (the legacy spelling of
     /// `--discovery-provider kubernetes`)
@@ -1002,7 +1032,11 @@ struct CliArgs {
     /// which is also reread as soon as it changes (default: 30)
     #[arg(long, help_heading = "Service Discovery (File)")]
     discovery_check_interval_secs: Option<u64>,
+}
 
+#[derive(clap::Args, Debug)]
+#[group(skip)]
+struct ServingArgs {
     // ==================== Logging ====================
     /// Directory for the log files, created at start-up when missing (under
     /// a writable directory); an existing path must be a writable directory
@@ -1311,7 +1345,11 @@ struct CliArgs {
     /// remove immediately without draining.
     #[arg(long, default_value_t = 5, help_heading = "Health Checks")]
     drain_settle_secs: u64,
+}
 
+#[derive(clap::Args, Debug)]
+#[group(skip)]
+struct ModelArgs {
     // ==================== Tokenizer ====================
     /// Model path for loading tokenizer (HuggingFace ID, fetched lazily, or a
     /// local path: one that exists must hold a tokenizer layout; one that
@@ -1427,7 +1465,11 @@ struct CliArgs {
     /// Path to a YAML schema config file for storage table/column remapping; `auto_migrate: true` in it applies pending schema migrations at start-up (the environment variable DB_AUTO_MIGRATE=true does the same without a file)
     #[arg(long, help_heading = "Backend")]
     schema_config: Option<String>,
+}
 
+#[derive(clap::Args, Debug)]
+#[group(skip)]
+struct IntegrationArgs {
     // ==================== Oracle Database ====================
     /// Path to Oracle ATP wallet directory
     #[arg(long, env = "ATP_WALLET_PATH", help_heading = "Oracle Database")]
@@ -2060,42 +2102,42 @@ impl CliArgs {
     fn resolve_secret_sources(&mut self, env: EnvLookup<'_>) -> ConfigResult<()> {
         let mut sources = SecretSources::default();
         if let Some((value, source)) = API_KEY_SETTING.resolve_value(
-            self.api_key.as_deref(),
-            self.api_key_file.as_deref(),
+            self.integrations.api_key.as_deref(),
+            self.integrations.api_key_file.as_deref(),
             env,
         )? {
-            self.api_key = Some(value);
+            self.integrations.api_key = Some(value);
             sources.api_key = Some(source);
         }
         if let Some((entries, source)) = TENANT_API_KEYS_SETTING.resolve_entries(
-            &self.tenant_api_keys,
-            self.tenant_api_keys_file.as_deref(),
+            &self.integrations.tenant_api_keys,
+            self.integrations.tenant_api_keys_file.as_deref(),
             env,
         )? {
             sources.tenant_api_keys = Some((source, entries.len()));
-            self.tenant_api_keys = entries;
+            self.integrations.tenant_api_keys = entries;
         }
-        if self.history_backend == "postgres" {
+        if self.model.history_backend == "postgres" {
             if let Some((value, source)) = POSTGRES_DB_URL_SETTING.resolve_value(
-                self.postgres_db_url.as_deref(),
-                self.postgres_db_url_file.as_deref(),
+                self.integrations.postgres_db_url.as_deref(),
+                self.integrations.postgres_db_url_file.as_deref(),
                 env,
             )? {
-                self.postgres_db_url = Some(value);
+                self.integrations.postgres_db_url = Some(value);
                 sources.postgres_db_url = Some(source);
             }
         }
-        if self.history_backend == "redis" {
+        if self.model.history_backend == "redis" {
             if let Some((value, source)) = REDIS_URL_SETTING.resolve_value(
-                self.redis_url.as_deref(),
-                self.redis_url_file.as_deref(),
+                self.integrations.redis_url.as_deref(),
+                self.integrations.redis_url_file.as_deref(),
                 env,
             )? {
-                self.redis_url = Some(value);
+                self.integrations.redis_url = Some(value);
                 sources.redis_url = Some(source);
             }
         }
-        self.secret_sources = sources;
+        self.integrations.secret_sources = sources;
         Ok(())
     }
 }
@@ -2107,19 +2149,25 @@ impl CliArgs {
     /// is an error: silently dropping it would start the control plane open.
     fn build_control_plane_auth_config(&self) -> ConfigResult<ControlPlaneAuthConfig> {
         // Build JWT config if issuer and audience are provided
-        let jwt = match (&self.jwt_issuer, &self.jwt_audience) {
+        let jwt = match (
+            &self.integrations.jwt_issuer,
+            &self.integrations.jwt_audience,
+        ) {
             (Some(issuer), Some(audience)) => {
                 // One malformed mapping refuses the start: dropped, it could widen access
                 let role_mapping = self
+                    .integrations
                     .jwt_role_mapping
                     .iter()
                     .map(|m| parse_role_mapping(m))
                     .collect::<ConfigResult<HashMap<String, Role>>>()?;
 
                 let mut jwt_config = JwtConfig::new(issuer.clone(), audience.clone());
-                jwt_config.role_claim.clone_from(&self.jwt_role_claim);
+                jwt_config
+                    .role_claim
+                    .clone_from(&self.integrations.jwt_role_claim);
                 jwt_config.role_mapping = role_mapping;
-                if let Some(jwks_uri) = &self.jwt_jwks_uri {
+                if let Some(jwks_uri) = &self.integrations.jwt_jwks_uri {
                     jwt_config.jwks_uri = Some(jwks_uri.clone());
                 }
                 Some(jwt_config)
@@ -2139,6 +2187,7 @@ impl CliArgs {
 
         // Build API keys from CLI args; one malformed entry refuses the start
         let api_keys = self
+            .integrations
             .control_plane_api_keys
             .iter()
             .map(|k| parse_control_plane_api_key(k))
@@ -2147,7 +2196,7 @@ impl CliArgs {
         Ok(ControlPlaneAuthConfig {
             jwt,
             api_keys,
-            audit_enabled: !self.disable_audit_logging,
+            audit_enabled: !self.integrations.disable_audit_logging,
         })
     }
 
@@ -2166,18 +2215,18 @@ impl CliArgs {
     /// The worker discovery provider selected by either spelling:
     /// `--service-discovery` is `--discovery-provider kubernetes`.
     fn selected_discovery_provider(&self) -> Option<DiscoveryProvider> {
-        if self.service_discovery {
+        if self.discovery.service_discovery {
             Some(DiscoveryProvider::Kubernetes)
         } else {
-            self.discovery_provider
+            self.discovery.discovery_provider
         }
     }
 
     /// Selecting a discovery provider, by either spelling, turns IGW mode on.
     /// Returns whether this call turned it on.
     fn enable_igw_for_discovery(&mut self) -> bool {
-        let enable = self.selected_discovery_provider().is_some() && !self.enable_igw;
-        self.enable_igw |= enable;
+        let enable = self.selected_discovery_provider().is_some() && !self.routing.enable_igw;
+        self.routing.enable_igw |= enable;
         enable
     }
 
@@ -2196,9 +2245,10 @@ impl CliArgs {
     /// The metrics bind host: `--prometheus-host`, or the unspecified address
     /// of `--host`'s family when it is not given.
     fn metrics_host(&self) -> String {
-        self.prometheus_host
+        self.serving
+            .prometheus_host
             .clone()
-            .unwrap_or_else(|| MetricsConfig::default_host_for(&self.host))
+            .unwrap_or_else(|| MetricsConfig::default_host_for(&self.routing.host))
     }
 
     fn parse_mesh_socket_addr(
@@ -2213,12 +2263,13 @@ impl CliArgs {
         })
     }
 
+    /// Build mesh settings from the integration flags, validating addresses and TLS pairs.
     fn build_mesh_server_config(&self) -> ConfigResult<Option<MeshServerConfig>> {
-        if !self.enable_mesh {
+        if !self.integrations.enable_mesh {
             return Ok(None);
         }
 
-        let self_name = if let Some(name) = &self.mesh_server_name {
+        let self_name = if let Some(name) = &self.integrations.mesh_server_name {
             validate_mesh_server_name(name)?;
             name.to_string()
         } else {
@@ -2228,6 +2279,7 @@ impl CliArgs {
         };
 
         let peer = self
+            .integrations
             .mesh_peer_urls
             .first()
             .map(|url| {
@@ -2245,10 +2297,10 @@ impl CliArgs {
         // bind. It would also reach router discovery as the fallback mesh port
         // for Pods whose annotation is missing or invalid, publishing `IP:0`
         // peers into the cluster state.
-        if self.mesh_port == 0 {
+        if self.integrations.mesh_port == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "mesh_port".to_string(),
-                value: self.mesh_port.to_string(),
+                value: self.integrations.mesh_port.to_string(),
                 reason: "mesh port cannot be 0; peers dial the advertised port, \
                          so it must be a fixed, routable one"
                     .to_string(),
@@ -2257,15 +2309,22 @@ impl CliArgs {
 
         // The mesh port against the other listeners' is checked in
         // `server::startup`, for every way the server configuration is built.
-        let bind_addr = Self::parse_mesh_socket_addr(&self.mesh_host, self.mesh_port, "mesh_host")?;
+        let bind_addr = Self::parse_mesh_socket_addr(
+            &self.integrations.mesh_host,
+            self.integrations.mesh_port,
+            "mesh_host",
+        )?;
         let (advertise_host, advertise_field) =
-            if let Some(host) = self.mesh_advertise_host.as_deref() {
+            if let Some(host) = self.integrations.mesh_advertise_host.as_deref() {
                 (host, "mesh_advertise_host")
             } else {
-                (self.mesh_host.as_str(), "mesh_host")
+                (self.integrations.mesh_host.as_str(), "mesh_host")
             };
-        let advertise_addr =
-            Self::parse_mesh_socket_addr(advertise_host, self.mesh_port, advertise_field)?;
+        let advertise_addr = Self::parse_mesh_socket_addr(
+            advertise_host,
+            self.integrations.mesh_port,
+            advertise_field,
+        )?;
 
         if advertise_addr.ip().is_unspecified() {
             return Err(ConfigError::InvalidValue {
@@ -2290,9 +2349,9 @@ impl CliArgs {
     /// each file has to be readable at start-up, not at the first dial.
     fn mesh_mtls_config(&self) -> ConfigResult<Option<MTLSConfig>> {
         let (Some(ca), Some(cert), Some(key)) = (
-            &self.mesh_tls_ca_cert,
-            &self.mesh_tls_cert,
-            &self.mesh_tls_key,
+            &self.integrations.mesh_tls_ca_cert,
+            &self.integrations.mesh_tls_cert,
+            &self.integrations.mesh_tls_key,
         ) else {
             return Ok(None);
         };
@@ -2315,57 +2374,58 @@ impl CliArgs {
         }))
     }
 
+    /// Build a routing policy with the same per-policy defaults as the CLI flags.
     fn parse_policy(&self, policy_str: &str) -> PolicyConfig {
         match policy_str {
             "random" => PolicyConfig::Random,
             "round_robin" => PolicyConfig::RoundRobin,
             "passthrough" => PolicyConfig::Passthrough,
             "cache_aware" => PolicyConfig::CacheAware {
-                cache_threshold: self.cache_threshold,
-                balance_abs_threshold: self.balance_abs_threshold,
-                balance_rel_threshold: self.balance_rel_threshold,
-                eviction_interval_secs: self.eviction_interval,
-                max_tree_size: self.max_tree_size,
-                block_size: self.block_size,
-                balance_token_usage_threshold: self.balance_token_usage_threshold,
-                overload_token_usage_threshold: self.overload_token_usage_threshold,
-                overlap_decay: self.overlap_decay,
-                selection_temperature: self.selection_temperature,
-                cache_index: Self::parse_cache_index(&self.cache_index),
-                cache_ttl_secs: self.cache_ttl_secs,
-                cache_boundaries: self.cache_boundaries.clone(),
-                selection_policy: (self.selection_policy != DEFAULT_SELECTION_POLICY)
-                    .then(|| self.selection_policy.clone()),
-                selection_accounting_ttl_ms: self.selection_accounting_ttl_ms,
+                cache_threshold: self.routing.cache_threshold,
+                balance_abs_threshold: self.routing.balance_abs_threshold,
+                balance_rel_threshold: self.routing.balance_rel_threshold,
+                eviction_interval_secs: self.routing.eviction_interval,
+                max_tree_size: self.routing.max_tree_size,
+                block_size: self.routing.block_size,
+                balance_token_usage_threshold: self.routing.balance_token_usage_threshold,
+                overload_token_usage_threshold: self.routing.overload_token_usage_threshold,
+                overlap_decay: self.routing.overlap_decay,
+                selection_temperature: self.routing.selection_temperature,
+                cache_index: Self::parse_cache_index(&self.routing.cache_index),
+                cache_ttl_secs: self.routing.cache_ttl_secs,
+                cache_boundaries: self.routing.cache_boundaries.clone(),
+                selection_policy: (self.routing.selection_policy != DEFAULT_SELECTION_POLICY)
+                    .then(|| self.routing.selection_policy.clone()),
+                selection_accounting_ttl_ms: self.routing.selection_accounting_ttl_ms,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
-                load_metric: self.power_of_two_load_metric,
+                load_metric: self.routing.power_of_two_load_metric,
             },
             "least_load" => PolicyConfig::LeastLoad {
                 load_check_interval_secs: 5,
-                kv_pressure_weight: self.least_load_kv_pressure_weight,
-                mean_prefill_tokens: self.least_load_mean_prefill_tokens,
-                default_throughput: self.least_load_default_throughput,
-                max_waiting_requests: self.least_load_max_waiting_requests,
+                kv_pressure_weight: self.routing.least_load_kv_pressure_weight,
+                mean_prefill_tokens: self.routing.least_load_mean_prefill_tokens,
+                default_throughput: self.routing.least_load_default_throughput,
+                max_waiting_requests: self.routing.least_load_max_waiting_requests,
             },
             "bucket" => PolicyConfig::Bucket {
-                balance_abs_threshold: self.balance_abs_threshold,
-                balance_rel_threshold: self.balance_rel_threshold,
+                balance_abs_threshold: self.routing.balance_abs_threshold,
+                balance_rel_threshold: self.routing.balance_rel_threshold,
                 bucket_adjust_interval_secs: 5,
             },
             "prefix_hash" => PolicyConfig::PrefixHash {
-                prefix_token_count: self.prefix_token_count,
-                load_factor: self.prefix_hash_load_factor,
-                balance_abs_threshold: self.prefix_hash_balance_abs_threshold,
-                cache_boundaries: self.cache_boundaries.clone(),
+                prefix_token_count: self.routing.prefix_token_count,
+                load_factor: self.routing.prefix_hash_load_factor,
+                balance_abs_threshold: self.routing.prefix_hash_balance_abs_threshold,
+                cache_boundaries: self.routing.cache_boundaries.clone(),
             },
             "consistent_hashing" => PolicyConfig::ConsistentHashing,
             "manual" => PolicyConfig::Manual {
-                eviction_interval_secs: self.eviction_interval,
-                max_idle_secs: self.max_idle_secs,
+                eviction_interval_secs: self.routing.eviction_interval,
+                max_idle_secs: self.routing.max_idle_secs,
                 assignment_mode: Self::parse_assignment_mode(
-                    self.assignment_mode.as_deref(),
+                    self.routing.assignment_mode.as_deref(),
                     ManualAssignmentMode::Random,
                 ),
             },
@@ -2403,8 +2463,9 @@ impl CliArgs {
         }
     }
 
+    /// Load the optional storage schema, reporting file and YAML errors as configuration errors.
     fn load_schema_config(&self) -> ConfigResult<Option<SchemaConfig>> {
-        match &self.schema_config {
+        match &self.model.schema_config {
             Some(path) => {
                 let content =
                     std::fs::read_to_string(path).map_err(|e| ConfigError::ValidationFailed {
@@ -2420,24 +2481,25 @@ impl CliArgs {
         }
     }
 
+    /// Prefer an explicit Oracle DSN; otherwise require both wallet path and TNS alias.
     fn resolve_oracle_connect_details(&self) -> ConfigResult<OracleConnectSource> {
-        if let Some(dsn) = self.oracle_dsn.clone() {
+        if let Some(dsn) = self.integrations.oracle_dsn.clone() {
             return Ok(OracleConnectSource::Dsn { descriptor: dsn });
         }
 
-        let wallet_path =
-            self.oracle_wallet_path
-                .clone()
-                .ok_or_else(|| ConfigError::MissingRequired {
-                    field: "oracle_wallet_path or ATP_WALLET_PATH".to_string(),
-                })?;
+        let wallet_path = self
+            .integrations
+            .oracle_wallet_path
+            .clone()
+            .ok_or_else(|| ConfigError::MissingRequired {
+                field: "oracle_wallet_path or ATP_WALLET_PATH".to_string(),
+            })?;
 
-        let tns_alias =
-            self.oracle_tns_alias
-                .clone()
-                .ok_or_else(|| ConfigError::MissingRequired {
-                    field: "oracle_tns_alias or ATP_TNS_ALIAS".to_string(),
-                })?;
+        let tns_alias = self.integrations.oracle_tns_alias.clone().ok_or_else(|| {
+            ConfigError::MissingRequired {
+                field: "oracle_tns_alias or ATP_TNS_ALIAS".to_string(),
+            }
+        })?;
 
         Ok(OracleConnectSource::Wallet {
             path: wallet_path,
@@ -2445,35 +2507,41 @@ impl CliArgs {
         })
     }
 
+    /// Build Oracle storage settings after validating authentication and pool bounds.
     fn build_oracle_config(&self, schema: Option<SchemaConfig>) -> ConfigResult<OracleConfig> {
         let (wallet_path, connect_descriptor) = match self.resolve_oracle_connect_details()? {
             OracleConnectSource::Dsn { descriptor } => (None, descriptor),
             OracleConnectSource::Wallet { path, alias } => (Some(path), alias),
         };
-        let (username, password) = if self.oracle_external_auth {
+        let (username, password) = if self.integrations.oracle_external_auth {
             (
-                self.oracle_user.clone().unwrap_or_default(),
-                self.oracle_password.clone().unwrap_or_default(),
+                self.integrations.oracle_user.clone().unwrap_or_default(),
+                self.integrations
+                    .oracle_password
+                    .clone()
+                    .unwrap_or_default(),
             )
         } else {
             (
-                self.oracle_user
-                    .clone()
-                    .ok_or_else(|| ConfigError::MissingRequired {
+                self.integrations.oracle_user.clone().ok_or_else(|| {
+                    ConfigError::MissingRequired {
                         field: "oracle_user or ATP_USER".to_string(),
-                    })?,
-                self.oracle_password
-                    .clone()
-                    .ok_or_else(|| ConfigError::MissingRequired {
+                    }
+                })?,
+                self.integrations.oracle_password.clone().ok_or_else(|| {
+                    ConfigError::MissingRequired {
                         field: "oracle_password or ATP_PASSWORD".to_string(),
-                    })?,
+                    }
+                })?,
             )
         };
 
         let pool_min = self
+            .integrations
             .oracle_pool_min
             .unwrap_or_else(OracleConfig::default_pool_min);
         let pool_max = self
+            .integrations
             .oracle_pool_max
             .unwrap_or_else(OracleConfig::default_pool_max);
 
@@ -2494,13 +2562,14 @@ impl CliArgs {
         }
 
         let pool_timeout_secs = self
+            .integrations
             .oracle_pool_timeout_secs
             .unwrap_or_else(OracleConfig::default_pool_timeout_secs);
 
         Ok(OracleConfig {
             wallet_path,
             connect_descriptor,
-            external_auth: self.oracle_external_auth,
+            external_auth: self.integrations.oracle_external_auth,
             username,
             password,
             pool_min,
@@ -2510,15 +2579,22 @@ impl CliArgs {
         })
     }
 
+    /// Build PostgreSQL storage settings, requiring a URL and valid pool bounds.
     fn build_postgres_config(&self, schema: Option<SchemaConfig>) -> ConfigResult<PostgresConfig> {
-        let db_url = self.postgres_db_url.clone().unwrap_or_default();
+        let db_url = self
+            .integrations
+            .postgres_db_url
+            .clone()
+            .unwrap_or_default();
         let pool_max = self
+            .integrations
             .postgres_pool_max_size
             .unwrap_or_else(PostgresConfig::default_pool_max);
         let pcf = PostgresConfig {
             db_url,
             pool_max,
             op_timeout_secs: self
+                .integrations
                 .postgres_op_timeout_secs
                 .unwrap_or_else(PostgresConfig::default_op_timeout_secs),
             schema,
@@ -2529,11 +2605,12 @@ impl CliArgs {
         Ok(pcf)
     }
 
+    /// Build Redis storage settings, requiring a URL and a nonzero pool size.
     fn build_redis_config(&self, schema: Option<SchemaConfig>) -> ConfigResult<RedisConfig> {
-        let url = self.redis_url.clone().unwrap_or_default();
-        let pool_max = self.redis_pool_max_size.unwrap_or(16);
+        let url = self.integrations.redis_url.clone().unwrap_or_default();
+        let pool_max = self.integrations.redis_pool_max_size.unwrap_or(16);
 
-        let retention_days = match self.redis_retention_days {
+        let retention_days = match self.integrations.redis_retention_days {
             Some(-1) => None, // Persistent
             // A retention of 0 days would expire every record as it is
             // written; -1 is the one spelling of persistent records.
@@ -2552,6 +2629,7 @@ impl CliArgs {
             url,
             pool_max,
             op_timeout_secs: self
+                .integrations
                 .redis_op_timeout_secs
                 .unwrap_or_else(RedisConfig::default_op_timeout_secs),
             retention_days,
@@ -2580,7 +2658,7 @@ impl CliArgs {
         // header names and an empty API key are checked by the shared
         // `ConfigValidator`, which every construction path runs (this CLI
         // through `builder.build()`).
-        let buckets = &self.prometheus_duration_buckets;
+        let buckets = &self.serving.prometheus_duration_buckets;
         if let Some(bad) = buckets.iter().find(|b| !b.is_finite() || **b <= 0.0) {
             return Err(invalid(
                 "prometheus_duration_buckets",
@@ -2595,7 +2673,7 @@ impl CliArgs {
                 "bucket bounds must ascend strictly",
             ));
         }
-        for entry in &self.storage_context_headers {
+        for entry in &self.serving.storage_context_headers {
             if !entry.contains('=') {
                 return Err(invalid(
                     "storage_context_headers",
@@ -2604,7 +2682,7 @@ impl CliArgs {
                 ));
             }
         }
-        for mapping in &self.jwt_role_mapping {
+        for mapping in &self.integrations.jwt_role_mapping {
             match mapping.split_once('=') {
                 Some((idp_role, gateway_role))
                     if !idp_role.is_empty()
@@ -2634,8 +2712,8 @@ impl CliArgs {
     ) -> Vec<String> {
         const PD: &str = "without --pd-disaggregation (or --epd-disaggregation)";
         const EPD: &str = "without --epd-disaggregation";
-        let pd = self.pd_disaggregation || self.epd_disaggregation;
-        let epd = self.epd_disaggregation;
+        let pd = self.workers.pd_disaggregation || self.workers.epd_disaggregation;
+        let epd = self.workers.epd_disaggregation;
         // The selectors select Kubernetes pods: another provider ignores them
         // as the absence of any does.
         let provider = self.selected_discovery_provider();
@@ -2649,7 +2727,7 @@ impl CliArgs {
         };
         // Two worker sources are both honoured, which is worth a line of its
         // own, naming the source as it was given.
-        let source = if self.service_discovery {
+        let source = if self.discovery.service_discovery {
             "--service-discovery".to_string()
         } else {
             provider.map_or_else(String::new, |provider| {
@@ -2659,49 +2737,53 @@ impl CliArgs {
         let ignored = |flag: &str, needs: &str| format!("{flag} is ignored {needs}");
         let warnings = [
             (!prefill_urls.is_empty() && !pd, ignored("--prefill", PD)),
-            (!self.decode.is_empty() && !pd, ignored("--decode", PD)),
             (
-                self.prefill_policy.is_some() && !pd,
+                !self.workers.decode.is_empty() && !pd,
+                ignored("--decode", PD),
+            ),
+            (
+                self.workers.prefill_policy.is_some() && !pd,
                 ignored("--prefill-policy", PD),
             ),
             (
-                self.decode_policy.is_some() && !pd,
+                self.workers.decode_policy.is_some() && !pd,
                 ignored("--decode-policy", PD),
             ),
             (!encode_urls.is_empty() && !epd, ignored("--encode", EPD)),
             (
-                self.encode_policy.is_some() && !epd,
+                self.workers.encode_policy.is_some() && !epd,
                 ignored("--encode-policy", EPD),
             ),
             (
-                !self.selector.is_empty() && !kubernetes,
+                !self.discovery.selector.is_empty() && !kubernetes,
                 ignored("--selector", selectors.as_str()),
             ),
             (
-                !self.prefill_selector.is_empty() && !kubernetes,
+                !self.discovery.prefill_selector.is_empty() && !kubernetes,
                 ignored("--prefill-selector", selectors.as_str()),
             ),
             (
-                !self.decode_selector.is_empty() && !kubernetes,
+                !self.discovery.decode_selector.is_empty() && !kubernetes,
                 ignored("--decode-selector", selectors.as_str()),
             ),
             (
-                !self.encode_selector.is_empty() && !kubernetes,
+                !self.discovery.encode_selector.is_empty() && !kubernetes,
                 ignored("--encode-selector", selectors.as_str()),
             ),
             (
-                !self.router_selector.is_empty() && !kubernetes,
+                !self.discovery.router_selector.is_empty() && !kubernetes,
                 ignored("--router-selector", selectors.as_str()),
             ),
             (
-                provider.is_some() && !self.worker_urls.is_empty(),
+                provider.is_some() && !self.routing.worker_urls.is_empty(),
                 format!(
                     "--worker-urls and {source} are both given: both are worker sources, \
                      the listed workers register first and the discovered ones join them"
                 ),
             ),
             (
-                self.priority_scheduler_config.is_some() && !self.priority_scheduler_enabled,
+                self.serving.priority_scheduler_config.is_some()
+                    && !self.serving.priority_scheduler_enabled,
                 ignored(
                     "--priority-scheduler-config",
                     "without --priority-scheduler-enabled",
@@ -2739,35 +2821,35 @@ impl CliArgs {
     ) -> RoutingMode {
         let policy = |name: Option<&String>| name.map(|p| self.parse_policy(p));
         match (
-            self.backend,
-            self.epd_disaggregation,
-            self.pd_disaggregation,
+            self.model.backend,
+            self.workers.epd_disaggregation,
+            self.workers.pd_disaggregation,
         ) {
             (Some(Backend::Openai), _, _) => RoutingMode::OpenAI {
-                worker_urls: self.worker_urls.clone(),
+                worker_urls: self.routing.worker_urls.clone(),
             },
             (Some(Backend::Anthropic), _, _) => RoutingMode::Anthropic {
-                worker_urls: self.worker_urls.clone(),
+                worker_urls: self.routing.worker_urls.clone(),
             },
             (Some(Backend::Gemini), _, _) => RoutingMode::Gemini {
-                worker_urls: self.worker_urls.clone(),
+                worker_urls: self.routing.worker_urls.clone(),
             },
             (_, true, _) => RoutingMode::EncodePrefillDecode {
                 encode_urls,
                 prefill_urls,
-                decode_urls: self.decode.clone(),
-                encode_policy: policy(self.encode_policy.as_ref()),
-                prefill_policy: policy(self.prefill_policy.as_ref()),
-                decode_policy: policy(self.decode_policy.as_ref()),
+                decode_urls: self.workers.decode.clone(),
+                encode_policy: policy(self.workers.encode_policy.as_ref()),
+                prefill_policy: policy(self.workers.prefill_policy.as_ref()),
+                decode_policy: policy(self.workers.decode_policy.as_ref()),
             },
             (_, false, true) => RoutingMode::PrefillDecode {
                 prefill_urls,
-                decode_urls: self.decode.clone(),
-                prefill_policy: policy(self.prefill_policy.as_ref()),
-                decode_policy: policy(self.decode_policy.as_ref()),
+                decode_urls: self.workers.decode.clone(),
+                prefill_policy: policy(self.workers.prefill_policy.as_ref()),
+                decode_policy: policy(self.workers.decode_policy.as_ref()),
             },
             (_, false, false) => RoutingMode::Regular {
-                worker_urls: self.worker_urls.clone(),
+                worker_urls: self.routing.worker_urls.clone(),
             },
         }
     }
@@ -2780,7 +2862,8 @@ impl CliArgs {
     fn discovery_config(&self) -> ConfigResult<Option<DiscoveryConfig>> {
         let provider = self.selected_discovery_provider();
         if provider != Some(DiscoveryProvider::File)
-            && (self.discovery_file.is_some() || self.discovery_check_interval_secs.is_some())
+            && (self.discovery.discovery_file.is_some()
+                || self.discovery.discovery_check_interval_secs.is_some())
         {
             return Err(ConfigError::IncompatibleConfig {
                 reason: "--discovery-file and --discovery-check-interval-secs apply only to \
@@ -2792,30 +2875,30 @@ impl CliArgs {
             None => None,
             Some(DiscoveryProvider::Kubernetes) => {
                 Some(DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
-                    namespace: self.service_discovery_namespace.clone(),
-                    port: self.service_discovery_port,
+                    namespace: self.discovery.service_discovery_namespace.clone(),
+                    port: self.discovery.service_discovery_port,
                     check_interval_secs: 60,
-                    selector: Self::parse_selector(&self.selector),
-                    encode_selector: Self::parse_selector(&self.encode_selector),
-                    prefill_selector: Self::parse_selector(&self.prefill_selector),
-                    decode_selector: Self::parse_selector(&self.decode_selector),
+                    selector: Self::parse_selector(&self.discovery.selector),
+                    encode_selector: Self::parse_selector(&self.discovery.encode_selector),
+                    prefill_selector: Self::parse_selector(&self.discovery.prefill_selector),
+                    decode_selector: Self::parse_selector(&self.discovery.decode_selector),
                     bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
                     worker_ports_annotation: "smg.ai/worker-ports".to_string(),
-                    kv_connector_annotation: self.kv_connector_annotation.clone(),
-                    kv_engine_id_annotation: self.kv_engine_id_annotation.clone(),
-                    router_selector: Self::parse_selector(&self.router_selector),
+                    kv_connector_annotation: self.discovery.kv_connector_annotation.clone(),
+                    kv_engine_id_annotation: self.discovery.kv_engine_id_annotation.clone(),
+                    router_selector: Self::parse_selector(&self.discovery.router_selector),
                     router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
-                    model_id_source: self.model_id_from.clone(),
+                    model_id_source: self.discovery.model_id_from.clone(),
                 }))
             }
             Some(DiscoveryProvider::File) => Some(DiscoveryConfig::File(FileDiscoveryConfig {
-                path: self
-                    .discovery_file
-                    .clone()
-                    .ok_or_else(|| ConfigError::MissingRequired {
+                path: self.discovery.discovery_file.clone().ok_or_else(|| {
+                    ConfigError::MissingRequired {
                         field: "--discovery-file".to_string(),
-                    })?,
+                    }
+                })?,
                 check_interval_secs: self
+                    .discovery
                     .discovery_check_interval_secs
                     .unwrap_or(DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS),
             })),
@@ -2862,7 +2945,7 @@ impl CliArgs {
         if connection_mode != ConnectionMode::Zmq {
             return None;
         }
-        match self.backend {
+        match self.model.backend {
             Some(Backend::Vllm) => Some(RuntimeType::Vllm),
             Some(Backend::Tokenspeed) => Some(RuntimeType::TokenSpeed),
             Some(Backend::Sglang) => Some(RuntimeType::Sglang),
@@ -2911,19 +2994,19 @@ impl CliArgs {
         self.warn_ignored_companions(&prefill_urls, &encode_urls);
 
         let mode = self.routing_mode(prefill_urls, encode_urls);
-        let policy = self.parse_policy(&self.policy);
+        let policy = self.parse_policy(&self.routing.policy);
         let discovery = self.discovery_config()?;
         let metrics = Some(MetricsConfig {
-            port: self.prometheus_port,
+            port: self.serving.prometheus_port,
             host: self.metrics_host(),
         });
         let trace_config = Some(TraceConfig {
-            enable_trace: self.enable_trace,
-            otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
+            enable_trace: self.integrations.enable_trace,
+            otlp_traces_endpoint: self.integrations.otlp_traces_endpoint.clone(),
         });
         let connection_mode = Self::determine_connection_mode(&Self::startup_worker_urls(&mode));
         let startup_worker_runtime_type = self.startup_worker_runtime_type(connection_mode);
-        let history_backend = match self.history_backend.as_str() {
+        let history_backend = match self.model.history_backend.as_str() {
             "none" => HistoryBackend::None,
             "oracle" => HistoryBackend::Oracle,
             "postgres" => HistoryBackend::Postgres,
@@ -2932,6 +3015,7 @@ impl CliArgs {
         };
         let schema = self.load_schema_config()?;
         let tenant_api_keys = self
+            .integrations
             .tenant_api_keys
             .iter()
             .map(|k| parse_tenant_api_key(k))
@@ -2942,180 +3026,194 @@ impl CliArgs {
             HistoryBackend::Redis => (None, None, Some(self.build_redis_config(schema)?)),
             _ => (None, None, None),
         };
-        let model_aliases = Self::model_aliases(&self.model_alias)?;
+        let model_aliases = Self::model_aliases(&self.discovery.model_alias)?;
 
         let builder = RouterConfig::builder()
             .mode(mode)
             .policy(policy)
-            .cache_boundaries(self.cache_boundaries.clone())
+            .cache_boundaries(self.routing.cache_boundaries.clone())
             .connection_mode(connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
-            .zmq_engine_count(self.zmq_engine_count)
-            .host(&self.host)
-            .port(self.port)
-            .health_check_port(self.health_check_port)
-            .runtime_worker_threads(self.runtime_worker_threads)
-            .max_payload_size(self.max_payload_size)
-            .max_buffered_request_bytes(self.max_buffered_request_bytes)
-            .stream_body_stall_timeout_secs(self.stream_body_stall_timeout_secs)
-            .header_read_timeout_secs(self.header_read_timeout_secs)
-            .idle_connection_timeout_secs(self.idle_connection_timeout_secs)
-            .request_timeout_secs(self.request_timeout_secs)
-            .sse_keepalive_secs(self.sse_keepalive_secs)
-            .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
-            .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
-            .worker_startup_delay_secs(self.worker_startup_delay)
-            .worker_startup_check_interval_secs(self.worker_startup_check_interval)
-            .job_queue_capacity(self.job_queue_capacity)
-            .job_queue_concurrency(self.job_queue_concurrency)
-            .load_monitor_interval_secs(self.load_monitor_interval)
-            .worker_stall_secs(self.worker_stall_secs)
-            .worker_wedge_secs(self.worker_wedge_secs)
-            .worker_stale_secs(self.worker_stale_secs)
+            .zmq_engine_count(self.routing.zmq_engine_count)
+            .host(&self.routing.host)
+            .port(self.routing.port)
+            .health_check_port(self.routing.health_check_port)
+            .runtime_worker_threads(self.integrations.runtime_worker_threads)
+            .max_payload_size(self.serving.max_payload_size)
+            .max_buffered_request_bytes(self.serving.max_buffered_request_bytes)
+            .stream_body_stall_timeout_secs(self.serving.stream_body_stall_timeout_secs)
+            .header_read_timeout_secs(self.serving.header_read_timeout_secs)
+            .idle_connection_timeout_secs(self.serving.idle_connection_timeout_secs)
+            .request_timeout_secs(self.serving.request_timeout_secs)
+            .sse_keepalive_secs(self.serving.sse_keepalive_secs)
+            .upstream_pool_idle_timeout_secs(self.serving.upstream_pool_idle_timeout_secs)
+            .worker_startup_timeout_secs(self.workers.worker_startup_timeout_secs)
+            .worker_startup_delay_secs(self.workers.worker_startup_delay)
+            .worker_startup_check_interval_secs(self.workers.worker_startup_check_interval)
+            .job_queue_capacity(self.routing.job_queue_capacity)
+            .job_queue_concurrency(self.routing.job_queue_concurrency)
+            .load_monitor_interval_secs(self.workers.load_monitor_interval)
+            .worker_stall_secs(self.workers.worker_stall_secs)
+            .worker_wedge_secs(self.workers.worker_wedge_secs)
+            .worker_stale_secs(self.workers.worker_stale_secs)
             .worker_warmup(
-                self.worker_warmup_secs,
-                self.worker_warmup_share,
-                self.worker_warmup_blocks,
-                self.worker_warmup_thin_ratio,
-                self.worker_warmup_divert_every,
+                self.routing.worker_warmup_secs,
+                self.routing.worker_warmup_share,
+                self.routing.worker_warmup_blocks,
+                self.routing.worker_warmup_thin_ratio,
+                self.routing.worker_warmup_divert_every,
             )
-            .pd_admission_wait_secs(self.pd_admission_wait_secs)
-            .disable_load_monitoring(self.disable_load_monitoring)
+            .pd_admission_wait_secs(self.workers.pd_admission_wait_secs)
+            .disable_load_monitoring(self.workers.disable_load_monitoring)
             .worker_overload_protection(
-                self.worker_overload_protection && !self.disable_worker_overload_protection,
+                self.routing.worker_overload_protection
+                    && !self.routing.disable_worker_overload_protection,
             )
-            .worker_overload_waiting_requests(Some(self.worker_overload_waiting_requests))
-            .worker_overload_token_usage(Some(self.worker_overload_token_usage))
-            .worker_overload_shed(self.worker_overload_shed)
-            .kv_indexer_ttl_secs(self.kv_indexer_ttl_secs)
-            .kv_indexer_max_entries(self.kv_indexer_max_entries)
-            .kv_index(self.kv_index.clone())
-            .engine_metrics(self.engine_metrics)
-            .multimodal_tensor_transport(self.multimodal_tensor_transport)
-            .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
-            .multimodal_max_inflight_bytes(self.multimodal_max_inflight_bytes)
-            .mm_per_request_image_limit(self.mm_per_request_image_limit.map(|v| v as usize))
-            .mm_processing(self.mm_processing)
-            .mm_pixel_cache_mb(self.mm_pixel_cache_mb)
-            .mm_pixel_rdma(self.mm_pixel_rdma)
-            .mm_allowed_media_domains(self.mm_allowed_media_domains.clone())
-            .mm_allow_private_media_hosts(self.mm_allow_private_media_hosts)
-            .rdma_listen_ip(self.rdma_listen_ip.clone())
-            .rdma_slot_ttl_s(self.rdma_slot_ttl_s)
-            .log_mm_timing(self.log_mm_timing)
-            .max_concurrent_requests(self.max_concurrent_requests)
-            .queue_size(self.queue_size)
-            .queue_timeout_secs(self.queue_timeout_secs)
-            .prefill_max_inflight_requests_per_worker(self.prefill_max_inflight_requests_per_worker)
-            .prefill_queue_size(self.prefill_queue_size)
-            .prefill_queue_timeout_secs(self.prefill_queue_timeout_secs)
-            .priority_scheduler_enabled(self.priority_scheduler_enabled)
-            .priority_scheduler_default_max_class(self.priority_scheduler_default_max_class.clone())
-            .priority_scheduler_config(self.priority_scheduler_config.clone())
-            .priority_scheduler_tenant_metric_top_n(self.priority_scheduler_tenant_metric_top_n)
-            .tenant_rate_limit_enabled(self.tenant_rate_limit_enabled)
-            .tenant_rate_limit_config(self.tenant_rate_limit_config.clone())
-            .cors_allowed_origins(self.cors_allowed_origins.clone())
+            .worker_overload_waiting_requests(Some(self.routing.worker_overload_waiting_requests))
+            .worker_overload_token_usage(Some(self.routing.worker_overload_token_usage))
+            .worker_overload_shed(self.routing.worker_overload_shed)
+            .kv_indexer_ttl_secs(self.routing.kv_indexer_ttl_secs)
+            .kv_indexer_max_entries(self.routing.kv_indexer_max_entries)
+            .kv_index(self.routing.kv_index.clone())
+            .engine_metrics(self.workers.engine_metrics)
+            .multimodal_tensor_transport(self.workers.multimodal_tensor_transport)
+            .multimodal_shm_min_bytes(self.workers.multimodal_shm_min_bytes)
+            .multimodal_max_inflight_bytes(self.workers.multimodal_max_inflight_bytes)
+            .mm_per_request_image_limit(self.workers.mm_per_request_image_limit.map(|v| v as usize))
+            .mm_processing(self.workers.mm_processing)
+            .mm_pixel_cache_mb(self.workers.mm_pixel_cache_mb)
+            .mm_pixel_rdma(self.workers.mm_pixel_rdma)
+            .mm_allowed_media_domains(self.workers.mm_allowed_media_domains.clone())
+            .mm_allow_private_media_hosts(self.workers.mm_allow_private_media_hosts)
+            .rdma_listen_ip(self.workers.rdma_listen_ip.clone())
+            .rdma_slot_ttl_s(self.workers.rdma_slot_ttl_s)
+            .log_mm_timing(self.workers.log_mm_timing)
+            .max_concurrent_requests(self.serving.max_concurrent_requests)
+            .queue_size(self.serving.queue_size)
+            .queue_timeout_secs(self.serving.queue_timeout_secs)
+            .prefill_max_inflight_requests_per_worker(
+                self.workers.prefill_max_inflight_requests_per_worker,
+            )
+            .prefill_queue_size(self.workers.prefill_queue_size)
+            .prefill_queue_timeout_secs(self.workers.prefill_queue_timeout_secs)
+            .priority_scheduler_enabled(self.serving.priority_scheduler_enabled)
+            .priority_scheduler_default_max_class(
+                self.serving.priority_scheduler_default_max_class.clone(),
+            )
+            .priority_scheduler_config(self.serving.priority_scheduler_config.clone())
+            .priority_scheduler_tenant_metric_top_n(
+                self.serving.priority_scheduler_tenant_metric_top_n,
+            )
+            .tenant_rate_limit_enabled(self.serving.tenant_rate_limit_enabled)
+            .tenant_rate_limit_config(self.serving.tenant_rate_limit_config.clone())
+            .cors_allowed_origins(self.serving.cors_allowed_origins.clone())
             .retry_config(RetryConfig {
-                max_retries: self.retry_max_retries,
-                initial_backoff_ms: self.retry_initial_backoff_ms,
-                max_backoff_ms: self.retry_max_backoff_ms,
-                backoff_multiplier: self.retry_backoff_multiplier,
-                jitter_factor: self.retry_jitter_factor,
+                max_retries: self.serving.retry_max_retries,
+                initial_backoff_ms: self.serving.retry_initial_backoff_ms,
+                max_backoff_ms: self.serving.retry_max_backoff_ms,
+                backoff_multiplier: self.serving.retry_backoff_multiplier,
+                jitter_factor: self.serving.retry_jitter_factor,
             })
             .circuit_breaker_config(CircuitBreakerConfig {
-                failure_threshold: self.cb_failure_threshold,
-                success_threshold: self.cb_success_threshold,
-                timeout_duration_secs: self.cb_timeout_duration_secs,
-                window_duration_secs: self.cb_window_duration_secs,
+                failure_threshold: self.serving.cb_failure_threshold,
+                success_threshold: self.serving.cb_success_threshold,
+                timeout_duration_secs: self.serving.cb_timeout_duration_secs,
+                window_duration_secs: self.serving.cb_window_duration_secs,
             })
             .health_check_config(HealthCheckConfig {
-                failure_threshold: self.health_failure_threshold,
-                success_threshold: self.health_success_threshold,
-                timeout_secs: self.health_check_timeout_secs,
-                check_interval_secs: self.health_check_interval_secs,
-                endpoint: self.health_check_endpoint.clone(),
-                disable_health_check: self.disable_health_check,
+                failure_threshold: self.serving.health_failure_threshold,
+                success_threshold: self.serving.health_success_threshold,
+                timeout_secs: self.serving.health_check_timeout_secs,
+                check_interval_secs: self.serving.health_check_interval_secs,
+                endpoint: self.serving.health_check_endpoint.clone(),
+                disable_health_check: self.serving.disable_health_check,
                 remove_unhealthy_workers: resolve_worker_auto_recovery(
-                    self.remove_unhealthy_workers,
+                    self.serving.remove_unhealthy_workers,
                     self.selected_discovery_provider().is_some(),
                 ),
-                drain_settle_secs: self.drain_settle_secs,
+                drain_settle_secs: self.serving.drain_settle_secs,
             })
             .tokenizer_cache(TokenizerCacheConfig {
-                enable_l0: self.tokenizer_cache_enable_l0,
-                l0_max_entries: self.tokenizer_cache_l0_max_entries,
-                l0_max_memory: self.tokenizer_cache_l0_max_memory,
-                enable_l1: self.tokenizer_cache_enable_l1,
-                l1_max_memory: self.tokenizer_cache_l1_max_memory,
+                enable_l0: self.model.tokenizer_cache_enable_l0,
+                l0_max_entries: self.model.tokenizer_cache_l0_max_entries,
+                l0_max_memory: self.model.tokenizer_cache_l0_max_memory,
+                enable_l1: self.model.tokenizer_cache_enable_l1,
+                l1_max_memory: self.model.tokenizer_cache_l1_max_memory,
             })
-            .disable_tokenizer_autoload(self.disable_tokenizer_autoload)
-            .parser(ParserChoice::parse(&self.parser).unwrap_or_default())
+            .disable_tokenizer_autoload(self.model.disable_tokenizer_autoload)
+            .parser(ParserChoice::parse(&self.model.parser).unwrap_or_default())
             .history_backend(history_backend)
             .memory_config(MemoryConfig {
-                max_responses: self.history_memory_max_responses,
-                max_items: self.history_memory_max_items,
-                retention_secs: (self.history_memory_retention_secs > 0)
-                    .then_some(self.history_memory_retention_secs),
+                max_responses: self.model.history_memory_max_responses,
+                max_items: self.model.history_memory_max_items,
+                retention_secs: (self.model.history_memory_retention_secs > 0)
+                    .then_some(self.model.history_memory_retention_secs),
             })
-            .log_level(&self.log_level)
-            .maybe_api_key(self.api_key.as_ref())
+            .log_level(&self.serving.log_level)
+            .maybe_api_key(self.integrations.api_key.as_ref())
             .tenant_api_keys(tenant_api_keys)
             .maybe_discovery(discovery)
             .maybe_metrics(metrics)
             .maybe_trace(trace_config)
-            .maybe_log_dir(self.log_dir.as_ref())
-            .maybe_jemalloc_prof_dir(self.jemalloc_prof_dir.as_ref())
+            .maybe_log_dir(self.serving.log_dir.as_ref())
+            .maybe_jemalloc_prof_dir(self.serving.jemalloc_prof_dir.as_ref())
             .maybe_request_id_headers(
-                (!self.request_id_headers.is_empty()).then(|| self.request_id_headers.clone()),
+                (!self.serving.request_id_headers.is_empty())
+                    .then(|| self.serving.request_id_headers.clone()),
             )
             .maybe_storage_context_headers(
-                (!self.storage_context_headers.is_empty())
-                    .then(|| Self::parse_selector(&self.storage_context_headers)),
+                (!self.serving.storage_context_headers.is_empty())
+                    .then(|| Self::parse_selector(&self.serving.storage_context_headers)),
             )
-            .trust_tenant_header(self.trust_tenant_header)
-            .tenant_header_name(&self.tenant_header_name)
-            .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
-            .max_background_responses(self.max_background_responses)
-            .maybe_model_path(self.model_path.as_ref())
-            .maybe_tokenizer_path(self.tokenizer_path.as_ref())
-            .maybe_chat_template(self.chat_template.as_ref())
+            .trust_tenant_header(self.serving.trust_tenant_header)
+            .tenant_header_name(&self.serving.tenant_header_name)
+            .maybe_rate_limit_tokens_per_second(self.serving.rate_limit_tokens_per_second)
+            .max_background_responses(self.serving.max_background_responses)
+            .maybe_model_path(self.model.model_path.as_ref())
+            .maybe_tokenizer_path(self.model.tokenizer_path.as_ref())
+            .maybe_chat_template(self.model.chat_template.as_ref())
             .model_aliases(model_aliases)
             .maybe_oracle(oracle)
             .maybe_postgres(postgres)
             .maybe_redis(redis)
-            .maybe_reasoning_parser(self.reasoning_parser.as_ref())
-            .maybe_tool_call_parser(self.tool_call_parser.as_ref())
-            .maybe_mcp_config_path(self.mcp_config_path.as_ref())
-            .dp_aware(self.dp_aware)
-            .pd_pairing_mode(PdPairingMode::parse(&self.pd_pairing_mode).unwrap_or_default())
+            .maybe_reasoning_parser(self.model.reasoning_parser.as_ref())
+            .maybe_tool_call_parser(self.model.tool_call_parser.as_ref())
+            .maybe_mcp_config_path(self.model.mcp_config_path.as_ref())
+            .dp_aware(self.routing.dp_aware)
+            .pd_pairing_mode(
+                PdPairingMode::parse(&self.routing.pd_pairing_mode).unwrap_or_default(),
+            )
             .routing_key_override(RoutingKeyOverrideConfig {
-                enabled: self.routing_key_override,
-                eviction_interval_secs: self.eviction_interval,
-                max_idle_secs: self.max_idle_secs,
+                enabled: self.routing.routing_key_override,
+                eviction_interval_secs: self.routing.eviction_interval,
+                max_idle_secs: self.routing.max_idle_secs,
                 assignment_mode: Self::parse_assignment_mode(
-                    self.assignment_mode.as_deref(),
+                    self.routing.assignment_mode.as_deref(),
                     ManualAssignmentMode::Delegate,
                 ),
-                headers: self.routing_key_headers.clone(),
+                headers: self.routing.routing_key_headers.clone(),
             })
-            .retries(!self.disable_retries)
-            .upstream_http2(self.upstream_http2)
-            .circuit_breaker(!self.disable_circuit_breaker)
-            .enable_wasm(self.enable_wasm)
-            .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
-            .igw(self.enable_igw)
+            .retries(!self.serving.disable_retries)
+            .upstream_http2(self.routing.upstream_http2)
+            .circuit_breaker(!self.serving.disable_circuit_breaker)
+            .enable_wasm(self.model.enable_wasm)
+            .maybe_storage_hook_wasm_path(self.model.storage_hook_wasm_path.as_deref())
+            .igw(self.routing.enable_igw)
             .rl(smg_rl::RlConfig {
-                enabled: self.enable_rl,
-                control_timeout_secs: self.rl_control_timeout_secs,
-                fanout_concurrency: self.rl_fanout_concurrency,
+                enabled: self.workers.enable_rl,
+                control_timeout_secs: self.workers.rl_control_timeout_secs,
+                fanout_concurrency: self.workers.rl_fanout_concurrency,
             })
-            .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler)
-            .maybe_server_cert_and_key(self.tls_cert_path.as_ref(), self.tls_key_path.as_ref());
+            .dp_minimum_tokens_scheduler(self.routing.dp_minimum_tokens_scheduler)
+            .maybe_server_cert_and_key(
+                self.integrations.tls_cert_path.as_ref(),
+                self.integrations.tls_key_path.as_ref(),
+            );
 
         builder.build()
     }
 
+    /// Combine validated router settings with listener, discovery, and authentication flags.
     fn to_server_config(&self, router_config: RouterConfig) -> ConfigResult<ServerConfig> {
         let service_discovery_config = router_config
             .discovery
@@ -3128,12 +3226,12 @@ impl CliArgs {
             .and_then(MeshDiscoveryConfig::from_discovery);
 
         let prometheus_config = Some(PrometheusConfig {
-            port: self.prometheus_port,
+            port: self.serving.prometheus_port,
             host: self.metrics_host(),
-            duration_buckets: if self.prometheus_duration_buckets.is_empty() {
+            duration_buckets: if self.serving.prometheus_duration_buckets.is_empty() {
                 None
             } else {
-                Some(self.prometheus_duration_buckets.clone())
+                Some(self.serving.prometheus_duration_buckets.clone())
             },
         });
 
@@ -3151,30 +3249,30 @@ impl CliArgs {
         let mesh_server_config = self.build_mesh_server_config()?;
 
         Ok(ServerConfig {
-            host: self.host.clone(),
-            port: self.port,
-            health_check_port: self.health_check_port,
-            runtime_worker_threads: self.runtime_worker_threads,
+            host: self.routing.host.clone(),
+            port: self.routing.port,
+            health_check_port: self.routing.health_check_port,
+            runtime_worker_threads: self.integrations.runtime_worker_threads,
             router_config,
-            max_payload_size: self.max_payload_size,
-            log_dir: self.log_dir.clone(),
-            log_level: Some(self.log_level.clone()),
-            log_json: self.log_json,
+            max_payload_size: self.serving.max_payload_size,
+            log_dir: self.serving.log_dir.clone(),
+            log_level: Some(self.serving.log_level.clone()),
+            log_json: self.serving.log_json,
             service_discovery_config,
             mesh_discovery_config,
             prometheus_config,
-            request_timeout_secs: self.request_timeout_secs,
-            request_id_headers: if self.request_id_headers.is_empty() {
+            request_timeout_secs: self.serving.request_timeout_secs,
+            request_id_headers: if self.serving.request_id_headers.is_empty() {
                 None
             } else {
-                Some(self.request_id_headers.clone())
+                Some(self.serving.request_id_headers.clone())
             },
-            shutdown_grace_period_secs: self.shutdown_grace_period_secs,
+            shutdown_grace_period_secs: self.serving.shutdown_grace_period_secs,
             control_plane_auth,
             mesh_server_config,
-            webrtc_bind_addr: self.webrtc_bind_addr,
-            webrtc_stun_server: self.webrtc_stun_server.clone(),
-            secret_sources: self.secret_sources,
+            webrtc_bind_addr: self.integrations.webrtc_bind_addr,
+            webrtc_stun_server: self.integrations.webrtc_stun_server.clone(),
+            secret_sources: self.integrations.secret_sources,
         })
     }
 
@@ -3183,17 +3281,17 @@ impl CliArgs {
     /// backends, then the disaggregated modes, then the backend's name
     /// (`--backend gemini` is labelled `Regular (gemini)`, as it always was).
     fn banner_mode(&self) -> String {
-        if self.enable_igw {
+        if self.routing.enable_igw {
             "IGW (Inference Gateway)".to_string()
-        } else if matches!(self.backend, Some(Backend::Openai)) {
+        } else if matches!(self.model.backend, Some(Backend::Openai)) {
             "OpenAI Backend".to_string()
-        } else if matches!(self.backend, Some(Backend::Anthropic)) {
+        } else if matches!(self.model.backend, Some(Backend::Anthropic)) {
             "Anthropic Backend".to_string()
-        } else if self.epd_disaggregation {
+        } else if self.workers.epd_disaggregation {
             "EPD Disaggregated".to_string()
-        } else if self.pd_disaggregation {
+        } else if self.workers.pd_disaggregation {
             "PD Disaggregated".to_string()
-        } else if let Some(backend) = &self.backend {
+        } else if let Some(backend) = &self.model.backend {
             format!("Regular ({backend})")
         } else {
             "Regular".to_string()
@@ -3217,19 +3315,19 @@ impl CliArgs {
         if igw_enabled_for_discovery {
             println!("INFO: IGW mode automatically enabled because service discovery is turned on");
         }
-        version::print_banner(&self.host, self.port, &self.banner_mode());
-        if self.enable_igw {
+        version::print_banner(&self.routing.host, self.routing.port, &self.banner_mode());
+        if self.routing.enable_igw {
             return;
         }
-        println!("Policy: {}", self.policy);
-        if self.pd_disaggregation && !prefill_urls.is_empty() {
+        println!("Policy: {}", self.routing.policy);
+        if self.workers.pd_disaggregation && !prefill_urls.is_empty() {
             println!("Prefill nodes: {prefill_urls:?}");
-            println!("Decode nodes: {:?}", self.decode);
+            println!("Decode nodes: {:?}", self.workers.decode);
         }
-        if self.epd_disaggregation {
+        if self.workers.epd_disaggregation {
             println!("Encode nodes: {encode_urls:?}");
             println!("Prefill nodes: {prefill_urls:?}");
-            println!("Decode nodes: {:?}", self.decode);
+            println!("Decode nodes: {:?}", self.workers.decode);
         }
     }
 
@@ -3317,6 +3415,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exercise both generated builders and startup parsing on Rust's default
+    /// thread stack. A subprocess contains stack overflow's process-wide abort.
+    #[test]
+    fn cli_startup_fits_a_two_mib_thread_stack() {
+        const CHILD: &str = "SMG_CLI_STACK_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            std::thread::Builder::new()
+                .stack_size(2 * 1024 * 1024)
+                .spawn(|| {
+                    use clap::CommandFactory;
+
+                    Cli::command().debug_assert();
+                    Cli::command_for_update().debug_assert();
+                    for prefix in [&["smg"][..], &["smg", "launch"], &["smg", "start"]] {
+                        let cli =
+                            Cli::try_parse_from(prefix.iter().copied().chain(["--port", "31000"]))
+                                .unwrap();
+                        let mut args = match cli.command {
+                            Some(Commands::Launch { args }) => args,
+                            None => cli.router_args,
+                        };
+                        args.resolve_secret_sources(&|_| Ok(None)).unwrap();
+                        let router = args.to_router_config(vec![], vec![]).unwrap();
+                        let server = args.to_server_config(router).unwrap();
+                        assert_eq!(server.port, 31000);
+                        assert_eq!(server.router_config.port, 31000);
+                    }
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::cli_startup_fits_a_two_mib_thread_stack",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "CLI startup exceeded its thread stack or failed: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
 
     /// Parse top-level CLI args into the flattened `CliArgs` the binary uses.
     fn cli_args_from(args: &[&str]) -> CliArgs {
@@ -3613,14 +3763,16 @@ mod tests {
             }
         }
         for args in [cli_args_from(&spaced), launch_args_from(&spaced)] {
-            assert_eq!(args.max_concurrent_requests, -1);
-            assert_eq!(args.prefill_max_inflight_requests_per_worker, -1);
-            assert_eq!(args.redis_retention_days, Some(-1));
+            assert_eq!(args.serving.max_concurrent_requests, -1);
+            assert_eq!(args.workers.prefill_max_inflight_requests_per_worker, -1);
+            assert_eq!(args.integrations.redis_retention_days, Some(-1));
             // Refused later by the validator, by name, as a negative rate.
-            assert_eq!(args.rate_limit_tokens_per_second, Some(-1));
+            assert_eq!(args.serving.rate_limit_tokens_per_second, Some(-1));
         }
         assert_eq!(
-            launch_args_from(&["--max-concurrent-requests=-1"]).max_concurrent_requests,
+            launch_args_from(&["--max-concurrent-requests=-1"])
+                .serving
+                .max_concurrent_requests,
             -1
         );
         for flag in ["--oracle-pool-min", "--oracle-pool-max"] {
@@ -3969,10 +4121,12 @@ mod tests {
     #[test]
     fn zmq_engine_count_rejects_non_positive() {
         assert_eq!(
-            cli_args_from(&["--zmq-engine-count", "2"]).zmq_engine_count,
+            cli_args_from(&["--zmq-engine-count", "2"])
+                .routing
+                .zmq_engine_count,
             Some(2)
         );
-        assert_eq!(cli_args_from(&[]).zmq_engine_count, None);
+        assert_eq!(cli_args_from(&[]).routing.zmq_engine_count, None);
 
         for bad in ["0", "-1"] {
             let argv = ["smg", "--zmq-engine-count", bad];
@@ -4552,16 +4706,16 @@ mod tests {
         ] {
             let mut cli = cli_args_from(selection);
             assert!(cli.enable_igw_for_discovery(), "{selection:?}");
-            assert!(cli.enable_igw, "{selection:?}");
+            assert!(cli.routing.enable_igw, "{selection:?}");
         }
 
         let mut already_on = cli_args_from(&["--service-discovery", "--enable-igw"]);
         assert!(!already_on.enable_igw_for_discovery());
-        assert!(already_on.enable_igw);
+        assert!(already_on.routing.enable_igw);
 
         let mut no_discovery = cli_args_from(&[]);
         assert!(!no_discovery.enable_igw_for_discovery());
-        assert!(!no_discovery.enable_igw);
+        assert!(!no_discovery.routing.enable_igw);
     }
 
     /// `--worker-auto-recovery` defaults to the `--service-discovery`
@@ -4933,7 +5087,7 @@ mod tests {
         assert!(Cli::try_parse_from(["smg", "--rdma-slot-ttl-s", "soon"]).is_err());
         assert!(Cli::try_parse_from(["smg", "--mm-pixel-cache-mb", "-1"]).is_err());
         let cli = cli_args_from(&["--mm-processing", "Router"]);
-        assert_eq!(cli.mm_processing, Some(MmProcessingMode::Router));
+        assert_eq!(cli.workers.mm_processing, Some(MmProcessingMode::Router));
     }
 
     /// The multimodal transport flags must reach both `RouterConfig` and the
@@ -5276,17 +5430,17 @@ mod tests {
         ];
 
         let cli = resolved(&["--history-backend", "postgres"], &vars).expect("resolves");
-        assert_eq!(cli.api_key.as_deref(), Some("env-shared-key"));
+        assert_eq!(cli.integrations.api_key.as_deref(), Some("env-shared-key"));
         assert_eq!(
-            cli.tenant_api_keys,
+            cli.integrations.tenant_api_keys,
             vec!["red:env-red", "blue:env-blue", "green:env-green"]
         );
         assert_eq!(
-            cli.postgres_db_url.as_deref(),
+            cli.integrations.postgres_db_url.as_deref(),
             Some("postgresql://u:env-pg-pass@db.example:5432/smg")
         );
         assert_eq!(
-            cli.secret_sources,
+            cli.integrations.secret_sources,
             SecretSources {
                 api_key: Some(SecretSource::Environment),
                 tenant_api_keys: Some((SecretSource::Environment, 3)),
@@ -5317,14 +5471,14 @@ mod tests {
 
         let cli = resolved(&["--history-backend", "redis"], &vars).expect("resolves");
         assert_eq!(
-            cli.redis_url.as_deref(),
+            cli.integrations.redis_url.as_deref(),
             Some("redis://:env-redis-pass@cache.example:6379/0")
         );
         assert_eq!(
-            cli.secret_sources.redis_url,
+            cli.integrations.secret_sources.redis_url,
             Some(SecretSource::Environment)
         );
-        assert_eq!(cli.secret_sources.postgres_db_url, None);
+        assert_eq!(cli.integrations.secret_sources.postgres_db_url, None);
         let config = cli.to_router_config(vec![], vec![]).expect("builds");
         assert_eq!(
             config.redis.expect("a redis store").url,
@@ -5345,9 +5499,9 @@ mod tests {
             ),
         ];
         let cli = resolved(&["--history-backend", "postgres"], &vars).expect("resolves");
-        assert_eq!(cli.api_key.as_deref(), Some("env-shared-key"));
+        assert_eq!(cli.integrations.api_key.as_deref(), Some("env-shared-key"));
         assert_eq!(
-            cli.postgres_db_url.as_deref(),
+            cli.integrations.postgres_db_url.as_deref(),
             Some("postgresql://u:env-pg-pass@db.example:5432/smg")
         );
     }
@@ -5390,7 +5544,7 @@ mod tests {
             matches!(&err, ConfigError::InvalidValue { field, .. } if field == "SMG_API_KEY"),
             "{err}"
         );
-        assert_eq!(cli.api_key, None);
+        assert_eq!(cli.integrations.api_key, None);
     }
 
     /// The command line beats the environment for every secret, and the
@@ -5420,14 +5574,14 @@ mod tests {
         )
         .expect("resolves");
 
-        assert_eq!(cli.api_key.as_deref(), Some("flag-shared-key"));
-        assert_eq!(cli.tenant_api_keys, vec!["blue:flag-blue"]);
+        assert_eq!(cli.integrations.api_key.as_deref(), Some("flag-shared-key"));
+        assert_eq!(cli.integrations.tenant_api_keys, vec!["blue:flag-blue"]);
         assert_eq!(
-            cli.postgres_db_url.as_deref(),
+            cli.integrations.postgres_db_url.as_deref(),
             Some("postgresql://u:flag@db.example:5432/smg")
         );
         assert_eq!(
-            cli.secret_sources,
+            cli.integrations.secret_sources,
             SecretSources {
                 api_key: Some(SecretSource::Flag),
                 tenant_api_keys: Some((SecretSource::Flag, 1)),
@@ -5442,12 +5596,12 @@ mod tests {
     fn without_a_source_no_secret_is_set() {
         let cli = resolved(&["--history-backend", "postgres"], &[]).expect("resolves");
 
-        assert_eq!(cli.api_key, None);
-        assert!(cli.tenant_api_keys.is_empty());
-        assert_eq!(cli.postgres_db_url, None);
-        assert_eq!(cli.redis_url, None);
-        assert_eq!(cli.secret_sources, SecretSources::default());
-        assert!(!cli.secret_sources.any());
+        assert_eq!(cli.integrations.api_key, None);
+        assert!(cli.integrations.tenant_api_keys.is_empty());
+        assert_eq!(cli.integrations.postgres_db_url, None);
+        assert_eq!(cli.integrations.redis_url, None);
+        assert_eq!(cli.integrations.secret_sources, SecretSources::default());
+        assert!(!cli.integrations.secret_sources.any());
     }
 
     /// A secret file is read whole with its trailing newline dropped, a
@@ -5490,17 +5644,20 @@ mod tests {
             &[],
         )
         .expect("resolves");
-        assert_eq!(by_flag.api_key.as_deref(), Some("file-shared-key"));
         assert_eq!(
-            by_flag.tenant_api_keys,
+            by_flag.integrations.api_key.as_deref(),
+            Some("file-shared-key")
+        );
+        assert_eq!(
+            by_flag.integrations.tenant_api_keys,
             vec!["red:file-red", "blue : file-blue"]
         );
         assert_eq!(
-            by_flag.postgres_db_url.as_deref(),
+            by_flag.integrations.postgres_db_url.as_deref(),
             Some("postgresql://u:file-pg@db.example:5432/smg")
         );
         assert_eq!(
-            by_flag.secret_sources,
+            by_flag.integrations.secret_sources,
             SecretSources {
                 api_key: Some(SecretSource::File),
                 tenant_api_keys: Some((SecretSource::File, 2)),
@@ -5527,14 +5684,17 @@ mod tests {
             ],
         )
         .expect("resolves");
-        assert_eq!(by_env.api_key.as_deref(), Some("file-shared-key"));
-        assert_eq!(by_env.tenant_api_keys.len(), 2);
         assert_eq!(
-            by_env.redis_url.as_deref(),
+            by_env.integrations.api_key.as_deref(),
+            Some("file-shared-key")
+        );
+        assert_eq!(by_env.integrations.tenant_api_keys.len(), 2);
+        assert_eq!(
+            by_env.integrations.redis_url.as_deref(),
             Some("redis://:file-redis@cache.example:6379/1")
         );
         assert_eq!(
-            by_env.secret_sources,
+            by_env.integrations.secret_sources,
             SecretSources {
                 api_key: Some(SecretSource::File),
                 tenant_api_keys: Some((SecretSource::File, 2)),
@@ -5752,9 +5912,9 @@ mod tests {
         ];
 
         let cli = resolved(&[], &vars).expect("the memory backend reads no store URL");
-        assert_eq!(cli.postgres_db_url, None);
-        assert_eq!(cli.redis_url, None);
-        assert_eq!(cli.secret_sources, SecretSources::default());
+        assert_eq!(cli.integrations.postgres_db_url, None);
+        assert_eq!(cli.integrations.redis_url, None);
+        assert_eq!(cli.integrations.secret_sources, SecretSources::default());
 
         let err = resolved(&["--history-backend", "postgres"], &vars).expect_err("opened");
         assert!(
