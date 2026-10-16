@@ -152,10 +152,9 @@ def scheduler_load_fields(
 ) -> dict:
     """The ``SchedulerLoad`` fields for one rank: vLLM's own counts plus the
     tracker's estimate, with ``num_used_tokens`` and ``utilization`` derived
-    from the KV usage as the SGLang servicer derives them. The estimate is
-    the servicer's, not a rank's, and belongs to the first rank: another
-    rank passes ``None`` and reports no queued token-work, throughput or hit
-    rate, as the Rust servicer's ``GetLoads`` reports its other ranks."""
+    from the KV usage as the SGLang servicer derives them. The estimate must
+    belong to this rank; pass ``None`` when no rank-local estimate is available
+    to omit queued token-work, throughput and hit rate."""
     kv_usage = max(0.0, float(kv_usage or 0.0))
     fields = {
         "dp_rank": int(dp_rank),
@@ -177,6 +176,24 @@ def scheduler_load_fields(
     return fields
 
 
+class RankLoadTrackers:
+    """Keep request estimates in the same global rank space as scheduler stats.
+
+    Unassigned requests on a DP frontend cannot be attributed until the engine
+    exposes their chosen rank. They must not contribute to any rank's estimate.
+    """
+
+    def __init__(self, ranks, *, clock=time.monotonic):
+        """Create independent request trackers for the managed global ranks."""
+        self._trackers = {rank: LoadTracker(clock=clock) for rank in ranks}
+
+    def for_rank(self, rank: int | None) -> LoadTracker | None:
+        """Resolve an explicit rank, or an unnamed request on a single rank."""
+        if rank is None and len(self._trackers) == 1:
+            return next(iter(self._trackers.values()))
+        return self._trackers.get(rank)
+
+
 def load_record(
     num_running: int,
     num_waiting: int,
@@ -189,9 +206,8 @@ def load_record(
 ) -> common_pb2.EngineLoad:
     """The load record the KV-event stream carries for one rank, from the
     figures :func:`scheduler_load_fields` reports on ``GetLoads``: the two
-    agree field for field. The queued token-work is this servicer's estimate
-    and rides the first rank's record only (``estimate`` is ``None`` for
-    another rank, whose record leaves it unset), as on the poll."""
+    agree field for field. The estimate must belong to this rank; when it is
+    ``None``, the record leaves queued token-work unset."""
     load = vllm_engine_pb2.SchedulerLoad(
         **scheduler_load_fields(
             num_running,

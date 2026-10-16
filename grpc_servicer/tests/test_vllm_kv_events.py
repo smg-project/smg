@@ -343,139 +343,107 @@ async def test_servicer_hands_its_load_record_to_the_relay():
 # --- The servicer's record is the batch's rank's own (no vLLM import) ---
 
 
-def _load_record_method():
-    """The real ``_load_record`` of the vLLM servicer with the readers it
-    calls (``_scheduler_counts``, ``_latest_scheduler_stats``, ``_first_rank``),
-    compiled on their own (the servicer module imports the engine), and the
-    loads module they draw on, loaded by path for the same reason."""
+def _servicer_over(stat_logger, managed=(0,)):
+    """Bind the real push method without importing the optional vLLM engine."""
     import ast
-    import logging
-
-    from smg_grpc_proto.generated import common_pb2
-    from smg_grpc_servicer.vllm.config_view import EngineConfigView
-
-    package = Path(__file__).parents[1] / "smg_grpc_servicer" / "vllm"
-    spec = importlib.util.spec_from_file_location("vllm_loads_for_the_record", package / "loads.py")
-    loads_mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(loads_mod)
-    source_path = package / "servicer.py"
-    wanted = {"_latest_scheduler_stats", "_scheduler_counts", "_load_record", "_first_rank"}
-    defs = [
-        node
-        for node in ast.walk(ast.parse(source_path.read_text()))
-        if isinstance(node, ast.FunctionDef) and node.name in wanted
-    ]
-    assert {node.name for node in defs} == wanted
-    namespace = {
-        "EngineConfigView": EngineConfigView,
-        "common_pb2": common_pb2,
-        "load_record": loads_mod.load_record,
-        "logger": logging.getLogger("vllm_servicer_under_test"),
-        "_kv_capacity_tokens": lambda engine: 0,
-        "_max_running_requests": lambda engine: 0,
-    }
-    exec(compile(ast.Module(body=defs, type_ignores=[]), str(source_path), "exec"), namespace)
-    return loads_mod, namespace
-
-
-def _servicer_over(stat_logger, managed=None):
-    """A servicer whose engine keeps its scheduler stats on ``stat_logger``
-    (and whose engine client manages the ranks ``managed``, when given)."""
     from types import MethodType, SimpleNamespace
 
-    loads_mod, namespace = _load_record_method()
-    engine = SimpleNamespace(logger_manager=SimpleNamespace(stat_loggers=[stat_logger]))
-    if managed is not None:
-        engine.engine_core = SimpleNamespace(engine_ranks_managed=managed)
-    servicer = SimpleNamespace(engine=engine, _loads=loads_mod.LoadTracker())
-    servicer._scheduler_counts = MethodType(namespace["_scheduler_counts"], servicer)
+    from smg_grpc_proto import vllm_engine_pb2
+    from smg_grpc_proto.generated import common_pb2
+    from smg_grpc_servicer.load_record import engine_load_from
+    from smg_grpc_servicer.vllm.loads import RankLoadTrackers
+    from smg_grpc_servicer.vllm.scheduler_loads import build_loads_response, managed_ranks
+
+    source = Path(__file__).parents[1] / "smg_grpc_servicer" / "vllm" / "servicer.py"
+    method = next(
+        node
+        for node in ast.walk(ast.parse(source.read_text()))
+        if isinstance(node, ast.FunctionDef) and node.name == "_load_record"
+    )
+    namespace = dict(
+        common_pb2=common_pb2,
+        vllm_engine_pb2=vllm_engine_pb2,
+        engine_load_from=engine_load_from,
+        build_loads_response=build_loads_response,
+        managed_ranks=managed_ranks,
+    )
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), namespace)
+    engine = SimpleNamespace(
+        logger_manager=SimpleNamespace(stat_loggers=[stat_logger], engine_indexes=managed),
+        vllm_config=SimpleNamespace(
+            cache_config=SimpleNamespace(kv_cache_size_tokens=8000),
+            scheduler_config=SimpleNamespace(max_num_seqs=32),
+        ),
+    )
+    servicer = SimpleNamespace(engine=engine, _loads=RankLoadTrackers(managed))
     servicer._load_record = MethodType(namespace["_load_record"], servicer)
-    servicer._first_rank = MethodType(lambda self: namespace["_first_rank"](self.engine), servicer)
     return servicer
 
 
 def _stats(running, waiting, usage):
+    """Build an engine-free scheduler snapshot."""
     from types import SimpleNamespace
 
     return SimpleNamespace(num_running_reqs=running, num_waiting_reqs=waiting, kv_cache_usage=usage)
 
 
-def _core(record):
-    return record.running_requests, record.waiting_requests, record.token_usage
-
-
 @pytest.mark.parametrize("shape", ["aggregated_logger", "per_engine_loggers"])
-def test_the_record_is_the_batch_ranks_own_with_the_estimate_on_the_first_rank(shape):
+def test_pushed_loads_match_polled_loads_for_each_global_rank(shape):
+    """Push and poll share global ranks, skipped queues and rank-local estimates."""
     from types import SimpleNamespace
 
-    first, second = _stats(3, 2, 0.25), _stats(5, 1, 0.5)
+    from smg_grpc_proto import vllm_engine_pb2
+    from smg_grpc_servicer.load_record import engine_load_from
+    from smg_grpc_servicer.vllm.scheduler_loads import build_loads_response
+
+    stats = {4: _stats(3, 2, 0.25), 5: _stats(5, 1, 0.5)}
+    stats[5].num_skipped_waiting_reqs = 2
     if shape == "aggregated_logger":
-        stat_logger = SimpleNamespace(last_scheduler_stats_dict={0: first, 1: second})
+        logger = SimpleNamespace(last_scheduler_stats_dict=stats)
     else:
-        stat_logger = SimpleNamespace(
+        logger = SimpleNamespace(
             per_engine_stat_loggers={
-                0: SimpleNamespace(last_scheduler_stats=first),
-                1: SimpleNamespace(last_scheduler_stats=second),
+                rank: SimpleNamespace(last_scheduler_stats=value) for rank, value in stats.items()
             }
         )
-    servicer = _servicer_over(stat_logger)
-
-    rank_one = servicer._load_record(1)
-    assert _core(rank_one) == (5, 1, 0.5)
-    # The queued-work estimate is the servicer's: the first rank's record carries it, no other.
-    assert not rank_one.HasField("waiting_uncached_tokens")
-    rank_zero = servicer._load_record(0)
-    assert _core(rank_zero) == (3, 2, 0.25)
-    assert rank_zero.HasField("waiting_uncached_tokens")
-    assert servicer._load_record(None) == rank_zero
-
-
-def test_a_rank_the_stat_loggers_do_not_keep_apart_gets_no_record():
-    from types import SimpleNamespace
-
-    servicer = _servicer_over(SimpleNamespace(last_scheduler_stats=_stats(3, 2, 0.25)))
-    assert servicer._load_record(0).running_requests == 3
-    assert servicer._load_record(1) is None
-
-
-def test_the_first_rank_alone_reports_zeros_before_the_first_snapshot():
-    from types import SimpleNamespace
-
-    servicer = _servicer_over(SimpleNamespace())
-    assert servicer._load_record(None).running_requests == 0
-    assert servicer._load_record(1) is None
-
-
-def test_a_servicer_managing_a_slice_of_the_ranks_counts_from_its_first_rank():
-    from types import SimpleNamespace
-
-    # External or hybrid load balancing: this servicer's engines are ranks 4 and
-    # 5, the stat loggers are keyed by those global ranks, and the aggregated
-    # logger's own snapshot is the aggregate (index -1), no rank's own.
-    stat_logger = SimpleNamespace(
-        engine_index=-1,
-        last_scheduler_stats=_stats(9, 9, 0.9),
-        last_scheduler_stats_dict={4: _stats(3, 2, 0.25), 5: _stats(5, 1, 0.5)},
+    servicer = _servicer_over(logger, managed=(4, 5))
+    servicer._loads.for_rank(4).submitted("a", 100)
+    servicer._loads.for_rank(5).submitted("b", 300)
+    response = build_loads_response(
+        servicer.engine, vllm_engine_pb2.GetLoadsRequest(), trackers=servicer._loads
     )
-    servicer = _servicer_over(stat_logger, managed=[4, 5])
-
-    assert servicer._first_rank() == 4
-    # What GetLoads reads: the first rank's own counts, not the aggregate.
-    assert servicer._scheduler_counts(servicer._first_rank()) == (3, 2, 0.25)
-    first = servicer._load_record(None)
-    assert _core(first) == (3, 2, 0.25) and first.HasField("waiting_uncached_tokens")
-    assert servicer._load_record(4) == first
-    assert not servicer._load_record(5).HasField("waiting_uncached_tokens")
+    for load in response.loads:
+        assert servicer._load_record(load.dp_rank) == engine_load_from(load, queued_token_work=True)
+    assert servicer._load_record(4).waiting_uncached_tokens == 100
+    assert servicer._load_record(5).waiting_uncached_tokens == 300
+    assert servicer._load_record(None) is None
     assert servicer._load_record(0) is None
 
 
-def test_the_first_rank_falls_back_to_the_configured_start_rank():
+@pytest.mark.parametrize("stats", [None, _stats(1, 0, float("nan"))])
+def test_missing_or_invalid_push_snapshot_is_not_idle(stats):
+    """Unavailable telemetry must never synthesize an idle pushed record."""
     from types import SimpleNamespace
 
-    servicer = _servicer_over(SimpleNamespace(last_scheduler_stats_dict={3: _stats(1, 0, 0.1)}))
-    servicer.engine.vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(data_parallel_rank=3)
-    )
-    assert servicer._first_rank() == 3
-    record = servicer._load_record(None)
-    assert _core(record) == (1, 0, 0.1) and record.HasField("waiting_uncached_tokens")
+    servicer = _servicer_over(SimpleNamespace(last_scheduler_stats=stats))
+    assert servicer._load_record(None) is None
+    assert servicer._load_record(0) is None
+
+
+def test_single_rank_push_can_attribute_an_unnamed_batch():
+    """An unnamed batch is unambiguous on a single nonzero managed rank."""
+    from types import SimpleNamespace
+
+    servicer = _servicer_over(SimpleNamespace(last_scheduler_stats=_stats(3, 2, 0.25)), (5,))
+    assert servicer._load_record(None) == servicer._load_record(5)
+    assert servicer._load_record(5).running_requests == 3
+    assert servicer._load_record(0) is None
+
+
+def test_multi_rank_push_rejects_scalar_aggregate():
+    """A scalar frontend aggregate cannot describe either managed DP rank."""
+    from types import SimpleNamespace
+
+    servicer = _servicer_over(SimpleNamespace(last_scheduler_stats=_stats(3, 2, 0.25)), (4, 5))
+    assert servicer._load_record(4) is None
+    assert servicer._load_record(5) is None
