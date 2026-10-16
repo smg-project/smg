@@ -19,10 +19,11 @@ use axum::response::{IntoResponse, Response};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},
     classify::ClassifyRequest,
+    common::Usage,
     completion::CompletionRequest,
-    decisions::DecisionsRequest,
+    decisions::{DecisionUsage, DecisionsRequest},
     embedding::EmbeddingRequest,
-    generate::GenerateRequest,
+    generate::{GenerateRequest, GenerateResponse},
     messages::CreateMessageRequest,
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
@@ -32,6 +33,7 @@ use tracing::{debug, error};
 
 use super::{
     common::{
+        response_formatting::TokenCounts,
         responses::{ResponsesContext, StreamStartupSender},
         stages::*,
     },
@@ -955,20 +957,76 @@ impl RequestPipeline {
     /// disabled or endpoint opted out) or was never admitted (e.g. prep
     /// failed before the reserve stage ran). Idempotent -- `settle_success`
     /// is a no-op if the handle was already resolved.
-    async fn settle_reservation(
-        cell: Option<&RateLimitCell>,
-        actual_input_tokens: u32,
-        completion_tokens: u32,
-    ) {
+    async fn settle_reservation(cell: Option<&RateLimitCell>, usage: UsageSettlement) {
         let Some(RateLimitOutcome::Admitted(handle)) = cell.and_then(RateLimitCell::peek) else {
             return;
         };
-        handle
-            .settle_success(UsageSettlement {
-                actual_input_tokens,
-                completion_tokens,
-            })
-            .await;
+        handle.settle_success(usage).await;
+    }
+
+    /// The settlement of a non-streamed chat or messages answer: the engine's
+    /// counters the response stage recorded (see `ResponseState::engine_counts`);
+    /// all zeros, a full refund, when none were (the stage always records
+    /// them with a response).
+    fn recorded_settlement(response: &ResponseState) -> UsageSettlement {
+        response
+            .engine_counts
+            .map_or_else(UsageSettlement::default, TokenCounts::settlement)
+    }
+
+    /// The settlement of a non-streamed legacy completion: its usage object
+    /// is the engine's counters unchanged (no unbilled prompt tokens, no
+    /// parser), summed over the prompts of a batch.
+    pub(in crate::routers::grpc) fn completion_settlement(
+        usage: Option<&Usage>,
+    ) -> UsageSettlement {
+        usage.map_or_else(UsageSettlement::default, |usage| UsageSettlement {
+            actual_input_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            cached_input_tokens: usage
+                .prompt_tokens_details
+                .as_ref()
+                .map_or(0, |details| details.cached_tokens),
+            reasoning_tokens: usage
+                .completion_tokens_details
+                .as_ref()
+                .and_then(|details| details.reasoning_tokens)
+                .unwrap_or(0),
+        })
+    }
+
+    /// The settlement of a non-streamed generate answer, one entry per
+    /// choice: the choices share one prompt, so its count and its cache hit
+    /// are taken once (the first entry's; every entry reports the same), and
+    /// each choice's own completion and reasoning counts sum.
+    pub(in crate::routers::grpc) fn generate_settlement(
+        responses: &[GenerateResponse],
+    ) -> UsageSettlement {
+        UsageSettlement {
+            actual_input_tokens: responses.first().map_or(0, |r| r.meta_info.prompt_tokens),
+            completion_tokens: responses
+                .iter()
+                .map(|r| r.meta_info.completion_tokens)
+                .sum(),
+            cached_input_tokens: responses.first().map_or(0, |r| r.meta_info.cached_tokens),
+            reasoning_tokens: responses
+                .iter()
+                .map(|r| r.meta_info.reasoning_tokens.unwrap_or(0))
+                .sum(),
+        }
+    }
+
+    /// The settlement of a decision batch: its input tokens, no completion
+    /// (label scoring generates none, as today), and the cache and reasoning
+    /// counters its usage reports, zero while the backend reports none.
+    pub(in crate::routers::grpc) fn decisions_settlement(usage: &DecisionUsage) -> UsageSettlement {
+        let count = |tokens: u64| u32::try_from(tokens).unwrap_or(u32::MAX);
+        UsageSettlement {
+            actual_input_tokens: count(usage.input_tokens),
+            completion_tokens: 0,
+            cached_input_tokens: count(usage.input_tokens_details.cached_tokens),
+            reasoning_tokens: count(usage.output_tokens_details.reasoning_tokens),
+        }
     }
 
     /// [`Self::run`], reporting to a Responses stream's startup barrier
@@ -1028,14 +1086,11 @@ impl RequestPipeline {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Chat(response)) => {
-                    let usage = response.usage.as_ref();
+                    // The engine's counts: the usage shown excludes the unbilled
+                    // stub and may carry the parser's reasoning split.
                     Self::settle_reservation(
                         dctx.rate_limit_cell.as_deref(),
-                        // The engine's count: the usage shown excludes the unbilled stub.
-                        usage.map_or(0, |u| {
-                            u.prompt_tokens + dctx.response.unbilled_prompt_tokens
-                        }),
-                        usage.map_or(0, |u| u.completion_tokens),
+                        Self::recorded_settlement(&dctx.response),
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
@@ -1075,14 +1130,9 @@ impl RequestPipeline {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Generate(response)) => {
-                    let actual_input_tokens =
-                        response.first().map_or(0, |r| r.meta_info.prompt_tokens);
-                    let completion_tokens =
-                        response.iter().map(|r| r.meta_info.completion_tokens).sum();
                     Self::settle_reservation(
                         dctx.rate_limit_cell.as_deref(),
-                        actual_input_tokens,
-                        completion_tokens,
+                        Self::generate_settlement(&response),
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
@@ -1122,11 +1172,9 @@ impl RequestPipeline {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Completion(response)) => {
-                    let usage = response.usage.as_ref();
                     Self::settle_reservation(
                         dctx.rate_limit_cell.as_deref(),
-                        usage.map_or(0, |u| u.prompt_tokens),
-                        usage.map_or(0, |u| u.completion_tokens),
+                        Self::completion_settlement(response.usage.as_ref()),
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
@@ -1166,10 +1214,12 @@ impl RequestPipeline {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Messages(response)) => {
+                    // The engine's counts: the Messages usage reports no cache
+                    // hits and the greater of the engine's and the parser's
+                    // thinking count.
                     Self::settle_reservation(
                         dctx.rate_limit_cell.as_deref(),
-                        response.usage.input_tokens,
-                        response.usage.output_tokens,
+                        Self::recorded_settlement(&dctx.response),
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
@@ -1213,8 +1263,7 @@ impl RequestPipeline {
                 Some(FinalResponse::Decisions(response)) => {
                     Self::settle_reservation(
                         dctx.rate_limit_cell.as_deref(),
-                        u32::try_from(response.usage.input_tokens).unwrap_or(u32::MAX),
-                        0,
+                        Self::decisions_settlement(&response.usage),
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
@@ -4306,7 +4355,10 @@ mod request_release_tests {
 #[cfg(test)]
 mod rate_limit_reserve_tests {
     use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
-    use openai_protocol::generate::GenerateRequest;
+    use openai_protocol::{
+        decisions::{DecisionInputTokensDetails, DecisionOutputTokensDetails},
+        generate::{GenerateFinishReason, GenerateFinishType, GenerateMetaInfo, GenerateRequest},
+    };
     use serde_json::json;
 
     use super::*;
@@ -4447,11 +4499,11 @@ mod rate_limit_reserve_tests {
 
     #[tokio::test]
     async fn settle_reservation_with_zero_usage_refunds_the_full_estimate() {
-        // Budget 6; reserve 5 leaves 1. A response with no `usage` settles
-        // with 0/0 (see the `usage.map_or(0, ...)` call sites in
-        // execute_chat/execute_generate/etc.) -- that must refund the full
-        // 5-token debit back to the tenant, not silently keep it (nothing
-        // was actually consumed) and not leave the reservation stuck open
+        // Budget 6; reserve 5 leaves 1. A response without usage settles
+        // with all zeros (see `recorded_settlement`, `completion_settlement`
+        // and `generate_settlement`) -- that must refund the full 5-token
+        // debit back to the tenant, not silently keep it (nothing was
+        // actually consumed) and not leave the reservation stuck open
         // (which would leak budget forever).
         let manager = manager_with_tokens_per_minute(6);
         let components = test_components().await;
@@ -4461,7 +4513,11 @@ mod rate_limit_reserve_tests {
         let stage = RateLimitReserveStage::new(Some(manager.clone()));
         assert!(stage.execute(&mut ctx).await.is_ok());
 
-        RequestPipeline::settle_reservation(ctx.input.rate_limit_cell.as_deref(), 0, 0).await;
+        RequestPipeline::settle_reservation(
+            ctx.input.rate_limit_cell.as_deref(),
+            UsageSettlement::default(),
+        )
+        .await;
 
         // The full 6-token budget must be available again -- would be
         // denied if settle had kept the original 5-token debit instead of
@@ -4476,6 +4532,151 @@ mod rate_limit_reserve_tests {
             manager.reserve(check).await,
             Reservation::Admitted(_)
         ));
+    }
+
+    /// The cached and reasoning split of a settlement is carried for the
+    /// consumers that price or report it; the true-up charges the counts.
+    #[tokio::test]
+    async fn settle_reservation_charges_the_counts_and_not_their_split() {
+        let manager = manager_with_tokens_per_minute(100);
+        let components = test_components().await;
+        let mut ctx = ctx_with_tokens(components, 5);
+        ctx.input.rate_limit_cell = Some(Arc::new(RateLimitCell::new()));
+
+        let stage = RateLimitReserveStage::new(Some(manager.clone()));
+        assert!(stage.execute(&mut ctx).await.is_ok());
+
+        RequestPipeline::settle_reservation(
+            ctx.input.rate_limit_cell.as_deref(),
+            UsageSettlement {
+                actual_input_tokens: 5,
+                completion_tokens: 10,
+                cached_input_tokens: 4,
+                reasoning_tokens: 3,
+            },
+        )
+        .await;
+
+        // 100 - 15 = 85 remain: the split neither charges twice nor refunds.
+        let check = |tokens: u32| ReserveRequest {
+            request_charge_id: uuid::Uuid::now_v7(),
+            tenant_key: TenantKey::new("test-tenant"),
+            model_id: Some(MODEL.to_string()),
+            estimated_input_tokens: tokens,
+        };
+        assert!(matches!(
+            manager.reserve(check(85)).await,
+            Reservation::Admitted(_)
+        ));
+        assert!(matches!(
+            manager.reserve(check(1)).await,
+            Reservation::Denied { .. }
+        ));
+    }
+
+    /// The non-streamed completion settles from its usage object: the
+    /// engine's counters, their details included; zeros without one.
+    #[test]
+    fn completion_settlement_carries_the_usage_details() {
+        let usage = Usage::from_counts(7, 5)
+            .with_cached_tokens(3)
+            .with_reasoning_tokens(2);
+        assert_eq!(
+            RequestPipeline::completion_settlement(Some(&usage)),
+            UsageSettlement {
+                actual_input_tokens: 7,
+                completion_tokens: 5,
+                cached_input_tokens: 3,
+                reasoning_tokens: 2,
+            }
+        );
+        assert_eq!(
+            RequestPipeline::completion_settlement(Some(&Usage::from_counts(7, 5))),
+            UsageSettlement {
+                actual_input_tokens: 7,
+                completion_tokens: 5,
+                cached_input_tokens: 0,
+                reasoning_tokens: 0,
+            }
+        );
+        assert_eq!(
+            RequestPipeline::completion_settlement(None),
+            UsageSettlement::default()
+        );
+    }
+
+    /// The non-streamed generate answer settles its shared prompt and cache
+    /// hit once and sums each choice's completion and reasoning counts; an
+    /// empty answer settles zeros.
+    #[test]
+    fn generate_settlement_takes_the_shared_prompt_once_and_sums_the_choices() {
+        let choice = |completion_tokens: u32, reasoning_tokens: Option<u32>| GenerateResponse {
+            text: String::new(),
+            output_ids: Vec::new(),
+            meta_info: GenerateMetaInfo {
+                id: "gen".to_string(),
+                finish_reason: GenerateFinishReason::Stop {
+                    finish_type: GenerateFinishType::Stop,
+                },
+                prompt_tokens: 9,
+                weight_version: "default".to_string(),
+                input_token_logprobs: None,
+                output_token_logprobs: None,
+                completion_tokens,
+                cached_tokens: 4,
+                reasoning_tokens,
+                e2e_latency: 0.0,
+                matched_stop: None,
+            },
+        };
+        assert_eq!(
+            RequestPipeline::generate_settlement(&[choice(3, Some(1)), choice(5, None)]),
+            UsageSettlement {
+                actual_input_tokens: 9,
+                completion_tokens: 8,
+                cached_input_tokens: 4,
+                reasoning_tokens: 1,
+            }
+        );
+        assert_eq!(
+            RequestPipeline::generate_settlement(&[]),
+            UsageSettlement::default()
+        );
+    }
+
+    /// A decision batch settles its input tokens and the cache and reasoning
+    /// counters its usage carries, no completion; a count past `u32` saturates.
+    #[test]
+    fn decisions_settlement_carries_the_usage_counters() {
+        let usage = DecisionUsage {
+            input_tokens: 11,
+            output_tokens: 0,
+            total_tokens: 11,
+            input_tokens_details: DecisionInputTokensDetails {
+                cached_tokens: 2,
+                cache_write_tokens: 0,
+            },
+            output_tokens_details: DecisionOutputTokensDetails {
+                reasoning_tokens: 1,
+            },
+        };
+        assert_eq!(
+            RequestPipeline::decisions_settlement(&usage),
+            UsageSettlement {
+                actual_input_tokens: 11,
+                completion_tokens: 0,
+                cached_input_tokens: 2,
+                reasoning_tokens: 1,
+            }
+        );
+        let beyond = DecisionUsage {
+            input_tokens: u64::from(u32::MAX) + 1,
+            ..usage
+        };
+        assert_eq!(
+            RequestPipeline::decisions_settlement(&beyond).actual_input_tokens,
+            u32::MAX
+        );
     }
 }
 

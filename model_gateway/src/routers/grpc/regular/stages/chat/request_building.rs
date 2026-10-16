@@ -388,7 +388,6 @@ impl BuildStage for ChatRequestBuildingStage {
         .await?;
 
         // Only the client-facing usage drops them; settlement keeps the engine's count.
-        ctx.state.response.unbilled_prompt_tokens = unbilled_prompt_tokens;
         let mut spec = ChatResponseSpec::from(chat_request.as_ref());
         spec.unbilled_prompt_tokens = unbilled_prompt_tokens;
         spec.reasoning_in_prefill = reasoning_in_prefill;

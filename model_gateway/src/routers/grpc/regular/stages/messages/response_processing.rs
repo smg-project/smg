@@ -150,7 +150,7 @@ impl ProcessStage for MessageResponseProcessingStage {
             )
         })?;
 
-        let response = self
+        let (response, counts) = self
             .processor
             .process_non_streaming_messages_response(
                 execution_result,
@@ -161,8 +161,9 @@ impl ProcessStage for MessageResponseProcessingStage {
             )
             .await?;
 
-        // Store the final response
+        // Store the final response, and the engine's counters for the settlement
         ctx.response.final_response = Some(FinalResponse::Messages(Box::new(response)));
+        ctx.response.engine_counts = Some(counts);
 
         Ok(None)
     }

@@ -136,7 +136,7 @@ impl ProcessStage for HarmonyResponseProcessingStage {
                 }
 
                 // For non-streaming, delegate to Harmony response processor to build ChatCompletionResponse
-                let response = self
+                let (response, counts) = self
                     .processor
                     .process_non_streaming_chat_response(
                         execution_result,
@@ -147,6 +147,7 @@ impl ProcessStage for HarmonyResponseProcessingStage {
                     .await?;
 
                 ctx.response.final_response = Some(FinalResponse::Chat(response));
+                ctx.response.engine_counts = Some(counts);
                 Ok(None)
             }
             HarmonyResponseSpec::Responses(responses_request) => {

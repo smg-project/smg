@@ -26,10 +26,13 @@ use tracing::{debug, error};
 
 use super::{
     backend_client::BackendClient,
-    common::stages::{
-        encode::EncodeDispatchPlan,
-        helpers::{IdStamp, SamplingBaseline, SamplingDefaultsMask, ToolConstraintStamp},
-        RateLimitCell,
+    common::{
+        response_formatting::TokenCounts,
+        stages::{
+            encode::EncodeDispatchPlan,
+            helpers::{IdStamp, SamplingBaseline, SamplingDefaultsMask, ToolConstraintStamp},
+            RateLimitCell,
+        },
     },
     multimodal::{InflightPermit, MediaPlan, MultimodalComponents, MultimodalIntermediate},
     proto_wrapper::{
@@ -863,8 +866,14 @@ pub(crate) struct ResponseState {
     /// Final processed response
     pub final_response: Option<FinalResponse>,
 
-    /// Rendered prompt tokens the client-facing usage drops; settlement adds them back.
-    pub unbilled_prompt_tokens: u32,
+    /// The engine's counters of a non-streamed chat or messages answer, as
+    /// the response stage recorded them for the settlement: the
+    /// client-facing usage drops the rendered prompt tokens the provider
+    /// does not bill and may carry the gateway parser's reasoning split
+    /// instead of the engine's count, and the Messages shape reports no
+    /// cache hits at all. `None` for the shapes whose response carries the
+    /// engine's counters unchanged (completion, generate, decisions).
+    pub engine_counts: Option<TokenCounts>,
 
     /// Responses API iteration result (Harmony only, for tool loop orchestration)
     pub responses_iteration_result: Option<super::harmony::ResponsesIterationResult>,

@@ -8,7 +8,10 @@ use std::collections::HashMap;
 
 use openai_protocol::common::Usage;
 
-use crate::routers::grpc::proto_wrapper::{ProtoGenerateComplete, ProtoGenerateStreamChunk};
+use crate::{
+    rate_limit::UsageSettlement,
+    routers::grpc::proto_wrapper::{ProtoGenerateComplete, ProtoGenerateStreamChunk},
+};
 
 /// The token counters of one request, aggregated over its choices the way
 /// the engines report them. The `n>1` choices of a chat/generate request
@@ -63,12 +66,18 @@ impl TokenCounts {
             .with_reasoning_tokens(self.reasoning)
             .with_speculative_tokens(self.spec_accepted, self.spec_drafted)
     }
-}
 
-/// Build usage information from collected gRPC responses (the
-/// [`TokenCounts`] aggregation of their counters).
-pub(crate) fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {
-    TokenCounts::of(responses).usage()
+    /// The settlement of the request's reservation: the engine's counts as
+    /// they are, before the client-facing usage drops unbilled prompt
+    /// tokens or substitutes the gateway parser's reasoning split.
+    pub(crate) fn settlement(self) -> UsageSettlement {
+        UsageSettlement {
+            actual_input_tokens: self.prompt,
+            completion_tokens: self.completion,
+            cached_input_tokens: self.cached,
+            reasoning_tokens: self.reasoning,
+        }
+    }
 }
 
 /// The usage of a chat completion from `engine_usage`, the usage the
@@ -193,6 +202,11 @@ mod tests {
     use smg_grpc_client::{tokenspeed_proto as tokenspeed, vllm_proto as vllm};
 
     use super::*;
+
+    /// The usage the counters of `responses` make.
+    fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {
+        TokenCounts::of(responses).usage()
+    }
 
     fn complete(
         prompt_tokens: u32,

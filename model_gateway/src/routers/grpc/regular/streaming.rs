@@ -1153,18 +1153,19 @@ impl StreamingProcessor {
         }
 
         // Every choice shares one prompt, so prompt/cache counts take max;
-        // completion and reasoning counts sum across choices. Built by the
-        // non-streamed answer's builder: the usage chunk carries the usage
-        // object that answer carries.
+        // completion and reasoning counts sum across choices. The counters
+        // once, for the usage chunk, the settlement and the metrics; the
+        // usage chunk is built by the non-streamed answer's builder, so it
+        // carries the usage object that answer carries.
+        let counts = TokenCounts {
+            prompt: prompt_tokens.values().copied().max().unwrap_or(0),
+            completion: completion_tokens.total(),
+            cached: cached_tokens.values().copied().max().unwrap_or(0),
+            reasoning: reasoning_tokens.values().sum(),
+            spec_accepted: spec_accepted.values().sum(),
+            spec_drafted: spec_drafted.values().sum(),
+        };
         let final_usage = (deepseek_usage || include_usage).then(|| {
-            let counts = TokenCounts {
-                prompt: prompt_tokens.values().copied().max().unwrap_or(0),
-                completion: completion_tokens.total(),
-                cached: cached_tokens.values().copied().max().unwrap_or(0),
-                reasoning: reasoning_tokens.values().sum(),
-                spec_accepted: spec_accepted.values().sum(),
-                spec_drafted: spec_drafted.values().sum(),
-            };
             chat_usage(
                 counts.usage(),
                 (reasoning_parser_available || assignment.is_some())
@@ -1227,9 +1228,6 @@ impl StreamingProcessor {
         // Mark stream as completed successfully to prevent abort on drop
         grpc_stream.mark_completed();
 
-        // Record streaming metrics
-        let total_prompt: u32 = prompt_tokens.values().copied().max().unwrap_or(0);
-        let total_completion: u32 = completion_tokens.total();
         if let Some(handle) = reservation {
             // `prompt_tokens` is only ever populated from a `Complete` message
             // (line ~573 above), one entry per index. A clean EOF that didn't
@@ -1240,12 +1238,7 @@ impl StreamingProcessor {
             if (prompt_tokens.len() as u32) < expected_choices {
                 handle.close_reserved_only().await;
             } else {
-                handle
-                    .settle_success(UsageSettlement {
-                        actual_input_tokens: total_prompt,
-                        completion_tokens: total_completion,
-                    })
-                    .await;
+                handle.settle_success(counts.settlement()).await;
             }
         }
         // In PD mode this task only starts once the decode stream exists —
@@ -1264,8 +1257,8 @@ impl StreamingProcessor {
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: first_token_time.map(|t| t.duration_since(stream_base)),
             generation_duration: stream_base.elapsed(),
-            input_tokens: Some(total_prompt as u64),
-            output_tokens: total_completion as u64,
+            input_tokens: Some(counts.prompt as u64),
+            output_tokens: counts.completion as u64,
         });
 
         Ok(())
@@ -1448,6 +1441,10 @@ impl StreamingProcessor {
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
         // Same prompt for every index; the last Complete's value is as good as any.
         let mut prompt_tokens: u32 = 0;
+        // The cache hit is a property of that shared prompt too (max, not sum);
+        // reasoning is each choice's own, one entry per index.
+        let mut cached_tokens: u32 = 0;
+        let mut reasoning_tokens_map: HashMap<u32, u32> = HashMap::new();
         // Indices that received a `Complete` message -- the only source of
         // authoritative usage. Chunks alone (tracked in `completion_tokens_map`)
         // don't count: an index can start generating and never finish.
@@ -1517,6 +1514,8 @@ impl StreamingProcessor {
                     let index_id = format!("{}-{}", ctx.request_id, index);
                     let e2e_latency = start_time.elapsed().as_secs_f64();
                     prompt_tokens = complete.prompt_tokens();
+                    cached_tokens = cached_tokens.max(complete.cached_tokens());
+                    reasoning_tokens_map.insert(index, complete.reasoning_tokens());
                     completed_indices.insert(index);
 
                     // Send final chunk with finish_reason
@@ -1560,6 +1559,8 @@ impl StreamingProcessor {
                     .settle_success(UsageSettlement {
                         actual_input_tokens: prompt_tokens,
                         completion_tokens: total_completion,
+                        cached_input_tokens: cached_tokens,
+                        reasoning_tokens: reasoning_tokens_map.values().sum(),
                     })
                     .await;
             } else {
@@ -1654,6 +1655,10 @@ impl StreamingProcessor {
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
         // Same prompt for every index; the last Complete's value is as good as any.
         let mut prompt_tokens: u32 = 0;
+        // The cache hit is a property of that shared prompt too (max, not sum);
+        // reasoning is each choice's own, one entry per index.
+        let mut cached_tokens: u32 = 0;
+        let mut reasoning_tokens_map: HashMap<u32, u32> = HashMap::new();
         // Indices that received a `Complete` message -- the only source of
         // authoritative usage. Chunks alone (tracked in `completion_tokens_map`)
         // don't count: an index can start generating and never finish.
@@ -1757,6 +1762,8 @@ impl StreamingProcessor {
                     let index_id = format!("{}-{}", ctx.request_id, index);
                     let e2e_latency = start_time.elapsed().as_secs_f64();
                     prompt_tokens = complete.prompt_tokens();
+                    cached_tokens = cached_tokens.max(complete.cached_tokens());
+                    reasoning_tokens_map.insert(index, complete.reasoning_tokens());
                     completed_indices.insert(index);
 
                     // Parse finish_reason
@@ -1808,6 +1815,8 @@ impl StreamingProcessor {
                     .settle_success(UsageSettlement {
                         actual_input_tokens: prompt_tokens,
                         completion_tokens: total_completion,
+                        cached_input_tokens: cached_tokens,
+                        reasoning_tokens: reasoning_tokens_map.values().sum(),
                     })
                     .await;
             } else {
@@ -2717,6 +2726,9 @@ impl StreamingProcessor {
         let thinking_requested = original_request.thinking_requested;
         let mut parsed_thinking_tokens: u32 = 0;
         let mut engine_thinking_tokens: u32 = 0;
+        // The engine's cache hit on the prompt, for the settlement: the
+        // Messages usage reports none.
+        let mut cached_tokens: u32 = 0;
         let mut was_in_reasoning = false;
         let mut held_tokens: u32 = 0;
         Self::send_messages_event(
@@ -2826,6 +2838,7 @@ impl StreamingProcessor {
                     saw_complete = true;
                     completion_tokens.record_complete(&complete);
                     engine_thinking_tokens = complete.reasoning_tokens();
+                    cached_tokens = complete.cached_tokens();
                     // A local stop-decoder match already pinned "stop"; don't let
                     // the engine's finish reason overwrite it.
                     if !stopped {
@@ -3430,6 +3443,8 @@ impl StreamingProcessor {
                     .settle_success(UsageSettlement {
                         actual_input_tokens: prompt_tokens,
                         completion_tokens: completion_tokens.total(),
+                        cached_input_tokens: cached_tokens,
+                        reasoning_tokens: engine_thinking_tokens,
                     })
                     .await;
             } else {
@@ -3650,6 +3665,8 @@ impl StreamingProcessor {
                                 .settle_success(UsageSettlement {
                                     actual_input_tokens: total_prompt,
                                     completion_tokens: total_completion,
+                                    cached_input_tokens: total_cached,
+                                    reasoning_tokens: total_reasoning,
                                 })
                                 .await;
                         } else {

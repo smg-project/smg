@@ -30,7 +30,7 @@ use super::{
 };
 use crate::{
     observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
-    rate_limit::{SharedReservationHandle, UsageSettlement},
+    rate_limit::SharedReservationHandle,
     routers::{
         common::{
             openai_bridge::{self, descriptor, FormatRegistry, ResponseFormat},
@@ -564,12 +564,7 @@ impl HarmonyStreamingProcessor {
             if (decode_completed_indices.len() as u32) < expected_choices {
                 handle.close_reserved_only().await;
             } else {
-                handle
-                    .settle_success(UsageSettlement {
-                        actual_input_tokens: counts.prompt,
-                        completion_tokens: counts.completion,
-                    })
-                    .await;
+                handle.settle_success(counts.settlement()).await;
             }
         }
 
