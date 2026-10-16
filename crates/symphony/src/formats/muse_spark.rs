@@ -198,7 +198,7 @@ mod tests {
     use crate::{
         engine::Engine,
         event::{DropReason, Event, Events, Text},
-        grammar::Options,
+        grammar::{GrammarStart, Options},
         input::{EngineFinish, Input},
         parser::Parser,
         tagged::Declared,
@@ -670,6 +670,7 @@ mod tests {
                     at_least_one: true,
                     reasoning_open,
                     one_call: false,
+                    start: GrammarStart::Unknown,
                 },
             )
             .expect("a tag")
@@ -709,6 +710,7 @@ mod tests {
                     at_least_one: true,
                     reasoning_open: false,
                     one_call: true,
+                    start: GrammarStart::Unknown,
                 },
             )
             .expect("a tag")

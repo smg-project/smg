@@ -340,6 +340,7 @@ impl BuildStage for ChatRequestBuildingStage {
                     &chat_request,
                     &chat_request.callable_tools(),
                     reasoning,
+                    symphony::grammar_start_from(decoding.start),
                     &ctx.components.templates,
                 )
             },

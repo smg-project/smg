@@ -377,12 +377,19 @@ pub(crate) async fn prepare_chat_like(
         // tags cannot (`regular::symphony::worker_constraint`).
         let parser: ParserChoice = ctx.state.parser.unwrap_or_default();
         let names = ctx.components.parser_resolver.names(&request.model);
+        // The tag takes the start the model's workers name, when they agree; the selected
+        // worker's own start decides the `auto` tag at request building.
+        let workers = ctx
+            .components
+            .worker_registry
+            .get_by_model(&ctx.input.model_id);
         let symphony_constraint = symphony::constraint(
             parser,
             &names,
             request,
             &constraint_tools,
             reasoning,
+            symphony::grammar_start_of(&workers),
             &ctx.components.templates,
         );
         let tool_call_constraint = match (symphony_constraint, request.tool_choice.as_ref()) {

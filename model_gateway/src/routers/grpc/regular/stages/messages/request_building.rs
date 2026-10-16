@@ -218,6 +218,7 @@ impl BuildStage for MessageRequestBuildingStage {
                     &messages_request,
                     &tools,
                     require_reasoning,
+                    symphony::grammar_start_from(decoding.start),
                     continued_final_message,
                     &ctx.components.templates,
                 )

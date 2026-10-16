@@ -28,7 +28,7 @@ use openai_protocol::common::{Function, Tool};
 use serde_json::{json, Value};
 use symphony::{
     adapt,
-    grammar::Options,
+    grammar::{GrammarStart, Options},
     shape::{
         self, Arguments, Atom, CallLayout, CallShape, Class, Dialect, End, Layout, Message,
         NameSource, Nested, Pattern, Segment, Slot, Spellings, ValueParser, Words, Written,
@@ -1510,6 +1510,7 @@ fn modes(format: &Format, reasoning_open: bool) -> [Grammar; 4] {
         at_least_one,
         reasoning_open,
         one_call,
+        start: GrammarStart::Unknown,
     };
     let tag = |options| format.grammar_for(&tools, options).expect("a tag");
     [

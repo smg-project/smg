@@ -247,12 +247,17 @@ impl MessagePreparationStage {
             tokenizer.as_ref(),
         );
         let names = ctx.components.parser_resolver.names(&request.model);
+        let workers = ctx
+            .components
+            .worker_registry
+            .get_by_model(&ctx.input.model_id);
         let symphony_constraint = symphony::constraint_messages(
             parser,
             &names,
             request,
             &filtered_tools,
             reasoning,
+            symphony::grammar_start_of(&workers),
             request.continues_final_assistant(),
             &ctx.components.templates,
         );

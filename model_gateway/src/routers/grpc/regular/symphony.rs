@@ -41,6 +41,8 @@
 
 pub(crate) mod template;
 
+use std::sync::Arc;
+
 use axum::http::HeaderMap;
 use llm_tokenizer::{
     stop::{SequenceDecoderOutput, StopSequenceDecoder},
@@ -55,11 +57,11 @@ use openai_protocol::{
 use serde_json::{json, Value};
 use symphony::{
     formats::{for_model, table_for, Table},
-    grammar::Options,
+    grammar::{GrammarStart, Options},
     Declared, Engine, EngineFinish, Event, Events, Format, Grammar, Input, OutputAnswer,
     OutputChoice, Parser as _, TokenSpan, Turn,
 };
-use tool_parser::ToolConstraint;
+use tool_parser::{GrammarStart as WorkerGrammarStart, ToolConstraint};
 use tracing::debug;
 
 use self::template::Templates;
@@ -69,6 +71,7 @@ use crate::{
         spec::scans_for_tool_calls,
         utils::{Names, WorkerDecoding},
     },
+    worker::Worker,
 };
 
 /// The request header that names the parser for one request, `legacy` or `symphony`, over the
@@ -296,6 +299,10 @@ fn tagged(
 
 /// The tag of a forced call to one of `tools`, at most one when `one_call`, with
 /// `reasoning_open` when the prompt leaves the model inside its thought ([`tagged`]).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the table, the request's ask, where the prompt and the engine leave the model"
+)]
 fn calls_tag(
     format: &Format,
     compiled: bool,
@@ -303,6 +310,7 @@ fn calls_tag(
     tools: &[Tool],
     one_call: bool,
     reasoning_open: bool,
+    start: GrammarStart,
     continues: bool,
 ) -> Result<Option<ToolConstraint>, String> {
     let grammar = format.grammar_for(
@@ -311,6 +319,7 @@ fn calls_tag(
             at_least_one: true,
             reasoning_open,
             one_call,
+            start,
         },
     );
     tagged(grammar, compiled, model, "a forced tool choice", continues)
@@ -332,9 +341,10 @@ fn answer_tag(
     model: &str,
     schema: &Value,
     reasoning_open: bool,
+    start: GrammarStart,
     continues: bool,
 ) -> Result<Option<ToolConstraint>, String> {
-    let grammar = format.answer_grammar(schema, reasoning_open);
+    let grammar = format.answer_grammar_for(schema, reasoning_open, start);
     if !compiled && (continues || matches!(grammar, Some(Grammar::JsonSchema { .. }))) {
         return Ok(None);
     }
@@ -377,6 +387,41 @@ fn markers_hidden_by_the_decoder(format: &Format, tokenizer: &dyn Tokenizer) -> 
     })
 }
 
+/// Where a worker's engine starts a request's grammar on a prompt that leaves the model inside
+/// its thought, as Symphony's tags take it: the worker's `constrained_decoding_start` label
+/// ([`WorkerDecoding::start`]).
+pub(crate) fn grammar_start_from(start: WorkerGrammarStart) -> GrammarStart {
+    match start {
+        WorkerGrammarStart::AfterReasoning => GrammarStart::AfterReasoning,
+        WorkerGrammarStart::FirstToken => GrammarStart::FirstToken,
+        WorkerGrammarStart::Unknown => GrammarStart::Unknown,
+    }
+}
+
+/// Where the model's `workers` start a grammar, before one is selected: the start every one of
+/// them names in its `constrained_decoding_start` label; unknown when none says or they differ,
+/// and the tag takes the prefix that fits either kind of engine.
+pub(crate) fn grammar_start_of(workers: &[Arc<dyn Worker>]) -> GrammarStart {
+    let mut starts = workers.iter().map(|worker| {
+        WorkerGrammarStart::from_label(
+            worker
+                .metadata()
+                .spec
+                .labels
+                .get(WorkerGrammarStart::LABEL)
+                .map(String::as_str),
+        )
+    });
+    let Some(first) = starts.next() else {
+        return GrammarStart::Unknown;
+    };
+    if starts.all(|start| start == first) {
+        grammar_start_from(first)
+    } else {
+        GrammarStart::Unknown
+    }
+}
+
 /// The structural tag the table gives a chat request's forced or required call to one of `tools`,
 /// or its JSON `response_format`, with `reasoning_open` when the prompt leaves the model inside
 /// its thought ([`calls_tag`], [`answer_tag`]). `Ok(None)` when no table reads the response
@@ -389,6 +434,7 @@ pub(crate) fn constraint(
     request: &ChatCompletionRequest,
     tools: &[Tool],
     reasoning_open: bool,
+    start: GrammarStart,
     templates: &Templates,
 ) -> Result<Option<ToolConstraint>, String> {
     let Some(format) = reads(parser, names, &request.model, templates)? else {
@@ -418,6 +464,7 @@ pub(crate) fn constraint(
             tools,
             one_call,
             reasoning_open,
+            start,
             continues,
         );
     }
@@ -428,6 +475,7 @@ pub(crate) fn constraint(
             &request.model,
             &schema,
             reasoning_open,
+            start,
             continues,
         ),
         None => Ok(None),
@@ -449,6 +497,7 @@ pub(crate) fn auto_constraint(
     request: &ChatCompletionRequest,
     tools: &[Tool],
     reasoning_open: bool,
+    start: GrammarStart,
     templates: &Templates,
 ) -> Result<Option<ToolConstraint>, String> {
     let Some(format) = reads(parser, names, &request.model, templates)? else {
@@ -471,6 +520,7 @@ pub(crate) fn auto_constraint(
         &format,
         tools,
         reasoning_open,
+        start,
         request.parallel_tool_calls == Some(false),
     ))
 }
@@ -481,6 +531,7 @@ fn auto_tag(
     format: &Format,
     tools: &[Tool],
     reasoning_open: bool,
+    start: GrammarStart,
     one_call: bool,
 ) -> Option<ToolConstraint> {
     format
@@ -490,6 +541,7 @@ fn auto_tag(
                 at_least_one: false,
                 reasoning_open,
                 one_call,
+                start,
             },
         )
         .map(|grammar| ToolConstraint::StructuralTag(grammar.payload().to_string()))
@@ -498,12 +550,17 @@ fn auto_tag(
 /// [`constraint`] for a Messages request: a `tool_choice` of `any` or a named tool forces a call
 /// to one of `tools`, one call when the tool is named or parallel use is disabled. `continues`
 /// says whether the prompt continues the assistant's message.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the parser's choice, the request, its tools, where the prompt and the engine leave the model"
+)]
 pub(crate) fn constraint_messages(
     parser: ParserChoice,
     names: &Names,
     request: &CreateMessageRequest,
     tools: &[Tool],
     reasoning_open: bool,
+    start: GrammarStart,
     continues: bool,
     templates: &Templates,
 ) -> Result<Option<ToolConstraint>, String> {
@@ -523,6 +580,7 @@ pub(crate) fn constraint_messages(
         tools,
         one_call,
         reasoning_open,
+        start,
         continues,
     )
 }
@@ -531,12 +589,17 @@ pub(crate) fn constraint_messages(
 /// one at most when parallel use is disabled; nothing when the prompt `continues` the assistant's
 /// message. A Messages request carries no constraint of its own (an `output_format` is refused
 /// before this).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the parser's choice, the request, its tools, where the prompt and the engine leave the model"
+)]
 pub(crate) fn auto_constraint_messages(
     parser: ParserChoice,
     names: &Names,
     request: &CreateMessageRequest,
     tools: &[Tool],
     reasoning_open: bool,
+    start: GrammarStart,
     continues: bool,
     templates: &Templates,
 ) -> Result<Option<ToolConstraint>, String> {
@@ -553,7 +616,7 @@ pub(crate) fn auto_constraint_messages(
         Some(MessagesToolChoice::Any { .. } | MessagesToolChoice::Tool { .. }) => return Ok(None),
         None => false,
     };
-    Ok(auto_tag(&format, tools, reasoning_open, one_call))
+    Ok(auto_tag(&format, tools, reasoning_open, start, one_call))
 }
 
 /// The constraint preparation finds for what a request asks, before its worker is known: the
@@ -1072,6 +1135,7 @@ mod tests {
     use tool_parser::GrammarStart;
 
     use super::*;
+    use crate::worker::{BasicWorkerBuilder, WorkerType};
 
     fn request(extra: Value) -> ChatCompletionRequest {
         let mut request = json!({"model": "Qwen/Qwen3-8B", "messages": [], "stream": true});
@@ -1130,8 +1194,141 @@ mod tests {
         tools: &[Tool],
         reasoning_open: bool,
     ) -> Option<ToolConstraint> {
-        super::constraint(parser, names, request, tools, reasoning_open, &templates())
+        super::constraint(
+            parser,
+            names,
+            request,
+            tools,
+            reasoning_open,
+            symphony::GrammarStart::Unknown,
+            &templates(),
+        )
+        .expect("no hf")
+    }
+
+    /// Where the model's workers start the grammar shapes what precedes a table's answer or its
+    /// calls when the prompt leaves the thought open: nothing after the reasoning parser's gate
+    /// (a JSON answer then needs no tag; the request's own schema goes to the engine as it is),
+    /// the thought closed first from the first token, and the free-text prefix when the workers
+    /// do not say.
+    #[test]
+    fn the_workers_grammar_start_shapes_what_precedes_a_tables_answer_and_calls() {
+        let deepseek = names(Some("deepseek_v4"), Some("deepseek_v4"));
+        let answer = request(json!({"response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "city", "schema": {"type": "object"}},
+        }}));
+        let tag_of = |start| {
+            super::constraint(
+                ParserChoice::Symphony,
+                &deepseek,
+                &answer,
+                &[],
+                true,
+                start,
+                &templates(),
+            )
             .expect("no hf")
+            .map(|constraint| match constraint {
+                ToolConstraint::StructuralTag(tag) => {
+                    serde_json::from_str::<Value>(&tag).expect("JSON")
+                }
+                ToolConstraint::JsonSchema(schema) => {
+                    panic!("a structural tag, not the JSON schema {schema}")
+                }
+            })
+        };
+        let unknown = tag_of(symphony::GrammarStart::Unknown).expect("a tag with the prefix");
+        assert_eq!(unknown["format"]["elements"][0]["type"], "any_text");
+        assert_eq!(unknown["format"]["elements"][1]["type"], "json_schema");
+        assert_eq!(
+            tag_of(symphony::GrammarStart::AfterReasoning),
+            None,
+            "after the gate the schema stands alone, and needs no tag"
+        );
+        let first = tag_of(symphony::GrammarStart::FirstToken).expect("a tag");
+        assert_eq!(first["format"]["elements"][0]["type"], "tag");
+        assert_eq!(first["format"]["elements"][0]["begin"], "");
+        assert_eq!(first["format"]["elements"][0]["end"], "</think>");
+        assert_eq!(first["format"]["elements"][1]["type"], "json_schema");
+        let forced = request(json!({"tool_choice": "required"}));
+        let call_of = |start| {
+            let Some(ToolConstraint::StructuralTag(tag)) = super::constraint(
+                ParserChoice::Symphony,
+                &deepseek,
+                &forced,
+                &tools(),
+                true,
+                start,
+                &templates(),
+            )
+            .expect("no hf") else {
+                panic!("a forced tag");
+            };
+            serde_json::from_str::<Value>(&tag).expect("JSON")
+        };
+        assert_eq!(
+            call_of(symphony::GrammarStart::Unknown)["format"]["elements"][0]["type"],
+            "any_text"
+        );
+        let bare = call_of(symphony::GrammarStart::AfterReasoning);
+        assert_eq!(
+            bare["format"]["elements"][0]["type"], "const_string",
+            "the block's opener comes first at the gate: {bare}"
+        );
+        let first = call_of(symphony::GrammarStart::FirstToken);
+        assert_eq!(first["format"]["elements"][0]["end"], "</think>");
+        assert_eq!(first["format"]["elements"][1], bare["format"]);
+    }
+
+    /// The model's workers name the start when they all carry the same label; none, a missing
+    /// label or a disagreement leaves it unknown. A worker's own label maps one to one.
+    #[test]
+    fn the_models_workers_name_the_grammar_start_when_they_agree() {
+        let worker = |start: Option<&str>| -> Arc<dyn Worker> {
+            let mut builder =
+                BasicWorkerBuilder::new("grpc://engine:50051").worker_type(WorkerType::Regular);
+            if let Some(start) = start {
+                builder = builder.label(WorkerGrammarStart::LABEL, start);
+            }
+            Arc::new(builder.build())
+        };
+        assert_eq!(grammar_start_of(&[]), symphony::GrammarStart::Unknown);
+        assert_eq!(
+            grammar_start_of(&[worker(None)]),
+            symphony::GrammarStart::Unknown
+        );
+        assert_eq!(
+            grammar_start_of(&[
+                worker(Some("after_reasoning")),
+                worker(Some("after_reasoning"))
+            ]),
+            symphony::GrammarStart::AfterReasoning
+        );
+        assert_eq!(
+            grammar_start_of(&[worker(Some("first_token"))]),
+            symphony::GrammarStart::FirstToken
+        );
+        assert_eq!(
+            grammar_start_of(&[worker(Some("after_reasoning")), worker(Some("first_token"))]),
+            symphony::GrammarStart::Unknown
+        );
+        assert_eq!(
+            grammar_start_of(&[worker(Some("after_reasoning")), worker(None)]),
+            symphony::GrammarStart::Unknown
+        );
+        assert_eq!(
+            grammar_start_from(WorkerGrammarStart::AfterReasoning),
+            symphony::GrammarStart::AfterReasoning
+        );
+        assert_eq!(
+            grammar_start_from(WorkerGrammarStart::FirstToken),
+            symphony::GrammarStart::FirstToken
+        );
+        assert_eq!(
+            grammar_start_from(WorkerGrammarStart::Unknown),
+            symphony::GrammarStart::Unknown
+        );
     }
 
     #[test]
@@ -1804,6 +2001,7 @@ mod tests {
                 &request(extra),
                 &[],
                 reasoning_open,
+                symphony::GrammarStart::Unknown,
                 &templates(),
             )
         };
@@ -1932,6 +2130,7 @@ mod tests {
             &auto,
             &tools(),
             false,
+            symphony::GrammarStart::Unknown,
             &templates(),
         )
         .expect("no hf");
@@ -1957,6 +2156,7 @@ mod tests {
             &auto,
             &[],
             false,
+            symphony::GrammarStart::Unknown,
             &templates(),
         )
         .expect("no hf")
@@ -1967,6 +2167,7 @@ mod tests {
             &auto,
             &tools(),
             false,
+            symphony::GrammarStart::Unknown,
             &templates(),
         )
         .expect("legacy")
@@ -1977,6 +2178,7 @@ mod tests {
             &request(json!({"tool_choice": "none"})),
             &tools(),
             false,
+            symphony::GrammarStart::Unknown,
             &templates(),
         )
         .expect("no hf")
@@ -2000,6 +2202,7 @@ mod tests {
                     &request(own.clone()),
                     &tools(),
                     false,
+                    symphony::GrammarStart::Unknown,
                     &templates(),
                 )
                 .expect("no hf")
@@ -2022,6 +2225,7 @@ mod tests {
                 &messages_auto,
                 &tools,
                 false,
+                symphony::GrammarStart::Unknown,
                 false,
                 &templates(),
             )
@@ -2034,6 +2238,7 @@ mod tests {
             &messages_auto,
             &tools,
             false,
+            symphony::GrammarStart::Unknown,
             true,
             &templates(),
         )
@@ -2049,6 +2254,7 @@ mod tests {
             &messages_any,
             &tools,
             false,
+            symphony::GrammarStart::Unknown,
             false,
             &templates(),
         )
@@ -2274,6 +2480,7 @@ mod tests {
                 &request(extra),
                 &tools(),
                 false,
+                symphony::GrammarStart::Unknown,
                 templates,
             )
         };
@@ -2316,8 +2523,8 @@ mod tests {
                 &request(json!({"response_format": {"type": "json_object"}})),
                 &tools(),
                 false,
-                &templates(),
-            )
+                symphony::GrammarStart::Unknown,
+                &templates(),)
             .expect("read")
             .is_none(),
             "the Qwen3 table's answer tag is the schema alone, the engine's own constraint, so the \
@@ -2380,6 +2587,7 @@ mod tests {
                 &message_request(extra),
                 &tools(),
                 false,
+                symphony::GrammarStart::Unknown,
                 false,
                 &templates(),
             )
@@ -2422,6 +2630,7 @@ mod tests {
             &message_request(json!({"tool_choice": {"type": "any"}})),
             &tools(),
             false,
+            symphony::GrammarStart::Unknown,
             false,
             &unrendered,
         )

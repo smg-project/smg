@@ -423,7 +423,7 @@ mod tests {
         adapt,
         engine::Engine,
         event::Events,
-        grammar::Options,
+        grammar::{GrammarStart, Options},
         input::{EngineFinish, Input},
         parser::Parser as _,
         shape::{intern, CallLayout, Class, Message, NameSource, Pattern, ValueParser, Written},
@@ -582,6 +582,7 @@ mod tests {
             at_least_one,
             reasoning_open: false,
             one_call,
+            start: GrammarStart::Unknown,
         }
     }
 
