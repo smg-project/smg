@@ -58,7 +58,9 @@ const LEAF_BYTES: usize = 256 * 1024;
 /// How many bytes the walks behind one invoke's number leaves may size, the refused walks counted
 /// too. A walk stops at what the leaves may still spell, but a leaf that is refused spends none of
 /// that, so a thousand distinct leaves at a definition just past the budget would each walk it to
-/// the end; past this allowance a number leaf with pointers is free text without a walk.
+/// the end; past this allowance a number leaf with pointers is free text without a walk. A leaf
+/// without pointers walks nothing but itself, which the request already holds, and the allowance
+/// neither bounds nor charges it.
 const WALK_BYTES: usize = 4 * LEAF_BYTES;
 /// What an enum's word costs beyond its length: the alternative that spells it.
 const WORD_FRAMING: usize = 36;
@@ -702,12 +704,14 @@ impl MinimaxM3Parser {
 /// cannot take the elements its siblings need for their own tags. The leaves' spellings are
 /// counted against [`LEAF_BYTES`]: an enum's words, and a number's schema with the definitions
 /// its pointers reach (those and no other, each written once per fragment); once they are spent,
-/// an enum is text as it is and a number free text.
+/// an enum is text as it is and a number free text. The walks that size a number's definitions,
+/// refused ones too, are counted against [`WALK_BYTES`]; once it is spent, a number with pointers
+/// is free text without a walk.
 ///
 /// The `symphony` crate's `grammar/xml.rs` writes the same model's block from its table, and
 /// spells the same output for a schema within the budgets; it follows the references and the
-/// depth cap the same way and has the same element budget, and the byte budget goes to it in a
-/// change of its own.
+/// depth cap the same way and has the same element and byte budgets, and takes the same walk
+/// allowance in its follow-up.
 struct Elements<'a> {
     root: &'a Value,
     /// The pointers of the references on the path being written, outermost first.
@@ -725,7 +729,8 @@ struct Elements<'a> {
     /// worked out once per invoke.
     entry_bytes: HashMap<usize, usize>,
     /// What each number leaf's fragment costs and reaches, by the leaf schema's address: `None`
-    /// for a leaf the budget refused, which it refuses again, the budget only shrinking.
+    /// for a leaf the budget or the walks' allowance refused, which they refuse again, both only
+    /// shrinking.
     reached_by_leaf: HashMap<usize, Option<(usize, Vec<Reached<'a>>)>>,
     /// What each enum costs, by its word list's address.
     enum_bytes: HashMap<usize, usize>,
@@ -1045,7 +1050,8 @@ impl<'a> Elements<'a> {
     /// beside it, those and no other (the entry a pointer names by its first segment, and the
     /// entries those reach), so each pointer resolves once the engine compiles the fragment
     /// alone; a definition the schema declares itself stays. Free text up to `close` once the
-    /// leaves' byte budget cannot take the fragment, definitions included.
+    /// leaves' byte budget cannot take the fragment, definitions included, or the walks' allowance
+    /// ([`WALK_BYTES`]) is spent before the fragment's definitions are sized.
     fn fragment(&mut self, schema: &'a Value, close: &str) -> Value {
         let Some((cost, reached)) = self.reached_within(schema) else {
             return Self::free_text(close);
@@ -1083,11 +1089,20 @@ impl<'a> Elements<'a> {
                 _ => None,
             };
         }
-        let limit = self.leaf_bytes.min(self.walk_bytes);
+        // A leaf without pointers walks nothing but itself, which the request already holds: the
+        // allowance is for the definitions a leaf reaches, and neither bounds nor charges one.
+        let walks = !local_pointers(schema).is_empty();
+        let limit = if walks {
+            self.leaf_bytes.min(self.walk_bytes)
+        } else {
+            self.leaf_bytes
+        };
         let found = self.walk_reached(schema, limit);
-        self.walk_bytes = self
-            .walk_bytes
-            .saturating_sub(found.as_ref().map_or(limit, |(cost, _)| *cost));
+        if walks {
+            self.walk_bytes = self
+                .walk_bytes
+                .saturating_sub(found.as_ref().map_or(limit, |(cost, _)| *cost));
+        }
         self.reached_by_leaf.insert(key, found.clone());
         found
     }

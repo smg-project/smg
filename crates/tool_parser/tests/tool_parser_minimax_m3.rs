@@ -2624,9 +2624,10 @@ fn m3_a_hub_of_thousands_of_definitions_is_walked_within_the_budget() {
 }
 
 /// A hub of 6,300 one-word definitions whose closure sits just past the byte budget, reached by
-/// 1,024 number leaves written inline, each its own schema: a refused walk spends none of the
-/// leaves' budget, so the walks have an allowance of their own, and the leaves after it are free
-/// text without a walk.
+/// 1,023 number leaves written inline, each its own schema, and a plain integer after them: a
+/// refused walk spends none of the leaves' budget, so the walks have an allowance of their own,
+/// the leaves after it are free text without a walk, and the integer, which walks nothing, is a
+/// fragment still.
 #[test]
 fn m3_distinct_leaves_at_a_hub_past_the_budget_stop_walking() {
     let mut defs = serde_json::Map::new();
@@ -2637,7 +2638,7 @@ fn m3_distinct_leaves_at_a_hub_past_the_budget_stop_walking() {
         })
         .collect();
     defs.insert("Hub".to_string(), json!({"anyOf": branches}));
-    let root: serde_json::Map<String, serde_json::Value> = (0..1024)
+    let mut root: serde_json::Map<String, serde_json::Value> = (0..1023)
         .map(|i| {
             (
                 format!("n{i:04}"),
@@ -2645,6 +2646,10 @@ fn m3_distinct_leaves_at_a_hub_past_the_budget_stop_walking() {
             )
         })
         .collect();
+    root.insert(
+        "plain".to_string(),
+        json!({"type": "integer", "minimum": 0}),
+    );
     let required: Vec<String> = root.keys().cloned().collect();
     let tool = schema_tool(json!({
         "type": "object",
@@ -2658,7 +2663,9 @@ fn m3_distinct_leaves_at_a_hub_past_the_budget_stop_walking() {
     let text = serde_json::to_string(&tag).unwrap();
     assert!(text.len() < 400_000, "{} bytes", text.len());
     assert_eq!(elements_written(&tag), 1024);
-    assert!(fragments(&tag).is_empty());
+    let leaves = fragments(&tag);
+    assert_eq!(leaves.len(), 1, "the plain integer's fragment alone");
+    assert_eq!(leaves[0]["type"], "integer");
     assert!(
         free_text_runs(&tag) >= 1000,
         "{} free-text runs",
