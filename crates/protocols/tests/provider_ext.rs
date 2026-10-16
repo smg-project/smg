@@ -2,6 +2,8 @@
 //! deserialize→serialize round trip, and tool_choice validation must
 //! accept "auto"/"none" without tools.
 
+use std::borrow::Cow;
+
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage},
     common::{ImageUrl, ToolChoice, ToolChoiceValue, VideoUrl},
@@ -1590,6 +1592,56 @@ fn callable_tool_names(value: Value) -> Vec<String> {
         .iter()
         .map(|tool| tool.function.name.clone())
         .collect()
+}
+
+#[test]
+fn tool_lists_are_borrowed_from_the_request_where_nothing_narrows_them() {
+    let tool = |name: &str| json!({"type": "function", "function": {"name": name, "parameters": {"type": "object"}}});
+    let request = |value: Value| -> ChatCompletionRequest {
+        serde_json::from_value(value).expect("request deserializes")
+    };
+
+    // Request-level tools and a choice that narrows nothing: the request's own list, as it is.
+    let plain = request(json!({
+        "model": "self-hosted-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [tool("a"), tool("b")],
+        "tool_choice": "auto"
+    }));
+    assert!(matches!(plain.effective_tool_list(), Cow::Borrowed(tools) if tools.len() == 2));
+    assert!(matches!(plain.callable_tools(), Cow::Borrowed(tools) if tools.len() == 2));
+
+    // A named choice narrows: the narrowed list is the request's subset.
+    let named = request(json!({
+        "model": "self-hosted-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [tool("a"), tool("b")],
+        "tool_choice": {"type": "function", "function": {"name": "b"}}
+    }));
+    assert!(matches!(named.effective_tool_list(), Cow::Borrowed(_)));
+    assert!(
+        matches!(named.callable_tools(), Cow::Owned(tools) if tools.len() == 1 && tools[0].function.name == "b")
+    );
+
+    // A tool declared on a message joins the request's: one list that chains both.
+    let dynamic = request(json!({
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "system", "content": "", "tools": [tool("get_weather")]},
+            {"role": "user", "content": "hi"}
+        ],
+        "tools": [tool("a")]
+    }));
+    assert!(
+        matches!(dynamic.effective_tool_list(), Cow::Owned(tools) if tools.len() == 2 && tools[1].function.name == "get_weather")
+    );
+
+    // No tools anywhere: an empty list, borrowed.
+    let none = request(json!({
+        "model": "self-hosted-model",
+        "messages": [{"role": "user", "content": "hi"}]
+    }));
+    assert!(matches!(none.callable_tools(), Cow::Borrowed(tools) if tools.is_empty()));
 }
 
 #[test]

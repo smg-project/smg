@@ -12,7 +12,10 @@
 //!
 //! Notes on what this module decides, and on what it leaves open: `docs/assemblers.md`.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use openai_protocol::common::Tool;
 use serde_json::Value;
@@ -236,33 +239,81 @@ impl<'a> Lookup<'a> {
 
 /// What a request declares about its calls: the parameter types its tools declare, by function
 /// name and then parameter name, and the function its `tool_choice` forces, when it names one.
+/// The tools are read in place, shared with whoever else holds them ([`Declared::shared`]):
+/// neither a reader for one more choice nor the clone the engine takes for a shaped call copies
+/// a schema.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Declared {
-    functions: HashMap<String, HashMap<String, Kind>>,
-    /// Each function's `parameters` schema, for a kind below the top level.
-    schemas: HashMap<String, Value>,
+    tools: Arc<Tools>,
     /// The function the request forces, whose arguments alone the output is under the gateway's
     /// JSON-schema constraint ([`formats::forced`](crate::formats::forced())).
     forced: Option<String>,
 }
 
+/// A request's tools with what [`Declared`] reads from them once: for each function name, the
+/// first tool of that name and the kinds its `parameters.properties` declare.
+#[derive(Debug, Default)]
+struct Tools {
+    tools: Arc<[Tool]>,
+    functions: HashMap<String, Declaration>,
+}
+
+/// One function as its first tool declares it.
+#[derive(Debug)]
+struct Declaration {
+    /// The tool in [`Tools::tools`], whose `parameters` is the function's schema, for a kind
+    /// below the top level.
+    tool: usize,
+    /// The kind of each parameter that declares one.
+    kinds: HashMap<String, Kind>,
+}
+
+impl Tools {
+    /// `function`'s whole `parameters` schema, if a tool declares it.
+    fn schema(&self, function: &str) -> Option<&Value> {
+        let declaration = self.functions.get(function)?;
+        Some(&self.tools[declaration.tool].function.parameters)
+    }
+}
+
+/// Equal when the same functions declare the same kinds and schemas, whatever else their tools
+/// carry.
+impl PartialEq for Tools {
+    fn eq(&self, other: &Self) -> bool {
+        self.functions.len() == other.functions.len()
+            && self.functions.iter().all(|(name, declaration)| {
+                other.functions.get(name).is_some_and(|theirs| {
+                    declaration.kinds == theirs.kinds && self.schema(name) == other.schema(name)
+                })
+            })
+    }
+}
+
+impl Eq for Tools {}
+
 impl Declared {
     /// Reads the types from each tool's `parameters.properties`. When two tools share a name, the
     /// first one's parameters count.
     pub fn of(tools: &[Tool]) -> Self {
-        let mut functions = HashMap::new();
-        let mut schemas = HashMap::new();
-        for tool in tools {
-            functions
-                .entry(tool.function.name.clone())
-                .or_insert_with(|| parameters_of(&tool.function.parameters));
-            schemas
-                .entry(tool.function.name.clone())
-                .or_insert_with(|| tool.function.parameters.clone());
+        Self::shared(Arc::from(tools))
+    }
+
+    /// [`Declared::of`] over tools the caller keeps: they are read in place, and nothing of them
+    /// is copied.
+    pub fn shared(tools: Arc<[Tool]>) -> Self {
+        let mut functions: HashMap<String, Declaration> = HashMap::new();
+        for (at, tool) in tools.iter().enumerate() {
+            if functions.contains_key(&tool.function.name) {
+                continue;
+            }
+            let declaration = Declaration {
+                tool: at,
+                kinds: parameters_of(&tool.function.parameters),
+            };
+            functions.insert(tool.function.name.clone(), declaration);
         }
         Self {
-            functions,
-            schemas,
+            tools: Arc::new(Tools { tools, functions }),
             forced: None,
         }
     }
@@ -281,13 +332,18 @@ impl Declared {
 
     /// The kind `function` declares for `parameter`, if it declares one.
     pub fn kind(&self, function: &str, parameter: &str) -> Option<Kind> {
-        self.functions.get(function)?.get(parameter).copied()
+        self.tools
+            .functions
+            .get(function)?
+            .kinds
+            .get(parameter)
+            .copied()
     }
 
     /// The schema `function` declares for `parameter`: its whole `parameters`, where a `$ref`
     /// points, and the parameter's own schema, if it declares one.
     pub fn parameter(&self, function: &str, parameter: &str) -> Option<(&Value, &Value)> {
-        let root = self.schemas.get(function)?;
+        let root = self.tools.schema(function)?;
         Some((root, root.get("properties")?.get(parameter)?))
     }
 
@@ -297,7 +353,7 @@ impl Declared {
     /// property may be named `item` too, so the schema's shape decides, not the segment). Nothing
     /// when the path leads nowhere in the schema.
     pub fn kind_at(&self, function: &str, path: &[&str]) -> Option<Kind> {
-        let root = self.schemas.get(function)?;
+        let root = self.tools.schema(function)?;
         let mut schema = root;
         for segment in path {
             schema = below(root, schema, segment)?;
@@ -791,6 +847,30 @@ mod tests {
         assert_eq!(declared.kind("count", "query"), Some(Kind::Integer));
         assert_eq!(declared.kind("count", "limit"), None);
         assert_eq!(declared.kind("missing", "query"), None);
+    }
+
+    #[test]
+    fn shared_tools_are_read_in_place_and_equal_a_copy_of_them() {
+        let tools: Arc<[Tool]> = Arc::from(vec![tool(
+            "search",
+            value!({"query": {"type": "string"}, "limit": {"type": "integer"}}),
+        )]);
+        let declared = Declared::shared(Arc::clone(&tools));
+        assert_eq!(
+            Arc::strong_count(&tools),
+            2,
+            "the tools are shared, not copied"
+        );
+        let clone = declared.clone();
+        assert_eq!(Arc::strong_count(&tools), 2, "a clone shares them too");
+        assert_eq!(clone.kind("search", "limit"), Some(Kind::Integer));
+        assert_eq!(clone.kind_at("search", &["query"]), Some(Kind::String));
+        assert_eq!(declared, Declared::of(&tools));
+        assert_ne!(
+            declared,
+            Declared::of(&[tool("search", value!({"query": {"type": "integer"}}))])
+        );
+        assert_ne!(declared, declared.clone().forcing("search"));
     }
 
     #[test]
@@ -1450,7 +1530,10 @@ mod tests {
         assert_eq!(declared.kind_at("f", &["nowhere", "x"]), None);
         // A definition that refers to itself ends at the hop limit and admits nothing.
         let looped = value!({"$ref": "#/$defs/Loop"});
-        assert_eq!(Kind::of(&declared.schemas["f"], &looped), None);
+        let (root, _) = declared
+            .parameter("f", "meta")
+            .expect("a declared parameter");
+        assert_eq!(Kind::of(root, &looped), None);
     }
 
     #[test]

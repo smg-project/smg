@@ -41,7 +41,7 @@
 
 pub(crate) mod template;
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use axum::http::HeaderMap;
 use llm_tokenizer::{
@@ -717,9 +717,9 @@ fn chat_turn(
     request: &ChatCompletionRequest,
     prompt: &str,
 ) -> Result<Option<ToolConstraint>, String> {
-    let declared: Vec<Tool> = request.effective_tools().cloned().collect();
+    let declared = request.effective_tool_list();
     let callable = match request.tool_choice {
-        Some(ToolChoice::Value(ToolChoiceValue::None)) => Vec::new(),
+        Some(ToolChoice::Value(ToolChoiceValue::None)) => Cow::Borrowed(&[][..]),
         _ => request.callable_tools(),
     };
     let schema = answer_schema(request.response_format.as_ref());
@@ -983,10 +983,11 @@ pub(crate) struct Reader {
 }
 
 impl Reader {
-    /// A reader for one choice, seeded with the assignment's prompt.
-    pub(crate) fn new(assignment: &Assignment, tools: &[Tool]) -> Result<Self, String> {
+    /// A reader for one choice, seeded with the assignment's prompt. `tools` are the request's
+    /// as its response spec holds them: every choice's reader shares them, none copies a schema.
+    pub(crate) fn new(assignment: &Assignment, tools: Arc<[Tool]>) -> Result<Self, String> {
         let mut reader = Self {
-            engine: Engine::new(assignment.format.clone(), Declared::of(tools)),
+            engine: Engine::new(assignment.format.clone(), Declared::shared(tools)),
             events: Events::new(),
             last_token: None,
             ends: Vec::new(),
@@ -2394,7 +2395,7 @@ mod tests {
             format: qwen3(CallSyntax::Json),
             prompt: String::new(),
         };
-        let mut reader = Reader::new(&assignment, &[]).expect("a reader");
+        let mut reader = Reader::new(&assignment, Arc::default()).expect("a reader");
         assert!(!reader.ended());
         let events = reader.end(EngineFinish::Stop).expect("ended");
         assert!(finished(&events).is_some());
@@ -2699,7 +2700,7 @@ mod tests {
             format,
             prompt: "<|im_start|>assistant\n".to_string(),
         };
-        let mut reader = Reader::new(&assignment, &tools()).expect("a reader");
+        let mut reader = Reader::new(&assignment, tools().into()).expect("a reader");
         let mut events = reader.tail(QWEN3_OUTPUT).expect("read");
         events.extend(reader.end(EngineFinish::Stop).expect("ended"));
         events
@@ -2716,7 +2717,7 @@ mod tests {
             prompt: "<|im_start|>assistant\n".to_string(),
         };
         let calls = |first_only: bool| {
-            let mut reader = Reader::new(&assignment, &tools())
+            let mut reader = Reader::new(&assignment, tools().into())
                 .expect("a reader")
                 .first_call_only(first_only);
             let mut events = reader.tail(TWO_CALLS).expect("read");
@@ -2750,7 +2751,7 @@ mod tests {
             format: symphony::formats::json().without_calls(),
             prompt: String::new(),
         };
-        let mut reader = Reader::new(&assignment, &[]).expect("a reader");
+        let mut reader = Reader::new(&assignment, Arc::default()).expect("a reader");
         let answer = "{\"answer\": 42}";
         let mut events = reader.tail(answer).expect("read");
         events.extend(reader.end(EngineFinish::Stop).expect("ended"));

@@ -196,7 +196,7 @@ async fn a_call_the_conversation_established_is_a_call_without_a_tool_inventory(
     );
     let mut spec = ChatResponseSpec::from(&request);
     assert!(
-        spec.tools.as_ref().is_some_and(Vec::is_empty),
+        spec.tools.as_deref().is_some_and(<[Tool]>::is_empty),
         "scanned for calls, with no inventory"
     );
     spec.symphony = Some(assignment);
@@ -462,7 +462,7 @@ fn assigned_message(format: Format, prompt: &str, thinking: bool) -> MessagesRes
         tool_choice: None,
         has_tools: true,
         history_tool_calls_count: 0,
-        chat_tools: lookup_tools(),
+        chat_tools: lookup_tools().into(),
         stop_sequences: None,
         symphony: Some(Assignment {
             format,

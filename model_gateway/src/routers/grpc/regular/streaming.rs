@@ -632,7 +632,7 @@ impl StreamingProcessor {
                             let reader = match readers.entry(index) {
                                 Entry::Occupied(reader) => reader.into_mut(),
                                 Entry::Vacant(slot) => slot.insert(
-                                    Reader::new(assignment, tools.as_deref().unwrap_or(&[]))?
+                                    Reader::new(assignment, tools.clone().unwrap_or_default())?
                                         .first_call_only(original_request.first_tool_call_only),
                                 ),
                             };
@@ -2695,7 +2695,7 @@ impl StreamingProcessor {
             .symphony
             .as_ref()
             .map(|assignment| {
-                Reader::new(assignment, chat_tools)
+                Reader::new(assignment, Arc::clone(&original_request.chat_tools))
                     .map(|reader| reader.first_call_only(original_request.first_tool_call_only))
             })
             .transpose()?

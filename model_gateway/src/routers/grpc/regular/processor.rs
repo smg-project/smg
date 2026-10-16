@@ -341,7 +341,7 @@ impl ResponseProcessor {
         tokenizer: &Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<(ChatChoice, u32), String> {
-        let tools = original_request.tools.as_deref().unwrap_or(&[]);
+        let tools = original_request.tools.clone().unwrap_or_default();
         let mut reader =
             Reader::new(assignment, tools)?.first_call_only(original_request.first_tool_call_only);
         let (mut events, stopped) = reader.read(stop_decoder, complete.output_ids())?;
@@ -414,7 +414,7 @@ impl ResponseProcessor {
         request: &MessagesResponseSpec,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<Message, String> {
-        let mut reader = Reader::new(assignment, &request.chat_tools)?
+        let mut reader = Reader::new(assignment, Arc::clone(&request.chat_tools))?
             .first_call_only(request.first_tool_call_only);
         stop_decoder.reset();
         let (mut events, stopped) = reader.read(stop_decoder, complete.output_ids())?;

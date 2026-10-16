@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -834,16 +834,41 @@ impl ChatCompletionRequest {
         self.tools.iter().flatten().chain(self.dynamic_tools())
     }
 
-    /// The tools a `tool_choice` may force: [`Self::effective_tools`] narrowed
-    /// by the choice (see [`ToolChoice::narrow_tools`]). A `tool_choice`
-    /// grammar must be built from this set; built from `tools` alone, a
-    /// forced call could only ever land on a request-level tool.
-    pub fn callable_tools(&self) -> Vec<Tool> {
-        let tools: Vec<Tool> = self.effective_tools().cloned().collect();
-        self.tool_choice
+    /// [`Self::effective_tools`] as one list: the request's own `tools`,
+    /// borrowed as they are, when no message declares a tool; a list that
+    /// chains both otherwise. The serving path reads the set several times per
+    /// request (the constraint, the response spec, the table that reads the
+    /// calls), so where nothing narrows it, nothing copies it.
+    pub fn effective_tool_list(&self) -> Cow<'_, [Tool]> {
+        let mut dynamic = self.dynamic_tools().peekable();
+        if dynamic.peek().is_none() {
+            return Cow::Borrowed(self.tools.as_deref().unwrap_or(&[]));
+        }
+        Cow::Owned(
+            self.tools
+                .iter()
+                .flatten()
+                .chain(dynamic)
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// The tools a `tool_choice` may force: [`Self::effective_tool_list`]
+    /// narrowed by the choice (see [`ToolChoice::narrow_tools`]). A
+    /// `tool_choice` grammar must be built from this set; built from `tools`
+    /// alone, a forced call could only ever land on a request-level tool. The
+    /// list is borrowed from the request where the choice narrows nothing.
+    pub fn callable_tools(&self) -> Cow<'_, [Tool]> {
+        let tools = self.effective_tool_list();
+        match self
+            .tool_choice
             .as_ref()
             .and_then(|choice| choice.narrow_tools(&tools))
-            .unwrap_or(tools)
+        {
+            Some(narrowed) => Cow::Owned(narrowed),
+            None => tools,
+        }
     }
 }
 

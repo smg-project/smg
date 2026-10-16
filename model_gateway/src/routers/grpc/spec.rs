@@ -78,7 +78,9 @@ pub(crate) struct ChatResponseSpec {
     pub provider: ProviderProfile,
     pub separate_reasoning: bool,
     pub tool_choice: Option<ToolChoice>,
-    pub tools: Option<Vec<Tool>>,
+    /// The tools the response is read against, shared with the readers that
+    /// type its calls (one per choice) rather than copied into each.
+    pub tools: Option<Arc<[Tool]>>,
     pub history_tool_calls_count: usize,
     pub stream_options: Option<StreamOptions>,
     /// `parallel_tool_calls: false`: only the first tool call is returned.
@@ -130,8 +132,7 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             // (`ChatCompletionRequest::declares_tools`, the one answer every
             // gate reads) and the provider does not parse tool calls without
             // them (`scans_for_tool_calls`).
-            tools: scans_for_tool_calls(request)
-                .then(|| request.effective_tools().cloned().collect()),
+            tools: scans_for_tool_calls(request).then(|| Arc::from(request.effective_tool_list())),
             history_tool_calls_count: request.history_tool_calls_count(),
             stream_options: request.stream_options.clone(),
             first_tool_call_only: request.disables_parallel_tool_calls(),
@@ -182,8 +183,8 @@ pub(crate) struct MessagesResponseSpec {
     pub history_tool_calls_count: usize,
     /// The custom tools as chat tools, converted once: the template renders
     /// them (narrowed by `tool_choice`), the constraints and the parsers
-    /// read them.
-    pub chat_tools: Vec<Tool>,
+    /// read them; shared with the reader that types the calls.
+    pub chat_tools: Arc<[Tool]>,
     /// The stop sequences as the decoders match them.
     pub stop_sequences: Option<StringOrArray>,
     /// Symphony's assignment when a table reads the message (see `regular::symphony`).
@@ -201,7 +202,7 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
             tool_choice: request.tool_choice.clone(),
             has_tools: request.tools.is_some(),
             history_tool_calls_count: request.history_tool_calls_count(),
-            chat_tools: request.chat_tools(),
+            chat_tools: request.chat_tools().into(),
             stop_sequences: request.stop_sequences.clone().map(StringOrArray::Array),
             symphony: None,
             first_tool_call_only: request.disables_parallel_tool_use(),
@@ -285,7 +286,7 @@ mod tests {
     fn tool_names(spec: &ChatResponseSpec) -> Vec<String> {
         spec.tools
             .iter()
-            .flatten()
+            .flat_map(|tools| tools.iter())
             .map(|tool| tool.function.name.clone())
             .collect()
     }
@@ -394,6 +395,9 @@ mod tests {
             "messages": [{"role": "user", "content": "try again"}]
         }));
 
-        assert_eq!(ChatResponseSpec::from(&request).tools, Some(Vec::new()));
+        assert_eq!(
+            ChatResponseSpec::from(&request).tools.as_deref(),
+            Some(&[][..])
+        );
     }
 }
