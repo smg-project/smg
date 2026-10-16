@@ -1,0 +1,854 @@
+{
+  "cases": [
+    {
+      "expansion": "<|image_start|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|image_end|>",
+      "fnv1a_bf16": "f5d82a712e874039",
+      "fnv1a_f32": "3ae4f0042883d9a1",
+      "grid_thw": [
+        1,
+        6,
+        6
+      ],
+      "height": 64,
+      "name": "synthetic_64x64",
+      "resized_hw": [
+        84,
+        84
+      ],
+      "shape": [
+        36,
+        1176
+      ],
+      "source": {
+        "seed": 0
+      },
+      "tokens": 9,
+      "width": 64
+    },
+    {
+      "expansion": "<|image_start|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|image_end|>",
+      "fnv1a_bf16": "f26dc56a20ed72c9",
+      "fnv1a_f32": "7a50eb0b3c74cafd",
+      "grid_thw": [
+        1,
+        8,
+        6
+      ],
+      "height": 128,
+      "name": "synthetic_96x128",
+      "resized_hw": [
+        112,
+        84
+      ],
+      "shape": [
+        48,
+        1176
+      ],
+      "source": {
+        "seed": 1
+      },
+      "tokens": 12,
+      "width": 96
+    },
+    {
+      "expansion": "<|image_start|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|image_end|>",
+      "fnv1a_bf16": "5f6ce2deba02edc5",
+      "fnv1a_f32": "c06b184d39371bbd",
+      "grid_thw": [
+        1,
+        12,
+        16
+      ],
+      "height": 150,
+      "name": "synthetic_200x150",
+      "resized_hw": [
+        168,
+        224
+      ],
+      "shape": [
+        192,
+        1176
+      ],
+      "source": {
+        "seed": 2
+      },
+      "tokens": 48,
+      "width": 200
+    },
+    {
+      "expansion": "<|image_start|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|image_end|>",
+      "fnv1a_bf16": "b52df813f1e5e4e5",
+      "fnv1a_f32": "8052e4106958796d",
+      "grid_thw": [
+        1,
+        18,
+        24
+      ],
+      "height": 240,
+      "name": "synthetic_320x240",
+      "resized_hw": [
+        252,
+        336
+      ],
+      "shape": [
+        432,
+        1176
+      ],
+      "source": {
+        "seed": 3
+      },
+      "tokens": 108,
+      "width": 320
+    },
+    {
+      "expansion": "<|image_start|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|image_end|>",
+      "fnv1a_bf16": "4fbc277413143825",
+      "fnv1a_f32": "7c39297ab0dc75ad",
+      "grid_thw": [
+        1,
+        38,
+        38
+      ],
+      "height": 512,
+      "name": "synthetic_512x512",
+      "resized_hw": [
+        532,
+        532
+      ],
+      "shape": [
+        1444,
+        1176
+      ],
+      "source": {
+        "seed": 4
+      },
+      "tokens": 361,
+      "width": 512
+    },
+    {
+      "expansion": "<|image_start|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|image_end|>",
+      "fnv1a_bf16": "ff0c28cbaea27e95",
+      "fnv1a_f32": "cfa5638601a79b39",
+      "grid_thw": [
+        1,
+        34,
+        46
+      ],
+      "height": 480,
+      "name": "synthetic_640x480",
+      "resized_hw": [
+        476,
+        644
+      ],
+      "shape": [
+        1564,
+        1176
+      ],
+      "source": {
+        "seed": 5
+      },
+      "tokens": 391,
+      "width": 640
+    },
+    {
+      "expansion": "<|image_start|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|image_end|>",
+      "fnv1a_bf16": "03bef4a89aaa7b4d",
+      "fnv1a_f32": "88558b73b3898a11",
+      "grid_thw": [
+        1,
+        74,
+        74
+      ],
+      "height": 1024,
+      "name": "synthetic_1024x1024",
+      "resized_hw": [
+        1036,
+        1036
+      ],
+      "shape": [
+        5476,
+        1176
+      ],
+      "source": {
+        "seed": 6
+      },
+      "tokens": 1369,
+      "width": 1024
+    },
+    {
+      "expansion": "<|image_start|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|image_end|>",
+      "fnv1a_bf16": "147081edaae6e771",
+      "fnv1a_f32": "e7f3010af9671cfd",
+      "grid_thw": [
+        1,
+        22,
+        86
+      ],
+      "height": 300,
+      "name": "synthetic_1200x300",
+      "resized_hw": [
+        308,
+        1204
+      ],
+      "shape": [
+        1892,
+        1176
+      ],
+      "source": {
+        "seed": 7
+      },
+      "tokens": 473,
+      "width": 1200
+    },
+    {
+      "expansion": "<|image_start|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|image_end|>",
+      "fnv1a_bf16": "d9d7a39451460cf5",
+      "fnv1a_f32": "664d75a5021b44b5",
+      "grid_thw": [
+        1,
+        86,
+        22
+      ],
+      "height": 1200,
+      "name": "synthetic_300x1200",
+      "resized_hw": [
+        1204,
+        308
+      ],
+      "shape": [
+        1892,
+        1176
+      ],
+      "source": {
+        "seed": 8
+      },
+      "tokens": 473,
+      "width": 300
+    },
+    {
+      "expansion": "<|image_start|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|image_end|>",
+      "fnv1a_bf16": "27199543d6814fd1",
+      "fnv1a_f32": "474860fb5b955ee9",
+      "grid_thw": [
+        1,
+        52,
+        92
+      ],
+      "height": 720,
+      "name": "synthetic_1280x720",
+      "resized_hw": [
+        728,
+        1288
+      ],
+      "shape": [
+        4784,
+        1176
+      ],
+      "source": {
+        "seed": 9
+      },
+      "tokens": 1196,
+      "width": 1280
+    },
+    {
+      "expansion": "<|image_start|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|image_end|>",
+      "fnv1a_bf16": "f838a290e9e39155",
+      "fnv1a_f32": "af3c6c815c2dbc5d",
+      "grid_thw": [
+        1,
+        78,
+        138
+      ],
+      "height": 1080,
+      "name": "synthetic_1920x1080",
+      "resized_hw": [
+        1092,
+        1932
+      ],
+      "shape": [
+        10764,
+        1176
+      ],
+      "source": {
+        "seed": 10
+      },
+      "tokens": 2691,
+      "width": 1920
+    },
+    {
+      "expansion": "<|image_start|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|image_end|>",
+      "fnv1a_bf16": "cbeb7d4c3e5a03d5",
+      "fnv1a_f32": "06f18815fce045a5",
+      "grid_thw": [
+        1,
+        104,
+        156
+      ],
+      "height": 2000,
+      "name": "synthetic_3000x2000",
+      "resized_hw": [
+        1456,
+        2184
+      ],
+      "shape": [
+        16224,
+        1176
+      ],
+      "source": {
+        "seed": 11
+      },
+      "tokens": 4056,
+      "width": 3000
+    },
+    {
+      "expansion": "<|image_start|><|patch|><|patch|><|patch|><|patch|><|image_end|>",
+      "fnv1a_bf16": "8b08b1915ad35af9",
+      "fnv1a_f32": "13049a5f3bade611",
+      "grid_thw": [
+        1,
+        4,
+        4
+      ],
+      "height": 56,
+      "name": "synthetic_41x56",
+      "resized_hw": [
+        56,
+        56
+      ],
+      "shape": [
+        16,
+        1176
+      ],
+      "source": {
+        "seed": 12
+      },
+      "tokens": 4,
+      "width": 41
+    },
+    {
+      "expansion": "<|image_start|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|image_end|>",
+      "fnv1a_bf16": "0cc0905f568cea09",
+      "fnv1a_f32": "8ba9d209c20a5889",
+      "grid_thw": [
+        1,
+        26,
+        2
+      ],
+      "height": 351,
+      "name": "synthetic_28x351",
+      "resized_hw": [
+        364,
+        28
+      ],
+      "shape": [
+        52,
+        1176
+      ],
+      "source": {
+        "seed": 13
+      },
+      "tokens": 13,
+      "width": 28
+    },
+    {
+      "expansion": "<|image_start|><|patch|><|image_end|>",
+      "fnv1a_bf16": "e5a65537f3164ca5",
+      "fnv1a_f32": "511b1c0ff54f62a5",
+      "grid_thw": [
+        1,
+        2,
+        2
+      ],
+      "height": 1,
+      "name": "synthetic_1x1",
+      "resized_hw": [
+        28,
+        28
+      ],
+      "shape": [
+        4,
+        1176
+      ],
+      "source": {
+        "seed": 14
+      },
+      "tokens": 1,
+      "width": 1
+    },
+    {
+      "expansion": "<|image_start|><|patch|><|image_end|>",
+      "fnv1a_bf16": "ad28b568f5ebeda5",
+      "fnv1a_f32": "4d6c2d02a7b40285",
+      "grid_thw": [
+        1,
+        2,
+        2
+      ],
+      "height": 3,
+      "name": "synthetic_2x3",
+      "resized_hw": [
+        28,
+        28
+      ],
+      "shape": [
+        4,
+        1176
+      ],
+      "source": {
+        "seed": 15
+      },
+      "tokens": 1,
+      "width": 2
+    },
+    {
+      "expansion": "<|image_start|><|patch|><|image_end|>",
+      "fnv1a_bf16": "c78892b2aeb5725d",
+      "fnv1a_f32": "4db75fd8931af231",
+      "grid_thw": [
+        1,
+        2,
+        2
+      ],
+      "height": 47,
+      "name": "synthetic_47x47",
+      "resized_hw": [
+        28,
+        28
+      ],
+      "shape": [
+        4,
+        1176
+      ],
+      "source": {
+        "seed": 16
+      },
+      "tokens": 1,
+      "width": 47
+    },
+    {
+      "expansion": "<|image_start|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|image_end|>",
+      "fnv1a_bf16": "c81d60f6f55e9511",
+      "fnv1a_f32": "b821c992dacc92c1",
+      "grid_thw": [
+        1,
+        2,
+        216
+      ],
+      "height": 10,
+      "name": "synthetic_3000x10",
+      "resized_hw": [
+        28,
+        3024
+      ],
+      "shape": [
+        432,
+        1176
+      ],
+      "source": {
+        "seed": 17
+      },
+      "tokens": 108,
+      "width": 3000
+    },
+    {
+      "expansion": "<|image_start|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|image_end|>",
+      "fnv1a_bf16": "f47cda1aad362c5d",
+      "fnv1a_f32": "f5c3326ee12ef129",
+      "grid_thw": [
+        1,
+        8,
+        8
+      ],
+      "height": 130,
+      "name": "synthetic_137x130",
+      "resized_hw": [
+        112,
+        112
+      ],
+      "shape": [
+        64,
+        1176
+      ],
+      "source": {
+        "seed": 18
+      },
+      "tokens": 16,
+      "width": 137
+    },
+    {
+      "expansion": "<|image_start|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|image_end|>",
+      "fnv1a_bf16": "549a0c35fd9c8ea1",
+      "fnv1a_f32": "44ff29cb6a895c09",
+      "grid_thw": [
+        1,
+        34,
+        34
+      ],
+      "height": 469,
+      "name": "synthetic_463x469",
+      "resized_hw": [
+        476,
+        476
+      ],
+      "shape": [
+        1156,
+        1176
+      ],
+      "source": {
+        "seed": 19
+      },
+      "tokens": 289,
+      "width": 463
+    },
+    {
+      "expansion": "<|image_start|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|image_end|>",
+      "fnv1a_bf16": "5f3cf79d3d4807bd",
+      "fnv1a_f32": "2b95e7f477d2cd1d",
+      "grid_thw": [
+        1,
+        50,
+        50
+      ],
+      "height": 688,
+      "name": "synthetic_698x688",
+      "resized_hw": [
+        700,
+        700
+      ],
+      "shape": [
+        2500,
+        1176
+      ],
+      "source": {
+        "seed": 20
+      },
+      "tokens": 625,
+      "width": 698
+    },
+    {
+      "expansion": "<|image_start|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|image_end|>",
+      "fnv1a_bf16": "4eae04b8c1bf7dc1",
+      "fnv1a_f32": "0cd7f1b3049b0281",
+      "grid_thw": [
+        1,
+        50,
+        74
+      ],
+      "height": 701,
+      "name": "carrots",
+      "resized_hw": [
+        700,
+        1036
+      ],
+      "shape": [
+        3700,
+        1176
+      ],
+      "source": {
+        "file": "deepseek_v41_carrots.png"
+      },
+      "tokens": 925,
+      "width": 1024
+    },
+    {
+      "expansion": "<|image_start|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|patch|><|image_end|>",
+      "fnv1a_bf16": "774b3d335b128de9",
+      "fnv1a_f32": "c186c8c02c69c839",
+      "grid_thw": [
+        1,
+        22,
+        32
+      ],
+      "height": 308,
+      "name": "corn",
+      "resized_hw": [
+        308,
+        448
+      ],
+      "shape": [
+        704,
+        1176
+      ],
+      "source": {
+        "file": "deepseek_v41_corn.png"
+      },
+      "tokens": 176,
+      "width": 450
+    },
+    {
+      "expansion": "",
+      "fnv1a_bf16": "4434f1d0a66b8b69",
+      "fnv1a_f32": "42881e48112ab055",
+      "grid_thw": [
+        [
+          1,
+          12,
+          16
+        ],
+        [
+          1,
+          8,
+          6
+        ]
+      ],
+      "height": 0,
+      "name": "batch_200x150_96x128",
+      "resized_hw": [
+        0,
+        0
+      ],
+      "shape": [
+        240,
+        1176
+      ],
+      "source": {
+        "seeds": [
+          2,
+          1
+        ],
+        "sizes": [
+          [
+            200,
+            150
+          ],
+          [
+            96,
+            128
+          ]
+        ]
+      },
+      "tokens": [
+        48,
+        12
+      ],
+      "width": 0
+    }
+  ],
+  "image_config": {
+    "do_convert_rgb": true,
+    "do_normalize": true,
+    "do_rescale": true,
+    "do_resize": true,
+    "image_mean": [
+      0.5,
+      0.5,
+      0.5
+    ],
+    "image_std": [
+      0.5,
+      0.5,
+      0.5
+    ],
+    "max_image_tokens": 4096,
+    "merge_size": 2,
+    "patch_size": 14,
+    "resample": 1,
+    "rescale_factor": 0.00392156862745098,
+    "temporal_patch_size": 2
+  },
+  "reference": "transformers 5.20.0 MuseGlimmerImageProcessor / MuseGlimmerVideoProcessor (torchvision backend), torch 2.14.1+cpu",
+  "reference_sha256": {
+    "image_processing_muse_glimmer.py": "827b93a32e8a4b3c80c35395cc261f798a3af3b17665116b0b30d40906a960a9",
+    "video_processing_muse_glimmer.py": "5fd8eea79870585cfcfd9b3578887b8ea0b823059e588609ee7fdf6b89d0f56c"
+  },
+  "video_cases": [
+    {
+      "expansion": "<|vid_start|>Time: 0.00s<|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|vid_end|>",
+      "fnv1a_bf16": "1ab840dc4c39865c",
+      "fnv1a_f32": "596558a8661122a4",
+      "frame_indices": [
+        0,
+        7
+      ],
+      "grid_thw": [
+        1,
+        18,
+        24
+      ],
+      "height": 240,
+      "name": "clip_320x240_8fps_1s",
+      "resized_hw": [
+        252,
+        336
+      ],
+      "shape": [
+        432,
+        1176
+      ],
+      "source": {
+        "fps": 8.0,
+        "frames": 8,
+        "seed": 30
+      },
+      "stamps": [
+        "Time: 0.00s"
+      ],
+      "tokens": 108,
+      "width": 320
+    },
+    {
+      "expansion": "<|vid_start|>Time: 0.00s<|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|vid_end|>",
+      "fnv1a_bf16": "6dcf0efaba624cf0",
+      "fnv1a_f32": "20cdce18cde4b760",
+      "frame_indices": [
+        0,
+        4
+      ],
+      "grid_thw": [
+        1,
+        24,
+        42
+      ],
+      "height": 360,
+      "name": "clip_640x360_24fps_5frames",
+      "resized_hw": [
+        336,
+        588
+      ],
+      "shape": [
+        1008,
+        1176
+      ],
+      "source": {
+        "fps": 24.0,
+        "frames": 5,
+        "seed": 40
+      },
+      "stamps": [
+        "Time: 0.00s"
+      ],
+      "tokens": 252,
+      "width": 640
+    },
+    {
+      "expansion": "<|vid_start|>Time: 0.00s<|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|vid_end|>",
+      "fnv1a_bf16": "1395612fe5e3873d",
+      "fnv1a_f32": "a34010df3f458cbb",
+      "frame_indices": [
+        0,
+        44
+      ],
+      "grid_thw": [
+        1,
+        24,
+        42
+      ],
+      "height": 720,
+      "name": "clip_1280x720_30fps_45frames",
+      "resized_hw": [
+        336,
+        588
+      ],
+      "shape": [
+        1008,
+        1176
+      ],
+      "source": {
+        "fps": 30.0,
+        "frames": 45,
+        "seed": 50
+      },
+      "stamps": [
+        "Time: 0.00s"
+      ],
+      "tokens": 252,
+      "width": 1280
+    },
+    {
+      "expansion": "<|vid_start|>Time: 0.00s<|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|vid_end|>",
+      "fnv1a_bf16": "8076a3df82611ed5",
+      "fnv1a_f32": "60daf0574c096959",
+      "frame_indices": [
+        0
+      ],
+      "grid_thw": [
+        1,
+        8,
+        8
+      ],
+      "height": 96,
+      "name": "clip_96x96_1frame",
+      "resized_hw": [
+        112,
+        112
+      ],
+      "shape": [
+        64,
+        1176
+      ],
+      "source": {
+        "fps": 25.0,
+        "frames": 1,
+        "seed": 60
+      },
+      "stamps": [
+        "Time: 0.00s"
+      ],
+      "tokens": 16,
+      "width": 96
+    },
+    {
+      "expansion": "<|vid_start|>Time: 0.00s<|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|vid_frame_separator|>Time: 1.67s<|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|video|><|vid_end|>",
+      "fnv1a_bf16": "3d4ac2789bf1240b",
+      "fnv1a_f32": "e2e48fd36993559f",
+      "frame_indices": [
+        0,
+        10,
+        20,
+        30
+      ],
+      "grid_thw": [
+        2,
+        22,
+        14
+      ],
+      "height": 300,
+      "name": "clip_200x300_12fps_31frames",
+      "resized_hw": [
+        308,
+        196
+      ],
+      "shape": [
+        616,
+        1176
+      ],
+      "source": {
+        "fps": 12.0,
+        "frames": 31,
+        "seed": 70
+      },
+      "stamps": [
+        "Time: 0.00s",
+        "Time: 1.67s"
+      ],
+      "tokens": 154,
+      "width": 200
+    }
+  ],
+  "video_config": {
+    "do_convert_rgb": true,
+    "do_normalize": true,
+    "do_rescale": true,
+    "do_resize": true,
+    "do_sample_frames": true,
+    "fps": 2.0,
+    "frame_timestamp_format": "Time: {timestamp:.2f}s",
+    "image_mean": [
+      0.5,
+      0.5,
+      0.5
+    ],
+    "image_std": [
+      0.5,
+      0.5,
+      0.5
+    ],
+    "max_video_frame_tokens": 256,
+    "merge_size": 2,
+    "num_frames": 600,
+    "patch_size": 14,
+    "resample": 1,
+    "rescale_factor": 0.00392156862745098,
+    "temporal_patch_size": 2
+  }
+}
