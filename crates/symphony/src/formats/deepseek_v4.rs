@@ -634,6 +634,12 @@ mod tests {
             .expect("the shape");
         let prompt = format!("<｜Assistant｜>{}", turn.tail);
         let whole = run(&prompt, &[turn.output]);
+        assert!(
+            !whole
+                .iter()
+                .any(|event| matches!(event, Event::Malformed { .. })),
+            "the whole turn reads with every wrapper byte dropped, none malformed"
+        );
         for cut in 1..turn.output.len() {
             if !turn.output.is_char_boundary(cut) {
                 continue;
@@ -644,6 +650,18 @@ mod tests {
             assert_eq!(
                 arguments_of(&events, 0),
                 arguments_of(&whole, 0),
+                "cut at {cut}"
+            );
+            assert_eq!(content_of(&events), content_of(&whole), "cut at {cut}");
+            assert_eq!(reasoning_of(&events), reasoning_of(&whole), "cut at {cut}");
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::Malformed { .. })),
+                "cut at {cut}: a wrapper byte read as malformed text"
+            );
+            assert!(
+                matches!(events.last(), Some(Event::Finish { tool_calls: 1, .. })),
                 "cut at {cut}"
             );
         }
