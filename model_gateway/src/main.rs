@@ -889,8 +889,10 @@ struct CliArgs {
     #[arg(long, action = ArgAction::SetTrue, help_heading = "Multimodal")]
     mm_allow_private_media_hosts: bool,
 
-    /// Listener IP for the RDMA pixel lane's metadata exchange; without one
-    /// the lane stays on the inline path. Falls back to `SMG_RDMA_LISTEN_IP`.
+    /// Listener IP for the RDMA pixel lane's metadata exchange, a plain IPv4
+    /// or IPv6 address (no hostname, port or brackets: the workers connect to
+    /// it as written); without one the lane stays on the inline path. Falls
+    /// back to `SMG_RDMA_LISTEN_IP`.
     #[arg(long, help_heading = "Multimodal")]
     rdma_listen_ip: Option<String>,
 
@@ -1651,7 +1653,8 @@ struct CliArgs {
     webrtc_stun_server: Option<String>,
 
     // ==================== Runtime ====================
-    /// Explicit async runtime worker-thread count, at least 1. Leave unset to
+    /// Explicit async runtime worker-thread count, from 1 to 4 x the CPUs
+    /// available to the process (a refusal names the bound). Leave unset to
     /// use tokio's default (`available_parallelism()`), which already honors the
     /// cgroup CPU quota on Rust 1.95+ and is therefore container-aware.
     #[arg(long, help_heading = "Runtime")]
@@ -4723,6 +4726,58 @@ mod tests {
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert_eq!(server_config.runtime_worker_threads, None);
+    }
+
+    /// Both values the validator bounds are checked on the command line's own
+    /// path, after the flags are parsed and before the runtime is built: a
+    /// count above the host's bound is refused naming the field and the
+    /// bound, a listener address that is not an IP address naming its field
+    /// and the value; the smallest count and a plain address pass.
+    #[test]
+    fn runtime_worker_threads_and_rdma_listen_ip_are_validated_on_the_cli_path() {
+        // The builder validates as it builds the configuration, and the
+        // configure phase validates once more before the runtime is built;
+        // the refusal reads the same from either.
+        let refusal = |args: &[&str]| match cli_args_from(args).to_router_config(vec![], vec![]) {
+            Err(err) => err.to_string(),
+            Ok(config) => config.validate().expect_err("refused").to_string(),
+        };
+        let text = refusal(&["--runtime-worker-threads", "100000"]);
+        assert!(
+            text.contains("runtime_worker_threads") && text.contains("Must be at most"),
+            "{text}"
+        );
+        let text = refusal(&["--rdma-listen-ip", "999.1.1.1", "--mm-pixel-rdma"]);
+        assert!(
+            text.contains("rdma_listen_ip")
+                && text.contains("999.1.1.1")
+                && text.contains("expected an IP address"),
+            "{text}"
+        );
+        cli_args_from(&[
+            "--runtime-worker-threads",
+            "1",
+            "--rdma-listen-ip",
+            "10.0.0.7",
+            "--mm-pixel-rdma",
+        ])
+        .to_router_config(vec![], vec![])
+        .unwrap()
+        .validate()
+        .unwrap();
+    }
+
+    /// The flag's help states the bound as the validator computes it.
+    #[test]
+    fn the_runtime_flag_help_names_the_bound() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        let bound = format!(
+            "from 1 to {} x the CPUs available to the process",
+            smg::config::RUNTIME_WORKER_THREADS_PER_CPU
+        );
+        assert!(help.contains(&bound), "{help}");
     }
 
     /// Over ZMQ, `--backend` pins the startup workers' runtime (the shared

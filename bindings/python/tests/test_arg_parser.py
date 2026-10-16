@@ -623,6 +623,21 @@ class TestParseRouterArgs:
                 parse_router_args([flag, "-1"])
         assert parse_router_args(["--mm-pixel-cache-mb", "0"]).mm_pixel_cache_mb == 0
 
+    def test_rdma_listen_ip_takes_an_ip_address_only(self):
+        """The RDMA listener address is parsed as the router validates it: a plain IPv4
+        or IPv6 literal (padding dropped, blank is unset); a non-address, a hostname, a
+        port or brackets are refused by the parser, before the router is built."""
+        for value, parsed in [
+            ("10.0.0.7", "10.0.0.7"),
+            ("fd00::1", "fd00::1"),
+            (" 10.0.0.7 ", "10.0.0.7"),
+            ("   ", None),
+        ]:
+            assert parse_router_args(["--rdma-listen-ip", value]).rdma_listen_ip == parsed
+        for value in ["999.1.1.1", "10.0.0", "gateway.example", "10.0.0.7:18515", "[fd00::1]"]:
+            with pytest.raises(SystemExit):
+                parse_router_args(["--rdma-listen-ip", value])
+
     def test_parse_routing_key_headers(self):
         """Ordered list flag; unset keeps the x-smg-routing-key default."""
         router_args = parse_router_args(

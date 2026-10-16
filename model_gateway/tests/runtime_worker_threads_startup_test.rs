@@ -1,6 +1,7 @@
-//! `--runtime-worker-threads 0` is a configuration error: the gateway exits
-//! non-zero with the field in the error, without the async runtime builder's
-//! panic, and its port is never bound; a count of 1 serves its health route,
+//! `--runtime-worker-threads 0`, and a count above the host's bound, are
+//! configuration errors: the gateway exits non-zero with the field in the
+//! error, without the async runtime builder's panic and without building a
+//! thread, and its port is never bound; a count of 1 serves its health route,
 //! and the runtime's size reaches the log with the pinned count. The gateway
 //! runs as a process on purpose: the runtime is built in `main`, before
 //! `startup`.
@@ -8,6 +9,8 @@
 
 #[path = "common/gateway_launch.rs"]
 mod gateway_launch;
+
+use std::time::{Duration, Instant};
 
 use gateway_launch::{launch, Until, EXIT_TIMEOUT};
 
@@ -38,6 +41,47 @@ fn a_zero_runtime_worker_thread_count_refuses_to_start() {
     assert!(
         log.contains("runtime_worker_threads"),
         "the error does not name the field\n{log}"
+    );
+}
+
+/// A count above the host's bound (a small multiple of the CPUs available to
+/// the process) is refused before anything listens, with the field and the
+/// bound in the error, and at once: 100,000 used to pass, build its threads
+/// for over a minute and hold gigabytes before the first bind.
+#[test]
+fn a_runtime_worker_thread_count_above_the_bound_refuses_to_start() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let started = Instant::now();
+    let launch = launch(
+        &["--runtime-worker-threads", "100000"],
+        Until::Bound,
+        &dir.path().join("huge.log"),
+    );
+    let elapsed = started.elapsed();
+    let log = &launch.log;
+    assert!(
+        launch.bound.is_none(),
+        "the gateway bound port {:?} with 100,000 worker threads\n{log}",
+        launch.bound
+    );
+    let status = launch.status.unwrap_or_else(|| {
+        panic!("the gateway neither exited nor listened within {EXIT_TIMEOUT:?}\n{log}")
+    });
+    assert!(!status.success(), "the gateway exited successfully\n{log}");
+    assert!(
+        !log.contains("panicked"),
+        "a panic is not a configuration error\n{log}"
+    );
+    assert!(
+        log.contains("runtime_worker_threads") && log.contains("Must be at most"),
+        "the error does not name the field and the bound\n{log}"
+    );
+    // Refused at validation, not after the threads were built: a fraction of
+    // a second, where the threads took over a minute. The allowance is for a
+    // loaded host, not for the threads.
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "the refusal took {elapsed:?}\n{log}"
     );
 }
 

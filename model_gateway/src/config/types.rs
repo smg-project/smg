@@ -100,8 +100,11 @@ pub struct RouterConfig {
     pub health_check_port: Option<u16>,
     /// Explicit async runtime worker-thread count. `None` uses tokio's default
     /// (`available_parallelism()`), which already honors the cgroup CPU quota on
-    /// Rust 1.95+ and is therefore container-aware. `Some` pins a count of at
-    /// least 1: the runtime builder panics on 0, so `ConfigValidator` refuses it.
+    /// Rust 1.95+ and is therefore container-aware. `Some` pins a count from 1
+    /// to [`RUNTIME_WORKER_THREADS_PER_CPU`](crate::config::RUNTIME_WORKER_THREADS_PER_CPU)
+    /// x the CPUs available to the process: the runtime builder panics on 0,
+    /// and every thread above the bound is a stack and a wake-up for nothing,
+    /// so `ConfigValidator` refuses both, naming the bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_worker_threads: Option<usize>,
     pub max_payload_size: usize,
@@ -328,8 +331,10 @@ pub struct RouterConfig {
     /// When unset, falls back to `SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS`.
     #[serde(default)]
     pub mm_allow_private_media_hosts: bool,
-    /// Listener IP for the RDMA metadata exchange; when unset, falls back to
-    /// `SMG_RDMA_LISTEN_IP`, and without either the lane stays on the inline path.
+    /// Listener IP for the RDMA metadata exchange, a plain IPv4 or IPv6 address
+    /// (the workers connect to it as written, so `ConfigValidator` refuses
+    /// anything else); when unset, falls back to `SMG_RDMA_LISTEN_IP`, and
+    /// without either the lane stays on the inline path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rdma_listen_ip: Option<String>,
     /// Full-TTL override (seconds) for leased RDMA pixel slots; when unset, falls
