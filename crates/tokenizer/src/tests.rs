@@ -103,6 +103,7 @@ fn byte_fallback_run_streams_each_complete_character() {
 fn byte_fallback_invalid_byte_keeps_streamed_text_and_counts_the_recovery() {
     let tokenizer = byte_fallback_full_tokenizer(Vec::new());
     let before = crate::decode_activity_stats();
+    let own_before = crate::decode_activity::thread_decode_activity_stats();
     // "日本" streamed, then an invalid byte, then "語" and a regular token.
     // Batch decoding turns the whole run into ten replacement characters; the
     // stream keeps "日本" (six bytes) and sends the remaining four once
@@ -136,6 +137,13 @@ fn byte_fallback_invalid_byte_keeps_streamed_text_and_counts_the_recovery() {
         byte_run(&after) >= byte_run(&before) + 2,
         "{before:?} -> {after:?}"
     );
+    // This thread's own view of the counters: exactly the two recoveries.
+    let own_after = crate::decode_activity::thread_decode_activity_stats();
+    assert_eq!(
+        byte_run(&own_after),
+        byte_run(&own_before) + 2,
+        "{own_before:?} -> {own_after:?}"
+    );
 }
 
 #[test]
@@ -159,6 +167,7 @@ fn decoder_rewrite_of_streamed_text_emits_the_remainder_without_failing() {
     let tokenizer: Arc<dyn crate::TokenizerTrait> =
         Arc::new(crate::HuggingFaceTokenizer::from_tokenizer(native));
     let before = crate::decode_activity_stats();
+    let own_before = crate::decode_activity::thread_decode_activity_stats();
     let (deltas, batch, recoveries) = stream_all(
         &tokenizer,
         &[1, 4],
@@ -189,6 +198,13 @@ fn decoder_rewrite_of_streamed_text_emits_the_remainder_without_failing() {
     assert!(
         decoder(&after) >= decoder(&before) + 2,
         "{before:?} -> {after:?}"
+    );
+    // This thread's own view of the counters: exactly the two recoveries.
+    let own_after = crate::decode_activity::thread_decode_activity_stats();
+    assert_eq!(
+        decoder(&own_after),
+        decoder(&own_before) + 2,
+        "{own_before:?} -> {own_after:?}"
     );
 }
 
@@ -673,42 +689,36 @@ fn byte_fallback_invalid_run_streams_one_replacement_per_byte_as_it_comes() {
 #[test]
 fn raw_decode_step_over_an_invalid_run_is_bounded_and_does_not_count() {
     // The raw step (what the gateway replays for token accounting) gets the
-    // same bound as the client path over an invalid run, and the process-wide
-    // counters do not move for it. The counters are shared with the other
-    // tests of this binary, so the run repeats: a counting step would add
-    // RUNS, concurrent tests a few.
-    const RUNS: u64 = 50;
+    // same bound as the client path over an invalid run, and the recovery
+    // counters do not move for it. The process-wide counters are shared with
+    // the other tests of this binary, so the check reads this thread's own.
     let tokenizer = byte_fallback_full_tokenizer(vec![]);
     let text: String = "日本語".chars().cycle().take(700).collect();
     let mut run: Vec<u32> = byte_ids(&text)[..2_000].to_vec();
     run[9] = 0xFF + 2;
     run.push(1);
-    let before = crate::decode_activity_stats();
-    for _ in 0..RUNS {
-        let (mut ids, mut prefix, mut prefix_index) = (Vec::new(), String::new(), 0usize);
-        let mut streamed = String::new();
-        let mut max_window = 0;
-        for &id in &run {
-            let step = tokenizer
-                .decode_step(id, &mut ids, &mut prefix, &mut prefix_index, true)
-                .unwrap();
-            if let Some(delta) = step {
-                streamed.push_str(&delta);
-            }
-            max_window = max_window.max(ids.len());
+    let before = crate::decode_activity::thread_decode_activity_stats();
+    let (mut ids, mut prefix, mut prefix_index) = (Vec::new(), String::new(), 0usize);
+    let mut streamed = String::new();
+    let mut max_window = 0;
+    for &id in &run {
+        let step = tokenizer
+            .decode_step(id, &mut ids, &mut prefix, &mut prefix_index, true)
+            .unwrap();
+        if let Some(delta) = step {
+            streamed.push_str(&delta);
         }
-        assert!(max_window <= 16, "held window grew to {max_window} ids");
-        assert_eq!(streamed.chars().count(), 3 + (2_000 - 9) + 1);
-        assert!(streamed.starts_with("日本語\u{FFFD}") && streamed.ends_with("\u{FFFD}x"));
+        max_window = max_window.max(ids.len());
     }
-    let after = crate::decode_activity_stats();
+    assert!(max_window <= 16, "held window grew to {max_window} ids");
+    assert_eq!(streamed.chars().count(), 3 + (2_000 - 9) + 1);
+    assert!(streamed.starts_with("日本語\u{FFFD}") && streamed.ends_with("\u{FFFD}x"));
+    let after = crate::decode_activity::thread_decode_activity_stats();
     for (b, a) in before.iter().zip(after.iter()) {
-        assert!(
-            a.prefix_mismatches - b.prefix_mismatches < RUNS,
-            "{}: {} -> {}",
-            a.kind,
-            b.prefix_mismatches,
-            a.prefix_mismatches
+        assert_eq!(
+            a.prefix_mismatches, b.prefix_mismatches,
+            "{}: the raw step counted a recovery",
+            a.kind
         );
     }
 }
@@ -776,40 +786,35 @@ fn byte_fallback_invalid_run_keeps_the_decode_window_bounded() {
 fn raw_decode_step_recovers_but_does_not_count() {
     // <0xC3> <0xA9> <0xF2> " suffix" through the raw steps (what the gateway
     // replays for token accounting): the rewritten prefix is recovered, and
-    // the process-wide counters do not move for it. The counters are shared
-    // with the other tests of this binary, so the raw steps run a thousand
-    // times: a counting step would add a thousand, concurrent tests a few.
-    const RUNS: u64 = 1_000;
+    // the recovery counters do not move for it. The process-wide counters are
+    // shared with the other tests of this binary, so the check reads this
+    // thread's own.
     let tokenizer = byte_fallback_tokenizer();
-    let before = crate::decode_activity_stats();
+    let before = crate::decode_activity::thread_decode_activity_stats();
     for eager in [false, true] {
-        for _ in 0..RUNS {
-            let (mut ids, mut prefix, mut prefix_index) = (Vec::new(), String::new(), 0usize);
-            let mut text = String::new();
-            for id in [5, 6, 3, 4] {
-                let step = if eager {
-                    tokenizer.decode_step_eager(id, &mut ids, &mut prefix, &mut prefix_index, true)
-                } else {
-                    tokenizer.decode_step(id, &mut ids, &mut prefix, &mut prefix_index, true)
-                };
-                if let Some(delta) = step.unwrap() {
-                    text.push_str(&delta);
-                }
+        let (mut ids, mut prefix, mut prefix_index) = (Vec::new(), String::new(), 0usize);
+        let mut text = String::new();
+        for id in [5, 6, 3, 4] {
+            let step = if eager {
+                tokenizer.decode_step_eager(id, &mut ids, &mut prefix, &mut prefix_index, true)
+            } else {
+                tokenizer.decode_step(id, &mut ids, &mut prefix, &mut prefix_index, true)
+            };
+            if let Some(delta) = step.unwrap() {
+                text.push_str(&delta);
             }
-            assert!(
-                text.starts_with("é") && text.ends_with(" suffix"),
-                "eager={eager}: {text:?}"
-            );
         }
-    }
-    let after = crate::decode_activity_stats();
-    for (b, a) in before.iter().zip(after.iter()) {
         assert!(
-            a.prefix_mismatches - b.prefix_mismatches < RUNS,
-            "{}: {} -> {}",
-            a.kind,
-            b.prefix_mismatches,
-            a.prefix_mismatches
+            text.starts_with("é") && text.ends_with(" suffix"),
+            "eager={eager}: {text:?}"
+        );
+    }
+    let after = crate::decode_activity::thread_decode_activity_stats();
+    for (b, a) in before.iter().zip(after.iter()) {
+        assert_eq!(
+            a.prefix_mismatches, b.prefix_mismatches,
+            "eager and raw steps: {} counted a recovery",
+            a.kind
         );
     }
 }
