@@ -464,6 +464,10 @@ struct RoutingArgs {
     )]
     balance_rel_threshold: f32,
 
+    /// Seconds between the bucket policy's boundary adjustments (at least 1)
+    #[arg(long, default_value_t = 5, help_heading = "Routing Policy")]
+    bucket_adjust_interval_secs: usize,
+
     /// Abandon cache affinity for shortest-queue when the KV-usage spread
     /// (hottest minus coldest backend, 0.0-1.0) exceeds this — catches
     /// long-context KV imbalance that request counts miss. Backend must
@@ -1615,6 +1619,20 @@ struct IntegrationArgs {
     #[arg(long, help_heading = "TLS/mTLS Security")]
     tls_key_path: Option<String>,
 
+    /// Client certificate (PEM) presented to workers for mTLS; with
+    /// --client-key-path, both or neither
+    #[arg(long, help_heading = "TLS/mTLS Security")]
+    client_cert_path: Option<String>,
+
+    /// Client private key (PEM) for mTLS with workers; with --client-cert-path
+    #[arg(long, help_heading = "TLS/mTLS Security")]
+    client_key_path: Option<String>,
+
+    /// CA certificates (PEM) the workers' TLS certificates are verified
+    /// against; several paths per flag, and the flag repeats
+    #[arg(long, num_args = 0.., help_heading = "TLS/mTLS Security")]
+    ca_cert_paths: Vec<String>,
+
     // ==================== Tracing (OpenTelemetry) ====================
     /// Enable OpenTelemetry tracing
     #[arg(
@@ -2445,7 +2463,7 @@ impl CliArgs {
             "bucket" => PolicyConfig::Bucket {
                 balance_abs_threshold: self.routing.balance_abs_threshold,
                 balance_rel_threshold: self.routing.balance_rel_threshold,
-                bucket_adjust_interval_secs: 5,
+                bucket_adjust_interval_secs: self.routing.bucket_adjust_interval_secs,
             },
             "prefix_hash" => PolicyConfig::PrefixHash {
                 prefix_token_count: self.routing.prefix_token_count,
@@ -3241,6 +3259,11 @@ impl CliArgs {
                 fanout_concurrency: self.workers.rl_fanout_concurrency,
             })
             .dp_minimum_tokens_scheduler(self.routing.dp_minimum_tokens_scheduler)
+            .maybe_client_cert_and_key(
+                self.integrations.client_cert_path.as_ref(),
+                self.integrations.client_key_path.as_ref(),
+            )
+            .add_ca_certificates(self.integrations.ca_cert_paths.clone())
             .maybe_server_cert_and_key(
                 self.integrations.tls_cert_path.as_ref(),
                 self.integrations.tls_key_path.as_ref(),
@@ -3938,6 +3961,89 @@ mod tests {
             std::fs::write(&path, b"test").unwrap();
             path.to_string_lossy().into_owned()
         })
+    }
+
+    /// `--bucket-adjust-interval-secs` reaches the bucket policy, which only
+    /// the Python launcher could set until now; without the flag the interval
+    /// stays at 5 s, zero is refused by the validator, a negative by the parser.
+    #[test]
+    fn bucket_adjust_interval_flag_reaches_the_bucket_policy() {
+        let interval = |args: &[&str]| match cli_args_from(args)
+            .to_router_config(vec![], vec![])
+            .unwrap()
+            .policy
+        {
+            PolicyConfig::Bucket {
+                bucket_adjust_interval_secs,
+                ..
+            } => bucket_adjust_interval_secs,
+            other => panic!("expected the bucket policy, got {other:?}"),
+        };
+        assert_eq!(interval(&["--policy", "bucket"]), 5);
+        assert_eq!(
+            interval(&["--policy", "bucket", "--bucket-adjust-interval-secs", "9"]),
+            9
+        );
+
+        let err = cli_args_from(&["--policy", "bucket", "--bucket-adjust-interval-secs", "0"])
+            .to_router_config(vec![], vec![])
+            .expect_err("a zero interval is refused");
+        assert!(
+            err.to_string().contains("bucket_adjust_interval_secs"),
+            "{err}"
+        );
+        assert!(Cli::try_parse_from(["smg", "--bucket-adjust-interval-secs", "-1"]).is_err());
+    }
+
+    fn worker_tls_files(tag: &str) -> [String; 3] {
+        let dir = std::env::temp_dir().join(format!("smg-worker-tls-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        ["ca.pem", "client.pem", "client-key.pem"].map(|name| {
+            let path = dir.join(name);
+            std::fs::write(&path, b"test").unwrap();
+            path.to_string_lossy().into_owned()
+        })
+    }
+
+    /// The worker mTLS flags reach the config as the launcher's options of the
+    /// same names do: the certificate and key are read into the client
+    /// identity, every CA path into the trust list (several per flag, the
+    /// flag repeats), and a certificate without its key is refused.
+    #[test]
+    fn worker_mtls_flags_reach_the_config() {
+        let [ca, cert, key] = worker_tls_files("all");
+        let [second_ca, _, _] = worker_tls_files("second");
+        let args = cli_args_from(&[
+            "--client-cert-path",
+            &cert,
+            "--client-key-path",
+            &key,
+            "--ca-cert-paths",
+            &ca,
+            &second_ca,
+            "--ca-cert-paths",
+            &ca,
+        ]);
+        assert_eq!(args.integrations.ca_cert_paths, [ca.clone(), second_ca, ca]);
+        let config = args.to_router_config(vec![], vec![]).unwrap();
+        assert!(
+            config.client_identity.is_some(),
+            "certificate and key form the identity"
+        );
+        assert_eq!(config.client_key_path.as_deref(), Some(key.as_str()));
+        assert_eq!(config.ca_certificates.len(), 3);
+
+        let err = cli_args_from(&["--client-cert-path", &cert])
+            .to_router_config(vec![], vec![])
+            .expect_err("a certificate without its key is refused");
+        assert!(err.to_string().contains("--client-key-path"), "{err}");
+
+        let plain = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert!(
+            plain.client_identity.is_none(),
+            "no flags, no client identity"
+        );
+        assert!(plain.ca_certificates.is_empty(), "no flags, no CA list");
     }
 
     #[test]

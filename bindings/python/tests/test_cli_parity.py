@@ -30,10 +30,6 @@ CLI_ONLY = {
 
 # Options of the launcher with no Rust CLI flag of that spelling, with the reason.
 LAUNCHER_ONLY = {
-    "--bucket-adjust-interval-secs": "a Router parameter the Rust CLI leaves at its default",
-    "--ca-cert-paths": "worker mTLS: a Router parameter the Rust CLI does not expose",
-    "--client-cert-path": "worker mTLS: a Router parameter the Rust CLI does not expose",
-    "--client-key-path": "worker mTLS: a Router parameter the Rust CLI does not expose",
     "--control-plane-audit-enabled": "the launcher's switch; the CLI's is --disable-audit-logging",
     "--eviction-interval-secs": "the launcher's first spelling of --eviction-interval",
     "--no-remove-unhealthy-workers": "argparse's negative form; the CLI takes =false",
