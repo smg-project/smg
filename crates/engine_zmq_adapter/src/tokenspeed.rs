@@ -951,6 +951,67 @@ mod tests {
     }
 
     #[test]
+    fn tokenspeed_translates_audio_items_as_the_engine_reads_them() {
+        // An audio item: the waveform rows travel as they were written
+        // (bfloat16 [samples, 1]) with the per-clip row count beside them;
+        // the pad value carries the audio tag; no token id is collected.
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        req.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 100, 100, 100, 8, 2];
+        let samples: u32 = 1_920;
+        let item = tokenspeed_proto::MultimodalItem {
+            modality: common::Modality::Audio as i32,
+            content_hash: 0x0123_4567_89AB_CDEFu64.to_le_bytes().to_vec(),
+            encoder_input: Some(tokenspeed_proto::TensorData {
+                shape: vec![samples, 1],
+                dtype: "bfloat16".to_string(),
+                payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(
+                    vec![0x3Fu8; samples as usize * 2].into(),
+                )),
+            }),
+            model_specific_tensors: [(
+                "samples_per_audio".to_string(),
+                tokenspeed_proto::TensorData {
+                    shape: vec![1],
+                    dtype: "int64".to_string(),
+                    payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(
+                        (samples as i64).to_le_bytes().to_vec().into(),
+                    )),
+                },
+            )]
+            .into(),
+            placeholders: vec![tokenspeed_proto::PlaceholderRange {
+                offset: 2,
+                length: 3,
+            }],
+            placeholder_token_id: Some(100),
+        };
+        req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items: vec![item] });
+        let wire = translate_request_tokenspeed(req).expect("translated");
+
+        let expected_pad = mm_pad_value(TokenSpeedWireModality::Audio, 0x0123_4567_89AB_CDEF);
+        assert_ne!(
+            expected_pad,
+            mm_pad_value(TokenSpeedWireModality::Image, 0x0123_4567_89AB_CDEF)
+        );
+        assert_eq!(
+            wire.input_ids,
+            vec![1, 7, expected_pad, expected_pad, expected_pad, 8, 2]
+        );
+        let mm = wire.multimodal_inputs.expect("mm payload");
+        assert_eq!(mm.im_token_id, None);
+        assert_eq!(mm.video_token_id, None);
+        let item = &mm.mm_items[0];
+        assert_eq!(item.modality, TokenSpeedWireModality::Audio);
+        assert_eq!(item.pad_value, expected_pad);
+        assert_eq!(item.offsets, vec![(2, 4)]);
+        assert_eq!(item.feature.dtype, "bfloat16");
+        assert_eq!(item.feature.shape, vec![samples as usize, 1]);
+        let rows = &item.model_specific_data["samples_per_audio"];
+        assert_eq!(rows.dtype, "int64");
+        assert_eq!(rows.shape, vec![1]);
+    }
+
+    #[test]
     fn tokenspeed_multimodal_rejects_bad_items() {
         // Out-of-bounds placeholder: prompt has 3 tokens, range needs 4.
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
