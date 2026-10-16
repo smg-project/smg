@@ -255,20 +255,8 @@ Called from the router Deployment template.
 - {{ .Values.history.redis.poolMax | quote }}
 {{- end }}
 {{- if eq .Values.history.backend "oracle" }}
-{{- if .Values.history.oracle.dsn }}
-- "--oracle-connect-descriptor"
-- {{ .Values.history.oracle.dsn | quote }}
-{{- end }}
 - "--oracle-pool-max"
 - {{ .Values.history.oracle.poolMax | quote }}
-{{- if .Values.history.oracle.user }}
-- "--oracle-username"
-- {{ .Values.history.oracle.user | quote }}
-{{- end }}
-{{- if .Values.history.oracle.password }}
-- "--oracle-password"
-- {{ .Values.history.oracle.password | quote }}
-{{- end }}
 {{- end }}
 {{- if ge (int .Values.auth.rateLimitTokensPerSecond) 0 }}
 - "--rate-limit-tokens-per-second"
@@ -385,6 +373,67 @@ rolls the pods.
 {{- $store := index $.Values.history . -}}
 {{- if and $store.url (not $store.existingSecret) -}}true{{- end -}}
 {{- end -}}
+{{- end }}
+
+{{/*
+Oracle secret -- the Secret holding the Oracle connect descriptor, database
+user and password. Each reaches the router pod as the environment variable
+the gateway reads (ATP_DSN, ATP_USER, ATP_PASSWORD); none is in the pod's
+arguments. `history.oracle.existingSecret` names a Secret the operator
+manages; otherwise the credentials set under history.oracle are written into
+the chart-managed Secret <fullname>-secrets, the Secret earlier chart
+versions wrote without reading it (same name, same keys). Empty when the
+backend is not oracle or no credential is configured.
+*/}}
+{{- define "smg.oracleSecretName" -}}
+{{- if eq .Values.history.backend "oracle" -}}
+{{- with .Values.history.oracle -}}
+{{- if .existingSecret -}}
+{{- .existingSecret -}}
+{{- else if or .dsn .user .password -}}
+{{- printf "%s-secrets" (include "smg.fullname" $) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Oracle secret managed -- "true" when the chart writes the Oracle Secret
+itself (a credential is set under history.oracle and no `existingSecret`
+replaces them). The router pod template carries a checksum of that Secret,
+so a changed credential rolls the pods.
+*/}}
+{{- define "smg.oracleSecretManaged" -}}
+{{- if eq .Values.history.backend "oracle" -}}
+{{- with .Values.history.oracle -}}
+{{- if and (not .existingSecret) (or .dsn .user .password) -}}true{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Oracle credentials -- the credentials the router pod is wired to, as a JSON
+list for fromJsonArray: each with the environment variable the gateway reads
+it from (env), its key within the Oracle Secret (key) and its value from the
+values (value, used by the chart-managed Secret alone). With `existingSecret`
+all three are wired and that Secret holds their keys; otherwise the ones set
+under history.oracle. Empty when there is no Oracle Secret.
+*/}}
+{{- define "smg.oracleCredentials" -}}
+{{- $credentials := list -}}
+{{- if include "smg.oracleSecretName" . -}}
+{{- $oracle := .Values.history.oracle -}}
+{{- $keys := $oracle.secretKeys | default dict -}}
+{{- $dsn := dict "env" "ATP_DSN" "key" ($keys.dsn | default "oracle-dsn") "value" $oracle.dsn -}}
+{{- $user := dict "env" "ATP_USER" "key" ($keys.user | default "oracle-user") "value" $oracle.user -}}
+{{- $password := dict "env" "ATP_PASSWORD" "key" ($keys.password | default "oracle-password") "value" $oracle.password -}}
+{{- range $credential := list $dsn $user $password -}}
+{{- if or $oracle.existingSecret $credential.value -}}
+{{- $credentials = append $credentials $credential -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- toJson $credentials -}}
 {{- end }}
 
 {{/*

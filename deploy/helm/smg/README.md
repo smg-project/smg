@@ -60,7 +60,7 @@ See [`values.yaml`](values.yaml) for the full list of configurable parameters.
 | `workers` | Worker (inference engine) deployments |
 | `huggingface` | HuggingFace token for gated model downloads |
 | `auth` | API key authentication, rate limiting |
-| `history` | Storage backend (none/memory/postgres/redis/oracle) and the Secret its connection URL comes from |
+| `history` | Storage backend (none/memory/postgres/redis/oracle) and the Secret its connection URL or credentials come from |
 | `serviceAccount` | Service account creation and annotations |
 | `rbac` | RBAC for Kubernetes service discovery |
 
@@ -119,7 +119,7 @@ helm install smg deploy/helm/smg \
   --set auth.apiKeySecretKey=api-key   # the default
 ```
 
-The gateway also reads its other secrets from the environment or from files, which `router.extraEnv` can feed from Secrets: `SMG_TENANT_API_KEYS` (or `SMG_TENANT_API_KEYS_FILE`) for per-tenant keys; the store URLs have values of their own ([Store URLs](#store-urls)). On the command line a flag beats the environment, and a value together with a file for the same secret is refused at start-up. The launcher's reference in [the Python package's README](../../../bindings/python/README.md#secrets-from-the-environment-or-files) lists every name.
+The gateway also reads its other secrets from the environment or from files, which `router.extraEnv` can feed from Secrets: `SMG_TENANT_API_KEYS` (or `SMG_TENANT_API_KEYS_FILE`) for per-tenant keys; the store URLs and the Oracle credentials have values of their own ([Store URLs](#store-urls), [Oracle Credentials](#oracle-credentials)). On the command line a flag beats the environment, and a value together with a file for the same secret is refused at start-up. The launcher's reference in [the Python package's README](../../../bindings/python/README.md#secrets-from-the-environment-or-files) lists every name.
 
 The gateway reads the key file once, at start-up, so a rotated key reaches a pod when the pod restarts. A rotated `auth.apiKey` rolls the router pods by itself: the pod template carries a `checksum/auth` annotation over the chart-managed Secret, so `helm upgrade` with a new key is a rolling update. A rotated `auth.existingSecret` is not seen by the chart; roll the pods by hand after updating it, or the running pods keep accepting the old key until they restart. By label, which covers both workload kinds and every release name: `kubectl rollout restart deployment,statefulset -l app.kubernetes.io/instance=<release>,app.kubernetes.io/component=router` (the workload is `<fullname>-router`, where `<fullname>` is `<release>-smg` unless the release name contains `smg` or `fullnameOverride` is set).
 
@@ -140,6 +140,23 @@ helm install smg deploy/helm/smg \
 A changed `url` rolls the router pods: the pod template carries a checksum of the chart-managed Secret. The checksum is a hash of the Secret's rendered contents, in which the URL is the only unknown, so a URL set in the values should carry a high-entropy password (anyone who can read the Deployment can test guesses against the hash); an existing Secret exposes no hash. The existing Secret's name must differ from the chart-managed one (`<fullname>-history`, so `smg-history` for a release named `smg`), or a later switch to `url` fails the upgrade because the chart cannot take over a Secret it did not create. A rotated existing Secret does not roll the pods, as the gateway reads the URL once at start-up; restart the router pods after rotating it (`kubectl rollout restart` of the router Deployment, or of the StatefulSet in mesh mode). With neither `url` nor `existingSecret` the chart passes no URL, and the gateway refuses to start a store backend without one, unless `router.extraEnv` provides the variable.
 
 An older gateway image does not read `SMG_POSTGRES_DB_URL` / `SMG_REDIS_URL`; a chart of this version with such an image refuses to start the store backend rather than starting it without the URL.
+
+#### Oracle Credentials
+
+The Oracle backend's connect descriptor, database user and password (`history.oracle.dsn`, `user`, `password`) are written into the chart-managed Secret `<release>-secrets` and the router pod gets them as the environment variables the gateway reads (`ATP_DSN`, `ATP_USER`, `ATP_PASSWORD`); none is in the pod's arguments. Credentials managed outside the chart's values come from an existing Secret holding the three keys:
+
+```bash
+kubectl create secret generic smg-oracle \
+  --from-literal=oracle-dsn='<connect descriptor>' \
+  --from-literal=oracle-user='<user>' \
+  --from-literal=oracle-password='<password>'
+helm install smg deploy/helm/smg \
+  --set history.backend=oracle \
+  --set history.oracle.existingSecret=smg-oracle \
+  --set history.oracle.secretKeys.password=oracle-password   # the defaults: oracle-dsn, oracle-user, oracle-password
+```
+
+A changed credential rolls the router pods, as a changed store URL does: the pod template carries a checksum of the chart-managed Secret. The checksum is a hash of the Secret's contents, so a password set in the values should be a high-entropy one (anyone who can read the Deployment can test guesses against the hash); an existing Secret exposes no hash, and a rotation of it needs the same restart as a rotated store URL. With `existingSecret` all three variables are wired, so the Secret holds the three keys; a deployment that needs fewer (external authentication, a wallet with a TNS alias) sets the credentials it has under `history.oracle` or wires them with `router.extraEnv`. Earlier chart versions wrote the `<release>-secrets` Secret with these keys without reading it: an upgrade keeps the Secret and moves the credentials from the router's arguments to its environment. The pool size (`history.oracle.poolMax`) stays an argument; the other Oracle settings (a wallet path, a TNS alias, external authentication, the pool bounds) are `ATP_*` variables for `router.extraEnv` or flags for `router.extraArgs`. Every gateway image with the Oracle backend reads these three variables.
 
 #### Router Probes and Shutdown
 
