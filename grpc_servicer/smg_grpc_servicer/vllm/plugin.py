@@ -22,6 +22,12 @@ Their parsed values are carried into the environment as well, for a launcher
 that builds the servicer without its namespace. Parsers of other commands
 are untouched. A ``VLLM_PLUGINS`` setting that leaves this plugin out only
 removes the flags; the environment variables work regardless.
+
+The parse step is also where a launch that builds an engine for gRPC gets
+its CUDA-graph capture cap derived from the admission step when the operator
+set none (:mod:`smg_grpc_servicer.vllm.capture_cap`): the value joins the
+parsed namespace the launcher builds the engine from, for both servicer
+implementations and for the engine-only ranks of a multi-node engine.
 """
 
 from __future__ import annotations
@@ -97,6 +103,39 @@ def handoff_mm_flags(parser: argparse.ArgumentParser, parsed: Any) -> Any | None
     return carry_mm_flags(parsed)
 
 
+def launches_engine(parser: argparse.ArgumentParser, parsed: Any) -> bool:
+    """Whether a parse builds an engine this package serves: the stock gRPC
+    launcher's (gRPC is all it serves), ``vllm serve --grpc``, and ``vllm
+    serve --headless`` (the engine-only ranks of a multi-node engine, started
+    with the leader's flags). An HTTP ``vllm serve`` is not this package's
+    launch and keeps the engine's own defaults."""
+    if not serves_grpc(parser):
+        return False
+    actions = parser._option_string_actions  # noqa: SLF001 — argparse's registry of option strings
+    if "--grpc" not in actions:
+        return True
+    return bool(getattr(parsed, "grpc", False) or getattr(parsed, "headless", False))
+
+
+def handoff_capture_cap(parser: argparse.ArgumentParser, parsed: Any) -> Any | None:
+    """After a parse that launches an engine for gRPC: the CUDA-graph capture
+    cap derived from the admission step joins the namespace where the
+    operator set none, and one line says what applies. A knob value the
+    derivation does not take is a usage error (exit code 2, the variable and
+    the value named), as a bad flag value would be. Returns the decision,
+    ``None`` for any other parse."""
+    if not launches_engine(parser, parsed):
+        return None
+    from smg_grpc_servicer.vllm.capture_cap import apply_capture_cap, log_capture_cap
+
+    try:
+        cap = apply_capture_cap(parsed)
+    except ValueError as error:
+        parser.error(str(error))
+    log_capture_cap(cap)
+    return cap
+
+
 def register() -> None:
     """The ``vllm.general_plugins`` entry point. Idempotent, and loaded in
     every vLLM process: it wraps the parser class's parse step and installs
@@ -131,6 +170,9 @@ def register() -> None:
         # process (so a flag stays `source=flag`), and the set values go into
         # the environment too; on every gRPC parse, the flags' origin aside.
         handoff_mm_flags(self, parsed)
+        # A launch that builds an engine for gRPC: the capture cap the
+        # engine would default below the admission step is derived here.
+        handoff_capture_cap(self, parsed)
         return parsed, extras
 
     FlexibleArgumentParser.parse_known_args = parse_known_args  # type: ignore[method-assign]

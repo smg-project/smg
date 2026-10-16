@@ -387,6 +387,16 @@ impl AppTestContext {
         )
     }
 
+    /// The production routers: the data listener's and, with
+    /// `admin_listener`, the admin listener's.
+    pub fn create_apps(&self, admin_listener: bool) -> smg::server::GatewayApps {
+        test_app::create_test_apps_with_context(
+            Arc::clone(&self.router),
+            Arc::clone(&self.app_context),
+            admin_listener,
+        )
+    }
+
     pub async fn shutdown(mut self) {
         for worker in &mut self.workers {
             worker.stop().await;

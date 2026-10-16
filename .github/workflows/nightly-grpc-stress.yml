@@ -1,0 +1,80 @@
+name: Nightly - gRPC router stress bed
+
+# The CPU-only stress bed of scripts/bench/grpc_stress: the release gateway
+# in front of mock gRPC engines, a short version of every traffic family, and
+# the report (CPU per request and per frame, memory slope, latency, errors)
+# as an artifact and in the step summary. No GPU runner is involved.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 3 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-grpc-stress
+  cancel-in-progress: true
+
+jobs:
+  stress:
+    name: gRPC router stress (CPU)
+    if: github.repository == 'smg-project/smg' || vars.SMG_RUN_BENCHMARKS == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          # A release build with frame pointers and line tables: a key of its own, so the
+          # rust-cache entry the PR jobs restore is never saved from this target dir.
+          cache-key: grpc-stress
+
+      - name: Build the bed (frame pointers and line tables for perf)
+        env:
+          RUSTFLAGS: -C force-frame-pointers=yes
+          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+          CFLAGS: -fno-omit-frame-pointer
+        run: |
+          source "$HOME/.cargo/env"
+          cargo build --release -p smg -p mock-worker --bin smg --bin mock-worker --bin stress_load
+
+      - name: Run the families (short cells)
+        env:
+          TOKENIZER: Qwen/Qwen3-0.6B
+          REPEATS: "1"
+          DURATION: "40"
+          WARMUP: "5"
+          DRAIN: "60"
+          PERF_SECS: "0"
+          GW_THREADS: "2"
+        run: |
+          nproc
+          scripts/bench/grpc_stress/run_all.sh unary stream idle-default long tenants tools responses
+
+      - name: Report
+        if: always()
+        run: |
+          {
+            echo "## gRPC router stress bed (CPU)"
+            echo
+            cat target/grpc-stress/report.md 2>/dev/null || echo "no report"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the run
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: grpc-stress-${{ github.sha }}
+          path: |
+            target/grpc-stress/report.md
+            target/grpc-stress/report.json
+            target/grpc-stress/run_all.log
+            target/grpc-stress/cells/*/summary.json
+            target/grpc-stress/cells/*/samples.csv
+            target/grpc-stress/cells/*/cell.json
+            target/grpc-stress/bed/*.log
+          retention-days: 30

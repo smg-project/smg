@@ -27,7 +27,7 @@ from collections.abc import Callable, Mapping
 from functools import cached_property
 from typing import Any
 
-from smg_grpc_servicer.config_view import positive_int
+from smg_grpc_servicer.config_view import attr_int, attr_str, positive_int
 
 
 def token_ids(value: Any) -> list[int]:
@@ -122,10 +122,10 @@ class ModelSection:
             max_model_len=int(model_config.max_model_len),
             vocab_size=int(model_config.get_vocab_size()),
             architectures=[str(a) for a in (getattr(model_config, "architectures", None) or [])],
-            model_type=str(getattr(hf_config, "model_type", None) or ""),
+            model_type=attr_str(hf_config, "model_type"),
             hf_eos_token_ids=hf_eos_token_ids(model_config),
-            pad_token_id=int(getattr(hf_config, "pad_token_id", None) or 0),
-            bos_token_id=int(getattr(hf_config, "bos_token_id", None) or 0),
+            pad_token_id=attr_int(hf_config, "pad_token_id"),
+            bos_token_id=attr_int(hf_config, "bos_token_id"),
             tokenizer_revision=getattr(model_config, "tokenizer_revision", None)
             or getattr(model_config, "revision", None),
         )

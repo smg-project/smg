@@ -564,6 +564,10 @@ class RouterArgs:
     # on every removal (a discovery deletion, an unhealthy worker's removal, the
     # API); 0 removes it at once; appended last for the same reason
     drain_settle_secs: int = 5
+    # The admin listener (port and bind host) for the control-plane routes; None = the control
+    # plane stays on the data listener; appended last for the same reason
+    admin_port: int | None = None
+    admin_host: str | None = None
 
     @staticmethod
     def add_cli_args(
@@ -735,6 +739,26 @@ class RouterArgs:
                 " runtime. Unset = dedicated probe listener off (routes remain"
                 " available on the main port)."
             ),
+        )
+        worker_group.add_argument(
+            f"--{prefix}admin-port",
+            type=int,
+            default=RouterArgs.admin_port,
+            help=(
+                "Port of the admin listener. When set, the control-plane routes (the admin"
+                " routes, the worker-registry routes /workers and the RL routes /v1/rl) are"
+                " served there, with /health, /liveness and /readiness, and the data listener"
+                " (--port) answers 404 for them. Control-plane authentication applies on it as"
+                " it does on the data listener; the public /loads stays on the data listener."
+                " Each listener needs its own port. Unset = the control plane stays on the data"
+                " listener."
+            ),
+        )
+        worker_group.add_argument(
+            f"--{prefix}admin-host",
+            type=str,
+            default=RouterArgs.admin_host,
+            help="Bind host of the admin listener (needs --admin-port). Defaults to --host.",
         )
 
         # Routing policy configuration

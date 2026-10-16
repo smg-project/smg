@@ -530,6 +530,8 @@ class TestRouterPositionalSignature:
             "history_memory_max_responses",
             "history_memory_max_items",
             "history_memory_retention_secs",
+            "admin_port",
+            "admin_host",
         ]
 
 

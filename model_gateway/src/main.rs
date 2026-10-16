@@ -368,6 +368,26 @@ struct RoutingArgs {
     #[arg(long, help_heading = "Worker Configuration")]
     health_check_port: Option<u16>,
 
+    /// Port of the admin listener. When set, the control-plane routes (the
+    /// admin routes /flush_cache, /start_profile, /stop_profile,
+    /// /heap_profile, /get_loads, /parse/*, /wasm and /v1/tokenizers, the
+    /// worker-registry routes /workers and the RL routes /v1/rl) are served
+    /// there, with /health, /liveness and /readiness, and the data listener
+    /// (--port) answers 404 for them: the control plane can sit on a private
+    /// address, behind its own network policy, off the data port's ingress.
+    /// Control-plane authentication applies on it as it does on the data
+    /// listener. The public /loads stays on the data listener (a gateway
+    /// registered as a worker is polled there) and names the backends as
+    /// before. Each listener needs its own port. Unset = the control plane
+    /// stays on the data listener
+    #[arg(long, help_heading = "Worker Configuration")]
+    admin_port: Option<u16>,
+
+    /// Bind host of the admin listener (needs --admin-port). Defaults to
+    /// --host
+    #[arg(long, help_heading = "Worker Configuration")]
+    admin_host: Option<String>,
+
     /// List of worker URLs (supports IPv4 and IPv6)
     #[arg(long, num_args = 0.., help_heading = "Worker Configuration")]
     worker_urls: Vec<String>,
@@ -3038,6 +3058,8 @@ impl CliArgs {
             .host(&self.routing.host)
             .port(self.routing.port)
             .health_check_port(self.routing.health_check_port)
+            .admin_port(self.routing.admin_port)
+            .admin_host(self.routing.admin_host.clone())
             .runtime_worker_threads(self.integrations.runtime_worker_threads)
             .max_payload_size(self.serving.max_payload_size)
             .max_buffered_request_bytes(self.serving.max_buffered_request_bytes)
@@ -4790,6 +4812,27 @@ mod tests {
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert_eq!(server_config.health_check_port, None);
+    }
+
+    /// `--admin-port` and `--admin-host` flow into `RouterConfig`, the copy
+    /// the validator checks and `startup` reads, and reach `ServerConfig`
+    /// nested in it; unset, the control plane stays on the data listener.
+    #[test]
+    fn admin_listener_flags_flow_into_the_router_config() {
+        let cli = cli_args_from(&["--admin-port", "9001", "--admin-host", "127.0.0.1"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.admin_port, Some(9001));
+        assert_eq!(router_config.admin_host.as_deref(), Some("127.0.0.1"));
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(server_config.router_config.admin_port, Some(9001));
+        assert_eq!(
+            server_config.router_config.admin_host.as_deref(),
+            Some("127.0.0.1")
+        );
+
+        let router_config = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.admin_port, None);
+        assert_eq!(router_config.admin_host, None);
     }
 
     /// `--engine-metrics` must flow into `RouterConfig` and survive nesting

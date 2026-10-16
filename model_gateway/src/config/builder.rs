@@ -205,6 +205,19 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// The admin listener's port; `None` keeps the control plane on the
+    /// data listener.
+    pub fn admin_port(mut self, admin_port: Option<u16>) -> Self {
+        self.config.admin_port = admin_port;
+        self
+    }
+
+    /// The admin listener's bind host; `None` binds it on the server host.
+    pub fn admin_host(mut self, admin_host: Option<String>) -> Self {
+        self.config.admin_host = admin_host;
+        self
+    }
+
     pub fn runtime_worker_threads(mut self, threads: Option<usize>) -> Self {
         self.config.runtime_worker_threads = threads;
         self

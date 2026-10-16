@@ -344,6 +344,47 @@ the engine's own server would: the bare calls behind the parser's gate, so the
 call is forced right there; the thought and then the calls from the first
 token.
 
+#### CUDA-graph capture cap
+
+The engine replays a captured CUDA graph for a step that fits one of its
+capture sizes and runs a larger step eagerly, kernel by kernel from Python.
+Its default for the largest size (`max_cudagraph_capture_size`) is twice
+`--max-num-seqs`, at most 512 (1024 on one newer GPU platform): with a window
+of 32 that is 64 tokens, so a step that admits a prefill chunk beside the
+decodes runs eagerly, and an engine whose eager step is expensive (a
+sparse-attention or MoE model: hundreds of launches per rank) is host-bound at
+every admission. A gRPC launch (`vllm serve --grpc`, the stock launcher, and
+`vllm serve --headless` for the engine-only ranks of a multi-node engine)
+therefore derives the cap from the admission step when the operator set none:
+`--max-num-batched-tokens` (unset: unbounded, the engine's own step-size
+defaults are 2048 or more), at most 512, applied only where it raises the
+engine's default, for both servicer implementations, and logged once at start
+(`CUDA-graph capture cap: ...`). The engine's rule is kept: the value is the
+step size itself or a value of the engine's capture grid (1, 2, 4, multiples
+of 8 to 248, multiples of 16 from 256), which the engine neither clamps nor
+truncates.
+
+| setting | engine default | launch default |
+|---|---|---|
+| `--max-num-seqs 32 --max-num-batched-tokens 16384` | 64 | 512 |
+| `--max-num-seqs 32 --max-num-batched-tokens 300` | 64 | 300 |
+| `--max-num-seqs 32`, step size unset | 64 | 512 |
+| `--max-num-seqs 32 --max-num-batched-tokens 48` | 48 | the engine's |
+| `--max-num-seqs 256` or more | 512 | the engine's |
+| `--max-num-seqs` unset | 512 (the engine's window defaults) | the engine's |
+
+Kept as given: an explicit `--max-cudagraph-capture-size`,
+`--cudagraph-capture-sizes` or the same keys of `--compilation-config`;
+`--enforce-eager` and a `cudagraph_mode` of `NONE` (no graphs); a
+`--speculative-config` (the engine's default adds the uniform-decode sizes an
+explicit cap drops); an HTTP `vllm serve`, which is not this package's launch.
+
+`SMG_VLLM_CUDAGRAPH_CAPTURE_CAP` is the knob: `auto` (the default), `engine`
+(the opt-out: the engine's own default, as before this derivation), or a
+positive integer, the ceiling in place of 512, rounded down to the capture
+grid. Each captured size costs capture time at start and graph memory per
+rank: 11 sizes at the engine's 64, 51 at 512, 83 at 1024.
+
 #### Multi-node engines: the worker pod's liveness
 
 An engine whose tensor-parallel ranks span pods runs its EngineCore and the

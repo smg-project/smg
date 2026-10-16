@@ -98,6 +98,15 @@ pub struct RouterConfig {
     /// routes always remain available on the main `port` regardless.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check_port: Option<u16>,
+    /// Port of the admin listener. When set, the control-plane routes (the
+    /// admin, worker-registry and RL routes) are served on it, with the probe
+    /// routes, and the data listener answers 404 for them. `None` keeps the
+    /// control plane on the data listener.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_port: Option<u16>,
+    /// Bind host of the admin listener; `None` binds it on `host`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_host: Option<String>,
     /// Explicit async runtime worker-thread count. `None` uses tokio's default
     /// (`available_parallelism()`), which already honors the cgroup CPU quota on
     /// Rust 1.95+ and is therefore container-aware. `Some` pins a count from 1
@@ -1635,6 +1644,8 @@ impl Default for RouterConfig {
             host: "0.0.0.0".to_string(),
             port: 3001,
             health_check_port: None,
+            admin_port: None,
+            admin_host: None,
             runtime_worker_threads: None,
             max_payload_size: 536_870_912, // 512MB
             max_buffered_request_bytes: default_max_buffered_request_bytes(),
@@ -1970,6 +1981,33 @@ mod tests {
         assert!(json.contains("health_check_port"));
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(with.health_check_port, Some(8081));
+    }
+
+    #[test]
+    fn test_admin_listener_serde_roundtrip_and_backward_compat() {
+        // Default: no admin listener, and neither key is serialized.
+        let config = RouterConfig::default();
+        assert_eq!(
+            (config.admin_port, config.admin_host.as_deref()),
+            (None, None)
+        );
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("admin_port") && !json.contains("admin_host"));
+
+        // Config files predating the fields deserialize to the default.
+        let without: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!((without.admin_port, without.admin_host), (None, None));
+
+        // When set, both round-trip.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .admin_port(Some(9001))
+            .admin_host(Some("127.0.0.1".to_string()))
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.admin_port, Some(9001));
+        assert_eq!(with.admin_host.as_deref(), Some("127.0.0.1"));
     }
 
     #[test]

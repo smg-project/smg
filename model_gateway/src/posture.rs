@@ -151,22 +151,27 @@ pub(crate) struct PostureWarning {
 pub(crate) fn open_posture_warning(
     open: OpenSurfaces,
     metrics: Option<&PrometheusConfig>,
+    admin_listener: Option<SocketAddr>,
 ) -> Option<PostureWarning> {
     if !open.any() {
         return None;
     }
     let mut control_plane_parts = Vec::new();
     if open.control_plane {
-        control_plane_parts.push(
-            "OPEN: POST /workers and PUT/PATCH/DELETE /workers/{id} (register or remove backends by \
-             URL), GET /workers and GET /get_loads (the backends' addresses), POST /flush_cache \
-             (drops the engines' prefix caches), POST /start_profile and POST /stop_profile (the \
-             engines' profilers), POST /heap_profile (writes this gateway's heap profile to \
-             disk), /parse/*, /wasm and /v1/tokenizers; protect them with \
+        // With an admin listener the routes answer there alone: the record
+        // names it, so the address to fence is the one in the record.
+        let listener = admin_listener.map_or_else(String::new, |addr| {
+            format!(" (on the admin listener {addr})")
+        });
+        control_plane_parts.push(format!(
+            "OPEN{listener}: POST /workers and PUT/PATCH/DELETE /workers/{{id}} (register or remove \
+             backends by URL), GET /workers and GET /get_loads (the backends' addresses), POST \
+             /flush_cache (drops the engines' prefix caches), POST /start_profile and POST \
+             /stop_profile (the engines' profilers), POST /heap_profile (writes this gateway's \
+             heap profile to disk), /parse/*, /wasm and /v1/tokenizers; protect them with \
              --control-plane-api-keys id:name:admin:<key> or --jwt-issuer/--jwt-audience (the \
              shared --api-key gates them too)"
-                .to_string(),
-        );
+        ));
     }
     if let Some(addr) = open.mesh_without_tls {
         control_plane_parts.push(format!(
@@ -203,16 +208,18 @@ pub(crate) fn open_posture_warning(
     })
 }
 
-/// Logs the record, one WARN, when a plane is open.
+/// Logs the record, one WARN, when a plane is open. `admin_listener` is the
+/// admin listener's address when the control plane has one.
 pub(crate) fn log_open_posture(
     serving_auth: &AuthConfig,
     admin_auth: &AuthConfig,
     control_plane_auth: bool,
     metrics: Option<&PrometheusConfig>,
     mesh: Option<&MeshServerConfig>,
+    admin_listener: Option<SocketAddr>,
 ) {
     let open = OpenSurfaces::judge(serving_auth, admin_auth, control_plane_auth, mesh);
-    if let Some(warning) = open_posture_warning(open, metrics) {
+    if let Some(warning) = open_posture_warning(open, metrics, admin_listener) {
         warn!(
             control_plane = warning.control_plane.as_deref(),
             data_plane = warning.data_plane.as_deref(),
@@ -253,7 +260,8 @@ mod tests {
             }
         );
 
-        let warning = open_posture_warning(open, Some(&listener())).expect("an open start warns");
+        let warning =
+            open_posture_warning(open, Some(&listener()), None).expect("an open start warns");
         let message = format!(
             "{HEADLINE} {} {} {}",
             warning.control_plane.as_deref().unwrap_or_default(),
@@ -284,6 +292,30 @@ mod tests {
         }
     }
 
+    /// With an admin listener, the open control plane is named with the
+    /// listener's address: that is the address to fence.
+    #[test]
+    fn an_admin_listener_is_named_with_the_open_control_plane() {
+        let open = OpenSurfaces::judge(&unkeyed(), &unkeyed(), false, None);
+        let admin: SocketAddr = "10.0.0.5:9001".parse().unwrap();
+        let warning = open_posture_warning(open, None, Some(admin)).expect("an open start warns");
+        let control_plane = warning.control_plane.expect("the control plane is named");
+        assert!(
+            control_plane.starts_with("OPEN (on the admin listener 10.0.0.5:9001): POST /workers"),
+            "{control_plane}"
+        );
+        assert!(warning.data_plane.is_some());
+
+        let without = open_posture_warning(open, None, None).expect("an open start warns");
+        assert!(
+            without
+                .control_plane
+                .expect("named")
+                .starts_with("OPEN: POST /workers"),
+            "no listener named without one"
+        );
+    }
+
     #[test]
     fn control_plane_keys_alone_leave_only_the_data_plane_open() {
         let open = OpenSurfaces::judge(&unkeyed(), &unkeyed(), true, None);
@@ -296,7 +328,7 @@ mod tests {
             }
         );
 
-        let warning = open_posture_warning(open, None).expect("the data plane is open");
+        let warning = open_posture_warning(open, None, None).expect("the data plane is open");
 
         assert!(warning.data_plane.is_some());
         assert_eq!(warning.control_plane, None);
@@ -311,7 +343,8 @@ mod tests {
             ..PrometheusConfig::default()
         };
 
-        let warning = open_posture_warning(open, Some(&listener)).expect("an open start warns");
+        let warning =
+            open_posture_warning(open, Some(&listener), None).expect("an open start warns");
 
         assert!(warning
             .metrics_listener
@@ -324,7 +357,7 @@ mod tests {
         let open = OpenSurfaces::judge(&keyed(), &keyed(), false, None);
 
         assert!(!open.any());
-        assert_eq!(open_posture_warning(open, Some(&listener())), None);
+        assert_eq!(open_posture_warning(open, Some(&listener()), None), None);
     }
 
     /// Tenant keys gate the serving routes, and without a shared key the
@@ -347,7 +380,7 @@ mod tests {
     #[traced_test]
     #[test]
     fn an_open_start_logs_the_warning() {
-        log_open_posture(&unkeyed(), &unkeyed(), false, Some(&listener()), None);
+        log_open_posture(&unkeyed(), &unkeyed(), false, Some(&listener()), None, None);
 
         assert!(logs_contain("SECURITY POSTURE"));
         assert!(logs_contain("control_plane=\"OPEN: POST /workers"));
@@ -377,7 +410,7 @@ mod tests {
         );
         assert!(open.any());
 
-        let warning = open_posture_warning(open, None).expect("a plaintext mesh warns");
+        let warning = open_posture_warning(open, None, None).expect("a plaintext mesh warns");
         let control_plane = warning
             .control_plane
             .expect("the mesh is a control-plane surface");
@@ -416,6 +449,7 @@ mod tests {
             true,
             Some(&listener()),
             Some(&mesh(None)),
+            None,
         );
 
         assert!(logs_contain("SECURITY POSTURE"));
@@ -425,7 +459,7 @@ mod tests {
     #[traced_test]
     #[test]
     fn a_keyed_start_logs_nothing() {
-        log_open_posture(&keyed(), &keyed(), true, Some(&listener()), None);
+        log_open_posture(&keyed(), &keyed(), true, Some(&listener()), None, None);
 
         assert!(!logs_contain("SECURITY POSTURE"));
     }

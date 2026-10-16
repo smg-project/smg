@@ -37,11 +37,13 @@ pub fn validate_mesh_listener_port(
     port: u16,
     metrics_port: Option<u16>,
     health_check_port: Option<u16>,
+    admin_port: Option<u16>,
 ) -> ConfigResult<()> {
     let listeners = [
         Some(("port", "--port", port)),
         metrics_port.map(|port| ("metrics.port", "--prometheus-port", port)),
         health_check_port.map(|port| ("health_check_port", "--health-check-port", port)),
+        admin_port.map(|port| ("admin_port", "--admin-port", port)),
         Some(("mesh_port", "--mesh-port", mesh_port)),
     ];
     let listeners: Vec<_> = listeners.into_iter().flatten().collect();
@@ -1173,6 +1175,36 @@ impl ConfigValidator {
             });
         }
 
+        // The admin listener: a port of 0 would be an unstable ephemeral one
+        // (as for the probe listener), a host without a port names a listener
+        // that does not exist, and the host must be a bind host.
+        if config.admin_port == Some(0) {
+            return Err(ConfigError::InvalidValue {
+                field: "admin_port".to_string(),
+                value: "0".to_string(),
+                reason: "Port must be > 0 (0 would request an unstable OS-ephemeral port)"
+                    .to_string(),
+            });
+        }
+        if let Some(admin_host) = &config.admin_host {
+            if config.admin_port.is_none() {
+                return Err(ConfigError::InvalidValue {
+                    field: "admin_host".to_string(),
+                    value: admin_host.clone(),
+                    reason: "--admin-host needs --admin-port: the admin listener exists only \
+                             with a port"
+                        .to_string(),
+                });
+            }
+            if let Err(reason) = parse_bind_host(admin_host) {
+                return Err(ConfigError::InvalidValue {
+                    field: "admin_host".to_string(),
+                    value: admin_host.clone(),
+                    reason,
+                });
+            }
+        }
+
         // Each listener needs its own port. Two of them on one port used to
         // bind the first, answer, and die at the second bind with a raw
         // AddrInUse that named no flag: a partial start an operator's
@@ -1186,6 +1218,9 @@ impl ConfigValidator {
             config
                 .health_check_port
                 .map(|port| ("health_check_port", "--health-check-port", port)),
+            config
+                .admin_port
+                .map(|port| ("admin_port", "--admin-port", port)),
         ];
         let listeners: Vec<_> = listeners.into_iter().flatten().collect();
         validate_distinct_listener_ports(&listeners)?;
@@ -4403,8 +4438,9 @@ mod tests {
             ("--port", 30001),
             ("--prometheus-port", 30002),
             ("--health-check-port", 30003),
+            ("--admin-port", 30004),
         ] {
-            match validate_mesh_listener_port(taken, 30001, Some(30002), Some(30003)) {
+            match validate_mesh_listener_port(taken, 30001, Some(30002), Some(30003), Some(30004)) {
                 Err(ConfigError::InvalidValue {
                     field,
                     value,
@@ -4420,8 +4456,66 @@ mod tests {
                 other => panic!("--mesh-port equal to {flag} must be rejected, got {other:?}"),
             }
         }
-        assert!(validate_mesh_listener_port(30004, 30001, Some(30002), Some(30003)).is_ok());
-        assert!(validate_mesh_listener_port(30002, 30001, None, None).is_ok());
+        assert!(
+            validate_mesh_listener_port(30005, 30001, Some(30002), Some(30003), Some(30004))
+                .is_ok()
+        );
+        assert!(validate_mesh_listener_port(30002, 30001, None, None, None).is_ok());
+    }
+
+    /// The admin listener's settings: a port of 0 is refused (an ephemeral
+    /// port is no stable control-plane address), a host without a port names
+    /// a listener that does not exist, the host must be a bind host, and the
+    /// port must differ from the other listeners'; a port alone, or with a
+    /// bind host, passes.
+    #[test]
+    fn admin_listener_settings_are_validated() {
+        let config = |admin_port: Option<u16>, admin_host: Option<&str>| RouterConfig {
+            port: 30001,
+            metrics: Some(MetricsConfig {
+                port: 30002,
+                host: "127.0.0.1".to_string(),
+            }),
+            health_check_port: Some(30003),
+            admin_port,
+            admin_host: admin_host.map(str::to_string),
+            mode: RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            ..Default::default()
+        };
+        let refused = |config: &RouterConfig| match ConfigValidator::validate(config) {
+            Err(ConfigError::InvalidValue { field, reason, .. }) => (field, reason),
+            other => panic!("expected an InvalidValue, got {other:?}"),
+        };
+        for (admin_port, admin_host) in [
+            (None, None),
+            (Some(30004), None),
+            (Some(30004), Some("[::1]")),
+        ] {
+            ConfigValidator::validate(&config(admin_port, admin_host))
+                .unwrap_or_else(|e| panic!("{admin_port:?} {admin_host:?}: {e}"));
+        }
+
+        let (field, _) = refused(&config(Some(0), None));
+        assert_eq!(field, "admin_port");
+        let (field, reason) = refused(&config(None, Some("127.0.0.1")));
+        assert_eq!(field, "admin_host");
+        assert!(reason.contains("--admin-port"), "{reason}");
+        let (field, _) = refused(&config(Some(30004), Some("localhost")));
+        assert_eq!(field, "admin_host");
+        for (taken, flag) in [
+            (30001, "--port"),
+            (30002, "--prometheus-port"),
+            (30003, "--health-check-port"),
+        ] {
+            let (field, reason) = refused(&config(Some(taken), None));
+            assert_eq!(field, "admin_port");
+            assert!(
+                reason.contains("--admin-port") && reason.contains(flag),
+                "{reason}"
+            );
+        }
     }
 
     #[test]

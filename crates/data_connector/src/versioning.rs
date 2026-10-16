@@ -146,6 +146,53 @@ fn pending_migrations_error(
     msg
 }
 
+// ── Pending migrations ─────────────────────────────────────────────────────
+
+/// The migrations a store at `current` still needs, the prelude the Oracle
+/// and Postgres runners share: the schema config's `version` is a floor under
+/// the recorded version and the migrations above the higher of the two are
+/// pending. `None` when there are none; the actionable
+/// [`pending_migrations_error`] when there are some and automatic migration
+/// is off. `backend` names the store in the log and the error.
+fn pending_migrations<'a>(
+    backend: &str,
+    current: u32,
+    migrations: &'a [Migration],
+    config_version: Option<u32>,
+    auto_migrate: bool,
+    schema: &SchemaConfig,
+) -> Result<Option<Vec<&'a Migration>>, String> {
+    let effective_start = current.max(config_version.unwrap_or(0));
+
+    let pending: Vec<&Migration> = migrations
+        .iter()
+        .filter(|m| m.version > effective_start)
+        .collect();
+
+    if pending.is_empty() {
+        tracing::debug!(current_version = effective_start, "schema is up to date");
+        return Ok(None);
+    }
+
+    // When auto_migrate is off, fail with actionable info
+    if !auto_migrate {
+        return Err(pending_migrations_error(
+            backend,
+            effective_start,
+            &pending,
+            schema,
+        ));
+    }
+
+    tracing::info!(
+        current_version = effective_start,
+        pending = pending.len(),
+        "applying schema migrations"
+    );
+
+    Ok(Some(pending))
+}
+
 // ── A schema ahead of this build ───────────────────────────────────────────
 
 /// Refuses a store whose schema version is ahead of the migrations this
@@ -273,34 +320,17 @@ pub fn run_oracle_migrations(
     // judged again here, before this build serves on it. The override's
     // warning was logged by the early check; this one only refuses.
     schema_ahead_override("oracle", current, migrations, config_version)?;
-    let skip_up_to = config_version.unwrap_or(0);
-    let effective_start = current.max(skip_up_to);
-
-    let pending: Vec<&Migration> = migrations
-        .iter()
-        .filter(|m| m.version > effective_start)
-        .collect();
-
-    if pending.is_empty() {
-        tracing::debug!(current_version = effective_start, "schema is up to date");
+    let Some(pending) = pending_migrations(
+        "oracle",
+        current,
+        migrations,
+        config_version,
+        auto_migrate,
+        schema,
+    )?
+    else {
         return Ok(Vec::new());
-    }
-
-    // When auto_migrate is off, fail with actionable info
-    if !auto_migrate {
-        return Err(pending_migrations_error(
-            "oracle",
-            effective_start,
-            &pending,
-            schema,
-        ));
-    }
-
-    tracing::info!(
-        current_version = effective_start,
-        pending = pending.len(),
-        "applying schema migrations"
-    );
+    };
 
     let versions_table = oracle_versions_table(schema);
 
@@ -458,34 +488,17 @@ pub async fn run_postgres_migrations(
     auto_migrate: bool,
 ) -> Result<Vec<u32>, String> {
     let current = postgres_current_version(tx).await?;
-    let skip_up_to = config_version.unwrap_or(0);
-    let effective_start = current.max(skip_up_to);
-
-    let pending: Vec<&Migration> = migrations
-        .iter()
-        .filter(|m| m.version > effective_start)
-        .collect();
-
-    if pending.is_empty() {
-        tracing::debug!(current_version = effective_start, "schema is up to date");
+    let Some(pending) = pending_migrations(
+        "postgres",
+        current,
+        migrations,
+        config_version,
+        auto_migrate,
+        schema,
+    )?
+    else {
         return Ok(Vec::new());
-    }
-
-    // When auto_migrate is off, fail with actionable info
-    if !auto_migrate {
-        return Err(pending_migrations_error(
-            "postgres",
-            effective_start,
-            &pending,
-            schema,
-        ));
-    }
-
-    tracing::info!(
-        current_version = effective_start,
-        pending = pending.len(),
-        "applying schema migrations"
-    );
+    };
 
     let mut applied = Vec::new();
     for migration in pending {
@@ -956,6 +969,44 @@ mod tests {
         assert!(schema_ahead_check("oracle", 99, &migrations, Some(50)).is_err());
         assert!(schema_ahead_check("oracle", 99, &migrations, Some(99)).is_ok());
         assert!(schema_ahead_check("oracle", 99, &migrations, Some(100)).is_ok());
+    }
+
+    /// The prelude the two runners share: the migrations above the recorded
+    /// version are pending, the schema config's `version` is a floor under
+    /// it, nothing pending is `None`, and pending migrations without
+    /// automatic migration are the refusal that names them.
+    #[test]
+    fn pending_migrations_follow_the_recorded_version_the_floor_and_the_automatic_setting() {
+        let schema = SchemaConfig::default();
+        let migrations = three_migrations();
+        let versions = |pending: Option<Vec<&Migration>>| -> Option<Vec<u32>> {
+            pending.map(|pending| pending.iter().map(|m| m.version).collect())
+        };
+
+        // Nothing pending: the store is at the last version this build knows.
+        let none = pending_migrations("postgres", 3, &migrations, None, false, &schema);
+        assert_eq!(versions(none.unwrap()), None);
+
+        // Pending with automatic migration: the ones above the recorded version.
+        let above = pending_migrations("postgres", 1, &migrations, None, true, &schema);
+        assert_eq!(versions(above.unwrap()), Some(vec![2, 3]));
+
+        // The floor above the recorded version takes the version's place.
+        let floored = pending_migrations("oracle", 1, &migrations, Some(2), true, &schema);
+        assert_eq!(versions(floored.unwrap()), Some(vec![3]));
+
+        // Pending without automatic migration: the refusal, counted from the
+        // floor and naming only the migrations above it.
+        let refused = pending_migrations("oracle", 1, &migrations, Some(2), false, &schema);
+        let Err(err) = refused else {
+            panic!("pending migrations without automatic migration are a refusal");
+        };
+        assert!(err.contains("current version: 2"), "{err}");
+        assert!(
+            err.contains("v3: test") && !err.contains("v2: test"),
+            "{err}"
+        );
+        assert!(err.contains("oracle schema config"), "{err}");
     }
 
     #[test]

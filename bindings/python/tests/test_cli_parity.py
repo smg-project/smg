@@ -92,17 +92,19 @@ def literal_default(attribute: str) -> object:
         return None
 
 
-def parse_rust_cli(text: str) -> RustCli:
+def parse_rust_cli(text: str, struct_name: str = "CliArgs") -> RustCli:
     """The flags of ``struct CliArgs``: each ``#[arg(...)]`` attribute and the field
-    it annotates, the long flag being the explicit ``long = ".."`` or the field
+    it annotates, recursively including ``#[command(flatten)]`` argument groups.
+    The long flag is the explicit ``long = ".."`` or the field
     name with dashes, the second spellings its ``alias``/``visible_alias``."""
     lines = text.splitlines()
-    start = lines.index("struct CliArgs {")
+    start = lines.index(f"struct {struct_name} {{")
     end = lines.index("}", start)
     cli = RustCli(pre_clap=set(re.findall(r'args\[i\] == "(--[a-z-]+)"', text)))
     i = start + 1
     while i < end:
-        if not lines[i].lstrip().startswith("#[arg("):
+        flattened = lines[i].strip() == "#[command(flatten)]"
+        if not flattened and not lines[i].lstrip().startswith("#[arg("):
             i += 1
             continue
         attribute = lines[i].strip()
@@ -114,8 +116,14 @@ def parse_rust_cli(text: str) -> RustCli:
         i += 1
         while not lines[i].strip() or lines[i].lstrip().startswith(("#", "/")):
             i += 1
-        declared = re.match(r"\s*(?:pub\s+)?([a-z0-9_]+)\s*:", lines[i])
+        declared = re.match(r"\s*(?:pub\s+)?([a-z0-9_]+)\s*:\s*([A-Za-z0-9_]+)", lines[i])
         assert declared is not None, f"no field after the attribute ending at line {i}"
+        if flattened:
+            group = parse_rust_cli(text, declared.group(2))
+            cli.flags.update(group.flags)
+            cli.aliases.update(group.aliases)
+            i += 1
+            continue
         if re.fullmatch(r"#\[arg\(\s*skip\s*(=.*)?\)\]", attribute):
             # A field clap never reads from the command line (a record filled
             # after parsing): no flag to mirror.
@@ -129,6 +137,36 @@ def parse_rust_cli(text: str) -> RustCli:
             cli.aliases["--" + alias] = flag
         i += 1
     return cli
+
+
+def test_parse_rust_cli_follows_only_reachable_flattened_groups():
+    """Flattened groups retain flags, defaults and aliases, without unrelated structs."""
+    cli = parse_rust_cli("""
+struct CliArgs {
+    #[arg(long, default_value_t = 3)]
+    retries: usize,
+    #[command(flatten)]
+    worker: WorkerArgs,
+}
+struct WorkerArgs {
+    #[arg(long = "worker-url", visible_alias = "url")]
+    endpoint: String,
+    #[command(flatten)]
+    nested: NestedArgs,
+}
+struct NestedArgs {
+    #[arg(long, default_value_t = false)]
+    enabled: bool,
+    #[arg(skip)]
+    internal: usize,
+}
+struct Unrelated {
+    #[arg(long)]
+    ignored: String,
+}
+""")
+    assert cli.flags == {"--retries": 3, "--worker-url": None, "--enabled": False}
+    assert cli.aliases == {"--url": "--worker-url"}
 
 
 def launcher_options(use_router_prefix: bool = False) -> dict[str, argparse.Action]:

@@ -418,6 +418,8 @@ struct Router {
     host: String,
     port: u16,
     health_check_port: Option<u16>,
+    admin_port: Option<u16>,
+    admin_host: Option<String>,
     routing_key_override: bool,
     worker_urls: Vec<String>,
     policy: PolicyType,
@@ -922,8 +924,11 @@ impl Router {
         };
         let has_discovery = discovery.is_some();
 
-        let metrics = self.prometheus_port.map(|port| MetricsConfig {
-            port,
+        // The metrics listener `start` creates: its port when unset is the
+        // exporter's default, so the validator's port checks (the admin,
+        // probe and data ports against it) see the listener that will bind.
+        let metrics = Some(MetricsConfig {
+            port: self.prometheus_port.unwrap_or(29000),
             host: self.metrics_host(),
         });
 
@@ -1018,6 +1023,8 @@ impl Router {
             .host(&self.host)
             .port(self.port)
             .health_check_port(self.health_check_port)
+            .admin_port(self.admin_port)
+            .admin_host(self.admin_host.clone())
             .connection_mode(self.connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
             .zmq_engine_count(self.zmq_engine_count)
@@ -1390,6 +1397,8 @@ impl Router {
         history_memory_max_responses = 10000,
         history_memory_max_items = 100000,
         history_memory_retention_secs = 86400,
+        admin_port = None,
+        admin_host = None,
         // Keyword-only, so it never takes a positional slot.
         *,
         mesh_tls_ca_cert = None,
@@ -1593,6 +1602,8 @@ impl Router {
         history_memory_max_responses: usize,
         history_memory_max_items: usize,
         history_memory_retention_secs: u64,
+        admin_port: Option<u16>,
+        admin_host: Option<String>,
         mesh_tls_ca_cert: Option<String>,
         mesh_tls_cert: Option<String>,
         mesh_tls_key: Option<String>,
@@ -1635,6 +1646,8 @@ impl Router {
             host,
             port,
             health_check_port,
+            admin_port,
+            admin_host,
             routing_key_override,
             worker_urls,
             policy,

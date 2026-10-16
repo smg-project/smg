@@ -18,8 +18,15 @@ path = "src/main.rs"
 name = "replay"
 path = "src/bin/replay.rs"
 
+# The open-loop stress client of scripts/bench/grpc_stress (chat, tools,
+# responses, image traffic at a fixed rate against the gateway).
+[[bin]]
+name = "stress_load"
+path = "src/bin/stress_load.rs"
+
 [dependencies]
 anyhow.workspace = true
+bytes.workspace = true
 clap = { version = "4", features = ["derive"] }
 reqwest = { workspace = true, features = ["json", "stream", "rustls-no-provider"] }
 serde = { workspace = true, features = ["derive"] }

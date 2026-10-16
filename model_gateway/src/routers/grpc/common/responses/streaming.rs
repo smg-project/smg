@@ -6,7 +6,7 @@ use futures::Stream;
 use http::header::{HeaderValue, CONTENT_TYPE};
 use openai_protocol::{
     chat::ChatCompletionStreamResponse,
-    common::Usage,
+    common::{ToolCallDelta, Usage},
     event_types::{
         ContentPartEvent, FunctionCallEvent, McpEvent, OutputItemEvent, OutputTextEvent,
         ResponseEvent,
@@ -1136,202 +1136,220 @@ impl ResponseStreamEventEmitter {
         Ok(())
     }
 
-    /// Process a chunk and emit appropriate events
+    /// Process a chunk and emit appropriate events: the reasoning delta, the
+    /// content delta, the tool-call deltas, then the finish, in that order.
     pub async fn process_chunk(
         &mut self,
         chunk: &ChatCompletionStreamResponse,
         tx: &SseSender,
     ) -> Result<(), String> {
-        // Process content if present
-        if let Some(choice) = chunk.choices.first() {
-            // Reasoning streams as its own output item, opened on the first
-            // delta so it precedes the answer (OpenAI order).
-            if let Some(reasoning) = choice
-                .delta
-                .reasoning_content
-                .as_deref()
-                .filter(|r| !r.is_empty())
-            {
-                if self.reasoning_item.is_none() {
-                    let (output_index, item_id) =
-                        self.allocate_output_index(OutputItemKind::Reasoning);
-                    let item = json!({
-                        "id": item_id,
-                        "type": "reasoning",
-                        "summary": [],
-                        "content": [],
-                        "status": "in_progress"
-                    });
-                    let event = self.emit_output_item_added(output_index, &item);
-                    self.send_event(&event, tx).await?;
-                    let event = json!({
-                        "type": "response.content_part.added",
-                        "sequence_number": self.next_sequence(),
-                        "output_index": output_index,
-                        "item_id": item_id,
-                        "content_index": 0,
-                        "part": { "type": "reasoning_text", "text": "" }
-                    });
-                    self.send_event(&event, tx).await?;
-                    self.reasoning_item = Some(ReasoningStreamItem {
-                        output_index,
-                        item_id,
-                        text: String::new(),
-                    });
-                }
-                if let Some(item) = self.reasoning_item.as_mut() {
-                    item.text.push_str(reasoning);
-                    let (output_index, item_id) = (item.output_index, item.item_id.clone());
-                    let event = self.emit_reasoning_text_delta(output_index, &item_id, reasoning);
-                    self.send_event(&event, tx).await?;
-                }
-            }
-            if let Some(content) = &choice.delta.content {
-                if !content.is_empty() {
-                    // Allocate output_index and item_id for this message item (once per message)
-                    if self.current_item_id.is_none() {
-                        self.close_reasoning_item(tx).await?;
-                        let (output_index, item_id) =
-                            self.allocate_output_index(OutputItemKind::Message);
-
-                        // Build message item structure
-                        let item = json!({
-                            "id": item_id,
-                            "type": "message",
-                            "role": "assistant",
-                            "content": []
-                        });
-
-                        // Emit output_item.added
-                        let event = self.emit_output_item_added(output_index, &item);
-                        self.send_event(&event, tx).await?;
-                        self.has_emitted_output_item_added = true;
-
-                        // Store for subsequent events
-                        self.current_item_id = Some(item_id);
-                        self.current_message_output_index = Some(output_index);
-                    }
-
-                    // output_index and item_id are always set in the block above
-                    // when current_item_id was None and we allocated new ones
-                    if let (Some(output_index), Some(item_id)) = (
-                        self.current_message_output_index,
-                        self.current_item_id.clone(),
-                    ) {
-                        let content_index = 0; // Single content part for now
-
-                        // Emit content_part.added before first delta
-                        if !self.has_emitted_content_part_added {
-                            let event =
-                                self.emit_content_part_added(output_index, &item_id, content_index);
-                            self.send_event(&event, tx).await?;
-                            self.has_emitted_content_part_added = true;
-                        }
-
-                        // Emit text delta
-                        let event =
-                            self.emit_text_delta(content, output_index, &item_id, content_index);
-                        self.send_event(&event, tx).await?;
-                    }
-                }
-            }
-
-            // Translate chat tool-call deltas into Responses function_call
-            // events; without this the streamed call is dropped entirely.
-            if let Some(tool_calls) = &choice.delta.tool_calls {
-                for tc in tool_calls {
-                    let pos = match self
-                        .tool_call_items
-                        .iter()
-                        .position(|i| i.chat_index == tc.index)
-                    {
-                        Some(pos) => pos,
-                        None => {
-                            self.close_reasoning_item(tx).await?;
-                            let (output_index, item_id) =
-                                self.allocate_output_index(OutputItemKind::FunctionCall);
-                            self.tool_call_items.push(ToolCallStreamItem {
-                                chat_index: tc.index,
-                                output_index,
-                                item_id,
-                                call_id: tc
-                                    .id
-                                    .clone()
-                                    .unwrap_or_else(|| format!("call_{}", Uuid::now_v7())),
-                                name: String::new(),
-                                arguments: String::new(),
-                                added_emitted: false,
-                            });
-                            self.tool_call_items.len() - 1
-                        }
-                    };
-                    let function = tc.function.as_ref();
-                    let name_delta = function
-                        .and_then(|f| f.name.as_deref())
-                        .filter(|n| !n.is_empty());
-                    let args_delta = function
-                        .and_then(|f| f.arguments.as_deref())
-                        .filter(|a| !a.is_empty());
-
-                    let item = &mut self.tool_call_items[pos];
-                    if let (true, Some(name)) = (item.name.is_empty(), name_delta) {
-                        item.name = name.to_string();
-                    }
-                    if let Some(args) = args_delta {
-                        item.arguments.push_str(args);
-                    }
-                    let emit_added = !item.added_emitted
-                        && (!item.name.is_empty() || !item.arguments.is_empty());
-                    item.added_emitted |= emit_added;
-                    let (output_index, item_id, call_id, name) = (
-                        item.output_index,
-                        item.item_id.clone(),
-                        item.call_id.clone(),
-                        item.name.clone(),
-                    );
-                    let custom = self.is_custom_tool(&name);
-
-                    if emit_added {
-                        let item = if custom {
-                            json!({
-                                "id": item_id,
-                                "type": "custom_tool_call",
-                                "call_id": call_id,
-                                "name": name,
-                                "input": "",
-                            })
-                        } else {
-                            json!({
-                                "id": item_id,
-                                "type": "function_call",
-                                "call_id": call_id,
-                                "name": name,
-                                "arguments": "",
-                                "status": "in_progress",
-                            })
-                        };
-                        let event = self.emit_output_item_added(output_index, &item);
-                        self.send_event(&event, tx).await?;
-                    }
-                    // Custom tool calls carry their payload as the raw `input`
-                    // string of the final item, not as streamed JSON arguments.
-                    if let Some(delta) = args_delta.filter(|_| !custom) {
-                        let event =
-                            self.emit_function_call_arguments_delta(output_index, &item_id, delta);
-                        self.send_event(&event, tx).await?;
-                    }
-                }
-            }
-
-            // Check for finish_reason to emit completion events
-            if let Some(reason) = &choice.finish_reason {
-                self.finish_reason = Some(reason.clone());
-                self.close_reasoning_item(tx).await?;
-                self.close_message_item(tx).await?;
-                self.close_tool_call_items(tx).await?;
+        let Some(choice) = chunk.choices.first() else {
+            return Ok(());
+        };
+        if let Some(reasoning) = choice
+            .delta
+            .reasoning_content
+            .as_deref()
+            .filter(|r| !r.is_empty())
+        {
+            self.process_reasoning_delta(reasoning, tx).await?;
+        }
+        if let Some(content) = choice.delta.content.as_deref().filter(|c| !c.is_empty()) {
+            self.process_content_delta(content, tx).await?;
+        }
+        if let Some(tool_calls) = &choice.delta.tool_calls {
+            for tc in tool_calls {
+                self.process_tool_call_delta(tc, tx).await?;
             }
         }
+        // Check for finish_reason to emit completion events
+        if let Some(reason) = &choice.finish_reason {
+            self.finish_reason = Some(reason.clone());
+            self.close_reasoning_item(tx).await?;
+            self.close_message_item(tx).await?;
+            self.close_tool_call_items(tx).await?;
+        }
+        Ok(())
+    }
 
+    /// A reasoning delta. Reasoning streams as its own output item, opened on
+    /// the first delta so it precedes the answer (OpenAI order).
+    async fn process_reasoning_delta(
+        &mut self,
+        reasoning: &str,
+        tx: &SseSender,
+    ) -> Result<(), String> {
+        if self.reasoning_item.is_none() {
+            let (output_index, item_id) = self.allocate_output_index(OutputItemKind::Reasoning);
+            let item = json!({
+                "id": item_id,
+                "type": "reasoning",
+                "summary": [],
+                "content": [],
+                "status": "in_progress"
+            });
+            let event = self.emit_output_item_added(output_index, &item);
+            self.send_event(&event, tx).await?;
+            let event = json!({
+                "type": "response.content_part.added",
+                "sequence_number": self.next_sequence(),
+                "output_index": output_index,
+                "item_id": item_id,
+                "content_index": 0,
+                "part": { "type": "reasoning_text", "text": "" }
+            });
+            self.send_event(&event, tx).await?;
+            self.reasoning_item = Some(ReasoningStreamItem {
+                output_index,
+                item_id,
+                text: String::new(),
+            });
+        }
+        if let Some(item) = self.reasoning_item.as_mut() {
+            item.text.push_str(reasoning);
+            let (output_index, item_id) = (item.output_index, item.item_id.clone());
+            let event = self.emit_reasoning_text_delta(output_index, &item_id, reasoning);
+            self.send_event(&event, tx).await?;
+        }
+        Ok(())
+    }
+
+    /// A content delta. The first one closes the reasoning item and opens the
+    /// message item and its content part; every one streams its text.
+    async fn process_content_delta(&mut self, content: &str, tx: &SseSender) -> Result<(), String> {
+        // Allocate output_index and item_id for this message item (once per message)
+        if self.current_item_id.is_none() {
+            self.close_reasoning_item(tx).await?;
+            let (output_index, item_id) = self.allocate_output_index(OutputItemKind::Message);
+
+            // Build message item structure
+            let item = json!({
+                "id": item_id,
+                "type": "message",
+                "role": "assistant",
+                "content": []
+            });
+
+            // Emit output_item.added
+            let event = self.emit_output_item_added(output_index, &item);
+            self.send_event(&event, tx).await?;
+            self.has_emitted_output_item_added = true;
+
+            // Store for subsequent events
+            self.current_item_id = Some(item_id);
+            self.current_message_output_index = Some(output_index);
+        }
+
+        // output_index and item_id are always set in the block above
+        // when current_item_id was None and we allocated new ones
+        if let (Some(output_index), Some(item_id)) = (
+            self.current_message_output_index,
+            self.current_item_id.clone(),
+        ) {
+            let content_index = 0; // Single content part for now
+
+            // Emit content_part.added before first delta
+            if !self.has_emitted_content_part_added {
+                let event = self.emit_content_part_added(output_index, &item_id, content_index);
+                self.send_event(&event, tx).await?;
+                self.has_emitted_content_part_added = true;
+            }
+
+            // Emit text delta
+            let event = self.emit_text_delta(content, output_index, &item_id, content_index);
+            self.send_event(&event, tx).await?;
+        }
+        Ok(())
+    }
+
+    /// A chat tool-call delta as Responses function_call events; without this
+    /// the streamed call is dropped entirely. The call's item is found or
+    /// opened (closing the reasoning item first), announced once it has a name
+    /// or arguments, and its arguments streamed unless the tool is custom.
+    async fn process_tool_call_delta(
+        &mut self,
+        tc: &ToolCallDelta,
+        tx: &SseSender,
+    ) -> Result<(), String> {
+        let pos = match self
+            .tool_call_items
+            .iter()
+            .position(|i| i.chat_index == tc.index)
+        {
+            Some(pos) => pos,
+            None => {
+                self.close_reasoning_item(tx).await?;
+                let (output_index, item_id) =
+                    self.allocate_output_index(OutputItemKind::FunctionCall);
+                self.tool_call_items.push(ToolCallStreamItem {
+                    chat_index: tc.index,
+                    output_index,
+                    item_id,
+                    call_id: tc
+                        .id
+                        .clone()
+                        .unwrap_or_else(|| format!("call_{}", Uuid::now_v7())),
+                    name: String::new(),
+                    arguments: String::new(),
+                    added_emitted: false,
+                });
+                self.tool_call_items.len() - 1
+            }
+        };
+        let function = tc.function.as_ref();
+        let name_delta = function
+            .and_then(|f| f.name.as_deref())
+            .filter(|n| !n.is_empty());
+        let args_delta = function
+            .and_then(|f| f.arguments.as_deref())
+            .filter(|a| !a.is_empty());
+
+        let item = &mut self.tool_call_items[pos];
+        if let (true, Some(name)) = (item.name.is_empty(), name_delta) {
+            item.name = name.to_string();
+        }
+        if let Some(args) = args_delta {
+            item.arguments.push_str(args);
+        }
+        let emit_added =
+            !item.added_emitted && (!item.name.is_empty() || !item.arguments.is_empty());
+        item.added_emitted |= emit_added;
+        let (output_index, item_id, call_id, name) = (
+            item.output_index,
+            item.item_id.clone(),
+            item.call_id.clone(),
+            item.name.clone(),
+        );
+        let custom = self.is_custom_tool(&name);
+
+        if emit_added {
+            let item = if custom {
+                json!({
+                    "id": item_id,
+                    "type": "custom_tool_call",
+                    "call_id": call_id,
+                    "name": name,
+                    "input": "",
+                })
+            } else {
+                json!({
+                    "id": item_id,
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": "",
+                    "status": "in_progress",
+                })
+            };
+            let event = self.emit_output_item_added(output_index, &item);
+            self.send_event(&event, tx).await?;
+        }
+        // Custom tool calls carry their payload as the raw `input`
+        // string of the final item, not as streamed JSON arguments.
+        if let Some(delta) = args_delta.filter(|_| !custom) {
+            let event = self.emit_function_call_arguments_delta(output_index, &item_id, delta);
+            self.send_event(&event, tx).await?;
+        }
         Ok(())
     }
 
@@ -1860,6 +1878,60 @@ mod process_chunk_tests {
         assert_eq!(events[6]["item"], output[0]);
         assert_eq!(events[11]["item"], output[1]);
         assert_eq!(events[10]["arguments"], "{\"city\":\"Paris\"}");
+    }
+
+    #[tokio::test]
+    async fn one_chunk_carrying_reasoning_content_and_a_call_emits_them_in_that_order() {
+        // One chunk with every kind of delta at once: the reasoning item
+        // opens first, the content closes it and opens the message, the
+        // call opens its item, and the finish closes the message and the
+        // call, in that order.
+        let (events, output) = stream(
+            json!({"model": "test-model", "input": "hi"}),
+            &[chunk(
+                json!({
+                    "reasoning_content": "think",
+                    "content": "answer",
+                    "tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{}"}}]
+                }),
+                Some("tool_calls"),
+            )],
+        )
+        .await;
+        assert_eq!(
+            types(&events),
+            [
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.reasoning_text.delta",
+                "response.reasoning_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+            ]
+        );
+        assert_eq!(
+            output
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["reasoning", "message", "function_call"]
+        );
+        assert_eq!(output[0]["content"][0]["text"], "think");
+        assert_eq!(output[1]["content"][0]["text"], "answer");
+        assert_eq!(output[2]["arguments"], "{}");
     }
 
     #[tokio::test]

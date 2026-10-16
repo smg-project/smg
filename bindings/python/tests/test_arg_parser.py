@@ -1856,6 +1856,8 @@ class TestRouterArgsFieldOrder:
         "history_memory_retention_secs",
         "parser",
         "drain_settle_secs",
+        "admin_port",
+        "admin_host",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1926,6 +1928,8 @@ class TestRouterArgsFieldOrder:
             "history_memory_max_responses",
             "history_memory_max_items",
             "history_memory_retention_secs",
+            "admin_port",
+            "admin_host",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "
@@ -1953,6 +1957,21 @@ class TestConnectionTimeouts:
         )
         assert args.header_read_timeout_secs == 5
         assert args.idle_connection_timeout_secs == 0
+
+
+class TestAdminListener:
+    """The admin listener is off by default; its port and bind host parse
+    (a host without a port is refused by the Rust validator, by name)."""
+
+    def test_off_by_default(self):
+        args = parse_router_args([])
+        assert args.admin_port is None
+        assert args.admin_host is None
+
+    def test_flags_parse(self):
+        args = parse_router_args(["--admin-port", "9001", "--admin-host", "10.0.0.5"])
+        assert args.admin_port == 9001
+        assert args.admin_host == "10.0.0.5"
 
 
 class TestPrometheusHostDefault:
