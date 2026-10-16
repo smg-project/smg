@@ -302,7 +302,7 @@ impl MessagePreparationStage {
                 &names,
                 &request.model,
                 &ctx.components.templates,
-                tokenizer.as_ref(),
+                &tokenizer,
             );
 
         // Derive skip_special_tokens from parser and constraint type:

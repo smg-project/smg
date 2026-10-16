@@ -435,7 +435,7 @@ pub(crate) async fn prepare_chat_like(
                 &names,
                 &request.model,
                 &ctx.components.templates,
-                tokenizer.as_ref(),
+                &tokenizer,
             );
 
         let skip_special_tokens = skips_special_tokens(

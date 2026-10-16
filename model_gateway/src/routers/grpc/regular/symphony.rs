@@ -359,16 +359,21 @@ fn answer_tag(
 /// whose tokens decode to its text with the special tokens kept and to something else with them
 /// dropped is such a marker. `false` when no table reads the response, or when every marker
 /// survives the decoder either way (Qwen3's `<think>` and `<tool_call>` are added tokens the
-/// decoder keeps), so a model the older rule already serves is read as before.
+/// decoder keeps), so a model the older rule already serves is read as before. Asking the
+/// tokenizer encodes and decodes every marker, and the answer depends on the tokenizer and the
+/// markers alone, so it is decided once per model and kept with them
+/// ([`Templates::markers_hidden`]).
 pub(crate) fn keeps_special_tokens(
     parser: ParserChoice,
     names: &Names,
     model: &str,
     templates: &Templates,
-    tokenizer: &dyn Tokenizer,
+    tokenizer: &Arc<dyn Tokenizer>,
 ) -> bool {
     match reads(parser, names, model, templates) {
-        Ok(Some(format)) => markers_hidden_by_the_decoder(&format, tokenizer),
+        Ok(Some(format)) => templates.markers_hidden(model, &format, tokenizer, || {
+            markers_hidden_by_the_decoder(&format, tokenizer.as_ref())
+        }),
         _ => false,
     }
 }
@@ -1138,7 +1143,7 @@ impl Reader {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use llm_tokenizer::registry::TokenizerRegistry;
     use serde_json::{json, Value};
@@ -2355,27 +2360,167 @@ mod tests {
         ));
         // Through the names: Qwen3's table over this vocabulary needs nothing, and no table
         // (the legacy parsers, or `--parser legacy`) asks for nothing.
+        let shared: Arc<dyn Tokenizer> = Arc::new(marker_tokenizer());
         assert!(!keeps_special_tokens(
             ParserChoice::Symphony,
             &names(Some("qwen3"), None),
             "Qwen/Qwen3-8B",
             &templates(),
-            &tokenizer,
+            &shared,
         ));
         assert!(!keeps_special_tokens(
             ParserChoice::Symphony,
             &names(Some("passthrough"), None),
             "Qwen/Qwen3-8B",
             &templates(),
-            &tokenizer,
+            &shared,
         ));
         assert!(!keeps_special_tokens(
             ParserChoice::Legacy,
             &names(Some("qwen3"), None),
             "Qwen/Qwen3-8B",
             &templates(),
-            &tokenizer,
+            &shared,
         ));
+    }
+
+    /// The marker tokenizer, counting the encodes asked of it.
+    struct Counting {
+        inner: llm_tokenizer::MockTokenizer,
+        encodes: AtomicUsize,
+    }
+
+    impl Counting {
+        fn shared() -> (Arc<Self>, Arc<dyn Tokenizer>) {
+            let counting = Arc::new(Self {
+                inner: marker_tokenizer(),
+                encodes: AtomicUsize::new(0),
+            });
+            let tokenizer: Arc<dyn Tokenizer> = counting.clone();
+            (counting, tokenizer)
+        }
+
+        fn encodes(&self) -> usize {
+            self.encodes.load(Ordering::Relaxed)
+        }
+    }
+
+    impl llm_tokenizer::traits::Encoder for Counting {
+        fn encode(
+            &self,
+            input: &str,
+            add_special_tokens: bool,
+        ) -> anyhow::Result<llm_tokenizer::traits::Encoding> {
+            self.encodes.fetch_add(1, Ordering::Relaxed);
+            self.inner.encode(input, add_special_tokens)
+        }
+
+        fn encode_batch(
+            &self,
+            inputs: &[&str],
+            add_special_tokens: bool,
+        ) -> anyhow::Result<Vec<llm_tokenizer::traits::Encoding>> {
+            self.inner.encode_batch(inputs, add_special_tokens)
+        }
+    }
+
+    impl llm_tokenizer::traits::Decoder for Counting {
+        fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> anyhow::Result<String> {
+            self.inner.decode(token_ids, skip_special_tokens)
+        }
+    }
+
+    impl Tokenizer for Counting {
+        fn vocab_size(&self) -> usize {
+            self.inner.vocab_size()
+        }
+
+        fn get_special_tokens(&self) -> &llm_tokenizer::traits::SpecialTokens {
+            self.inner.get_special_tokens()
+        }
+
+        fn token_to_id(&self, token: &str) -> Option<u32> {
+            self.inner.token_to_id(token)
+        }
+
+        fn id_to_token(&self, id: u32) -> Option<String> {
+            self.inner.id_to_token(id)
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn a_decided_true_is_answered_as_true_without_asking_again() {
+        let templates = templates();
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(marker_tokenizer());
+        let asked = std::cell::Cell::new(0);
+        let decide = |format: &Format| {
+            templates.markers_hidden("m", format, &tokenizer, || {
+                asked.set(asked.get() + 1);
+                markers_hidden_by_the_decoder(format, tokenizer.as_ref())
+            })
+        };
+        // Markers this vocabulary hides: decided true once, answered true after.
+        let hidden = table_with_markers("<bos>", "<eos>");
+        assert!(decide(&hidden));
+        assert!(decide(&hidden));
+        assert_eq!(asked.get(), 1);
+        // Markers it keeps, for the same model: decided again, false, once.
+        let kept = table_with_markers("<think>", "</think>");
+        assert!(!decide(&kept));
+        assert!(!decide(&kept));
+        assert_eq!(asked.get(), 2);
+    }
+
+    #[test]
+    fn the_decoders_answer_is_decided_once_per_model_tokenizer_and_markers() {
+        let templates = templates();
+        let (counting, tokenizer) = Counting::shared();
+        let qwen3 = names(Some("qwen3"), None);
+        let decide = |names: &Names, tokenizer: &Arc<dyn Tokenizer>| {
+            keeps_special_tokens(
+                ParserChoice::Symphony,
+                names,
+                "Qwen/Qwen3-8B",
+                &templates,
+                tokenizer,
+            )
+        };
+        // The first request asks the tokenizer about every marker of the table; the next ones
+        // for the same model, tokenizer and markers ask nothing.
+        assert!(!decide(&qwen3, &tokenizer));
+        let asked = counting.encodes();
+        assert_eq!(asked, Table::Qwen3.format().terminal_texts().count());
+        assert!(!decide(&qwen3, &tokenizer));
+        assert!(!decide(&qwen3, &tokenizer));
+        assert_eq!(counting.encodes(), asked);
+        // A table with the same markers is decided: the tagged syntax over the same table, and
+        // GLM's table, whose markers are Qwen3's (its tags are the call syntax's).
+        assert!(!decide(&names(Some("qwen3_tagged"), None), &tokenizer));
+        assert!(!decide(&names(Some("glm"), None), &tokenizer));
+        assert_eq!(counting.encodes(), asked);
+        // The same model and markers under a replaced tokenizer are asked about again: the
+        // entry holds Qwen3's markers still, so the tokenizer alone decides that.
+        let (replaced, other) = Counting::shared();
+        assert!(!decide(&qwen3, &other));
+        assert_eq!(replaced.encodes(), asked);
+        assert_eq!(counting.encodes(), asked);
+        // A table with other markers is asked about again, on the tokenizer in place.
+        assert!(!decide(&names(Some("mistral_v13"), None), &other));
+        let mistral = Table::MistralV13.format().terminal_texts().count();
+        assert_eq!(replaced.encodes(), asked + mistral);
+        // Another model asks for itself.
+        assert!(!keeps_special_tokens(
+            ParserChoice::Symphony,
+            &qwen3,
+            "Qwen/Qwen3-4B",
+            &templates,
+            &other,
+        ));
+        assert_eq!(replaced.encodes(), 2 * asked + mistral);
     }
 
     #[test]
