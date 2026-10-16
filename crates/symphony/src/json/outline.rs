@@ -29,6 +29,9 @@ pub struct Outline {
     pub name: Option<String>,
     /// The arguments value's bytes, from its first byte to where it ends or to where the text ends.
     pub arguments: Option<Span>,
+    /// An arguments member's key has arrived, whether or not its value began: an object whose
+    /// outline stops at a delimiter where the value should start has the key and no span.
+    pub arguments_named: bool,
     /// One past the object's closing brace, once it has arrived.
     pub close: Option<usize>,
 }
@@ -329,6 +332,9 @@ impl Scanner {
                     (false, '"') => {
                         let key = decode_string(&text[*start..=at])
                             .map_or(Member::Other, |key| self.found.member_named(&key));
+                        if key == Member::Arguments {
+                            self.found.arguments_named = true;
+                        }
                         self.stage = Stage::Colon { key };
                     }
                     _ => {}

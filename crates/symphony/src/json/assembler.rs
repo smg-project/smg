@@ -214,12 +214,14 @@ impl Assembler {
         taken
     }
 
-    /// The call ends without an arguments member: it is a call with none, `{}`, one fragment that
-    /// accounts for no bytes, so that a client reads the same arguments for it as for one written
-    /// `"arguments": {}`, and the other syntaxes' call with nothing in it. Pushed before the end,
-    /// where the object closed or ended short of its close.
+    /// The call ends without an arguments member, its key never having come: it is a call with
+    /// none, `{}`, one fragment that accounts for no bytes, so that a client reads the same
+    /// arguments for it as for one written `"arguments": {}`, and the other syntaxes' call with
+    /// nothing in it. Pushed before the end, where the object closed or ended short of its close.
+    /// A member whose key came and whose value never began is not one: the call ends with what
+    /// arrived, as before, and nothing is made up for a value the model botched.
     fn no_arguments(&self, arguments: Option<&Span>, out: &mut Events) {
-        if arguments.is_none() {
+        if arguments.is_none() && !self.scanner.found().arguments_named {
             out.push(Event::ToolCallArguments {
                 index: self.index,
                 json: "{}".to_string(),
@@ -616,13 +618,13 @@ mod tests {
         // Other members do not make arguments: the call still has `{}`; without an arguments
         // value the start's source is the whole object and the end's is empty, and the
         // arguments written `{}` read the same.
-        for (text, arguments, end) in [
+        for (text, expected, end) in [
             (r#"{"name": "f", "id": 7}"#, "{}", ""),
             (r#"{"id": 7, "name": "f"}"#, "{}", ""),
             (r#"{"name": "f", "arguments": {}}"#, "{}", "}"),
         ] {
             let events = run(&[text]);
-            assert_eq!(arguments_of(&events), arguments, "{text}");
+            assert_eq!(arguments(&events), expected, "{text}");
             assert_eq!(
                 events.last(),
                 Some(&Event::ToolCallEnd {
@@ -633,11 +635,6 @@ mod tests {
             );
             assert_eq!(sources(&events), text, "{text}");
         }
-    }
-
-    /// The concatenated argument fragments.
-    fn arguments_of(events: &[Event]) -> String {
-        arguments(events)
     }
 
     #[test]
@@ -956,6 +953,17 @@ mod tests {
             "a call without arguments has `{{}}`"
         );
         assert_eq!(tail, Some(("</f>".to_string(), Some('"'))));
+
+        // An arguments member whose value never began is not a call with none: its key came, so
+        // no `{}` is made up for it; the call ends with what arrived and the bytes from the stop
+        // on are the caller's, as before.
+        let (events, tail) = feed(r#"{"name": "f", "arguments": }</f>"#, false);
+        assert_eq!(
+            events,
+            vec![start(r#"{"name": "f", "arguments": "#), end("")],
+            "an arguments member without a value is not a call with `{{}}`"
+        );
+        assert_eq!(tail, Some(("}</f>".to_string(), Some(' '))));
 
         let (events, tail) = feed(r#"{"arguments": {"a": 1}, x</f>"#, false);
         assert_eq!(
