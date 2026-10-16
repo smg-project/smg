@@ -82,8 +82,8 @@ fn scan_ready<D: WorkflowData>(
     }
 }
 
-/// Take every completion the channel holds: a step that succeeded or was
-/// skipped puts its dependents up for a check. Whether anything came.
+/// Take every completion the channel holds and put up for a check what each
+/// one unblocks. Whether anything came.
 fn drain_completions<D: WorkflowData>(
     rx: &mut mpsc::Receiver<(StepId, StepResult)>,
     definition: &WorkflowDefinition<D>,
@@ -99,13 +99,25 @@ fn drain_completions<D: WorkflowData>(
             when,
             "Step completed"
         );
-        if matches!(result, StepResult::Success | StepResult::Skip) {
-            for &dep_idx in definition.get_dependent_indices(&step_id) {
-                pending_check.push_back(dep_idx);
-            }
-        }
+        enqueue_dependents(definition, &step_id, result, pending_check);
     }
     drained
+}
+
+/// A step that succeeded or was skipped puts its dependents up for a check; a
+/// failed one leaves them where they are. The one rule for a completion,
+/// whichever way it arrived.
+fn enqueue_dependents<D: WorkflowData>(
+    definition: &WorkflowDefinition<D>,
+    step_id: &StepId,
+    result: StepResult,
+    pending_check: &mut VecDeque<usize>,
+) {
+    if matches!(result, StepResult::Success | StepResult::Skip) {
+        for &dep_idx in definition.get_dependent_indices(step_id) {
+            pending_check.push_back(dep_idx);
+        }
+    }
 }
 
 /// How long until the soonest waiting step is ready; a short tick when every
@@ -669,14 +681,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                         result = ?result,
                         "Step completed"
                     );
-
-                    // Add dependents of completed step to pending_check (O(1) lookup)
-                    // Only if the step succeeded or was skipped (not failed)
-                    if matches!(result, StepResult::Success | StepResult::Skip) {
-                        for &dep_idx in definition.get_dependent_indices(&completed_step_id) {
-                            pending_check.push_back(dep_idx);
-                        }
-                    }
+                    enqueue_dependents(&definition, &completed_step_id, result, &mut pending_check);
                 }
             } else if has_waiting {
                 // No running tasks, but some steps are waiting for their delay/schedule
@@ -883,13 +888,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         definition: &WorkflowDefinition<D>,
         scan: &ReadyScan,
     ) -> (Vec<usize>, usize) {
-        let newly_ready_from_wait = scan.wait_ready.clone();
-        let deps_ready_indices = scan.deps_ready.clone();
         let now = std::time::Instant::now();
         let mut added_to_waiting = 0usize;
 
         // Clear waiting status for ready steps
-        for &idx in &newly_ready_from_wait {
+        for &idx in &scan.wait_ready {
             t.clear_waiting(idx);
         }
 
@@ -897,13 +900,13 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         // dependency but must only launch once.
         let mut seen = HashSet::new();
         let mut ready: Vec<usize> = Vec::new();
-        for idx in newly_ready_from_wait {
+        for &idx in &scan.wait_ready {
             if seen.insert(idx) {
                 ready.push(idx);
             }
         }
 
-        for idx in deps_ready_indices {
+        for &idx in &scan.deps_ready {
             let step = &definition.steps[idx];
             let wait_duration = Self::calculate_wait_duration(step);
 
@@ -1408,6 +1411,28 @@ mod scheduler_tests {
             [1, 2],
             "a failed step's dependents are not put up; a skipped step's are"
         );
+    }
+
+    #[test]
+    fn a_completion_puts_dependents_up_for_a_check_only_when_its_step_succeeded_or_was_skipped() {
+        let definition = three_steps(None);
+        let a = StepId::new("a");
+        let dependents_of_a: Vec<usize> = definition.get_dependent_indices(&a).to_vec();
+        assert!(
+            !dependents_of_a.is_empty(),
+            "the fixture gives `a` a dependent"
+        );
+
+        let mut pending = VecDeque::new();
+        enqueue_dependents(&definition, &a, StepResult::Failure, &mut pending);
+        assert!(pending.is_empty(), "a failed step unblocks nothing");
+
+        enqueue_dependents(&definition, &a, StepResult::Skip, &mut pending);
+        assert_eq!(Vec::from(pending.clone()), dependents_of_a);
+
+        pending.clear();
+        enqueue_dependents(&definition, &a, StepResult::Success, &mut pending);
+        assert_eq!(Vec::from(pending), dependents_of_a);
     }
 
     #[test]
