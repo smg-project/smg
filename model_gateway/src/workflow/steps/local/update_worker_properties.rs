@@ -143,6 +143,11 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                         worker.url(),
                         "update_worker_properties",
                     )?;
+                    super::create_worker::validate_traffic_split_labels(
+                        &updated_labels,
+                        worker.url(),
+                        "update_worker_properties",
+                    )?;
                     if updated_labels.len() > existing.len()
                         && updated_labels.len() > MAX_WORKER_LABELS
                     {

@@ -27,6 +27,12 @@ const MAX_TOOL_LABELS: usize = 1024;
 
 static MODEL_LABELS: Lazy<BoundedLabels> = Lazy::new(|| BoundedLabels::new(MAX_MODEL_LABELS));
 static TOOL_LABELS: Lazy<BoundedLabels> = Lazy::new(|| BoundedLabels::new(MAX_TOOL_LABELS));
+
+/// Max distinct worker-group labels (the operator's `traffic_group` label
+/// values) retained before collapsing to the sentinel.
+const MAX_GROUP_LABELS: usize = 64;
+
+static GROUP_LABELS: Lazy<BoundedLabels> = Lazy::new(|| BoundedLabels::new(MAX_GROUP_LABELS));
 static BOUNDED_LABEL_SENTINEL_ARC: Lazy<Arc<str>> = Lazy::new(|| Arc::from(BOUNDED_LABEL_SENTINEL));
 
 /// Intern a client-controlled label with a hard cardinality cap.
@@ -93,6 +99,12 @@ pub fn intern_model_label(model_id: &str) -> Arc<str> {
 /// `MAX_TOOL_LABELS`.
 pub fn intern_tool_label(tool_name: &str) -> Arc<str> {
     TOOL_LABELS.intern(tool_name)
+}
+
+/// Intern an operator-controlled worker-group label, bounded by
+/// [`MAX_GROUP_LABELS`].
+pub fn intern_group_label(group: &str) -> Arc<str> {
+    GROUP_LABELS.intern(group)
 }
 
 pub const STREAMING_TRUE: &str = "true";

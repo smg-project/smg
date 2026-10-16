@@ -796,7 +796,8 @@ impl AppContextBuilder {
                 config.policy.clone(),
                 config.routing_key_override.clone(),
             )
-            .with_pd_pairing_mode(config.pd_pairing_mode),
+            .with_pd_pairing_mode(config.pd_pairing_mode)
+            .with_traffic_split(config.traffic_split),
         ));
         self
     }
