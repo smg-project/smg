@@ -189,6 +189,23 @@ mod tests {
     }
 
     #[test]
+    fn an_object_without_its_arguments_member_is_a_call_with_an_empty_object() {
+        // The object's assembler says `{}` for a call whose object lacks the member, here `args`,
+        // whole and byte by byte.
+        let call = "get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\"}";
+        let per_char: Vec<&str> = call
+            .char_indices()
+            .map(|(i, c)| &call[i..i + c.len_utf8()])
+            .collect();
+        for (events, taken) in [run(&[call], false), run(&per_char, false)] {
+            assert_eq!(taken, call.len());
+            assert_eq!(bytes(&events), call);
+            assert_eq!(arguments(&events), "{}");
+            assert!(matches!(events.last(), Some(Event::ToolCallEnd { .. })));
+        }
+    }
+
+    #[test]
     fn a_call_message_drops_its_framing_and_reads_its_object_with_every_byte() {
         let (events, taken) = run(&[CALL], false);
         assert_eq!(taken, CALL.len());

@@ -9,7 +9,11 @@ does with it, byte accounting included, and where a rule comes from.
 Every byte of the object lands in exactly one event: the head up to the arguments value is the
 `source` of `ToolCallStart`, the argument bytes are the `source` of their fragments, the tail after
 the value is the `source` of `ToolCallEnd`. When the arguments come before the name they are held
-until the name is whole, since a call starts before its arguments.
+until the name is whole, since a call starts before its arguments. An object that ends without an
+arguments member is a call with none: one fragment, `{}`, of no bytes goes before the end, so the
+call reads as one written `"arguments": {}` and as every other syntax's call with nothing in it,
+on every path that reads the fragments (a client of the stream, the message, a server call made
+from the arguments).
 
 The assembler keeps the promise `ToolCallArguments` makes, that the fragments so far always form a
 valid JSON prefix, as far as the prefix parser can tell: each new run of argument bytes is judged by

@@ -5,7 +5,9 @@
 //! arguments value has begun (or the object has closed without one), `ToolCallArguments` for every
 //! run of new argument bytes, `ToolCallEnd` when the object closes. The fragments are the model's
 //! own bytes: what a client receives, concatenated, is exactly what the model wrote as the
-//! arguments value, spacing included, and no fragment ever has to be revised. The old crate had no
+//! arguments value, spacing included, and no fragment ever has to be revised; an object that ends
+//! without an arguments member is a call with none, `{}`, one fragment of no bytes, as every
+//! other syntax writes a call with nothing in it. The old crate had no
 //! equivalent; it parsed the partial object on every chunk, re-serialized the arguments and emitted
 //! the difference, which is how `{"city": "Paris"}` reached clients as `{"city":"Paris"}`.
 //!
@@ -184,6 +186,7 @@ impl Assembler {
             // them. The call ends with what arrived, and the bytes from there on are the caller's
             // (`refused_tail`).
             self.send_held(arguments.as_ref(), out);
+            self.no_arguments(arguments.as_ref(), out);
             let tail_start = arguments
                 .as_ref()
                 .and_then(|span| span.end)
@@ -197,6 +200,7 @@ impl Assembler {
         }
         if let Some(close) = close {
             self.send_held(arguments.as_ref(), out);
+            self.no_arguments(arguments.as_ref(), out);
             let tail_start = arguments
                 .as_ref()
                 .and_then(|span| span.end)
@@ -208,6 +212,20 @@ impl Assembler {
             self.done = true;
         }
         taken
+    }
+
+    /// The call ends without an arguments member: it is a call with none, `{}`, one fragment that
+    /// accounts for no bytes, so that a client reads the same arguments for it as for one written
+    /// `"arguments": {}`, and the other syntaxes' call with nothing in it. Pushed before the end,
+    /// where the object closed or ended short of its close.
+    fn no_arguments(&self, arguments: Option<&Span>, out: &mut Events) {
+        if arguments.is_none() {
+            out.push(Event::ToolCallArguments {
+                index: self.index,
+                json: "{}".to_string(),
+                source: Text::default(),
+            });
+        }
     }
 
     /// No more bytes will come, and the object never closed. A call that started is closed with
@@ -566,23 +584,60 @@ mod tests {
     }
 
     #[test]
-    fn an_object_without_arguments_starts_and_ends_at_its_close() {
-        let events = run(&[r#"{"name": "f"}"#]);
-        assert_eq!(
-            events,
-            vec![
-                Event::ToolCallStart {
+    fn an_object_without_arguments_is_a_call_with_an_empty_object_that_starts_and_ends_at_its_close(
+    ) {
+        // The call starts at the close, since nothing before it says the object has no arguments
+        // member; its arguments are `{}`, one fragment of no bytes, as a call written
+        // `"arguments": {}` reads, and as every other syntax reads a call with nothing in it.
+        let expected = vec![
+            Event::ToolCallStart {
+                index: 0,
+                id: "call_0".into(),
+                name: "f".into(),
+                source: Text::uncounted(r#"{"name": "f"}"#),
+            },
+            Event::ToolCallArguments {
+                index: 0,
+                json: "{}".into(),
+                source: Text::default(),
+            },
+            Event::ToolCallEnd {
+                index: 0,
+                source: Text::default(),
+            },
+        ];
+        let text = r#"{"name": "f"}"#;
+        assert_eq!(run(&[text]), expected);
+        let per_char: Vec<&str> = text
+            .char_indices()
+            .map(|(i, c)| &text[i..i + c.len_utf8()])
+            .collect();
+        assert_eq!(run(&per_char), expected, "byte by byte");
+        // Other members do not make arguments: the call still has `{}`; without an arguments
+        // value the start's source is the whole object and the end's is empty, and the
+        // arguments written `{}` read the same.
+        for (text, arguments, end) in [
+            (r#"{"name": "f", "id": 7}"#, "{}", ""),
+            (r#"{"id": 7, "name": "f"}"#, "{}", ""),
+            (r#"{"name": "f", "arguments": {}}"#, "{}", "}"),
+        ] {
+            let events = run(&[text]);
+            assert_eq!(arguments_of(&events), arguments, "{text}");
+            assert_eq!(
+                events.last(),
+                Some(&Event::ToolCallEnd {
                     index: 0,
-                    id: "call_0".into(),
-                    name: "f".into(),
-                    source: Text::uncounted(r#"{"name": "f"}"#),
-                },
-                Event::ToolCallEnd {
-                    index: 0,
-                    source: Text::default(),
-                },
-            ]
-        );
+                    source: Text::uncounted(end),
+                }),
+                "{text}"
+            );
+            assert_eq!(sources(&events), text, "{text}");
+        }
+    }
+
+    /// The concatenated argument fragments.
+    fn arguments_of(events: &[Event]) -> String {
+        arguments(events)
     }
 
     #[test]
@@ -889,8 +944,16 @@ mod tests {
         let (events, tail) = feed(r#"{"name": "f"</f>"#, false);
         assert_eq!(
             events,
-            vec![start(r#"{"name": "f""#), end("")],
-            "a call without arguments"
+            vec![
+                start(r#"{"name": "f""#),
+                Event::ToolCallArguments {
+                    index: 0,
+                    json: "{}".into(),
+                    source: Text::default(),
+                },
+                end("")
+            ],
+            "a call without arguments has `{{}}`"
         );
         assert_eq!(tail, Some(("</f>".to_string(), Some('"'))));
 

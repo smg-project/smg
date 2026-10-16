@@ -386,6 +386,32 @@ mod tests {
     }
 
     #[test]
+    fn an_object_without_arguments_is_a_call_with_an_empty_object_in_a_list_and_alone() {
+        // The object's assembler says `{}` for a call whose object has no arguments member, so a
+        // list's object and a lone object read as one written `"arguments": {}`, whole and byte
+        // by byte.
+        let list = "[{\"name\": \"f\"}, {\"name\": \"g\", \"arguments\": {}}]";
+        let per_char: Vec<&str> = list
+            .char_indices()
+            .map(|(i, c)| &list[i..i + c.len_utf8()])
+            .collect();
+        for events in [run(&[list]), run(&per_char)] {
+            assert_eq!(bytes(&events), list);
+            assert_eq!(
+                calls(&events),
+                [
+                    (0, "f".to_string(), "{}".to_string()),
+                    (1, "g".to_string(), "{}".to_string()),
+                ]
+            );
+        }
+        let alone = "{\"name\": \"f\"}";
+        let events = run_alone(&[alone]);
+        assert_eq!(bytes(&events), alone);
+        assert_eq!(calls(&events), [(0, "f".to_string(), "{}".to_string())]);
+    }
+
+    #[test]
     fn a_list_gives_each_object_as_a_call_with_the_brackets_and_commas_dropped() {
         let events = run(&[LIST]);
         assert_eq!(bytes(&events), LIST);

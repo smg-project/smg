@@ -1268,6 +1268,7 @@ const XLAM_OUTPUTS: &[&str] = &[
     "[{\"name\": \"f\", \"arguments\": {}} junk {\"name\": \"g\", \"arguments\": {}}] after",
     "Hello, [not a list].",
     "",
+    "[{\"name\": \"get_weather\"}]",
 ];
 
 /// Python calls as Olmo 3 writes them: bare, one per line.
@@ -1325,6 +1326,7 @@ const LLAMA_NEMOTRON_OUTPUTS: &[&str] = &[
     "<TOOLCALL>[{\"name\": \"get_weather\", \"arguments\": {}} junk]</TOOLCALL> after",
     "<think>Only a thought.</think>",
     "Hello!",
+    "<TOOLCALL>[{\"name\": \"get_weather\"}]</TOOLCALL>",
 ];
 
 /// FunctionGemma's calls: Gemma's spelling between `<start_function_call>` and
@@ -1570,6 +1572,7 @@ const QWEN3_OUTPUTS: &[&str] = &[
     "",
     "Hello!",
     "<think>\n\n</think>\n\nHello!",
+    "<tool_call>\n{\"name\": \"get_weather\"}\n</tool_call>\n",
     "<think>\nplan\n</think>\n\nSure.\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>",
     "Let me check.\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>\nAnd again.\n<tool_call>\n{\"name\": \"get_time\", \"arguments\": {\"zone\": \"CET\"}}\n</tool_call>\nDone.",
     "<tool_call>\n{\"name\": \"save_note\", \"arguments\": {\"title\": \"計画 🌍\", \"body\": \"a \\\"q\\\" \\\\ b\\nc\"}}\n</tool_call>",
@@ -1620,6 +1623,7 @@ const JSON_OUTPUTS: &[&str] = &[
     "",
     "{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Par",
     "{\"name\": \"f\", \"arguments\": {}} and then some",
+    "{\"name\": \"get_weather\"}",
 ];
 
 /// The outputs bellwether's common set records for MiniMax M2 (the thought the prompt opens
@@ -1698,6 +1702,7 @@ const INKLING_OUTPUTS: &[&str] = &[
     "<|content_text|>Hello!<|end_message|>",
     "<|content_thinking|>97 is not divisible by 2, 3, 5 or 7.<|end_message|><|message_model|><|content_text|>Yes, 97 is prime.<|end_message|>",
     "<|content_text|><|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"ci",
+    "<|content_text|><|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\"}<|end_message|>",
 ];
 
 /// Every subject with each of its outputs.
@@ -1965,6 +1970,107 @@ fn calls_are_numbered_from_zero_in_order_with_ids_that_follow_the_index() {
         for (position, (index, id, _)) in Said::of(&events).calls.iter().enumerate() {
             assert_eq!(*index as usize, position, "{}: {text:?}", subject.name);
             assert_eq!(id, &format!("call_{index}"), "{}: {text:?}", subject.name);
+        }
+    }
+}
+
+/// One call with nothing in it, as each table's template writes it, by the subject's name.
+const CALLS_WITHOUT_ARGUMENTS: &[(&str, &str)] = &[
+    ("qwen3", "<tool_call>\n{\"name\": \"get_weather\"}\n</tool_call>\n"),
+    ("qwen2.5", "<tool_call>\n{\"name\": \"get_weather\"}\n</tool_call>"),
+    (
+        "qwen3 tagged",
+        "<tool_call>\n<function=get_weather>\n</function>\n</tool_call>",
+    ),
+    (
+        "qwen3 tagged, the value between the tags",
+        "<tool_call>\n<function=get_weather>\n</function>\n</tool_call>",
+    ),
+    (
+        "seed-oss",
+        "<seed:tool_call>\n<function=get_weather>\n</function>\n</seed:tool_call>",
+    ),
+    (
+        "deepseek v4.1",
+        "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+    ),
+    (
+        "deepseek v4",
+        "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+    ),
+    (
+        "hy4",
+        "<tool_calls:opensource><tool_call:opensource>get_weather</tool_call:opensource>\
+         </tool_calls:opensource>",
+    ),
+    ("ling", "<tool_call>get_weather\n</tool_call>"),
+    ("glm", "<tool_call>get_weather</tool_call>"),
+    ("glm4", "<tool_call>get_weather\n</tool_call>"),
+    ("iquest", "<iquest_tool_call>get_weather</iquest_tool_call>"),
+    (
+        "k2 horizon",
+        "<ifm|tool_calls>\n<ifm|tool_call>get_weather\n</ifm|tool_call>\n</ifm|tool_calls>",
+    ),
+    (
+        "minimax m2",
+        "<minimax:tool_call>\n<invoke name=\"get_weather\">\n</invoke>\n</minimax:tool_call>",
+    ),
+    (
+        "minimax m3",
+        "<tool_call>\n]<]minimax[>[<invoke name=\"get_weather\">]<]minimax[>[</invoke>\n\
+         ]<]minimax[>[</tool_call>",
+    ),
+    ("minicpm5", "<function name=\"get_weather\"></function>"),
+    (
+        "dots3",
+        "<dots_function_call>\n<invoke name=\"get_weather\">\n</invoke>\n</dots_function_call>",
+    ),
+    (
+        "kimi k3",
+        "<|open|>think<|sep|><|close|>think<|sep|><|open|>tools<|sep|>\
+         <|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|close|>call<|sep|>\
+         <|close|>tools<|sep|><|close|>message<|sep|>",
+    ),
+    ("gemma 4", "<|tool_call>call:get_weather{}<tool_call|>"),
+    (
+        "function gemma",
+        "<start_function_call>call:get_weather{}<end_function_call>",
+    ),
+    ("olmo3", "<function_calls>get_weather()</function_calls>"),
+    ("lfm2.5", "<|tool_call_start|>[get_weather()]<|tool_call_end|>"),
+    ("mistral v13", "[TOOL_CALLS]get_weather[ARGS]{}"),
+    ("forced", "{}"),
+    ("xlam", "[{\"name\": \"get_weather\"}]"),
+    ("llama nemotron", "<TOOLCALL>[{\"name\": \"get_weather\"}]</TOOLCALL>"),
+    ("json", "{\"name\": \"get_weather\"}"),
+    (
+        "inkling",
+        "<|content_text|><|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>\
+         {\"name\":\"get_weather\"}<|end_message|>",
+    ),
+];
+
+/// A call that takes no arguments reads the same from every family, and the same as one written
+/// with an empty object: its arguments are `{}` under every chunking, whichever syntax the table
+/// reads and whether the syntax writes the empty object or leaves the member out.
+#[test]
+fn a_call_with_nothing_in_it_has_an_empty_object_for_its_arguments_whatever_the_syntax() {
+    for (name, text) in CALLS_WITHOUT_ARGUMENTS {
+        let subject = FORMATS
+            .iter()
+            .find(|subject| subject.name == *name)
+            .unwrap_or_else(|| panic!("{name}: no such subject"));
+        for (plan, cuts) in chunkings(text, usize::MAX) {
+            let events = replay(subject, text, &cuts, false)
+                .unwrap_or_else(|e| panic!("{name}: {text:?} {plan}: {e}"));
+            let said = Said::of(&events);
+            assert_eq!(said.calls.len(), 1, "{name}: {text:?} {plan}: {said:?}");
+            assert_eq!(
+                said.arguments,
+                [(0, "{}".to_string())],
+                "{name}: {text:?} {plan}: {said:?}"
+            );
+            assert_eq!(said.ended, [0], "{name}: {text:?} {plan}: {said:?}");
         }
     }
 }
