@@ -292,11 +292,10 @@ mod tests {
             "<TOOLCALL>[{\"name\": \"get_stock_price\", \"arguments\": {}}] tail</TOOLCALL>",
         );
         assert_eq!(calls(&events).len(), 1);
-        assert_eq!(malformed(&events), ["tail"]);
-        assert_eq!(
-            dropped(&events),
-            ["<TOOLCALL>", "[", "]", " ", "</TOOLCALL>"]
-        );
+        // The text after the list takes the whitespace before it: once text follows, every byte
+        // after the `]` is the model's.
+        assert_eq!(malformed(&events), [" tail"]);
+        assert_eq!(dropped(&events), ["<TOOLCALL>", "[", "]", "</TOOLCALL>"]);
     }
 
     #[test]
