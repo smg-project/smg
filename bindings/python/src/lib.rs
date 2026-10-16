@@ -631,6 +631,7 @@ struct Router {
     tokenizer_cache_l1_max_memory: usize,
     tokenizer_path: Option<String>,
     tool_call_parser: Option<String>,
+    traffic_split: bool,
     trust_tenant_header: bool,
     upstream_http2: bool,
     upstream_pool_idle_timeout_secs: u64,
@@ -1283,6 +1284,7 @@ impl Router {
                     .parse_assignment_mode(config::ManualAssignmentMode::Delegate)?,
                 headers: self.routing_key_headers.clone(),
             })
+            .traffic_split(self.traffic_split)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .igw(self.enable_igw)
@@ -1505,6 +1507,7 @@ impl Router {
         tokenizer_cache_l1_max_memory = 52428800,
         tokenizer_path = None,
         tool_call_parser = None,
+        traffic_split = false,
         trust_tenant_header = false,
         upstream_http2 = false,
         upstream_pool_idle_timeout_secs = 3,
@@ -1726,6 +1729,7 @@ impl Router {
         tokenizer_cache_l1_max_memory: usize,
         tokenizer_path: Option<String>,
         tool_call_parser: Option<String>,
+        traffic_split: bool,
         trust_tenant_header: bool,
         upstream_http2: bool,
         upstream_pool_idle_timeout_secs: u64,
@@ -1983,6 +1987,7 @@ impl Router {
             tokenizer_cache_l1_max_memory,
             tokenizer_path,
             tool_call_parser,
+            traffic_split,
             trust_tenant_header,
             upstream_http2,
             upstream_pool_idle_timeout_secs,

@@ -598,6 +598,16 @@ struct RoutingArgs {
     )]
     routing_key_override: bool,
 
+    /// Weighted traffic split across worker groups: a worker's traffic_group
+    /// label names its group (default for workers without one) and its
+    /// traffic_weight label the group's weight (100 when absent). A request
+    /// with two or more groups among its candidates picks one by weight, by
+    /// its routing key when it has one so a session stays in one group,
+    /// then the policy selects inside it. Weights are labels: a ramp is a
+    /// PATCH /workers/{id}, a weight of 0 drains a group
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    traffic_split: bool,
+
     /// How strictly PD placement pairs a prefill with a decode on their KV
     /// transfer protocol. `lenient` refuses only a known difference in
     /// runtime, transport or KV layout (unknown components and engine
@@ -3057,6 +3067,7 @@ impl CliArgs {
                 ),
                 headers: self.routing.routing_key_headers.clone(),
             })
+            .traffic_split(self.routing.traffic_split)
             .retries(!self.serving.disable_retries)
             .upstream_http2(self.routing.upstream_http2)
             .circuit_breaker(!self.serving.disable_circuit_breaker)
@@ -5190,6 +5201,19 @@ mod tests {
             Some(0.8)
         );
         assert!(!server_config.router_config.worker_overload_shed);
+    }
+
+    /// `--traffic-split` is off by default and flows into both configs.
+    #[test]
+    fn traffic_split_is_opt_in_and_flows_into_both_configs() {
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert!(!defaults.traffic_split);
+
+        let cli = cli_args_from(&["--traffic-split"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(router_config.traffic_split);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(server_config.router_config.traffic_split);
     }
 
     /// The two opt-outs: `--disable-worker-overload-protection` switches the

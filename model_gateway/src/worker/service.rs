@@ -17,6 +17,7 @@ use tracing::warn;
 
 use crate::{
     config::{validate_worker_url, RouterConfig},
+    policies::traffic_split,
     routers::provider_support,
     service_discovery::{DISCOVERY_LABEL_PREFIX, DISCOVERY_PROVIDER_LABEL},
     worker::{
@@ -210,6 +211,10 @@ fn validate_labels(labels: &HashMap<String, String>) -> Result<(), WorkerService
             )));
         }
     }
+    // The traffic split's group name and weight (`traffic_group`,
+    // `traffic_weight`): a weight the split could not read would silently
+    // weigh the group as the default.
+    traffic_split::validate_labels(labels).map_err(bad_request)?;
     Ok(())
 }
 
@@ -1317,5 +1322,28 @@ mod tests {
         let short: HashMap<String, String> = [("has space".to_string(), "v".to_string())].into();
         let err = validate_labels(&short).expect_err("a key with a space");
         assert!(err.to_string().contains("\"has space\""), "{err}");
+    }
+
+    /// The traffic split's labels are held to their shape at the admin
+    /// boundary, named in the refusal.
+    #[test]
+    fn traffic_split_labels_are_held_to_their_shape() {
+        let ok: HashMap<String, String> = [
+            ("traffic_group".to_string(), "canary".to_string()),
+            ("traffic_weight".to_string(), "5".to_string()),
+        ]
+        .into();
+        assert!(validate_labels(&ok).is_ok());
+
+        let bad_weight: HashMap<String, String> =
+            [("traffic_weight".to_string(), "5%".to_string())].into();
+        let err = validate_labels(&bad_weight).expect_err("a weight that is not an integer");
+        assert!(err.to_string().contains("traffic_weight"), "{err}");
+        assert!(err.to_string().contains("\"5%\""), "{err}");
+
+        let bad_group: HashMap<String, String> =
+            [("traffic_group".to_string(), "two words".to_string())].into();
+        let err = validate_labels(&bad_group).expect_err("a group name with a space");
+        assert!(err.to_string().contains("traffic_group"), "{err}");
     }
 }

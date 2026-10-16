@@ -346,6 +346,7 @@ impl ConfigValidator {
         Self::validate_access_log_fields(config)?;
         Self::validate_storage_context_headers(config)?;
         Self::validate_routing_key_headers(config)?;
+        Self::validate_traffic_split(config)?;
         Self::validate_tenant_resolution(config)?;
         Self::validate_tenant_api_keys(config)?;
         Self::validate_memory_history(config)?;
@@ -576,6 +577,26 @@ impl ConfigValidator {
     }
 
     /// The memory history backend's bounds: at least one record of each kind.
+    /// The traffic split confines each selection to one worker group;
+    /// `bucket` places prefill by request size over boundaries that span its
+    /// whole fleet, so the two cannot run together (the runtime skips the
+    /// split for a hinted per-model `bucket` for the same reason).
+    fn validate_traffic_split(config: &RouterConfig) -> ConfigResult<()> {
+        if !config.traffic_split {
+            return Ok(());
+        }
+        let bucket = |policy: &PolicyConfig| matches!(policy, PolicyConfig::Bucket { .. });
+        if bucket(&config.policy) || bucket(config.mode.get_prefill_policy(&config.policy)) {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "traffic_split cannot run with the bucket policy: bucket places prefill \
+                         over boundaries spanning its whole fleet, and the split confines each \
+                         selection to one worker group"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
     fn validate_memory_history(config: &RouterConfig) -> ConfigResult<()> {
         if let Some(memory) = &config.memory {
             memory
@@ -5309,5 +5330,58 @@ mod tests {
             matches!(built, Err(ConfigError::InvalidValue { ref field, .. }) if field == "cors_allowed_origins"),
             "{built:?}"
         );
+    }
+
+    /// `--traffic-split` confines a selection to one worker group; the bucket
+    /// policy places prefill over its whole fleet, so the pair is refused,
+    /// as the main policy and as the PD prefill policy.
+    #[test]
+    fn traffic_split_refuses_the_bucket_policy() {
+        let bucket = || PolicyConfig::Bucket {
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            bucket_adjust_interval_secs: 5,
+        };
+        let mut config = RouterConfig {
+            traffic_split: true,
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+                decode_urls: vec!["http://decode:8000".to_string()],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate_traffic_split(&config).is_ok());
+
+        config.mode = RoutingMode::PrefillDecode {
+            prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+            decode_urls: vec!["http://decode:8000".to_string()],
+            prefill_policy: Some(bucket()),
+            decode_policy: None,
+        };
+        match ConfigValidator::validate_traffic_split(&config) {
+            Err(ConfigError::IncompatibleConfig { reason }) => {
+                assert!(
+                    reason.contains("traffic_split") && reason.contains("bucket"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected an incompatible configuration, got {other:?}"),
+        }
+
+        // Off, the same configuration passes this rule.
+        config.traffic_split = false;
+        assert!(ConfigValidator::validate_traffic_split(&config).is_ok());
+
+        // The main policy is checked too.
+        let mut regular = RouterConfig {
+            traffic_split: true,
+            policy: bucket(),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate_traffic_split(&regular).is_err());
+        regular.policy = PolicyConfig::RoundRobin;
+        assert!(ConfigValidator::validate_traffic_split(&regular).is_ok());
     }
 }

@@ -20,15 +20,18 @@ use tracing::{debug, info, warn};
 use super::{
     get_healthy_worker_indices,
     manual::{ExecutionBranch, PinState},
-    normalize_model_key, BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy,
-    ManualConfig, ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerRole,
+    normalize_model_key,
+    traffic_split::Split,
+    BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig,
+    ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerRole,
 };
 use crate::{
     config::types::{ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
     mesh::adapters::TreeSyncAdapter,
     observability::{cache_trace, metrics::Metrics},
     routers::common::header_utils::{
-        extract_routing_key_hint_named, parse_routing_tokens_hint, ROUTING_KEY_HINT_MAX_BYTES,
+        extract_routing_key_hint_named, extract_target_worker, parse_routing_tokens_hint,
+        ROUTING_KEY_HINT_MAX_BYTES,
     },
     worker::{load_state::LoadReceiver, KvEventMonitor, RequestCompletionSink, Worker, WorkerType},
 };
@@ -179,6 +182,9 @@ pub struct PolicyRegistry {
     routing_key_headers: Arc<Vec<HeaderName>>,
     /// How strictly PD placement pairs prefill and decode descriptors.
     pd_pairing_mode: PdPairingMode,
+    /// Whether the weighted traffic split across worker groups runs before
+    /// the policy (`--traffic-split`); see [`super::traffic_split`].
+    traffic_split: bool,
 }
 
 /// A sticky key with this many of its own requests already in flight on its
@@ -260,6 +266,7 @@ impl PolicyRegistry {
             routing_key_sticky,
             routing_key_headers: Arc::new(routing_key_headers),
             pd_pairing_mode: PdPairingMode::default(),
+            traffic_split: false,
         }
     }
 
@@ -273,6 +280,19 @@ impl PolicyRegistry {
     /// How strictly PD placement pairs prefill and decode descriptors.
     pub fn pd_pairing_mode(&self) -> PdPairingMode {
         self.pd_pairing_mode
+    }
+
+    /// Run the weighted traffic split across worker groups before every
+    /// selection (`--traffic-split`).
+    #[must_use]
+    pub fn with_traffic_split(mut self, enabled: bool) -> Self {
+        self.traffic_split = enabled;
+        self
+    }
+
+    /// Whether the weighted traffic split is on.
+    pub fn traffic_split_enabled(&self) -> bool {
+        self.traffic_split
     }
 
     /// Derive the session key from a request id: trailing `_r<n>` retry and
@@ -349,13 +369,54 @@ impl PolicyRegistry {
             .or_else(|| info.rid_key.map(|key| (key, "rid")))
     }
 
-    /// Select a worker, applying the sticky routing-key override when it is
-    /// enabled, the request carries a key from the configured source, and the
-    /// configured policy does not already honor the key (`manual` /
-    /// `consistent_hashing`, which read `rid_key` and the header themselves
-    /// with the same header-first precedence). Otherwise delegates to `policy`.
-    /// `policy.name()` stays the real policy (for metrics).
+    /// Select a worker: under `--traffic-split`, first confine the choice to
+    /// one worker group picked by weight (see [`super::traffic_split`]), then
+    /// apply the sticky routing-key override when it is enabled, the request
+    /// carries a key from the configured source, and the configured policy
+    /// does not already honor the key (`manual` / `consistent_hashing`, which
+    /// read `rid_key` and the header themselves with the same header-first
+    /// precedence); otherwise delegate to `policy`. `policy.name()` stays the
+    /// real policy (for metrics). The returned index is into `workers`.
     pub fn select_worker_for_model(
+        &self,
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+    ) -> Option<usize> {
+        if self.traffic_split && Self::traffic_split_applies(policy.name(), info) {
+            if let Some(split) = Split::plan(workers) {
+                // The same key the sticky override would pin by keeps a
+                // session in one group; a keyless request draws at random.
+                let arm = match self.effective_sticky_key(info) {
+                    Some((key, _)) => split.arm_for_key(key),
+                    None => split.arm_at_random(&mut rand::rng()),
+                };
+                Metrics::record_traffic_split_selection(model_id, arm.name);
+                let members: Vec<Arc<dyn Worker>> = arm
+                    .members
+                    .iter()
+                    .map(|&idx| Arc::clone(&workers[idx]))
+                    .collect();
+                let picked = self.select_within(policy, model_id, &members, info)?;
+                return Some(arm.members[picked]);
+            }
+        }
+        self.select_within(policy, model_id, workers, info)
+    }
+
+    /// Whether the traffic split may confine this selection: an explicit
+    /// `X-SMG-Target-Worker` indexes the whole pool and outranks it (as it
+    /// outranks the routing key), and `bucket` places prefill by request
+    /// size over boundaries spanning its whole fleet, which one group cannot
+    /// represent.
+    fn traffic_split_applies(policy_name: &str, info: &SelectWorkerInfo) -> bool {
+        policy_name != "bucket" && extract_target_worker(info.headers).is_none()
+    }
+
+    /// The selection proper over `workers`: the sticky override when it
+    /// applies, else the policy.
+    fn select_within(
         &self,
         policy: &Arc<dyn LoadBalancingPolicy>,
         model_id: &str,
@@ -2920,6 +2981,228 @@ mod tests {
                 "http://prefill-2:8000",
                 "size {size}"
             );
+        }
+    }
+
+    /// The weighted traffic split (`--traffic-split`) runs before the policy
+    /// and the sticky override, inside [`PolicyRegistry::select_worker_for_model`].
+    mod traffic_split {
+        use openai_protocol::worker::WorkerStatus;
+
+        use super::*;
+        use crate::{
+            config::types::RoutingKeyOverrideConfig,
+            policies::traffic_split::{GROUP_LABEL, WEIGHT_LABEL},
+        };
+
+        fn grouped(url: &str, group: Option<&str>, weight: Option<&str>) -> Arc<dyn Worker> {
+            let mut labels = HashMap::new();
+            if let Some(group) = group {
+                labels.insert(GROUP_LABEL.to_string(), group.to_string());
+            }
+            if let Some(weight) = weight {
+                labels.insert(WEIGHT_LABEL.to_string(), weight.to_string());
+            }
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .labels(labels)
+                .build();
+            worker.set_status(WorkerStatus::Ready);
+            Arc::new(worker)
+        }
+
+        /// Two stable workers at weight 90 around one canary at weight 10:
+        /// indices 0 and 2 are stable, 1 is the canary.
+        fn fleet(canary_weight: &str) -> Vec<Arc<dyn Worker>> {
+            vec![
+                grouped("http://s1:8000", Some("stable"), Some("90")),
+                grouped("http://c1:8000", Some("canary"), Some(canary_weight)),
+                grouped("http://s2:8000", Some("stable"), Some("90")),
+            ]
+        }
+
+        fn registry(split: bool) -> PolicyRegistry {
+            PolicyRegistry::new(PolicyConfig::RoundRobin).with_traffic_split(split)
+        }
+
+        fn pick(
+            reg: &PolicyRegistry,
+            workers: &[Arc<dyn Worker>],
+            info: &SelectWorkerInfo,
+        ) -> usize {
+            reg.select_worker_for_model(&reg.get_default_policy(), "m", workers, info)
+                .expect("a worker is selected")
+        }
+
+        fn picks(reg: &PolicyRegistry, workers: &[Arc<dyn Worker>], n: usize) -> Vec<usize> {
+            let info = SelectWorkerInfo::default();
+            (0..n).map(|_| pick(reg, workers, &info)).collect()
+        }
+
+        #[test]
+        fn off_by_default_the_policy_runs_over_the_whole_pool() {
+            let reg = registry(false);
+            assert!(!reg.traffic_split_enabled());
+            assert_eq!(picks(&reg, &fleet("10"), 6), vec![0, 1, 2, 0, 1, 2]);
+        }
+
+        #[test]
+        fn one_group_runs_the_policy_over_the_whole_pool() {
+            let reg = registry(true);
+            let unlabelled = vec![
+                grouped("http://a:8000", None, None),
+                grouped("http://b:8000", None, None),
+                grouped("http://c:8000", None, None),
+            ];
+            assert_eq!(picks(&reg, &unlabelled, 6), vec![0, 1, 2, 0, 1, 2]);
+        }
+
+        #[test]
+        fn keyless_selections_follow_the_weights_and_the_policy_runs_inside_the_arm() {
+            let reg = registry(true);
+            let workers = fleet("10");
+            let n = 3_000;
+            let chosen = picks(&reg, &workers, n);
+            let canary = chosen.iter().filter(|&&idx| idx == 1).count();
+            // Mean 300, standard deviation 16.4: a 5-sigma band.
+            assert!((218..=382).contains(&canary), "canary took {canary} of {n}");
+            let s1 = chosen.iter().filter(|&&idx| idx == 0).count();
+            let s2 = chosen.iter().filter(|&&idx| idx == 2).count();
+            // Round robin alternates inside the stable arm.
+            assert!(s1.abs_diff(s2) <= 1, "stable arm split {s1} / {s2}");
+            assert_eq!(s1 + s2 + canary, n);
+        }
+
+        #[test]
+        fn a_routing_key_keeps_a_session_in_one_group() {
+            let reg = registry(true);
+            let workers = fleet("30");
+            let group_of = |idx: usize| if idx == 1 { "canary" } else { "stable" };
+            let mut seen_canary = false;
+            let mut seen_stable = false;
+            for i in 0..200 {
+                let headers = headers_with_key(&format!("conv-{i}"));
+                let info = SelectWorkerInfo {
+                    headers: Some(&headers),
+                    ..Default::default()
+                };
+                let first = group_of(pick(&reg, &workers, &info));
+                for _ in 0..5 {
+                    assert_eq!(group_of(pick(&reg, &workers, &info)), first, "conv-{i}");
+                }
+                seen_canary |= first == "canary";
+                seen_stable |= first == "stable";
+            }
+            assert!(seen_canary && seen_stable, "keys spread over both groups");
+        }
+
+        #[test]
+        fn a_drained_group_takes_nothing_until_its_weight_returns() {
+            let reg = registry(true);
+            let drained = fleet("0");
+            assert!(picks(&reg, &drained, 300).iter().all(|&idx| idx != 1));
+            let ramped = fleet("100");
+            let canary = picks(&reg, &ramped, 2_000)
+                .iter()
+                .filter(|&&idx| idx == 1)
+                .count();
+            // Weight 100 against 90: about 53 %.
+            assert!(
+                (900..=1_200).contains(&canary),
+                "canary took {canary} of 2000"
+            );
+        }
+
+        #[test]
+        fn the_selected_index_is_into_the_callers_slice() {
+            let reg = registry(true);
+            // The canary is last, so an index into the arm's member list and
+            // an index into the caller's slice differ.
+            let workers = vec![
+                grouped("http://s1:8000", Some("stable"), Some("0")),
+                grouped("http://s2:8000", Some("stable"), Some("0")),
+                grouped("http://c1:8000", Some("canary"), Some("10")),
+            ];
+            assert!(picks(&reg, &workers, 20).iter().all(|&idx| idx == 2));
+        }
+
+        #[test]
+        fn an_explicit_target_worker_bypasses_the_split() {
+            let reg = PolicyRegistry::new(PolicyConfig::ConsistentHashing).with_traffic_split(true);
+            // The canary is drained; an explicit index still reaches it.
+            let workers = fleet("0");
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-target-worker", "1".parse().unwrap());
+            let info = SelectWorkerInfo {
+                headers: Some(&headers),
+                ..Default::default()
+            };
+            for _ in 0..10 {
+                assert_eq!(pick(&reg, &workers, &info), 1);
+            }
+        }
+
+        #[test]
+        fn bucket_and_targeted_requests_are_exempt() {
+            let plain = SelectWorkerInfo::default();
+            assert!(PolicyRegistry::traffic_split_applies("round_robin", &plain));
+            assert!(PolicyRegistry::traffic_split_applies("cache_aware", &plain));
+            assert!(!PolicyRegistry::traffic_split_applies("bucket", &plain));
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-target-worker", "0".parse().unwrap());
+            let targeted = SelectWorkerInfo {
+                headers: Some(&headers),
+                ..Default::default()
+            };
+            assert!(!PolicyRegistry::traffic_split_applies(
+                "round_robin",
+                &targeted
+            ));
+        }
+
+        #[test]
+        fn the_sticky_override_pins_inside_the_keys_group() {
+            let reg = PolicyRegistry::with_override(
+                PolicyConfig::RoundRobin,
+                RoutingKeyOverrideConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            )
+            .with_traffic_split(true);
+            let workers = fleet("50");
+            let group_of = |idx: usize| if idx == 1 { "canary" } else { "stable" };
+            let mut pinned_in_canary = 0;
+            for i in 0..100 {
+                let headers = headers_with_key(&format!("session-{i}"));
+                let info = SelectWorkerInfo {
+                    headers: Some(&headers),
+                    ..Default::default()
+                };
+                let first = pick(&reg, &workers, &info);
+                // The pin holds, and it lies in the key's group.
+                for _ in 0..4 {
+                    assert_eq!(pick(&reg, &workers, &info), first, "session-{i}");
+                }
+                if group_of(first) == "canary" {
+                    pinned_in_canary += 1;
+                }
+            }
+            assert!(
+                (10..=60).contains(&pinned_in_canary),
+                "{pinned_in_canary} of 100 keys pinned in the canary"
+            );
+        }
+
+        #[test]
+        fn an_unavailable_group_is_left_out_of_the_draw() {
+            let reg = registry(true);
+            let workers = fleet("100");
+            workers[1].set_status(WorkerStatus::Failed);
+            // Only the stable arm is live: the policy runs over the pool and
+            // never picks the failed canary.
+            assert!(picks(&reg, &workers, 50).iter().all(|&idx| idx != 1));
         }
     }
 }
