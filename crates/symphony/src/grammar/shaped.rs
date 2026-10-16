@@ -33,8 +33,8 @@
 //! written one after another, the layout's text between two, and nothing follows the last but the
 //! stop. A tag the stop ends holds no repetition, which an engine cannot end on its own: a schema
 //! without properties takes at most one parameter there. Where no call is owed and more than one
-//! may come, each call terminal triggers a tag. This constrains every call the model starts while
-//! still allowing free text instead of a call and allowing another call after the first.
+//! may come, such a call has no tag: the free text after a tag would be the call's own, and a
+//! parameter written there would count with nothing to constrain it.
 //!
 //! With the prompt's thought open, a tag that owes a call follows the free prefix every syntax's
 //! tag takes; one that owes none takes no prefix, its own free text writing the thought: an engine
@@ -69,10 +69,9 @@ struct Call {
 
 /// The structural tag of a shaped call to one of `tools`, as `count` asks, written as `layout`
 /// says the template writes one (see the module documentation). `None` when the layout does not
-/// fit the table, the arguments are not tagged parameters, a value's end holds no text, or no
-/// tool can be called through the header. When the stream's stop closes the last call, an
-/// optional-call grammar uses the call terminal as a repeatable trigger, so it remains optional
-/// and still permits parallel calls.
+/// fit the table, the arguments are not tagged parameters, a value's end holds no text, no tool
+/// can be called through the header, or the stream's stop closes the last call while no call is
+/// owed and more than one may come.
 pub(super) fn calls(
     format: &Format,
     shape: &CallShape,
@@ -100,6 +99,12 @@ pub(super) fn calls(
         call.close.as_deref().unwrap_or("")
     );
     let one = count.one || layout.between_calls.is_none();
+    // Where the stop closes the last call, its region stays open after its parameters: with no
+    // call owed and more than one allowed, free text after a tag would be the call's own, where a
+    // parameter no tag constrains would count, so there is no tag.
+    if call.close.is_none() && !one && !count.at_least_one {
+        return None;
+    }
     // Where the stop closes the last call, the calls are written one after another, nothing after
     // the last; otherwise each call is a tag of its own, free text after it outside its region.
     let in_a_row = call.close.is_none() && !one;
@@ -128,7 +133,7 @@ pub(super) fn calls(
     if written.is_empty() {
         return None;
     }
-    if in_a_row && count.at_least_one {
+    if in_a_row {
         let tags = written
             .iter()
             .map(|call| {
@@ -891,12 +896,6 @@ mod tests {
         assert_eq!(free["format"]["type"], "triggered_tags");
         assert_eq!(free["format"]["at_least_one"], false);
         assert_eq!(free["format"]["stop_after_first"], true);
-        // No call owed and more than one allowed by the request: every call terminal triggers a
-        // tag, leaving free text possible before, after and between calls.
-        let free = payload(&format, &[f()], options(false, false)).expect("a tag");
-        assert_eq!(free["format"]["at_least_one"], false);
-        assert!(free["format"].get("stop_after_first").is_none());
-        assert_eq!(free["format"]["tags"][0]["content"], parameters);
         // The template writes its own name: another tool has no tag.
         assert_eq!(
             payload(
@@ -914,6 +913,26 @@ mod tests {
         )
         .expect("a tag");
         assert_eq!(bare["format"]["tags"][0]["content"]["type"], "optional");
+    }
+
+    #[test]
+    fn an_optional_call_the_stop_closes_has_no_tag_where_more_than_one_may_come() {
+        let format = stopped().with_layout(stopped_layout());
+        // After the tag `[c]<k a>x</k> <k b>1</k>`, the text up to the stop holds no `[c]`: free
+        // text a tag that owes no call lets through, and the call's region reads it as its own,
+        // `b` and an undeclared `z` with nothing to constrain them.
+        assert_eq!(
+            read(
+                &format,
+                &[f()],
+                "",
+                "[c]<k a>x</k> <k b>1</k> <k b>oops</k> <k z>extra</k>[s]",
+            ),
+            value!({"content": null, "calls": [
+                {"name": "f", "arguments": {"a": "x", "b": "oops", "z": "extra"}},
+            ]})
+        );
+        assert_eq!(payload(&format, &[f()], options(false, false)), None);
     }
 
     #[test]
