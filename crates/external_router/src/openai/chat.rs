@@ -37,6 +37,81 @@ pub(super) struct ChatRouterContext<'a> {
     pub retry_config: &'a RetryConfig,
 }
 
+/// One attempt against the worker: the payload posted with the caller's auth
+/// and the provider's headers, as an event stream when the request streams.
+async fn send_attempt(
+    client: &reqwest::Client,
+    url: &str,
+    payload: &serde_json::Value,
+    headers: Option<&HeaderMap>,
+    worker_api_key: Option<&String>,
+    streaming: bool,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let mut req = client.post(url).json(payload);
+    let auth_header = extract_auth_header(headers, worker_api_key);
+    req = apply_provider_headers(req, url, auth_header.as_ref());
+    if streaming {
+        req = req.header("Accept", "text/event-stream");
+    }
+    req.send().await
+}
+
+/// The upstream's stream relayed to the client frame by frame; an error on
+/// it ends the client's stream with the error's text. The content type is
+/// the upstream's, else `text/event-stream` on a success.
+fn relayed_body(resp: reqwest::Response, status: StatusCode) -> Response {
+    let content_type = resp.headers().get(CONTENT_TYPE).cloned();
+    let stream = resp.bytes_stream();
+    let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "fire-and-forget stream relay; gateway shutdown need not wait for individual stream forwarding"
+    )]
+    tokio::spawn(async move {
+        let mut s = stream;
+        while let Some(chunk) = s.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    if tx.send(Ok(bytes)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(format!("Stream error: {e}"))).await;
+                    break;
+                }
+            }
+        }
+    });
+    let mut response = Response::new(Body::from_stream(ReceiverStream::new(rx)));
+    *response.status_mut() = status;
+    if let Some(ct) = content_type {
+        response.headers_mut().insert(CONTENT_TYPE, ct);
+    } else if status.is_success() {
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    }
+    response
+}
+
+/// The upstream's body read whole under its status and content type; a read
+/// failure is a 500.
+async fn buffered_body(resp: reqwest::Response, status: StatusCode) -> Response {
+    let content_type = resp.headers().get(CONTENT_TYPE).cloned();
+    match resp.bytes().await {
+        Ok(body) => {
+            let mut response = Response::new(Body::from(body));
+            *response.status_mut() = status;
+            if let Some(ct) = content_type {
+                response.headers_mut().insert(CONTENT_TYPE, ct);
+            }
+            response
+        }
+        Err(e) => error::internal_error("upstream_error", format!("Failed to read response: {e}")),
+    }
+}
+
 /// Route a chat completion request to the appropriate upstream worker.
 pub(super) async fn route_chat(
     deps: &ChatRouterContext<'_>,
@@ -158,16 +233,16 @@ pub(super) async fn route_chat(
             let worker = Arc::clone(&worker);
 
             async move {
-                let mut req = client.post(&url).json(&*payload);
-                let auth_header =
-                    extract_auth_header((*headers).as_ref(), (*worker_api_key).as_ref());
-                req = apply_provider_headers(req, &url, auth_header.as_ref());
-
-                if is_streaming {
-                    req = req.header("Accept", "text/event-stream");
-                }
-
-                let resp = match req.send().await {
+                let sent = send_attempt(
+                    &client,
+                    &url,
+                    &payload,
+                    (*headers).as_ref(),
+                    (*worker_api_key).as_ref(),
+                    is_streaming,
+                )
+                .await;
+                let resp = match sent {
                     Ok(r) => r,
                     Err(e) => {
                         worker.record_outcome(503);
@@ -186,56 +261,11 @@ pub(super) async fn route_chat(
                 // For non-streaming: we record here too — body read errors
                 // are connection issues, not worker health issues.
                 worker.record_outcome(status.as_u16());
-                let content_type = resp.headers().get(CONTENT_TYPE).cloned();
 
                 if is_streaming {
-                    let stream = resp.bytes_stream();
-                    let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
-                    #[expect(clippy::disallowed_methods, reason = "fire-and-forget stream relay; gateway shutdown need not wait for individual stream forwarding")]
-                    tokio::spawn(async move {
-                        let mut s = stream;
-                        while let Some(chunk) = s.next().await {
-                            match chunk {
-                                Ok(bytes) => {
-                                    if tx.send(Ok(bytes)).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(Err(format!("Stream error: {e}"))).await;
-                                    break;
-                                }
-                            }
-                        }
-                    });
-                    let mut response =
-                        Response::new(Body::from_stream(ReceiverStream::new(rx)));
-                    *response.status_mut() = status;
-                    if let Some(ct) = content_type {
-                        response.headers_mut().insert(CONTENT_TYPE, ct);
-                    } else if status.is_success() {
-                        response
-                            .headers_mut()
-                            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-                    }
-                    response
+                    relayed_body(resp, status)
                 } else {
-                    match resp.bytes().await {
-                        Ok(body) => {
-                            let mut response = Response::new(Body::from(body));
-                            *response.status_mut() = status;
-                            if let Some(ct) = content_type {
-                                response.headers_mut().insert(CONTENT_TYPE, ct);
-                            }
-                            response
-                        }
-                        Err(e) => {
-                            error::internal_error(
-                                "upstream_error",
-                                format!("Failed to read response: {e}"),
-                            )
-                        }
-                    }
+                    buffered_body(resp, status).await
                 }
             }
         },
@@ -277,4 +307,69 @@ pub(super) async fn route_chat(
     }
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::to_bytes;
+
+    use super::*;
+
+    fn upstream(status: u16, content_type: Option<&str>, body: &'static str) -> reqwest::Response {
+        let mut builder = http::Response::builder().status(status);
+        if let Some(ct) = content_type {
+            builder = builder.header(CONTENT_TYPE, ct);
+        }
+        reqwest::Response::from(builder.body(reqwest::Body::from(body)).expect("a response"))
+    }
+
+    async fn bytes_of(response: Response) -> Vec<u8> {
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("a body")
+            .to_vec()
+    }
+
+    fn content_type_of(response: &Response) -> Option<String> {
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    }
+
+    #[tokio::test]
+    async fn a_buffered_body_keeps_the_upstreams_status_content_type_and_bytes() {
+        let response = buffered_body(
+            upstream(201, Some("application/json"), "{\"ok\":true}"),
+            StatusCode::CREATED,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            content_type_of(&response).as_deref(),
+            Some("application/json")
+        );
+        assert_eq!(bytes_of(response).await, b"{\"ok\":true}");
+    }
+
+    #[tokio::test]
+    async fn a_relayed_body_forwards_the_bytes_and_is_an_event_stream_on_a_success_without_a_type()
+    {
+        let response = relayed_body(upstream(200, None, "data: x\n\n"), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            content_type_of(&response).as_deref(),
+            Some("text/event-stream")
+        );
+        assert_eq!(bytes_of(response).await, b"data: x\n\n");
+    }
+
+    #[tokio::test]
+    async fn a_relayed_failure_keeps_its_status_and_gets_no_event_stream_type() {
+        let response = relayed_body(upstream(502, None, "bad gateway"), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(content_type_of(&response).is_none());
+        assert_eq!(bytes_of(response).await, b"bad gateway");
+    }
 }
