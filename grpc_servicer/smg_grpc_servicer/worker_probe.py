@@ -118,7 +118,9 @@ class Rendezvous:
     def from_host_port_flag(cls, module: str, flag: str) -> Rendezvous:
         """The rendezvous of an engine whose one ``flag host:port`` names the
         leader's store, host and port together, as SGLang's and TokenSpeed's
-        ``--dist-init-addr`` does."""
+        ``--dist-init-addr`` does. The flag is taken in either spelling and
+        kept dashed, the spelling the command line is read by."""
+        flag = flag.replace("_", "-")
         return cls(
             module=module,
             leader_flag=flag,
@@ -132,6 +134,8 @@ def host_port_from_cmdline(flag: str) -> Callable[[bytes], tuple[str | None, int
     the engine's command line carries them (an IPv6 literal in brackets, the
     ``=`` and ``_`` spellings, inside a shell wrapper's one argument too);
     ``None`` for a part that is absent or unreadable."""
+
+    flag = flag.replace("_", "-")
 
     def leader_from_cmdline(cmdline: bytes) -> tuple[str | None, int | None]:
         value = flag_values(cmdline, flag).get(flag)

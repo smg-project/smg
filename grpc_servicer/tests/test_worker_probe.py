@@ -132,6 +132,19 @@ def test_a_host_port_flag_rendezvous_reads_the_leader_from_its_one_flag():
     for probe in (sglang_probe, tokenspeed_probe):
         assert probe.leader_from_cmdline is probe.RENDEZVOUS.leader_from_cmdline
         assert probe.RENDEZVOUS.leader_flag == probe.RENDEZVOUS.port_flag == "--dist-init-addr"
+    # An underscored flag is the same flag: the command line is read by the
+    # dashed spelling, so the constructor keeps that one.
+    underscored = worker_probe.Rendezvous.from_host_port_flag(module="m", flag="--dist_init_addr")
+    assert (underscored.leader_flag, underscored.port_flag) == (
+        "--dist-init-addr",
+        "--dist-init-addr",
+    )
+    assert underscored.leader_from_cmdline(
+        cmdline("engine", "--dist-init-addr", "leader:5000")
+    ) == (
+        "leader",
+        5000,
+    )
 
 
 def test_check_passes_only_with_an_established_connection_to_the_leader_store():
