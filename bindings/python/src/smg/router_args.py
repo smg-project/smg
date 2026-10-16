@@ -222,6 +222,41 @@ def _read_entries_file(path: str, file_flag: str) -> list[str]:
     return entries
 
 
+_ACCESS_LOG_FIELD_NAMES = (
+    "client_addr",
+    "forwarded_for",
+    "user_agent",
+    "tenant",
+    "key_id",
+    "request_bytes",
+    "response_bytes",
+    "worker",
+)
+
+
+class _ExtendAccessLogFields(argparse.Action):
+    """``--access-log-fields client_addr worker`` and the Rust CLI's comma form
+    ``--access-log-fields client_addr,worker`` both extend the list, so one
+    spelling works in both CLIs; an unknown name is refused naming the known
+    ones, as ``choices`` would."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        names = list(getattr(namespace, self.dest, None) or [])
+        for value in values:
+            for name in value.split(","):
+                name = name.strip()
+                if not name:
+                    continue
+                if name not in _ACCESS_LOG_FIELD_NAMES:
+                    raise argparse.ArgumentError(
+                        self,
+                        f"invalid choice: {name!r} (choose from "
+                        f"{', '.join(_ACCESS_LOG_FIELD_NAMES)})",
+                    )
+                names.append(name)
+        setattr(namespace, self.dest, names)
+
+
 @dataclasses.dataclass
 class RouterArgs:
     # Worker configuration
@@ -1598,22 +1633,14 @@ class RouterArgs:
             f"--{prefix}access-log-fields",
             type=str,
             nargs="*",
-            action="extend",
+            action=_ExtendAccessLogFields,
             default=[],
-            choices=[
-                "client_addr",
-                "forwarded_for",
-                "user_agent",
-                "tenant",
-                "key_id",
-                "request_bytes",
-                "response_bytes",
-                "worker",
-            ],
+            metavar="{" + ",".join(_ACCESS_LOG_FIELD_NAMES) + "}",
             help=(
-                "Optional fields of the access-log record, each written once it is listed"
-                " (e.g. client_addr worker response_bytes). Without this flag the record keeps"
-                " the fields it has always had."
+                "Optional fields of the access-log record, each written once it is listed,"
+                " space- or comma-separated (e.g. client_addr worker response_bytes, or"
+                " client_addr,worker as the Rust CLI takes it). Without this flag the record"
+                " keeps the fields it has always had."
             ),
         )
 

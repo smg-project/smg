@@ -2714,6 +2714,9 @@ mod tests {
                 }
                 other => panic!("{bad}: expected a refusal, got {other:?}"),
             }
+        }
+    }
+
     /// Each optional field of the access-log record is listed once; a field
     /// listed twice is refused by name, the rest of the list is accepted.
     #[test]

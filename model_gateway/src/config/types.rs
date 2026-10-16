@@ -613,9 +613,11 @@ pub enum AccessLogField {
     /// The address the request came in from, `ip:port`: the TCP peer, which
     /// is a proxy's address when one sits in front of the gateway.
     ClientAddr,
-    /// The `X-Forwarded-For` header as the request carried it, unverified:
-    /// the gateway keeps no list of trusted proxies, so it never folds this
-    /// into `client_addr`; the reader decides which hop to believe.
+    /// The `X-Forwarded-For` header as the request carried it, unverified,
+    /// every field line of it joined with `, ` (a proxy may add a line of
+    /// its own rather than append to the client's): the gateway keeps no
+    /// list of trusted proxies, so it never folds this into `client_addr`;
+    /// the reader decides which hop to believe.
     ForwardedFor,
     /// The `User-Agent` header, its first 256 bytes.
     UserAgent,
@@ -627,9 +629,12 @@ pub enum AccessLogField {
     KeyId,
     /// The bytes of the request body the handler read.
     RequestBytes,
-    /// The bytes of the response body: the declared length on the finish
-    /// line, the bytes out on a later line (a streamed body's end, a client
-    /// that left, a stream that failed).
+    /// The bytes of the response body: `response_bytes` is its length, the
+    /// declared one on the finish line or the count at a streamed body's
+    /// end; a body that ended early (a client that left, a stream that
+    /// failed) has the bytes out so far on that line as
+    /// `response_bytes_sent`, a key of its own, so the length is never
+    /// recorded twice.
     ResponseBytes,
     /// The worker the request was routed to.
     Worker,

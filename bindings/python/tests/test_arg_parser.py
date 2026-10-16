@@ -1464,13 +1464,23 @@ class TestParseRouterArgs:
         ]
 
     def test_parse_access_log_fields(self):
-        """The access-log record's optional fields are listed by name; the
-        default keeps the record's fields; an unknown name is refused."""
+        """The access-log record's optional fields are listed by name, space- or
+        comma-separated (the Rust CLI's spelling works here too); the default
+        keeps the record's fields; an unknown name is refused in either form."""
         args = ["--access-log-fields", "client_addr", "worker", "--access-log-fields", "tenant"]
         assert parse_router_args(args).access_log_fields == ["client_addr", "worker", "tenant"]
+        args = ["--access-log-fields", "client_addr,worker", "--access-log-fields", "tenant"]
+        assert parse_router_args(args).access_log_fields == ["client_addr", "worker", "tenant"]
+        assert parse_router_args(
+            ["--access-log-fields", "client_addr, worker"]
+        ).access_log_fields == [
+            "client_addr",
+            "worker",
+        ]
         assert parse_router_args([]).access_log_fields == []
-        with pytest.raises(SystemExit):
-            parse_router_args(["--access-log-fields", "peer"])
+        for unknown in (["peer"], ["client_addr,peer"]):
+            with pytest.raises(SystemExit):
+                parse_router_args(["--access-log-fields", *unknown])
 
     def test_parse_tokenizer_args(self):
         """Test parsing tokenizer arguments."""

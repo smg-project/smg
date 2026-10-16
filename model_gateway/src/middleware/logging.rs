@@ -153,15 +153,37 @@ static ROUTED_WORKER_ID: HeaderName = HeaderName::from_static("x-smg-routed-work
 /// A header's value as text for the record: decoded lossily (a user agent is
 /// not always visible ASCII) and bounded by [`HEADER_FIELD_MAX_BYTES`].
 fn header_field<'a>(headers: &'a HeaderMap, name: &HeaderName) -> Option<Cow<'a, str>> {
-    let text = String::from_utf8_lossy(headers.get(name)?.as_bytes());
+    Some(bounded(String::from_utf8_lossy(
+        headers.get(name)?.as_bytes(),
+    )))
+}
+
+/// A header's every field line as one text for the record, the lines joined
+/// with `", "` (the combined value RFC 9110 section 5.3 makes of them): a
+/// proxy may add a line of its own rather than append to the client's, and
+/// the record keeps every hop, in order, for the reader to weigh. Decoded
+/// lossily and bounded as [`header_field`] is.
+fn header_lines_field<'a>(headers: &'a HeaderMap, name: &HeaderName) -> Option<Cow<'a, str>> {
+    let mut lines = headers.get_all(name).iter();
+    let mut text = String::from_utf8_lossy(lines.next()?.as_bytes());
+    for line in lines {
+        let joined = text.to_mut();
+        joined.push_str(", ");
+        joined.push_str(&String::from_utf8_lossy(line.as_bytes()));
+    }
+    Some(bounded(text))
+}
+
+/// `text` within [`HEADER_FIELD_MAX_BYTES`], cut at a character boundary.
+fn bounded(text: Cow<'_, str>) -> Cow<'_, str> {
     if text.len() <= HEADER_FIELD_MAX_BYTES {
-        return Some(text);
+        return text;
     }
     let mut end = HEADER_FIELD_MAX_BYTES;
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    Some(Cow::Owned(text[..end].to_owned()))
+    Cow::Owned(text[..end].to_owned())
 }
 
 /// The request-side fields of the record, on the span before the request's
@@ -180,7 +202,7 @@ fn record_request_fields(span: &Span, request: &Request, fields: AccessLogFields
         }
     }
     if fields.contains(AccessLogField::ForwardedFor) {
-        if let Some(value) = header_field(request.headers(), &X_FORWARDED_FOR) {
+        if let Some(value) = header_lines_field(request.headers(), &X_FORWARDED_FOR) {
             span.record("forwarded_for", value.as_ref());
         }
     }
@@ -306,6 +328,7 @@ impl<B> MakeSpan<B> for RequestSpan {
             key_id = Empty,
             request_bytes = Empty,
             response_bytes = Empty,
+            response_bytes_sent = Empty,
             worker = Empty,
             module = "smg"
         );
@@ -635,9 +658,12 @@ impl ClientCloseLog {
     }
 
     /// The client closed the connection: one line for the stage the request
-    /// was in, once. `response_bytes` are the bytes out so far, when the
-    /// record carries them.
-    fn client_closed(&mut self, response_bytes: Option<u64>) {
+    /// was in, once. `bytes_sent` are the bytes out so far, when the record
+    /// carries them: `response_bytes_sent`, a key of its own, since
+    /// `response_bytes` may already hold the declared length from the finish
+    /// line and the text format appends a second value rather than replacing
+    /// the first.
+    fn client_closed(&mut self, bytes_sent: Option<u64>) {
         match std::mem::replace(&mut self.stage, Stage::Done) {
             Stage::BeforeResponse => {
                 // The access-log fields the response line would have carried.
@@ -656,8 +682,8 @@ impl ClientCloseLog {
                 );
             }
             Stage::Streaming => {
-                if let Some(bytes) = response_bytes {
-                    self.span.record("response_bytes", bytes);
+                if let Some(bytes) = bytes_sent {
+                    self.span.record("response_bytes_sent", bytes);
                 }
                 let _enter = self.span.enter();
                 info!(
@@ -730,8 +756,10 @@ impl http_body::Body for SpannedBody {
         let poll = Pin::new(&mut this.inner).poll_frame(cx);
         match &poll {
             Poll::Ready(Some(Err(error))) => {
+                // The bytes out before the failure, under the early-end key
+                // (`response_bytes` may hold the declared length already).
                 if let Some(bytes) = this.bytes_out() {
-                    this.span.record("response_bytes", bytes);
+                    this.span.record("response_bytes_sent", bytes);
                 }
                 StreamFailureLogger.on_failure(
                     ServerErrorsFailureClass::Error(error.to_string()),
@@ -1369,16 +1397,39 @@ mod field_tests {
             )
             .route(
                 "/v1/stream",
+                post({
+                    let slot = Arc::clone(&slot);
+                    move |body: Bytes| {
+                        let stream = slot
+                            .lock()
+                            .expect("slot")
+                            .take()
+                            .expect("the stream handler is called once");
+                        async move {
+                            assert_eq!(body.len(), PAYLOAD.len());
+                            routed(
+                                ([(header::CONTENT_TYPE, "text/event-stream")], stream)
+                                    .into_response(),
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1/sized",
                 post(move |body: Bytes| {
                     let stream = slot
                         .lock()
                         .expect("slot")
                         .take()
-                        .expect("the stream handler is called once");
+                        .expect("the sized handler is called once");
                     async move {
                         assert_eq!(body.len(), PAYLOAD.len());
                         routed(
-                            ([(header::CONTENT_TYPE, "text/event-stream")], stream).into_response(),
+                            Response::builder()
+                                .header(header::CONTENT_LENGTH, 2 * FRAME.len())
+                                .body(stream)
+                                .expect("response"),
                         )
                     }
                 }),
@@ -1581,8 +1632,63 @@ mod field_tests {
             message,
             "client closed the connection before the response stream ended"
         );
-        assert_eq!(span["response_bytes"], FRAME.len());
+        assert_eq!(span["response_bytes_sent"], FRAME.len());
+        assert!(
+            !span.contains_key("response_bytes"),
+            "a stream cut short has no length: {span:?}"
+        );
         assert_eq!(span["request_bytes"], PAYLOAD.len());
+    }
+
+    /// A body under a declared length that the client leaves short of it:
+    /// the finish line said the length once, and the client-closed line says
+    /// the bytes that went out under a key of its own, so the text format
+    /// (which appends a re-recorded field rather than replacing it) carries
+    /// each value once.
+    #[tokio::test]
+    async fn a_declared_body_cut_short_keeps_the_length_once_and_adds_the_bytes_sent() {
+        let capture = Capture::default();
+        let _guard = tracing::subscriber::set_default(text_subscriber(&capture));
+        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
+        let response = app(
+            AccessLogFields::all(),
+            Some(Body::from_stream(ReceiverStream::new(rx))),
+        )
+        .oneshot(request("/v1/sized"))
+        .await
+        .expect("response");
+        tx.send(Ok(Bytes::from_static(FRAME))).await.expect("send");
+        let mut body = response.into_body();
+        let frame = body.frame().await.expect("one frame").expect("frame ok");
+        assert_eq!(frame.data_ref().map(Bytes::len), Some(FRAME.len()));
+        drop(body);
+        drop(tx);
+
+        let text = capture.text();
+        let finish = text
+            .lines()
+            .find(|line| line.contains("finished processing request"))
+            .expect("the finish line");
+        let declared = format!("response_bytes={}", 2 * FRAME.len());
+        assert_eq!(finish.matches(&declared).count(), 1, "{finish}");
+        assert!(!finish.contains("response_bytes_sent="), "{finish}");
+        let closed = text
+            .lines()
+            .find(|line| {
+                line.contains("client closed the connection before the response stream ended")
+            })
+            .expect("the client-closed line");
+        assert_eq!(closed.matches("response_bytes=").count(), 1, "{closed}");
+        assert!(closed.contains(&declared), "{closed}");
+        assert_eq!(
+            closed.matches("response_bytes_sent=").count(),
+            1,
+            "{closed}"
+        );
+        assert!(
+            closed.contains(&format!("response_bytes_sent={}", FRAME.len())),
+            "{closed}"
+        );
     }
 
     /// The text format carries the selected fields on the finish line, and
@@ -1699,6 +1805,48 @@ mod field_tests {
             Some("\u{fffd}\u{fffd}agent")
         );
         assert_eq!(header_field(&headers, &X_FORWARDED_FOR), None);
+        assert_eq!(header_lines_field(&headers, &X_FORWARDED_FOR), None);
+    }
+
+    /// Every `X-Forwarded-For` field line is in the record, in order, joined
+    /// as the combined value: a proxy that adds a line of its own is not
+    /// hidden behind the line the client sent.
+    #[test]
+    fn every_forwarded_for_line_is_in_the_record_in_order() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            X_FORWARDED_FOR.clone(),
+            HeaderValue::from_static("203.0.113.9"),
+        );
+        headers.append(
+            X_FORWARDED_FOR.clone(),
+            HeaderValue::from_static("198.51.100.2, 192.0.2.1"),
+        );
+        assert_eq!(
+            header_lines_field(&headers, &X_FORWARDED_FOR).as_deref(),
+            Some("203.0.113.9, 198.51.100.2, 192.0.2.1")
+        );
+        assert_eq!(
+            header_field(&headers, &X_FORWARDED_FOR).as_deref(),
+            Some("203.0.113.9"),
+            "the single-line reader sees the first line alone"
+        );
+
+        // The joined text is bounded like a single value, at a character
+        // boundary.
+        let mut headers = HeaderMap::new();
+        headers.append(
+            X_FORWARDED_FOR.clone(),
+            HeaderValue::from_bytes("a".repeat(HEADER_FIELD_MAX_BYTES - 3).as_bytes())
+                .expect("header"),
+        );
+        headers.append(
+            X_FORWARDED_FOR.clone(),
+            HeaderValue::from_bytes("é".as_bytes()).expect("header"),
+        );
+        let field = header_lines_field(&headers, &X_FORWARDED_FOR).expect("a value");
+        assert_eq!(field.len(), HEADER_FIELD_MAX_BYTES - 1);
+        assert!(field.ends_with(", "), "{field}");
     }
 
     #[test]
