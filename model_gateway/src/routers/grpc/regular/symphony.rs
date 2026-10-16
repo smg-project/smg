@@ -278,14 +278,15 @@ fn calls_tag(
 }
 
 /// The tag of a JSON answer following `schema`, with `reasoning_open` when the prompt leaves the
-/// model inside its thought ([`Format::answer_grammar`], [`tagged`]): the answer written where
-/// the table reads one, which the engine's own schema constraint is not for a table whose answer
-/// is a message (the bare JSON lands outside every message and the table drops it); where the
-/// output starts in content the tag is the schema alone, after the prefix a forced call takes
-/// when the prompt leaves the thought open, so the model closes its thought first. A registry
-/// table leaves the engine's schema, as before, when it has no tag or when the prompt `continues`
-/// the assistant's message, since the tag writes a turn from its start; the template's table
-/// refuses both.
+/// model inside its thought ([`Format::answer_grammar`]): the answer written where the table
+/// reads one, which the engine's own schema constraint is not for a table whose answer is a
+/// message (the bare JSON lands outside every message and the table drops it), nor with the
+/// thought open for an engine that runs the grammar from the first token (the JSON lands inside
+/// the thought), nor for a table that admits a thought before its answer. A registry table whose
+/// tag is the schema alone, the engine's own constraint, leaves it to the engine as before, and
+/// so does one with no tag, or a prompt that `continues` the assistant's message, since the tag
+/// writes a turn from its start; the template's table takes its tag either way and refuses what
+/// it cannot constrain ([`tagged`]).
 fn answer_tag(
     format: &Format,
     compiled: bool,
@@ -294,10 +295,10 @@ fn answer_tag(
     reasoning_open: bool,
     continues: bool,
 ) -> Result<Option<ToolConstraint>, String> {
-    if continues && !compiled {
+    let grammar = format.answer_grammar(schema, reasoning_open);
+    if !compiled && (continues || matches!(grammar, Some(Grammar::JsonSchema { .. }))) {
         return Ok(None);
     }
-    let grammar = format.answer_grammar(schema, reasoning_open);
     tagged(grammar, compiled, model, "a JSON answer", continues)
 }
 
@@ -1364,15 +1365,17 @@ mod tests {
         .is_none());
     }
 
-    /// A JSON `response_format` takes the table's answer tag whatever names select the table. The
-    /// engine's own schema constraint writes bare JSON from the turn's own state, which a table
-    /// whose answer is a message (Muse Spark's, Kimi K3's, Inkling's) drops as framing, so the
-    /// content came back empty; the tag writes the answer where the table reads one. Where the
-    /// output starts in content the tag is the schema alone, after the thought's prefix when the
-    /// prompt leaves the thought open. A table with no answer state, and a prompt that continues
-    /// the assistant's message, leave the engine's schema as before.
+    /// A JSON `response_format` takes the table's answer tag whatever names select the table,
+    /// unless the tag is the schema alone, the engine's own constraint, which the engine keeps as
+    /// before. A table whose answer is written inside a message (Muse Spark's, Kimi K3's,
+    /// Inkling's) takes its tag: the engine's schema writes bare JSON from the turn's own state,
+    /// which such a table drops as framing, so the content came back empty. A table whose output
+    /// starts in content takes the tag with the thought's close before the schema when the prompt
+    /// leaves the thought open, and with the thought the model may write first where its table
+    /// admits one (MiniMax M3's); a table with no answer state and a prompt that continues the
+    /// assistant's message keep the engine's schema.
     #[test]
-    fn a_json_response_format_takes_the_tables_answer_tag_for_every_table() {
+    fn a_json_response_format_takes_the_tables_answer_tag_unless_it_is_the_schema_alone() {
         let schema = json!({
             "type": "object",
             "properties": {
@@ -1427,6 +1430,11 @@ mod tests {
         // With the prompt inside the thought, the tag closes it before the message.
         let open = tag_of(answer(&muse, any_object.clone(), true));
         assert_ne!(open, tag, "{open}");
+        let begin = open["format"]["begin"].as_str().unwrap_or_default();
+        assert!(
+            begin.ends_with(" to=user<|message|>") && begin.len() > " to=user<|message|>".len(),
+            "{open}"
+        );
         // The registry's tables whose answer is a message take theirs too.
         for model in ["moonshotai/Kimi-K3", "thinkingmachines/Inkling"] {
             let tag = tag_of(answer(
@@ -1440,31 +1448,41 @@ mod tests {
                 "{model}: {tag}"
             );
         }
-        // A table whose output starts in content (the registry's Qwen3 table) writes the schema
-        // alone: the engine's own constraint, as a tag.
-        let alone = tag_of(answer(
-            &Names::default(),
-            json!({"response_format": {"type": "json_object"}}),
-            false,
-        ));
-        assert_eq!(
-            alone,
-            json!({"format": {"type": "json_schema", "json_schema": {"type": "object"}}}),
-            "{alone}"
-        );
-        // With the prompt inside the thought, the schema follows the prefix a forced call takes:
-        // free text that closes the thought.
-        let led = tag_of(answer(
-            &Names::default(),
-            json!({"response_format": {"type": "json_object"}}),
-            true,
-        ));
+        // A table whose output starts in content (the registry's Qwen3 table) has the schema
+        // alone for its tag with the thought closed: the engine's own constraint, which stands.
+        let content_first = json!({"response_format": {"type": "json_object"}});
+        assert!(answer(&Names::default(), content_first.clone(), false)
+            .expect("read")
+            .is_none());
+        // With the prompt inside the thought, the schema follows the prefix a forced call takes,
+        // free text that closes the thought, so the JSON is not written inside it.
+        let led = tag_of(answer(&Names::default(), content_first, true));
         assert_eq!(led["format"]["type"], "sequence", "{led}");
         assert_eq!(led["format"]["elements"][0]["type"], "any_text", "{led}");
         assert_eq!(
             led["format"]["elements"][1],
             json!({"type": "json_schema", "json_schema": {"type": "object"}}),
             "{led}"
+        );
+        // A table that admits a thought before its answer (MiniMax M3's) keeps that tag with the
+        // thought closed: the thought the model may write first, then the schema.
+        let thought_first = tag_of(answer(
+            &Names::default(),
+            json!({"model": "MiniMaxAI/MiniMax-M3", "response_format": {"type": "json_object"}}),
+            false,
+        ));
+        assert_eq!(
+            thought_first["format"]["type"], "sequence",
+            "{thought_first}"
+        );
+        assert_eq!(
+            thought_first["format"]["elements"][0]["type"], "optional",
+            "{thought_first}"
+        );
+        assert_eq!(
+            thought_first["format"]["elements"][1],
+            json!({"type": "json_schema", "json_schema": {"type": "object"}}),
+            "{thought_first}"
         );
         // No answer state (xLAM's list), a continued assistant message, or no JSON asked: the
         // engine's schema, or nothing.
@@ -1890,18 +1908,21 @@ mod tests {
             json!({"response_format": {"type": "json_object"}}),
         ));
         assert_eq!(answer["format"]["type"], "json_schema", "{answer}");
-        // The registry's table for the model answers the same: its content opens with no marker,
-        // so its tag is the schema alone.
         let plain = names(None, None);
-        let answer = tag_of(super::constraint(
-            ParserChoice::Symphony,
-            &plain,
-            &request(json!({"response_format": {"type": "json_object"}})),
-            &tools(),
-            false,
-            &templates(),
-        ));
-        assert_eq!(answer["format"]["type"], "json_schema", "{answer}");
+        assert!(
+            super::constraint(
+                ParserChoice::Symphony,
+                &plain,
+                &request(json!({"response_format": {"type": "json_object"}})),
+                &tools(),
+                false,
+                &templates(),
+            )
+            .expect("read")
+            .is_none(),
+            "the Qwen3 table's answer tag is the schema alone, the engine's own constraint, so the \
+             older registry's JSON schema stands"
+        );
         // A regex or ebnf constraint would apply outside the template's format.
         let why = constrain(
             &with_layout,
