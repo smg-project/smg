@@ -591,7 +591,6 @@ struct Router {
     rdma_listen_ip: Option<String>,
     rdma_slot_ttl_s: Option<u64>,
     log_mm_timing: bool,
-    access_log_fields: Vec<String>,
     prefill_max_inflight_requests_per_worker: i32,
     prefill_queue_size: Option<usize>,
     prefill_queue_timeout_secs: Option<u64>,
@@ -627,6 +626,8 @@ struct Router {
     mesh_tls_cert: Option<String>,
     mesh_tls_key: Option<String>,
     power_of_two_load_metric: String,
+    /// Keyword-only: the optional fields of the access-log record.
+    access_log_fields: Vec<String>,
 }
 
 /// Read the keyword-only `discovery` mapping by the same rules as
@@ -1381,7 +1382,6 @@ impl Router {
         rdma_listen_ip = None,
         rdma_slot_ttl_s = None,
         log_mm_timing = false,
-        access_log_fields = vec![],
         prefill_max_inflight_requests_per_worker = -1,
         prefill_queue_size = None,
         prefill_queue_timeout_secs = None,
@@ -1424,6 +1424,7 @@ impl Router {
         mesh_tls_key = None,
         power_of_two_load_metric = String::from("expected_wait"),
         discovery = None,
+        access_log_fields = vec![],
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -1587,7 +1588,6 @@ impl Router {
         rdma_listen_ip: Option<String>,
         rdma_slot_ttl_s: Option<u64>,
         log_mm_timing: bool,
-        access_log_fields: Vec<String>,
         prefill_max_inflight_requests_per_worker: i32,
         prefill_queue_size: Option<usize>,
         prefill_queue_timeout_secs: Option<u64>,
@@ -1628,6 +1628,7 @@ impl Router {
         mesh_tls_key: Option<String>,
         power_of_two_load_metric: String,
         discovery: Option<Bound<'_, PyAny>>,
+        access_log_fields: Vec<String>,
     ) -> PyResult<Self> {
         // Two spellings of one choice: refuse both rather than pick one.
         if service_discovery && discovery.is_some() {
@@ -1830,7 +1831,6 @@ impl Router {
             rdma_listen_ip,
             rdma_slot_ttl_s,
             log_mm_timing,
-            access_log_fields,
             prefill_max_inflight_requests_per_worker,
             prefill_queue_size,
             prefill_queue_timeout_secs,
@@ -1860,6 +1860,7 @@ impl Router {
             mesh_tls_cert,
             mesh_tls_key,
             power_of_two_load_metric,
+            access_log_fields,
         })
     }
 
