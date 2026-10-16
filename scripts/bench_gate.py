@@ -87,42 +87,60 @@ GATE_ENTRY_KEYS = {"pattern", "threshold", "note"}
 
 
 def load_gates(path: Path) -> Gates:
-    """The gate file, checked: an unknown key, a `[[gate]]` without `pattern` or `threshold`, a
-    pattern or filter that does not compile, a threshold outside (0, 1) or a repeat count under 1
-    is a `ValueError` (exit 2, a usage error), never a silent default or a traceback."""
+    """The gate file, checked: an unknown key, a value of the wrong type, a `[[gate]]` without
+    `pattern` or `threshold`, a pattern or filter that does not compile, a threshold outside
+    (0, 1) or a repeat count under 1 is a `ValueError` (exit 2, a usage error), never a silent
+    default or a traceback."""
     with path.open("rb") as handle:
         raw = tomllib.load(handle)
     unknown = set(raw) - GATE_FILE_KEYS
     if unknown:
         raise ValueError(f"{path}: unknown keys {sorted(unknown)}; known: {sorted(GATE_FILE_KEYS)}")
-    gates = Gates(
-        repeats=int(raw.get("repeats", 3)),
-        filter=raw.get("filter"),
-        bench_args=[str(arg) for arg in raw.get("bench_args", [])],
-    )
-    if gates.repeats < 1:
+    repeats = raw.get("repeats", 3)
+    if isinstance(repeats, bool) or not isinstance(repeats, int):
+        raise ValueError(f"{path}: repeats must be an integer, got {repeats!r}")
+    if repeats < 1:
         raise ValueError(f"{path}: repeats must be at least 1")
+    filter_ = raw.get("filter")
+    if filter_ is not None and not isinstance(filter_, str):
+        raise ValueError(f"{path}: filter must be a string, got {filter_!r}")
+    bench_args = raw.get("bench_args", [])
+    if not isinstance(bench_args, list):
+        raise ValueError(f"{path}: bench_args must be a list of strings, got {bench_args!r}")
+    gates = Gates(repeats=repeats, filter=filter_, bench_args=[str(arg) for arg in bench_args])
     if gates.filter is not None:
         try:
             re.compile(gates.filter)
         except re.error as err:
             raise ValueError(f"{path}: filter {gates.filter!r} does not compile: {err}") from err
-    for index, entry in enumerate(raw.get("gate", []), start=1):
+    entries = raw.get("gate", [])
+    if not isinstance(entries, list):
+        raise ValueError(
+            f"{path}: gate must be an array of tables ([[gate]]), got a {type(entries).__name__}"
+        )
+    for index, entry in enumerate(entries, start=1):
         if not isinstance(entry, dict) or "pattern" not in entry or "threshold" not in entry:
             raise ValueError(f"{path}: [[gate]] entry {index} needs pattern and threshold")
         unknown = set(entry) - GATE_ENTRY_KEYS
         if unknown:
             raise ValueError(f"{path}: [[gate]] entry {index}: unknown keys {sorted(unknown)}")
-        threshold = float(entry["threshold"])
+        pattern, threshold = entry["pattern"], entry["threshold"]
+        if not isinstance(pattern, str):
+            raise ValueError(
+                f"{path}: [[gate]] entry {index}: pattern must be a string, got {pattern!r}"
+            )
+        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+            raise ValueError(
+                f"{path}: [[gate]] entry {index}: threshold must be a number, got {threshold!r}"
+            )
+        threshold = float(threshold)
         if not 0 < threshold < 1:
             raise ValueError(f"{path}: threshold {threshold} must be a fraction in (0, 1)")
         try:
-            re.compile(entry["pattern"])
+            re.compile(pattern)
         except re.error as err:
-            raise ValueError(
-                f"{path}: pattern {entry['pattern']!r} does not compile: {err}"
-            ) from err
-        gates.gates.append(Gate(entry["pattern"], threshold, str(entry.get("note", ""))))
+            raise ValueError(f"{path}: pattern {pattern!r} does not compile: {err}") from err
+        gates.gates.append(Gate(pattern, threshold, str(entry.get("note", ""))))
     return gates
 
 
@@ -481,7 +499,7 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     try:
         return args.func(args)
-    except (RuntimeError, ValueError, OSError) as err:
+    except (RuntimeError, ValueError, TypeError, OSError) as err:
         print(f"bench_gate: {err}", file=sys.stderr)
         return 2
 

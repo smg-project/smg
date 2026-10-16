@@ -93,6 +93,15 @@ def test_gate_file_rejects_bad_values(mod, tmp_path):
         ('[[gate]]\npattern = "x"\nthreshold = 0.1\nthreshhold = 0.2\n', "unknown keys"),
         ('[[gate]]\npattern = "(unclosed"\nthreshold = 0.1\n', "does not compile"),
         ('filter = "(unclosed"\n', "does not compile"),
+        # A value of the wrong TOML type is a usage error too, not a TypeError traceback.
+        ('filter = ["^a/", "^b/"]\n', "filter must be a string"),
+        ("filter = 5\n", "filter must be a string"),
+        ("repeats = [3]\n", "repeats must be an integer"),
+        ("bench_args = 5\n", "bench_args must be a list"),
+        ("[[gate]]\npattern = 1\nthreshold = 0.1\n", "pattern must be a string"),
+        ('[[gate]]\npattern = "x"\nthreshold = [0.1]\n', "threshold must be a number"),
+        # A single [gate] table where the [[gate]] array belongs.
+        ('[gate]\npattern = "x"\nthreshold = 0.1\n', "array of tables"),
     ]:
         path.write_text(text)
         with pytest.raises(ValueError, match=named):
