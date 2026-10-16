@@ -54,7 +54,7 @@ B_URL=$(BFCL_GPU=2,3 BFCL_SMG_TOOL_PARSER=qwen_xml  BFCL_SMG_REASONING_PARSER=qw
 bash launch_arm.sh stop
 ```
 
-Key env knobs for `launch_arm.sh`: `BFCL_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`), `BFCL_TP` (tensor-parallel size — match the GPU count), `BFCL_MAX_MODEL_LEN`, `BFCL_{VLLM,SMG}_{TOOL,REASONING}_PARSER`, and `BFCL_VLLM_EXTRA` for extra vLLM flags.
+Key env knobs for `launch_arm.sh`: `BFCL_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`), `BFCL_TP` (tensor-parallel size — match the GPU count), `BFCL_MAX_MODEL_LEN`, `BFCL_{VLLM,SMG}_{TOOL,REASONING}_PARSER`, `BFCL_VLLM_EXTRA` for extra vLLM flags, and `BFCL_VLLM_ENV` for extra vLLM environment (`NAME=VALUE` words).
 
 `run_ab.py` exits non-zero if the candidate's overall accuracy drops more than `--tolerance` (default 2pp) below the baseline.
 
@@ -67,6 +67,7 @@ Key env knobs for `launch_arm.sh`: `BFCL_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`)
 | DeepSeek-V4.1-Flash (`deepseek-v4.1`) | `blackwell` | 8 (seq) | `deepseek_v41` / `deepseek_v41` (+`--tokenizer-mode deepseek_v41 --trust-remote-code`; per-commit vLLM main wheel) | `deepseek_v41` / `deepseek_v41` |
 | MiniMax-M3 MXFP8 (`minimax-m3`) | `blackwell` | 4 | `minimax_m3` / `minimax_m3` (+`--trust-remote-code --block-size 128 --attention_config.indexer_kv_dtype fp8`) | `minimax_m3` / `minimax_m3` |
 | GLM-5.3-Flash (`glm-5.3-flash`) | `blackwell` | 4 | `glm47` / `glm45` (+`--trust-remote-code --kv-cache-dtype fp8`; per-commit vLLM main wheel) | `glm47_moe` / `glm45` |
+| DeepSeek-V4.1-Flash (`deepseek-v4.1-amd`) | `8-gpu-mi300x` | 8 (seq) | `deepseek_v41` / `deepseek_v41` (+`--tokenizer-mode deepseek_v41 --trust-remote-code --compilation-config.cudagraph_mode FULL_DECODE_ONLY`; vLLM ROCm nightly image) | `deepseek_v41` / `deepseek_v41` |
 
 > **gpt-oss has no SMG tool-call-parser.** SMG handles gpt-oss through its harmony
 > pipeline (`model_gateway/src/routers/grpc/harmony/`), auto-activated by
@@ -102,6 +103,12 @@ a GitHub Actions matrix — one leg per model, `fail-fast: false`, each on its o
   asks for them, with `only` or with `hardware: amd`. They never run on
   `pull_request`.
 
+  The AMD legs whose models need ROCm fixes newer than the pin run in a pinned
+  vLLM ROCm nightly instead (`amd_nightly_image`), with the flags and engine
+  environment (`vllm_env`) of vLLM's MI300X recipe for the model:
+  - `deepseek-v4.1-amd` — DeepSeek-V4.1-Flash on the whole node (TP=8, arms
+    sequential).
+
 All legs use `max_model_len` **32768**: the `multi_turn` categories emit ~18k-token
 prompts that 400'd ("decoder prompt longer than the maximum model length") at 16384.
 Weights already fit at each leg's TP and the extra KV for a 32k window is only a few
@@ -111,7 +118,7 @@ Each leg sets `arm_mode`:
 
 - **concurrent** (the half-node legs) — both arms serve at once on opposite GPU halves;
   `run_ab.py` scores them **in parallel** (separate servers/GPUs, no contention) and diffs.
-- **sequential** (`deepseek-v4.1`) — for a model that needs the whole node (TP=8)
+- **sequential** (`deepseek-v4.1`, `deepseek-v4.1-amd`) — for a model that needs the whole node (TP=8)
   so the arms can't coexist: `run_ab.py --score-arm` scores arm A alone → tears it
   down → scores arm B alone → `--diff-baseline/--diff-candidate` compares the two
   saved score files. Flip a leg's `arm_mode` to enable it.
@@ -132,7 +139,8 @@ A leg whose model the pinned vLLM release (`scripts/ci_install_vllm.sh`) cannot 
 sets `vllm_commit` + `vllm_version` in its matrix entry; the job then swaps in that
 per-commit main wheel from `wheels.vllm.ai/<commit>` for **both** arms (the A/B stays
 engine-identical). `deepseek-v4.1` and `glm-5.3-flash` share one such wheel until a
-vLLM release ships both models and the CI pin moves; drop the keys then.
+vLLM release ships both models and the CI pin moves; drop the keys then. The AMD legs
+cannot take these wheels (they are CUDA builds); an AMD leg sets its own `image` instead.
 
 ## Gotchas discovered while bringing this up (read before debugging)
 

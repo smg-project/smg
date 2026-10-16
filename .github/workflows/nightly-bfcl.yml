@@ -11,7 +11,7 @@
 # On PRs that touch this pipeline it runs a quick non-live sanity subset for
 # merge confidence. The A/B mechanics were validated manually on an H100 box
 # (see scripts/bfcl/README.md "Validation status").
-# AMD legs run the H100 legs' models on an AMD Instinct self-hosted runner; until
+# AMD legs run models from the H100 and Blackwell legs on an AMD Instinct self-hosted runner; until
 # one is registered and the repo variable SMG_RUN_AMD_LEGS is "true", only a
 # dispatch that asks for them (`only`, or `hardware: amd`) runs them.
 name: Nightly BFCL
@@ -29,7 +29,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: "Run only this matrix leg (qwen3.8|gpt-oss|deepseek-v4.1|minimax-m3|glm-5.3-flash|gpt-oss-amd|qwen3.8-amd); empty = all"
+        description: "Run only this matrix leg (qwen3.8|gpt-oss|deepseek-v4.1|minimax-m3|glm-5.3-flash|gpt-oss-amd|qwen3.8-amd|deepseek-v4.1-amd); empty = all"
         required: false
         default: ""
       hardware:
@@ -151,6 +151,10 @@ jobs:
           amd_runner = os.environ.get("AMD_RUNNER") or "8-gpu-mi300x"
           # vLLM's ROCm image of the CI pin (scripts/ci_install_vllm.sh).
           amd_image = "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f"
+          # vLLM's ROCm nightly, for the AMD legs whose models need ROCm fixes newer
+          # than the pin: main at vllm-project/vllm@3f1bcfd8 (2026-10-15). The AMD
+          # legs cannot take a per-commit wheel (vllm_commit) — those are CUDA builds.
+          amd_nightly_image = "vllm/vllm-openai-rocm:nightly-3f1bcfd82bb2e93fcd364fc7a5491718453a77e2@sha256:1b61c6c8cf063a6ee08651c82e14169eb39fa800cc1691a5f3eebcecfbe6648c"
           # max_model_len "auto": largest window that fits in GPU memory (capped at
           # native max). A fixed 32768 400'd on multi_turn_long_context (>32k prompts).
           #
@@ -274,6 +278,28 @@ jobs:
                "vllm_extra": "", "gpu_mem": "0.85", "startup_timeout": "900",
                "run_timeout": "18000",
                "model_cache": "/models", "arm_mode": "concurrent", "max_model_len": "auto"},
+              # DeepSeek-V4.1-Flash (~765GB) on the whole MI300X node, TP=8 with arms
+              # sequential like its Blackwell leg, and that leg's parsers and tokenizer
+              # mode. At TP=8 the Engram tables stay on the GPUs (~96GB of weights per
+              # GPU); the recipe's TP=4 offloads them to host memory instead. Flags and
+              # env per vLLM's MI300X recipe (recipes.vllm.ai/deepseek-ai/DeepSeek-V4.1-Flash):
+              # AITER on, no breakable CUDA graphs, and full decode graphs only, since
+              # piecewise capture segfaults the workers on gfx942. The recipe asks for a
+              # ROCm build from 2026-10-13 or later (vllm-project/vllm#59039), which
+              # v0.31.0 predates, so this leg runs in the nightly image.
+              {"name": "deepseek-v4.1-amd", "runner": amd_runner, "vendor": "amd", "tp": 8,
+               "image": amd_nightly_image,
+               "gpu_a": "0,1,2,3,4,5,6,7", "gpu_b": "",  # sequential: arm B reuses GPU_A (whole node)
+               "model": "deepseek-ai/DeepSeek-V4.1-Flash", "bfcl_model": "deepseek-ai/DeepSeek-V4.1-Flash-FC",
+               "vllm_tool": "deepseek_v41", "vllm_reason": "deepseek_v41",
+               "smg_tool": "deepseek_v41", "smg_reason": "deepseek_v41",
+               "vllm_extra": "--tokenizer-mode deepseek_v41 --trust-remote-code --compilation-config.cudagraph_mode FULL_DECODE_ONLY",
+               "vllm_env": "VLLM_ROCM_USE_AITER=1 VLLM_USE_BREAKABLE_CUDAGRAPH=0 VLLM_ENGINE_READY_TIMEOUT_S=3600",
+               # 765GB load + first-run kernel JIT, as on the Blackwell leg.
+               "gpu_mem": "0.90", "startup_timeout": "3600",
+               # Sequential: both arms share the 360m job, as on the Blackwell leg.
+               "run_timeout": "5400",
+               "model_cache": "/models", "arm_mode": "sequential", "max_model_len": "auto"},
           ]
           only = os.environ.get("ONLY", "")
           hardware = os.environ.get("HARDWARE") or "both"
@@ -404,6 +430,8 @@ jobs:
           BFCL_VLLM_REASONING_PARSER: ${{ github.event.inputs.reasoning_parser || matrix.vllm_reason }}
           BFCL_SMG_REASONING_PARSER: ${{ github.event.inputs.reasoning_parser || matrix.smg_reason }}
           BFCL_VLLM_EXTRA: ${{ matrix.vllm_extra }}
+          # Engine env vars for both arms' vLLM processes (empty for most legs).
+          BFCL_VLLM_ENV: ${{ matrix.vllm_env }}
           BFCL_TP: ${{ matrix.tp }}
           BFCL_MAX_MODEL_LEN: ${{ matrix.max_model_len }}
           BFCL_GPU_MEM_UTIL: ${{ matrix.gpu_mem }}
