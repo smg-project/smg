@@ -756,8 +756,9 @@ static FORGIVEN: AtomicUsize = AtomicUsize::new(0);
 /// difference: the output holds a broken surrogate escape; everything said is the same but the
 /// calls' arguments and the malformed text; for every call whose arguments differ, the whole
 /// said nothing and the pieces said a top-level string's bytes (a leading `"`); and the pieces
-/// said under `Malformed` exactly the whole's malformed bytes less the ones they said as
-/// arguments, so no byte is lost or invented either way.
+/// said under `Malformed` the same reasons in the same order, and the whole's malformed text is
+/// the pieces' with the bytes they said as arguments put back, in order, where the whole refused
+/// them (an exact comparison), so no byte is lost, invented, changed or re-judged either way.
 fn is_the_stated_exception(text: &str, whole: &Said, cut: &Said) -> bool {
     if !holds_a_broken_surrogate_escape(text)
         || whole.content != cut.content
@@ -770,7 +771,7 @@ fn is_the_stated_exception(text: &str, whole: &Said, cut: &Said) -> bool {
     {
         return false;
     }
-    let mut moved = 0;
+    let mut moved: Vec<&str> = Vec::new();
     for ((whole_index, whole_arguments), (cut_index, cut_arguments)) in
         whole.arguments.iter().zip(&cut.arguments)
     {
@@ -783,15 +784,42 @@ fn is_the_stated_exception(text: &str, whole: &Said, cut: &Said) -> bool {
         if !whole_arguments.is_empty() || !cut_arguments.starts_with('"') {
             return false;
         }
-        moved += cut_arguments.len();
+        moved.push(cut_arguments);
     }
-    let malformed_bytes = |said: &Said| {
-        said.malformed
+    if moved.is_empty()
+        || !whole
+            .malformed
             .iter()
-            .map(|(_, text)| text.len())
-            .sum::<usize>()
-    };
-    moved > 0 && malformed_bytes(whole) == malformed_bytes(cut) + moved
+            .map(|(why, _)| why)
+            .eq(cut.malformed.iter().map(|(why, _)| why))
+    {
+        return false;
+    }
+    // Entry by entry (one per reason, in order): the pieces' text with the moved bytes put
+    // back, in stream order, is the whole's text. A cursor per entry starts where the last
+    // put-back ended, so a later call's bytes are never put back too early, and a byte that
+    // crossed a reason is a difference.
+    let mut rest: Vec<String> = cut.malformed.iter().map(|(_, text)| text.clone()).collect();
+    let mut cursors = vec![0usize; rest.len()];
+    'moved: for bytes in moved {
+        for (entry, (_, whole_text)) in whole.malformed.iter().enumerate() {
+            let text = &mut rest[entry];
+            let found = (cursors[entry]..=text.len()).find(|&at| {
+                at <= whole_text.len()
+                    && text.is_char_boundary(at)
+                    && whole_text.is_char_boundary(at)
+                    && whole_text[..at] == text[..at]
+                    && whole_text[at..].starts_with(bytes)
+            });
+            if let Some(at) = found {
+                text.insert_str(at, bytes);
+                cursors[entry] = at + bytes.len();
+                continue 'moved;
+            }
+        }
+        return false;
+    }
+    rest.iter().eq(whole.malformed.iter().map(|(_, text)| text))
 }
 
 #[test]
@@ -826,10 +854,55 @@ fn the_stated_exception_is_told_from_any_other_difference() {
         "a byte invented"
     );
     let mut other = cut.clone();
-    other.arguments[0].1 = "ab".to_string();
+    other.arguments[0].1 = r"[ab\udc0".to_string();
     assert!(
         !is_the_stated_exception(text, &whole, &other),
-        "not a top-level string"
+        "not a top-level string, the bytes balancing"
+    );
+    let mut other = cut.clone();
+    other.malformed[0].0 = MalformedReason::InvalidArguments;
+    assert!(
+        !is_the_stated_exception(text, &whole, &other),
+        "a reason re-judged"
+    );
+    let mut other = cut.clone();
+    other.arguments[0].1 = r#""zb\udc0"#.to_string();
+    assert!(
+        !is_the_stated_exception(text, &whole, &other),
+        "a byte changed, the count the same"
+    );
+    // A byte that crossed a reason: the closing quote moved from one entry to the next.
+    let mut whole_two = whole.clone();
+    whole_two.malformed[0].0 = MalformedReason::InvalidArguments;
+    whole_two
+        .malformed
+        .push((MalformedReason::UnterminatedRegion, "q".to_string()));
+    let mut cut_two = cut.clone();
+    cut_two.malformed[0] = (MalformedReason::InvalidArguments, "0".to_string());
+    cut_two
+        .malformed
+        .push((MalformedReason::UnterminatedRegion, r#""q"#.to_string()));
+    assert!(
+        !is_the_stated_exception(text, &whole_two, &cut_two),
+        "a byte crossed a reason"
+    );
+    // Two calls cut alike: the second call's bytes go back after the first's.
+    let text_two =
+        r#"{"name": "f", "arguments": "ab\udc00"}{"name": "f", "arguments": "ab\udc00"}"#;
+    let mut whole_two = whole.clone();
+    whole_two
+        .calls
+        .push((1, "call_2".to_string(), "f".to_string()));
+    whole_two.arguments.push((1, String::new()));
+    whole_two.malformed[0].1 = r#""ab\udc00""ab\udc00""#.to_string();
+    whole_two.ended.push(1);
+    let mut cut_two = whole_two.clone();
+    cut_two.arguments[0].1 = r#""ab\udc0"#.to_string();
+    cut_two.arguments[1].1 = r#""ab\udc0"#.to_string();
+    cut_two.malformed[0].1 = r#"0"0""#.to_string();
+    assert!(
+        is_the_stated_exception(text_two, &whole_two, &cut_two),
+        "two calls cut alike"
     );
     assert!(
         !is_the_stated_exception(text, &whole, &whole),
