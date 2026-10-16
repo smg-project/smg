@@ -32,7 +32,7 @@ use crate::{
     routers::grpc::multimodal::{
         load_image_preprocessor_config, load_video_preprocessor_config, MultimodalModelConfig,
     },
-    worker::{ConnectionMode, WorkerRegistry},
+    worker::{ConnectionMode, Worker, WorkerRegistry},
 };
 
 /// Configuration for adding a tokenizer
@@ -301,65 +301,22 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                 let name = name.clone();
                 let id = id.clone();
                 async move {
-                    let base_tokenizer = match factory::create_tokenizer_async_with_chat_template(
+                    load_tokenizer(
+                        &app_context,
+                        &id,
+                        &name,
                         &source,
                         chat_template.as_deref(),
+                        cache_cfg,
                     )
                     .await
-                    {
-                        Ok(tok) => tok,
-                        Err(local_err) => {
-                            debug!(
-                                "Local tokenizer load failed for source '{}', attempting to fetch from worker. Error: {:?}",
-                                source, local_err
-                            );
-
-                            fetch_tokenizer_from_worker(&app_context, &id, &name, chat_template.as_deref()).await.map_err(
-                                |worker_err| {
-                                    format!(
-                                        "Failed to load tokenizer locally ({local_err}) and remotely from worker ({worker_err})"
-                                    )
-                                },
-                            )?
-                        }
-                    };
-
-                    Ok(with_optional_cache(base_tokenizer, cache_cfg))
                 }
             })
             .await;
 
         match result {
             Ok(outcome) => {
-                let loaded_id = outcome.id();
-
-                // Get vocab size for logging
-                let vocab_size = app_context
-                    .tokenizer_registry
-                    .get_by_id(loaded_id)
-                    .map(|e| e.tokenizer.vocab_size());
-
-                match &outcome {
-                    LoadOutcome::Loaded { id } => {
-                        info!(
-                            "Successfully loaded tokenizer '{}' (id: {}) with vocab_size: {:?}",
-                            name, id, vocab_size
-                        );
-                        hint_response_template(&app_context, &name, id);
-                    }
-                    LoadOutcome::AlreadyExists { id } => {
-                        if config.fail_on_duplicate {
-                            return Err(WorkflowError::StepFailed {
-                                step_id: StepId::new("load_tokenizer"),
-                                message: format!("Tokenizer '{name}' already exists (id: {id})"),
-                            });
-                        }
-                        info!(
-                            "Tokenizer '{}' already exists (id: {}), skipping load",
-                            name, id
-                        );
-                    }
-                }
+                let vocab_size = note_load_outcome(&app_context, config, &outcome)?;
 
                 // Store vocab size in typed data
                 if let Some(size) = vocab_size {
@@ -381,6 +338,86 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         true // Network/IO errors are retryable
     }
+}
+
+/// The tokenizer of `source` with its chat template, the loader the registry
+/// runs for [`LoadTokenizerStep`]: the local path or the hub first, a serving
+/// worker's bundle when that fails, wrapped in the cache when one is
+/// configured.
+async fn load_tokenizer(
+    app_context: &AppContext,
+    tokenizer_id: &str,
+    model_id: &str,
+    source: &str,
+    chat_template: Option<&str>,
+    cache_cfg: Option<TokenizerCacheConfig>,
+) -> Result<Arc<dyn Tokenizer>, String> {
+    let base_tokenizer = match factory::create_tokenizer_async_with_chat_template(
+        source,
+        chat_template,
+    )
+    .await
+    {
+        Ok(tok) => tok,
+        Err(local_err) => {
+            debug!(
+                    "Local tokenizer load failed for source '{}', attempting to fetch from worker. Error: {:?}",
+                    source, local_err
+                );
+
+            fetch_tokenizer_from_worker(app_context, tokenizer_id, model_id, chat_template)
+                    .await
+                    .map_err(|worker_err| {
+                        format!(
+                            "Failed to load tokenizer locally ({local_err}) and remotely from worker ({worker_err})"
+                        )
+                    })?
+        }
+    };
+
+    Ok(with_optional_cache(base_tokenizer, cache_cfg))
+}
+
+/// What a load that ended means for the step: a tokenizer loaded is logged
+/// with the template hint; one the registry already held is logged, or is
+/// the failure the request asks for on a duplicate. Returns the vocabulary
+/// size of the tokenizer under the outcome's id.
+fn note_load_outcome(
+    app_context: &AppContext,
+    config: &TokenizerConfigRequest,
+    outcome: &LoadOutcome,
+) -> WorkflowResult<Option<usize>> {
+    let name = &config.name;
+
+    // Get vocab size for logging
+    let vocab_size = app_context
+        .tokenizer_registry
+        .get_by_id(outcome.id())
+        .map(|e| e.tokenizer.vocab_size());
+
+    match outcome {
+        LoadOutcome::Loaded { id } => {
+            info!(
+                "Successfully loaded tokenizer '{}' (id: {}) with vocab_size: {:?}",
+                name, id, vocab_size
+            );
+            hint_response_template(app_context, name, id);
+        }
+        LoadOutcome::AlreadyExists { id } => {
+            if config.fail_on_duplicate {
+                return Err(WorkflowError::StepFailed {
+                    step_id: StepId::new("load_tokenizer"),
+                    message: format!("Tokenizer '{name}' already exists (id: {id})"),
+                });
+            }
+            info!(
+                "Tokenizer '{}' already exists (id: {}), skipping load",
+                name, id
+            );
+        }
+    }
+
+    Ok(vocab_size)
 }
 
 fn with_optional_cache(
@@ -495,70 +532,22 @@ async fn fetch_tokenizer_from_worker(
             runtime
         );
 
-        let backend_client = match worker.get_backend_client().await {
-            Ok(Some(client)) => client,
-            Ok(None) => {
-                failures.push(format!(
-                    "worker {} (runtime: {runtime}) does not provide a gRPC client",
-                    worker.url(),
-                ));
-                continue;
-            }
-            Err(e) => {
-                failures.push(format!(
-                    "failed to create gRPC client for worker {} (runtime: {runtime}): {e}",
-                    worker.url(),
-                ));
-                continue;
-            }
-        };
-
-        let bundle = match backend_client.get_tokenizer().await {
+        let bundle = match fetch_bundle(worker.as_ref()).await {
             Ok(bundle) => bundle,
-            Err(e) => {
-                let is_unimplemented = e
-                    .downcast_ref::<tonic::Status>()
-                    .is_some_and(|s| s.code() == tonic::Code::Unimplemented);
-                if is_unimplemented {
-                    debug!(
-                        "Worker {} (runtime: {}) does not support GetTokenizer",
-                        worker.url(),
-                        runtime
-                    );
-                } else {
-                    warn!(
-                        "Worker {} (runtime: {}) get_tokenizer failed: {}",
-                        worker.url(),
-                        runtime,
-                        e
-                    );
-                }
-                failures.push(format!(
-                    "worker {} (runtime: {runtime}) get_tokenizer failed: {e}",
-                    worker.url(),
-                ));
+            Err(failure) => {
+                failures.push(failure);
                 continue;
             }
         };
-        debug!(
-            "Tokenizer bundle validation passed for worker {}",
-            worker.url()
-        );
 
-        match load_tokenizer_from_bundle(&bundle, chat_template_path) {
-            Ok((tokenizer, mm_config)) => {
-                if let Some(cfg) = mm_config {
-                    app_context
-                        .multimodal_config_registry
-                        .insert(tokenizer_id.to_string(), Arc::new(cfg));
-                    info!(
-                        tokenizer_id = %tokenizer_id,
-                        tokenizer_name = %model_id,
-                        "Preloaded multimodal config from GetTokenizer bundle"
-                    );
-                }
-                return Ok(tokenizer);
-            }
+        match install_bundle(
+            app_context,
+            tokenizer_id,
+            model_id,
+            &bundle,
+            chat_template_path,
+        ) {
+            Ok(tokenizer) => return Ok(tokenizer),
             Err(e) => failures.push(format!(
                 "worker {} (runtime: {runtime}) bundle extraction/load failed: {e}",
                 worker.url(),
@@ -570,6 +559,83 @@ async fn fetch_tokenizer_from_worker(
     Err(format!(
         "Failed to fetch tokenizer for model '{model_id}' from {worker_count} healthy gRPC worker(s): {failures_summary}"
     ))
+}
+
+/// The tokenizer bundle `worker` serves over its gRPC client, or the failure
+/// the fetch reports for it: no gRPC client, a client that fails to build, a
+/// worker that does not implement the call or fails it.
+async fn fetch_bundle(worker: &dyn Worker) -> Result<StreamBundle, String> {
+    let runtime = worker.metadata().spec.runtime_type;
+
+    let backend_client = match worker.get_backend_client().await {
+        Ok(Some(client)) => client,
+        Ok(None) => {
+            return Err(format!(
+                "worker {} (runtime: {runtime}) does not provide a gRPC client",
+                worker.url(),
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "failed to create gRPC client for worker {} (runtime: {runtime}): {e}",
+                worker.url(),
+            ));
+        }
+    };
+
+    let bundle = backend_client.get_tokenizer().await.map_err(|e| {
+        let is_unimplemented = e
+            .downcast_ref::<tonic::Status>()
+            .is_some_and(|s| s.code() == tonic::Code::Unimplemented);
+        if is_unimplemented {
+            debug!(
+                "Worker {} (runtime: {}) does not support GetTokenizer",
+                worker.url(),
+                runtime
+            );
+        } else {
+            warn!(
+                "Worker {} (runtime: {}) get_tokenizer failed: {}",
+                worker.url(),
+                runtime,
+                e
+            );
+        }
+        format!(
+            "worker {} (runtime: {runtime}) get_tokenizer failed: {e}",
+            worker.url(),
+        )
+    })?;
+    debug!(
+        "Tokenizer bundle validation passed for worker {}",
+        worker.url()
+    );
+
+    Ok(bundle)
+}
+
+/// The tokenizer of a bundle a worker served, loaded with the chat template;
+/// a multimodal configuration the bundle carries is registered under the
+/// tokenizer's id on the way.
+fn install_bundle(
+    app_context: &AppContext,
+    tokenizer_id: &str,
+    model_id: &str,
+    bundle: &StreamBundle,
+    chat_template_path: Option<&str>,
+) -> Result<Arc<dyn Tokenizer>, String> {
+    let (tokenizer, mm_config) = load_tokenizer_from_bundle(bundle, chat_template_path)?;
+    if let Some(cfg) = mm_config {
+        app_context
+            .multimodal_config_registry
+            .insert(tokenizer_id.to_string(), Arc::new(cfg));
+        info!(
+            tokenizer_id = %tokenizer_id,
+            tokenizer_name = %model_id,
+            "Preloaded multimodal config from GetTokenizer bundle"
+        );
+    }
+    Ok(tokenizer)
 }
 
 // ============================================================================
