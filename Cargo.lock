@@ -7926,6 +7926,7 @@ dependencies = [
  "http-body-util",
  "memchr",
  "metrics",
+ "metrics-exporter-prometheus",
  "multer",
  "once_cell",
  "openai-protocol",

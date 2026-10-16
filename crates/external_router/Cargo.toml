@@ -61,3 +61,6 @@ tracing.workspace = true
 url = "2.5.8"
 uuid = { workspace = true, features = ["serde"] }
 webpki-roots = { workspace = true }
+
+[dev-dependencies]
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }

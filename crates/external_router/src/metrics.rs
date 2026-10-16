@@ -242,6 +242,199 @@ pub mod metrics_labels {
     pub const ERROR_ENGINE: &str = "engine_error";
 }
 
+/// Per-thread caches of the handles the per-request records go through.
+///
+/// The `metrics` macros build a key on every call (the labels in a `Vec`,
+/// the hash) and search the recorder's registry for the series under one of
+/// its shard locks, after the dynamic labels were interned through shared
+/// maps. A request records a handful of metrics that way from whichever
+/// runtime worker is polling it, against the same few label sets, so at a
+/// thousand requests per second the interners' and the registry's locks are
+/// taken thousands of times per second from every worker. A handle the
+/// recorder hands out refers to the series' shared value, so each worker
+/// keeps the handles it has used in a map of its own and a record is a local
+/// lookup plus the atomic update of the value. The label sets are bounded
+/// (static values, the route templates, the capped model labels), and so is
+/// every map. Nothing is kept before the recorder is installed: a handle
+/// from the no-op recorder would be a dead end for the series.
+pub mod handles {
+    use std::{
+        cell::{Cell, RefCell},
+        collections::HashMap,
+        sync::atomic::{AtomicBool, Ordering},
+    };
+
+    use metrics::{Counter, Histogram};
+
+    use super::MAX_MODEL_LABELS;
+
+    static RECORDER_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+    /// The most handles one map keeps: the model labels the interner admits
+    /// and its sentinel. The other dynamic labels (route templates, status
+    /// codes, worker addresses) are far fewer. Past the cap a record builds
+    /// its handle and uses it without keeping it, so a flood of distinct
+    /// labels, which the interner collapses to its sentinel, cannot grow a
+    /// map.
+    pub const MAX_KEPT_PER_MAP: usize = MAX_MODEL_LABELS + 1;
+
+    /// The process's Prometheus recorder is installed: records keep their
+    /// handles from here on.
+    pub fn recorder_installed() {
+        RECORDER_INSTALLED.store(true, Ordering::Release);
+    }
+
+    /// Whether a record on this thread keeps the handle it builds.
+    pub fn keep_handles() -> bool {
+        FORCED
+            .get()
+            .unwrap_or_else(|| RECORDER_INSTALLED.load(Ordering::Acquire))
+    }
+
+    /// For tests: have the records of this thread keep their handles (or
+    /// build keys), whatever the installed flag says; `None` gives the flag
+    /// its say back. A handle kept under a test's local recorder belongs to
+    /// that recorder, so a test that forces keeping stays on its own thread
+    /// (the harness gives every test one) and its handles die with it.
+    pub fn force_on_this_thread(keep: Option<bool>) {
+        FORCED.set(keep);
+    }
+
+    /// Handles by a static label set, then by the model label.
+    pub type ByLabels<L, H> = HashMap<L, HashMap<String, H>>;
+
+    /// The static labels of `smg_router_requests_total`.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    pub(super) struct RequestLabels {
+        pub(super) router_type: &'static str,
+        pub(super) backend_type: &'static str,
+        pub(super) connection_mode: &'static str,
+        pub(super) endpoint: &'static str,
+        pub(super) streaming: &'static str,
+    }
+
+    /// The static labels of `smg_router_request_duration_seconds`.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    pub(super) struct DurationLabels {
+        pub(super) router_type: &'static str,
+        pub(super) backend_type: &'static str,
+        pub(super) connection_mode: &'static str,
+        pub(super) endpoint: &'static str,
+    }
+
+    thread_local! {
+        /// A test's say for this thread, over the installed flag.
+        static FORCED: Cell<Option<bool>> = const { Cell::new(None) };
+        /// `smg_router_requests_total`.
+        pub(super) static ROUTER_REQUESTS: RefCell<ByLabels<RequestLabels, Counter>> = RefCell::new(HashMap::new());
+        /// `smg_router_request_duration_seconds`.
+        pub(super) static ROUTER_DURATIONS: RefCell<ByLabels<DurationLabels, Histogram>> = RefCell::new(HashMap::new());
+    }
+
+    /// Uses the handle under `key`, building it on first sight and keeping
+    /// it while the map is under [`MAX_KEPT_PER_MAP`]. The key is only
+    /// allocated for a new entry.
+    pub fn with_handle<H>(
+        map: &mut HashMap<String, H>,
+        key: &str,
+        build: impl FnOnce() -> H,
+        use_handle: impl FnOnce(&H),
+    ) {
+        if let Some(handle) = map.get(key) {
+            use_handle(handle);
+            return;
+        }
+        let handle = build();
+        use_handle(&handle);
+        if map.len() < MAX_KEPT_PER_MAP {
+            map.insert(key.to_owned(), handle);
+        }
+    }
+
+    /// The inner map under `key`, created on first sight; the key is only
+    /// allocated for a new entry.
+    #[expect(
+        clippy::expect_used,
+        reason = "the key is inserted just above when missing"
+    )]
+    pub fn nested<'m, V: Default>(map: &'m mut HashMap<String, V>, key: &str) -> &'m mut V {
+        if !map.contains_key(key) {
+            map.insert(key.to_owned(), V::default());
+        }
+        map.get_mut(key).expect("inserted above")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::cell::Cell;
+
+        use super::*;
+
+        #[test]
+        fn a_handle_is_built_once_per_key_and_used_every_time() {
+            let mut map: HashMap<String, usize> = HashMap::new();
+            let builds = Cell::new(0);
+            let mut used = Vec::new();
+            for key in ["/a", "/a", "/b", "/a"] {
+                with_handle(
+                    &mut map,
+                    key,
+                    || {
+                        builds.set(builds.get() + 1);
+                        key.len() * 10
+                    },
+                    |handle| used.push(*handle),
+                );
+            }
+            assert_eq!(builds.get(), 2);
+            assert_eq!(map.len(), 2);
+            assert_eq!(used, [20, 20, 20, 20]);
+        }
+
+        #[test]
+        fn a_full_map_uses_a_new_handle_without_keeping_it() {
+            let mut map: HashMap<String, usize> = HashMap::new();
+            for i in 0..MAX_KEPT_PER_MAP {
+                with_handle(&mut map, &format!("m{i}"), || i, |_| {});
+            }
+            assert_eq!(map.len(), MAX_KEPT_PER_MAP);
+            let mut used = None;
+            with_handle(
+                &mut map,
+                "one-too-many",
+                || 7,
+                |handle| used = Some(*handle),
+            );
+            assert_eq!(used, Some(7));
+            assert_eq!(map.len(), MAX_KEPT_PER_MAP);
+            assert!(!map.contains_key("one-too-many"));
+            // A kept key is still found when the map is full.
+            with_handle(&mut map, "m3", || 99, |handle| used = Some(*handle));
+            assert_eq!(used, Some(3));
+        }
+
+        #[test]
+        fn a_nested_map_is_created_once() {
+            let mut map: HashMap<String, Vec<u8>> = HashMap::new();
+            nested(&mut map, "/a").push(1);
+            nested(&mut map, "/a").push(2);
+            assert_eq!(map.len(), 1);
+            assert_eq!(map["/a"], [1, 2]);
+        }
+
+        #[test]
+        fn the_forced_say_of_a_thread_outranks_the_installed_flag() {
+            assert!(!keep_handles());
+            force_on_this_thread(Some(true));
+            assert!(keep_handles());
+            force_on_this_thread(Some(false));
+            assert!(!keep_handles());
+            force_on_this_thread(None);
+            assert!(!keep_handles());
+        }
+    }
+}
+
 /// Recorders for the metrics a router emits.
 pub struct Metrics;
 
@@ -260,17 +453,37 @@ impl Metrics {
         endpoint: &'static str,
         streaming: &'static str,
     ) {
-        let model = intern_model_label(model_id);
-        counter!(
-            "smg_router_requests_total",
-            "router_type" => router_type,
-            "backend_type" => backend_type,
-            "connection_mode" => connection_mode,
-            "model" => model,
-            "endpoint" => endpoint,
-            "streaming" => streaming
-        )
-        .increment(1);
+        let build = || {
+            let model = intern_model_label(model_id);
+            counter!(
+                "smg_router_requests_total",
+                "router_type" => router_type,
+                "backend_type" => backend_type,
+                "connection_mode" => connection_mode,
+                "model" => model,
+                "endpoint" => endpoint,
+                "streaming" => streaming
+            )
+        };
+        if !handles::keep_handles() {
+            build().increment(1);
+            return;
+        }
+        let labels = handles::RequestLabels {
+            router_type,
+            backend_type,
+            connection_mode,
+            endpoint,
+            streaming,
+        };
+        handles::ROUTER_REQUESTS.with_borrow_mut(|by_labels| {
+            handles::with_handle(
+                by_labels.entry(labels).or_default(),
+                model_id,
+                build,
+                |counter| counter.increment(1),
+            );
+        });
     }
     /// Record router request duration.
     /// Uses string interning for model_id.
@@ -282,16 +495,36 @@ impl Metrics {
         endpoint: &'static str,
         duration: Duration,
     ) {
-        let model = intern_model_label(model_id);
-        histogram!(
-            "smg_router_request_duration_seconds",
-            "router_type" => router_type,
-            "backend_type" => backend_type,
-            "connection_mode" => connection_mode,
-            "model" => model,
-            "endpoint" => endpoint
-        )
-        .record(duration.as_secs_f64());
+        let build = || {
+            let model = intern_model_label(model_id);
+            histogram!(
+                "smg_router_request_duration_seconds",
+                "router_type" => router_type,
+                "backend_type" => backend_type,
+                "connection_mode" => connection_mode,
+                "model" => model,
+                "endpoint" => endpoint
+            )
+        };
+        let seconds = duration.as_secs_f64();
+        if !handles::keep_handles() {
+            build().record(seconds);
+            return;
+        }
+        let labels = handles::DurationLabels {
+            router_type,
+            backend_type,
+            connection_mode,
+            endpoint,
+        };
+        handles::ROUTER_DURATIONS.with_borrow_mut(|by_labels| {
+            handles::with_handle(
+                by_labels.entry(labels).or_default(),
+                model_id,
+                build,
+                |histogram| histogram.record(seconds),
+            );
+        });
     }
     /// Record a router error.
     /// Uses string interning for model_id.
@@ -405,7 +638,89 @@ impl Metrics {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
     use super::*;
+
+    /// The scrape of a recorder of its own after `records`, as series lines
+    /// (no `# HELP` or `# TYPE`), sorted.
+    fn series_after(records: &dyn Fn()) -> Vec<String> {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, records);
+        let mut series: Vec<String> = handle
+            .render()
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .map(str::to_owned)
+            .collect();
+        series.sort_unstable();
+        series
+    }
+
+    /// The request counter and the duration histogram recorded through
+    /// kept handles render exactly as with a key built per record, and one
+    /// handle is kept per label set and model.
+    #[test]
+    fn router_records_render_the_same_through_kept_handles() {
+        let records = || {
+            for streaming in [STREAMING_TRUE, STREAMING_FALSE, STREAMING_TRUE] {
+                Metrics::record_router_request(
+                    metrics_labels::ROUTER_GRPC,
+                    metrics_labels::BACKEND_REGULAR,
+                    metrics_labels::CONNECTION_GRPC,
+                    "m1",
+                    metrics_labels::ENDPOINT_CHAT,
+                    streaming,
+                );
+            }
+            Metrics::record_router_request(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                "m2",
+                metrics_labels::ENDPOINT_GENERATE,
+                STREAMING_FALSE,
+            );
+            for millis in [5, 7] {
+                Metrics::record_router_duration(
+                    metrics_labels::ROUTER_GRPC,
+                    metrics_labels::BACKEND_REGULAR,
+                    metrics_labels::CONNECTION_GRPC,
+                    "m1",
+                    metrics_labels::ENDPOINT_CHAT,
+                    Duration::from_millis(millis),
+                );
+            }
+        };
+        let built = series_after(&records);
+
+        handles::force_on_this_thread(Some(true));
+        let kept = series_after(&records);
+        let kept_counters = handles::ROUTER_REQUESTS
+            .with_borrow(|by_labels| by_labels.values().map(HashMap::len).sum::<usize>());
+        let kept_histograms = handles::ROUTER_DURATIONS
+            .with_borrow(|by_labels| by_labels.values().map(HashMap::len).sum::<usize>());
+        handles::force_on_this_thread(None);
+
+        assert_eq!(kept, built);
+        assert_eq!(kept_counters, 3, "a counter per label set and model");
+        assert_eq!(kept_histograms, 1, "a histogram per label set and model");
+        for expected in [
+            "smg_router_requests_total{router_type=\"grpc\",backend_type=\"regular\",connection_mode=\"grpc\",model=\"m1\",endpoint=\"chat\",streaming=\"true\"} 2",
+            "smg_router_requests_total{router_type=\"grpc\",backend_type=\"regular\",connection_mode=\"grpc\",model=\"m1\",endpoint=\"chat\",streaming=\"false\"} 1",
+            "smg_router_requests_total{router_type=\"http\",backend_type=\"regular\",connection_mode=\"http\",model=\"m2\",endpoint=\"generate\",streaming=\"false\"} 1",
+            "smg_router_request_duration_seconds_count{router_type=\"grpc\",backend_type=\"regular\",connection_mode=\"grpc\",model=\"m1\",endpoint=\"chat\"} 2",
+        ] {
+            assert!(
+                kept.iter().any(|line| line == expected),
+                "missing {expected} in:\n{}",
+                kept.join("\n")
+            );
+        }
+    }
 
     #[test]
     fn bounded_labels_cap_cardinality_with_a_sentinel() {
