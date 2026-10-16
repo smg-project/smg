@@ -1,7 +1,6 @@
 //! Muse Spark: the family's chat template writes one `<|patch|>` per image
-//! part and one `<|video|>` per video part (one `<|audio|>` per audio part,
-//! the audio arm of this spec), and the reference processor rewrites each in
-//! place:
+//! part, one `<|video|>` per video part and one `<|audio|>` per audio part,
+//! and the reference processor rewrites each in place:
 //!
 //! - an image as `<|image_start|>`, one `<|patch|>` per merged token,
 //!   `<|image_end|>`;
@@ -9,17 +8,26 @@
 //!   processor's `frame_timestamp_format`, `Time: {timestamp:.2f}s` on the
 //!   released checkpoints, of the group's first sampled frame's time) and one
 //!   `<|video|>` per merged token of the group, the groups separated by
-//!   `<|vid_frame_separator|>` and the last closed by `<|vid_end|>`.
+//!   `<|vid_frame_separator|>` and the last closed by `<|vid_end|>`;
+//! - an audio clip as `<|soft_audio_start|>`, one `<|audio|>` per token of
+//!   the clip (its padded samples over the samples per token), and
+//!   `<|soft_audio_end|>`.
 //!
 //! The anchor token of each modality is also its fill token, so every
 //! replacement declares its feature ranges. Images and frames travel as patch
-//! rows with per-item grids (see [`crate::vision::processors::muse_spark`]).
+//! rows with per-item grids (see [`crate::vision::processors::muse_spark`]);
+//! audio as the clip's padded samples, `[samples, 1]` rows flat over the
+//! batch (see [`crate::audio::processors::muse_spark`]).
 
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
 use crate::{
+    audio::{
+        AudioPreProcessor, MuseSparkAudioConfigError, MuseSparkAudioProcessor,
+        MUSE_SPARK_SAMPLES_PER_AUDIO_KEY,
+    },
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     media::FrameSampling,
     registry::{
@@ -43,6 +51,8 @@ const IMAGE_END: &str = "<|image_end|>";
 const VIDEO_START: &str = "<|vid_start|>";
 const VIDEO_END: &str = "<|vid_end|>";
 const VIDEO_SEPARATOR: &str = "<|vid_frame_separator|>";
+const AUDIO_START: &str = "<|soft_audio_start|>";
+const AUDIO_END: &str = "<|soft_audio_end|>";
 /// The reference video processor class's frame budget (`num_frames`); the
 /// released checkpoints raise it in their processor config.
 const DEFAULT_VIDEO_FRAMES: usize = 96;
@@ -56,6 +66,8 @@ const DEFAULT_FRAME_TIMESTAMP_FORMAT: &str = "Time: {timestamp:.1f}s";
 const MAX_IMAGES_PER_REQUEST: usize = 10;
 /// Videos per request (`SMG_VIDEO_MAX_COUNT`).
 const MAX_VIDEOS_PER_REQUEST: usize = 1;
+/// Audio clips per request (`SMG_AUDIO_MAX_COUNT`).
+const MAX_AUDIOS_PER_REQUEST: usize = 10;
 
 pub(super) struct MuseSparkSpec;
 
@@ -94,6 +106,52 @@ impl MuseSparkSpec {
             });
         }
         Ok(&preprocessed.feature_token_counts)
+    }
+
+    /// The checkpoint ships the audio tower: an `audio_config` and the token
+    /// its prompts carry per audio sample run.
+    fn has_audio_tower(config: &Value) -> bool {
+        config.get("audio_config").is_some_and(|c| !c.is_null())
+            && config.get("audio_token_id").is_some_and(|c| !c.is_null())
+    }
+
+    fn audio_config_error(error: MuseSparkAudioConfigError) -> ModelRegistryError {
+        match error {
+            MuseSparkAudioConfigError::Invalid { field, reason } => {
+                ModelRegistryError::InvalidConfigField { field, reason }
+            }
+        }
+    }
+
+    /// One replacement per clip: `<|soft_audio_start|>`, one `<|audio|>` per
+    /// token, `<|soft_audio_end|>`, the tokens between them as the feature
+    /// span.
+    fn audio_replacements(
+        metadata: &ModelMetadata,
+        preprocessed: &PreprocessedEncoderInputs,
+    ) -> RegistryResult<Vec<PromptReplacement>> {
+        let placeholder = Self::token_for(metadata, "audio_token_id")?;
+        let audio = Self::config_token_id(metadata, "audio_token_id")?;
+        let start = metadata.token_id(AUDIO_START)?;
+        let end = metadata.token_id(AUDIO_END)?;
+        Self::token_counts(preprocessed)?
+            .iter()
+            .map(|&count| {
+                if count == 0 {
+                    return Err(ModelRegistryError::InvalidPreprocessedField {
+                        field: "feature_token_counts".to_string(),
+                    });
+                }
+                let mut tokens = Vec::with_capacity(count + 2);
+                tokens.push(start);
+                tokens.extend(std::iter::repeat_n(audio, count));
+                tokens.push(end);
+                Ok(
+                    PromptReplacement::sequence(Modality::Audio, &placeholder, tokens)
+                        .with_feature_span(1, count),
+                )
+            })
+            .collect()
     }
 
     /// One replacement per image: `<|image_start|>`, one `<|patch|>` per
@@ -321,7 +379,9 @@ impl ModelProcessorSpec for MuseSparkSpec {
 
     /// Images and frames travel as `[patches, features]` rows flat over the
     /// batch, sliced per item by `patches_per_image` / `patches_per_video`,
-    /// with one `[t, h, w]` grid row per item, kept on the CPU.
+    /// with one `[t, h, w]` grid row per item, kept on the CPU; audio as the
+    /// clip's padded samples, `[samples, 1]` rows flat over the batch and
+    /// sliced per clip by `samples_per_audio`.
     fn hooks(&self, modality: Modality) -> Option<ModalityHooks> {
         match modality {
             Modality::Image => Some(ModalityHooks {
@@ -360,7 +420,26 @@ impl ModelProcessorSpec for MuseSparkSpec {
                 encoder_input_key: None,
                 worker_expandable: false,
             }),
-            Modality::Audio | Modality::ImageEmbeds => None,
+            Modality::Audio => Some(ModalityHooks {
+                placeholder: |metadata| Self::token_for(metadata, "audio_token_id"),
+                placeholder_id: |metadata| Self::config_token_id(metadata, "audio_token_id"),
+                replacements: |metadata, preprocessed, _, _| {
+                    Self::audio_replacements(metadata, preprocessed)
+                },
+                layouts: || {
+                    EncoderFieldLayouts::new(
+                        FieldLayout::flat(MUSE_SPARK_SAMPLES_PER_AUDIO_KEY),
+                        HashMap::from([(
+                            MUSE_SPARK_SAMPLES_PER_AUDIO_KEY.to_string(),
+                            FieldLayout::Batched,
+                        )]),
+                    )
+                },
+                keep_on_cpu: &[],
+                encoder_input_key: None,
+                worker_expandable: false,
+            }),
+            Modality::ImageEmbeds => None,
         }
     }
 
@@ -383,11 +462,29 @@ impl ModelProcessorSpec for MuseSparkSpec {
         if metadata.config_u32(&["video_token_id"]).is_some() {
             limits.insert(Modality::Video, MAX_VIDEOS_PER_REQUEST);
         }
+        if Self::has_audio_tower(metadata.config) {
+            limits.insert(Modality::Audio, MAX_AUDIOS_PER_REQUEST);
+        }
         Ok(limits)
     }
 
     fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
         Ok(json!({}))
+    }
+
+    /// No audio tower is a model without audio; a tower whose geometry the
+    /// processor cannot serve is an error naming the field.
+    fn audio_processor(
+        &self,
+        model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+    ) -> RegistryResult<Option<Box<dyn AudioPreProcessor>>> {
+        if !Self::has_audio_tower(model_config) {
+            return Ok(None);
+        }
+        let processor = MuseSparkAudioProcessor::from_configs(model_config, preprocessor_config)
+            .map_err(Self::audio_config_error)?;
+        Ok(Some(Box::new(processor)))
     }
 
     fn prompt_replacements(
@@ -467,6 +564,9 @@ mod tests {
     const VIDEO_START_ID: u32 = 200_082;
     const VIDEO_END_ID: u32 = 200_083;
     const VIDEO_SEPARATOR_ID: u32 = 200_087;
+    const AUDIO_ID: u32 = 200_038;
+    const AUDIO_START_ID: u32 = 201_463;
+    const AUDIO_END_ID: u32 = 201_464;
     /// Where the byte-encoding test tokenizer puts plain text.
     const TEXT_BASE: u32 = 1000;
 
@@ -474,11 +574,14 @@ mod tests {
         TestTokenizer::new(&[
             ("<|patch|>", PATCH_ID),
             ("<|video|>", VIDEO_ID),
+            ("<|audio|>", AUDIO_ID),
             (IMAGE_START, IMAGE_START_ID),
             (IMAGE_END, IMAGE_END_ID),
             (VIDEO_START, VIDEO_START_ID),
             (VIDEO_END, VIDEO_END_ID),
             (VIDEO_SEPARATOR, VIDEO_SEPARATOR_ID),
+            (AUDIO_START, AUDIO_START_ID),
+            (AUDIO_END, AUDIO_END_ID),
         ])
         .with_byte_encoder(TEXT_BASE)
     }
@@ -489,6 +592,8 @@ mod tests {
             "architectures": ["MuseSparkForConditionalGeneration"],
             "image_token_id": PATCH_ID,
             "video_token_id": VIDEO_ID,
+            "audio_token_id": AUDIO_ID,
+            "audio_config": {"model_type": "muse_spark_audio", "patch_sizes": [16, 6, 5, 4]},
         })
     }
 
@@ -874,8 +979,152 @@ mod tests {
             Err(ModelRegistryError::InvalidPreprocessedField { .. })
         ));
         assert!(matches!(
-            MuseSparkSpec.prompt_replacements_for(&metadata, &no_grid, Modality::Audio),
+            MuseSparkSpec.prompt_replacements_for(&metadata, &no_grid, Modality::ImageEmbeds),
             Err(ModelRegistryError::UnsupportedModality { .. })
         ));
+    }
+
+    #[test]
+    fn audio_replacements_wrap_the_token_run_in_the_soft_delimiters() {
+        let tokenizer = tokenizer();
+        let config = config();
+        let metadata = metadata(&tokenizer, &config);
+        let spec = MuseSparkSpec;
+        assert_eq!(
+            spec.placeholder_token_for(&metadata, Modality::Audio)
+                .unwrap(),
+            "<|audio|>"
+        );
+        assert_eq!(
+            spec.placeholder_token_id_for(&metadata, Modality::Audio)
+                .unwrap(),
+            AUDIO_ID as TokenId
+        );
+        assert!(!spec.worker_expandable(Modality::Audio));
+        let replacements = spec
+            .prompt_replacements_for(
+                &metadata,
+                &test_preprocessed_with_tokens(
+                    &[ImageSize::new(1, 1), ImageSize::new(1, 1)],
+                    &[3, 1],
+                ),
+                Modality::Audio,
+            )
+            .unwrap();
+        assert_eq!(replacements.len(), 2);
+        assert_eq!(replacements[0].placeholder_token, "<|audio|>");
+        assert_eq!(
+            replacements[0].tokens,
+            vec![
+                AUDIO_START_ID as TokenId,
+                AUDIO_ID as TokenId,
+                AUDIO_ID as TokenId,
+                AUDIO_ID as TokenId,
+                AUDIO_END_ID as TokenId
+            ]
+        );
+        assert_eq!(
+            replacements[0].feature_ranges,
+            Some(vec![PlaceholderRange {
+                offset: 1,
+                length: 3
+            }])
+        );
+        assert_eq!(
+            replacements[1].tokens,
+            vec![
+                AUDIO_START_ID as TokenId,
+                AUDIO_ID as TokenId,
+                AUDIO_END_ID as TokenId
+            ]
+        );
+        let layouts = spec.encoder_field_layouts_for(Modality::Audio);
+        assert_eq!(
+            layouts.encoder_input,
+            FieldLayout::flat(MUSE_SPARK_SAMPLES_PER_AUDIO_KEY)
+        );
+        assert_eq!(
+            layouts.model_specific,
+            HashMap::from([(
+                MUSE_SPARK_SAMPLES_PER_AUDIO_KEY.to_string(),
+                FieldLayout::Batched
+            )])
+        );
+        assert!(spec.keep_on_cpu_keys_for(Modality::Audio).is_empty());
+        let bare = TestTokenizer::new(&[("<|audio|>", AUDIO_ID)]);
+        let metadata = self::metadata(&bare, &config);
+        assert_eq!(
+            spec.prompt_replacements_for(
+                &metadata,
+                &test_preprocessed_with_tokens(&[ImageSize::new(1, 1)], &[1]),
+                Modality::Audio
+            )
+            .unwrap_err(),
+            ModelRegistryError::TokenNotFound {
+                token: AUDIO_START.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn audio_is_served_only_with_the_tower_and_its_processor_follows_the_configs() {
+        use std::sync::Arc;
+
+        use bytes::Bytes;
+
+        use crate::{
+            audio::DecodedAudio,
+            types::{AudioClip, AudioSource},
+        };
+
+        let tokenizer = tokenizer();
+        let config = config();
+        let spec = MuseSparkSpec;
+        let limits = spec
+            .modality_limits(&metadata(&tokenizer, &config))
+            .unwrap();
+        assert_eq!(limits.get(&Modality::Audio), Some(&MAX_AUDIOS_PER_REQUEST));
+        let without_tower = json!({
+            "model_type": "muse_spark",
+            "image_token_id": PATCH_ID,
+            "audio_token_id": AUDIO_ID,
+        });
+        assert!(!spec
+            .modality_limits(&metadata(&tokenizer, &without_tower))
+            .unwrap()
+            .contains_key(&Modality::Audio));
+
+        let default = PreProcessorConfig::default();
+        let processor = spec
+            .audio_processor(&config, &default)
+            .unwrap()
+            .expect("a checkpoint with an audio tower has an audio processor");
+        let clip = Arc::new(AudioClip::new(
+            Bytes::from_static(b"audio"),
+            DecodedAudio {
+                samples: vec![0.5; 1_921],
+                sample_rate: 24_000,
+            },
+            AudioSource::InlineBytes,
+            "audio-hash".to_string(),
+        ));
+        let output = processor.preprocess(&[clip]).unwrap();
+        assert_eq!(output.feature_token_counts, vec![2]);
+        assert_eq!(output.encoder_input.shape(), &[2 * 1_920, 1]);
+        assert!(spec
+            .audio_processor(&without_tower, &default)
+            .unwrap()
+            .is_none());
+
+        let extractor =
+            PreProcessorConfig::from_json(r#"{"samples_per_token": 1600, "sampling_rate": 24000}"#)
+                .unwrap();
+        match spec.audio_processor(&config, &extractor) {
+            Err(ModelRegistryError::InvalidConfigField { field, .. }) => {
+                assert_eq!(field, "samples_per_token");
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("a disagreeing samples_per_token must be refused"),
+        }
     }
 }
