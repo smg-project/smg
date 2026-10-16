@@ -146,7 +146,6 @@ def dummy_media(processor, modality: str) -> list:
     return list(items) if isinstance(items, (list, tuple)) else [items]
 
 
-
 def apply_processor(processor, prompt_ids: list[int], mm_data: dict):
     """Run the processor over token ids plus media on either processing API.
 
@@ -159,13 +158,15 @@ def apply_processor(processor, prompt_ids: list[int], mm_data: dict):
     from vllm.multimodal.processing.context import TimingContext
     from vllm.multimodal.processing.inputs import ProcessorInputs
 
+    # Only the two fields every version has: the kwargs fields default to empty
+    # mappings where they exist, and `media_io_kwargs` is newer than the
+    # `inputs` form of `apply` (absent on the versions in between).
     inputs = ProcessorInputs(
         prompt=prompt_ids,
         mm_data_items=processor.data_parser.parse_mm_data(mm_data),
-        hf_processor_mm_kwargs={},
-        media_io_kwargs={},
     )
     return processor.apply(inputs, TimingContext(enabled=False))
+
 
 def check(model_key: str, model_id: str, trust_remote_code: bool) -> list[Outcome]:
     from transformers import AutoConfig
@@ -190,7 +191,9 @@ def check(model_key: str, model_id: str, trust_remote_code: bool) -> list[Outcom
             continue
         prompt_ids = prefix + [anchor_id] + suffix
         try:
-            result = apply_processor(processor, prompt_ids, {modality: dummy_media(processor, modality)})
+            result = apply_processor(
+                processor, prompt_ids, {modality: dummy_media(processor, modality)}
+            )
         except Exception as e:  # noqa: BLE001 - any processor failure is a parity failure
             outcomes.append(
                 Outcome(
