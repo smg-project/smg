@@ -1296,6 +1296,88 @@ async fn chat_role_chunk_goes_out_on_the_first_engine_output() {
     server.abort();
 }
 
+/// Per choice, the role and finish reason of each of its deltas, in stream
+/// order.
+fn choice_trail(events: &[Value], index: u32) -> Vec<(Option<&str>, Option<&str>)> {
+    events
+        .iter()
+        .filter_map(|event| {
+            let choice = event["choices"].get(0)?;
+            (choice["index"] == index).then(|| {
+                (
+                    choice["delta"]["role"].as_str(),
+                    choice["finish_reason"].as_str(),
+                )
+            })
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn chat_lone_complete_opens_the_choice_before_its_finish() {
+    // The engine's only output for the choice is its Complete (a completion
+    // with no tokens): the role chunk still opens the choice and the finish
+    // chunk ends it, as when a first Chunk opens it.
+    let (result, events) = chat_events(vec![complete(0, "stop")], false, "0").await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        choice_trail(&events, 0),
+        vec![(Some("assistant"), None), (None, Some("stop"))],
+        "{events:?}"
+    );
+    assert_eq!(chat_text(&events, 0, "content"), "");
+}
+
+#[tokio::test]
+async fn chat_lone_complete_opens_its_choice_among_others() {
+    // One of two choices produces no tokens: its Complete opens it, the other
+    // choice's stream is as before, and no choice gets its role twice.
+    let (result, events) = chat_events(
+        vec![chunk(0, "hi"), complete(0, "stop"), complete(1, "stop")],
+        false,
+        "0",
+    )
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        choice_trail(&events, 1),
+        vec![(Some("assistant"), None), (None, Some("stop"))],
+        "{events:?}"
+    );
+    let trail = choice_trail(&events, 0);
+    assert_eq!(
+        trail.first(),
+        Some(&(Some("assistant"), None)),
+        "{events:?}"
+    );
+    assert_eq!(trail.last(), Some(&(None, Some("stop"))), "{events:?}");
+    assert_eq!(trail.iter().filter(|(role, _)| role.is_some()).count(), 1);
+    assert_eq!(chat_text(&events, 0, "content"), "hi");
+    assert_eq!(chat_text(&events, 1, "content"), "");
+}
+
+#[tokio::test]
+async fn chat_lone_complete_role_chunk_reports_the_completes_usage() {
+    // With continuous usage, the role chunk a lone Complete opens the choice
+    // with carries the Complete's counts, as a first Chunk's carries that
+    // chunk's: the prompt is known by the time the choice opens.
+    let request = serde_json::json!({
+        "model": "eof-test", "messages": [], "stream": true,
+        "stream_options": {"include_usage": true, "continuous_usage_stats": true}
+    });
+    let spec = ChatResponseSpec::from(
+        &serde_json::from_value::<ChatCompletionRequest>(request).expect("chat request"),
+    );
+    let (result, events) =
+        chat_events_with_spec(vec![complete_with_prompt(0, "stop", 7)], false, spec, "0").await;
+    assert!(result.is_ok(), "{result:?}");
+    let role_chunk = events
+        .iter()
+        .find(|event| event["choices"][0]["delta"]["role"] == "assistant")
+        .expect("the role chunk");
+    assert_eq!(role_chunk["usage"]["prompt_tokens"], 7, "{events:?}");
+}
+
 #[tokio::test]
 async fn chat_eof_preserves_reasoning_and_normal_tails_per_choice() {
     for send_complete in [true, false] {

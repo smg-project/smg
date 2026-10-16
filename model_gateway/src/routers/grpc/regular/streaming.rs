@@ -750,6 +750,35 @@ impl StreamingProcessor {
                         usage.record_complete(&complete);
                     }
 
+                    // A choice's first engine output may be its Complete (a
+                    // completion with no tokens: a finish that carries none
+                    // comes without a Chunk). It opens the choice as a first
+                    // Chunk does, the role chunk before the finish chunk, and
+                    // records the stream's first-token time; its usage, as a
+                    // first Chunk's, counts the output it rides on.
+                    if first_token_time.is_none() {
+                        first_token_time = Some(Instant::now());
+                        if let Some(timing) = &pd_timing {
+                            timing.record_first_decode_token(self.backend_type, model);
+                        }
+                    }
+                    if is_firsts.get(&index).copied().unwrap_or(true) {
+                        let usage = continuous_usage.as_ref().map(|tracker| {
+                            tracker.snapshot(original_request.unbilled_prompt_tokens)
+                        });
+                        Self::send_role_chunk(
+                            tx,
+                            &mut sse_buffer,
+                            &chunk_frame,
+                            index,
+                            opens_tool_call,
+                            usage.as_ref(),
+                            emit_usage_null,
+                        )
+                        .await?;
+                        is_firsts.insert(index, false);
+                    }
+
                     cached_tokens.insert(index, complete.cached_tokens());
                     reasoning_tokens.insert(index, complete.reasoning_tokens());
                     spec_accepted.insert(index, complete.spec_accepted_tokens());
