@@ -64,6 +64,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     servicer_switch,
 )
 from smg_grpc_servicer.vllm.config_view import EngineConfigView
+from smg_grpc_servicer.vllm.launcher_switch import SUPPORTED_VLLM_RELEASES
 from smg_grpc_servicer.vllm.media_refs import FETCHABLE_MODALITIES
 from smg_grpc_servicer.vllm.model_info import (
     constrained_decoding_start,
@@ -584,9 +585,11 @@ def require_python_impl(environ: Mapping[str, str] | None = None) -> None:
         raise RuntimeError(
             f"{SERVICER_IMPL_ENV}={impl}, but this process is starting the Python "
             "servicer: the switch this package installs over vLLM's gRPC launcher "
-            "never ran (a launcher executed directly as __main__, or one that did "
-            "not import smg_grpc_servicer.vllm.servicer before defining serve_grpc). "
-            "Start through `vllm serve <model> --grpc`, or unset the flag; a silent "
+            "never ran (a launcher run as a file path or with this package's plugin "
+            "left out of VLLM_PLUGINS, or one that did not import "
+            "smg_grpc_servicer.vllm.servicer before defining serve_grpc). Start "
+            "through `vllm serve <model> --grpc` or `python -m` on the launcher "
+            f"module (vLLM {SUPPORTED_VLLM_RELEASES}), or unset the flag; a silent "
             "Python fallback would report Rust coverage that never ran."
         )
 

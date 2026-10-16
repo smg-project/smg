@@ -162,12 +162,13 @@ Router cannot tell the two apart.
 vllm serve Qwen/Qwen3-0.6B --grpc --port 50051
 
 # Rust request path, same entrypoint. The flag is this package's: vLLM loads
-# it as a general plugin while it builds the parser (smg_grpc_servicer/vllm/plugin.py).
+# it as a general plugin while it builds the parser (smg_grpc_servicer/vllm/plugin.py);
+# the stock launcher's own parser (`python -m` below) takes it too.
 vllm serve Qwen/Qwen3-0.6B --grpc --port 50051 --servicer-impl rust
 
-# The environment form works for the import-based entrypoints too (`vllm serve --grpc`,
-# the deprecated `python -m vllm.entrypoints.grpc_server`); a launcher file executed
-# directly as __main__ is not switched and refuses the flag instead.
+# The environment form, as a deployment sets it, works for every entry: `vllm serve --grpc`,
+# and `python -m` on the launcher module (`vllm.entrypoints.grpc_server` is the launcher itself
+# on vLLM 0.28 and 0.29, and from 0.30 a shim importing `vllm.entrypoints.launchers.grpc_server`).
 SMG_VLLM_SERVICER_IMPL=rust python -m vllm.entrypoints.grpc_server --model Qwen/Qwen3-0.6B --port 50051
 ```
 
@@ -179,6 +180,45 @@ from smg_grpc_servicer.vllm import resolve_servicer_impl, serve_rust
 
 if resolve_servicer_impl(args) == "rust":
     raise SystemExit(await serve_rust(args))
+```
+
+##### Supported vLLM releases
+
+The switch binds `serve_grpc` in the launcher module of the installed release
+(`launcher_switch.LAUNCHERS`, newest first):
+
+| vLLM | launcher module | what `python -m vllm.entrypoints.grpc_server` runs |
+|---|---|---|
+| 0.30 and later | `vllm.entrypoints.launchers.grpc_server` | a shim importing the launcher, which is bound as it loads |
+| 0.28 and 0.29 | `vllm.entrypoints.grpc_server` | the launcher itself, as `__main__` |
+
+Verified on 0.28 through 0.31 (`launcher_switch.SUPPORTED_VLLM_RELEASES`),
+for every entry. `vllm serve <model> --grpc` imports the launcher under its
+name after the parse, and the import-time hook (or the finder) binds it.
+`python -m` on the launcher module itself runs it as `__main__`, where no
+import hook reaches it, so it is bound in its own namespace from the two
+moments this package runs inside the launcher's `main()` once `serve_grpc`
+exists: vLLM loads the plugin while the launcher builds its parser
+(`AsyncEngineArgs.add_cli_args`), and the plugin's parse step runs on the
+launcher's own parse. A main-branch build between two releases carries the
+next release's layout under the earlier version; the binding goes by what is
+loaded, never by the version. A launcher run as a file path, or with the
+plugin left out of `VLLM_PLUGINS`, is not reached; the Python servicer then
+refuses the flag with one line.
+
+The CPU smoke behind that table (`scripts/launcher_switch_smoke.py`) runs each
+launcher through to the servicer construction against a stub engine, in a
+fresh interpreter per case, and checks that Rust takes the process before any
+engine exists and that the Python default still constructs the servicer:
+
+```bash
+# The vendored upstream launchers (tests/launchers/, one per layout); no vLLM needed.
+pytest -q grpc_servicer/tests/test_vllm_launcher_switch_main.py
+# A launcher tree extracted from a wheel (vllm/entrypoints/**/grpc_server.py), the rest stubbed.
+python -I grpc_servicer/scripts/launcher_switch_smoke.py --launcher-tree <dir> --servicer-root grpc_servicer
+# The installed vLLM (a CPU-only container with the engine image is enough): its real launcher,
+# CLI, parser and plugin loading, with only the engine stubbed; no model is read.
+python -I grpc_servicer/scripts/launcher_switch_smoke.py --installed
 ```
 
 `smg serve --backend vllm --connection-mode grpc --servicer-impl rust` sets

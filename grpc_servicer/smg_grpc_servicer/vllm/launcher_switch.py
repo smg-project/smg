@@ -1,13 +1,13 @@
 """The servicer switch, installed into vLLM's gRPC launcher by the launcher's
 own import of this package.
 
-vLLM's launcher (``vllm/entrypoints/launchers/grpc_server.py``, behind
-``vllm serve --grpc`` and ``python -m vllm.entrypoints.grpc_server``) imports
-this package's servicer classes at module level, then defines ``serve_grpc``,
-which builds an AsyncLLM before it instantiates them. The Rust path has to
-take the process before that engine exists, so the switch must run ahead of
-``serve_grpc``; the launcher's import of this package is the first moment this
-package runs inside it, and :func:`install_launcher_switch` uses that moment.
+vLLM's launcher (one of :data:`LAUNCHERS`, behind ``vllm serve --grpc`` and
+``python -m`` on the launcher module) imports this package's servicer
+classes at module level, then defines ``serve_grpc``, which builds an
+AsyncLLM before it instantiates them. The Rust path has to take the process
+before that engine exists, so the switch must run ahead of ``serve_grpc``;
+the launcher's import of this package is the first moment this package runs
+inside it, and :func:`install_launcher_switch` uses that moment.
 
 The launcher module is mid-import then (``serve_grpc`` not yet defined), so
 its class is swapped for a ``ModuleType`` subclass whose first attribute
@@ -18,26 +18,100 @@ in-source hook would carry, with the launcher's own ``args``. The launcher's
 ``main()`` reads the rebound name from its globals, so every documented entry
 runs the switch. A launcher imported after this package (something imported
 the servicer first, or a launcher that imports it lazily) is caught by a
-meta-path finder that binds the switch as the launcher loads. A launcher file
-executed directly as ``__main__`` is the one form neither reaches; there the
-Python servicer refuses the flag loudly
+meta-path finder that binds the switch as the launcher loads.
+
+``python -m`` on the launcher module itself runs it as ``__main__``, where it
+is never in ``sys.modules`` under its name: on 0.28 and 0.29 that is what
+``python -m vllm.entrypoints.grpc_server`` does (from 0.30 the same command
+runs a shim whose import of the launcher the finder catches). That launcher
+is bound in its ``__main__`` namespace instead, from the two moments this
+package runs inside its ``main()`` after the body defined ``serve_grpc``:
+vLLM loads this package's plugin while the launcher builds its parser
+(``AsyncEngineArgs.add_cli_args``), and the plugin's parse step runs on the
+launcher's own parse; both call :func:`install_launcher_switch`, and
+``main()`` reads the rebound name right after. A launcher run as a file path
+(no module spec), or with the plugin left out of ``VLLM_PLUGINS``, is the one
+form nothing reaches; there the Python servicer refuses the flag loudly
 (:func:`smg_grpc_servicer.vllm.rust.require_python_impl`).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import importlib.abc
+import re
 import sys
 import types
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-LAUNCHER_MODULES = (
-    "vllm.entrypoints.launchers.grpc_server",
-    "vllm.entrypoints.grpc_server",
+
+@dataclasses.dataclass(frozen=True)
+class LauncherModule:
+    """One layout of vLLM's gRPC launcher: the module that defines the
+    coroutine the switch binds (and runs ``main()`` under ``python -m``), and
+    the releases that ship it there."""
+
+    name: str
+    """The module's dotted name."""
+    releases: str
+    """The releases whose launcher this is, as the docs name them."""
+    floor: tuple[int, int]
+    """The first release (major, minor) with this layout."""
+
+
+# The launchers the switch binds, newest layout first. From 0.30 the old
+# name is a shim that imports ``main`` and ``serve_grpc`` from the new module,
+# so the deprecated ``python -m vllm.entrypoints.grpc_server`` keeps working
+# there (the shim is ``__main__``, the import it does is bound as it loads). A
+# main-branch build between two releases carries the next release's layout
+# under the earlier release's version, so the switch binds by what is loaded,
+# never by the version; the releases here are for the docs and the messages
+# (:func:`launcher_for_release`).
+LAUNCHERS = (
+    LauncherModule("vllm.entrypoints.launchers.grpc_server", "0.30 and later", (0, 30)),
+    LauncherModule("vllm.entrypoints.grpc_server", "0.28 and 0.29", (0, 28)),
 )
+LAUNCHER_MODULES = tuple(launcher.name for launcher in LAUNCHERS)
+# The launcher's coroutine the switch binds over.
+HOOK_ATTRIBUTE = "serve_grpc"
+# The releases the binding is verified on, every layout and entry form, by
+# the CPU smoke (``grpc_servicer/scripts/launcher_switch_smoke.py``): the
+# table's floor through the newest release checked. The hook points are the
+# same in all of them: the servicer classes imported at module level, then
+# ``async def serve_grpc(args)``, then a ``main()`` that builds the parser
+# with ``AsyncEngineArgs.add_cli_args`` (which loads this package's plugin),
+# parses, and runs ``serve_grpc(args)``.
+SUPPORTED_VLLM_RELEASES = "0.28 through 0.31"
 _SWITCH_MARK = "__smg_servicer_switch__"
+_RELEASE = re.compile(r"^\s*v?(\d+)\.(\d+)")
+
+
+def launcher_for_release(version: str | None) -> LauncherModule | None:
+    """The launcher a vLLM *release* of this version ships, by the table:
+    the newest layout whose floor the version reaches; ``None`` below the
+    table's floor or for a version that does not parse. A main-branch build
+    (``0.29.1rc1.devN+g...``) may already carry the next release's layout:
+    this is what the release notes say, not what is installed."""
+    match = _RELEASE.match(version or "")
+    if match is None:
+        return None
+    release = (int(match.group(1)), int(match.group(2)))
+    for launcher in LAUNCHERS:
+        if release >= launcher.floor:
+            return launcher
+    return None
+
+
+def supported_launchers() -> str:
+    """The launchers the switch binds, for a message: each module with its
+    releases, and the releases the binding is verified on."""
+    layouts = ", ".join(f"{launcher.name} ({launcher.releases})" for launcher in LAUNCHERS)
+    return (
+        f"the switch binds the {HOOK_ATTRIBUTE} of {layouts}, imported under that name or run as "
+        f"__main__ by `python -m` (vLLM {SUPPORTED_VLLM_RELEASES} checked)"
+    )
 
 
 def with_servicer_switch(
@@ -72,9 +146,13 @@ def with_servicer_switch(
 
 
 def _rebind(namespace: dict[str, Any]) -> None:
-    serve_grpc = namespace.get("serve_grpc")
+    serve_grpc = namespace.get(HOOK_ATTRIBUTE)
     if callable(serve_grpc) and not getattr(serve_grpc, _SWITCH_MARK, False):
-        namespace["serve_grpc"] = with_servicer_switch(serve_grpc)
+        namespace[HOOK_ATTRIBUTE] = with_servicer_switch(serve_grpc)
+
+
+def _bound(namespace: dict[str, Any]) -> bool:
+    return bool(getattr(namespace.get(HOOK_ATTRIBUTE), _SWITCH_MARK, False))
 
 
 class _SwitchedLauncher(types.ModuleType):
@@ -124,12 +202,25 @@ class _LauncherFinder(importlib.abc.MetaPathFinder):
         return None
 
 
+def launcher_main() -> Any | None:
+    """The launcher when it is this process's ``__main__``: ``python -m`` on
+    the launcher module itself, which runpy names in ``__main__.__spec__``
+    (the real module on 0.28 and 0.29, where the deprecated command is not a
+    shim; the 0.30+ module run by its own name). ``None`` for any other
+    ``__main__``: the ``vllm`` console script, the shim, a file path."""
+    main = sys.modules.get("__main__")
+    name = getattr(getattr(main, "__spec__", None), "name", None)
+    return main if name in LAUNCHER_MODULES else None
+
+
 def install_launcher_switch() -> list[str]:
     """Hook every launcher module that is importing or imported, and arrange
     for one imported later (this package imported first, or a launcher that
-    imports it lazily) to be hooked as it loads. Idempotent; returns the names
-    hooked now. A module another extension already replaced with its own
-    class is left alone."""
+    imports it lazily) to be hooked as it loads; bind a launcher running as
+    ``__main__`` in its namespace once its body defined ``serve_grpc``.
+    Idempotent; returns the names hooked now (``"__main__"`` for the
+    launcher run by ``python -m``). A module another extension already
+    replaced with its own class is left alone."""
     if not any(isinstance(finder, _LauncherFinder) for finder in sys.meta_path):
         sys.meta_path.insert(0, _LauncherFinder())
     hooked: list[str] = []
@@ -145,4 +236,15 @@ def install_launcher_switch() -> list[str]:
         _rebind(vars(module))
         module.__class__ = _SwitchedLauncher
         hooked.append(name)
+    # The launcher as __main__: its main() reads serve_grpc from this dict
+    # (not through the module object), so the dict is rebound, from the calls
+    # that run inside main(): the plugin's load and its parse step. Mid-body
+    # (the servicer import) there is nothing to bind yet; nothing is left
+    # hooked, the next call binds.
+    main = launcher_main()
+    if main is not None:
+        namespace = vars(main)
+        _rebind(namespace)
+        if _bound(namespace):
+            hooked.append("__main__")
     return hooked
