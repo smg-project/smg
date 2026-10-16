@@ -210,11 +210,12 @@ impl Arguments {
 
     /// The bytes that arrived since the last call: a fragment for the part that keeps the
     /// arguments a valid JSON prefix, malformed text for the rest, once the prefix has broken.
-    /// While the object is `open`, a word under way at the end of the bytes (`nu`, so far a
-    /// prefix of `null`) is held: the judge refuses a word that turns out to be no literal from
-    /// its first letter, and a fragment passed on cannot be taken back, so the pieces would say
-    /// `n` where the whole says nothing. It is sent once the next bytes spell it on or end it,
-    /// with the object's close, or when no more bytes can come ([`Self::finish`]).
+    /// While the object is `open`, bytes the judge may still go back to (a word being spelled,
+    /// `nu`; a surrogate escape awaiting its low half; a top-level string, which the parser
+    /// refuses whole when a surrogate inside it breaks) are held: a fragment passed on cannot be
+    /// taken back, so the pieces would say `n` where the whole says nothing. They are sent once
+    /// the next bytes settle them, with the object's close, or when no more bytes can come
+    /// ([`Self::finish`]).
     fn emit_new_bytes(&mut self, open: bool, out: &mut Events) {
         if self.text.len() <= self.emitted {
             return;
@@ -229,7 +230,7 @@ impl Arguments {
                 Some(from) => *self.invalid_from.insert(from.max(self.emitted)),
             },
         };
-        let valid_end = match self.prefix.word_start() {
+        let valid_end = match self.prefix.held_from(true) {
             Some(start) if open && self.invalid_from.is_none() => {
                 valid_end.min(start).max(self.emitted)
             }
@@ -343,6 +344,9 @@ mod tests {
             ("1x", "1", "x"),
             ("{\"a\": nosuch}", "{\"a\": ", "nosuch}"),
             ("{\"a\": null}", "{\"a\": null}", ""),
+            ("{\"e\": \"\\ud83c\\x\"}", "{\"e\": \"\\ud83c", "\\x\"}"),
+            ("\"\\udc00\"", "", "\"\\udc00\""),
+            ("\"ab\\ud83c\\ude00 c\"", "\"ab\\ud83c\\ude00 c\"", ""),
         ];
         for (value, expected_arguments, expected_malformed) in cases {
             for cut in [true, false] {

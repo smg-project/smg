@@ -173,12 +173,55 @@ impl Prefix {
 
     /// Where the word under way starts, while one is: a literal being spelled (`nu`), which is a
     /// prefix of `null` so far, and which the judge refuses from its first letter if it turns out
-    /// to be no literal.
+    /// to be no literal; at the top, from the value's start, as the parser refuses the whole
+    /// value then.
     pub fn word_start(&self) -> Option<usize> {
         match self.token {
-            Token::Lit { start, .. } if self.invalid.is_none() => Some(start),
+            Token::Lit { start, .. } if self.invalid.is_none() => {
+                Some(if self.open.is_empty() { 0 } else { start })
+            }
             _ => None,
         }
+    }
+
+    /// Where the surrogate escape under way starts, while a high surrogate awaits its low half
+    /// behind a backslash: the backslash, where the judge stops when what follows it is not the
+    /// low half, one byte before the character that says so.
+    pub fn escape_start(&self) -> Option<usize> {
+        match self.token {
+            Token::Str {
+                state: Str::AfterHighBackslash { at },
+                ..
+            } if self.invalid.is_none() => Some(at),
+            _ => None,
+        }
+    }
+
+    /// The start of the value, while the top-level value is a string that has not closed: a
+    /// surrogate escape that breaks inside it has the parser refuse the whole value, so nothing
+    /// of it is certain before its closing quote. `None` inside a container, where a broken
+    /// string ends where it broke and the parent judges what follows.
+    pub fn string_start(&self) -> Option<usize> {
+        match self.token {
+            Token::Str { .. } if self.open.is_empty() && self.invalid.is_none() => Some(0),
+            _ => None,
+        }
+    }
+
+    /// Where the judge may still go back to, if anywhere: the earliest of the word's start
+    /// ([`Self::word_start`]), the escape's ([`Self::escape_start`]) and, when `strings` is
+    /// asked, a top-level string's ([`Self::string_start`]). An assembler that passes bytes on
+    /// as fragments holds from there, since a fragment passed on cannot be taken back; one that
+    /// streams a top-level string whatever comes leaves `strings` out, and says so.
+    pub fn held_from(&self, strings: bool) -> Option<usize> {
+        [
+            self.word_start(),
+            self.escape_start(),
+            if strings { self.string_start() } else { None },
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// One character, at byte offset `at` of the whole text.
@@ -575,6 +618,32 @@ mod tests {
             }
         }
         assert!(cuts > 800, "{cuts} cuts");
+    }
+
+    #[test]
+    fn the_judge_says_where_it_may_still_go_back_to() {
+        let after = |text: &str| {
+            let mut prefix = Prefix::default();
+            assert_eq!(prefix.feed(text), None, "{text:?}");
+            prefix
+        };
+        // A word: its first letter inside a container, the value's start at the top.
+        assert_eq!(after(r#"{"a": nu"#).held_from(false), Some(6));
+        assert_eq!(after("  nu").held_from(false), Some(0));
+        assert_eq!(after("null").held_from(false), Some(0));
+        assert_eq!(after("[null, ").held_from(false), None);
+        // A surrogate escape awaiting its low half behind a backslash: the backslash.
+        assert_eq!(after(r#"{"e": "\ud83c\"#).held_from(false), Some(13));
+        assert_eq!(after(r#"{"e": "\ud83c\u"#).held_from(false), None);
+        assert_eq!(after(r#"{"e": "\ud83c"#).held_from(false), None);
+        // A top-level string, only when asked.
+        assert_eq!(after(r#""ab\ud83c"#).held_from(true), Some(0));
+        assert_eq!(after(r#""ab"#).held_from(true), Some(0));
+        assert_eq!(after(r#""ab"#).held_from(false), None);
+        assert_eq!(after(r#""ab""#).held_from(true), None);
+        // A number and a container: nothing to go back to.
+        assert_eq!(after("12.").held_from(true), None);
+        assert_eq!(after(r#"{"a": [1, "#).held_from(true), None);
     }
 
     #[test]

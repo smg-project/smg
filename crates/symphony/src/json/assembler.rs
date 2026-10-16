@@ -252,8 +252,8 @@ impl Assembler {
         }
     }
 
-    /// The argument bytes held back as a word under way ([`Self::emit_new_argument_bytes`]), sent
-    /// as the prefix they are when the value can take no more bytes: at its end, or the stream's.
+    /// The argument bytes held back ([`Self::emit_new_argument_bytes`]), sent as the prefix they
+    /// are when the value can take no more bytes: at its end, or the stream's.
     fn send_held(&mut self, arguments: Option<&Span>, out: &mut Events) {
         let Some(span) = arguments else {
             return;
@@ -290,13 +290,13 @@ impl Assembler {
                 Some(from) => *self.invalid_from.insert(from.max(self.emitted)),
             },
         };
-        // A word under way at the end of the bytes (`nu`, so far a prefix of `null`) is held
-        // while the value is still open: the judge refuses a word that turns out to be no
-        // literal from its first letter, and a fragment passed on cannot be taken back, so the
-        // pieces would say `n` where the whole says nothing. It is sent once the next bytes
-        // spell it on or end it, with the value's end, or when no more bytes can come
-        // ([`Self::send_held`]), as the prefix it is then.
-        let valid_end = match self.prefix.word_start() {
+        // Bytes the judge may still go back to (a word being spelled, `nu`; a surrogate escape
+        // awaiting its low half; a top-level string, which the parser refuses whole when a
+        // surrogate inside it breaks) are held while the value is still open: a fragment passed
+        // on cannot be taken back, so the pieces would say `n` where the whole says nothing. They
+        // are sent once the next bytes settle them, with the value's end, or when no more bytes
+        // can come ([`Self::send_held`]), as the prefix they are then.
+        let valid_end = match self.prefix.held_from(true) {
             Some(start) if span.end.is_none() && self.invalid_from.is_none() => {
                 valid_end.min(start).max(self.emitted)
             }
@@ -412,7 +412,9 @@ mod tests {
         // A word that is no literal is refused from its first letter, and nothing of it is
         // passed on as arguments however the bytes were cut; a literal, whole or cut short at
         // the end, is sent once it is spelled or once nothing more can come; a number is sent as
-        // far as it is one. Open values end with the stream, closed ones at their object's brace.
+        // far as it is one. A surrogate escape that breaks behind its backslash takes the
+        // backslash with it, and a top-level string that breaks is refused whole, the pieces
+        // saying the same. Open values end with the stream, closed ones at their object's brace.
         let cases = [
             ("nosuch", "", "nosuch"),
             ("trash", "", "trash"),
@@ -423,6 +425,10 @@ mod tests {
             (r#"{"a": nosuch}"#, r#"{"a": "#, "nosuch}"),
             (r#"{"a": null}"#, r#"{"a": null}"#, ""),
             ("[true, trash]", "[true, ", "trash]"),
+            (r#"{"e": "\ud83c\x"}"#, r#"{"e": "\ud83c"#, r#"\x"}"#),
+            (r#"{"e": "\ud83c\ude00"}"#, r#"{"e": "\ud83c\ude00"}"#, ""),
+            (r#""\udc00""#, "", r#""\udc00""#),
+            (r#""ab\ud83c\ude00 c""#, r#""ab\ud83c\ude00 c""#, ""),
         ];
         for (value, expected_arguments, expected_malformed) in cases {
             for closed in [false, true] {
@@ -734,6 +740,52 @@ mod tests {
     /// brace left off, text where a member should be) ends there, as one whose arguments break
     /// does: the call ends with what the outline read after the arguments, and the bytes from the
     /// stop on are handed back. Stopped before its name, the object named no call, and its bytes
+    #[test]
+    fn a_word_refused_hands_the_same_tail_back_whole_and_in_pieces() {
+        // The shaped calls' assembler ends where its arguments stop being a value and hands the
+        // bytes from there on back for the trailer to read. A word under way is held, so the
+        // bytes handed back start at the word's first letter whole and in pieces alike, and so
+        // do the arguments sent before them.
+        let feed = |text: &str, by_char: bool| {
+            let mut assembler = Assembler::new(0, "call_0").ending_where_refused();
+            let mut out = Events::new();
+            let mut back = String::new();
+            let pieces: Vec<&str> = if by_char {
+                text.char_indices()
+                    .map(|(i, c)| &text[i..i + c.len_utf8()])
+                    .collect()
+            } else {
+                vec![text]
+            };
+            for piece in pieces {
+                let taken = assembler.feed(piece, &mut out);
+                if let Some((tail, _)) = assembler.refused_tail() {
+                    back.push_str(&tail);
+                }
+                back.push_str(&piece[taken..]);
+            }
+            assembler.finish(&mut out);
+            let events = out.drain();
+            (arguments(&events), malformed(&events), back)
+        };
+        for (text, expected_arguments, expected_back) in [
+            (r#"{"name": "f", "arguments": nosuch</f>"#, "", "nosuch</f>"),
+            (r#"{"name": "f", "arguments": nul</f>"#, "nul", "</f>"),
+            (r#"{"name": "f", "arguments": null</f>"#, "null", "</f>"),
+            (
+                r#"{"name": "f", "arguments": {"a": nosuch}</f>"#,
+                r#"{"a": "#,
+                "nosuch}</f>",
+            ),
+        ] {
+            let whole = feed(text, false);
+            let in_pieces = feed(text, true);
+            assert_eq!(whole, in_pieces, "{text:?}: whole and in pieces");
+            assert_eq!(whole.0, expected_arguments, "{text:?}: arguments");
+            assert_eq!(whole.2, expected_back, "{text:?}: handed back");
+        }
+    }
+
     /// come back malformed.
     #[test]
     fn an_object_ending_where_refused_ends_where_its_outline_stops() {

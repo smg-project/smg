@@ -315,7 +315,11 @@ impl Arguments {
         }
         let mut upto = end;
         if self.invalid_from.is_none() && self.whole.is_none() {
-            let held = [self.prefix.word_start(), self.members.open];
+            // A word being spelled and a surrogate escape awaiting its low half are held; a
+            // top-level string streams on, as a string parameter would otherwise wait for its
+            // closing quote, and a surrogate that breaks inside it is the one case where the
+            // pieces say more of the value than the whole, which refuses it.
+            let held = [self.prefix.held_from(false), self.members.open];
             upto = held.into_iter().flatten().fold(end, usize::min);
         }
         // A value that ends where refused keeps the bytes from the refusal on for the caller
