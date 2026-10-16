@@ -34,13 +34,18 @@
 //! depth cap alone does not bound, stays bounded. The budget is spent depth first, in the schema's
 //! order, but an object's later properties each keep one element while an earlier one is written,
 //! so what runs short loses its structure from the inside out: the nested objects first, the
-//! top-level arguments last. A property typed `null`, written as nothing, costs nothing.
+//! top-level arguments last. A property typed `null`, written as nothing, costs nothing. The
+//! leaves' spellings count against [`LEAF_BYTES`] besides: an enum's words, and a number's schema
+//! with the definitions its pointers reach; once they are spent, an enum is text as it is and a
+//! number any text, so a value that is large or reused through references cannot multiply the tag.
+
+use std::collections::HashMap;
 
 use openai_protocol::common::Tool;
 use serde_json::Value;
 
 use super::{
-    schema::{keyword, kind, shape, Definitions},
+    schema::{json_bytes, keyword, kind, shape, string_enum, Definitions},
     CallMarkers, Count, Grammar, Tag,
 };
 
@@ -54,18 +59,36 @@ const DEPTH: usize = 16;
 /// text. An acyclic schema unfolds as k^d elements for k properties over d levels, which the depth
 /// cap alone does not bound; ordinary tool schemas stay far below this. The budget is each invoke's
 /// own: a tag for many tools holds up to this many elements per tool. It counts elements, not
-/// bytes: a value's own spelling (an enum's words, a number's schema) is written as it is. A value
-/// past the budget is any text up to its own closing tag, as one past the depth cap is, so it
-/// cannot hold a descendant whose tag spells the same close (the separator stands before inner
-/// tags too); the budget makes that fallback reachable at any depth, where the depth cap kept it
-/// past the sixteenth.
+/// bytes: a value's own spelling (an enum's words, a number's schema) is counted by
+/// [`LEAF_BYTES`]. A value past the budget is any text up to its own closing tag, as one past the
+/// depth cap is, so it cannot hold a descendant whose tag spells the same close (the separator
+/// stands before inner tags too); the budget makes that fallback reachable at any depth, where the
+/// depth cap kept it past the sixteenth.
 const NODES: usize = 1024;
+/// How many bytes the leaves of one invoke may spell: an enum's words, a number's schema with the
+/// definitions its pointers reach. Past that, a string with an enum is text as it is and a number
+/// any text, so a value that is large, or reused through references, cannot multiply the tag: a
+/// 5,000-word enum reached by a thousand number leaves is written while it fits, not a thousand
+/// times. Each invoke's own, as [`NODES`] is, and spent in the schema's order.
+const LEAF_BYTES: usize = 256 * 1024;
+/// What an enum's word costs beyond its length: the alternative that spells it.
+const WORD_FRAMING: usize = 36;
 
-/// The elements one invoke may still write, and how many of them are held for the properties
-/// after the one being written, at every level of the descent together.
+/// The elements one invoke may still write, how many of them are held for the properties after
+/// the one being written, at every level of the descent together, and the bytes its leaves may
+/// still spell.
 struct Budget {
     nodes: usize,
     reserved: usize,
+    leaf_bytes: usize,
+    /// The serialized size of each root definition a fragment reached, by the entry's address,
+    /// worked out once per invoke.
+    entry_bytes: HashMap<usize, usize>,
+    /// What each number leaf's fragment costs, by the leaf schema's address: `None` for a leaf
+    /// the budget refused, which it refuses again, the budget only shrinking.
+    fragment_bytes: HashMap<usize, Option<usize>>,
+    /// What each enum costs, by its word list's address.
+    enum_bytes: HashMap<usize, usize>,
 }
 
 impl Budget {
@@ -73,7 +96,55 @@ impl Budget {
         Self {
             nodes: NODES,
             reserved: 0,
+            leaf_bytes: LEAF_BYTES,
+            entry_bytes: HashMap::new(),
+            fragment_bytes: HashMap::new(),
+            enum_bytes: HashMap::new(),
         }
+    }
+
+    /// What an enum's words cost, worked out once per word list per invoke.
+    fn enum_cost(&mut self, words: &[Value]) -> usize {
+        let key = words.as_ptr() as usize;
+        *self.enum_bytes.entry(key).or_insert_with(|| {
+            words
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|word| word.len() + WORD_FRAMING)
+                .sum()
+        })
+    }
+
+    /// What a number leaf's fragment would cost, with the definitions its pointers reach, when
+    /// that fits what the leaves may still spell ([`Definitions::reached_within`]); `None` when
+    /// it does not. Worked out once per leaf schema per invoke: a leaf refused once is refused
+    /// again, the budget only shrinking.
+    fn fragment_cost(&mut self, schema: &Value, definitions: Definitions<'_>) -> Option<usize> {
+        let key = std::ptr::from_ref(schema) as usize;
+        if let Some(known) = self.fragment_bytes.get(&key) {
+            return known.filter(|cost| *cost <= self.leaf_bytes);
+        }
+        let limit = self.leaf_bytes;
+        let mut entry_bytes = std::mem::take(&mut self.entry_bytes);
+        let found = definitions
+            .reached_within(schema, limit, |entry| {
+                let key = std::ptr::from_ref(entry) as usize;
+                *entry_bytes.entry(key).or_insert_with(|| json_bytes(entry))
+            })
+            .map(|(cost, _)| cost);
+        self.entry_bytes = entry_bytes;
+        self.fragment_bytes.insert(key, found);
+        found
+    }
+
+    /// `cost` bytes off the leaves' budget; `false` when they do not fit, when the caller writes
+    /// the value's fallback and the budget stays for a smaller leaf.
+    fn takes_bytes(&mut self, cost: usize) -> bool {
+        if cost > self.leaf_bytes {
+            return false;
+        }
+        self.leaf_bytes -= cost;
+        true
     }
 
     /// Whether an element is left beyond the ones held for later siblings.
@@ -248,7 +319,8 @@ impl Writer<'_> {
     }
 
     /// The value between an element's tags, as [`Self::how`] says it is written: any text, or by
-    /// the type the property's schema pins, a string's or a number's grammar [`shape`]'s.
+    /// the type the property's schema pins, a string's or a number's grammar [`shape`]'s where
+    /// the leaves' byte budget takes it, text as it is or any text where it does not.
     fn value(
         &self,
         schema: &Value,
@@ -270,6 +342,26 @@ impl Writer<'_> {
                 }
                 _ => self.any_text(close),
             },
+            "string" => {
+                if let Some(words) = string_enum(schema, definitions.target_of(schema)) {
+                    let cost = budget.enum_cost(words);
+                    if !budget.takes_bytes(cost) {
+                        return self.text(close);
+                    }
+                }
+                shape(schema, definitions, || self.text(close))
+                    .map_or_else(|| self.text(close), |(_, shaped)| shaped)
+            }
+            "number" => {
+                let Some(cost) = budget.fragment_cost(schema, definitions) else {
+                    return self.any_text(close);
+                };
+                if !budget.takes_bytes(cost) {
+                    return self.any_text(close);
+                }
+                shape(schema, definitions, || self.text(close))
+                    .map_or_else(|| self.any_text(close), |(_, shaped)| shaped)
+            }
             _ => shape(schema, definitions, || self.text(close))
                 .map_or_else(|| self.any_text(close), |(_, shaped)| shaped),
         }
@@ -911,6 +1003,174 @@ mod tests {
         let nest = first_invoke(&[tool("t", fan_out(1, 17))]);
         assert_eq!(elements_written(&nest), 17);
         assert_eq!(any_text_runs(&nest), 1, "the innermost, past the depth cap");
+    }
+
+    /// The `json_schema` leaves a payload holds, in order.
+    fn fragments(node: &Value) -> Vec<Value> {
+        match node {
+            Value::Object(object) => {
+                if object.get("type").and_then(Value::as_str) == Some("json_schema") {
+                    return vec![object["json_schema"].clone()];
+                }
+                object.values().flat_map(fragments).collect()
+            }
+            Value::Array(items) => items.iter().flat_map(fragments).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// How many `or` nodes of `width` alternatives a payload holds: the enums spelled out.
+    fn enums_spelled(node: &Value, width: usize) -> usize {
+        match node {
+            Value::Object(object) => {
+                let spelled = object.get("type").and_then(Value::as_str) == Some("or")
+                    && object
+                        .get("elements")
+                        .and_then(Value::as_array)
+                        .is_some_and(|elements| elements.len() == width);
+                usize::from(spelled)
+                    + object
+                        .values()
+                        .map(|value| enums_spelled(value, width))
+                        .sum::<usize>()
+            }
+            Value::Array(items) => items.iter().map(|item| enums_spelled(item, width)).sum(),
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn number_fragments_past_the_byte_budget_are_any_text() {
+        // A 5,000-word enum under `$defs`, reached by 32 x 32 number leaves through `not`: it
+        // travelled with every fragment (about 110 MB of tag from a 113 KB request); it travels
+        // while the budget lasts, the leaves after that are any text, and the tag stays well
+        // under a megabyte.
+        let words: Vec<String> = (0..5000).map(|i| format!("option_number_{i:05}")).collect();
+        let row: serde_json::Map<String, Value> = (0..32)
+            .map(|i| {
+                (
+                    format!("n{i:02}"),
+                    value!({"type": "number", "not": {"$ref": "#/$defs/Big"}}),
+                )
+            })
+            .collect();
+        let row_required: Vec<String> = row.keys().cloned().collect();
+        let root: serde_json::Map<String, Value> = (0..32)
+            .map(|i| (format!("r{i:02}"), value!({"$ref": "#/$defs/Row"})))
+            .collect();
+        let required: Vec<String> = root.keys().cloned().collect();
+        let invoke = first_invoke(&[tool(
+            "t",
+            value!({
+                "type": "object",
+                "$defs": {
+                    "Big": {"type": "string", "enum": words},
+                    "Row": {"type": "object", "properties": row, "required": row_required},
+                },
+                "properties": root,
+                "required": required,
+            }),
+        )]);
+        let payload = invoke.to_string();
+        assert!(payload.len() < 700_000, "{} bytes", payload.len());
+        let leaves = fragments(&invoke);
+        assert!(
+            (1..=3).contains(&leaves.len()),
+            "the definition travels while the budget lasts: {} fragments",
+            leaves.len()
+        );
+        assert!(leaves.iter().all(|leaf| leaf["$defs"]["Big"]["enum"]
+            .as_array()
+            .is_some_and(|w| w.len() == 5000)));
+        assert_eq!(elements_written(&invoke), 1024, "the element budget stands");
+        assert!(
+            any_text_runs(&invoke) >= 900,
+            "the number leaves past the budget are any text: {}",
+            any_text_runs(&invoke)
+        );
+    }
+
+    #[test]
+    fn a_hub_of_thousands_of_definitions_is_walked_within_the_budget() {
+        // A hub that reaches four thousand small definitions, from a thousand number leaves: the
+        // walk behind each leaf stops at the budget and is remembered per leaf, so the tag stays
+        // small and the build quick however many definitions a refused leaf would have reached.
+        let mut defs = serde_json::Map::new();
+        let branches: Vec<Value> = (0..4000)
+            .map(|i| {
+                defs.insert(format!("d{i:05}"), value!({}));
+                value!({"$ref": format!("#/$defs/d{i:05}")})
+            })
+            .collect();
+        defs.insert("Hub".to_string(), value!({"anyOf": branches}));
+        let row: serde_json::Map<String, Value> = (0..32)
+            .map(|i| {
+                (
+                    format!("n{i:02}"),
+                    value!({"type": "number", "not": {"$ref": "#/$defs/Hub"}}),
+                )
+            })
+            .collect();
+        let row_required: Vec<String> = row.keys().cloned().collect();
+        defs.insert(
+            "Row".to_string(),
+            value!({"type": "object", "properties": row, "required": row_required}),
+        );
+        let root: serde_json::Map<String, Value> = (0..32)
+            .map(|i| (format!("r{i:02}"), value!({"$ref": "#/$defs/Row"})))
+            .collect();
+        let required: Vec<String> = root.keys().cloned().collect();
+        let started = std::time::Instant::now();
+        let invoke = first_invoke(&[tool(
+            "t",
+            value!({"type": "object", "$defs": defs, "properties": root, "required": required}),
+        )]);
+        let took = started.elapsed();
+        let payload = invoke.to_string();
+        assert!(payload.len() < 700_000, "{} bytes", payload.len());
+        assert_eq!(elements_written(&invoke), 1024);
+        let leaves = fragments(&invoke);
+        assert!(
+            (1..=3).contains(&leaves.len()),
+            "{} fragments",
+            leaves.len()
+        );
+        assert!(leaves.iter().all(|leaf| leaf["$defs"]["Hub"].is_object()));
+        assert!(
+            took.as_secs() < 5,
+            "bounded and remembered per leaf: {took:?}"
+        );
+    }
+
+    #[test]
+    fn an_enum_reused_through_references_stops_at_the_byte_budget() {
+        // One copy is 2,000 words of 11 bytes and their framing, about 94 KB: two fit the budget,
+        // the third does not, and the properties after that are text as it is, strings still.
+        let words: Vec<String> = (0..2000).map(|i| format!("choice_{i:04}")).collect();
+        let properties: serde_json::Map<String, Value> = (0..30)
+            .map(|i| (format!("e{i:02}"), value!({"$ref": "#/$defs/E"})))
+            .collect();
+        let required: Vec<String> = properties.keys().cloned().collect();
+        let invoke = first_invoke(&[tool(
+            "t",
+            value!({
+                "type": "object",
+                "$defs": {"E": {"type": "string", "enum": words}},
+                "properties": properties,
+                "required": required,
+            }),
+        )]);
+        let payload = invoke.to_string();
+        assert_eq!(enums_spelled(&invoke, 2000), 2, "{} bytes", payload.len());
+        assert!(payload.len() < 400_000, "{} bytes", payload.len());
+        let elements = &invoke["content"]["elements"];
+        assert_eq!(
+            elements[2],
+            element("e02", text("e02")),
+            "typed text, no enum"
+        );
+        assert_eq!(elements[29], element("e29", text("e29")));
+        assert_eq!(any_text_runs(&invoke), 0, "nothing untyped");
     }
 
     #[test]

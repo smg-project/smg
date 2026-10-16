@@ -11,6 +11,8 @@
 //! reach travel with it, and the annotations JSON Schema defines as such (`title`, `description`,
 //! `examples`, `$comment`), which constrain nothing, are dropped at every schema position.
 
+use std::collections::HashSet;
+
 use serde_json::{json, Value};
 
 use super::Grammar;
@@ -163,7 +165,7 @@ pub(super) fn kind(schema: &Value, definitions: Definitions<'_>) -> Option<&'sta
 
 /// The words of a string `enum`, where the schema (or its `$ref` target) has one with a word in
 /// it and nothing else.
-fn string_enum<'a>(schema: &'a Value, target: Option<&'a Value>) -> Option<&'a [Value]> {
+pub(super) fn string_enum<'a>(schema: &'a Value, target: Option<&'a Value>) -> Option<&'a [Value]> {
     keyword(schema, target, "enum")
         .and_then(Value::as_array)
         .filter(|values| !values.is_empty() && values.iter().all(Value::is_string))
@@ -204,6 +206,9 @@ pub(super) fn shape(
     Some((kind, grammar))
 }
 
+/// A definition a schema reaches: its block (`$defs` or `definitions`), its name and the entry.
+pub(super) type Reached<'a> = (&'static str, &'a str, &'a Value);
+
 /// The definitions at the root of a tool's schema, `$defs` and `definitions`. Each property's
 /// schema goes to the engine as a document of its own, and a `$ref` such as `#/$defs/Node` points
 /// from the root of the document it stands in, so the definitions travel with the property's
@@ -213,13 +218,24 @@ pub(super) fn shape(
 pub(super) struct Definitions<'a> {
     defs: Option<&'a Value>,
     definitions: Option<&'a Value>,
+    /// Whether every local pointer anywhere in the root names something, worked out once, so
+    /// the check each property's [`kind`] makes costs nothing when the tool's schema is whole.
+    whole: bool,
 }
 
 impl<'a> Definitions<'a> {
     pub(super) fn of(root: &'a Value) -> Self {
-        Self {
+        let definitions = Self {
             defs: root.get("$defs"),
             definitions: root.get("definitions"),
+            whole: false,
+        };
+        let whole = local_pointers(root)
+            .into_iter()
+            .all(|pointer| definitions.resolve(pointer).is_some());
+        Self {
+            whole,
+            ..definitions
         }
     }
 
@@ -250,10 +266,13 @@ impl<'a> Definitions<'a> {
     /// at nothing inside one of them reaches the engine too. A definition that names itself is
     /// followed once.
     fn pointers_resolve(self, schema: &Value) -> bool {
-        self.pointers_resolve_from(schema, &mut Vec::new())
+        self.whole || self.pointers_resolve_from(schema, &mut HashSet::new())
     }
 
-    fn pointers_resolve_from(self, schema: &Value, followed: &mut Vec<String>) -> bool {
+    fn pointers_resolve_from<'s>(self, schema: &'s Value, followed: &mut HashSet<&'s str>) -> bool
+    where
+        'a: 's,
+    {
         match schema {
             Value::Object(map) => map.iter().all(|(key, value)| {
                 let local = value
@@ -261,10 +280,8 @@ impl<'a> Definitions<'a> {
                     .filter(|pointer| is_reference(key) && pointer.starts_with('#'));
                 let named_resolves = local.is_none_or(|pointer| match self.resolve(pointer) {
                     None => false,
-                    Some(_) if followed.iter().any(|seen| seen == pointer) => true,
                     Some(target) => {
-                        followed.push(pointer.to_string());
-                        self.pointers_resolve_from(target, followed)
+                        !followed.insert(pointer) || self.pointers_resolve_from(target, followed)
                     }
                 });
                 named_resolves && self.pointers_resolve_from(value, followed)
@@ -295,7 +312,11 @@ impl<'a> Definitions<'a> {
             };
             let entries: Vec<(&String, Value)> = entries
                 .iter()
-                .filter(|(key, _)| reached.contains(&(name, key.as_str())))
+                .filter(|(key, _)| {
+                    reached.iter().any(|(block, reached_key, _)| {
+                        *block == name && *reached_key == key.as_str()
+                    })
+                })
                 .map(|(key, value)| (key, without_annotations(value)))
                 .collect();
             if entries.is_empty() {
@@ -320,29 +341,66 @@ impl<'a> Definitions<'a> {
     }
 
     /// The root's definitions the pointers in `schema` reach, directly or through one another:
-    /// each as its block (`$defs` or `definitions`) and its name, the first segment after the
-    /// block, since a pointer deeper into an entry needs the whole entry.
-    fn reached_from(self, schema: &Value) -> Vec<(&'static str, &'a str)> {
-        let mut reached: Vec<(&'static str, &'a str)> = Vec::new();
+    /// each as its block (`$defs` or `definitions`), its name, the first segment after the block,
+    /// since a pointer deeper into an entry needs the whole entry, and the entry itself, for a
+    /// writer that counts a fragment's bytes before it is attached.
+    pub(super) fn reached_from(self, schema: &Value) -> Vec<Reached<'a>> {
+        let mut reached: Vec<Reached<'a>> = Vec::new();
+        let mut seen: HashSet<(&'static str, &'a str)> = HashSet::new();
         let mut pending: Vec<&Value> = vec![schema];
         while let Some(node) = pending.pop() {
             for pointer in local_pointers(node) {
                 let Some((block, name, entry)) = self.entry_of(pointer) else {
                     continue;
                 };
-                if reached.contains(&(block, name)) {
+                if !seen.insert((block, name)) {
                     continue;
                 }
-                reached.push((block, name));
+                reached.push((block, name, entry));
                 pending.push(entry);
             }
         }
         reached
     }
 
+    /// [`Self::reached_from`] with the bytes the fragment would cost (the leaf's schema with the
+    /// entries reached, each sized by `size`), within `limit`: `None` as soon as the running
+    /// count passes it, so a leaf a budget refuses costs the walk up to the budget and no more.
+    pub(super) fn reached_within(
+        self,
+        schema: &Value,
+        limit: usize,
+        mut size: impl FnMut(&'a Value) -> usize,
+    ) -> Option<(usize, Vec<Reached<'a>>)> {
+        let mut cost = json_bytes(schema);
+        if cost > limit {
+            return None;
+        }
+        let mut reached: Vec<Reached<'a>> = Vec::new();
+        let mut seen: HashSet<(&'static str, &'a str)> = HashSet::new();
+        let mut pending: Vec<&Value> = vec![schema];
+        while let Some(node) = pending.pop() {
+            for pointer in local_pointers(node) {
+                let Some((block, name, entry)) = self.entry_of(pointer) else {
+                    continue;
+                };
+                if !seen.insert((block, name)) {
+                    continue;
+                }
+                cost += size(entry);
+                if cost > limit {
+                    return None;
+                }
+                reached.push((block, name, entry));
+                pending.push(entry);
+            }
+        }
+        Some((cost, reached))
+    }
+
     /// The block, the entry name and the entry a local pointer names, with the pointer's escapes
     /// undone (`~1` for `/`, `~0` for `~`), so an entry named `a/b` is followed by its name.
-    fn entry_of(self, pointer: &str) -> Option<(&'static str, &'a str, &'a Value)> {
+    fn entry_of(self, pointer: &str) -> Option<Reached<'a>> {
         let mut segments = pointer.strip_prefix("#/")?.split('/');
         let (block, entries) = match segments.next()? {
             "$defs" => ("$defs", self.defs?),
@@ -451,6 +509,40 @@ fn collect_local_pointers<'v>(schema: &'v Value, pointers: &mut Vec<&'v str>) {
             .iter()
             .for_each(|item| collect_local_pointers(item, pointers)),
         _ => {}
+    }
+}
+
+/// About how many bytes `value` takes serialized, the escapes counted: what a leaf costs an
+/// invoke's byte budget before it is written.
+pub(super) fn json_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(flag) => {
+            if *flag {
+                4
+            } else {
+                5
+            }
+        }
+        Value::Number(number) => number.to_string().len(),
+        Value::String(text) => {
+            text.len()
+                + 2
+                + text
+                    .bytes()
+                    .filter(|byte| matches!(byte, b'"' | b'\\') || *byte < 0x20)
+                    .count()
+        }
+        Value::Array(items) => {
+            2 + items.iter().map(json_bytes).sum::<usize>() + items.len().saturating_sub(1)
+        }
+        Value::Object(object) => {
+            2 + object
+                .iter()
+                .map(|(key, value)| key.len() + 3 + json_bytes(value))
+                .sum::<usize>()
+                + object.len().saturating_sub(1)
+        }
     }
 }
 
