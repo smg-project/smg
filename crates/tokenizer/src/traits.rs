@@ -79,9 +79,11 @@ pub struct RendererCapabilities {
     /// marker, and one that ends the conversation leaves the prompt without
     /// the header, so the model answers an empty turn. On the Messages path
     /// the gateway renders a `system`-role message sent inside `messages[]`
-    /// after the first as a user turn at its position for such a renderer;
-    /// elsewhere the message is forwarded in place, for the templates that
-    /// render a system turn anywhere.
+    /// past the leading run of system messages (the system prompt, which
+    /// every renderer writes, whether it came as the top-level `system` or
+    /// as the first messages) as a user turn at its position for such a
+    /// renderer; elsewhere the message is forwarded in place, for the
+    /// templates that render a system turn anywhere.
     pub leading_system_only: bool,
 }
 

@@ -154,8 +154,10 @@ pub(crate) fn process_messages_prompt(
     }
 
     // Step 2b: a renderer whose reference writes no turn for a system
-    // message after the first gets the ones sent inside `messages[]` as
-    // user turns at their positions.
+    // message past the leading run gets the ones sent inside `messages[]`
+    // after it as user turns at their positions; the leading run (the
+    // top-level system prompt and any system messages that open the array)
+    // is the system prompt and stays.
     let capabilities = tokenizer.renderer_capabilities();
     if capabilities.leading_system_only {
         system_messages_after_the_first_as_user_turns(&mut transformed_messages);
@@ -498,9 +500,9 @@ pub(crate) fn process_message_content_format(
                 // forwarded in place, preserving its position in the conversation so
                 // inline-`system` chat templates render it where it was sent.
                 // See https://github.com/smg-project/smg/issues/1795. A renderer
-                // that writes no turn for a system message after the first gets
-                // it as a user turn there instead, once the system prompt is in
-                // (`system_messages_after_the_first_as_user_turns`).
+                // that writes no turn for a system message past the leading run
+                // gets it as a user turn there instead, once the system prompt is
+                // in (`system_messages_after_the_first_as_user_turns`).
                 messages::Role::System => {
                     result.push(convert_system_message(&message.content));
                 }
@@ -1870,6 +1872,38 @@ mod tests {
         assert_eq!(
             render(&request, &leading_system_only),
             "system: Be terse.\nuser: Hi\nuser: Note\nassistant: "
+        );
+    }
+
+    /// With a top-level system prompt and a `system` message opening the
+    /// array, both are the leading run: the system prompt, which stays as it
+    /// is for every renderer; only the system messages past it become user
+    /// turns for a leading-system-only renderer.
+    #[test]
+    fn a_top_level_system_and_a_leading_system_message_are_both_the_system_prompt() {
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 8,
+            "system": "Be terse.",
+            "messages": [
+                {"role": "system", "content": "# Environment"},
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": "Note"}
+            ]
+        }))
+        .expect("the request");
+        let leading_system_only =
+            llm_tokenizer::MockTokenizer::new().with_renderer_capabilities(RendererCapabilities {
+                leading_system_only: true,
+                ..RendererCapabilities::default()
+            });
+        assert_eq!(
+            render(&request, &leading_system_only),
+            "system: Be terse.\nsystem: # Environment\nuser: Hi\nuser: Note\nassistant: "
+        );
+        assert_eq!(
+            render(&request, &llm_tokenizer::MockTokenizer::new()),
+            "system: Be terse.\nsystem: # Environment\nuser: Hi\nsystem: Note\nassistant: "
         );
     }
 
