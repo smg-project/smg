@@ -277,6 +277,11 @@ name = "kv_index_decision"
 harness = false
 path = "benches/kv_index_decision.rs"
 
+[[bench]]
+name = "access_log"
+harness = false
+path = "benches/access_log.rs"
+
 [lints]
 workspace = true
 
