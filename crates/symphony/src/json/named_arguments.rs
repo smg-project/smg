@@ -347,6 +347,8 @@ mod tests {
             ("{\"e\": \"\\ud83c\\x\"}", "{\"e\": \"\\ud83c", "\\x\"}"),
             ("\"\\udc00\"", "", "\"\\udc00\""),
             ("\"ab\\ud83c\\ude00 c\"", "\"ab\\ud83c\\ude00 c\"", ""),
+            ("\tnosuch", "", "\tnosuch"),
+            (" null", " null", ""),
         ];
         for (value, expected_arguments, expected_malformed) in cases {
             for cut in [true, false] {

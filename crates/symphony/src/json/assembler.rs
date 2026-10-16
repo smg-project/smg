@@ -429,6 +429,9 @@ mod tests {
             (r#"{"e": "\ud83c\ude00"}"#, r#"{"e": "\ud83c\ude00"}"#, ""),
             (r#""\udc00""#, "", r#""\udc00""#),
             (r#""ab\ud83c\ude00 c""#, r#""ab\ud83c\ude00 c""#, ""),
+            // The outline keeps the whitespace before the value out of the arguments' span.
+            ("\tnosuch", "", "nosuch"),
+            (" null", "null", ""),
         ];
         for (value, expected_arguments, expected_malformed) in cases {
             for closed in [false, true] {

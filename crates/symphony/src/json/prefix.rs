@@ -210,14 +210,21 @@ impl Prefix {
 
     /// Where the judge may still go back to, if anywhere: the earliest of the word's start
     /// ([`Self::word_start`]), the escape's ([`Self::escape_start`]) and, when `strings` is
-    /// asked, a top-level string's ([`Self::string_start`]). An assembler that passes bytes on
-    /// as fragments holds from there, since a fragment passed on cannot be taken back; one that
-    /// streams a top-level string whatever comes leaves `strings` out, and says so.
+    /// asked, a top-level string's ([`Self::string_start`]); and the value's start while
+    /// nothing but whitespace has come at the top, since a word may yet come and have the whole
+    /// value refused, whitespace included. An assembler that passes bytes on as fragments holds
+    /// from there, since a fragment passed on cannot be taken back; one that streams a top-level
+    /// string whatever comes leaves `strings` out, and says so.
     pub fn held_from(&self, strings: bool) -> Option<usize> {
+        let before_the_value = self.open.is_empty()
+            && self.expect == Expect::Value
+            && matches!(self.token, Token::None)
+            && self.invalid.is_none();
         [
             self.word_start(),
             self.escape_start(),
             if strings { self.string_start() } else { None },
+            if before_the_value { Some(0) } else { None },
         ]
         .into_iter()
         .flatten()
@@ -627,9 +634,14 @@ mod tests {
             assert_eq!(prefix.feed(text), None, "{text:?}");
             prefix
         };
-        // A word: its first letter inside a container, the value's start at the top.
+        // A word: its first letter inside a container, the value's start at the top; and the
+        // value's start while nothing but whitespace has come at the top.
         assert_eq!(after(r#"{"a": nu"#).held_from(false), Some(6));
         assert_eq!(after("  nu").held_from(false), Some(0));
+        assert_eq!(after("  ").held_from(false), Some(0));
+        assert_eq!(after("").held_from(false), Some(0));
+        assert_eq!(after("  {").held_from(false), None);
+        assert_eq!(after("  1").held_from(false), None);
         assert_eq!(after("null").held_from(false), Some(0));
         assert_eq!(after("[null, ").held_from(false), None);
         // A surrogate escape awaiting its low half behind a backslash: the backslash.
