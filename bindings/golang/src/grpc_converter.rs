@@ -9,8 +9,11 @@ use std::{
 };
 
 use llm_tokenizer::{stop::SequenceDecoderOutput, stream::DecodeStream, traits::Tokenizer};
-use openai_protocol::common::{
-    FunctionCallDelta, StringOrArray, Tool, ToolCallDelta, ToolChoice, ToolChoiceValue, Usage,
+use openai_protocol::{
+    chat::ChatCompletionRequest,
+    common::{
+        FunctionCallDelta, StringOrArray, Tool, ToolCallDelta, ToolChoice, ToolChoiceValue, Usage,
+    },
 };
 use serde_json::Value;
 use smg::routers::grpc::utils::create_stop_decoder;
@@ -147,31 +150,78 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_create(
         serde_json::from_str::<Vec<u32>>(ids_str).ok()
     };
 
-    // Get system fingerprint from model (simplified)
-    let system_fingerprint = Some("fp_placeholder".to_string()); // TODO: Get actual fingerprint
-
-    Box::into_raw(Box::new(GrpcResponseConverterHandle {
+    Box::into_raw(Box::new(GrpcResponseConverterHandle::new(
         tokenizer,
-        tool_parsers: HashMap::new(),
-        stop,
-        stop_token_ids,
-        model: model_str.to_string(),
-        request_id: request_id_str.to_string(),
-        // unwrap_or_default is acceptable here: if the clock is before UNIX epoch,
-        // the `created` field in the API response will be 0, which is cosmetic
-        // and does not cause data corruption or silent data loss.
-        created: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-        system_fingerprint,
+        model_str.to_string(),
+        request_id_str.to_string(),
+        skip_special_tokens != 0,
         tools,
         tool_choice,
-        history_tool_calls_count: 0,
-        stream_state: StreamStateManager::new(),
-        initial_prompt_tokens: None,
-        skip_special_tokens: skip_special_tokens != 0,
-    }))
+        stop,
+        stop_token_ids,
+    )))
+}
+
+impl GrpcResponseConverterHandle {
+    /// A converter over one request's stream: the tools its parser resolves
+    /// calls against, its tool choice and its stops; the clock stamps
+    /// `created`.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        tokenizer: Arc<dyn Tokenizer>,
+        model: String,
+        request_id: String,
+        skip_special_tokens: bool,
+        tools: Option<Vec<Tool>>,
+        tool_choice: Option<ToolChoice>,
+        stop: Option<StringOrArray>,
+        stop_token_ids: Option<Vec<u32>>,
+    ) -> Self {
+        Self {
+            tokenizer,
+            tool_parsers: HashMap::new(),
+            stop,
+            stop_token_ids,
+            model,
+            request_id,
+            // unwrap_or_default is acceptable here: if the clock is before UNIX epoch,
+            // the `created` field in the API response will be 0, which is cosmetic
+            // and does not cause data corruption or silent data loss.
+            created: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            // TODO: Get actual fingerprint
+            system_fingerprint: Some("fp_placeholder".to_string()),
+            tools,
+            tool_choice,
+            history_tool_calls_count: 0,
+            stream_state: StreamStateManager::new(),
+            initial_prompt_tokens: None,
+            skip_special_tokens,
+        }
+    }
+
+    /// The converter of a chat request's stream: its effective tools
+    /// (request-level and message-declared, the set its constraint was built
+    /// from), its tool choice and its stops.
+    pub(crate) fn for_chat(
+        tokenizer: Arc<dyn Tokenizer>,
+        request: &ChatCompletionRequest,
+        request_id: String,
+    ) -> Self {
+        let tools: Vec<Tool> = request.effective_tools().cloned().collect();
+        Self::new(
+            tokenizer,
+            request.model.clone(),
+            request_id,
+            request.skip_special_tokens,
+            (!tools.is_empty()).then_some(tools),
+            request.tool_choice.clone(),
+            request.stop.clone(),
+            request.stop_token_ids.clone(),
+        )
+    }
 }
 
 /// Convert a gRPC GenerateResponse chunk to OpenAI format
@@ -1431,5 +1481,105 @@ mod tests {
         assert_eq!(choice.delta.content.as_deref(), Some("{"), "{response:?}");
         assert!(choice.delta.tool_calls.is_none(), "{response:?}");
         assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
+    }
+
+    /// The converter the chat path builds from the request's own values is
+    /// the one the C entry point builds from the request's JSON strings: the
+    /// tools (request-level and message-declared), the tool choice and the
+    /// stops.
+    #[test]
+    fn the_chat_converter_matches_the_c_entry_point() {
+        use crate::tool_constraint::effective_tools_json;
+
+        let tokenizer = byte_fallback_tokenizer();
+        let requests = [
+            serde_json::json!({
+                "model": "kimi-k3",
+                "messages": [
+                    {"role": "system", "content": "", "tools": [{"type": "function", "function":
+                        {"name": "get_time", "parameters": {"type": "object"}}}]},
+                    {"role": "user", "content": "hi"}
+                ],
+                "tools": [{"type": "function", "function": {"name": "get_weather", "parameters":
+                    {"type": "object", "properties": {"city": {"type": "string"}}}}}],
+                "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+                "stop": ["\n", "END"],
+                "stop_token_ids": [1, 2],
+                "skip_special_tokens": false
+            }),
+            serde_json::json!({
+                "model": "plain",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tool_choice": "none",
+                "stop": "x"
+            }),
+        ];
+        for request in requests {
+            let request: ChatCompletionRequest = serde_json::from_value(request).unwrap();
+            let typed = GrpcResponseConverterHandle::for_chat(
+                tokenizer.clone(),
+                &request,
+                "chatcmpl-1".into(),
+            );
+            // The strings the entry points used to hand the C entry point.
+            let json_arg = |value: Option<String>| value.map(|s| CString::new(s).unwrap());
+            let tools = json_arg(effective_tools_json(&request));
+            let tool_choice = json_arg(
+                request
+                    .tool_choice
+                    .as_ref()
+                    .map(|choice| serde_json::to_string(choice).unwrap()),
+            );
+            let stop = json_arg(
+                request
+                    .stop
+                    .as_ref()
+                    .map(|s| serde_json::to_string(s).unwrap()),
+            );
+            let stop_token_ids = json_arg(
+                request
+                    .stop_token_ids
+                    .as_ref()
+                    .map(|ids| serde_json::to_string(ids).unwrap()),
+            );
+            let as_ptr = |arg: &Option<CString>| arg.as_ref().map_or(ptr::null(), |s| s.as_ptr());
+            let mut tokenizer_handle = TokenizerHandle {
+                tokenizer: tokenizer.clone(),
+            };
+            let model = CString::new(request.model.clone()).unwrap();
+            let request_id = CString::new("chatcmpl-1").unwrap();
+            // SAFETY: every pointer is a live local or null where the entry
+            // point allows null; the handle it returns is taken back once.
+            let through_c = unsafe {
+                let raw = sgl_grpc_response_converter_create(
+                    &mut tokenizer_handle,
+                    model.as_ptr(),
+                    request_id.as_ptr(),
+                    as_ptr(&tools),
+                    as_ptr(&tool_choice),
+                    as_ptr(&stop),
+                    as_ptr(&stop_token_ids),
+                    c_int::from(request.skip_special_tokens),
+                    ptr::null_mut(),
+                );
+                assert!(!raw.is_null());
+                *Box::from_raw(raw)
+            };
+            let view = |handle: &GrpcResponseConverterHandle| {
+                serde_json::json!({
+                    "tools": handle.tools,
+                    "tool_choice": handle.tool_choice,
+                    "stop": handle.stop,
+                    "stop_token_ids": handle.stop_token_ids,
+                    "model": handle.model,
+                    "request_id": handle.request_id,
+                    "skip_special_tokens": handle.skip_special_tokens,
+                    "initial_prompt_tokens": handle.initial_prompt_tokens,
+                    "parsers": handle.tool_parsers.len(),
+                })
+            };
+            assert_eq!(view(&typed), view(&through_c), "{}", request.model);
+            assert!(typed.tools.is_some() == (request.model == "kimi-k3"));
+        }
     }
 }

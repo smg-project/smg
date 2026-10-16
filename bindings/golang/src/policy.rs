@@ -18,16 +18,13 @@ use std::{
 
 use async_trait::async_trait;
 use llm_tokenizer::{create_tokenizer_from_file, traits::Tokenizer};
-use openai_protocol::{
-    chat::ChatCompletionRequest,
-    worker::{HealthCheckConfig, WorkerSpec, WorkerStatus},
-};
+use openai_protocol::worker::{HealthCheckConfig, WorkerSpec, WorkerStatus};
 use smg::{
     policies::{
         BucketPolicy, CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy,
         RoundRobinPolicy, SelectWorkerInfo,
     },
-    routers::grpc::{backend_client::BackendClient, utils::process_chat_messages},
+    routers::grpc::backend_client::BackendClient,
     worker::{
         circuit_breaker::{CircuitBreaker, CircuitState},
         resilience::ResolvedResilience,
@@ -35,18 +32,13 @@ use smg::{
         ConnectionMode, OverloadThresholds, PdPairing, Worker, WorkerResult, WorkerType,
     },
 };
-use smg_grpc_client::sglang_scheduler::{SglangGenerateRequestOptions, SglangSchedulerClient};
-use tokio::sync::Mutex as TokioMutex;
-use uuid::Uuid;
+use smg_grpc_client::sglang_scheduler::SglangSchedulerClient;
 
 use super::{
+    chat_stream::{prepare_chat, start_chat_stream},
     error::{set_error_message, SglErrorCode},
-    grpc_converter::sgl_grpc_response_converter_create,
     runtime::RUNTIME,
     stream::SglangStreamHandle,
-    tokenizer::TokenizerHandle,
-    tool_constraint::{effective_tools_json, tool_constraint_for, tools_keep_special_tokens},
-    utils::chat_requires_reasoning,
 };
 
 /// FFI worker that implements the gateway's `Worker` trait so policies
@@ -569,38 +561,18 @@ pub unsafe extern "C" fn sgl_multi_client_chat_completion_stream(
             }
         };
 
-    // Parse OpenAI ChatCompletionRequest
-    let mut chat_request: ChatCompletionRequest = match serde_json::from_str(request_str) {
-        Ok(req) => req,
-        Err(e) => {
-            set_error_message(error_out, &format!("Failed to parse request JSON: {e}"));
-            return SglErrorCode::ParsingError;
+    let prepared = match prepare_chat(request_str, tokenizer.as_ref()) {
+        Ok(prepared) => prepared,
+        Err((code, message)) => {
+            set_error_message(error_out, &message);
+            return code;
         }
     };
-
-    // Process messages and apply chat template
-    let processed_messages = match process_chat_messages(&chat_request, tokenizer.as_ref(), None) {
-        Ok(msgs) => msgs,
-        Err(e) => {
-            set_error_message(error_out, &format!("Failed to process messages: {e}"));
-            return SglErrorCode::TokenizationError;
-        }
-    };
-
-    // Tokenize
-    let token_ids = match tokenizer.encode(&processed_messages.text, false) {
-        Ok(encoding) => encoding.token_ids().to_vec(),
-        Err(e) => {
-            set_error_message(error_out, &format!("Failed to tokenize: {e}"));
-            return SglErrorCode::TokenizationError;
-        }
-    };
-    let prompt_tokens = token_ids.len() as u32;
 
     // Select a worker using the real policy with request context
     let select_info = SelectWorkerInfo {
-        request_text: Some(&processed_messages.text),
-        tokens: Some(&token_ids),
+        request_text: Some(&prepared.text),
+        tokens: Some(&prepared.token_ids),
         ..Default::default()
     };
     let worker = match multi_client.select_worker(&select_info) {
@@ -614,153 +586,17 @@ pub unsafe extern "C" fn sgl_multi_client_chat_completion_stream(
     // Track load so policies like cache_aware and power_of_two can make informed decisions
     worker.increment_load();
 
-    let client = Arc::clone(&worker.client);
-
-    // Generate tool constraints if needed
-    let tool_constraint = match tool_constraint_for(&chat_request) {
-        Ok(constraint) => constraint.map(|c| c.to_tuple()),
-        Err(e) => {
-            set_error_message(
-                error_out,
-                &format!("Failed to generate tool constraints: {e}"),
-            );
-            return SglErrorCode::ParsingError;
-        }
-    };
-
-    // The engine keeps its special tokens when a parser will read them:
-    // tools at either level, a choice that allows calls, no JSON schema.
-    if tools_keep_special_tokens(&chat_request, tool_constraint.as_ref()) {
-        chat_request.skip_special_tokens = false;
-    }
-
-    // Build GenerateRequest
-    let request_id = format!("chatcmpl-{}", Uuid::now_v7());
-    let require_reasoning = chat_requires_reasoning(&chat_request, tokenizer.as_ref());
-    let proto_request = match client.build_generate_request_from_chat(
-        request_id.clone(),
-        &chat_request,
-        processed_messages.text,
-        token_ids,
-        SglangGenerateRequestOptions {
-            multimodal_inputs: None, // multimodal not supported in golang bindings
-            tool_call_constraint: tool_constraint,
-            require_reasoning,
-        },
-    ) {
-        Ok(req) => req,
-        Err(e) => {
-            set_error_message(error_out, &format!("Failed to build generate request: {e}"));
-            return SglErrorCode::ParsingError;
-        }
-    };
-
-    // Send request and get stream
-    let stream = match RUNTIME.block_on(async { client.generate(proto_request).await }) {
-        Ok(s) => s,
-        Err(e) => {
-            set_error_message(error_out, &format!("Failed to send request: {e}"));
-            return SglErrorCode::UnknownError;
-        }
-    };
-
-    // Create response converter
-    // Use and_then with CString::new to safely handle potential null bytes in JSON strings
-    // The tools the response parser resolves calls against: request-level and
-    // message-declared, the set the constraint was built from.
-    let tools_json = effective_tools_json(&chat_request)
-        .and_then(|s| CString::new(s).ok())
-        .map(|s| s.into_raw());
-    let tool_choice_json = chat_request
-        .tool_choice
-        .as_ref()
-        .and_then(|tc| serde_json::to_string(tc).ok())
-        .and_then(|s| CString::new(s).ok())
-        .map(|s| s.into_raw());
-    let stop_json = chat_request
-        .stop
-        .as_ref()
-        .and_then(|s| serde_json::to_string(s).ok())
-        .and_then(|s| CString::new(s).ok())
-        .map(|s| s.into_raw());
-    let stop_token_ids_json = chat_request
-        .stop_token_ids
-        .as_ref()
-        .and_then(|ids| serde_json::to_string(ids).ok())
-        .and_then(|s| CString::new(s).ok())
-        .map(|s| s.into_raw());
-
-    // Create tokenizer handle for converter
-    let tokenizer_handle = Box::into_raw(Box::new(TokenizerHandle {
-        tokenizer: Arc::clone(&tokenizer),
-    }));
-
-    let model_cstr = match CString::new(chat_request.model.clone()) {
-        Ok(s) => s,
-        Err(_) => {
-            set_error_message(error_out, "Invalid model name: contains null byte");
-            let _ = Box::from_raw(tokenizer_handle);
-            return SglErrorCode::InvalidArgument;
-        }
-    };
-    let request_id_cstr = match CString::new(request_id.clone()) {
-        Ok(s) => s,
-        Err(_) => {
-            set_error_message(error_out, "Invalid request ID: contains null byte");
-            let _ = Box::from_raw(tokenizer_handle);
-            return SglErrorCode::InvalidArgument;
-        }
-    };
-
-    let converter = sgl_grpc_response_converter_create(
-        tokenizer_handle,
-        model_cstr.as_ptr(),
-        request_id_cstr.as_ptr(),
-        tools_json.unwrap_or(ptr::null_mut()),
-        tool_choice_json.unwrap_or(ptr::null_mut()),
-        stop_json.unwrap_or(ptr::null_mut()),
-        stop_token_ids_json.unwrap_or(ptr::null_mut()),
-        if chat_request.skip_special_tokens {
-            1
-        } else {
-            0
-        },
+    match start_chat_stream(
+        &worker.client,
+        &tokenizer,
+        prepared,
+        Some(Arc::clone(&worker)),
         error_out,
-    );
-
-    // Free temporary tokenizer handle (converter now owns the tokenizer)
-    let _ = Box::from_raw(tokenizer_handle);
-
-    if converter.is_null() {
-        return SglErrorCode::MemoryError;
+    ) {
+        Ok(handle) => {
+            *stream_handle_out = Box::into_raw(Box::new(handle));
+            SglErrorCode::Success
+        }
+        Err(code) => code,
     }
-
-    // Clean up temporary CStrings
-    if let Some(ptr) = tools_json {
-        let _ = CString::from_raw(ptr);
-    }
-    if let Some(ptr) = tool_choice_json {
-        let _ = CString::from_raw(ptr);
-    }
-    if let Some(ptr) = stop_json {
-        let _ = CString::from_raw(ptr);
-    }
-    if let Some(ptr) = stop_token_ids_json {
-        let _ = CString::from_raw(ptr);
-    }
-
-    // Create converter handle and set initial_prompt_tokens
-    let mut converter_handle = *Box::from_raw(converter);
-    converter_handle.initial_prompt_tokens = Some(prompt_tokens);
-
-    // Create stream handle with worker reference for load tracking
-    *stream_handle_out = Box::into_raw(Box::new(SglangStreamHandle {
-        stream: Arc::new(TokioMutex::new(stream)),
-        converter: Arc::new(TokioMutex::new(converter_handle)),
-        client: Arc::clone(&client),
-        prompt_tokens,
-        worker: Some(Arc::clone(&worker)),
-    }));
-
-    SglErrorCode::Success
 }
