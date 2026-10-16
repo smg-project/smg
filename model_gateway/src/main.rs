@@ -1204,6 +1204,19 @@ struct ServingArgs {
     #[arg(long, default_value_t = 90, help_heading = "Request Handling")]
     idle_connection_timeout_secs: u64,
 
+    /// Most client connections the HTTP listener holds open at once, counted
+    /// from accept to close (idle keep-alive connections, connections inside
+    /// a TLS handshake and upgraded connections included). A connection
+    /// beyond the bound is closed at once, before any TLS handshake and
+    /// without a response: the client sees its connection end (an end of
+    /// stream, or a reset when it had already sent its request) and should
+    /// retry with backoff; each is counted in
+    /// smg_http_connections_rejected_total. Readiness is unaffected. Probes
+    /// on this port are subject to the bound like any connection: point them
+    /// at --health-check-port, which it does not cover. 0 = no bound
+    #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
+    max_connections: usize,
+
     /// Origins a browser may call the gateway from (exact origins,
     /// space-separated), or `*` alone for any origin. Without this flag the
     /// gateway makes no cross-origin allowance
@@ -3079,6 +3092,7 @@ impl CliArgs {
             .stream_body_stall_timeout_secs(self.serving.stream_body_stall_timeout_secs)
             .header_read_timeout_secs(self.serving.header_read_timeout_secs)
             .idle_connection_timeout_secs(self.serving.idle_connection_timeout_secs)
+            .max_connections(self.serving.max_connections)
             .request_timeout_secs(self.serving.request_timeout_secs)
             .sse_keepalive_secs(self.serving.sse_keepalive_secs)
             .upstream_pool_idle_timeout_secs(self.serving.upstream_pool_idle_timeout_secs)
@@ -4326,6 +4340,19 @@ mod tests {
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(defaults.header_read_timeout_secs, 30);
         assert_eq!(defaults.idle_connection_timeout_secs, 90);
+    }
+
+    /// The connection limit is a router setting and must flow into
+    /// `RouterConfig`; without the flag there is no bound.
+    #[test]
+    fn max_connections_flag_flows_into_router_config() {
+        let bounded = cli_args_from(&["--max-connections", "4096"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        assert_eq!(bounded.max_connections, 4096);
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.max_connections, 0);
     }
 
     /// The SSE keep-alive interval is a router-only setting and must flow

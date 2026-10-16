@@ -1736,6 +1736,21 @@ class TestAdminListener:
         assert args.admin_host == "10.0.0.5"
 
 
+class TestMaxConnections:
+    """The HTTP listener's connection limit: no bound by default, a bound
+    parses, a negative count is refused by the parser."""
+
+    def test_default_is_no_bound(self):
+        assert parse_router_args([]).max_connections == 0
+
+    def test_flag_parses(self):
+        assert parse_router_args(["--max-connections", "4096"]).max_connections == 4096
+
+    def test_negative_is_refused(self):
+        with pytest.raises(SystemExit):
+            parse_router_args(["--max-connections", "-1"])
+
+
 class TestPrometheusHostDefault:
     """--prometheus-host is unset by default: the router derives the metrics
     bind address from --host's family (:: for an IPv6 host, 0.0.0.0 otherwise)

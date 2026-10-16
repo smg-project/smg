@@ -417,6 +417,10 @@ pub(crate) fn init_metrics() {
         "HTTP connections closed for carrying no request, by the timeout that closed them (header_read, idle)"
     );
     describe_counter!(
+        "smg_http_connections_rejected_total",
+        "HTTP connections closed at accept for arriving beyond the connection limit (max_connections): nothing was read from or written to them"
+    );
+    describe_counter!(
         "smg_http_rate_limit_total",
         "Rate limiting decisions by result (allowed/rejected)"
     );
@@ -1032,6 +1036,9 @@ pub fn init_startup_series() {
     }
     counter!("smg_worker_overload_fallback_total", "stage" => STAGE_SELECTION).absolute(0);
     counter!("smg_worker_liveness_fallback_total", "stage" => STAGE_SELECTION).absolute(0);
+    // The connection limit's refusals: a zero series from the first scrape,
+    // bound or no bound, so a dashboard reads nothing refused as a zero.
+    counter!("smg_http_connections_rejected_total").absolute(0);
 
     // The retrying dispatch loops label their endpoint through
     // `route_to_endpoint`, whose values these are, for regular and
@@ -1533,6 +1540,12 @@ impl Metrics {
             "timeout" => timeout
         )
         .increment(1);
+    }
+
+    /// Record a connection closed at accept for arriving beyond the
+    /// connection limit.
+    pub fn record_http_connection_rejected() {
+        counter!("smg_http_connections_rejected_total").increment(1);
     }
 
     /// Record rate limit decision.
@@ -3806,6 +3819,7 @@ mod tests {
             Metrics::record_http_rate_limit("allowed");
             Metrics::record_http_rate_limit("allowed");
             Metrics::set_http_connections_active(7);
+            Metrics::record_http_connection_rejected();
             handles::reset();
         });
         for expected in [
@@ -3815,6 +3829,7 @@ mod tests {
             "smg_http_responses_total{path=\"/v1/chat/completions\",status_code=\"429\",error_code=\"rate_limited\"} 1",
             "smg_http_rate_limit_total{result=\"allowed\"} 2",
             "smg_http_connections_active 7",
+            "smg_http_connections_rejected_total 1",
         ] {
             assert!(
                 rendered.lines().any(|line| line == expected),

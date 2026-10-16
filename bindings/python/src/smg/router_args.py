@@ -408,6 +408,8 @@ class RouterArgs:
     max_buffered_request_bytes: int = 1048576
     # Standing-concurrency cap (-1 to disable); permits span the full response
     max_concurrent_requests: int = -1
+    # Most client connections the data listener holds open at once (0 = no bound)
+    max_connections: int = 0
     max_idle_secs: int = 4 * 3600
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     max_tree_size: int = 2**26
@@ -1883,6 +1885,22 @@ class RouterArgs:
                 " instead: keep the proxy's idle timeout under that too, or do"
                 " not pre-open. 0 keeps idle connections open until the client"
                 " closes them"
+            ),
+        )
+        request_group.add_argument(
+            f"--{prefix}max-connections",
+            type=_non_negative_int,
+            default=RouterArgs.max_connections,
+            help=(
+                "Most client connections the HTTP listener holds open at once, counted"
+                " from accept to close (idle keep-alive connections, connections inside"
+                " a TLS handshake and upgraded connections included). A connection beyond"
+                " the bound is closed at once, before any TLS handshake and without a"
+                " response: the client sees its connection end and should retry with"
+                " backoff; each is counted in smg_http_connections_rejected_total."
+                " Readiness is unaffected. Probes on this port are subject to the bound"
+                " like any connection: point them at --health-check-port, which it does"
+                " not cover. 0 = no bound"
             ),
         )
         request_group.add_argument(

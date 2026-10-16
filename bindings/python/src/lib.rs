@@ -505,6 +505,7 @@ struct Router {
     max_background_responses: usize,
     max_buffered_request_bytes: u64,
     max_concurrent_requests: i32,
+    max_connections: usize,
     max_idle_secs: u64,
     max_payload_size: usize,
     max_tree_size: usize,
@@ -1173,6 +1174,7 @@ impl Router {
             .stream_body_stall_timeout_secs(self.stream_body_stall_timeout_secs)
             .header_read_timeout_secs(self.header_read_timeout_secs)
             .idle_connection_timeout_secs(self.idle_connection_timeout_secs)
+            .max_connections(self.max_connections)
             .multimodal_tensor_transport(multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
             .multimodal_max_inflight_bytes(self.multimodal_max_inflight_bytes)
@@ -1305,6 +1307,7 @@ impl Router {
         max_background_responses = 1024,
         max_buffered_request_bytes = 1_048_576,
         max_concurrent_requests = -1,
+        max_connections = 0,
         max_idle_secs = 14400,
         max_payload_size = 512 * 1024 * 1024,
         max_tree_size = 2usize.pow(26),
@@ -1506,6 +1509,7 @@ impl Router {
         max_background_responses: usize,
         max_buffered_request_bytes: u64,
         max_concurrent_requests: i32,
+        max_connections: usize,
         max_idle_secs: u64,
         max_payload_size: usize,
         max_tree_size: usize,
@@ -1737,6 +1741,7 @@ impl Router {
             max_background_responses,
             max_buffered_request_bytes,
             max_concurrent_requests,
+            max_connections,
             max_idle_secs,
             max_payload_size,
             max_tree_size,

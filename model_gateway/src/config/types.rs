@@ -153,6 +153,14 @@ pub struct RouterConfig {
     /// connections until the client closes them.
     #[serde(default = "default_idle_connection_timeout_secs")]
     pub idle_connection_timeout_secs: u64,
+    /// Most client connections the HTTP listener holds open at once, counted
+    /// from accept to close (idle keep-alive connections, connections inside
+    /// a TLS handshake and upgraded connections included). A connection
+    /// beyond the bound is closed at once, before any TLS handshake and
+    /// without a response, and counted in
+    /// `smg_http_connections_rejected_total`. `0` is no bound.
+    #[serde(default)]
+    pub max_connections: usize,
     pub request_timeout_secs: u64,
     /// Seconds of upstream silence after which an open SSE stream carries a
     /// keep-alive frame (an SSE comment; the `ping` event on the Messages
@@ -1750,6 +1758,7 @@ impl Default for RouterConfig {
             stream_body_stall_timeout_secs: default_stream_body_stall_timeout_secs(),
             header_read_timeout_secs: default_header_read_timeout_secs(),
             idle_connection_timeout_secs: default_idle_connection_timeout_secs(),
+            max_connections: 0,
             request_timeout_secs: 1800, // 30 minutes
             sse_keepalive_secs: default_sse_keepalive_secs(),
             upstream_pool_idle_timeout_secs: default_upstream_pool_idle_timeout_secs(),
@@ -2247,6 +2256,26 @@ mod tests {
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(with.header_read_timeout_secs, 0);
         assert_eq!(with.idle_connection_timeout_secs, 0);
+    }
+
+    #[test]
+    fn test_max_connections_serde_default_and_roundtrip() {
+        // Config files predating the field deserialize to no bound.
+        let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("max_connections")
+            .unwrap();
+        let without: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(without.max_connections, 0);
+
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .max_connections(4096)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.max_connections, 4096);
     }
 
     #[test]

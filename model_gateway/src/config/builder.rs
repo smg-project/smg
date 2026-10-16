@@ -250,6 +250,13 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Most client connections the HTTP listener holds open at once; `0` is
+    /// no bound.
+    pub fn max_connections(mut self, max_connections: usize) -> Self {
+        self.config.max_connections = max_connections;
+        self
+    }
+
     pub fn upstream_pool_idle_timeout_secs(mut self, secs: u64) -> Self {
         self.config.upstream_pool_idle_timeout_secs = secs;
         self

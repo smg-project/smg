@@ -5,6 +5,7 @@ use std::{
 
 use axum::http::{HeaderName, HeaderValue, Uri};
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 
 use super::*;
 use crate::{middleware::scheduler, policies::cost as selection_cost};
@@ -1338,6 +1339,18 @@ impl ConfigValidator {
                 field: "request_timeout_secs".to_string(),
                 value: config.request_timeout_secs.to_string(),
                 reason: "Must be > 0".to_string(),
+            });
+        }
+
+        // The connection limit is a semaphore's permit count, and the
+        // runtime refuses more than its maximum at construction (a panic):
+        // a named configuration error here instead, for the config-file and
+        // bindings paths as much as the CLI.
+        if config.max_connections > Semaphore::MAX_PERMITS {
+            return Err(ConfigError::InvalidValue {
+                field: "max_connections".to_string(),
+                value: config.max_connections.to_string(),
+                reason: format!("Must be at most {} (0 = no bound)", Semaphore::MAX_PERMITS),
             });
         }
 
@@ -4566,6 +4579,35 @@ mod tests {
                 reason.contains("--admin-port") && reason.contains(flag),
                 "{reason}"
             );
+        }
+    }
+
+    /// A connection limit above the runtime's permit maximum is refused by
+    /// name; no bound (0) and ordinary counts pass.
+    #[test]
+    fn a_connection_limit_above_the_permit_maximum_is_rejected() {
+        let config = |max_connections: usize| RouterConfig {
+            max_connections,
+            mode: RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            ..Default::default()
+        };
+        for accepted in [0, 1, 4096, Semaphore::MAX_PERMITS] {
+            ConfigValidator::validate(&config(accepted))
+                .unwrap_or_else(|e| panic!("max_connections {accepted}: {e}"));
+        }
+        match ConfigValidator::validate(&config(Semaphore::MAX_PERMITS + 1)) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) => {
+                assert_eq!(field, "max_connections");
+                assert_eq!(value, (Semaphore::MAX_PERMITS + 1).to_string());
+                assert!(reason.contains("0 = no bound"), "{reason}");
+            }
+            other => panic!("expected an invalid max_connections, got {other:?}"),
         }
     }
 
