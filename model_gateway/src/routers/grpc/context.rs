@@ -246,9 +246,11 @@ pub(crate) struct ProcessingState {
     /// re-selection stays pinned to workers that accept them.
     pub media_refs_forwarded: bool,
 
-    /// The selected worker's constrained decoding, set once request building
-    /// decided the request's constraint on it, so retry re-selection stays on
-    /// workers that decide alike (`utils::WorkerDecoding::decides_alike`).
+    /// The selected worker's constrained decoding, set when request building
+    /// let its policy choose the request's constraint
+    /// (`regular::symphony::WorkerConstraint::by_policy`), so retry
+    /// re-selection stays on workers that decide alike
+    /// (`utils::WorkerDecoding::decides_alike`).
     pub constraint_decided_on: Option<WorkerDecoding>,
 
     /// `Some` iff the request is multimodal EPD and worker selection produced
@@ -365,8 +367,8 @@ pub(crate) struct DispatchContext {
     pub rate_limit_cell: Option<Arc<RateLimitCell>>,
     pub routing: RoutingSnapshot,
     pub wire: WireConstraint,
-    /// The selected worker's constrained decoding the plan's constraint was
-    /// decided on; a retry re-selects only workers that decide alike.
+    /// The selected worker's constrained decoding, when its policy chose the
+    /// plan's constraint; a retry re-selects only workers that decide alike.
     pub constraint_decided_on: Option<WorkerDecoding>,
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
     pub workers: Option<WorkerSelection>,

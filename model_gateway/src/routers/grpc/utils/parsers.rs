@@ -422,11 +422,12 @@ impl WorkerDecoding {
     }
 
     /// Whether `worker` decides a request's constraint as this one does: the
-    /// same policy, and the whole turn's grammar on both or on neither. The
-    /// decision reads the request, which is gone once the plan is built, so a
-    /// retry re-selects only such workers; the attempt stamp shapes a tag for
-    /// the start of the one it takes (`helpers::ToolConstraintStamp`). A
-    /// prefill worker generates no token a grammar constrains.
+    /// same policy, and the whole turn's grammar on both or on neither. A plan
+    /// whose constraint the policy chose holds a retry to such workers, since
+    /// the decision reads the request, which is gone once the plan is built;
+    /// the attempt stamp shapes a tag for the start of the worker the retry
+    /// takes (`helpers::ToolConstraintStamp`). A prefill worker generates no
+    /// token a grammar constrains.
     pub fn decides_alike(self, worker: &dyn Worker) -> bool {
         if *worker.worker_type() == WorkerType::Prefill {
             return true;

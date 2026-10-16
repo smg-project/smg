@@ -180,12 +180,14 @@ impl BuildStage for MessageRequestBuildingStage {
         // turn's grammar on a worker whose engine takes one on every turn from
         // its first token; else what preparation found, and on a worker that
         // takes a grammar on every turn the table's tag for the calls the
-        // request allows under `auto`. A retry re-selects only workers that
-        // decide alike (`utils::WorkerDecoding::decides_alike`), and the
-        // attempt stamp carries the tag unshaped like a forced call's, so the
-        // retry's worker shapes it for where its engine starts the grammar.
+        // request allows under `auto`. When the worker's policy chose the
+        // constraint, a retry re-selects only workers that decide alike
+        // (`utils::WorkerDecoding::decides_alike`); what the request asked for
+        // suits any worker. The attempt stamp carries the tag unshaped like a
+        // forced call's, so the retry's worker shapes it for where its engine
+        // starts the grammar.
         let decoding = utils::WorkerDecoding::of(ctx.state.workers.as_ref());
-        let tool_constraints = symphony::worker_constraint(
+        let decided = symphony::worker_constraint(
             decoding,
             tool_constraints,
             || {
@@ -221,10 +223,11 @@ impl BuildStage for MessageRequestBuildingStage {
                 )
             },
         )
-        .map_err(|why| error::bad_request("invalid_parser_configuration", why))?
-        .constraint
-        .map(|constraint| constraint.to_tuple());
-        ctx.state.constraint_decided_on = Some(decoding);
+        .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
+        if decided.by_policy {
+            ctx.state.constraint_decided_on = Some(decoding);
+        }
+        let tool_constraints = decided.constraint.map(|constraint| constraint.to_tuple());
         let unshaped_tool_constraints = tool_constraints.clone();
         let tool_constraints = utils::tool_constraints_for_worker(
             &ctx.components.tool_parser_factory,

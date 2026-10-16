@@ -308,10 +308,12 @@ impl BuildStage for ChatRequestBuildingStage {
         // its first token; else what preparation found, and on a worker that
         // takes a grammar on every turn the table's tag for the calls the
         // request allows under `auto`, built on the reasoning state the plan
-        // takes (`reasoning_decision`). A retry re-selects only workers that
-        // decide alike (`utils::WorkerDecoding::decides_alike`), and the
-        // attempt stamp carries the tag unshaped like a forced call's, so the
-        // retry's worker shapes it for where its engine starts the grammar.
+        // takes (`reasoning_decision`). When the worker's policy chose the
+        // constraint, a retry re-selects only workers that decide alike
+        // (`utils::WorkerDecoding::decides_alike`); what the request asked for
+        // suits any worker. The attempt stamp carries the tag unshaped like a
+        // forced call's, so the retry's worker shapes it for where its engine
+        // starts the grammar.
         let decoding = utils::WorkerDecoding::of(ctx.state.workers.as_ref());
         let decided = symphony::worker_constraint(
             decoding,
@@ -343,7 +345,9 @@ impl BuildStage for ChatRequestBuildingStage {
             },
         )
         .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
-        ctx.state.constraint_decided_on = Some(decoding);
+        if decided.by_policy {
+            ctx.state.constraint_decided_on = Some(decoding);
+        }
         let tool_constraints = decided.constraint.map(|constraint| constraint.to_tuple());
         let assignment = symphony::assign(
             parser,
