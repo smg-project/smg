@@ -117,19 +117,26 @@ def _worker_pid(pid_file, launcher: subprocess.Popen) -> int:
     """The pid the launcher wrote once it spawned its worker; a launcher that
     exits before that fails the test at once instead of at the bound."""
     deadline = time.monotonic() + _PATIENCE_SECS
-    while not pid_file.exists() or not pid_file.read_text().strip():
+    while True:
+        # Polled before the read: an exit seen here wrote all it would, so a
+        # launcher that writes its pid and exits between the two is not
+        # reported as one that never spawned its worker.
         code = launcher.poll()
+        if pid_file.exists() and pid_file.read_text().strip():
+            return int(pid_file.read_text())
         assert code is None, f"the launcher exited with {code} before it spawned its worker"
         assert time.monotonic() < deadline, "the launcher never spawned its worker"
         time.sleep(0.05)
-    return int(pid_file.read_text())
 
 
 def _exit_when(go_file, code: int) -> str:
     """The tail of a launcher's command: it exits with ``code`` once the test
     creates ``go_file``, so the test says when a core goes, not a timer that a
-    loaded host can outrun."""
-    return f"until [ -e {go_file} ]; do sleep 0.02; done; exit {code}"
+    loaded host can outrun. The wait ends on its own at the workers' 300 s
+    lifetime, so a test that fails before it creates the file (and every wait
+    in this file gives up at the patience bound, well before) leaves no
+    launcher polling for ever."""
+    return f"until [ -e {go_file} ] || (( SECONDS >= 300 )); do sleep 0.02; done; exit {code}"
 
 
 def _wait_dead(pid: int, what: str) -> None:
