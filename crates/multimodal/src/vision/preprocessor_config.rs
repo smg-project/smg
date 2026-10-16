@@ -484,10 +484,12 @@ impl PreProcessorConfig {
     /// A `usize` extra key, read strictly: `None` when the key is absent, the value when it is a
     /// non-negative integer (an integral JSON float such as `2.0` included, for toolchains that
     /// serialize integers as floats), else the value that could not be read, for the caller to
-    /// name in its error. [`get_extra`](Self::get_extra) cannot serve here: it swallows a type
-    /// mismatch into `None`, and a silent default would change an alignment factor or the token
-    /// geometry, so the gateway's placeholder count would disagree with the serving engine's
-    /// with no trace.
+    /// name in its error. The two forms are not interchangeable at the top: an integer is taken
+    /// as far as `u64` reaches, a float only up to `u32::MAX` (the rule the two processors
+    /// applied before it lived here). [`get_extra`](Self::get_extra) cannot serve here: it
+    /// swallows a type mismatch into `None`, and a silent default would change an alignment
+    /// factor or the token geometry, so the gateway's placeholder count would disagree with the
+    /// serving engine's with no trace.
     pub fn extra_usize(&self, key: &str) -> Result<Option<usize>, &serde_json::Value> {
         let Some(value) = self.extra.get(key) else {
             return Ok(None);
@@ -653,6 +655,9 @@ mod tests {
             "negative": -1,
             "text": "3",
             "flag": true,
+            "huge_integer": 4_294_967_296_u64,
+            "huge_float": 4_294_967_296.0,
+            "largest_float": 4_294_967_295.0,
         }))
         .unwrap();
         assert_eq!(config.extra_usize("absent"), Ok(None));
@@ -662,7 +667,17 @@ mod tests {
             Ok(Some(2)),
             "an integral float is the integer it spells"
         );
-        for key in ["fractional", "negative", "text", "flag"] {
+        assert_eq!(
+            config.extra_usize("huge_integer"),
+            Ok(Some(4_294_967_296)),
+            "an integer is taken as far as u64 reaches"
+        );
+        assert_eq!(
+            config.extra_usize("largest_float"),
+            Ok(Some(4_294_967_295)),
+            "a float is taken up to u32::MAX"
+        );
+        for key in ["fractional", "negative", "text", "flag", "huge_float"] {
             assert_eq!(
                 config.extra_usize(key),
                 Err(&config.extra[key]),
