@@ -4034,6 +4034,60 @@ pub fn without_outputs_of_missing_calls(
         .collect()
 }
 
+/// `items` from their first turn boundary on: a message the client sent (a
+/// user, developer or system message), or a tool call with its output (one
+/// an output among them answers, one that carries its output, a hosted
+/// call), with the reasoning right before that call. The newest items of a
+/// long conversation can begin inside a turn, with the tail of a turn whose
+/// request is not among them: the answer to a question the model does not
+/// see, the output of a call it did not make. What is before the first
+/// boundary is left out; items with no boundary come back as they are.
+pub fn from_turn_boundary(items: Vec<ResponseInputOutputItem>) -> Vec<ResponseInputOutputItem> {
+    let boundary = {
+        let answered: HashSet<&str> = items.iter().filter_map(tool_output_call_id).collect();
+        items
+            .iter()
+            .position(|item| is_client_message(item) || is_answered_call(item, &answered))
+    };
+    let Some(boundary) = boundary else {
+        return items;
+    };
+    let mut start = boundary;
+    if !is_client_message(&items[boundary]) {
+        // the reasoning that led to the call is the call's
+        while start > 0 && matches!(items[start - 1], ResponseInputOutputItem::Reasoning { .. }) {
+            start -= 1;
+        }
+    }
+    if start == 0 {
+        return items;
+    }
+    items.into_iter().skip(start).collect()
+}
+
+/// Whether `item` is a message the client sent (a user, developer or system
+/// message): the start of a turn.
+fn is_client_message(item: &ResponseInputOutputItem) -> bool {
+    match item {
+        ResponseInputOutputItem::Message { role, .. }
+        | ResponseInputOutputItem::SimpleInputMessage { role, .. } => role.as_str() != "assistant",
+        _ => false,
+    }
+}
+
+/// Whether `item` is a tool call with its output: a call an output among the
+/// items answers (`answered` holds their call ids), a call that carries its
+/// output, or a hosted call (its output, or its failure, is in the item).
+fn is_answered_call(item: &ResponseInputOutputItem, answered: &HashSet<&str>) -> bool {
+    match item {
+        ResponseInputOutputItem::FunctionToolCall {
+            output: Some(_), ..
+        }
+        | ResponseInputOutputItem::McpCall { .. } => true,
+        _ => tool_call_id(item).is_some_and(|call_id| answered.contains(call_id)),
+    }
+}
+
 /// The call id of a tool call the model made that a separate output item
 /// answers.
 fn tool_call_id(item: &ResponseInputOutputItem) -> Option<&str> {
@@ -4450,6 +4504,130 @@ mod tests {
             &kept[2],
             ResponseInputOutputItem::FunctionCallOutput { call_id, .. } if call_id == "call_kept"
         ));
+    }
+
+    fn items(value: Value) -> Vec<ResponseInputOutputItem> {
+        serde_json::from_value(value).expect("the items deserialize")
+    }
+
+    /// The kind of each item, with the role of a message.
+    fn kinds(items: &[ResponseInputOutputItem]) -> Vec<String> {
+        items
+            .iter()
+            .map(|item| match item {
+                ResponseInputOutputItem::Message { role, .. }
+                | ResponseInputOutputItem::SimpleInputMessage { role, .. } => {
+                    format!("message:{role}")
+                }
+                other => serde_json::to_value(other).expect("an item serializes")["type"]
+                    .as_str()
+                    .unwrap_or("?")
+                    .to_string(),
+            })
+            .collect()
+    }
+
+    /// A window that begins with the tail of a turn (the output of a call
+    /// before it, the assistant's answer) begins at the client's next
+    /// message, whichever role the client wrote it as; everything from there
+    /// on keeps its place.
+    #[test]
+    fn from_turn_boundary_begins_at_the_first_client_message() {
+        let items = items(serde_json::json!([
+            {"type": "function_call_output", "call_id": "call_gone", "output": "1"},
+            {"type": "message", "id": "msg_1", "role": "assistant",
+             "content": [{"type": "output_text", "text": "the tail of a turn", "annotations": []}]},
+            {"role": "developer", "content": "a note"},
+            {"type": "message", "id": "msg_2", "role": "user",
+             "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "function_call", "call_id": "call_kept", "name": "calc",
+             "arguments": "{}", "status": "completed"},
+            {"type": "function_call_output", "call_id": "call_kept", "output": "2"},
+        ]));
+
+        let kept = from_turn_boundary(items);
+
+        assert_eq!(
+            kinds(&kept),
+            [
+                "message:developer",
+                "message:user",
+                "function_call",
+                "function_call_output"
+            ]
+        );
+    }
+
+    /// A window with no client message (one long turn of the model's calls)
+    /// begins at its first call with its output, with the reasoning that led
+    /// to it: the output of the call before them and the model's aside go,
+    /// the rest keeps its place, an open call at the end included.
+    #[test]
+    fn from_turn_boundary_begins_at_a_call_with_its_output_and_its_reasoning() {
+        let items = items(serde_json::json!([
+            {"type": "function_call_output", "call_id": "call_gone", "output": "1"},
+            {"type": "message", "id": "msg_1", "role": "assistant",
+             "content": [{"type": "output_text", "text": "let me check", "annotations": []}]},
+            {"type": "reasoning", "id": "rs_1", "summary": [],
+             "content": [{"type": "reasoning_text", "text": "thinking"}]},
+            {"type": "function_call", "call_id": "call_kept", "name": "calc",
+             "arguments": "{}", "status": "completed"},
+            {"type": "function_call_output", "call_id": "call_kept", "output": "2"},
+            {"type": "function_call", "call_id": "call_open", "name": "calc",
+             "arguments": "{}", "status": "in_progress"},
+        ]));
+
+        let kept = from_turn_boundary(items);
+
+        assert_eq!(
+            kinds(&kept),
+            [
+                "reasoning",
+                "function_call",
+                "function_call_output",
+                "function_call"
+            ]
+        );
+    }
+
+    /// A hosted call carries its output and is a boundary; a window with no
+    /// boundary, and one already at a boundary, come back as they are.
+    #[test]
+    fn from_turn_boundary_takes_a_hosted_call_and_keeps_a_window_without_one() {
+        let answer = |text: &str| {
+            serde_json::json!({"type": "message", "id": "msg", "role": "assistant",
+                "content": [{"type": "output_text", "text": text, "annotations": []}]})
+        };
+        let hosted = items(serde_json::json!([
+            answer("the tail of a turn"),
+            {"type": "mcp_call", "id": "mcp_1", "name": "search", "server_label": "docs",
+             "arguments": "{}", "output": "found", "status": "completed"},
+            answer("found it"),
+        ]));
+        assert_eq!(
+            kinds(&from_turn_boundary(hosted)),
+            ["mcp_call", "message:assistant"]
+        );
+
+        let tail_only = items(serde_json::json!([
+            answer("the tail of a turn"),
+            {"type": "reasoning", "id": "rs_1", "summary": [],
+             "content": [{"type": "reasoning_text", "text": "thinking"}]},
+        ]));
+        assert_eq!(
+            kinds(&from_turn_boundary(tail_only)),
+            ["message:assistant", "reasoning"]
+        );
+
+        let whole = items(serde_json::json!([
+            {"type": "message", "id": "msg_1", "role": "user",
+             "content": [{"type": "input_text", "text": "hi"}]},
+            answer("hello"),
+        ]));
+        assert_eq!(
+            kinds(&from_turn_boundary(whole)),
+            ["message:user", "message:assistant"]
+        );
     }
 
     /// The Responses API usage of a chat-style usage: both detail objects

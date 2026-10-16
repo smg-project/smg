@@ -463,3 +463,110 @@ async fn a_history_window_that_begins_at_a_tool_output_leaves_it_out() {
     );
     engine.abort();
 }
+
+/// A conversation of 150 items: the engine receives items 51 to 150, oldest
+/// first, then the request's input; the cut lands on a user message, a turn
+/// boundary, so the window reaches the engine whole.
+#[tokio::test]
+async fn a_conversation_of_150_items_reaches_the_engine_from_item_51() {
+    let (app, requests, engine) = app().await;
+
+    let (status, conversation) = call(&app, Method::POST, "/v1/conversations", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{conversation}");
+    let conversation_id = conversation["id"].as_str().expect("a conversation id");
+    let items: Vec<Value> = (1..=150).map(message_item).collect();
+    add_items(&app, conversation_id, &items).await;
+
+    let (status, response) = call(
+        &app,
+        Method::POST,
+        "/v1/responses",
+        json!({
+            "model": MODEL,
+            "conversation": conversation_id,
+            "input": "item 151",
+            "max_output_tokens": 16,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["status"], "completed", "{response}");
+
+    let texts = last_prompt_texts(&requests);
+    let expected: Vec<String> = (51..=151).map(|n| format!("item {n}")).collect();
+    assert_eq!(texts, expected);
+    engine.abort();
+}
+
+/// The items of a conversation of agent turns, each the user's message, the
+/// model's call, its output and the model's answer: 37 whole turns, then a
+/// user message and an open call, 150 items.
+fn agent_turn_items() -> Vec<Value> {
+    let call_item = |turn: usize| {
+        json!({"type": "function_call", "call_id": format!("call_{turn}"), "name": "calc",
+               "arguments": "{\"expr\":\"6*7\"}", "status": "completed"})
+    };
+    let output_item = |turn: usize| json!({"type": "function_call_output", "call_id": format!("call_{turn}"), "output": "42"});
+    let mut items = Vec::new();
+    for turn in 1..=37 {
+        items.push(message_item(4 * turn - 3));
+        items.push(call_item(turn));
+        items.push(output_item(turn));
+        items.push(message_item(4 * turn));
+    }
+    items.push(message_item(149));
+    items.push(call_item(38));
+    items
+}
+
+/// A window cut inside a turn (item 51 is the output of turn 13's call): the
+/// engine's prompt begins at the next turn boundary, the user's message of
+/// turn 14 (item 53), and ends with the request; the output and the answer
+/// of turn 13 are not in it.
+#[tokio::test]
+async fn a_history_window_cut_inside_a_turn_reaches_the_engine_from_the_next_turn() {
+    let (app, requests, engine) = app().await;
+
+    let (status, conversation) = call(&app, Method::POST, "/v1/conversations", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{conversation}");
+    let conversation_id = conversation["id"].as_str().expect("a conversation id");
+    add_items(&app, conversation_id, &agent_turn_items()).await;
+
+    let (status, response) = call(
+        &app,
+        Method::POST,
+        "/v1/responses",
+        json!({
+            "model": MODEL,
+            "conversation": conversation_id,
+            "input": "item 151",
+            "max_output_tokens": 16,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["status"], "completed", "{response}");
+
+    let turns = last_prompt_turns(&requests);
+    assert_eq!(
+        &turns[..4],
+        [
+            "user",
+            "assistant+calls:call_14",
+            "tool:call_14",
+            "assistant"
+        ],
+        "{turns:?}"
+    );
+    assert!(!turns.contains(&"tool:call_13".to_string()), "{turns:?}");
+    // items 53 to 150, then the request
+    assert_eq!(turns.len(), 150 - 52 + 1, "{turns:?}");
+    let texts = last_prompt_texts(&requests);
+    assert_eq!(
+        texts.first().map(String::as_str),
+        Some("item 53"),
+        "{texts:?}"
+    );
+    assert_eq!(texts.last().map(String::as_str), Some("item 151"));
+    engine.abort();
+}
