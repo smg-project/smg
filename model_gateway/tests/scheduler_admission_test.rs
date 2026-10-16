@@ -2,8 +2,8 @@
 //!
 //! These complement the engine's in-process unit tests by driving the whole
 //! axum stack (tenant resolution → `priority_admission_middleware` → handler →
-//! `SchedulerGuardBody`) against mock workers, asserting the documented HTTP
-//! contract:
+//! the permit on the edge's body wrapper) against mock workers, asserting the
+//! documented HTTP contract:
 //!
 //! | Outcome              | Status | Extra                                   |
 //! |----------------------|--------|-----------------------------------------|
@@ -471,7 +471,7 @@ async fn preemption_evicts_bulk_and_serves_high_priority() {
         Some("1"),
         "preemption 503 must carry Retry-After: 1"
     );
-    // Draining the victim's 503 body drops its SchedulerGuardBody and frees the
+    // Draining the victim's 503 body drops the permit it carries and frees the
     // slot, so the (now-enqueued) interactive admission can proceed.
     let _ = body_json(bulk_resp).await;
 

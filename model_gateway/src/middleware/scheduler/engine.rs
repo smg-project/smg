@@ -25,7 +25,7 @@ use super::{
     slots::SlotPool,
     Class, ClassRuntimeConfig, SchedulerSettings,
 };
-use crate::worker::WorkerCapacity;
+use crate::{middleware::edge_body::Permit, worker::WorkerCapacity};
 
 /// Max time to wait, after firing a preemption cancel, for the victim's slot
 /// to free before falling back to enqueue.
@@ -207,7 +207,7 @@ impl PriorityScheduler {
                 // The mark is irreversible (no rollback — a CAS back to 0
                 // could race a now-arriving first byte). So a victim that
                 // doesn't unwind within the budget is still preempted: its
-                // first data frame is truncated by `SchedulerGuardBody`. For
+                // first data frame is truncated by the edge's body wrapper. For
                 // the victim to actually unwind, its handler must honor the
                 // cancel token (wired into the long-running handlers in M4.5
                 // / #1577); until that lands the flag must stay off.
@@ -828,10 +828,10 @@ impl SchedulerPermit {
         &self.handle
     }
 
-    /// Mark the first response byte. Called by [`super::body::SchedulerGuardBody`]
-    /// on the first data frame. Returns `false` if the scheduler already
-    /// won the preemption CAS — the body wrapper treats that as
-    /// "preempted, end the stream." The TTFT value is `admitted_at`
+    /// Mark the first response byte. Called by the edge's body wrapper (the
+    /// [`Permit`] below) on the first data frame. Returns `false` if the
+    /// scheduler already won the preemption CAS — the body wrapper treats
+    /// that as "preempted, end the stream." The TTFT value is `admitted_at`
     /// elapsed in millis, clamped by the handle to `[1, u64::MAX - 1]`.
     pub fn try_mark_first_byte(&self) -> bool {
         let now_ms = self.handle.admitted_at().elapsed().as_millis() as u64;
@@ -861,6 +861,15 @@ impl std::fmt::Debug for SchedulerPermit {
 impl Drop for SchedulerPermit {
     fn drop(&mut self) {
         self.scheduler.release_inflight(&self.handle);
+    }
+}
+
+/// On the response body: the first data frame marks TTFT, or ends the body
+/// without it when the scheduler preempted the request first; the drop
+/// releases the slot.
+impl Permit for SchedulerPermit {
+    fn first_data_frame(&mut self) -> bool {
+        self.try_mark_first_byte()
     }
 }
 

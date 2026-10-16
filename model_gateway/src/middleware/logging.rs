@@ -7,7 +7,10 @@
 //! and the response log, and once more if the response stream fails; it is
 //! not entered per body frame, so a long SSE stream costs no span bookkeeping
 //! per chunk. The span stays open until the body ends, so an exported trace
-//! still covers the whole stream.
+//! still covers the whole stream: it rides on the edge's one body wrapper
+//! (the metrics layer's [`EdgeBody`](super::edge_body::EdgeBody)), handed
+//! over through the response's extensions with the client-close line the
+//! access log owes if the body is dropped first.
 
 use std::{
     borrow::Cow,
@@ -40,6 +43,7 @@ use tracing::{debug, error, field::Empty, info, info_span, warn, Instrument, Spa
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::{
+    edge_body::BodyDuties,
     metrics::{matched_path_label, BodyProgress, CLIENT_CLOSED_REQUEST_STATUS},
     request_id::RequestId,
 };
@@ -575,7 +579,7 @@ where
                 let _enter = span.enter();
                 inner.call(request)
             };
-            let response = match future.instrument(span.clone()).await {
+            let mut response = match future.instrument(span.clone()).await {
                 Ok(response) => response,
                 Err(error) => {
                     close_log.done();
@@ -596,17 +600,18 @@ where
             // A body without a declared length is a stream: its bytes are
             // known at its end, which then gets a line of its own.
             let end_line = count_bytes && progress.declared().is_none();
-            Ok(response.map(|body| {
-                Body::new(SpannedBody {
-                    inner: body,
+            // The span stays open until the body ends: handed to the edge's one
+            // body wrapper with the close line it owes and the bytes it counts,
+            // which the wrapper reports at the body's end, failure or drop.
+            BodyDuties::hand(&mut response, |duties| {
+                duties.span = Some(SpanDuty {
                     span,
                     close_log,
-                    polled: false,
-                    progress,
                     count_bytes,
                     end_line,
-                })
-            }))
+                });
+            });
+            Ok(response)
         })
     }
 }
@@ -702,20 +707,14 @@ impl Drop for ClientCloseLog {
     }
 }
 
-/// A response body that keeps its request span alive until the body ends,
-/// without entering it per frame; a failure of the stream is logged under the
-/// span once, and so is the client closing the connection before the end.
-struct SpannedBody {
-    inner: Body,
+/// The request span, kept open until the response body ends without being
+/// entered per frame, and the access log's client-close line: carried by the
+/// edge's one body wrapper, which reports the body's end, failure or drop with
+/// the bytes that went out, so the record's byte fields are written here, at
+/// the body's end, by that one wrapper.
+pub(crate) struct SpanDuty {
     span: Span,
     close_log: ClientCloseLog,
-    /// Whether a frame was ever asked for: a body dropped before any poll is
-    /// one the server never meant to send (the answer to a HEAD request), not
-    /// one the client cut short.
-    polled: bool,
-    /// The declared length and the bytes out: the end-of-body rule shared
-    /// with the metrics wrapper.
-    progress: BodyProgress,
     /// Whether the record carries the response body's bytes.
     count_bytes: bool,
     /// Whether the body's end gets a line of its own (a streamed body, whose
@@ -723,12 +722,14 @@ struct SpannedBody {
     end_line: bool,
 }
 
-impl SpannedBody {
-    /// The body went out in full.
-    fn ended(&mut self) {
+impl SpanDuty {
+    /// The body ended (its last frame, or the declared length out) with
+    /// `bytes_sent` bytes out: a streamed body's end gets its line, with the
+    /// bytes, when the record carries them.
+    pub(crate) fn ended(&mut self, bytes_sent: u64) {
         self.close_log.done();
         if std::mem::replace(&mut self.end_line, false) {
-            self.span.record("response_bytes", self.progress.sent());
+            self.span.record("response_bytes", bytes_sent);
             let _enter = self.span.enter();
             info!(
                 target: "smg::response",
@@ -737,71 +738,34 @@ impl SpannedBody {
         }
     }
 
-    /// The bytes out so far, when the record carries them.
-    fn bytes_out(&self) -> Option<u64> {
-        self.count_bytes.then(|| self.progress.sent())
+    /// The response head went out but its body was never polled (the answer
+    /// to a HEAD request, a body complete before anyone read it): the span
+    /// closes with it, without an end line or a client-close line.
+    pub(crate) fn unpolled(&mut self) {
+        self.close_log.done();
     }
-}
 
-impl http_body::Body for SpannedBody {
-    type Data = <Body as http_body::Body>::Data;
-    type Error = <Body as http_body::Body>::Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        let this = self.get_mut();
-        this.polled = true;
-        let poll = Pin::new(&mut this.inner).poll_frame(cx);
-        match &poll {
-            Poll::Ready(Some(Err(error))) => {
-                // The bytes out before the failure, under the early-end key
-                // (`response_bytes` may hold the declared length already).
-                if let Some(bytes) = this.bytes_out() {
-                    this.span.record("response_bytes_sent", bytes);
-                }
-                StreamFailureLogger.on_failure(
-                    ServerErrorsFailureClass::Error(error.to_string()),
-                    Duration::ZERO,
-                    &this.span,
-                );
-                this.close_log.done();
-            }
-            Poll::Ready(None) => this.ended(),
-            Poll::Ready(Some(Ok(frame))) => {
-                // At its end: the last frame, or the declared length out.
-                if this
-                    .progress
-                    .frame_out(frame, http_body::Body::is_end_stream(&this.inner))
-                {
-                    this.ended();
-                }
-            }
-            Poll::Pending => {}
+    /// The body failed after its head: logged under the span, once, with the
+    /// bytes out before the failure under the early-end key (`response_bytes`
+    /// may hold the declared length already).
+    pub(crate) fn failed(&mut self, error: &axum::Error, bytes_sent: u64) {
+        if self.count_bytes {
+            self.span.record("response_bytes_sent", bytes_sent);
         }
-        poll
+        StreamFailureLogger.on_failure(
+            ServerErrorsFailureClass::Error(error.to_string()),
+            Duration::ZERO,
+            &self.span,
+        );
+        self.close_log.done();
     }
 
-    fn is_end_stream(&self) -> bool {
-        http_body::Body::is_end_stream(&self.inner)
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        http_body::Body::size_hint(&self.inner)
-    }
-}
-
-impl Drop for SpannedBody {
-    fn drop(&mut self) {
-        // Dropped before its end: the client closed the connection. A body
-        // that was never polled was not cut short.
-        if self.polled {
-            let bytes_out = self.bytes_out();
-            self.close_log.client_closed(bytes_out);
-        } else {
-            self.close_log.done();
-        }
+    /// The body was dropped before its end: the client closed the connection,
+    /// with the `bytes_sent` out so far on its line when the record carries
+    /// them.
+    pub(crate) fn client_closed(&mut self, bytes_sent: u64) {
+        let bytes = self.count_bytes.then_some(bytes_sent);
+        self.close_log.client_closed(bytes);
     }
 }
 
@@ -813,7 +777,7 @@ mod tests {
     };
 
     use axum::{
-        body::Bytes,
+        body::{Body, Bytes},
         http::{Request, StatusCode},
         routing::get,
         Router,
@@ -823,6 +787,9 @@ mod tests {
     use tracing_subscriber::{layer::SubscriberExt, Layer, Registry};
 
     use super::*;
+    use crate::{
+        middleware::HttpMetricsLayer, observability::inflight_tracker::InFlightRequestTracker,
+    };
 
     /// Counts how often any span is entered on this thread's subscriber.
     struct EnterCounter(Arc<AtomicUsize>);
@@ -854,7 +821,8 @@ mod tests {
                     ))
                 }),
             )
-            .layer(create_logging_layer(AccessLogFields::NONE));
+            .layer(create_logging_layer(AccessLogFields::NONE))
+            .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()));
         let response = app
             .oneshot(
                 Request::builder()
@@ -917,7 +885,8 @@ mod tests {
         let app = Router::new()
             .route("/refused", get(refused))
             .route("/failed", get(failed))
-            .layer(create_logging_layer(AccessLogFields::NONE));
+            .layer(create_logging_layer(AccessLogFields::NONE))
+            .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()));
         for (path, expected_errors) in [("/refused", 0), ("/failed", 1)] {
             errors.store(0, Ordering::Relaxed);
             let response = app
@@ -997,7 +966,8 @@ mod tests {
         let _guard = tracing::subscriber::set_default(Registry::default().with(fields.clone()));
         let app = Router::new()
             .route("/v1/models", get(|| async { "ok" }))
-            .layer(create_logging_layer(AccessLogFields::NONE));
+            .layer(create_logging_layer(AccessLogFields::NONE))
+            .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()));
         let key = "sk-test-7f3a9c0e11";
         let response = app
             .oneshot(
@@ -1047,6 +1017,9 @@ mod client_closed_tests {
     use tracing_subscriber::{layer::SubscriberExt, Layer, Registry};
 
     use super::*;
+    use crate::{
+        middleware::HttpMetricsLayer, observability::inflight_tracker::InFlightRequestTracker,
+    };
 
     /// Every event of the `smg::response` target, as (level, message).
     #[derive(Clone, Default)]
@@ -1122,6 +1095,7 @@ mod client_closed_tests {
                 }),
             )
             .layer(create_logging_layer(AccessLogFields::NONE))
+            .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()))
     }
 
     /// `/relay` answers with `body` under a `Content-Length` of nine bytes,
@@ -1146,6 +1120,7 @@ mod client_closed_tests {
                 }),
             )
             .layer(create_logging_layer(AccessLogFields::NONE))
+            .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()))
     }
 
     #[tokio::test]
@@ -1303,9 +1278,13 @@ mod field_tests {
     use crate::{
         config::{PolicyConfig, RouterConfig, RoutingMode},
         middleware::{
-            auth_middleware, route_request_meta_middleware, AuthConfig, TenantResolutionState,
+            auth_middleware, route_request_meta_middleware, AuthConfig, HttpMetricsLayer,
+            TenantResolutionState,
         },
-        observability::log_format::{JsonLine, SpanFields},
+        observability::{
+            inflight_tracker::InFlightRequestTracker,
+            log_format::{JsonLine, SpanFields},
+        },
     };
 
     const KEY: &str = "sk-test-5e1f0c9a7b3d2e4f";
@@ -1437,6 +1416,7 @@ mod field_tests {
             .route_layer(from_fn_with_state(tenants, route_request_meta_middleware))
             .route_layer(from_fn_with_state(auth, auth_middleware))
             .layer(create_logging_layer(fields))
+            .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()))
     }
 
     fn request(path: &str) -> Request<Body> {
@@ -1807,7 +1787,8 @@ mod field_tests {
                         }
                     }),
                 )
-                .layer(create_logging_layer(fields));
+                .layer(create_logging_layer(fields))
+                .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()));
             let response = app
                 .oneshot(
                     Request::builder()

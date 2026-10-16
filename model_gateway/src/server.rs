@@ -1399,6 +1399,9 @@ pub fn build_apps(
 
 /// The middleware every request crosses, matched or not: body limits, the
 /// trace-context echo, access logging, HTTP metrics, request ids and CORS.
+/// The metrics layer wraps the response body, once, with everything the
+/// layers inside hold until the body ends (the request span, an admission
+/// permit, an SSE keep-alive): see `middleware::edge_body`.
 ///
 /// `Router::layer` wraps only what the router holds when it is called, so the
 /// not-found fallback goes in first. Registered after the layers, unknown

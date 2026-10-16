@@ -4,6 +4,11 @@
 //! duration plus the in-flight connection count via
 //! `InFlightRequestTracker`. The path label is the matched axum route
 //! template (or `"other"` when unmatched) to bound metric cardinality.
+//! The layer is the outermost one with a duty that ends with the response
+//! body, and the one that wraps the body: the [`EdgeBody`] it builds carries
+//! this layer's in-flight guard and response count together with what the
+//! layers inside hand it (the request span, the admission permit, the SSE
+//! keep-alive), so a streamed frame crosses one wrapper.
 //!
 //! `smg_http_responses_total` counts a request once, when its outcome is
 //! known: the response's status once the response has gone out in full, or
@@ -43,9 +48,10 @@ use http_body::Body as _;
 use openai_protocol::validated::RejectionCode;
 use tower::{Layer, Service};
 
+use super::edge_body::{BodyDuties, EdgeBody};
 use crate::{
     observability::{
-        inflight_tracker::{InFlightGuard, InFlightRequestTracker},
+        inflight_tracker::InFlightRequestTracker,
         metrics::{method_to_static_str, Metrics},
     },
     routers::{
@@ -97,9 +103,9 @@ fn declared_body_length(response: &Response) -> Option<u64> {
 
 /// Where a response body stands: the length its response declared and the
 /// data bytes out so far. The body has gone out in full at its last frame,
-/// or once the bytes add up to the declared length. One rule for the
-/// metrics wrapper and the logging wrapper, so a response cannot count as
-/// complete in one and as cut short in the other.
+/// or once the bytes add up to the declared length: the one rule by which
+/// the edge body counts the response and closes its span, so a response
+/// cannot count as complete and read as cut short.
 pub(super) struct BodyProgress {
     declared: Option<u64>,
     sent: u64,
@@ -194,7 +200,7 @@ where
             // request as closed by the client.
             let mut outcome = ResponseOutcome::pending(path.clone());
 
-            let response = match inner.call(req).await {
+            let mut response = match inner.call(req).await {
                 Ok(response) => response,
                 Err(e) => {
                     // Decrement on error too.
@@ -214,15 +220,18 @@ where
             // guard is what `wait_for_drain()` and the age histogram observe.
             // The outcome rides along: the response counts when its body
             // ends, and as a client-closed request when the body is dropped
-            // before that.
+            // before that. The layers inside handed over what they hold
+            // until the body ends; the one wrapper carries it all.
             let progress = BodyProgress::new(&response);
+            let duties = BodyDuties::take(&mut response);
             let (parts, body) = response.into_parts();
-            let body = Body::new(TrackedBody::new(
+            let body = Body::new(EdgeBody::new(
                 body,
                 guard,
                 in_flight_request_tracker,
                 outcome,
                 progress,
+                duties,
             ));
             Ok(Response::from_parts(parts, body))
         })
@@ -233,7 +242,7 @@ where
 /// once: the response head's status once the response has gone out in full,
 /// the head's status with [`BODY_FAILED_CODE`] when its body failed after
 /// the head, a client-closed request when the client left first.
-struct ResponseOutcome {
+pub(super) struct ResponseOutcome {
     path: String,
     /// The response head's status and gateway error code, once there is one.
     head: Option<(u16, String)>,
@@ -241,7 +250,7 @@ struct ResponseOutcome {
 }
 
 impl ResponseOutcome {
-    fn pending(path: String) -> Self {
+    pub(super) fn pending(path: String) -> Self {
         Self {
             path,
             head: None,
@@ -250,7 +259,7 @@ impl ResponseOutcome {
     }
 
     /// The response head is out: the status a completed response counts as.
-    fn head(&mut self, response: &Response) {
+    pub(super) fn head(&mut self, response: &Response) {
         self.head = Some((
             response.status().as_u16(),
             error_code_label(response).to_owned(),
@@ -258,7 +267,7 @@ impl ResponseOutcome {
     }
 
     /// The response went out in full: count its head's status.
-    fn completed(&mut self) {
+    pub(super) fn completed(&mut self) {
         if std::mem::replace(&mut self.recorded, true) {
             return;
         }
@@ -269,7 +278,7 @@ impl ResponseOutcome {
 
     /// The body failed after the head went out: count the head's status,
     /// with the failure named unless the head carried a gateway error code.
-    fn body_failed(&mut self) {
+    pub(super) fn body_failed(&mut self) {
         if std::mem::replace(&mut self.recorded, true) {
             return;
         }
@@ -284,7 +293,7 @@ impl ResponseOutcome {
     }
 
     /// The client closed the connection before the response completed.
-    fn client_closed(&mut self) {
+    pub(super) fn client_closed(&mut self) {
         if std::mem::replace(&mut self.recorded, true) {
             return;
         }
@@ -308,130 +317,6 @@ impl Drop for ResponseOutcome {
         // whose client closed the connection (and, rarely, with one whose
         // handler panicked or that a forced shutdown cut: the module doc).
         self.client_closed();
-    }
-}
-
-/// Response-body wrapper that carries the in-flight guard, and the response's
-/// count, until the body completes or is dropped.
-///
-/// Unary bodies release at write-out (same point a handler-scoped guard would
-/// observe, modulo the final write); streaming bodies release at stream
-/// completion or client disconnect — which is what makes SSE generations
-/// visible to graceful drain and stuck-request detection, and a stream the
-/// client cut countable as such.
-struct TrackedBody {
-    inner: Body,
-    guard: Option<InFlightGuard>,
-    tracker: Arc<InFlightRequestTracker>,
-    outcome: ResponseOutcome,
-    /// Whether a frame was ever asked for. A body dropped before any poll is
-    /// one the server never meant to send (the answer to a HEAD request), not
-    /// one the client cut short.
-    polled: bool,
-    /// The declared length and the bytes out: the end-of-body rule shared
-    /// with the logging wrapper.
-    progress: BodyProgress,
-}
-
-impl TrackedBody {
-    fn new(
-        inner: Body,
-        guard: InFlightGuard,
-        tracker: Arc<InFlightRequestTracker>,
-        outcome: ResponseOutcome,
-        progress: BodyProgress,
-    ) -> Self {
-        let mut body = Self {
-            inner,
-            guard: Some(guard),
-            tracker,
-            outcome,
-            polled: false,
-            progress,
-        };
-        // An already-complete body (e.g. an empty unary response) may never be
-        // polled at all; do not retain the guard past construction for it,
-        // and count the response now.
-        if body.inner.is_end_stream() {
-            body.ended();
-        }
-        body
-    }
-
-    fn release(&mut self) {
-        if let Some(guard) = self.guard.take() {
-            // Drop before reading len() so the gauge reflects the decrement.
-            drop(guard);
-            Metrics::set_http_connections_active(self.tracker.len());
-        }
-    }
-
-    /// The body reached its end: the response is out and counts as its
-    /// head's status.
-    fn ended(&mut self) {
-        self.release();
-        self.outcome.completed();
-    }
-
-    /// The body failed after its head: the response ends here, truncated,
-    /// and counts as its head's status with the failure named.
-    fn failed(&mut self) {
-        self.release();
-        self.outcome.body_failed();
-    }
-}
-
-impl http_body::Body for TrackedBody {
-    type Data = Bytes;
-    type Error = axum::Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        let this = self.get_mut();
-        this.polled = true;
-        let poll = Pin::new(&mut this.inner).poll_frame(cx);
-        // Release as soon as the end of the stream is knowable: at the
-        // trailing None, on error, right after a successful final frame
-        // when the body reports is_end_stream(), or once the data frames add
-        // up to the length the response declared. Under the http_body
-        // contract, consumers may stop polling at those points and never ask
-        // for the None (an HTTP/1.1 server stops at the declared length).
-        // Drop still covers client disconnect.
-        match &poll {
-            Poll::Ready(None) => this.ended(),
-            Poll::Ready(Some(Err(_))) => this.failed(),
-            Poll::Ready(Some(Ok(frame))) => {
-                if this.progress.frame_out(frame, this.inner.is_end_stream()) {
-                    this.ended();
-                }
-            }
-            Poll::Pending => {}
-        }
-        poll
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        self.inner.size_hint()
-    }
-}
-
-impl Drop for TrackedBody {
-    fn drop(&mut self) {
-        self.release();
-        // Dropped before its end: the server stopped writing the body because
-        // the client closed the connection. A body that was never polled was
-        // not cut short; it counts as the response it was.
-        if self.polled {
-            self.outcome.client_closed();
-        } else {
-            self.outcome.completed();
-        }
     }
 }
 

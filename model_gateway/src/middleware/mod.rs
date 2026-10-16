@@ -8,6 +8,7 @@ pub mod auth;
 pub mod body_limit;
 pub mod body_timeout;
 pub mod concurrency;
+pub mod edge_body;
 pub mod logging;
 pub mod messages_errors;
 pub mod metrics;
@@ -22,7 +23,7 @@ pub mod wasm;
 pub use auth::{auth_middleware, deny_all_middleware, AuthConfig};
 pub use body_limit::{mark_passed_body_limit_middleware, payload_too_large_envelope_middleware};
 pub use body_timeout::{request_body_timeout_middleware, RequestBodyTimeouts};
-pub use concurrency::{concurrency_limit_middleware, AdmissionQueue, TokenGuardBody};
+pub use concurrency::{concurrency_limit_middleware, AdmissionQueue};
 pub use logging::{
     create_logging_layer, trace_context_response, AccessLogFields, AccessLogRecord, ProbeResponse,
     ReportedRefusal, RequestLogger, RequestSpan, ResponseLogger, StreamFailureLogger,

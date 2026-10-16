@@ -5,13 +5,14 @@
 //! later, and nothing was sent in between. An idle-timeout proxy in front of
 //! the gateway cuts a connection that carries no byte for its idle window
 //! (sixty seconds is a common setting), and the client sees a stream that
-//! ends before it began. [`sse_keepalive_middleware`] wraps every SSE
-//! response body so an interval of silence is broken by a frame the client
-//! ignores: an SSE comment on the OpenAI-shaped routes, the `ping` event the
-//! Messages API specifies on `/v1/messages`. The interval runs from the
-//! headers and from every frame sent, so a flowing stream carries no
-//! keep-alive; a keep-alive is only ever written between frames, never
-//! inside one.
+//! ends before it began. [`sse_keepalive_middleware`] gives every SSE
+//! response a [`KeepAlive`], carried by the edge's one body wrapper (the
+//! metrics layer's [`EdgeBody`](super::edge_body::EdgeBody)), so an interval
+//! of silence is broken by a frame the client ignores: an SSE comment on the
+//! OpenAI-shaped routes, the `ping` event the Messages API specifies on
+//! `/v1/messages`. The interval runs from the headers and from every frame
+//! sent, so a flowing stream carries no keep-alive; a keep-alive is only
+//! ever written between frames, never inside one.
 
 use std::{
     future::Future,
@@ -28,9 +29,10 @@ use axum::{
     response::Response,
 };
 use bytes::Bytes;
-use http_body::{Body as HttpBody, Frame, SizeHint};
+use http_body::Body as HttpBody;
 use tokio::time::{Instant, Sleep};
 
+use super::edge_body::BodyDuties;
 use crate::{
     config::types::RouterConfig,
     routers::http::stream_failure::{note_sent, on_frame_boundary},
@@ -64,13 +66,13 @@ impl SseKeepAlive {
         }
     }
 
-    /// Wraps the body of an SSE `response` whose length is not known up
-    /// front (a complete SSE answer has nothing to wait for, and a body sent
-    /// under a `Content-Length` header must not grow past it: the relays copy
-    /// an upstream's header onto a streamed body); `messages` selects the
-    /// Messages API's ping over the comment. Anything else is returned as it
-    /// came.
-    pub(crate) fn apply(self, response: Response, messages: bool) -> Response {
+    /// Gives an SSE `response` whose length is not known up front (a
+    /// complete SSE answer has nothing to wait for, and a body sent under a
+    /// `Content-Length` header must not grow past it: the relays copy an
+    /// upstream's header onto a streamed body) its keep-alive, handed to the
+    /// edge's body wrapper; `messages` selects the Messages API's ping over
+    /// the comment. Anything else is returned as it came.
+    pub(crate) fn apply(self, mut response: Response, messages: bool) -> Response {
         let Some(interval) = self.interval else {
             return response;
         };
@@ -81,7 +83,10 @@ impl SseKeepAlive {
             return response;
         }
         let frame = Bytes::from_static(if messages { MESSAGES_PING } else { COMMENT });
-        response.map(|body| Body::new(KeepAliveBody::new(body, interval, frame)))
+        BodyDuties::hand(&mut response, |duties| {
+            duties.keep_alive = Some(KeepAlive::new(interval, frame));
+        });
+        response
     }
 }
 
@@ -105,12 +110,13 @@ pub async fn sse_keepalive_middleware(
     keep_alive.apply(next.run(request).await, messages)
 }
 
-/// Body wrapper that writes `frame` after `interval` of silence, on a frame
-/// boundary. The timer is lazy: when it fires it is re-armed from the time
-/// of the last frame rather than reset on every frame, so a flowing stream
-/// costs one timer wake per interval, not one per token.
-struct KeepAliveBody {
-    inner: Body,
+/// The keep-alive of one SSE body: `frame` after `interval` of silence, on a
+/// frame boundary. The edge's body wrapper tells it of every frame sent and
+/// polls it while the body is quiet. The timer is lazy: when it fires it is
+/// re-armed from the time of the last frame rather than reset on every
+/// frame, so a flowing stream costs one timer wake per interval, not one per
+/// token.
+pub(crate) struct KeepAlive {
     interval: Duration,
     frame: Bytes,
     /// When the headers, the last frame or the last keep-alive went out.
@@ -121,11 +127,10 @@ struct KeepAliveBody {
     timer: Pin<Box<Sleep>>,
 }
 
-impl KeepAliveBody {
-    fn new(inner: Body, interval: Duration, frame: Bytes) -> Self {
+impl KeepAlive {
+    fn new(interval: Duration, frame: Bytes) -> Self {
         let now = Instant::now();
         Self {
-            inner,
             interval,
             frame,
             last_sent: now,
@@ -133,56 +138,36 @@ impl KeepAliveBody {
             timer: Box::pin(tokio::time::sleep_until(now + interval)),
         }
     }
-}
 
-impl HttpBody for KeepAliveBody {
-    type Data = Bytes;
-    type Error = axum::Error;
+    /// A data frame of the body went out.
+    pub(crate) fn frame_out(&mut self, data: &[u8]) {
+        note_sent(&mut self.tail, data);
+        self.last_sent = Instant::now();
+    }
 
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
-        let this = &mut *self;
-        match Pin::new(&mut this.inner).poll_frame(cx) {
-            Poll::Ready(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref() {
-                    note_sent(&mut this.tail, data);
-                    this.last_sent = Instant::now();
-                }
-                return Poll::Ready(Some(Ok(frame)));
-            }
-            Poll::Ready(end) => return Poll::Ready(end),
-            Poll::Pending => {}
-        }
-        // The upstream is quiet. The timer is due `interval` after the last
-        // frame: fired early (a frame went out since it was armed) it is
-        // re-armed for then; fired inside a frame it is re-armed for another
-        // interval and nothing is written.
+    /// The body is quiet: the keep-alive frame once `interval` has passed
+    /// since the last frame, on a frame boundary; pending, with the timer
+    /// armed, until then. The timer is due `interval` after the last frame:
+    /// fired early (a frame went out since it was armed) it is re-armed for
+    /// then; fired inside a frame it is re-armed for another interval and
+    /// nothing is written.
+    pub(crate) fn poll_silence(&mut self, cx: &mut Context<'_>) -> Poll<Bytes> {
         loop {
-            if this.timer.as_mut().poll(cx).is_pending() {
+            if self.timer.as_mut().poll(cx).is_pending() {
                 return Poll::Pending;
             }
             let now = Instant::now();
-            let due = this.last_sent + this.interval;
+            let due = self.last_sent + self.interval;
             if now < due {
-                this.timer.as_mut().reset(due);
-            } else if on_frame_boundary(&this.tail) {
-                this.last_sent = now;
-                this.timer.as_mut().reset(now + this.interval);
-                return Poll::Ready(Some(Ok(Frame::data(this.frame.clone()))));
+                self.timer.as_mut().reset(due);
+            } else if on_frame_boundary(&self.tail) {
+                self.last_sent = now;
+                self.timer.as_mut().reset(now + self.interval);
+                return Poll::Ready(self.frame.clone());
             } else {
-                this.timer.as_mut().reset(now + this.interval);
+                self.timer.as_mut().reset(now + self.interval);
             }
         }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
     }
 }
 
@@ -200,6 +185,10 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::{
+        middleware::{edge_body::at_the_edge, HttpMetricsLayer},
+        observability::inflight_tracker::InFlightRequestTracker,
+    };
 
     const SECS: u64 = 15;
     type Chunk = Result<Bytes, std::io::Error>;
@@ -228,11 +217,12 @@ mod tests {
             .unwrap()
     }
 
-    /// An SSE body under the keep-alive, fed through the returned sender.
+    /// An SSE body under the keep-alive, at the edge, fed through the
+    /// returned sender.
     fn wrapped(secs: u64, messages: bool) -> (mpsc::Sender<Chunk>, Body) {
         let (tx, rx) = mpsc::channel(16);
         let response = SseKeepAlive::every_secs(secs).apply(sse(rx), messages);
-        (tx, response.into_body())
+        (tx, at_the_edge(response).into_body())
     }
 
     async fn send(tx: &mpsc::Sender<Chunk>, bytes: &'static [u8]) {
@@ -340,6 +330,7 @@ mod tests {
                 SseKeepAlive::every_secs(SECS),
                 sse_keepalive_middleware,
             ))
+            .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()))
     }
 
     async fn call(app: Router, path: &str) -> Response {
