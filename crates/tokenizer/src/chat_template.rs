@@ -187,7 +187,8 @@ fn mentions_thinking_variable(template: &str) -> bool {
 /// same templates as the engine does (see [`ChatTemplateState::apply`]). A
 /// template is of the "openai" format when it has a loop over a message's
 /// content, a message being a loop variable over `messages` or over a
-/// variable assigned from it: the loop runs over `message.content` (also
+/// variable assigned from it (a namespace attribute included, `{% set
+/// ns.rest = messages[1:] %}`): the loop runs over `message.content` (also
 /// through a filter, a test or a slice), over a macro parameter the template
 /// fills with a message's content, or, outside any macro, over a variable
 /// named `content`. Any other template is of the "string" format, one that
@@ -402,8 +403,11 @@ fn is_var_or_elems_access(expr: &Expr<'_>, varname: &str, key: Option<&str>) -> 
         Expr::Var(v) => key.is_none() && v.id == varname,
         // The base of the attribute is the name itself, as in the engine's
         // `_is_attr_access`; the wrappers above are allowed around the whole
-        // access only.
-        Expr::GetAttr(g) => key.is_some_and(|key| g.name == key && is_var(&g.expr, varname)),
+        // access only. Without a key, a namespace attribute path is the name.
+        Expr::GetAttr(g) => match key {
+            Some(key) => g.name == key && is_var(&g.expr, varname),
+            None => attr_path(expr).as_deref() == Some(varname),
+        },
         Expr::GetItem(g) => key.is_some_and(|key| {
             matches!(&g.subscript_expr, Expr::Const(c) if c.value.as_str() == Some(key))
                 && is_var(&g.expr, varname)
@@ -412,27 +416,50 @@ fn is_var_or_elems_access(expr: &Expr<'_>, varname: &str, key: Option<&str>) -> 
     }
 }
 
-/// Whether `expr` is the plain name `varname`: the engine's `_is_var_access`.
+/// Whether `expr` is the plain name `varname`, or the namespace attribute
+/// path `varname` spells (`ns.rest`): the engine's `_is_var_access`, plus
+/// the namespace attributes [`names_assigned_from`] records.
 fn is_var(expr: &Expr<'_>, varname: &str) -> bool {
-    matches!(expr, Expr::Var(v) if v.id == varname)
+    match expr {
+        Expr::Var(v) => v.id == varname,
+        Expr::GetAttr(_) => attr_path(expr).as_deref() == Some(varname),
+        _ => false,
+    }
+}
+
+/// The dotted path of a chain of attribute accesses on a plain name
+/// (`ns.rest`), the way a namespace attribute is written; `None` for any
+/// other expression.
+fn attr_path(expr: &Expr<'_>) -> Option<String> {
+    match expr {
+        Expr::Var(v) => Some(v.id.to_string()),
+        Expr::GetAttr(g) => attr_path(&g.expr).map(|base| format!("{base}.{}", g.name)),
+        _ => None,
+    }
 }
 
 /// `root` and every name assigned from it or from such a name, through
 /// filters, tests and slices: the engine's `_iter_nodes_assign_var_or_elems`.
-fn names_assigned_from<'a>(sets: &[&'a Set<'a>], root: &'a str) -> Result<Vec<&'a str>, NotAName> {
-    let mut names = vec![root];
-    let mut queue = std::collections::VecDeque::from([root]);
+/// A namespace attribute assigned that way (`{% set ns.rest = messages[1:] %}`,
+/// which a template loops over as `ns.rest`) is recorded by its dotted path,
+/// where the engine's walk stops; any other target that is not a name stops
+/// this one too.
+fn names_assigned_from<'a>(sets: &[&'a Set<'a>], root: &'a str) -> Result<Vec<String>, NotAName> {
+    let mut names = vec![root.to_string()];
+    let mut queue = std::collections::VecDeque::from([root.to_string()]);
     while let Some(related) = queue.pop_front() {
         for set in sets {
-            if !is_var_or_elems_access(&set.expr, related, None) {
+            if !is_var_or_elems_access(&set.expr, &related, None) {
                 continue;
             }
-            let Expr::Var(target) = &set.target else {
-                return Err(NotAName);
+            let target = match &set.target {
+                Expr::Var(target) => target.id.to_string(),
+                Expr::GetAttr(_) => attr_path(&set.target).ok_or(NotAName)?,
+                _ => return Err(NotAName),
             };
-            if !names.contains(&target.id) {
-                names.push(target.id);
-                queue.push_back(target.id);
+            if !names.contains(&target) {
+                names.push(target.clone());
+                queue.push_back(target);
             }
         }
     }
@@ -443,7 +470,7 @@ fn names_assigned_from<'a>(sets: &[&'a Set<'a>], root: &'a str) -> Result<Vec<&'
 /// `_iter_nodes_assign_messages_item`.
 fn message_loop_vars<'a>(
     loops: &[(&'a ForLoop<'a>, Vec<&'a Macro<'a>>)],
-    messages_names: &[&str],
+    messages_names: &[String],
 ) -> Result<Vec<&'a str>, NotAName> {
     let mut vars = Vec::new();
     for (fl, _) in loops {
@@ -2187,6 +2214,51 @@ mod tests {
         assert_eq!(
             detect_chat_template_content_format(parts_template),
             ChatTemplateContentFormat::OpenAI
+        );
+    }
+
+    /// A template that keeps the messages it loops over in a namespace
+    /// attribute (`ns.rest = messages[1:]`) and renders each message's
+    /// content through a macro that walks its parts is of the "openai"
+    /// format: its parts reach the template, which writes the media anchors
+    /// itself. Any other non-name assignment target still falls back to the
+    /// "string" format.
+    #[test]
+    fn namespace_message_lists_are_followed_to_their_content_loop() {
+        let template = "{%- macro render_content(content) -%}\
+                        {%- if content is string -%}{{ content }}\
+                        {%- else -%}{%- for part in content -%}\
+                        {%- if part.get('type', '') in ['image', 'image_url'] -%}<|patch|>\
+                        {%- elif part.get('type', '') == 'text' -%}{{ part.get('text', '') }}\
+                        {%- endif -%}{%- endfor -%}{%- endif -%}{%- endmacro -%}\
+                        {%- set ns = namespace(rest=messages) -%}\
+                        {%- if messages and messages[0]['role'] == 'system' -%}\
+                        {%- set ns.rest = messages[1:] -%}{%- endif -%}\
+                        {%- for message in ns.rest -%}\
+                        <|start|>{{ message['role'] }}<|message|>{{ render_content(message['content']) }}<|eot|>\
+                        {%- endfor -%}";
+        assert_eq!(
+            detect_chat_template_content_format(template),
+            ChatTemplateContentFormat::OpenAI
+        );
+        let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
+        let messages = [serde_json::json!({"role": "user", "content": [
+            {"type": "image"}, {"type": "text", "text": "what is this?"}
+        ]})];
+        let rendered = processor
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<|start|>user<|message|><|patch|>what is this?<|eot|>"
+        );
+
+        // A plain string-content template with the same namespace shape stays string-format.
+        let plain = "{%- set ns = namespace(rest=messages) -%}{%- for message in ns.rest -%}\
+                     {{ message['content'] }}{%- endfor -%}";
+        assert_eq!(
+            detect_chat_template_content_format(plain),
+            ChatTemplateContentFormat::String
         );
     }
 
