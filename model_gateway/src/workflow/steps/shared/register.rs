@@ -8,15 +8,10 @@ use wfaas::{
     StepExecutor, StepId, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
 };
 
+use super::{refresh_worker_pool_sizes, PoolGroups};
 use crate::{
-    observability::metrics::Metrics,
     routers::common::pd_admission,
-    worker::{
-        bootstrap_probe,
-        registry::WorkerId,
-        worker::{ConnectionModeExt, WorkerTypeExt},
-        Worker, WorkerRegistry,
-    },
+    worker::{bootstrap_probe, registry::WorkerId, Worker, WorkerRegistry},
     workflow::data::{WorkerRegistrationData, WorkerRegistrationMode},
 };
 
@@ -182,7 +177,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
         }
 
         // Collect unique worker configurations to avoid redundant metric updates
-        let unique_configs: HashSet<_> = workers
+        let unique_configs: PoolGroups = workers
             .iter()
             .map(|w| {
                 let meta = w.metadata();
@@ -196,29 +191,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
 
         // Update Layer 3 worker pool size metrics per unique
         // `(worker_type, connection_mode, model_id)`.
-        for (worker_type, connection_mode, model_id) in &unique_configs {
-            // Get labels before moving values into get_workers_filtered
-            let worker_type_label = worker_type.as_metric_label();
-            let connection_mode_label = connection_mode.as_metric_label();
-
-            let pool_size = app_context
-                .worker_registry
-                .get_workers_filtered(
-                    Some(model_id),
-                    Some(*worker_type),
-                    Some(*connection_mode),
-                    None,
-                    false,
-                )
-                .len();
-
-            Metrics::set_worker_pool_size(
-                worker_type_label,
-                connection_mode_label,
-                model_id,
-                pool_size,
-            );
-        }
+        refresh_worker_pool_sizes(&app_context.worker_registry, &unique_configs);
 
         // WorkerMonitor subscribes to registry events directly (see
         // `worker::monitor::WorkerMonitor::start_event_loop`), so this

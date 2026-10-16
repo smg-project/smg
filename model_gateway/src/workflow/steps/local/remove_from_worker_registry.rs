@@ -1,15 +1,12 @@
 //! Step to remove workers from worker registry.
 
-use std::collections::HashSet;
-
 use async_trait::async_trait;
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::{
-    observability::metrics::Metrics,
-    worker::worker::{ConnectionModeExt, WorkerTypeExt},
-    workflow::data::WorkerRemovalWorkflowData,
+use crate::workflow::{
+    data::WorkerRemovalWorkflowData,
+    steps::shared::{refresh_worker_pool_sizes, PoolGroups},
 };
 
 /// Step to remove workers from the worker registry.
@@ -42,11 +39,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
         // pulled from the registry. The cache eviction the old
         // `LoadMonitor` path used to do here is now handled by
         // `WorkerMonitor` reacting to `WorkerEvent::Removed`.
-        let mut unique_configs: HashSet<(
-            openai_protocol::worker::WorkerType,
-            openai_protocol::worker::ConnectionMode,
-            String,
-        )> = HashSet::new();
+        let mut unique_configs = PoolGroups::new();
         for url in worker_urls {
             if let Some(w) = app_context.worker_registry.get_by_url(url) {
                 let meta = w.metadata();
@@ -85,29 +78,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
         // directly and reconciles per-group polling state on its own,
         // so this step no longer needs to push group-removed
         // notifications.
-        for (worker_type, connection_mode, model_id) in &unique_configs {
-            // Get labels before moving values into get_workers_filtered
-            let worker_type_label = worker_type.as_metric_label();
-            let connection_mode_label = connection_mode.as_metric_label();
-
-            let pool_size = app_context
-                .worker_registry
-                .get_workers_filtered(
-                    Some(model_id),
-                    Some(*worker_type),
-                    Some(*connection_mode),
-                    None,
-                    false,
-                )
-                .len();
-
-            Metrics::set_worker_pool_size(
-                worker_type_label,
-                connection_mode_label,
-                model_id,
-                pool_size,
-            );
-        }
+        refresh_worker_pool_sizes(&app_context.worker_registry, &unique_configs);
 
         Ok(StepResult::Success)
     }
