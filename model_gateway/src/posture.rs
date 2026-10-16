@@ -234,7 +234,7 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::config::TenantApiKeyEntry;
+    use crate::config::{TenantApiKeyEntry, TlsClientAuth};
 
     fn unkeyed() -> AuthConfig {
         AuthConfig::new(None)
@@ -314,6 +314,22 @@ mod tests {
                 .starts_with("OPEN: POST /workers"),
             "no listener named without one"
         );
+    }
+
+    /// Required client certificates are a credential requirement of their
+    /// own: with them and no key, the serving routes are not open; optional
+    /// ones leave the plane as the keys leave it.
+    #[test]
+    fn required_client_certificates_close_the_data_plane() {
+        let required = unkeyed().with_client_certificates(TlsClientAuth::Required);
+        let open = OpenSurfaces::judge(&required, &unkeyed(), true, None);
+        assert!(!open.data_plane);
+        assert!(!open.control_plane);
+        assert!(open_posture_warning(open, None, None).is_none());
+
+        let optional = unkeyed().with_client_certificates(TlsClientAuth::Optional);
+        let open = OpenSurfaces::judge(&optional, &unkeyed(), true, None);
+        assert!(open.data_plane, "optional certificates alone leave it open");
     }
 
     #[test]
