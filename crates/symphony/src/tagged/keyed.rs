@@ -22,13 +22,11 @@
 //!
 //! Notes on what this module decides, and on what it leaves open: `docs/assemblers.md`.
 
+use super::object::{Mode, Object};
 use crate::{
-    event::{runs, DropReason, Event, Events, MalformedReason, Text},
+    event::{runs, Event, Events, MalformedReason, Text},
     markers::{Piece, Scanner},
-    tagged::{
-        assembler::{push_escaped, push_quoted},
-        value::{json, Declared, Kind, NULL_WORDS},
-    },
+    tagged::value::{json, Declared, Kind},
 };
 
 const KEY_OPEN: usize = 0;
@@ -190,17 +188,14 @@ impl Tags {
 /// The events of one keyed call, from the bytes after the call's opening marker.
 #[derive(Clone, Debug)]
 pub struct Assembler {
-    index: u32,
     id: String,
     tags: Tags,
     scanner: Scanner,
-    /// Bytes no event has accounted for yet, in order; the next event takes them as its source.
-    carried: String,
+    /// The arguments object as it is written, with the bytes carried for the next event's source.
+    object: Object,
     stage: Stage,
     /// The function's name once `ToolCallStart` was pushed.
     function: Option<String>,
-    /// Members written to the arguments object so far.
-    written: u32,
     done: bool,
 }
 
@@ -227,22 +222,11 @@ struct ValueState {
     mode: Mode,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Mode {
-    /// A declared string, pushed piece by piece once its opening fragment is out.
-    Streaming { opened: bool },
-    /// Written at the close with [`json`].
-    Whole,
-    /// A string that may be null: held until its text rules the null words out.
-    Undecided,
-}
-
 impl Assembler {
     /// An assembler for the call at `index` with the id the format minted for it, positioned
     /// just after the call's opening marker.
     pub fn new(index: u32, id: impl Into<String>, tags: Tags) -> Self {
         Self {
-            index,
             id: id.into(),
             scanner: Scanner::new([
                 tags.key_open,
@@ -251,10 +235,9 @@ impl Assembler {
                 tags.value_close,
             ]),
             tags,
-            carried: String::new(),
+            object: Object::new(index),
             stage: Stage::Name,
             function: None,
-            written: 0,
             done: false,
         }
     }
@@ -285,25 +268,25 @@ impl Assembler {
             return;
         }
         let held = self.scanner.held().to_string();
-        self.carried.push_str(&held);
+        self.object.carried.push_str(&held);
         if matches!(self.stage, Stage::Name) {
             self.name_call(out);
         }
         if !self.started() {
-            self.carried.push_str(terminal);
-            self.report(WITHOUT_A_NAME, out);
+            self.object.carried.push_str(terminal);
+            self.object.report(WITHOUT_A_NAME, out);
             return;
         }
         match std::mem::replace(&mut self.stage, Stage::Between) {
             Stage::Between | Stage::Name => {}
             Stage::Value(value) => self.cut_value(&value, out),
             // A key or a tag the end cut short: its bytes are reported, and the object closes.
-            _ => self.report(TAG_CUT_SHORT, out),
+            _ => self.object.report(TAG_CUT_SHORT, out),
         }
-        let source = Text::uncounted(std::mem::take(&mut self.carried));
-        self.close_object(source, out);
+        let source = Text::uncounted(std::mem::take(&mut self.object.carried));
+        self.object.close(source, out);
         out.push(Event::ToolCallEnd {
-            index: self.index,
+            index: self.object.index,
             source: Text::uncounted(terminal),
         });
         self.done = true;
@@ -318,16 +301,16 @@ impl Assembler {
             return;
         }
         let held = self.scanner.held().to_string();
-        self.carried.push_str(&held);
-        if !self.carried.is_empty() {
+        self.object.carried.push_str(&held);
+        if !self.object.carried.is_empty() {
             out.push(Event::Malformed {
-                text: Text::uncounted(std::mem::take(&mut self.carried)),
+                text: Text::uncounted(std::mem::take(&mut self.object.carried)),
                 why: MalformedReason::UnterminatedRegion,
             });
         }
         if self.started() {
             out.push(Event::ToolCallEnd {
-                index: self.index,
+                index: self.object.index,
                 source: Text::default(),
             });
         }
@@ -350,7 +333,7 @@ impl Assembler {
                 if self.started() {
                     self.tag_between(tag, out);
                 } else {
-                    self.drop_carried(out);
+                    self.object.drop_carried(out);
                     out.push(Event::Malformed {
                         text: Text::uncounted(bytes),
                         why: MalformedReason::Other(TAG_OUT_OF_PLACE.to_string()),
@@ -359,10 +342,10 @@ impl Assembler {
             }
             Stage::Between => self.tag_between(tag, out),
             Stage::Key { start } if tag == KEY_CLOSE => {
-                let key = self.carried[*start..].to_string();
-                self.carried.push_str(bytes);
+                let key = self.object.carried[*start..].to_string();
+                self.object.carried.push_str(bytes);
                 if key.is_empty() {
-                    self.report(EMPTY_KEY, out);
+                    self.object.report(EMPTY_KEY, out);
                     self.stage = Stage::Between;
                 } else {
                     self.stage = Stage::Keyed { key };
@@ -370,7 +353,7 @@ impl Assembler {
             }
             Stage::Keyed { key } if tag == VALUE_OPEN => {
                 let key = key.clone();
-                self.carried.push_str(bytes);
+                self.object.carried.push_str(bytes);
                 self.open_value(key, declared);
             }
             Stage::Value(_) if tag == VALUE_CLOSE => self.close_value(bytes, out),
@@ -379,7 +362,7 @@ impl Assembler {
             // A tag cuts a key short, or stands where the syntax has another: the bytes so far
             // are reported, and the tag is read as between keys.
             _ => {
-                self.report(TAG_CUT_SHORT, out);
+                self.object.report(TAG_CUT_SHORT, out);
                 self.stage = Stage::Between;
                 self.tag_between(tag, out);
             }
@@ -391,12 +374,12 @@ impl Assembler {
     fn tag_between(&mut self, tag: usize, out: &mut Events) {
         let bytes = self.tags.text(tag);
         if tag == KEY_OPEN && self.started() {
-            self.carried.push_str(bytes);
+            self.object.carried.push_str(bytes);
             self.stage = Stage::Key {
-                start: self.carried.len(),
+                start: self.object.carried.len(),
             };
         } else {
-            self.drop_carried(out);
+            self.object.drop_carried(out);
             out.push(Event::Malformed {
                 text: Text::uncounted(bytes),
                 why: MalformedReason::Other(TAG_OUT_OF_PLACE.to_string()),
@@ -406,7 +389,7 @@ impl Assembler {
 
     fn text(&mut self, text: &str, out: &mut Events) {
         match &self.stage {
-            Stage::Name | Stage::Key { .. } => self.carried.push_str(text),
+            Stage::Name | Stage::Key { .. } => self.object.carried.push_str(text),
             Stage::Between | Stage::Keyed { .. } => self.text_between(text, out),
             Stage::Value(_) => self.value_text(text, out),
         }
@@ -416,9 +399,9 @@ impl Assembler {
     fn text_between(&mut self, text: &str, out: &mut Events) {
         for (run, space) in runs(text) {
             if space {
-                self.carried.push_str(run);
+                self.object.carried.push_str(run);
             } else {
-                self.drop_carried(out);
+                self.object.drop_carried(out);
                 out.push(Event::Malformed {
                     text: Text::uncounted(run),
                     why: MalformedReason::Other(TEXT_BETWEEN_TAGS.to_string()),
@@ -431,7 +414,7 @@ impl Assembler {
     /// the whitespace after the name is carried into the next source. A name with no text is
     /// reported, and no call starts.
     fn name_call(&mut self, out: &mut Events) {
-        let name = self.carried.trim().to_string();
+        let name = self.object.carried.trim().to_string();
         if name.is_empty() {
             self.stage = Stage::Between;
             return;
@@ -439,19 +422,19 @@ impl Assembler {
         if !is_name(&name) {
             // Text where the name should be, a JSON call inside a code fence or prose: reported,
             // and no call starts.
-            self.report(NOT_A_NAME, out);
+            self.object.report(NOT_A_NAME, out);
             self.stage = Stage::Between;
             return;
         }
-        let end = self.carried.trim_end().len();
-        let after = self.carried.split_off(end);
+        let end = self.object.carried.trim_end().len();
+        let after = self.object.carried.split_off(end);
         out.push(Event::ToolCallStart {
-            index: self.index,
+            index: self.object.index,
             id: self.id.clone(),
             name: name.clone(),
-            source: Text::uncounted(std::mem::take(&mut self.carried)),
+            source: Text::uncounted(std::mem::take(&mut self.object.carried)),
         });
-        self.carried = after;
+        self.object.carried = after;
         self.function = Some(name);
         self.stage = Stage::Between;
     }
@@ -468,7 +451,7 @@ impl Assembler {
         self.stage = Stage::Value(ValueState {
             key,
             kind,
-            start: self.carried.len(),
+            start: self.object.carried.len(),
             mode,
         });
     }
@@ -477,52 +460,8 @@ impl Assembler {
         let Stage::Value(value) = &mut self.stage else {
             return;
         };
-        if text.is_empty() {
-            return;
-        }
-        match value.mode {
-            Mode::Whole => self.carried.push_str(text),
-            Mode::Undecided => {
-                self.carried.push_str(text);
-                let so_far = &self.carried[value.start..];
-                if !NULL_WORDS.iter().any(|word| word.starts_with(so_far)) {
-                    // Not null after all: open the string and stream what arrived.
-                    let arrived = self.carried.split_off(value.start);
-                    value.mode = Mode::Streaming { opened: false };
-                    self.stream(&arrived, out);
-                }
-            }
-            Mode::Streaming { .. } => self.stream(text, out),
-        }
-    }
-
-    /// A piece of a streamed string, after its opening fragment.
-    fn stream(&mut self, text: &str, out: &mut Events) {
-        let Stage::Value(ValueState {
-            key,
-            mode: Mode::Streaming { opened },
-            ..
-        }) = &mut self.stage
-        else {
-            return;
-        };
-        let key = key.clone();
-        if !*opened {
-            *opened = true;
-            let mut opening = String::with_capacity(key.len() + 8);
-            opening.push_str(self.separator());
-            push_quoted(&mut opening, &key);
-            opening.push_str(": \"");
-            let source = Text::uncounted(std::mem::take(&mut self.carried));
-            self.push_fragment(opening, source, out);
-            self.written += 1;
-        }
-        if text.is_empty() {
-            return;
-        }
-        let mut json = String::with_capacity(text.len());
-        push_escaped(&mut json, text);
-        self.push_fragment(json, Text::uncounted(text), out);
+        self.object
+            .value_bytes(&value.key, value.start, &mut value.mode, text, out);
     }
 
     /// `</arg_value>`: a streamed string gets its closing quote, any other value is written whole.
@@ -532,29 +471,14 @@ impl Assembler {
         };
         let fragment = match value.mode {
             Mode::Streaming { opened: true } => "\"".to_string(),
-            Mode::Streaming { opened: false } => {
-                // An empty string: its opening and closing quotes come together.
-                let mut member = String::with_capacity(value.key.len() + 8);
-                member.push_str(self.separator());
-                push_quoted(&mut member, &value.key);
-                member.push_str(": \"\"");
-                self.written += 1;
-                member
-            }
+            // An empty string: its opening and closing quotes come together.
+            Mode::Streaming { opened: false } => self.object.member(&value.key, "\"\""),
             Mode::Whole | Mode::Undecided => {
-                let written = json(&self.carried[value.start..], value.kind);
-                let mut member = String::with_capacity(value.key.len() + written.len() + 8);
-                member.push_str(self.separator());
-                push_quoted(&mut member, &value.key);
-                member.push_str(": ");
-                member.push_str(&written);
-                self.written += 1;
-                member
+                let written = json(&self.object.carried[value.start..], value.kind);
+                self.object.member(&value.key, &written)
             }
         };
-        let mut source = std::mem::take(&mut self.carried);
-        source.push_str(tag);
-        self.push_fragment(fragment, Text::uncounted(source), out);
+        self.object.close_member(fragment, tag, out);
         self.stage = Stage::Between;
     }
 
@@ -564,56 +488,12 @@ impl Assembler {
         if matches!(value.mode, Mode::Streaming { opened: true }) {
             // Bytes the end cut short (the beginning of a tag) are reported, not hidden in the
             // quote's source.
-            self.report(TAG_CUT_SHORT, out);
-            self.push_fragment("\"".to_string(), Text::default(), out);
+            self.object.report(TAG_CUT_SHORT, out);
+            self.object
+                .push_fragment("\"".to_string(), Text::default(), out);
         } else {
-            self.report(TAG_CUT_SHORT, out);
+            self.object.report(TAG_CUT_SHORT, out);
         }
-    }
-
-    /// Reports the carried bytes as `Malformed` with `why`, whitespace included.
-    fn report(&mut self, why: &str, out: &mut Events) {
-        if self.carried.is_empty() {
-            return;
-        }
-        out.push(Event::Malformed {
-            text: Text::uncounted(std::mem::take(&mut self.carried)),
-            why: MalformedReason::Other(why.to_string()),
-        });
-    }
-
-    /// Whitespace carried before text that is reported: the template's, dropped so the report
-    /// holds only the text.
-    fn drop_carried(&mut self, out: &mut Events) {
-        if self.carried.is_empty() {
-            return;
-        }
-        out.push(Event::Dropped {
-            text: Text::uncounted(std::mem::take(&mut self.carried)),
-            why: DropReason::Wrapper,
-        });
-    }
-
-    fn separator(&self) -> &'static str {
-        if self.written == 0 {
-            "{"
-        } else {
-            ", "
-        }
-    }
-
-    /// `}` or `{}`, with `source` as its bytes.
-    fn close_object(&mut self, source: Text, out: &mut Events) {
-        let json = if self.written == 0 { "{}" } else { "}" }.to_string();
-        self.push_fragment(json, source, out);
-    }
-
-    fn push_fragment(&self, json: String, source: Text, out: &mut Events) {
-        out.push(Event::ToolCallArguments {
-            index: self.index,
-            json,
-            source,
-        });
     }
 }
 
@@ -640,6 +520,7 @@ mod tests {
     use serde_json::json as value;
 
     use super::*;
+    use crate::event::DropReason;
 
     const CLOSE: &str = "</tool_call>";
 

@@ -14,11 +14,14 @@
 //! whose parameter tags name their key in an attribute (MiniMax M2, dots3, MiniCPM5, typed by the
 //! request's tools; DeepSeek's DSML, typed by the tag's `string` attribute; Kimi K3's XTML, typed
 //! by the tag's `type` attribute); and [`xml`] for one MiniMax M3 invoke, whose arguments are an
-//! XML tree, typed by the request's tools at every depth.
+//! XML tree, typed by the request's tools at every depth. [`object`] is the arguments object the
+//! keyed and attributed assemblers write: the carried bytes, the separators and the close, and the
+//! three ways a member is written.
 
 pub mod assembler;
 pub mod attributed;
 pub mod keyed;
+mod object;
 pub mod value;
 pub mod xml;
 
