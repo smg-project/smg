@@ -27,12 +27,7 @@ from collections.abc import Callable, Mapping
 from functools import cached_property
 from typing import Any
 
-
-def _positive_int(value: Any) -> int | None:
-    """``value`` as a count above zero, else ``None`` (a bool is not a count)."""
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        return None
-    return value
+from smg_grpc_servicer.config_view import positive_int
 
 
 def token_ids(value: Any) -> list[int]:
@@ -177,8 +172,8 @@ class ParallelSection:
     def read(cls, vllm_config: Any) -> ParallelSection:
         parallel = getattr(vllm_config, "parallel_config", None)
         return cls(
-            data_parallel_size=_positive_int(getattr(parallel, "data_parallel_size", None)),
-            data_parallel_rank=_positive_int(getattr(parallel, "data_parallel_rank", 0)) or 0,
+            data_parallel_size=positive_int(getattr(parallel, "data_parallel_size", None)),
+            data_parallel_rank=positive_int(getattr(parallel, "data_parallel_rank", 0)) or 0,
             node_rank_within_dp=getattr(parallel, "node_rank_within_dp", 0),
             data_parallel_backend=getattr(parallel, "data_parallel_backend", "mp"),
         )
@@ -223,8 +218,8 @@ class CacheSection:
         dtype = getattr(cache, "cache_dtype", None)
         return cls(
             cache_dtype=str(dtype) if dtype else None,
-            block_size=_positive_int(getattr(cache, "block_size", None)),
-            num_gpu_blocks=_positive_int(getattr(cache, "num_gpu_blocks", None)),
+            block_size=positive_int(getattr(cache, "block_size", None)),
+            num_gpu_blocks=positive_int(getattr(cache, "num_gpu_blocks", None)),
         )
 
 
@@ -364,7 +359,7 @@ class EngineConfigView:
         """The scheduler's running window (``--max-num-seqs``); 0 when the
         config does not carry a count."""
         scheduler = getattr(self._config, "scheduler_config", None)
-        return _positive_int(getattr(scheduler, "max_num_seqs", None)) or 0
+        return positive_int(getattr(scheduler, "max_num_seqs", None)) or 0
 
     @cached_property
     def cache(self) -> CacheSection:
