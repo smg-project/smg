@@ -22,7 +22,8 @@ use crate::{
     routers::{
         common::{
             placement::{
-                self, CandidateFilter, PairFailure, PlacementFailure, PlacementInputs, RefusalSite,
+                self, CandidateFilter, PairFailure, PipelinePin, PlacementFailure, PlacementInputs,
+                RefusalSite,
             },
             retry::mark_non_retryable,
         },
@@ -47,8 +48,11 @@ use crate::{
 /// Result type for PD worker pair selection: (prefill, decode, runtime_type)
 type PdWorkerPair = (Arc<dyn Worker>, Arc<dyn Worker>, RuntimeType);
 
-/// The candidate predicate of a request carrying media references: only
-/// workers that process them themselves.
+/// The candidate predicate of a request carrying media references with no
+/// pipeline pin: only workers that process them themselves. The stage
+/// derives its own predicate from the request's media demands
+/// (`MediaDemands::accepts_refs`); the tests hand this one to the helpers.
+#[cfg(test)]
 const ACCEPTS_MEDIA_REFS: CandidateFilter<'static> = &accepts_media_refs;
 
 /// Why an EPD selection produced nothing. Only a full Prefill leg is told
@@ -371,13 +375,28 @@ impl WorkerSelectionStage {
             decode_needs_vision: demand.decode,
         });
         let rid_key = rid_key.as_deref();
+        // The request's media demands. The single worker takes the whole
+        // request, so it must meet every one of them; the disaggregated legs
+        // take the references' predicate (a worker that processes them, on
+        // the side of the pipeline pin the plan carries) from the inputs and
+        // their vision demands from `PairDemands` in the pair selection.
+        let media = MediaDemands {
+            media_refs,
+            vision: needs_vision,
+            pipeline: if media_refs {
+                ctx.state.media_refs_pipeline
+            } else {
+                PipelinePin::Any
+            },
+        };
+        let accepts_refs = |worker: &dyn Worker| media.accepts_refs(worker);
         let inputs = PlacementInputs {
             text,
             tokens,
             headers,
             rid_key,
             cache_namespace,
-            candidate_filter: media_refs.then_some(ACCEPTS_MEDIA_REFS),
+            candidate_filter: media_refs.then_some(&accepts_refs),
             tried: &[],
         };
         let sticky_key = ctx.state.sticky_key.as_deref();
@@ -390,18 +409,8 @@ impl WorkerSelectionStage {
                 runtime: RuntimeType::Sglang,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
-                requires_gateway_pipeline: false,
+                pipeline: PipelinePin::Any,
             });
-        // The single worker takes the whole request, so it must meet every
-        // demand of the request's media. The disaggregated legs take the
-        // media-refs predicate from here and their vision demands from
-        // `PairDemands` in the pair selection: the prefill leg's for any
-        // pixel media, the decode leg's for what a stripped leg cannot serve.
-        let media = MediaDemands {
-            media_refs,
-            vision: needs_vision,
-            pipeline_only: media_refs && ctx.state.media_refs_pipeline_only,
-        };
         let accepts_media = |worker: &dyn Worker| {
             media.accepts(worker) && context_requirements.admits(worker, model_id)
         };
@@ -508,7 +517,7 @@ impl WorkerSelectionStage {
             if let Err(err) = multimodal::ensure_selection_supports_media_refs(
                 &workers,
                 plan,
-                ctx.state.media_refs_pipeline_only,
+                ctx.state.media_refs_pipeline,
             ) {
                 return Err(error::bad_request(err.code(), err.to_string()));
             }
@@ -556,14 +565,15 @@ impl WorkerSelectionStage {
         let headers = ctx.headers.as_ref();
         let model_id = ctx.model_id.as_str();
         let context_requirements = ctx.routing.context_requirements;
-        // The retained wire carries the media-refs pin (the helpers derive it)
-        // and the routing snapshot the pixel-media fact.
+        // The retained wire carries the media-refs pin and the pipeline pin
+        // (the helpers derive them too), the routing snapshot the pixel-media
+        // fact.
         let wire = Some(ctx.wire);
         let media_refs = ctx.wire.requires_media_refs;
         let media = MediaDemands {
-            media_refs: false,
+            media_refs,
             vision: ctx.routing.needs_vision,
-            pipeline_only: false,
+            pipeline: ctx.wire.pipeline,
         };
         // A retry skips the workers that already answered this request
         // definitively (see `routers::common::attempt_ledger`), and stays on
@@ -607,9 +617,7 @@ impl WorkerSelectionStage {
                 }
             }
             WorkerSelectionMode::PrefillDecode | WorkerSelectionMode::EncodePrefillDecode => {
-                let pinned = |worker: &dyn Worker| {
-                    (!media_refs || accepts_media_refs(worker)) && admits(worker)
-                };
+                let pinned = |worker: &dyn Worker| media.accepts_refs(worker) && admits(worker);
                 let inputs = PlacementInputs {
                     text,
                     tokens,
@@ -882,10 +890,9 @@ struct MediaDemands {
     /// Pixel media is carried: only a worker with a vision encoder
     /// ([`vision_capable`]).
     vision: bool,
-    /// The forwarded references are of a family only the gateway's own
-    /// pipeline expands: only a worker running it
-    /// ([`multimodal::worker_runs_gateway_pipeline`]).
-    pipeline_only: bool,
+    /// With forwarded references: which of the workers that process them the
+    /// plan may use ([`pipeline_admits`]).
+    pipeline: PipelinePin,
 }
 
 impl MediaDemands {
@@ -893,16 +900,26 @@ impl MediaDemands {
     const NONE: Self = Self {
         media_refs: false,
         vision: false,
-        pipeline_only: false,
+        pipeline: PipelinePin::Any,
     };
 
-    /// These demands plus the retained plan's media-refs pin on a retry.
+    /// These demands plus the retained plan's pins on a retry.
     fn with_wire(self, wire: Option<WireConstraint>) -> Self {
         Self {
             media_refs: self.media_refs || wire.is_some_and(|w| w.requires_media_refs),
             vision: self.vision,
-            pipeline_only: self.pipeline_only || wire.is_some_and(|w| w.requires_gateway_pipeline),
+            pipeline: match self.pipeline {
+                PipelinePin::Any => wire.map_or(PipelinePin::Any, |w| w.pipeline),
+                pin => pin,
+            },
         }
+    }
+
+    /// Whether `worker` may take the request's references: it processes
+    /// them, on the side of the pipeline pin the plan carries. The vision
+    /// demand is the leg's own (see [`Self::accepts`]).
+    fn accepts_refs(self, worker: &dyn Worker) -> bool {
+        (!self.media_refs || accepts_media_refs(worker)) && pipeline_admits(self.pipeline, worker)
     }
 
     fn any(self) -> bool {
@@ -911,9 +928,18 @@ impl MediaDemands {
 
     /// Whether `worker` meets every demand.
     fn accepts(self, worker: &dyn Worker) -> bool {
-        (!self.media_refs || accepts_media_refs(worker))
-            && (!self.pipeline_only || multimodal::worker_runs_gateway_pipeline(worker))
-            && (!self.vision || vision_capable(worker))
+        self.accepts_refs(worker) && (!self.vision || vision_capable(worker))
+    }
+}
+
+/// Whether `worker` is on the side of `pin`: running the gateway's own
+/// pipeline for [`PipelinePin::Only`], not running it for
+/// [`PipelinePin::Never`], anything for [`PipelinePin::Any`].
+fn pipeline_admits(pin: PipelinePin, worker: &dyn Worker) -> bool {
+    match pin {
+        PipelinePin::Any => true,
+        PipelinePin::Only => multimodal::worker_runs_gateway_pipeline(worker),
+        PipelinePin::Never => !multimodal::worker_runs_gateway_pipeline(worker),
     }
 }
 
@@ -1137,12 +1163,14 @@ impl WorkerSelectionStage {
             }
             let capable: Vec<Arc<dyn Worker>> = capable
                 .into_iter()
-                .filter(|w| {
-                    !media.pipeline_only || multimodal::worker_runs_gateway_pipeline(w.as_ref())
-                })
+                .filter(|w| pipeline_admits(media.pipeline, w.as_ref()))
                 .collect();
             if capable.is_empty() {
-                return Self::pipeline_worker_required(model_id);
+                return match media.pipeline {
+                    PipelinePin::Only => Self::pipeline_worker_required(model_id),
+                    PipelinePin::Never => Self::pipeline_takes_no_audio(model_id),
+                    PipelinePin::Any => self.media_refs_shed(model_id),
+                };
             }
             match placement::failure_from(
                 &capable,
@@ -1176,6 +1204,24 @@ impl WorkerSelectionStage {
                  model's placeholders; start the workers with --mm-processor {} or the router \
                  with --mm-processing router",
                 multimodal::GATEWAY_PIPELINE_PROCESSOR,
+                multimodal::GATEWAY_PIPELINE_PROCESSOR
+            ),
+        );
+        mark_non_retryable(&mut response);
+        response
+    }
+
+    /// Every worker processing the model's media references runs the
+    /// gateway's own pipeline, which takes no audio. The request's own 400,
+    /// as the worker's refusal for the same request would be; terminal.
+    fn pipeline_takes_no_audio(model_id: &str) -> Response {
+        let mut response = error::bad_request(
+            "multimodal_not_supported",
+            format!(
+                "the workers processing media references for model {model_id} all run the \
+                 gateway's own pipeline (mm_processor={}), which takes image and video \
+                 references, not audio; a worker with --mm-processor inprocess or redis \
+                 processes audio with the engine's own processor",
                 multimodal::GATEWAY_PIPELINE_PROCESSOR
             ),
         );
@@ -1477,10 +1523,13 @@ impl WorkerSelectionStage {
         candidate_filter: Option<CandidateFilter<'_>>,
         tried: &[String],
     ) -> Option<Arc<dyn Worker>> {
-        // A retry pins the retained wire, and with it the media pin, on top of
-        // whatever the caller excludes.
+        // A retry pins the retained wire, and with it the media pin and the
+        // pipeline pin, on top of whatever the caller excludes.
+        let pipeline = wire.map_or(PipelinePin::Any, |w| w.pipeline);
         let pinned = |worker: &dyn Worker| {
-            accepts_media_refs(worker) && candidate_filter.is_none_or(|accepts| accepts(worker))
+            accepts_media_refs(worker)
+                && pipeline_admits(pipeline, worker)
+                && candidate_filter.is_none_or(|accepts| accepts(worker))
         };
         let candidate_filter: Option<CandidateFilter<'_>> =
             if wire.is_some_and(|w| w.requires_media_refs) {
@@ -2895,8 +2944,7 @@ mod tests {
                 runtime: RuntimeType::Vllm,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
-
-                requires_gateway_pipeline: false,
+                pipeline: PipelinePin::Any,
             },
         );
         for _ in 0..8 {
@@ -2958,6 +3006,7 @@ mod tests {
                 runtime: RuntimeType::TokenSpeed,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
+                pipeline: PipelinePin::Any,
             },
         );
         let decided_on = |worker: &Arc<dyn Worker>| {
@@ -3055,6 +3104,7 @@ mod tests {
                     runtime: RuntimeType::TokenSpeed,
                     connection: ConnectionMode::Grpc,
                     requires_media_refs: false,
+                    pipeline: PipelinePin::Any,
                 },
             );
             ctx.constraint_decided_on =
@@ -3136,6 +3186,7 @@ mod tests {
                     runtime: RuntimeType::TokenSpeed,
                     connection: ConnectionMode::Grpc,
                     requires_media_refs: false,
+                    pipeline: PipelinePin::Any,
                 },
             );
             let prep = PreparationOutput::Generate {
@@ -3217,8 +3268,7 @@ mod tests {
                 runtime: RuntimeType::Vllm,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
-
-                requires_gateway_pipeline: false,
+                pipeline: PipelinePin::Any,
             },
         );
         let mut headers = HeaderMap::new();
@@ -3315,8 +3365,7 @@ mod tests {
                 runtime: RuntimeType::Vllm,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
-
-                requires_gateway_pipeline: false,
+                pipeline: PipelinePin::Any,
             },
         );
         for _ in 0..8 {
@@ -3380,8 +3429,7 @@ mod tests {
                 runtime: RuntimeType::Vllm,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
-
-                requires_gateway_pipeline: false,
+                pipeline: PipelinePin::Any,
             },
         );
 
@@ -3448,8 +3496,7 @@ mod tests {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
             requires_media_refs: false,
-
-            requires_gateway_pipeline: false,
+            pipeline: PipelinePin::Any,
         };
         let namespace = |salt: &str| {
             CacheNamespace::derive(&CachePartition {
@@ -3554,8 +3601,7 @@ mod tests {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
             requires_media_refs: true,
-
-            requires_gateway_pipeline: false,
+            pipeline: PipelinePin::Any,
         };
         let worker = stage
             .select_single_worker(model_id, None, None, None, None, None, Some(wire), None)
@@ -3619,8 +3665,7 @@ mod tests {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
             requires_media_refs: true,
-
-            requires_gateway_pipeline: false,
+            pipeline: PipelinePin::Any,
         };
         assert!(stage
             .select_single_worker(model_id, None, None, None, None, None, Some(wire), None)
@@ -3642,18 +3687,24 @@ mod tests {
     const REFS: MediaDemands = MediaDemands {
         media_refs: true,
         vision: false,
-        pipeline_only: false,
+        pipeline: PipelinePin::Any,
     };
     const VISION: MediaDemands = MediaDemands {
         media_refs: false,
         vision: true,
-        pipeline_only: false,
+        pipeline: PipelinePin::Any,
     };
     /// References of a family only the gateway's own pipeline expands.
     const PIPELINE_REFS: MediaDemands = MediaDemands {
         media_refs: true,
         vision: false,
-        pipeline_only: true,
+        pipeline: PipelinePin::Only,
+    };
+    /// Audio references, which the gateway's own pipeline does not take.
+    const AUDIO_REFS: MediaDemands = MediaDemands {
+        media_refs: true,
+        vision: false,
+        pipeline: PipelinePin::Never,
     };
 
     /// A regular worker with `labels`, built as [`labeled_worker`] builds every
@@ -3715,6 +3766,11 @@ mod tests {
             ["grpc://127.0.0.1:8770", "grpc://127.0.0.1:8771"],
             "an opted-in family goes to every worker that processes references"
         );
+        assert_eq!(
+            urls_seen(&stage, model_id, AUDIO_REFS),
+            ["grpc://127.0.0.1:8771"],
+            "audio goes to the worker on the engine's own processor only"
+        );
 
         let engine_only = "test-model-pipeline-pinned-engine-only";
         worker_registry
@@ -3727,6 +3783,73 @@ mod tests {
         let response =
             stage.selection_failure(engine_only, &[WorkerType::Regular], None, PIPELINE_REFS);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let pipeline_only = "test-model-pipeline-pinned-pipeline-only";
+        worker_registry
+            .register(regular_worker(
+                "grpc://127.0.0.1:8774",
+                pipeline_only,
+                &pipeline,
+            ))
+            .unwrap();
+        let response =
+            stage.selection_failure(pipeline_only, &[WorkerType::Regular], None, AUDIO_REFS);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A retry keeps the retained plan's pipeline pin: with the pin on the
+    /// gateway's own pipeline, a worker on the engine's processor that joined
+    /// the pool since the first attempt is never picked; with the pin off it
+    /// (audio), the pipeline worker is never picked.
+    #[tokio::test]
+    async fn reselect_keeps_the_pipeline_pin_of_the_retained_plan() {
+        let model_id = "pipeline-pin-retry-model";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let pipeline = [
+            ("mm_processor", multimodal::GATEWAY_PIPELINE_PROCESSOR),
+            ("mm_media_ref_schemes", "http,https,data"),
+        ];
+        let engine = [
+            ("mm_processor", "inprocess"),
+            ("mm_media_ref_schemes", "http,https,data"),
+        ];
+        for (url, labels) in [
+            ("grpc://127.0.0.1:9340", &pipeline[..]),
+            ("grpc://127.0.0.1:9341", &engine[..]),
+        ] {
+            worker_registry
+                .register(regular_worker(url, model_id, labels))
+                .unwrap();
+        }
+        let stage = WorkerSelectionStage::new(
+            worker_registry,
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::Regular,
+            None,
+        );
+        for (pin, expected) in [
+            (PipelinePin::Only, "grpc://127.0.0.1:9340"),
+            (PipelinePin::Never, "grpc://127.0.0.1:9341"),
+        ] {
+            let mut ctx = dispatch_ctx(
+                model_id,
+                WireConstraint {
+                    runtime: RuntimeType::Vllm,
+                    connection: ConnectionMode::Grpc,
+                    requires_media_refs: true,
+                    pipeline: pin,
+                },
+            );
+            for _ in 0..6 {
+                stage.reselect(&mut ctx).await.unwrap();
+                match ctx.workers.as_ref().unwrap() {
+                    WorkerSelection::Single { worker } => {
+                        assert_eq!(worker.url(), expected, "{pin:?}");
+                    }
+                    WorkerSelection::Disaggregated { .. } => panic!("expected single selection"),
+                }
+            }
+        }
     }
 
     /// Pixel media never reaches a worker labeled without a vision encoder:
@@ -3865,7 +3988,7 @@ mod tests {
         let both = MediaDemands {
             media_refs: true,
             vision: true,
-            pipeline_only: false,
+            pipeline: PipelinePin::Any,
         };
         let refs_with_vision = [
             ("mm_processor", "inprocess"),
@@ -3949,8 +4072,7 @@ mod tests {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
             requires_media_refs: false,
-
-            requires_gateway_pipeline: false,
+            pipeline: PipelinePin::Any,
         };
 
         let stage = &stage;
@@ -4708,8 +4830,7 @@ mod tests {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
             requires_media_refs: false,
-
-            requires_gateway_pipeline: false,
+            pipeline: PipelinePin::Any,
         };
 
         let stage = &stage;
@@ -5310,8 +5431,7 @@ mod tests {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
             requires_media_refs: false,
-
-            requires_gateway_pipeline: false,
+            pipeline: PipelinePin::Any,
         };
 
         let stage = &stage;

@@ -237,9 +237,10 @@ class TestPDMultimodalLanguageModelOnlyDecode:
     def test_different_images_same_prefix_do_not_alias(self, setup_backend):
         backend, model, client, gateway = setup_backend
         _assert_no_cross_image_aliasing(client, model)
-        # A language-model-only decode worker cannot expand media references,
-        # so the media stay router-processed.
-        assert_mm_processing(gateway, worker_expandable=False)
+        # A language-model-only decode worker advertises no media processing,
+        # so the media stay router-processed whichever processor the prefill
+        # worker runs.
+        assert_mm_processing(gateway, worker_expandable=False, all_workers_process_media=False)
 
     def test_parallel_sampling_is_rejected_clearly(self, setup_backend):
         # n>1 has no KV handoff; a pixel-less decode worker cannot recompute

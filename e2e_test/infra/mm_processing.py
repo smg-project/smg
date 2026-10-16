@@ -26,26 +26,37 @@ def mm_processing_samples(gateway) -> list[tuple[dict[str, str], float]]:
     return parse_mm_processing_samples(response.text)
 
 
-def expected_mm_processing(*, worker_expandable: bool) -> tuple[str, str | None]:
+def expected_mm_processing(
+    *, worker_expandable: bool, all_workers_process_media: bool = True
+) -> tuple[str, str | None]:
     """The (mode, reason) the gateway must record for this lane and model.
 
     Only vLLM gRPC workers advertise worker-side processing, and only models
     whose placeholder anchor a vLLM worker can expand take the worker path,
-    unless the workers run the gateway's own pipeline (``smg``), which expands
-    any spec's anchor; every other combination stays on the router path.
+    unless every registered worker runs the gateway's own pipeline (``smg``),
+    which expands any spec's anchor; every other combination stays on the
+    router path. ``all_workers_process_media`` is False when a worker of the
+    model advertises no processing (a language-model-only decode worker).
     """
     if get_mm_processing() == MM_PROCESSING_WORKER and is_vllm():
         if worker_expandable:
-            return "worker", "auto_uniform"
-        if get_vllm_mm_processor() == "smg":
+            if all_workers_process_media:
+                return "worker", "auto_uniform"
+            return "router", "auto_mixed"
+        if get_vllm_mm_processor() == "smg" and all_workers_process_media:
             return "worker", "auto_pipeline"
         return "router", "model_not_opted_in"
     return "router", None
 
 
-def assert_mm_processing(gateway, *, worker_expandable: bool) -> None:
+def assert_mm_processing(
+    gateway, *, worker_expandable: bool, all_workers_process_media: bool = True
+) -> None:
     """Every multimodal request this gateway served took the lane's expected path."""
-    mode, reason = expected_mm_processing(worker_expandable=worker_expandable)
+    mode, reason = expected_mm_processing(
+        worker_expandable=worker_expandable,
+        all_workers_process_media=all_workers_process_media,
+    )
     samples = [(labels, value) for labels, value in mm_processing_samples(gateway) if value > 0]
     assert samples, f"gateway recorded no {MM_PROCESSING_METRIC} samples"
     modes = {labels["mode"] for labels, _ in samples}

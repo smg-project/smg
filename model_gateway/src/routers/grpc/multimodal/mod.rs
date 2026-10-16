@@ -87,7 +87,7 @@ pub(crate) use plan::{
 };
 pub(crate) use process::process_multimodal_plan;
 pub(crate) use refs::{
-    assemble_media_refs, ensure_selection_supports_media_refs, plan_needs_gateway_pipeline,
+    assemble_media_refs, ensure_selection_supports_media_refs, media_refs_pipeline_pin,
     resolve_mm_processing, worker_accepts_media_refs, worker_runs_gateway_pipeline, MmProcessing,
     MmRefsError, GATEWAY_PIPELINE_PROCESSOR,
 };

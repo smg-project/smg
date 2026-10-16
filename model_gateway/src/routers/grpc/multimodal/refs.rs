@@ -15,7 +15,7 @@ use super::{
 };
 use crate::{
     observability::metrics::Metrics,
-    routers::grpc::context::WorkerSelection,
+    routers::{common::placement::PipelinePin, grpc::context::WorkerSelection},
     worker::{ConnectionMode, RuntimeType, Worker, WorkerRegistry},
 };
 
@@ -240,7 +240,8 @@ pub(crate) fn worker_media_ref_schemes(worker: &dyn Worker) -> HashSet<String> {
 /// Whether a worker can expand every anchor of `plan`: the engine's own
 /// processor expands the modalities the spec opted in; a fleet whose
 /// media-processing workers all run the gateway's own pipeline
-/// (`pipeline_fleet`) expands any spec's anchor, as the gateway would.
+/// (`pipeline_fleet`) expands any spec's image or video anchor, as the
+/// gateway would, and no audio anchor at all (the pipeline takes no audio).
 fn ensure_worker_expandable(
     plan: &MediaPlan,
     placeholders: &PlaceholderTokens,
@@ -252,11 +253,30 @@ fn ensure_worker_expandable(
         if modality != Modality::Audio && !runtime_supports_modality(RuntimeType::Vllm, modality) {
             return Err(MmRefsError::ModalityUnsupported(modality));
         }
-        if !placeholders.worker_expandable(modality) && !pipeline_fleet {
+        let pipeline_expands = pipeline_fleet && modality != Modality::Audio;
+        if !placeholders.worker_expandable(modality) && !pipeline_expands {
             return Err(MmRefsError::ModelNotOptedIn(modality));
         }
     }
     Ok(())
+}
+
+/// Which of the workers that process references may take a forwarded plan:
+/// only those running the gateway's own pipeline when an anchor needs it
+/// ([`plan_needs_gateway_pipeline`]), never those when the plan carries
+/// audio (the pipeline takes none), either otherwise. Set in preparation,
+/// read by selection and by the retry pin.
+pub(crate) fn media_refs_pipeline_pin(
+    plan: &MediaPlan,
+    placeholders: &PlaceholderTokens,
+) -> PipelinePin {
+    if plan_needs_gateway_pipeline(plan, placeholders) {
+        PipelinePin::Only
+    } else if plan.modalities().contains(&Modality::Audio) {
+        PipelinePin::Never
+    } else {
+        PipelinePin::Any
+    }
 }
 
 /// Whether the router's own pipeline can serve `plan` for a vLLM worker: it has
@@ -366,15 +386,16 @@ pub(crate) fn resolve_mm_processing(
 /// Post-selection check: every leg must accept references, and every URL
 /// scheme in the plan must be one every leg that advertised schemes fetches
 /// (the prefill leg processes them; the decode leg does too whenever the
-/// identity relay does not apply, as with n>1). A plan whose anchor only the
-/// gateway's own pipeline expands (`needs_pipeline`, see
-/// [`plan_needs_gateway_pipeline`]) needs every leg on that pipeline, and a
-/// leg on it takes no audio.
+/// identity relay does not apply, as with n>1). A plan pinned to the
+/// gateway's own pipeline (`pin`, see [`media_refs_pipeline_pin`]) needs
+/// every leg on that pipeline, and a leg on it takes no audio; selection
+/// draws its candidates by the same pin, so this is the backstop.
 pub(crate) fn ensure_selection_supports_media_refs(
     workers: &WorkerSelection,
     plan: &MediaPlan,
-    needs_pipeline: bool,
+    pin: PipelinePin,
 ) -> Result<(), MmRefsError> {
+    let needs_pipeline = pin == PipelinePin::Only;
     let legs: Vec<&dyn Worker> = match workers {
         WorkerSelection::Single { worker } => vec![worker.as_ref()],
         WorkerSelection::Disaggregated {
@@ -1020,7 +1041,8 @@ mod tests {
         let single = WorkerSelection::Single {
             worker: capable("grpc://127.0.0.1:9600"),
         };
-        ensure_selection_supports_media_refs(&single, &plan_https, false).expect("capable single");
+        ensure_selection_supports_media_refs(&single, &plan_https, PipelinePin::Any)
+            .expect("capable single");
 
         let plain = WorkerSelection::Single {
             worker: worker(
@@ -1031,12 +1053,12 @@ mod tests {
             ),
         };
         assert_eq!(
-            ensure_selection_supports_media_refs(&plain, &plan_https, false),
+            ensure_selection_supports_media_refs(&plain, &plan_https, PipelinePin::Any),
             Err(MmRefsError::WorkerNotCapable)
         );
 
         let file_plan = plan(vec![image_url("file:///media/1.png")]);
-        let err = ensure_selection_supports_media_refs(&single, &file_plan, false)
+        let err = ensure_selection_supports_media_refs(&single, &file_plan, PipelinePin::Any)
             .expect_err("file scheme not advertised");
         assert_eq!(err.code(), "media_ref_scheme_not_accepted");
 
@@ -1052,7 +1074,7 @@ mod tests {
             runtime_type: RuntimeType::Vllm,
         };
         assert_eq!(
-            ensure_selection_supports_media_refs(&pd, &plan_https, false),
+            ensure_selection_supports_media_refs(&pd, &plan_https, PipelinePin::Any),
             Err(MmRefsError::WorkerNotCapable)
         );
 
@@ -1073,10 +1095,10 @@ mod tests {
             decode: capable("grpc://127.0.0.1:9605"),
             runtime_type: RuntimeType::Vllm,
         };
-        ensure_selection_supports_media_refs(&mixed, &plan_https, false)
+        ensure_selection_supports_media_refs(&mixed, &plan_https, PipelinePin::Any)
             .expect("https on both legs");
         assert_eq!(
-            ensure_selection_supports_media_refs(&mixed, &file_plan, false),
+            ensure_selection_supports_media_refs(&mixed, &file_plan, PipelinePin::Any),
             Err(MmRefsError::SchemeNotAccepted {
                 scheme: "file".to_string(),
                 accepted: "data,http,https".to_string(),
@@ -1097,7 +1119,7 @@ mod tests {
             runtime_type: RuntimeType::Vllm,
         };
         assert_eq!(
-            ensure_selection_supports_media_refs(&half, &file_plan, false)
+            ensure_selection_supports_media_refs(&half, &file_plan, PipelinePin::Any)
                 .expect_err("prefill's set still applies")
                 .code(),
             "media_ref_scheme_not_accepted"
@@ -1148,6 +1170,32 @@ mod tests {
         assert!(!worker_runs_gateway_pipeline(
             capable("grpc://127.0.0.1:9701").as_ref()
         ));
+
+        // The pin selection reads: the pipeline alone for an unopted anchor,
+        // never the pipeline for audio, either otherwise.
+        let audio = plan(vec![MediaContentPart::AudioUrl {
+            url: "https://a/x.wav".to_string(),
+            uuid: None,
+        }]);
+        let mut audio_opted = PlaceholderTokens::default();
+        audio_opted.insert(Modality::Audio, "<|audio_pad|>".to_string());
+        audio_opted.set_worker_expandable(Modality::Audio, true);
+        assert_eq!(
+            media_refs_pipeline_pin(&image, &unopted_placeholders()),
+            PipelinePin::Only
+        );
+        assert_eq!(
+            media_refs_pipeline_pin(&audio, &audio_opted),
+            PipelinePin::Never
+        );
+        assert_eq!(
+            media_refs_pipeline_pin(&image, &expandable_placeholders()),
+            PipelinePin::Any
+        );
+        assert_eq!(
+            media_refs_pipeline_pin(&image, &PlaceholderTokens::worker_only()),
+            PipelinePin::Any
+        );
     }
 
     /// Strict worker mode forwards a model the engine's processor cannot
@@ -1187,6 +1235,20 @@ mod tests {
             resolve_mm_processing(&components, &empty, MODEL, &image, &unopted)
                 .expect_err("no fleet"),
             MmRefsError::ModelNotOptedIn(Modality::Image)
+        );
+
+        // The pipeline takes no audio, so an unopted audio anchor is refused
+        // here, with the opt-in named, rather than forwarded to a refusal.
+        let audio = plan(vec![MediaContentPart::AudioUrl {
+            url: "https://a/x.wav".to_string(),
+            uuid: None,
+        }]);
+        let mut unopted_audio = PlaceholderTokens::default();
+        unopted_audio.insert(Modality::Audio, "<|audio_pad|>".to_string());
+        assert_eq!(
+            resolve_mm_processing(&components, &pipeline_fleet, MODEL, &audio, &unopted_audio)
+                .expect_err("the pipeline expands no audio anchor"),
+            MmRefsError::ModelNotOptedIn(Modality::Audio)
         );
 
         // An opted-in model needs no pipeline worker, as before.
@@ -1247,13 +1309,13 @@ mod tests {
         let engine_single = WorkerSelection::Single {
             worker: capable("grpc://127.0.0.1:9731"),
         };
-        ensure_selection_supports_media_refs(&pipeline_single, &image, true)
+        ensure_selection_supports_media_refs(&pipeline_single, &image, PipelinePin::Only)
             .expect("the pipeline worker takes the unopted model");
         assert_eq!(
-            ensure_selection_supports_media_refs(&engine_single, &image, true),
+            ensure_selection_supports_media_refs(&engine_single, &image, PipelinePin::Only),
             Err(MmRefsError::PipelineWorkerRequired)
         );
-        ensure_selection_supports_media_refs(&engine_single, &image, false)
+        ensure_selection_supports_media_refs(&engine_single, &image, PipelinePin::Any)
             .expect("an opted-in model goes to the engine's processor");
 
         let half = WorkerSelection::Disaggregated {
@@ -1263,15 +1325,15 @@ mod tests {
             runtime_type: RuntimeType::Vllm,
         };
         assert_eq!(
-            ensure_selection_supports_media_refs(&half, &image, true),
+            ensure_selection_supports_media_refs(&half, &image, PipelinePin::Only),
             Err(MmRefsError::PipelineWorkerRequired)
         );
 
         assert_eq!(
-            ensure_selection_supports_media_refs(&pipeline_single, &audio, false),
+            ensure_selection_supports_media_refs(&pipeline_single, &audio, PipelinePin::Any),
             Err(MmRefsError::PipelineTakesNoAudio)
         );
-        ensure_selection_supports_media_refs(&engine_single, &audio, false)
+        ensure_selection_supports_media_refs(&engine_single, &audio, PipelinePin::Any)
             .expect("the engine's processor takes audio");
         assert_eq!(
             MmRefsError::PipelineTakesNoAudio.code(),

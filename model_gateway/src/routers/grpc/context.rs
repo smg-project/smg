@@ -253,11 +253,12 @@ pub(crate) struct ProcessingState {
     /// (`utils::WorkerDecoding::decides_alike`).
     pub constraint_decided_on: Option<WorkerDecoding>,
 
-    /// With forwarded references: the model's family is not opted in for the
-    /// engine's prompt updates, so the references go only to workers running
-    /// the gateway's own pipeline (`mm_processor=smg`). Set in preparation
-    /// with `multimodal_refs`; worker selection and the retry pin read it.
-    pub media_refs_pipeline_only: bool,
+    /// With forwarded references: which of the workers that process them the
+    /// plan may use (the gateway's own pipeline alone for a family only it
+    /// expands, the engine's own processors alone for audio, either
+    /// otherwise). Set in preparation with `multimodal_refs`; worker
+    /// selection and the retry pin read it.
+    pub media_refs_pipeline: PipelinePin,
 
     /// `Some` iff the request is multimodal EPD and worker selection produced
     /// encode assignments. Request building injects the bootstrap info and drops
@@ -321,27 +322,23 @@ pub(crate) struct RoutingSnapshot {
     pub decode_needs_vision: bool,
 }
 
-pub(crate) use crate::routers::common::placement::WireConstraint;
+pub(crate) use crate::routers::common::placement::{PipelinePin, WireConstraint};
 
 impl WireConstraint {
-    fn of(
-        workers: &WorkerSelection,
-        requires_media_refs: bool,
-        requires_gateway_pipeline: bool,
-    ) -> Self {
+    fn of(workers: &WorkerSelection, requires_media_refs: bool, pipeline: PipelinePin) -> Self {
         match workers {
             WorkerSelection::Single { worker } => Self {
                 runtime: worker.metadata().spec.runtime_type,
                 connection: *worker.connection_mode(),
                 requires_media_refs,
-                requires_gateway_pipeline,
+                pipeline,
             },
             // Disaggregated legs are gRPC-only.
             WorkerSelection::Disaggregated { runtime_type, .. } => Self {
                 runtime: *runtime_type,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs,
-                requires_gateway_pipeline,
+                pipeline,
             },
         }
     }
@@ -1001,7 +998,11 @@ impl RequestContext {
                 WireConstraint::of(
                     workers,
                     state.media_refs_forwarded,
-                    state.media_refs_forwarded && state.media_refs_pipeline_only,
+                    if state.media_refs_forwarded {
+                        state.media_refs_pipeline
+                    } else {
+                        PipelinePin::Any
+                    },
                 )
             })
             .ok_or_else(|| {

@@ -53,10 +53,22 @@ pub(crate) struct WireConstraint {
     /// runtime and transport; the gRPC selection helpers derive their
     /// candidate predicate from this flag.
     pub requires_media_refs: bool,
-    /// With `requires_media_refs`: the references go only to workers running
-    /// the gateway's own pipeline (the model's family is not opted in for the
-    /// engine's prompt updates); derived into the predicate the same way.
-    pub requires_gateway_pipeline: bool,
+    /// With `requires_media_refs`: which of the workers that process them the
+    /// plan may use; the gRPC selection helpers derive their candidate
+    /// predicate from it as from the flag above.
+    pub pipeline: PipelinePin,
+}
+
+/// Which of the workers that process media references a forwarded plan may
+/// use: those running the gateway's own pipeline alone (a family whose anchor
+/// only that pipeline expands), those running the engine's own processor
+/// alone (audio, which the pipeline does not take), or either.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PipelinePin {
+    #[default]
+    Any,
+    Only,
+    Never,
 }
 
 impl WireConstraint {
@@ -1463,7 +1475,7 @@ mod tests {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
             requires_media_refs: false,
-            requires_gateway_pipeline: false,
+            pipeline: PipelinePin::Any,
         });
 
         assert_eq!(
@@ -1580,7 +1592,7 @@ mod tests {
                 runtime: RuntimeType::Sglang,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
-                requires_gateway_pipeline: false,
+                pipeline: PipelinePin::Any,
             }),
             false,
             None,
@@ -1745,7 +1757,7 @@ mod tests {
             runtime: RuntimeType::Sglang,
             connection: ConnectionMode::Grpc,
             requires_media_refs: false,
-            requires_gateway_pipeline: false,
+            pipeline: PipelinePin::Any,
         });
         let only_p1 = |w: &dyn Worker| w.url() == "grpc://p:1";
         let failure = select_pair(
