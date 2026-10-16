@@ -615,7 +615,9 @@ pub(crate) struct RequestFault {
     pub finish_error: bool,
     /// How long the stream is held, delivering nothing, once `after_tokens`
     /// tokens are out (none when unset): a backend that wedged mid-stream.
-    /// The hold ends early when the engine ends the request (an abort).
+    /// The hold ends early when the engine ends the request: the gateway's
+    /// abort, or the request's own completion, whose held tail then comes out
+    /// at once.
     /// Zero holds nothing.
     pub hang: Duration,
     /// How long the fault stays armed.
@@ -880,7 +882,6 @@ impl Engine {
         let _ = self.tx.send(EngineMsg::Request(req));
     }
 
-    /// Abort a queued or running request. Unknown or completed IDs are harmless.
     /// Clear the prefix cache and announce it (`AllBlocksCleared`).
     pub fn reset(&self) {
         let _ = self.tx.send(EngineMsg::Reset);

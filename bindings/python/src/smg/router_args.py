@@ -1376,7 +1376,8 @@ class RouterArgs:
                 " smg_constrained_no_progress_total counts it. The budget runs"
                 " between the engine's responses once the stream has started;"
                 " the first token's wait stays under the request timeout, and a"
-                " non-streamed generation is not bounded by it. Must stay below"
+                " non-streamed generation is not bounded by it. gRPC workers only:"
+                " the HTTP router does not apply it. Must stay below"
                 " --request-timeout-secs. 0 disables"
             ),
         )

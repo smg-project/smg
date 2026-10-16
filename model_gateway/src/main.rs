@@ -1156,8 +1156,9 @@ struct ServingArgs {
     /// non-streamed generation, which shows no progress before its one
     /// answer, is not bounded by it. Set it well above the engine's longest
     /// legitimate pause between tokens (a preemption, a long prefill batch);
-    /// the cut counts against the worker as a timeout. Must stay below
-    /// --request-timeout-secs. 0 disables
+    /// the cut counts against the worker as a timeout. gRPC workers only: the
+    /// HTTP router does not apply it. Must stay below --request-timeout-secs.
+    /// 0 disables
     #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
     constrained_no_progress_secs: u64,
 

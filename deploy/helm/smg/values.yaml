@@ -67,7 +67,7 @@ router:
   queueTimeoutSecs: 60
   # Cut a grammar-constrained streamed generation that produces no token for
   # this many seconds after its first one (aborted on the engine, slot freed,
-  # the client answered a constrained_no_progress error). 0 = off.
+  # the client answered a constrained_no_progress error). gRPC workers only. 0 = off.
   constrainedNoProgressSecs: 0
 
   # -- Resilience: retry
