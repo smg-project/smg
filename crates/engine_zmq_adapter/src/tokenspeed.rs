@@ -1028,7 +1028,8 @@ mod tests {
             placeholder_token_id: Some(100),
         };
         req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items: vec![item] });
-        let wire = translate_request_tokenspeed(req).expect("translated");
+        let wire =
+            translate_request_tokenspeed_for(req, GridTensors::Positions).expect("translated");
 
         let expected_pad = mm_pad_value(TokenSpeedWireModality::Audio, 0x0123_4567_89AB_CDEF);
         assert_ne!(
