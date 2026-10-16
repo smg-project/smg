@@ -220,7 +220,7 @@ impl Format {
     /// leaves the model past text no field holds, or inside an answer while a call is forced or
     /// the answer has a format; the tools are over [`OutputSpelling::check_parameter_counts`]'s
     /// limits, or the grammar over [`OutputSpelling::MAX_TAG_BYTES`] (worked out before it is
-    /// built). The error refuses what the grammar cannot hold:
+    /// built). Where one starts, the error refuses what it cannot hold:
     /// - a declared tool or parameter whose name a call cannot carry, whatever the choice
     ///   ([`OutputSpelling::check_names`]);
     /// - under `auto`, a strict tool or `parallel: false` with the request's own regex or ebnf,
@@ -232,33 +232,12 @@ impl Format {
         let Ok(spelling) = self.output_spelling() else {
             return Ok(None);
         };
-        spelling.check_names(turn.declared)?;
         let forced = turn.choice != OutputChoice::Auto;
-        let own_grammar = matches!(
-            turn.answer,
-            Some(OutputAnswer::Regex(_) | OutputAnswer::Ebnf(_))
-        );
-        let strict = turn
-            .callable
-            .iter()
-            .any(|tool| tool.function.strict == Some(true));
-        if own_grammar && !forced && !turn.callable.is_empty() && (strict || !turn.parallel) {
-            return Err(
-                "a strict tool, or parallel_tool_calls: false, cannot be held under tool_choice \
-                 auto together with the request's own regex or ebnf"
-                    .to_string(),
-            );
-        }
-        let answer = turn.answer.filter(|_| !forced);
-        if answer.is_some_and(|answer| !answer.composes()) {
-            return Err(
-                "the ebnf is in Lark's syntax, which this model's turn grammar cannot hold; \
-                 write it in xgrammar's (root ::= ...)"
-                    .to_string(),
-            );
-        }
         let position = self.output_position(turn.prompt, turn.continued);
         if position == OutputPosition::InAnswer && forced {
+            return Ok(None);
+        }
+        if OutputSpelling::check_parameter_counts(turn.callable).is_err() {
             return Ok(None);
         }
         let output = Output {
@@ -267,19 +246,42 @@ impl Format {
             callable: turn.callable,
             choice: turn.choice,
             parallel: turn.parallel,
-            answer,
+            answer: turn.answer.filter(|_| !forced),
         };
+        // The grammar's length comes before the grammar: one over the bound is never built.
+        if spelling
+            .payload_len(&output)
+            .is_none_or(|len| len > OutputSpelling::MAX_TAG_BYTES)
+        {
+            return Ok(None);
+        }
+        spelling.check_names(turn.declared)?;
+        let own_grammar = matches!(
+            output.answer,
+            Some(OutputAnswer::Regex(_) | OutputAnswer::Ebnf(_))
+        );
+        let strict = turn
+            .callable
+            .iter()
+            .any(|tool| tool.function.strict == Some(true));
+        if own_grammar && !turn.callable.is_empty() && (strict || !turn.parallel) {
+            return Err(
+                "a strict tool, or parallel_tool_calls: false, cannot be held under tool_choice \
+                 auto together with the request's own regex or ebnf"
+                    .to_string(),
+            );
+        }
+        if output.answer.is_some_and(|answer| !answer.composes()) {
+            return Err(
+                "the ebnf is in Lark's syntax, which this model's turn grammar cannot hold; \
+                 write it in xgrammar's (root ::= ...)"
+                    .to_string(),
+            );
+        }
         if let Some(why) = spelling.unenforced(&output) {
             return Err(why);
         }
-        if OutputSpelling::check_parameter_counts(turn.callable).is_err() {
-            return Ok(None);
-        }
-        // The grammar's length comes before the grammar: one over the bound is never built.
-        match spelling.payload_len(&output) {
-            Some(len) if len <= OutputSpelling::MAX_TAG_BYTES => Ok(spelling.grammar(&output)),
-            _ => Ok(None),
-        }
+        Ok(spelling.grammar(&output))
     }
 }
 

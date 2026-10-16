@@ -38,7 +38,7 @@ use super::{
     },
     regular::stages::decisions::scoring::{DecisionPrompt, DecisionScoring},
     spec::ResponseSpec,
-    utils::ParserResolver,
+    utils::{ParserResolver, WorkerDecoding},
 };
 use crate::{
     config::ParserChoice,
@@ -246,6 +246,11 @@ pub(crate) struct ProcessingState {
     /// re-selection stays pinned to workers that accept them.
     pub media_refs_forwarded: bool,
 
+    /// The selected worker's constrained decoding, set once request building
+    /// decided the request's constraint on it, so retry re-selection stays on
+    /// workers that decide alike (`utils::WorkerDecoding::decides_alike`).
+    pub constraint_decided_on: Option<WorkerDecoding>,
+
     /// `Some` iff the request is multimodal EPD and worker selection produced
     /// encode assignments. Request building injects the bootstrap info and drops
     /// prefill pixels; request execution `take()`s the dispatch plan.
@@ -360,6 +365,9 @@ pub(crate) struct DispatchContext {
     pub rate_limit_cell: Option<Arc<RateLimitCell>>,
     pub routing: RoutingSnapshot,
     pub wire: WireConstraint,
+    /// The selected worker's constrained decoding the plan's constraint was
+    /// decided on; a retry re-selects only workers that decide alike.
+    pub constraint_decided_on: Option<WorkerDecoding>,
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
     pub workers: Option<WorkerSelection>,
     pub sticky_key: Option<String>,
@@ -1006,6 +1014,7 @@ impl RequestContext {
             rate_limit_cell,
             routing,
             wire,
+            constraint_decided_on: state.constraint_decided_on,
             tokenizer: state.tokenizer,
             workers: state.workers,
             sticky_key: state.sticky_key,

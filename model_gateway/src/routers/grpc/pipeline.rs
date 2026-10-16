@@ -747,11 +747,20 @@ impl RequestPipeline {
             // worker: the next attempt goes to another available worker, or
             // the answer stands as the client's response.
             if let Some(workers) = dctx.workers.as_ref() {
+                // The alternative is sought where the retry would re-select,
+                // among the workers that decide the constraint alike too.
                 let pools = self.retry_pools(&dctx.model_id, dctx.wire);
+                let decided_on = dctx.constraint_decided_on;
                 dctx.ledger.settle(
                     &mut failure,
                     workers.workers(),
-                    pools.iter().flat_map(|pool| pool.as_slice().iter()),
+                    pools
+                        .iter()
+                        .flat_map(|pool| pool.as_slice().iter())
+                        .filter(|worker| {
+                            decided_on
+                                .is_none_or(|decoding| decoding.decides_alike(worker.as_ref()))
+                        }),
                 );
             }
 

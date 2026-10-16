@@ -58,13 +58,13 @@ use symphony::{
     Declared, Engine, EngineFinish, Event, Events, Format, Grammar, Input, OutputAnswer,
     OutputChoice, Parser as _, TokenSpan, Turn,
 };
-use tool_parser::{GrammarStart, ToolConstraint};
+use tool_parser::ToolConstraint;
 use tracing::debug;
 
 use self::template::Templates;
 use crate::{
     config::{ParserChoice, TEMPLATE_PARSER},
-    routers::grpc::utils::Names,
+    routers::grpc::utils::{Names, WorkerDecoding},
 };
 
 /// The request header that names the parser for one request, `legacy` or `symphony`, over the
@@ -567,8 +567,8 @@ pub(crate) struct WorkerConstraint {
 }
 
 /// What constrains a request's output on the worker selected for it, whose engine takes a grammar
-/// on every turn or only when the request asks (`policy`) and starts it where `start` says (under
-/// PD the decode worker's). The one place a worker's policy decides:
+/// on every turn or only when the request asks and starts it where its label says (`decoding`,
+/// under PD the decode worker's). The one place a worker's policy decides:
 ///
 /// - `requested`, the default: what preparation found (`prepared`), its refusal included.
 /// - `always`, on an engine that starts the grammar at the first token: the whole turn's grammar
@@ -576,15 +576,16 @@ pub(crate) struct WorkerConstraint {
 /// - `always` otherwise, or where the whole turn's grammar does not start: what preparation found,
 ///   and when that is nothing, the table's tag for the calls `auto` allows (`auto`,
 ///   [`auto_constraint`]).
+///
+/// A retry re-selects only workers that decide alike ([`WorkerDecoding::decides_alike`]).
 pub(crate) fn worker_constraint(
-    policy: ConstrainedDecoding,
-    start: GrammarStart,
+    decoding: WorkerDecoding,
     prepared: PreparedConstraint,
     turn: impl FnOnce() -> Result<Option<ToolConstraint>, String>,
     auto: impl FnOnce() -> Result<Option<ToolConstraint>, String>,
 ) -> Result<WorkerConstraint, String> {
-    let always = policy == ConstrainedDecoding::Always;
-    if always && start == GrammarStart::FirstToken {
+    let always = decoding.policy == ConstrainedDecoding::Always;
+    if decoding.takes_the_whole_turn() {
         if let Some(constraint) = turn()? {
             return Ok(WorkerConstraint {
                 constraint: Some(constraint),
@@ -1049,6 +1050,7 @@ mod tests {
     use llm_tokenizer::registry::TokenizerRegistry;
     use serde_json::{json, Value};
     use symphony::{formats::qwen3, CallSyntax};
+    use tool_parser::GrammarStart;
 
     use super::*;
 
@@ -2467,8 +2469,7 @@ mod tests {
         let decide = |policy, start, prepared: PreparedConstraint, turn: PreparedConstraint| {
             let built = std::cell::RefCell::new(Vec::new());
             let decided = worker_constraint(
-                policy,
-                start,
+                WorkerDecoding { policy, start },
                 prepared,
                 || {
                     built.borrow_mut().push("turn");

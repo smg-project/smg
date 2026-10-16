@@ -32,10 +32,10 @@ pub(crate) use metrics::{error_type_for_response, error_type_from_status, route_
 pub use parsers::chat_reasoning_starts_in_prefill;
 pub(crate) use parsers::{
     chat_reasoning_starts_in_rendered_prefill, check_reasoning_parser_availability,
-    check_tool_parser_availability, constrained_decoding_for, create_reasoning_parser,
-    create_tool_parser, get_tool_parser, grammar_start_for, messages_reasoning_starts_in_prefill,
-    reasoning_parser_requires_special_tokens, rendered_prompt_reasoning_in_prefill,
-    tool_constraints_for_worker, Names, ParserResolver,
+    check_tool_parser_availability, create_reasoning_parser, create_tool_parser, get_tool_parser,
+    messages_reasoning_starts_in_prefill, reasoning_parser_requires_special_tokens,
+    rendered_prompt_reasoning_in_prefill, tool_constraints_for_worker, Names, ParserResolver,
+    WorkerDecoding,
 };
 pub(crate) use pd_bootstrap::account_pd_leg_failure;
 pub(crate) use stream_failure::{send_stream_failure, StreamFailure, StreamSource};

@@ -548,9 +548,16 @@ impl WorkerSelectionStage {
             vision: ctx.routing.needs_vision,
         };
         // A retry skips the workers that already answered this request
-        // definitively (see `routers::common::attempt_ledger`).
+        // definitively (see `routers::common::attempt_ledger`), and stays on
+        // the workers that decide its constraint as the first attempt's did
+        // (`utils::WorkerDecoding::decides_alike`): the retained plan carries
+        // that decision.
         let ledger = &ctx.ledger;
-        let admits = |worker: &dyn Worker| ledger.admits(worker);
+        let decided_on = ctx.constraint_decided_on;
+        let admits = |worker: &dyn Worker| {
+            ledger.admits(worker)
+                && decided_on.is_none_or(|decoding| decoding.decides_alike(worker))
+        };
 
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
@@ -2649,6 +2656,7 @@ mod tests {
                 decode_needs_vision: false,
             },
             wire,
+            constraint_decided_on: None,
             tokenizer: None,
             workers: None,
             sticky_key: None,
@@ -2726,6 +2734,85 @@ mod tests {
                 WorkerSelection::Disaggregated { .. } => panic!("expected single selection"),
             }
         }
+    }
+
+    /// A retry stays on the workers that decide the request's constraint as
+    /// the first attempt's did: the whole turn's grammar, decided on a worker
+    /// that takes it, never reaches one that starts the grammar later or
+    /// takes one only when asked, and a plan decided on such a worker never
+    /// reaches the whole turn's.
+    #[tokio::test]
+    async fn reselect_stays_on_workers_that_decide_the_constraint_alike() {
+        let model_id = "decided-on-model";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let always = ("constrained_decoding", "always");
+        let first_token = ("constrained_decoding_start", "first_token");
+        let after_reasoning = ("constrained_decoding_start", "after_reasoning");
+        let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
+        for (url, labels) in [
+            ("grpc://127.0.0.1:9330", vec![always, first_token]),
+            ("grpc://127.0.0.1:9331", vec![]),
+            ("grpc://127.0.0.1:9332", vec![always, after_reasoning]),
+            ("grpc://127.0.0.1:9333", vec![always, first_token]),
+        ] {
+            let mut builder = BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(model_id))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::TokenSpeed)
+                .health_config(no_health_check());
+            for (key, value) in labels {
+                builder = builder.label(key, value);
+            }
+            let worker: Arc<dyn Worker> = Arc::new(builder.build());
+            worker_registry.register(Arc::clone(&worker)).unwrap();
+            workers.push(worker);
+        }
+        let stage = WorkerSelectionStage::new(
+            worker_registry,
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::Regular,
+            None,
+        );
+        let mut ctx = dispatch_ctx(
+            model_id,
+            WireConstraint {
+                runtime: RuntimeType::TokenSpeed,
+                connection: ConnectionMode::Grpc,
+                requires_media_refs: false,
+            },
+        );
+        let decided_on = |worker: &Arc<dyn Worker>| {
+            utils::WorkerDecoding::of(Some(&WorkerSelection::Single {
+                worker: Arc::clone(worker),
+            }))
+        };
+        let selected = |ctx: &DispatchContext| match ctx.workers.as_ref().unwrap() {
+            WorkerSelection::Single { worker } => worker.url().to_string(),
+            WorkerSelection::Disaggregated { .. } => panic!("expected single selection"),
+        };
+
+        // The whole turn's worker failed: the retry takes the other one that takes it.
+        ctx.constraint_decided_on = Some(decided_on(&workers[0]));
+        ctx.tried.push(workers[0].base_url().to_string());
+        for _ in 0..8 {
+            stage.reselect(&mut ctx).await.unwrap();
+            assert_eq!(selected(&ctx), "grpc://127.0.0.1:9333");
+        }
+        // Decided on the `always` worker that starts the grammar later.
+        ctx.constraint_decided_on = Some(decided_on(&workers[2]));
+        for _ in 0..8 {
+            stage.reselect(&mut ctx).await.unwrap();
+            assert_eq!(selected(&ctx), "grpc://127.0.0.1:9332");
+        }
+        // Without a decision (no constraint was decided for the request), any worker.
+        ctx.constraint_decided_on = None;
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..8 {
+            stage.reselect(&mut ctx).await.unwrap();
+            seen.insert(selected(&ctx));
+        }
+        assert_eq!(seen.len(), 3, "{seen:?}");
     }
 
     /// A keyed request's retry re-selects away from the engine its failed

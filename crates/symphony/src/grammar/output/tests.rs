@@ -821,3 +821,43 @@ fn the_turns_grammar_is_the_spellings_where_the_prompt_leaves_the_model() {
     let none = unaddressed.turn_grammar(&turn(&tools, OutputChoice::Auto, None, &start));
     assert_eq!(none, Ok(None));
 }
+
+/// What the turn's grammar cannot hold refuses the request only where that grammar is built:
+/// where none starts, or one would be over its limits, the table's tags decide and the request's
+/// own grammar goes to the engine as it came.
+#[test]
+fn the_turns_grammar_refuses_only_what_it_would_hold() {
+    let format = table(true);
+    let lark = OutputAnswer::Ebnf("start: \"y\"");
+    let regex = OutputAnswer::Regex("y+");
+    let strict = |mut tool: Tool| {
+        tool.function.strict = Some(true);
+        tool
+    };
+    let weather = [strict(weather())];
+    let mut properties = Map::new();
+    properties.insert("t".to_string(), json!({"type": "tuple"}));
+    for i in 0..OutputSpelling::MAX_TOOL_PARAMETERS {
+        properties.insert(format!("p{i}"), json!({"type": "string"}));
+    }
+    let crowded = [strict(tool(
+        "f",
+        json!({"type": "object", "properties": properties}),
+    ))];
+    let start = format!("user{OPENER}");
+    let elsewhere = format!("user{OPENER}Hello");
+    let at = |tools: &[Tool], answer, prompt: &str| {
+        format.turn_grammar(&Turn {
+            continued: prompt == elsewhere,
+            ..turn(tools, OutputChoice::Auto, answer, prompt)
+        })
+    };
+    // Where the grammar starts, each is refused.
+    assert!(at(&[], Some(lark), &start).is_err());
+    assert!(at(&weather, Some(regex), &start).is_err());
+    // Past text no field holds, no grammar starts.
+    assert_eq!(at(&[], Some(lark), &elsewhere), Ok(None));
+    assert_eq!(at(&weather, Some(regex), &elsewhere), Ok(None));
+    // A strict tool the calls would hold loosely, over the parameter limit: no grammar is built.
+    assert_eq!(at(&crowded, None, &start), Ok(None));
+}
