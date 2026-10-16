@@ -45,6 +45,16 @@
     When the system is imbalanced, routes to LeastLoad's atomic expected-wait
     winner regardless of cache affinity.
 
+    Spill Gate, Cost Form (balance_cost_gate)
+    -------------------------------------------
+    Opt-in. Instead of leaving a matched worker once its in-flight count
+    clears the two count margins, every eligible worker is ranked on its
+    expected wait plus the prefill the request still needs there (a holder's
+    uncached share of the prompt, a cold worker's whole prompt, at the
+    fleet's nominal drain rate): a holder is left exactly when its wait
+    exceeds a colder worker's by more than the time the prefix saves. The
+    chosen worker is credited with the work it must do, not the whole prompt.
+
     Hash Index Under-Layer (cache_index = hash)
     -------------------------------------------
     Replaces all three tree modes with a TTL'd exact-match placement map
@@ -60,6 +70,8 @@
                              the in-flight count's natural swing at the pool's mean, never under four
                              unless the configured value itself is lower (0: the relative part alone)
     balance_rel_threshold:   Relative margin of the spill gate (multiple of the fleet mean)
+    balance_cost_gate:       Cost form of the spill gate (expected wait plus uncached prefill)
+                             instead of the two count margins; off by default
     eviction_interval_secs:  Interval between LRU eviction / TTL sweep cycles
     max_tree_size:           Max total size (chars/tokens) of each model's approximate tree,
                              shared across all workers; enforced by eviction
@@ -1694,7 +1706,18 @@ impl CacheAwarePolicy {
         self.selection.name() == cost::DEFAULT_POLICY
             && tuning.selection_temperature <= 0.0
             && self.accounting.is_none()
+            && !self.config.balance_cost_gate
             && (tuning.overlap_decay <= 0.0 || tuning.waiting_prefill_tokens.is_none())
+    }
+
+    /// Whether a decision gathers every eligible worker as a row beside the
+    /// holders: an all-workers selection policy, the optimistic accounting
+    /// (a prediction may name a worker the index does not), or the cost
+    /// gate, which ranks every eligible worker on the wait it would add.
+    fn wants_all_rows(&self) -> bool {
+        self.selection.needs().all_workers
+            || self.accounting.is_some()
+            || self.config.balance_cost_gate
     }
 
     /// Whether the KV-pressure gate is configured: it reads the whole
@@ -1843,6 +1866,65 @@ impl CacheAwarePolicy {
     ) -> Option<usize> {
         self.load_scorer
             .select_min_expected_wait(workers, candidates, info, self.name())
+    }
+
+    /// The cost form of the spill decision (`balance_cost_gate`): every row
+    /// the decision read is a candidate at its expected wait plus the
+    /// prefill the request still needs there, its uncached share of the
+    /// prompt (see [`LeastLoadPolicy::select_min_total_wait`]). The holders
+    /// of the prefix are left for a colder worker exactly when their wait
+    /// exceeds its by more than the time the prefix saves; a shallower
+    /// holder keeps the credit of its own overlap; the in-flight count
+    /// margins do not apply. Selection and credit stay one atomic step.
+    fn select_final_by_cost(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        inputs: &[CandidateInputs<'_>],
+        request: &RequestInputs<'_>,
+        info: &SelectWorkerInfo,
+    ) -> Option<usize> {
+        let request_blocks = request.request_blocks.max(1) as f64;
+        let rows: Vec<usize> = inputs.iter().map(|candidate| candidate.idx).collect();
+        let shares: Vec<f64> = inputs
+            .iter()
+            .map(|candidate| (candidate.device_blocks / request_blocks).clamp(0.0, 1.0))
+            .collect();
+        let selected =
+            self.load_scorer
+                .select_min_total_wait(workers, &rows, &shares, info, self.name())?;
+        if cache_trace::enabled() {
+            let share = rows
+                .iter()
+                .position(|&idx| idx == selected)
+                .map_or(0.0, |pos| shares[pos]);
+            cache_trace::gate(serde_json::json!({
+                "source": "cost_gate", "worker": workers[selected].url(),
+                "cached_share": share, "request_blocks": request.request_blocks,
+                "spill": share <= 0.0 && shares.iter().any(|&held| held > 0.0),
+            }));
+        }
+        Some(selected)
+    }
+
+    /// The cost form of the hash-mode decision: the holders of the deepest
+    /// applicable head hold `boundary` of the prompt's `prompt_tokens`
+    /// tokens, every other eligible worker none of them.
+    fn select_hash_holders_by_cost(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+        holders: &[usize],
+        boundary: usize,
+        prompt_tokens: usize,
+        info: &SelectWorkerInfo,
+    ) -> Option<usize> {
+        let held = (boundary as f64 / prompt_tokens.max(1) as f64).clamp(0.0, 1.0);
+        let shares: Vec<f64> = healthy_indices
+            .iter()
+            .map(|idx| if holders.contains(idx) { held } else { 0.0 })
+            .collect();
+        self.load_scorer
+            .select_min_total_wait(workers, healthy_indices, &shares, info, self.name())
     }
 
     /// The count-pressure gate's comparison alone, with no trace record: a
@@ -2177,9 +2259,8 @@ impl CacheAwarePolicy {
         avg_load: f64,
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
-        let needs = self.selection.needs();
         let accounting = self.accounting.as_ref();
-        let wants_all = needs.all_workers || accounting.is_some();
+        let wants_all = self.wants_all_rows();
         if candidates.is_empty() && !wants_all {
             return self.select_final_from_affinity(workers, &[], healthy_indices, avg_load, info);
         }
@@ -2262,6 +2343,13 @@ impl CacheAwarePolicy {
         let selected = match self.selection.select(request, &inputs) {
             Pick::None => {
                 self.select_final_from_affinity(workers, &[], healthy_indices, avg_load, info)
+            }
+            Pick::Group(rows) if self.config.balance_cost_gate => {
+                // The group names the hit; the cost ranks every row, so a
+                // shallower holder and a cold worker compete with it on the
+                // wait each would add, not on a count margin.
+                debug_assert!(!rows.is_empty());
+                self.select_final_by_cost(workers, &inputs, request, info)
             }
             Pick::Group(rows) => {
                 let group: Vec<usize> = rows.iter().map(|&row| inputs[row].idx).collect();
@@ -2431,7 +2519,7 @@ impl CacheAwarePolicy {
         let gather = if self.exact_maximum_decision(&tuning) {
             Gather::TopGroup { cap }
         } else {
-            let wants_all = self.selection.needs().all_workers || self.accounting.is_some();
+            let wants_all = self.wants_all_rows();
             Gather::All {
                 cap: cap.filter(|_| wants_all),
             }
@@ -2994,13 +3082,24 @@ impl CacheAwarePolicy {
             if holder_candidates.is_empty() {
                 continue;
             }
-            let selected = self.select_final_from_affinity(
-                workers,
-                &holder_candidates,
-                healthy_indices,
-                avg_load,
-                info,
-            )?;
+            let selected = if self.config.balance_cost_gate {
+                self.select_hash_holders_by_cost(
+                    workers,
+                    healthy_indices,
+                    &holder_candidates,
+                    boundary,
+                    tokens.len(),
+                    info,
+                )
+            } else {
+                self.select_final_from_affinity(
+                    workers,
+                    &holder_candidates,
+                    healthy_indices,
+                    avg_load,
+                    info,
+                )
+            }?;
             let branch = if holder_candidates.contains(&selected) {
                 "hash_hit"
             } else {

@@ -72,6 +72,7 @@ fn a_request_asks_whether_text_is_wanted_without_allocating() {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_cost_gate: false,
         },
         RoutingKeyOverrideConfig {
             enabled: true,

@@ -1381,6 +1381,7 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_cost_gate: false,
         }
     }
 
@@ -1948,6 +1949,7 @@ mod tests {
                 cache_boundaries: Vec::new(),
                 selection_policy: None,
                 selection_accounting_ttl_ms: 0,
+                balance_cost_gate: false,
             },
             rid_override(ManualAssignmentMode::Delegate),
         );
@@ -2435,6 +2437,7 @@ mod tests {
                 cache_boundaries: Vec::new(),
                 selection_policy: None,
                 selection_accounting_ttl_ms: 0,
+                balance_cost_gate: false,
             }
         }
 
@@ -2485,6 +2488,7 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_cost_gate: false,
         });
 
         // Hinted policy is a fresh per-model instance, not the shared default.
@@ -2558,6 +2562,7 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_cost_gate: false,
         }));
 
         for round in 0..64 {

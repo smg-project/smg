@@ -212,6 +212,12 @@ class Router:
         balance_rel_threshold: Spill gate, relative part: the multiple of the
             healthy-fleet mean a matched worker's load must exceed, together with
             the absolute part. Default: 1.5
+        balance_cost_gate: Spill gate, cost form: a matched worker is left for
+            another when its expected wait exceeds the other's by more than the
+            time the matched prefix saves (every eligible worker ranked on its
+            expected wait plus the prefill the request still needs there),
+            instead of when its in-flight count clears the absolute and relative
+            thresholds. Needs backend load reports. Default: False
         eviction_interval_secs: Interval in seconds between cache eviction operations
             in cache-aware routing. Default: 60
         overlap_decay: Cache-aware anti-hotspot decay: each candidate's overlap score

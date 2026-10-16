@@ -1491,6 +1491,165 @@ fn the_gate_opens_at_the_load_the_pools_mean_sets() {
     assert!(policy.over_count_pressure_gate(301.0, 200.0));
 }
 
+/// The config of the cost form of the spill gate over the test defaults.
+fn cost_gate() -> CacheAwareConfig {
+    CacheAwareConfig {
+        balance_cost_gate: true,
+        ..test_config()
+    }
+}
+
+/// One selection of a 32-token request on a two-worker pool where `w1`
+/// holds the request's first `held` tokens, with `queued` uncached
+/// tokens reported per worker at 100 tokens/s and no request in flight
+/// on either worker. Returns the policy and workers for credit checks.
+fn cost_pick(
+    config: CacheAwareConfig,
+    held: usize,
+    queued: [i32; 2],
+) -> (CacheAwarePolicy, Vec<Arc<dyn Worker>>, usize) {
+    let policy = CacheAwarePolicy::with_config(config);
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    let tokens: Vec<u32> = (0..32).collect();
+    seed_token_tenants(&policy, &workers, &tokens[..held], &["http://w1:8000"]);
+    update_expected_wait_loads(&policy, &workers, &queued);
+    let info = SelectWorkerInfo {
+        tokens: Some(&tokens),
+        ..Default::default()
+    };
+    let idx = policy.select_worker(&workers, &info).unwrap();
+    (policy, workers, idx)
+}
+
+#[test]
+fn the_cost_gate_leaves_the_home_once_its_wait_exceeds_the_prefill_it_saves() {
+    // Reports at 100 tokens/s, so a queue's depth in tokens is its wait
+    // in hundredths of a second. The 32-token prompt is cached whole on
+    // its home, which saves 32 tokens of prefill there (0.32 s against a
+    // cold worker's whole prompt): the home is left only once its queue
+    // is more than 32 tokens deeper than the cold worker's. The count
+    // gate never opens here (no request in flight on either worker), so
+    // under it affinity holds whatever the queues.
+    for (queued, pick) in [
+        ([0, 0], 0),
+        ([31, 0], 0),
+        // Equal totals go to the warmer worker.
+        ([32, 0], 0),
+        ([33, 0], 1),
+        ([1_000, 970], 0),
+        ([1_000, 960], 1),
+    ] {
+        let (_, _, idx) = cost_pick(cost_gate(), 32, queued);
+        assert_eq!(idx, pick, "cost gate, queued {queued:?}");
+        let (_, _, idx) = cost_pick(test_config(), 32, queued);
+        assert_eq!(idx, 0, "count gate, queued {queued:?}");
+    }
+}
+
+#[test]
+fn the_cost_gate_prices_a_partial_prefix_at_its_uncached_share() {
+    // 24 of the 32 tokens are held: 8 remain to prefill on the home
+    // against 32 on a cold worker, so the gap that opens the gate is 24
+    // tokens, and the home is credited the 8 it must compute where the
+    // count gate credits the whole prompt.
+    let (policy, workers, idx) = cost_pick(cost_gate(), 24, [24, 0]);
+    assert_eq!(idx, 0);
+    assert_only_final_worker_credited(&policy, &workers, 0, 8);
+    let (policy, workers, idx) = cost_pick(cost_gate(), 24, [25, 0]);
+    assert_eq!(idx, 1);
+    assert_only_final_worker_credited(&policy, &workers, 1, 32);
+    let (policy, workers, idx) = cost_pick(test_config(), 24, [25, 0]);
+    assert_eq!(idx, 0);
+    assert_only_final_worker_credited(&policy, &workers, 0, 32);
+}
+
+#[test]
+fn without_load_reports_the_cost_gate_weighs_counts_against_the_work_in_mean_prefill_units() {
+    // No report anywhere: a worker's wait is its in-flight count, and
+    // the uncached work weighs tokens over mean_prefill_tokens (32 /
+    // 1024 of a request here), so one request of gap already outweighs
+    // the 32-token prefix where the count gate's margin would not open
+    // before four requests above the mean.
+    for ((w1_load, w2_load), pick) in [((0, 0), 0), ((1, 1), 0), ((1, 0), 1)] {
+        let policy = CacheAwarePolicy::with_config(cost_gate());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let tokens: Vec<u32> = (0..32).collect();
+        seed_token_tenants(&policy, &workers, &tokens, &["http://w1:8000"]);
+        for _ in 0..w1_load {
+            workers[0].increment_load();
+        }
+        for _ in 0..w2_load {
+            workers[1].increment_load();
+        }
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        assert_eq!(
+            policy.select_worker(&workers, &info),
+            Some(pick),
+            "loads {w1_load}/{w2_load}"
+        );
+    }
+    assert_eq!(affinity_pick(test_config(), 1, 0), 0);
+}
+
+#[test]
+fn the_cost_gate_applies_to_the_hash_index_at_the_boundarys_share() {
+    let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+        cache_index: CacheIndexKind::Hash,
+        cache_boundaries: vec![16],
+        ..cost_gate()
+    });
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    policy.init_workers(&workers);
+    let tokens: Vec<u32> = (0..32).collect();
+    let info = SelectWorkerInfo {
+        tokens: Some(&tokens),
+        ..Default::default()
+    };
+    // No holder yet: the expected wait places the first request on w1.
+    update_expected_wait_loads(&policy, &workers, &[0, 10]);
+    assert_eq!(policy.select_worker(&workers, &info), Some(0));
+    // w1 now holds the 16-token head, half the prompt: it is left once
+    // its queue is more than 16 tokens deeper than w2's.
+    update_expected_wait_loads(&policy, &workers, &[16, 0]);
+    assert_eq!(policy.select_worker(&workers, &info), Some(0));
+    update_expected_wait_loads(&policy, &workers, &[17, 0]);
+    assert_eq!(policy.select_worker(&workers, &info), Some(1));
+}
+
+#[test]
+fn event_cost_gate_leaves_the_holder_for_a_cold_worker_only_past_the_prefix_it_saves() {
+    // w1 holds the request's one block (4 tokens at block 4); reports at
+    // 100 tokens/s: w1 is left once its queue is more than 4 tokens
+    // deeper than w2's, where the count gate keeps the hit on w1.
+    for (config, queued, pick) in [
+        (cost_gate(), [4, 0], 0),
+        (cost_gate(), [5, 0], 1),
+        (test_config(), [5, 0], 0),
+    ] {
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        update_expected_wait_loads(&policy, &workers, &queued);
+        let monitor = Arc::new(KvEventMonitor::new());
+        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]]);
+        monitor.indexers.insert("unknown".to_string(), indexer);
+        policy.set_kv_event_monitor(Some(monitor));
+        let tokens = [1, 2, 3, 4];
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        assert_eq!(
+            policy.select_worker(&workers, &info),
+            Some(pick),
+            "queued {queued:?}"
+        );
+    }
+}
+
 #[test]
 fn kv_pressure_still_forces_expected_wait_fallback() {
     let policy = CacheAwarePolicy::with_config(CacheAwareConfig {

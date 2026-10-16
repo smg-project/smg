@@ -891,6 +891,7 @@ impl ConfigValidator {
                 cache_boundaries,
                 selection_policy,
                 selection_accounting_ttl_ms: _,
+                balance_cost_gate: _,
             } => {
                 Self::validate_cache_boundaries(cache_boundaries)?;
 
@@ -3383,6 +3384,7 @@ mod tests {
                 cache_boundaries: Vec::new(),
                 selection_policy: None,
                 selection_accounting_ttl_ms: 0,
+                balance_cost_gate: false,
             },
         );
 
@@ -3415,6 +3417,7 @@ mod tests {
                     cache_boundaries: Vec::new(),
                     selection_policy: None,
                     selection_accounting_ttl_ms: 0,
+                    balance_cost_gate: false,
                 },
             )
         };
@@ -3469,6 +3472,7 @@ mod tests {
                     cache_boundaries: Vec::new(),
                     selection_policy: None,
                     selection_accounting_ttl_ms: 0,
+                    balance_cost_gate: false,
                 },
             )
         };
@@ -3601,6 +3605,7 @@ mod tests {
                     cache_boundaries: boundaries,
                     selection_policy: None,
                     selection_accounting_ttl_ms: 0,
+                    balance_cost_gate: false,
                 },
             )
         };
@@ -3655,6 +3660,7 @@ mod tests {
                 cache_boundaries: Vec::new(),
                 selection_policy: None,
                 selection_accounting_ttl_ms: 0,
+                balance_cost_gate: false,
             },
         );
 
@@ -3778,6 +3784,7 @@ mod tests {
                 cache_boundaries: Vec::new(),
                 selection_policy: None,
                 selection_accounting_ttl_ms: 0,
+                balance_cost_gate: false,
             },
         );
 
@@ -3832,6 +3839,7 @@ mod tests {
                     cache_boundaries: Vec::new(),
                     selection_policy: None,
                     selection_accounting_ttl_ms: 0,
+                    balance_cost_gate: false,
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_metric: Default::default(),
@@ -3968,6 +3976,7 @@ mod tests {
                     cache_boundaries: Vec::new(),
                     selection_policy: None,
                     selection_accounting_ttl_ms: 0,
+                    balance_cost_gate: false,
                 }),
                 prefill_policy: None,
                 decode_policy: None,
