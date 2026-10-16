@@ -79,7 +79,7 @@ pub(crate) fn prepare(
     stage: &'static str,
 ) -> Result<Prepared, Response> {
     let model = asks.model();
-    let parser = ctx.state.parser.unwrap_or_default();
+    let parser = ctx.state.parser.unwrap_or(ParserChoice::Legacy);
     let names = ctx.components.parser_resolver.names(model);
     // The tag takes the start the model's workers name, when they agree; the
     // selected worker's own start decides the `auto` tag at request building.
@@ -264,7 +264,7 @@ pub(crate) fn decide(
 ) -> Result<Decided, Response> {
     let model = asks.model();
     let names = ctx.components.parser_resolver.names(model);
-    let parser = ctx.state.parser.unwrap_or_default();
+    let parser = ctx.state.parser.unwrap_or(ParserChoice::Legacy);
     let decoding = utils::WorkerDecoding::of(ctx.state.workers.as_ref());
     let decided = symphony::worker_constraint(
         decoding,

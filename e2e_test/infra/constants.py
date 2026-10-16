@@ -206,9 +206,9 @@ VLLM_MM_PROCESSORS = ("inprocess", "smg")
 def get_parser() -> str | None:
     """The parser a lane starts the gateway with, its ``--parser`` flag.
 
-    Set ``E2E_PARSER=symphony`` to read every chat completion with Symphony for
-    the models its registry knows; ``legacy`` names the per-model parsers.
-    Unset or blank leaves the gateway on its default, legacy.
+    Set ``E2E_PARSER=legacy`` to read every chat completion with the per-model
+    parsers; ``symphony`` pins Symphony for the models its registry knows.
+    Unset or blank leaves the gateway on its default, symphony.
     """
     value = os.environ.get(ENV_PARSER, "").strip().lower()
     if not value:
