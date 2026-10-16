@@ -671,8 +671,6 @@ pub(crate) fn translate_sampling_sglang(sp: sglang_proto::SamplingParams) -> Sgl
     params
 }
 
-/// Normalize an SGLang finish reason into the canonical set the gateway's
-/// response layer exact-matches (`stop`, `length`, `abort`).
 /// The gRPC status for a request the scheduler aborted with an HTTP-style
 /// status: the table the engine's Python servicer uses for the same status,
 /// so the two front ends of one engine answer alike. 400 is the caller's
@@ -690,6 +688,8 @@ pub(crate) fn scheduler_abort_status(status: Option<u16>, message: String) -> to
     }
 }
 
+/// Normalize an SGLang finish reason into the canonical set the gateway's
+/// response layer exact-matches (`stop`, `length`, `abort`).
 pub(crate) fn normalize_finish_reason(reason: &str) -> &'static str {
     match reason {
         "stop" => "stop",
