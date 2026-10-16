@@ -193,6 +193,27 @@ class LoadRecorder:
         # Failed reads of the source in a row, per rank: the outages being reported.
         self._failed_reads: dict[int | None, int] = {}
 
+    @classmethod
+    def optional(
+        cls,
+        source: LoadSource | None,
+        *,
+        load_tick: float = LOAD_TICK,
+        heartbeat_interval: float = HEARTBEAT_INTERVAL,
+        heartbeat_backoff: float = HEARTBEAT_BACKOFF,
+    ) -> LoadRecorder | None:
+        """A recorder over ``source`` at the given intervals, or ``None``
+        without a source: the stream then carries cache events only and the
+        gateway keeps polling the worker."""
+        if source is None:
+            return None
+        return cls(
+            source,
+            load_tick=load_tick,
+            heartbeat_interval=heartbeat_interval,
+            heartbeat_backoff=heartbeat_backoff,
+        )
+
     def poll_timeout(self, recv_timeout: float) -> float:
         """How long the stream may wait for the next batch before the record
         is checked again."""
@@ -291,3 +312,10 @@ class LoadRecorder:
             batch.dp_rank = self._last_rank
         batch.load.CopyFrom(record)
         return batch
+
+
+def poll_timeout_for(recorder: LoadRecorder | None, recv_timeout: float) -> float:
+    """How long a stream with ``recorder`` (or none) may wait for the next
+    batch: the recorder's :meth:`LoadRecorder.poll_timeout`, else
+    ``recv_timeout`` as given."""
+    return recorder.poll_timeout(recv_timeout) if recorder is not None else recv_timeout

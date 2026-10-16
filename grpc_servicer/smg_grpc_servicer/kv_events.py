@@ -20,6 +20,7 @@ from smg_grpc_servicer.load_record import (
     LOAD_TICK,
     LoadRecorder,
     LoadSource,
+    poll_timeout_for,
 )
 
 logger = logging.getLogger(__name__)
@@ -167,17 +168,13 @@ async def stream_kv_events(
 
     Yields proto KvEventBatch using the ZMQ publisher's native sequence numbers.
     """
-    recorder = (
-        LoadRecorder(
-            load_source,
-            load_tick=load_tick,
-            heartbeat_interval=heartbeat_interval,
-            heartbeat_backoff=heartbeat_backoff,
-        )
-        if load_source is not None
-        else None
+    recorder = LoadRecorder.optional(
+        load_source,
+        load_tick=load_tick,
+        heartbeat_interval=heartbeat_interval,
+        heartbeat_backoff=heartbeat_backoff,
     )
-    poll_timeout = recorder.poll_timeout(recv_timeout) if recorder is not None else recv_timeout
+    poll_timeout = poll_timeout_for(recorder, recv_timeout)
     await send_initial_metadata()
     event_id = 0
     while not is_cancelled():

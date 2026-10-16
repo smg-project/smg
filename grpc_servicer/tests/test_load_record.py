@@ -411,3 +411,29 @@ def test_a_source_with_nothing_to_report_yet_is_not_an_outage(caplog):
         assert not recorder.stamp(_batch(1)).HasField("load")
         assert recorder.heartbeat() is None
     assert caplog.records == []
+
+
+def test_a_recorder_is_optional_on_its_source():
+    assert load_record.LoadRecorder.optional(None) is None
+    recorder = load_record.LoadRecorder.optional(
+        lambda rank: None, load_tick=0.2, heartbeat_interval=3.0, heartbeat_backoff=9.0
+    )
+    assert isinstance(recorder, load_record.LoadRecorder)
+    assert (recorder.load_tick, recorder.heartbeat_interval, recorder.heartbeat_backoff) == (
+        0.2,
+        3.0,
+        9.0,
+    )
+    by_default = load_record.LoadRecorder.optional(lambda rank: None)
+    assert (by_default.load_tick, by_default.heartbeat_interval, by_default.heartbeat_backoff) == (
+        load_record.LOAD_TICK,
+        load_record.HEARTBEAT_INTERVAL,
+        load_record.HEARTBEAT_BACKOFF,
+    )
+
+
+def test_the_poll_timeout_without_a_recorder_is_the_receive_timeout():
+    assert load_record.poll_timeout_for(None, 1.0) == 1.0
+    recorder = load_record.LoadRecorder.optional(lambda rank: None, load_tick=0.1)
+    assert load_record.poll_timeout_for(recorder, 1.0) == pytest.approx(0.1)
+    assert load_record.poll_timeout_for(recorder, 0.05) == pytest.approx(0.05)
