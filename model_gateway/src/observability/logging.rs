@@ -885,8 +885,13 @@ mod writer_tests {
         let sink = FailingSink {
             ended: ended.clone(),
         };
+        // A window: the writer thread sleeps inside its first `write` while
+        // the guard's drop queues the shutdown message, so the flush that
+        // fails is the one that ends the shutdown drain, every time (with no
+        // window the worker may drain the line alone, fail its flush before
+        // the shutdown message is queued, and pass against the old flush).
         let (mut writer, guard) = non_blocking(
-            Batched::with(sink, Duration::ZERO, BATCH_BYTES),
+            Batched::with(sink, Duration::from_millis(50), BATCH_BYTES),
             "test-log-batched-failing",
         );
         writer
