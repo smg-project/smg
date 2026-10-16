@@ -1753,6 +1753,13 @@ fn open_predicate(col_raw: &str) -> String {
     )
 }
 
+/// [`open_predicate`] over the schema's object column; none when the schema
+/// skips it: there is no status to check, so the conditional store is a plain
+/// update of the row under the id (every backend of this crate agrees).
+fn open_predicate_for(s: &crate::schema::TableConfig) -> Option<String> {
+    (!s.is_skipped("raw_response")).then(|| open_predicate(s.col("raw_response")))
+}
+
 /// The statement of [`ResponseStorage::store_response_if_open`]: an UPDATE of
 /// every column of the row under the id, applied only while `open` holds
 /// (none: the schema skips the status' column, so the update is plain). The
@@ -1869,7 +1876,7 @@ impl ResponseStorage for PostgresResponseStorage {
         let hook_extra = current_extra_columns().unwrap_or_default();
         let extra_cols: Vec<(&str, Option<String>)> = resolve_extra_column_values(s, &hook_extra);
         let (col_names, params) = write_columns(s, &response, &previous_id, &extra_cols);
-        let open = (!s.is_skipped("raw_response")).then(|| open_predicate(s.col("raw_response")));
+        let open = open_predicate_for(s);
         let sql = update_if_open_sql(&table, &col_names, open.as_deref());
 
         let client = self
@@ -2418,5 +2425,23 @@ mod tests {
         ));
         assert!(!is_stale_statement_state(&SqlState::UNDEFINED_COLUMN, None));
         assert!(!is_stale_statement_state(&SqlState::QUERY_CANCELED, None));
+    }
+
+    #[test]
+    fn a_schema_without_the_object_column_has_no_open_condition() {
+        let mut s = crate::schema::TableConfig::with_table("responses");
+        s.columns
+            .insert("raw_response".to_string(), "payload".to_string());
+        assert_eq!(
+            open_predicate_for(&s).as_deref(),
+            Some(open_predicate("payload").as_str()),
+            "the mapped column is checked"
+        );
+        s.skip_columns.insert("raw_response".to_string());
+        assert_eq!(
+            open_predicate_for(&s),
+            None,
+            "no object column: the conditional store is a plain update"
+        );
     }
 }

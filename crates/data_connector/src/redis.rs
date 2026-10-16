@@ -788,6 +788,19 @@ impl RedisResponseStorage {
         }
     }
 
+    /// `ARGV[1]` of [`store_if_open_script`]: the field holding the stored
+    /// object, or empty when the schema skips it. With no status to check
+    /// the script writes while the record exists, as the SQL stores' plain
+    /// update for the same schema does.
+    fn object_field_arg(&self) -> &str {
+        let sr = &self.store.schema.responses;
+        if sr.is_skipped("raw_response") {
+            ""
+        } else {
+            sr.col("raw_response")
+        }
+    }
+
     fn safety_key(&self, identifier: &str) -> String {
         match &self.store.schema.owner {
             Some(owner) => format!("{owner}:safety:{identifier}:responses"),
@@ -1095,7 +1108,6 @@ impl ResponseStorage for RedisResponseStorage {
         &self,
         response: StoredResponse,
     ) -> ResponseResult<ConditionalStore> {
-        let sr = &self.store.schema.responses;
         let key = self.response_key(&response.id.0);
         let fields = self.hash_fields(&response)?;
 
@@ -1110,7 +1122,7 @@ impl ResponseStorage for RedisResponseStorage {
         // closes the record between them.
         let script = redis::Script::new(&store_if_open_script());
         let mut invocation = script.key(&key);
-        invocation.arg(sr.col("raw_response"));
+        invocation.arg(self.object_field_arg());
         for (field, value) in &fields {
             invocation.arg(*field).arg(value);
         }
@@ -1430,10 +1442,14 @@ impl ResponseStorage for RedisResponseStorage {
 
 /// The script of [`ResponseStorage::store_response_if_open`]: `KEYS[1]` is
 /// the response's hash, `ARGV[1]` the name of the field holding the stored
-/// object, `ARGV[2..]` the hash's fields and values. It writes the fields
-/// only while the stored object's status is not terminal
-/// ([`TERMINAL_RESPONSE_STATUSES`]; a hash without one counts as open) and
-/// answers `stored`, `closed` or `missing`.
+/// object (empty when the schema skips it), `ARGV[2..]` the hash's fields
+/// and values. It writes the fields only while the stored object's status is
+/// not terminal ([`TERMINAL_RESPONSE_STATUSES`]) and answers `stored`,
+/// `closed` or `missing`. A hash that exists without the object field, or
+/// without a status in it, counts as open, as a row whose object column is
+/// NULL does in the SQL stores; so does every existing hash under a schema
+/// that skips the field, where the SQL stores' update is plain. Only a hash
+/// that is gone is `missing`.
 fn store_if_open_script() -> String {
     let closed = TERMINAL_RESPONSE_STATUSES
         .iter()
@@ -1442,11 +1458,14 @@ fn store_if_open_script() -> String {
         .join(" or ");
     format!(
         "
-local raw = redis.call('HGET', KEYS[1], ARGV[1])
-if not raw then return 'missing' end
+local raw = nil
+if ARGV[1] ~= '' then raw = redis.call('HGET', KEYS[1], ARGV[1]) end
+if not raw and redis.call('EXISTS', KEYS[1]) == 0 then return 'missing' end
 local status = ''
-local ok, doc = pcall(cjson.decode, raw)
-if ok and type(doc) == 'table' and type(doc['status']) == 'string' then status = doc['status'] end
+if raw then
+  local ok, doc = pcall(cjson.decode, raw)
+  if ok and type(doc) == 'table' and type(doc['status']) == 'string' then status = doc['status'] end
+end
 if {closed} then return 'closed' end
 for i = 2, #ARGV - 1, 2 do redis.call('HSET', KEYS[1], ARGV[i], ARGV[i + 1]) end
 return 'stored'
@@ -1505,5 +1524,53 @@ mod tests {
             link_score(whole).to_bits(),
             1_700_000_000_123.0_f64.to_bits()
         );
+    }
+
+    #[test]
+    fn store_if_open_script_writes_an_existing_hash_without_a_status_and_refuses_a_missing_one() {
+        let script = store_if_open_script();
+        // The object field is read only when the schema has one.
+        assert!(
+            script.contains("if ARGV[1] ~= '' then raw = redis.call('HGET', KEYS[1], ARGV[1]) end")
+        );
+        // Without it, or without the field in the hash, the hash itself
+        // decides between missing and open.
+        assert!(script.contains(
+            "if not raw and redis.call('EXISTS', KEYS[1]) == 0 then return 'missing' end"
+        ));
+        assert!(script.contains(
+            "if status == 'completed' or status == 'incomplete' or status == 'failed' or \
+             status == 'cancelled' then return 'closed' end"
+        ));
+        assert!(script.trim_end().ends_with("return 'stored'"));
+    }
+
+    #[test]
+    fn the_object_field_argument_is_empty_when_the_schema_skips_the_column() {
+        let storage = |schema: Option<SchemaConfig>| {
+            RedisResponseStorage::new(
+                RedisStore::new(RedisConfig {
+                    url: "redis://127.0.0.1:1/0".to_string(),
+                    pool_max: 1,
+                    op_timeout_secs: 1,
+                    schema,
+                    retention_days: None,
+                })
+                .expect("a pool is built without a connection"),
+            )
+        };
+        assert_eq!(storage(None).object_field_arg(), "raw_response");
+        let mut mapped = SchemaConfig::default();
+        mapped
+            .responses
+            .columns
+            .insert("raw_response".to_string(), "payload".to_string());
+        assert_eq!(storage(Some(mapped)).object_field_arg(), "payload");
+        let mut skipped = SchemaConfig::default();
+        skipped
+            .responses
+            .skip_columns
+            .insert("raw_response".to_string());
+        assert_eq!(storage(Some(skipped)).object_field_arg(), "");
     }
 }

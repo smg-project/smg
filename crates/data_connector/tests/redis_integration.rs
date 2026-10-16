@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use chrono::{TimeDelta, Utc};
 use data_connector::{
     create_storage, ConditionalStore, ConversationItemId, HistoryBackend, ListParams,
-    NewConversation, NewConversationItem, RedisConfig, SortOrder, StorageBundle,
-    StorageFactoryConfig, StoredResponse,
+    NewConversation, NewConversationItem, RedisConfig, ResponseId, SchemaConfig, SortOrder,
+    StorageBundle, StorageFactoryConfig, StoredResponse,
 };
 use serde_json::json;
 
@@ -541,4 +541,137 @@ async fn a_conditional_store_replaces_an_open_record_and_refuses_a_closed_or_mis
         .expect("stored");
     assert_eq!(stored.raw_response["status"], "cancelled");
     storage.delete_response(&base.id).await.expect("delete");
+}
+
+/// Under a schema that skips the object column there is no status to check:
+/// the conditional store writes while the record exists and answers
+/// `Missing` only for a record that is gone, as the SQL stores' plain update
+/// does for the same schema (it answered `Missing` for every record before
+/// and wrote nothing). Under the default schema a hash that lost its object
+/// field counts as open the same way, as a NULL object column does in the
+/// SQL stores.
+#[tokio::test]
+#[ignore = "requires a live Redis server; set DATA_CONNECTOR_TEST_REDIS_URL and run with -- --ignored"]
+async fn a_conditional_store_without_an_object_column_writes_while_the_record_exists() {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let mut schema = SchemaConfig::default();
+    schema
+        .responses
+        .skip_columns
+        .insert("raw_response".to_string());
+    let redis_cfg = RedisConfig {
+        url: url.clone(),
+        pool_max: 4,
+        op_timeout_secs: RedisConfig::default_op_timeout_secs(),
+        schema: Some(schema),
+        retention_days: Some(1),
+    };
+    let resp = create_storage(StorageFactoryConfig {
+        backend: &HistoryBackend::Redis,
+        oracle: None,
+        postgres: None,
+        redis: Some(&redis_cfg),
+        memory: None,
+        hook: None,
+    })
+    .await
+    .expect("failed to initialize Redis storage")
+    .response_storage;
+
+    let mut queued = StoredResponse::new(None);
+    queued.model = Some("m".to_string());
+    queued.raw_response = json!({"id": queued.id.0, "status": "queued"});
+    let id = resp
+        .store_response(queued.clone())
+        .await
+        .expect("store response");
+    let mut result = queued.clone();
+    result.model = Some("m2".to_string());
+    result.raw_response = json!({"id": id.0, "status": "completed"});
+    assert!(
+        matches!(
+            resp.store_response_if_open(result)
+                .await
+                .expect("conditional store"),
+            ConditionalStore::Stored
+        ),
+        "the record exists: the write lands"
+    );
+    let read = resp
+        .get_response(&id)
+        .await
+        .expect("read")
+        .expect("the record");
+    assert_eq!(read.model.as_deref(), Some("m2"), "the write landed");
+    assert!(read.raw_response.is_null(), "no object column");
+    // Nothing closes a record without a status: a further write lands too,
+    // and a transition has nothing to move.
+    assert!(matches!(
+        resp.store_response_if_open(queued.clone())
+            .await
+            .expect("conditional store"),
+        ConditionalStore::Stored
+    ));
+    assert!(matches!(
+        resp.update_response_object_if_open(&id, json!({"id": id.0, "status": "cancelled"}))
+            .await
+            .expect("conditional update"),
+        ConditionalStore::Stored
+    ));
+    let mut unknown = queued.clone();
+    unknown.id = ResponseId::new();
+    assert!(
+        matches!(
+            resp.store_response_if_open(unknown)
+                .await
+                .expect("conditional store"),
+            ConditionalStore::Missing
+        ),
+        "a record that is gone takes nothing"
+    );
+    resp.delete_response(&id).await.expect("delete response");
+
+    // The default schema: a hash that lost its object field is open, not missing.
+    let resp = redis_bundle(&url)
+        .await
+        .expect("failed to initialize Redis storage")
+        .response_storage;
+    let mut queued = StoredResponse::new(None);
+    queued.raw_response = json!({"id": queued.id.0, "status": "queued"});
+    let id = resp
+        .store_response(queued.clone())
+        .await
+        .expect("store response");
+    let client = redis::Client::open(url.as_str()).expect("a client for the test's own commands");
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect");
+    let removed: i64 = redis::cmd("HDEL")
+        .arg(format!("response:{}", id.0))
+        .arg("raw_response")
+        .query_async(&mut conn)
+        .await
+        .expect("drop the object field");
+    assert_eq!(removed, 1);
+    let mut completed = queued.clone();
+    completed.raw_response = json!({"id": id.0, "status": "completed"});
+    assert!(
+        matches!(
+            resp.store_response_if_open(completed)
+                .await
+                .expect("conditional store"),
+            ConditionalStore::Stored
+        ),
+        "a hash without the object field is open"
+    );
+    let read = resp
+        .get_response(&id)
+        .await
+        .expect("read")
+        .expect("the record");
+    assert_eq!(read.raw_response["status"], "completed");
+    resp.delete_response(&id).await.expect("delete response");
 }

@@ -1523,6 +1523,14 @@ fn oracle_open_predicate(col_raw: &str) -> String {
     )
 }
 
+/// [`oracle_open_predicate`] over the schema's object column; none when the
+/// schema skips it: there is no status to check, so the conditional store is
+/// a plain update of the row under the id (every backend of this crate
+/// agrees).
+fn oracle_open_predicate_for(s: &crate::schema::TableConfig) -> Option<String> {
+    (!s.is_skipped("raw_response")).then(|| oracle_open_predicate(s.col("raw_response")))
+}
+
 #[async_trait]
 impl ResponseStorage for OracleResponseStorage {
     async fn store_response(
@@ -1658,8 +1666,7 @@ impl ResponseStorage for OracleResponseStorage {
                     columns.push(*name);
                     params.push(val);
                 }
-                let open = (!s.is_skipped("raw_response"))
-                    .then(|| oracle_open_predicate(s.col("raw_response")));
+                let open = oracle_open_predicate_for(s);
                 let (sql, binds) = update_if_open_sql(&table, &columns, open.as_deref());
                 let named: Vec<(&str, &dyn ToSql)> = binds
                     .iter()
@@ -2132,5 +2139,23 @@ mod tests {
              WHEN NOT MATCHED THEN INSERT (id) VALUES (:v1)"
         );
         assert_eq!(binds, ["v1"]);
+    }
+
+    #[test]
+    fn a_schema_without_the_object_column_has_no_open_condition() {
+        let mut s = crate::schema::TableConfig::with_table("responses");
+        s.columns
+            .insert("raw_response".to_string(), "payload".to_string());
+        assert_eq!(
+            oracle_open_predicate_for(&s).as_deref(),
+            Some(oracle_open_predicate("payload").as_str()),
+            "the mapped column is checked"
+        );
+        s.skip_columns.insert("raw_response".to_string());
+        assert_eq!(
+            oracle_open_predicate_for(&s),
+            None,
+            "no object column: the conditional store is a plain update"
+        );
     }
 }
