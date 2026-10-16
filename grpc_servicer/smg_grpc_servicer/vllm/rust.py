@@ -69,7 +69,7 @@ from smg_grpc_servicer.vllm.config_view import (
     mm_processor_kwargs,
     multimodal_config,
 )
-from smg_grpc_servicer.vllm.launcher_switch import SUPPORTED_VLLM_RELEASES
+from smg_grpc_servicer.vllm.launcher_switch import LAUNCHER_MODULES, SUPPORTED_VLLM_RELEASES
 from smg_grpc_servicer.vllm.media_refs import FETCHABLE_MODALITIES
 from smg_grpc_servicer.vllm.model_info import (
     constrained_decoding_start,
@@ -97,11 +97,9 @@ MULTIPROC_METHOD_ENV = "VLLM_WORKER_MULTIPROC_METHOD"
 # What upstream's gRPC entrypoint references when it carries the switch.
 HOOK_SYMBOL = "resolve_servicer_impl"
 # The launcher files the switch binds when they are imported, by module name
-# (``launcher_switch.LAUNCHER_MODULES``), relative to the vLLM package.
-LAUNCHER_PATHS = (
-    os.path.join("entrypoints", "launchers", "grpc_server.py"),
-    os.path.join("entrypoints", "grpc_server.py"),
-)
+# (``launcher_switch.LAUNCHER_MODULES``), relative to the vLLM package: derived
+# from the one list, so a layout added there is counted by the preflight too.
+LAUNCHER_PATHS = tuple(os.path.join(*name.split(".")[1:]) + ".py" for name in LAUNCHER_MODULES)
 
 
 def model_info_from_config(vllm_config: Any, *, log_stats: bool | None = None) -> dict[str, Any]:

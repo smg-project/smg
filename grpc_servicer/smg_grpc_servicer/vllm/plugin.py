@@ -40,7 +40,11 @@ from typing import Any
 
 # Loaded in every vLLM process: nothing heavier than the package init here.
 from smg_grpc_servicer.vllm import SERVICER_IMPL_ENV
-from smg_grpc_servicer.vllm.launcher_switch import LAUNCHER_MODULES, install_launcher_switch
+from smg_grpc_servicer.vllm.launcher_switch import (
+    LAUNCHER_MODULES,
+    SUPPORTED_VLLM_RELEASES,
+    install_launcher_switch,
+)
 
 SERVICER_IMPL_FLAG = "--servicer-impl"
 SERVICER_IMPL_CHOICES = ("python", "rust")
@@ -63,8 +67,9 @@ def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
             "Which implementation serves the gRPC contract under --grpc: the Python "
             "servicer (default) or the Rust one (smg.servicer.VllmGrpcServer, with the "
             f"engine headless). Unset falls back to ${SERVICER_IMPL_ENV}. The Rust one needs "
-            "a launcher the switch binds (vLLM 0.28 and later under `vllm serve <model> "
-            "--grpc`, checked through 0.31); any other launcher is refused at this parse, "
+            "a launcher the switch binds (`vllm serve <model> --grpc`, or `python -m` on the "
+            f"launcher module; vLLM {SUPPORTED_VLLM_RELEASES} checked) or one that carries "
+            "the check in its own source; any other launcher is refused at this parse, "
             "before the engine is built."
         ),
     )
@@ -195,6 +200,12 @@ def register() -> None:
             # The Python servicer's guard reads only the environment: carry the
             # flag there, so a switch that never bound still fails loudly.
             os.environ[SERVICER_IMPL_ENV] = impl
+        # A Rust selection is checked against the launcher first, before
+        # anything else is derived or logged for a launch that is not going
+        # ahead: a launcher the switch cannot bind is refused here, not by the
+        # Python servicer after the model loaded, and the refusal is the only
+        # line such a launch prints.
+        check_servicer_impl(self, parsed)
         # Upstream's launcher builds the Python servicer without its
         # namespace: a gRPC parser's parsed settings are kept for it in this
         # process (so a flag stays `source=flag`), and the set values go into
@@ -203,10 +214,6 @@ def register() -> None:
         # A launch that builds an engine for gRPC: the capture cap the
         # engine would default below the admission step is derived here.
         handoff_capture_cap(self, parsed)
-        # A Rust selection is checked against the launcher now, before the
-        # launcher builds the engine: a launcher the switch cannot bind is
-        # refused here, not by the Python servicer after the model loaded.
-        check_servicer_impl(self, parsed)
         return parsed, extras
 
     FlexibleArgumentParser.parse_known_args = parse_known_args  # type: ignore[method-assign]

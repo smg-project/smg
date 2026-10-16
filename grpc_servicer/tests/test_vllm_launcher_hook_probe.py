@@ -168,6 +168,62 @@ def test_a_launcher_at_a_path_the_switch_does_not_know_is_refused(
     assert LAUNCHER not in sys.modules and OLD_LAUNCHER not in sys.modules
 
 
+def test_a_launcher_at_an_unknown_path_passes_when_its_source_carries_the_check(
+    vllm_package, monkeypatch, tmp_path
+):
+    """The documented alternative to the binding: a launcher that carries the
+    check in its own source passes the parse-time check as it passes the
+    preflight, wherever it lives under ``entrypoints/``."""
+    carrying = f"# consults the flag itself: {rust.HOOK_SYMBOL}\n" + SERVE_GRPC
+    _launcher_tree(tmp_path, vllm_package, carrying, layout="moved")
+    hook = launcher_switch.require_launcher_hook()
+    assert (hook.state, hook.bindable) == ("source", True)
+    assert LAUNCHER not in sys.modules and OLD_LAUNCHER not in sys.modules
+
+
+def test_a_loaded_launcher_without_the_hook_passes_when_its_source_carries_the_check(
+    vllm_package, monkeypatch, tmp_path
+):
+    """A known-path launcher loaded without ``serve_grpc`` (renamed, or run as
+    ``__main__`` with the check in its body) is not refused when its file
+    carries the check."""
+    module = _loaded_launcher(monkeypatch, run_grpc_server=_run_grpc_server)
+    path = tmp_path / "grpc_server.py"
+    path.write_text(f"# consults the flag itself: {rust.HOOK_SYMBOL}\n")
+    module.__file__ = str(path)
+    assert launcher_switch.launcher_hook() == launcher_switch.LauncherHook("missing", LAUNCHER)
+    hook = launcher_switch.require_launcher_hook()
+    assert (hook.state, hook.module) == ("source", LAUNCHER)
+
+
+def test_a_newer_name_without_the_hook_is_passed_over_for_an_older_one_that_binds(
+    vllm_package, monkeypatch, tmp_path
+):
+    """A tree that answers the newer name with a module that is not the
+    launcher: the older name binds, and the verdict is its."""
+    root = _launcher_tree(tmp_path, vllm_package, "def main():\n    pass\n", layout="launchers")
+    (root / "entrypoints" / "grpc_server.py").write_text(SERVE_GRPC)
+    launcher_switch.install_launcher_switch()
+    hook = launcher_switch.require_launcher_hook()
+    assert (hook.state, hook.module) == ("bound", OLD_LAUNCHER)
+
+
+def test_a_newer_name_without_the_hook_keeps_its_verdict_when_the_older_import_fails(
+    vllm_package, monkeypatch, tmp_path
+):
+    """The 0.30+ shape this check exists for: the launcher renamed its
+    coroutine and the deprecated name is a shim whose import fails on it; the
+    shim's failure does not turn the missing hook into a pass."""
+    root = _launcher_tree(tmp_path, vllm_package, "def main():\n    pass\n", layout="launchers")
+    (root / "entrypoints" / "grpc_server.py").write_text(
+        "raise ImportError('cannot import serve_grpc from the launcher')\n"
+    )
+    launcher_switch.install_launcher_switch()
+    with pytest.raises(rust_lifecycle.ServicerConfigError) as raised:
+        launcher_switch.require_launcher_hook()
+    assert f"its gRPC launcher {LAUNCHER} defines no serve_grpc" in str(raised.value)
+
+
 def test_a_launcher_whose_import_fails_on_its_own_dependency_is_left_to_report_it(
     vllm_package, monkeypatch, tmp_path
 ):
@@ -270,8 +326,10 @@ def test_the_flags_help_names_the_launchers_the_switch_binds():
     parser = argparse.ArgumentParser(prog="vllm serve")
     parser.add_argument("--grpc", action="store_true")
     assert plugin.add_servicer_impl_argument(parser)
-    help_text = parser.format_help()
-    assert "vLLM 0.28 and later" in help_text and "refused at this parse" in help_text
+    # argparse wraps the help at the terminal width: compare on one line.
+    help_text = " ".join(parser.format_help().split())
+    assert f"vLLM {launcher_switch.SUPPORTED_VLLM_RELEASES} checked" in help_text
+    assert "python -m" in help_text and "refused at this parse" in help_text
 
 
 def test_the_preflight_counts_the_import_only_at_the_paths_the_switch_binds(tmp_path):

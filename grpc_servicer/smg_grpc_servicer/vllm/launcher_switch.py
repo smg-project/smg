@@ -281,6 +281,7 @@ MISSING = "missing"  # a launcher module is loaded and defines no serve_grpc
 ABSENT = "absent"  # no launcher module is loaded, or importable under the known names
 PENDING = "pending"  # a launcher module is still importing (it is importing this package)
 UNKNOWN = "unknown"  # the launcher's import failed on something its own import reports
+SOURCE = "source"  # the launcher carries the check in its own source (no binding needed)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -295,9 +296,10 @@ class LauncherHook:
     def bindable(self) -> bool:
         """Whether the switch binds, or may still bind, on this launcher: the
         hook is bound, the launcher is mid-import (its ``serve_grpc`` comes
-        after this package's import, and the hooked module binds it), or its
-        import failed on something its own import reports."""
-        return self.state in (BOUND, PENDING, UNKNOWN)
+        after this package's import, and the hooked module binds it), its
+        import failed on something its own import reports, or the launcher
+        carries the check in its own source and needs no binding."""
+        return self.state in (BOUND, PENDING, UNKNOWN, SOURCE)
 
 
 def launcher_hook() -> LauncherHook:
@@ -352,9 +354,12 @@ def _import_launcher() -> LauncherHook:
             absent = error.name or ""
             if absent and (name == absent or name.startswith(absent + ".")):
                 continue
-            return LauncherHook(UNKNOWN, name)
+            # An earlier name's verdict stands: the CLI imports that one, and
+            # a later name's failure (a shim importing the unbound newer
+            # module) must not pass the launcher the check would refuse.
+            return found or LauncherHook(UNKNOWN, name)
         except Exception:  # noqa: BLE001 - the launcher's own import reports its failure
-            return LauncherHook(UNKNOWN, name)
+            return found or LauncherHook(UNKNOWN, name)
         hook = launcher_hook()
         if hook.bindable:
             return hook
@@ -376,7 +381,35 @@ def require_launcher_hook(import_launcher: bool = True) -> LauncherHook:
         hook = _import_launcher()
     if hook.bindable:
         return hook
+    if _carries_the_check(hook):
+        # The documented alternative to the binding: the launcher's own
+        # source consults this package's flag, as the preflight
+        # (``rust.upstream_hook_installed``) accepts it; the two agree.
+        return LauncherHook(SOURCE, hook.module)
     raise ServicerConfigError(refusal_line(hook))
+
+
+def _carries_the_check(hook: LauncherHook) -> bool:
+    """Whether the launcher carries the check in its own source
+    (``rust.HOOK_SYMBOL``): the file of a loaded launcher without the hook
+    (the named module, or the one running as ``__main__``), or any launcher
+    under ``entrypoints/`` of the installed vLLM when none is loaded or
+    importable under the known names, the preflight's own scan."""
+    from smg_grpc_servicer.vllm import rust
+
+    if hook.state == MISSING and hook.module:
+        module = sys.modules.get(hook.module)
+        main = launcher_main()
+        if module is None and main is not None and main.__spec__.name == hook.module:
+            module = main
+        path = getattr(module, "__file__", None)
+        source = rust._read_source(path) if path else None
+        return source is not None and rust.HOOK_SYMBOL in source
+    if hook.state == ABSENT:
+        package = sys.modules.get("vllm")
+        roots = list(getattr(package, "__path__", []) or [])
+        return any(rust.upstream_hook_installed(root) for root in roots)
+    return False
 
 
 def refusal_line(hook: LauncherHook) -> str:
