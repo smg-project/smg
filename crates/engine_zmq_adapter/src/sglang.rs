@@ -343,11 +343,11 @@ impl MappedGenerateStream for SglangGenerateStream {
 
         // SGLang has no separate error finish: a request it could not serve
         // (rejected by the plugin's validation, refused at admission, dropped
-        // from a full queue) ends as `abort` with the reason and, when the
-        // request is at fault, HTTP 400. The frontend never asked for it (its
-        // own aborts drop the stream first), so it is an error to the caller,
-        // not an empty success, with the status mapped as SGLang's gRPC
-        // servicer maps it.
+        // from a full queue) ends as `abort` with the reason and an HTTP-style
+        // status (400 when the request is at fault). The frontend never asked
+        // for it (its own aborts drop the stream first), so it is an error to
+        // the caller, not an empty success, with the status mapped by the one
+        // table the engine's front ends share (`scheduler_abort_status`).
         if output.finish_reason.as_deref() == Some("abort") {
             let message = format!(
                 "the scheduler aborted the request: {}",
@@ -356,11 +356,7 @@ impl MappedGenerateStream for SglangGenerateStream {
                     .as_deref()
                     .unwrap_or("no reason reported")
             );
-            return Err(match output.finish_status {
-                Some(400) => tonic::Status::invalid_argument(message),
-                Some(503) => tonic::Status::unavailable(message),
-                _ => tonic::Status::internal(message),
-            });
+            return Err(scheduler_abort_status(output.finish_status, message));
         }
         let finish = output.finish_reason.map(|reason| {
             (
@@ -677,6 +673,23 @@ pub(crate) fn translate_sampling_sglang(sp: sglang_proto::SamplingParams) -> Sgl
 
 /// Normalize an SGLang finish reason into the canonical set the gateway's
 /// response layer exact-matches (`stop`, `length`, `abort`).
+/// The gRPC status for a request the scheduler aborted with an HTTP-style
+/// status: the table the engine's Python servicer uses for the same status,
+/// so the two front ends of one engine answer alike. 400 is the caller's
+/// fault, 404 a missing resource, 408 and 504 a deadline, 429 a full queue,
+/// 503 an unavailable engine; anything else, a missing status included, is
+/// internal.
+pub(crate) fn scheduler_abort_status(status: Option<u16>, message: String) -> tonic::Status {
+    match status {
+        Some(400) => tonic::Status::invalid_argument(message),
+        Some(404) => tonic::Status::not_found(message),
+        Some(408 | 504) => tonic::Status::deadline_exceeded(message),
+        Some(429) => tonic::Status::resource_exhausted(message),
+        Some(503) => tonic::Status::unavailable(message),
+        _ => tonic::Status::internal(message),
+    }
+}
+
 pub(crate) fn normalize_finish_reason(reason: &str) -> &'static str {
     match reason {
         "stop" => "stop",
@@ -694,6 +707,26 @@ pub(crate) fn normalize_finish_reason(reason: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_scheduler_abort_carries_the_status_its_http_code_means() {
+        let rows = [
+            (Some(400), tonic::Code::InvalidArgument),
+            (Some(404), tonic::Code::NotFound),
+            (Some(408), tonic::Code::DeadlineExceeded),
+            (Some(429), tonic::Code::ResourceExhausted),
+            (Some(500), tonic::Code::Internal),
+            (Some(503), tonic::Code::Unavailable),
+            (Some(504), tonic::Code::DeadlineExceeded),
+            (Some(418), tonic::Code::Internal),
+            (None, tonic::Code::Internal),
+        ];
+        for (status, code) in rows {
+            let got = scheduler_abort_status(status, "why".to_string());
+            assert_eq!(got.code(), code, "{status:?}");
+            assert_eq!(got.message(), "why");
+        }
+    }
+
     use std::time::Duration;
 
     use engine_zmq_client::{
