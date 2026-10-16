@@ -17,9 +17,11 @@
 //! nothing; the one stated exception to the chunking rule, held by the assemblers' own tests.
 //! No piece holds a broken escape, but a concatenation (a lone `\` before an escape) or a
 //! corruption (a cut inside an escape) builds one in a few per cent of the outputs. Those are
-//! checked like every other (a panic is never forgiven, and a break inside an object must keep
-//! the contract), and a contract breach on one of them is forgiven as the stated exception and
-//! counted on the diagnostic line, so a long audit never reports it as a failure.
+//! checked like every other; a difference between whole and pieces is forgiven, and counted on
+//! the diagnostic line, only when it is exactly the stated shape: the output holds a broken
+//! escape, the whole said nothing for a call's arguments where the pieces said a top-level
+//! string's bytes, and the malformed text differs by those bytes alone. A panic, a contract
+//! breach and any other difference (a break inside an object included) fail the case.
 //!
 //! `SYMPHONY_SCRAMBLE_CASES=n` sets the outputs per table, variant and declaration (one hundred
 //! by default; a longer run for an audit), `SYMPHONY_SCRAMBLE_SEED=n` the first seed, so a run can
@@ -698,6 +700,10 @@ fn check(
         adapt_all(&events);
         let said = Said::of(&events);
         if said != expected {
+            if is_the_stated_exception(text, &expected, &said) {
+                FORGIVEN.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             return Err(format!(
                 "{name} {cuts:?} says something else:\n  whole: {expected:?}\n  cut:   {said:?}"
             ));
@@ -742,9 +748,94 @@ fn subjects() -> Vec<(Table, Variant, bool)> {
     subjects
 }
 
-/// Outputs whose contract breach was forgiven for holding a broken surrogate escape (the stated
-/// exception), for the diagnostic line.
+/// Differences between whole and pieces forgiven as the stated exception, for the diagnostic
+/// line.
 static FORGIVEN: AtomicUsize = AtomicUsize::new(0);
+
+/// The one stated exception to the chunking rule (see the module doc), told from every other
+/// difference: the output holds a broken surrogate escape; everything said is the same but the
+/// calls' arguments and the malformed text; for every call whose arguments differ, the whole
+/// said nothing and the pieces said a top-level string's bytes (a leading `"`); and the pieces
+/// said under `Malformed` exactly the whole's malformed bytes less the ones they said as
+/// arguments, so no byte is lost or invented either way.
+fn is_the_stated_exception(text: &str, whole: &Said, cut: &Said) -> bool {
+    if !holds_a_broken_surrogate_escape(text)
+        || whole.content != cut.content
+        || whole.reasoning != cut.reasoning
+        || whole.dropped != cut.dropped
+        || whole.calls != cut.calls
+        || whole.ended != cut.ended
+        || whole.finish != cut.finish
+        || whole.arguments.len() != cut.arguments.len()
+    {
+        return false;
+    }
+    let mut moved = 0;
+    for ((whole_index, whole_arguments), (cut_index, cut_arguments)) in
+        whole.arguments.iter().zip(&cut.arguments)
+    {
+        if whole_index != cut_index {
+            return false;
+        }
+        if whole_arguments == cut_arguments {
+            continue;
+        }
+        if !whole_arguments.is_empty() || !cut_arguments.starts_with('"') {
+            return false;
+        }
+        moved += cut_arguments.len();
+    }
+    let malformed_bytes = |said: &Said| {
+        said.malformed
+            .iter()
+            .map(|(_, text)| text.len())
+            .sum::<usize>()
+    };
+    moved > 0 && malformed_bytes(whole) == malformed_bytes(cut) + moved
+}
+
+#[test]
+fn the_stated_exception_is_told_from_any_other_difference() {
+    let text = r#"{"name": "f", "arguments": "ab\udc00"}"#;
+    let mut whole = Said::default();
+    whole.calls.push((0, "call_1".to_string(), "f".to_string()));
+    whole.arguments.push((0, String::new()));
+    whole.malformed.push((
+        MalformedReason::UnterminatedRegion,
+        r#""ab\udc00""#.to_string(),
+    ));
+    whole.ended.push(0);
+    let mut cut = whole.clone();
+    cut.arguments[0].1 = r#""ab\udc0"#.to_string();
+    cut.malformed[0].1 = r#"0""#.to_string();
+    assert!(is_the_stated_exception(text, &whole, &cut));
+    assert!(
+        !is_the_stated_exception(r#"{"name": "f", "arguments": "ab"}"#, &whole, &cut),
+        "no broken escape in the output"
+    );
+    let mut other = cut.clone();
+    other.content.push('x');
+    assert!(
+        !is_the_stated_exception(text, &whole, &other),
+        "content differs"
+    );
+    let mut other = cut.clone();
+    other.malformed[0].1.push('"');
+    assert!(
+        !is_the_stated_exception(text, &whole, &other),
+        "a byte invented"
+    );
+    let mut other = cut.clone();
+    other.arguments[0].1 = "ab".to_string();
+    assert!(
+        !is_the_stated_exception(text, &whole, &other),
+        "not a top-level string"
+    );
+    assert!(
+        !is_the_stated_exception(text, &whole, &whole),
+        "no difference at all"
+    );
+}
 
 /// Whether `text` holds a JSON surrogate escape that is broken: a high surrogate (`\ud800` to
 /// `\udbff`) not followed by a low one (`\udc00` to `\udfff`), or a low one not preceded by a
@@ -882,12 +973,6 @@ fn scramble(
         }));
         let failure = match outcome {
             Ok(Ok(())) => continue,
-            // The stated exception (see the module doc): a contract breach on an output that
-            // holds a broken surrogate escape is forgiven; a panic never is.
-            Ok(Err(_)) if holds_a_broken_surrogate_escape(&text) => {
-                FORGIVEN.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
             Ok(Err(breach)) => breach,
             Err(payload) => format!("PANIC: {}", panic_message(payload)),
         };
@@ -946,8 +1031,8 @@ fn every_table_reads_every_scramble_without_a_panic_and_keeps_the_contract() {
     let forgiven = FORGIVEN.load(Ordering::Relaxed);
     println!(
         "{} scrambles read: {} tables x {} variants x 2 declarations x {cases} seeds from {first}; \
-         {forgiven} contract breaches forgiven on outputs holding a broken surrogate escape (the \
-         stated exception)",
+         {forgiven} differences forgiven as the stated exception (a broken surrogate escape in a \
+         top-level string)",
         subjects.len() as u64 * cases,
         Table::ALL.len(),
         Variant::ALL.len()
