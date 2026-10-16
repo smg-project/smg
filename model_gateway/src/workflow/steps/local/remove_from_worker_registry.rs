@@ -6,7 +6,7 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use crate::workflow::{
     data::WorkerRemovalWorkflowData,
-    steps::shared::{refresh_worker_pool_sizes, PoolGroups},
+    steps::shared::{pool_group, refresh_worker_pool_sizes, PoolGroups},
 };
 
 /// Step to remove workers from the worker registry.
@@ -42,12 +42,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
         let mut unique_configs = PoolGroups::new();
         for url in worker_urls {
             if let Some(w) = app_context.worker_registry.get_by_url(url) {
-                let meta = w.metadata();
-                unique_configs.insert((
-                    meta.spec.worker_type,
-                    meta.spec.connection_mode,
-                    w.model_id().to_string(),
-                ));
+                unique_configs.insert(pool_group(w.as_ref()));
             }
         }
 

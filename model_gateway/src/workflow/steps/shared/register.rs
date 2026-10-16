@@ -8,7 +8,7 @@ use wfaas::{
     StepExecutor, StepId, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
 };
 
-use super::{refresh_worker_pool_sizes, PoolGroups};
+use super::{pool_group, refresh_worker_pool_sizes, PoolGroups};
 use crate::{
     routers::common::pd_admission,
     worker::{bootstrap_probe, registry::WorkerId, Worker, WorkerRegistry},
@@ -110,18 +110,10 @@ fn register_worker(
 /// URL, when there is one and it differs (a replacement that changes the
 /// model, worker type or connection mode empties the old group).
 fn pool_groups_touched(registry: &WorkerRegistry, workers: &[Arc<dyn Worker>]) -> PoolGroups {
-    let group = |worker: &dyn Worker| {
-        let meta = worker.metadata();
-        (
-            meta.spec.worker_type,
-            meta.spec.connection_mode,
-            worker.model_id().to_string(),
-        )
-    };
-    let mut groups: PoolGroups = workers.iter().map(|w| group(w.as_ref())).collect();
+    let mut groups: PoolGroups = workers.iter().map(|w| pool_group(w.as_ref())).collect();
     for worker in workers {
         if let Some(replaced) = registry.get_by_url(worker.url()) {
-            groups.insert(group(replaced.as_ref()));
+            groups.insert(pool_group(replaced.as_ref()));
         }
     }
     groups

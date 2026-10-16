@@ -26,6 +26,18 @@ use crate::{
 /// the pool-size gauge is kept by.
 pub(crate) type PoolGroups = HashSet<(WorkerType, ConnectionMode, String)>;
 
+/// The pool-size gauge's key for one worker: its type, connection mode and
+/// primary model id. Registration and removal key the gauge through this, so
+/// the two cannot drift apart.
+pub(crate) fn pool_group(worker: &dyn Worker) -> (WorkerType, ConnectionMode, String) {
+    let meta = worker.metadata();
+    (
+        meta.spec.worker_type,
+        meta.spec.connection_mode,
+        worker.model_id().to_string(),
+    )
+}
+
 /// Set the worker pool-size gauge of each group in `groups` to the registry's
 /// current count of that group, after workers joined or left it.
 pub(crate) fn refresh_worker_pool_sizes(registry: &WorkerRegistry, groups: &PoolGroups) {
