@@ -183,7 +183,54 @@ pub(crate) fn schema_ahead_check(
 
 // ── Oracle helpers ─────────────────────────────────────────────────────────
 
-/// Run pending Oracle migrations on a synchronous `oracle::Connection`.
+/// What an Oracle store's start-up does to its database, as the steps
+/// [`bootstrap_oracle_schema`] orders. The store runs them on its connection;
+/// the unit tests run them on a fake that records their order.
+pub(crate) trait OracleSchemaSteps {
+    /// The highest recorded schema version, `None` when the versions table
+    /// does not exist. A read: nothing is created before the verdict on it.
+    fn recorded_version(&self) -> Result<Option<u32>, String>;
+    /// Creates the history tables and indexes that do not exist yet.
+    fn create_tables(&self) -> Result<(), String>;
+    /// Creates the versions table when it is missing, applies the pending
+    /// migrations (or refuses to start on them) and returns the versions it
+    /// applied.
+    fn migrate(&self) -> Result<Vec<u32>, String>;
+}
+
+/// Brings an Oracle database to the schema this build expects, in the order
+/// that leaves a database this build does not understand untouched: the
+/// recorded version against this build's migrations first, so a database a
+/// newer build migrated forward is refused before any history table is
+/// created or indexed (a table a newer migration renamed or dropped would
+/// otherwise be re-created in its legacy shape, and an index on a column it
+/// dropped would fail with the server's error instead of the refusal, see
+/// [`schema_ahead_check`]); a database without a versions table is at version
+/// 0, which no build is behind. Then the history tables, then the migrations,
+/// then the tables once more when migrations were applied, so that the
+/// indexes on the columns they added are created in this start rather than
+/// the next. Oracle DDL commits as it runs, so there is no transaction to roll
+/// the steps back into: the order is what keeps the refused database as it
+/// was.
+pub(crate) fn bootstrap_oracle_schema(
+    steps: &impl OracleSchemaSteps,
+    migrations: &[Migration],
+    config_version: Option<u32>,
+) -> Result<(), String> {
+    if let Some(current) = steps.recorded_version()? {
+        schema_ahead_check("oracle", current, migrations, config_version)?;
+    }
+    steps.create_tables()?;
+    let applied = steps.migrate()?;
+    if !applied.is_empty() {
+        steps.create_tables()?;
+    }
+    Ok(())
+}
+
+/// Run pending Oracle migrations on a synchronous `oracle::Connection`: the
+/// `migrate` step of [`bootstrap_oracle_schema`], which checked the recorded
+/// version against this build's migrations before the tables were created.
 ///
 /// Returns the list of newly applied version numbers.
 pub fn run_oracle_migrations(
@@ -197,7 +244,6 @@ pub fn run_oracle_migrations(
     ensure_oracle_versions_table(conn, schema)?;
 
     let current = oracle_current_version(conn, schema)?;
-    schema_ahead_check("oracle", current, migrations, config_version)?;
     let skip_up_to = config_version.unwrap_or(0);
     let effective_start = current.max(skip_up_to);
 
@@ -292,22 +338,15 @@ pub fn run_oracle_migrations(
     Ok(applied)
 }
 
-/// Ensure the `_schema_versions` table exists in Oracle.
-///
-/// Uses `all_tables` with an owner filter when `schema.owner` is set,
-/// falling back to `user_tables` for the current user's schema.
+/// The query that counts the `_schema_versions` table in Oracle's catalog:
+/// `all_tables` under the configured owner (the catalog holds owners in
+/// upper case), `user_tables` for the current user's schema otherwise.
 ///
 /// The table is always created with a quoted identifier since `_` is not
 /// valid as the first character of an unquoted Oracle identifier. This
-/// preserves the lowercase name in the catalog.
-fn ensure_oracle_versions_table(
-    conn: &oracle::Connection,
-    schema: &SchemaConfig,
-) -> Result<(), String> {
-    // The table is always created with a quoted identifier (preserves
-    // lowercase in Oracle's catalog) since `_` is invalid as the first
-    // character of an unquoted Oracle identifier.
-    let check_sql = match &schema.owner {
+/// preserves the lowercase name in the catalog, which is the name looked up.
+pub(crate) fn oracle_versions_table_exists_sql(schema: &SchemaConfig) -> String {
+    match &schema.owner {
         Some(owner) => format!(
             "SELECT COUNT(*) FROM all_tables WHERE owner = '{}' AND table_name = '{VERSIONS_TABLE}'",
             owner.to_ascii_uppercase()
@@ -315,12 +354,41 @@ fn ensure_oracle_versions_table(
         None => {
             format!("SELECT COUNT(*) FROM user_tables WHERE table_name = '{VERSIONS_TABLE}'")
         }
-    };
-    let present: i64 = conn
-        .query_row_as(&check_sql, &[])
-        .map_err(|e| format!("failed to check for {VERSIONS_TABLE} table: {e}"))?;
+    }
+}
 
-    if present == 0 {
+/// Whether the `_schema_versions` table exists in the Oracle database `conn`
+/// is connected to.
+fn oracle_versions_table_exists(
+    conn: &oracle::Connection,
+    schema: &SchemaConfig,
+) -> Result<bool, String> {
+    let present: i64 = conn
+        .query_row_as(&oracle_versions_table_exists_sql(schema), &[])
+        .map_err(|e| format!("failed to check for {VERSIONS_TABLE} table: {e}"))?;
+    Ok(present > 0)
+}
+
+/// The highest schema version an Oracle database records, `None` when it has
+/// no versions table (no build has versioned it yet): the `recorded_version`
+/// step of [`bootstrap_oracle_schema`], a read that creates nothing.
+pub(crate) fn oracle_recorded_version(
+    conn: &oracle::Connection,
+    schema: &SchemaConfig,
+) -> Result<Option<u32>, String> {
+    if !oracle_versions_table_exists(conn, schema)? {
+        return Ok(None);
+    }
+    oracle_current_version(conn, schema).map(Some)
+}
+
+/// Ensure the `_schema_versions` table exists in Oracle (see
+/// [`oracle_versions_table_exists_sql`] for the lookup and the quoting).
+fn ensure_oracle_versions_table(
+    conn: &oracle::Connection,
+    schema: &SchemaConfig,
+) -> Result<(), String> {
+    if !oracle_versions_table_exists(conn, schema)? {
         let ddl = oracle_create_versions_table(schema);
         if let Err(err) = conn.execute(&ddl, &[]) {
             // ORA-00955: name is already used — another instance created
@@ -518,8 +586,139 @@ pub(crate) async fn postgres_current_version(client: &impl GenericClient) -> Res
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
     use crate::schema::TableConfig;
+
+    /// The start-up steps on a database that records `recorded` (`None`: no
+    /// versions table) and whose migrate step applies `applies`; `ran` is
+    /// the order the steps ran in.
+    struct RecordedSteps {
+        recorded: Option<u32>,
+        applies: Vec<u32>,
+        ran: RefCell<Vec<&'static str>>,
+    }
+
+    impl RecordedSteps {
+        fn on(recorded: Option<u32>, applies: Vec<u32>) -> Self {
+            Self {
+                recorded,
+                applies,
+                ran: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn ran(&self) -> Vec<&'static str> {
+            self.ran.borrow().clone()
+        }
+    }
+
+    impl OracleSchemaSteps for RecordedSteps {
+        fn recorded_version(&self) -> Result<Option<u32>, String> {
+            self.ran.borrow_mut().push("read the version");
+            Ok(self.recorded)
+        }
+
+        fn create_tables(&self) -> Result<(), String> {
+            self.ran.borrow_mut().push("create the tables");
+            Ok(())
+        }
+
+        fn migrate(&self) -> Result<Vec<u32>, String> {
+            self.ran.borrow_mut().push("migrate");
+            Ok(self.applies.clone())
+        }
+    }
+
+    fn three_migrations() -> Vec<Migration> {
+        (1..=3)
+            .map(|version| Migration {
+                version,
+                description: "test",
+                up: |_| vec![],
+            })
+            .collect()
+    }
+
+    /// A database whose recorded version is ahead of the migrations this
+    /// build knows is refused before any history table is created or
+    /// indexed: the version is the only thing the start-up read.
+    #[test]
+    fn an_oracle_database_ahead_of_this_build_is_refused_before_its_tables_are_touched() {
+        let steps = RecordedSteps::on(Some(99), vec![]);
+        let message = bootstrap_oracle_schema(&steps, &three_migrations(), None)
+            .expect_err("a database ahead of this build must be refused at start-up");
+        assert!(
+            message.contains("version 99") && message.contains("ahead of the latest migration"),
+            "{message}"
+        );
+        assert_eq!(
+            steps.ran(),
+            ["read the version"],
+            "the refusal must come before the tables are touched"
+        );
+    }
+
+    /// The schema config's `version` at the database's version is the
+    /// operator's word that this build may run against it: the start-up goes
+    /// on, in its order.
+    #[test]
+    fn the_version_setting_lets_this_build_start_on_a_newer_oracle_database() {
+        let steps = RecordedSteps::on(Some(99), vec![]);
+        bootstrap_oracle_schema(&steps, &three_migrations(), Some(99))
+            .expect("`version: 99` lets the build run against the newer database");
+        assert_eq!(
+            steps.ran(),
+            ["read the version", "create the tables", "migrate"]
+        );
+    }
+
+    /// A database without a versions table (nothing is ahead of it) or at a
+    /// version this build knows gets its tables, then its migrations, then
+    /// its tables once more only when a migration was applied (the indexes
+    /// on the columns it added).
+    #[test]
+    fn an_oracle_database_this_build_knows_gets_its_tables_then_its_migrations() {
+        let settled = ["read the version", "create the tables", "migrate"];
+        let migrated = [
+            "read the version",
+            "create the tables",
+            "migrate",
+            "create the tables",
+        ];
+        for (recorded, applies, expected) in [
+            (None, vec![], &settled[..]),
+            (Some(3), vec![], &settled[..]),
+            (Some(0), vec![1, 2, 3], &migrated[..]),
+            (Some(1), vec![2, 3], &migrated[..]),
+        ] {
+            let steps = RecordedSteps::on(recorded, applies);
+            bootstrap_oracle_schema(&steps, &three_migrations(), None)
+                .expect("a database this build knows comes up");
+            assert_eq!(steps.ran(), expected, "recorded version {recorded:?}");
+        }
+    }
+
+    /// The version is read from the catalog's lowercase, quoted name: under
+    /// the configured owner (upper-cased, as the catalog holds it) or in the
+    /// current user's schema.
+    #[test]
+    fn the_versions_table_lookup_follows_the_owner() {
+        let no_owner = SchemaConfig::default();
+        assert_eq!(
+            oracle_versions_table_exists_sql(&no_owner),
+            "SELECT COUNT(*) FROM user_tables WHERE table_name = '_schema_versions'"
+        );
+        let with_owner = SchemaConfig {
+            owner: Some("admin".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            oracle_versions_table_exists_sql(&with_owner),
+            "SELECT COUNT(*) FROM all_tables WHERE owner = 'ADMIN' AND table_name = '_schema_versions'"
+        );
+    }
 
     #[test]
     fn oracle_versions_table_name_is_always_quoted() {
