@@ -468,7 +468,8 @@ mod tests {
     #[test]
     fn a_separator_inside_the_invoke_tag_is_carried_and_never_splits_a_character() {
         // The separator arriving between the name's quote and the `>`, after a multi-byte
-        // character: the tail is reported whole, and the call starts (smg #2850, claude[bot]).
+        // character: the tail is reported around it, in order, the separator in an event of its
+        // own, and the call starts (smg #2850, claude[bot]).
         let output = concat!(
             "</mm:think><tool_call>\n<invoke name=\"add\" ñ]<]minimax[>[x><a>1</a></invoke>\n",
             "</tool_call>"
@@ -477,9 +478,17 @@ mod tests {
         assert_eq!(bytes(&events), output);
         assert_eq!(names(&events), ["add"]);
         assert_eq!(arguments_of(&events, 0), r#"{"a": 1}"#);
+        let malformed: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Malformed { text, .. } => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(malformed, [" ñ", "x"]);
         assert!(events.iter().any(|event| matches!(
             event,
-            Event::Malformed { text, .. } if text.text == " ñ]<]minimax[>[x"
+            Event::Dropped { text, .. } if text.text == "]<]minimax[>["
         )));
     }
 

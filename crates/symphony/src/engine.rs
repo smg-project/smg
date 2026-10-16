@@ -112,6 +112,20 @@ enum Held {
     Ignored(String),
 }
 
+/// A text event of `like`'s kind carrying `text`, uncounted: the piece of a split text event.
+fn text_event_like(like: &Event, text: &str) -> Event {
+    let text = Text::uncounted(text);
+    match like {
+        Event::Reasoning(_) => Event::Reasoning(text),
+        Event::Dropped { why, .. } => Event::Dropped { text, why: *why },
+        Event::Malformed { why, .. } => Event::Malformed {
+            text,
+            why: why.clone(),
+        },
+        _ => Event::Content(text),
+    }
+}
+
 /// The text an event carries, for the events that carry output bytes.
 fn event_text(event: &mut Event) -> Option<&mut Text> {
     match event {
@@ -820,54 +834,90 @@ impl Engine {
     /// Pushes a call's events with their tokens counted, and counts each call that starts: the
     /// index the next call takes, and `Finish::tool_calls`. A syntax that writes several calls in
     /// one region starts each of them here. An event's bytes are counted as carried out of the
-    /// region, with the ignored terminals that arrived among them spliced in where they arrived.
+    /// region, with the ignored terminals that arrived among them placed where they arrived.
     fn push_call_events(&mut self, mut events: Events, out: &mut Events) {
         for event in events.drain() {
             if matches!(event, Event::ToolCallStart { .. }) {
                 self.calls += 1;
             }
-            let event = self.carried_into(event);
-            out.push(self.tokens.relabel(event));
+            for event in self.carried_into(event) {
+                out.push(self.tokens.relabel(event));
+            }
         }
     }
 
-    /// `event` with the ignored terminals that arrived among the bytes it carries spliced into
-    /// its text, each where it arrived, and its bytes counted as carried out of the region.
-    fn carried_into(&mut self, mut event: Event) -> Event {
+    /// `event` with the ignored terminals that arrived among the bytes it carries placed where
+    /// they arrived, and its bytes counted as carried out of the region. A call's event has them
+    /// spliced into its source, which no client reads; a text event is split around them, each
+    /// terminal a `Dropped { Wrapper }` event of its own, so that none joins text a client reads
+    /// (a syntax that hands held bytes back as content, as the bare list does).
+    fn carried_into(&mut self, mut event: Event) -> Vec<Event> {
         let Some(text) = event_text(&mut event) else {
-            return event;
+            return vec![event];
         };
         if text.text.is_empty() {
-            return event;
+            return vec![event];
         }
         let from = self.region.out;
         let to = from + text.text.len();
         self.region.out = to;
         if self.region.carried.is_empty() {
-            return event;
+            return vec![event];
         }
         let (within, after): (Vec<_>, Vec<_>) = std::mem::take(&mut self.region.carried)
             .into_iter()
             .partition(|(at, _)| *at <= to);
         self.region.carried = after;
         if within.is_empty() {
-            return event;
+            return vec![event];
         }
         let bytes = std::mem::take(&mut text.text);
-        let mut spliced = String::with_capacity(bytes.len());
+        let mut cuts = Vec::with_capacity(within.len());
         let mut done = 0;
         for (at, marker) in within {
             let mut cut = at.saturating_sub(from).clamp(done, bytes.len());
             while !bytes.is_char_boundary(cut) {
                 cut -= 1;
             }
-            spliced.push_str(&bytes[done..cut]);
-            spliced.push_str(&marker);
+            cuts.push((cut, marker));
             done = cut;
         }
-        spliced.push_str(&bytes[done..]);
-        text.text = spliced;
-        event
+        let is_call = matches!(
+            event,
+            Event::ToolCallStart { .. }
+                | Event::ToolCallArguments { .. }
+                | Event::ToolCallEnd { .. }
+        );
+        if is_call {
+            let mut spliced = String::with_capacity(bytes.len());
+            let mut done = 0;
+            for (cut, marker) in cuts {
+                spliced.push_str(&bytes[done..cut]);
+                spliced.push_str(&marker);
+                done = cut;
+            }
+            spliced.push_str(&bytes[done..]);
+            if let Some(text) = event_text(&mut event) {
+                text.text = spliced;
+            }
+            return vec![event];
+        }
+        let mut events = Vec::with_capacity(cuts.len() * 2 + 1);
+        let mut done = 0;
+        for (cut, marker) in cuts {
+            if cut > done {
+                events.push(text_event_like(&event, &bytes[done..cut]));
+            }
+            events.push(Event::Dropped {
+                text: Text::uncounted(marker),
+                why: DropReason::Wrapper,
+            });
+            done = cut;
+        }
+        if done < bytes.len() {
+            events.push(text_event_like(&event, &bytes[done..]));
+        }
+        events
     }
 
     /// Where the prompt leaves the engine: the table's replay of it ([`Format::replayed`], which
@@ -999,7 +1049,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        formats::{glm, inkling, qwen3},
+        formats::{glm, inkling, qwen3, xlam},
         tagged::{Placement, Spelling},
     };
 
@@ -1802,6 +1852,22 @@ mod tests {
         assert_eq!(
             wrapping,
             "<|content_text|><|content_model_end_sampling|><|end_message|>"
+        );
+        // A syntax that hands held bytes back as content (the bare list, which holds `[` until
+        // it knows whether a list follows) leaves the terminal in an event of its own, not in
+        // the text the client reads.
+        let list = xlam().ignores("sep", "|");
+        let events = run(list, "[|Sure, done", EngineFinish::Stop);
+        assert_eq!(bytes(&events), "[|Sure, done");
+        let [content, _, wrapping, _] = kinds(&events);
+        assert_eq!(content, "[Sure, done");
+        assert_eq!(wrapping, "|");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::Dropped { text, why: DropReason::Wrapper } if text.text == "|"
+            )),
+            "{events:?}"
         );
     }
 
