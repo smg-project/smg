@@ -23,6 +23,7 @@ files; weights are not loaded.
 from __future__ import annotations
 
 import argparse
+import inspect
 import sys
 from dataclasses import dataclass
 
@@ -135,10 +136,36 @@ def router_anchor(config, tokenizer, rule: tuple[str, str]) -> tuple[str, int]:
 
 
 def dummy_media(processor, modality: str) -> list:
-    data = processor.dummy_inputs.get_dummy_mm_data(seq_len=256, mm_counts={modality: 1})
+    kwargs = {"seq_len": 256, "mm_counts": {modality: 1}}
+    # Newer vLLM takes the per-modality dummy options as a third argument
+    # with no default; an empty mapping means the builder's defaults.
+    if "mm_options" in inspect.signature(processor.dummy_inputs.get_dummy_mm_data).parameters:
+        kwargs["mm_options"] = {}
+    data = processor.dummy_inputs.get_dummy_mm_data(**kwargs)
     items = data[modality]
     return list(items) if isinstance(items, (list, tuple)) else [items]
 
+
+
+def apply_processor(processor, prompt_ids: list[int], mm_data: dict):
+    """Run the processor over token ids plus media on either processing API.
+
+    Older vLLM took (prompt, mm_data, hf_processor_mm_kwargs); newer vLLM takes
+    a ProcessorInputs carrying the already-parsed media items and a
+    TimingContext. The result keeps the keys read below either way.
+    """
+    if "inputs" not in inspect.signature(processor.apply).parameters:
+        return processor.apply(prompt_ids, mm_data, {})
+    from vllm.multimodal.processing.context import TimingContext
+    from vllm.multimodal.processing.inputs import ProcessorInputs
+
+    inputs = ProcessorInputs(
+        prompt=prompt_ids,
+        mm_data_items=processor.data_parser.parse_mm_data(mm_data),
+        hf_processor_mm_kwargs={},
+        media_io_kwargs={},
+    )
+    return processor.apply(inputs, TimingContext(enabled=False))
 
 def check(model_key: str, model_id: str, trust_remote_code: bool) -> list[Outcome]:
     from transformers import AutoConfig
@@ -163,7 +190,7 @@ def check(model_key: str, model_id: str, trust_remote_code: bool) -> list[Outcom
             continue
         prompt_ids = prefix + [anchor_id] + suffix
         try:
-            result = processor.apply(prompt_ids, {modality: dummy_media(processor, modality)}, {})
+            result = apply_processor(processor, prompt_ids, {modality: dummy_media(processor, modality)})
         except Exception as e:  # noqa: BLE001 - any processor failure is a parity failure
             outcomes.append(
                 Outcome(
