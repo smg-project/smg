@@ -106,11 +106,11 @@ def parse_rust_cli(text: str, struct_name: str = "CliArgs") -> RustCli:
     ``attributes`` counts every attribute read, so held against
     ``arg_attributes(text)`` it shows a group the reader did not reach."""
     lines = text.splitlines()
-    header = re.compile(rf"^\s*(?:pub(?:\([^)]*\))?\s+)?struct\s+{struct_name}\s*\{{\s*$")
-    starts = [n for n, line in enumerate(lines) if header.match(line)]
+    header = re.compile(rf"^(\s*)(?:pub(?:\([^)]*\))?\s+)?struct\s+{struct_name}\s*\{{\s*$")
+    starts = [(n, m.group(1)) for n, line in enumerate(lines) if (m := header.match(line))]
     assert len(starts) == 1, f"struct {struct_name}: {len(starts)} definitions found, one expected"
-    start = starts[0]
-    end = lines.index("}", start)
+    start, indent = starts[0]
+    end = lines.index(indent + "}", start)  # the struct's own brace, at its indentation
     cli = RustCli(pre_clap=set(re.findall(r'args\[i\] == "(--[a-z-]+)"', text)))
     i = start + 1
     while i < end:
@@ -226,6 +226,29 @@ struct Unrelated {
     assert cli.flags == {"--retries": None, "--worker-url": None}
     assert cli.attributes == 3
     assert arg_attributes(source) == 4
+
+
+def test_parse_rust_cli_ends_a_group_at_its_own_brace():
+    """A group declared inside a module ends at its own closing brace, so the next
+    struct of that module does not pass its flags off as the group's."""
+    cli = parse_rust_cli("""
+struct CliArgs {
+    #[command(flatten)]
+    workers: WorkerArgs,
+}
+mod groups {
+    pub struct WorkerArgs {
+        #[arg(long)]
+        a: String,
+    }
+    pub struct Other {
+        #[arg(long)]
+        b: String,
+    }
+}
+""")
+    assert cli.flags == {"--a": None}
+    assert cli.attributes == 1
 
 
 def test_parse_rust_cli_names_a_group_it_cannot_find():
