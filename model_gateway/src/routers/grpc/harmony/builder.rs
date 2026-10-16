@@ -78,8 +78,12 @@ static HARMONY_ENCODING_INIT: Mutex<()> = Mutex::new(());
 /// The vocab may come from disk (`TIKTOKEN_ENCODINGS_BASE`) or a cached
 /// download; loading is triggered at gpt-oss worker registration
 /// (`EnsureHarmonyEncodingStep`), so request paths hit the loaded fast path.
-/// The load runs on a thread of its own, whatever the caller's thread drives
-/// (see [`on_its_own_thread`]).
+/// A request path can still reach a cold load (a request name-matched to the
+/// Harmony pipeline before any of its workers registered, or after that step
+/// failed them all): it then loads here, on the request task's thread, under
+/// the init lock, as it did before, and the load runs on a thread of its own
+/// (see [`on_its_own_thread`]) so that a caller inside a runtime gets the
+/// loader's result (or its error) instead of a panic.
 pub(crate) fn try_harmony_encoding() -> Result<&'static HarmonyEncoding, String> {
     if let Some(encoding) = HARMONY_ENCODING.get() {
         return Ok(encoding);
@@ -93,6 +97,7 @@ pub(crate) fn try_harmony_encoding() -> Result<&'static HarmonyEncoding, String>
     let encoding = on_its_own_thread(|| {
         openai_harmony::load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss)
     })
+    .map_err(|e| format!("Failed to load Harmony encoding: its thread could not start: {e}"))?
     .map_err(|e| format!("Failed to load Harmony encoding: {e:#}"))?;
     Ok(HARMONY_ENCODING.get_or_init(|| encoding))
 }
@@ -107,13 +112,17 @@ pub(crate) fn try_harmony_encoding() -> Result<&'static HarmonyEncoding, String>
 /// encodes a Harmony turn passed only once the sync builder tests of the same
 /// binary had filled the cell: test order, not a guarantee, and a failure by
 /// name on a cold machine. A thread of its own drives no runtime, so the load
-/// is the same from any caller.
-fn on_its_own_thread<T: Send>(load: impl FnOnce() -> T + Send) -> T {
+/// is the same from any caller. The thread is named, so a panic inside the
+/// loader is reported under it, and a thread the OS refuses to start is an
+/// error for the caller, not a panic.
+fn on_its_own_thread<T: Send>(load: impl FnOnce() -> T + Send) -> std::io::Result<T> {
     std::thread::scope(|scope| {
-        scope
-            .spawn(load)
+        let loader = std::thread::Builder::new()
+            .name("harmony-encoding-load".into())
+            .spawn_scoped(scope, load)?;
+        Ok(loader
             .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
     })
 }
 
@@ -133,7 +142,8 @@ mod own_thread_tests {
                     .expect("a runtime"),
             );
             42
-        });
+        })
+        .expect("the loader's thread starts");
         assert_eq!(answer, 42);
     }
 }
