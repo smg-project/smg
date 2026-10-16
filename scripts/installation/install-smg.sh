@@ -59,10 +59,33 @@ cd /tmp && \
     rm protoc-32.0-linux-x86_64.zip
 protoc --version
 
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
-    && rustc --version && cargo --version && protoc --version
+# rustup installs under CARGO_HOME (/root/.cargo in the image). A base that
+# already carries rustup keeps it: rustup-init over an existing /root/.rustup
+# fails on some bases (a cross-device rename inside the image's layers), and
+# rustup installs the toolchain rust-toolchain.toml pins at the first cargo
+# call in the checkout anyway. The download and the installer are separate
+# statements so that each fails on its own: a pipeline's status is its last
+# command's, and `sh` reading an empty script exits 0.
+CARGO_BIN="${CARGO_HOME:-${HOME}/.cargo}/bin"
+if [ -x "${CARGO_BIN}/rustup" ] || command -v rustup >/dev/null 2>&1; then
+    echo "install-smg.sh: rustup is already installed on this base; keeping it"
+else
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+    sh /tmp/rustup-init.sh -y
+    rm /tmp/rustup-init.sh
+fi
+export PATH="${CARGO_BIN}:${PATH}"
 
-export PATH="/root/.cargo/bin:${PATH}"
+# The version lines go to the build log on purpose, read from the source
+# checkout so that rustup names (and installs, if need be) the toolchain
+# rust-toolchain.toml pins, the one that builds smg below; one statement each:
+# under `set -e` a failing member of an `&&` list other than the last does not
+# stop the script, so a toolchain that does not answer must fail here rather
+# than at the first cargo call.
+cd "${SMG_SRC}"
+rustc --version
+cargo --version
+protoc --version
 
 pip install --no-cache-dir --upgrade pip \
     && pip install maturin --no-cache-dir --force-reinstall
