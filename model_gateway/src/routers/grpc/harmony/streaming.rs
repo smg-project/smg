@@ -445,6 +445,23 @@ impl HarmonyStreamingProcessor {
                     spec_accepted.insert(index, complete_wrapper.spec_accepted_tokens());
                     spec_drafted.insert(index, complete_wrapper.spec_draft_tokens());
 
+                    // A choice that reaches its Complete unopened (its only
+                    // engine output is this Complete, or every Chunk before it
+                    // was header tokens without content) opens here with its
+                    // role chunk, as a choice with content opened on its first
+                    // delta, and is the stream's first output when nothing
+                    // preceded it. A router-side stop already closed its choice.
+                    if !router_stopped.contains(&index)
+                        && is_firsts.get(&index).copied().unwrap_or(true)
+                    {
+                        if first_token_time.is_none() {
+                            first_token_time = Some(Instant::now());
+                        }
+                        Self::emit_role_chunk(index, dispatch, original_request, tx, &mut encoder)
+                            .await?;
+                        is_firsts.insert(index, false);
+                    }
+
                     // Finalize parser and emit final chunk
                     if let Some(parser) = parsers.get_mut(&index) {
                         let matched_stop = matched_stops.get(&index).and_then(|m| m.clone());
@@ -499,14 +516,8 @@ impl HarmonyStreamingProcessor {
                         // The choice's only engine output is its Complete (a
                         // completion with no tokens: a finish that carries
                         // none comes without a Chunk, so no parser was made
-                        // for it). It opens with its role chunk and ends with
-                        // its finish chunk, as a choice with output does, and
-                        // is the stream's first output when nothing preceded.
-                        if first_token_time.is_none() {
-                            first_token_time = Some(Instant::now());
-                        }
-                        Self::emit_role_chunk(index, dispatch, original_request, tx, &mut encoder)
-                            .await?;
+                        // for it); it ends with its finish chunk as a choice
+                        // with output does.
                         Self::emit_final_chunk(
                             index,
                             complete_wrapper.finish_reason(),
