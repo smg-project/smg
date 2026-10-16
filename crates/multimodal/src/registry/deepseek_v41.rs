@@ -99,17 +99,15 @@ impl ModelProcessorSpec for DeepseekV41VisionSpec {
     ) -> RegistryResult<Vec<PromptReplacement>> {
         let image_token_id = Self::image_token_id(metadata)?;
         let placeholder = self.placeholder_token(metadata)?;
-        Ok(preprocessed
-            .feature_token_counts
-            .iter()
-            .map(|&count| {
-                // Every span position carries image_token_id; the roles live
-                // in `types`. All of them are embed positions (delimiters get
-                // the learned vectors from embed_multimodal, not the embed
-                // table).
-                PromptReplacement::repeated(Modality::Image, &placeholder, image_token_id, count)
-            })
-            .collect())
+        // Every span position carries image_token_id; the roles live in
+        // `types`. All of them are embed positions (delimiters get the
+        // learned vectors from embed_multimodal, not the embed table).
+        Ok(PromptReplacement::repeated_per_item(
+            Modality::Image,
+            &placeholder,
+            image_token_id,
+            &preprocessed.feature_token_counts,
+        ))
     }
 
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {

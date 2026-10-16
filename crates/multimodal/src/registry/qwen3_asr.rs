@@ -374,13 +374,12 @@ impl ModelProcessorSpec for Qwen3AsrSpec {
             Modality::Audio => {
                 let token_id = Self::audio_token_id(metadata)?;
                 let token = self.placeholder_token_for(metadata, Modality::Audio)?;
-                Ok(preprocessed
-                    .feature_token_counts
-                    .iter()
-                    .map(|&count| {
-                        PromptReplacement::repeated(Modality::Audio, &token, token_id, count)
-                    })
-                    .collect())
+                Ok(PromptReplacement::repeated_per_item(
+                    Modality::Audio,
+                    &token,
+                    token_id,
+                    &preprocessed.feature_token_counts,
+                ))
             }
             Modality::Image | Modality::Video | Modality::ImageEmbeds => {
                 Err(ModelRegistryError::UnsupportedModality {

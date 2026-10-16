@@ -64,18 +64,12 @@ impl ModelProcessorSpec for KimiK25VisionSpec {
     ) -> RegistryResult<Vec<PromptReplacement>> {
         let pad_token_id = Self::pad_token_id(metadata)?;
         let placeholder_token = self.placeholder_token(metadata)?;
-        Ok(preprocessed
-            .feature_token_counts
-            .iter()
-            .map(|&num_tokens| {
-                PromptReplacement::repeated(
-                    Modality::Image,
-                    &placeholder_token,
-                    pad_token_id,
-                    num_tokens,
-                )
-            })
-            .collect())
+        Ok(PromptReplacement::repeated_per_item(
+            Modality::Image,
+            &placeholder_token,
+            pad_token_id,
+            &preprocessed.feature_token_counts,
+        ))
     }
 
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {

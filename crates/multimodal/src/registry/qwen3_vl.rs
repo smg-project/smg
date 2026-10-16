@@ -320,14 +320,12 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
         let placeholder_token = self.placeholder_token(metadata)?;
         // The chat template already wraps each image with <|vision_start|> ... <|vision_end|>,
         // so we only expand the single <|image_pad|> placeholder to N pad tokens.
-        Ok(preprocessed
-            .feature_token_counts
-            .iter()
-            .map(|&num_tokens| {
-                let tokens = vec![pad_token_id; num_tokens];
-                PromptReplacement::sequence(Modality::Image, &placeholder_token, tokens)
-            })
-            .collect())
+        Ok(PromptReplacement::repeated_per_item(
+            Modality::Image,
+            &placeholder_token,
+            pad_token_id,
+            &preprocessed.feature_token_counts,
+        ))
     }
 
     fn prompt_replacements_for(
