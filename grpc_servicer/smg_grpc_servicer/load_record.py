@@ -50,6 +50,7 @@ __all__ = [
     "core_only",
     "engine_load_from",
     "load_changed",
+    "poll_timeout_for",
 ]
 
 #: How often an idle stream checks the record for a change (seconds).
