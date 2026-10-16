@@ -1,13 +1,17 @@
 """
 Shared tokenizer bundle utilities for gRPC servicers.
 
-Builds and streams tokenizer artifacts as ZIP bundles over gRPC.
-Used by both SGLang and vLLM servicers.
+Builds and streams tokenizer artifacts as ZIP bundles over gRPC: every
+engine's ``GetTokenizer`` builds the archive with :func:`build_tokenizer_zip`
+and streams it with :func:`tokenizer_chunks`.
 """
 
 import io
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
+
+from smg_grpc_proto.generated import common_pb2
 
 # Streaming chunk size (aligned with Rust grpc_client limits)
 CHUNK_SIZE = 64 * 1024  # 64 KB per gRPC chunk
@@ -55,3 +59,24 @@ def build_tokenizer_zip(tokenizer_dir: Path) -> io.BytesIO:
         raise FileNotFoundError(f"No tokenizer files found in {tokenizer_dir}")
     buf.seek(0)
     return buf
+
+
+def tokenizer_chunks(zip_data, sha256: str) -> Iterator[common_pb2.GetTokenizerChunk]:
+    """The archive's bytes as ``GetTokenizerChunk`` messages of at most
+    :data:`CHUNK_SIZE` bytes each, in order; the SHA-256 fingerprint rides on
+    the last chunk only, every other chunk carries an empty ``sha256``. An
+    empty archive streams no chunk at all.
+
+    ``zip_data`` is the archive's bytes (a ``bytes`` or the ``memoryview`` of
+    the builder's buffer); ``sha256`` is its hex digest, computed by the caller
+    (one servicer computes it off the event loop, with the archive).
+    """
+    offset = 0
+    total = len(zip_data)
+    while offset < total:
+        end = min(offset + CHUNK_SIZE, total)
+        yield common_pb2.GetTokenizerChunk(
+            data=bytes(zip_data[offset:end]),
+            sha256=sha256 if end == total else "",
+        )
+        offset = end
