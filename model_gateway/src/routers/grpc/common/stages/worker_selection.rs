@@ -443,7 +443,7 @@ impl WorkerSelectionStage {
                     .admit_selection_within_budget(
                         ctx,
                         accepted,
-                        self.admit_pd_pair(model_id, inputs, sticky_key, None, media_refs, demand),
+                        self.admit_pd_pair(model_id, inputs, sticky_key, None, media, demand),
                     )
                     .await?;
                 ctx.state.pd_prefill_guard = Some(guard);
@@ -633,7 +633,7 @@ impl WorkerSelectionStage {
                         inputs,
                         ctx.sticky_key.as_deref(),
                         wire,
-                        media_refs,
+                        media,
                         PairDemands::new(
                             self.prefill_leg_needs_vision(ctx.routing.needs_vision),
                             ctx.routing.decode_needs_vision,
@@ -687,7 +687,7 @@ impl WorkerSelectionStage {
         inputs: PlacementInputs<'_>,
         sticky_key: Option<&str>,
         wire: Option<WireConstraint>,
-        media_refs: bool,
+        media: MediaDemands,
         demand: PairDemands,
     ) -> Result<(PdWorkerPair, PrefillLoadGuard), Response> {
         acquire_prefill(
@@ -699,7 +699,7 @@ impl WorkerSelectionStage {
         .await
         .map_err(|error| {
             Self::acquire_failure(model_id, error, |failure| {
-                self.pd_selection_failure(model_id, failure, media_refs)
+                self.pd_selection_failure(model_id, failure, media)
             })
         })
     }
@@ -1345,11 +1345,11 @@ impl WorkerSelectionStage {
         &self,
         model_id: &str,
         failure: PdSelectionFailure,
-        media_refs: bool,
+        media: MediaDemands,
     ) -> Response {
         match failure {
             PdSelectionFailure::Placement(failure) => {
-                self.pd_pair_failure(model_id, *failure, media_refs)
+                self.pd_pair_failure(model_id, *failure, media)
             }
             PdSelectionFailure::Context(response) => *response,
             PdSelectionFailure::NoVisionCapablePrefill => {
@@ -1582,16 +1582,42 @@ impl WorkerSelectionStage {
             .collect()
     }
 
-    fn pd_pair_failure(&self, model_id: &str, failure: PairFailure, media_refs: bool) -> Response {
-        if media_refs {
+    /// The placement's verdict for a failed pair, unless the failing leg's
+    /// pool explains it by the request's media: no worker of the leg
+    /// processes references, or none of those that do is on the side of
+    /// the plan's pipeline pin. Both are the request's own 400, as the
+    /// regular path answers them, not a retryable 503 over healthy workers.
+    fn pd_pair_failure(
+        &self,
+        model_id: &str,
+        failure: PairFailure,
+        media: MediaDemands,
+    ) -> Response {
+        if media.media_refs {
             let snapshot = self.worker_registry.get_routing_snapshot(model_id);
             let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
             let pool = match failure.leg {
                 WorkerLeg::Prefill => &pairs.prefill_pool,
                 _ => &pairs.decode_pool,
             };
-            if !pool.is_empty() && !pool.iter().any(|w| accepts_media_refs(w.as_ref())) {
-                return self.media_refs_shed(model_id);
+            if !pool.is_empty() {
+                let processing: Vec<&Arc<dyn Worker>> = pool
+                    .iter()
+                    .filter(|w| accepts_media_refs(w.as_ref()))
+                    .collect();
+                if processing.is_empty() {
+                    return self.media_refs_shed(model_id);
+                }
+                if !processing
+                    .iter()
+                    .any(|w| pipeline_admits(media.pipeline, w.as_ref()))
+                {
+                    match media.pipeline {
+                        PipelinePin::Only => return Self::pipeline_worker_required(model_id),
+                        PipelinePin::Never => return Self::pipeline_takes_no_audio(model_id),
+                        PipelinePin::Any => {}
+                    }
+                }
             }
         }
         self.pair_failure(model_id, failure)
@@ -2163,7 +2189,7 @@ mod tests {
                 PlacementInputs::default(),
                 None,
                 None,
-                false,
+                MediaDemands::NONE,
                 PairDemands::default(),
             )
             .await
@@ -2218,7 +2244,14 @@ mod tests {
                     ..PlacementInputs::default()
                 };
                 stage
-                    .admit_pd_pair(model_id, inputs, None, None, false, PairDemands::default())
+                    .admit_pd_pair(
+                        model_id,
+                        inputs,
+                        None,
+                        None,
+                        MediaDemands::NONE,
+                        PairDemands::default(),
+                    )
                     .await
             }
         });
@@ -2276,7 +2309,14 @@ mod tests {
         };
 
         let response = stage
-            .admit_pd_pair(model_id, inputs, None, None, false, PairDemands::default())
+            .admit_pd_pair(
+                model_id,
+                inputs,
+                None,
+                None,
+                MediaDemands::NONE,
+                PairDemands::default(),
+            )
             .await
             .err()
             .expect("full explicit target must wait or reject, not reassign");
@@ -4327,7 +4367,7 @@ mod tests {
                 None,
                 PairDemands::default(),
             )
-            .map_err(|failure| stage.pd_selection_failure(model_id, failure, true))
+            .map_err(|failure| stage.pd_selection_failure(model_id, failure, REFS))
             .expect_err("no prefill worker at all");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
@@ -4338,6 +4378,67 @@ mod tests {
             error::extract_error_code_from_response(&response),
             "no_media_ref_capable_worker"
         );
+    }
+
+    /// A prefill/decode pool whose reference-processing workers the plan's
+    /// pipeline pin excludes answers the request's own 400, the verdict the
+    /// regular path gives, not a retryable 503 over healthy workers: an
+    /// all-pipeline pool for audio, an all-engine pool for a pinned family.
+    #[test]
+    fn pd_selection_failure_reads_the_pipeline_pin() {
+        let pipeline = [
+            ("mm_processor", multimodal::GATEWAY_PIPELINE_PROCESSOR),
+            ("mm_media_ref_schemes", "http,https,data"),
+        ];
+        let engine = [
+            ("mm_processor", "inprocess"),
+            ("mm_media_ref_schemes", "http,https,data"),
+        ];
+        for (model_id, labels, demands, code) in [
+            (
+                "test-model-pd-pin-audio",
+                &pipeline[..],
+                AUDIO_REFS,
+                "multimodal_not_supported",
+            ),
+            (
+                "test-model-pd-pin-only",
+                &engine[..],
+                PIPELINE_REFS,
+                "multimodal_worker_processing_unsupported_model",
+            ),
+        ] {
+            let worker_registry = Arc::new(WorkerRegistry::new());
+            for (url, worker_type) in [
+                ("grpc://127.0.0.1:8760", WorkerType::Prefill),
+                ("grpc://127.0.0.1:8761", WorkerType::Decode),
+            ] {
+                worker_registry
+                    .register(labeled_worker(url, model_id, worker_type, labels))
+                    .unwrap();
+            }
+            let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
+            let accepts_refs = |worker: &dyn Worker| demands.accepts_refs(worker);
+            let response = stage
+                .select_pd_pair(
+                    model_id,
+                    PlacementInputs {
+                        candidate_filter: Some(&accepts_refs),
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                    PairDemands::default(),
+                )
+                .map_err(|failure| stage.pd_selection_failure(model_id, failure, demands))
+                .expect_err("the pin empties the pool");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{model_id}");
+            assert_eq!(
+                error::extract_error_code_from_response(&response),
+                code,
+                "{model_id}"
+            );
+        }
     }
 
     /// With the demand an image reference builds, a pool with no pair that
@@ -4380,7 +4481,7 @@ mod tests {
                 None,
                 PairDemands::new(true, true).with_media_refs(true),
             )
-            .map_err(|failure| stage.pd_selection_failure(model_id, failure, true))
+            .map_err(|failure| stage.pd_selection_failure(model_id, failure, REFS))
             .expect_err("no pair takes the references");
         assert_eq!(
             error::extract_error_code_from_response(&response),
@@ -4440,7 +4541,7 @@ mod tests {
                 None,
                 PairDemands::default(),
             )
-            .map_err(|failure| stage.pd_selection_failure(model_id, failure, true))
+            .map_err(|failure| stage.pd_selection_failure(model_id, failure, REFS))
             .expect_err("no advertising decode worker yet");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
@@ -4468,7 +4569,7 @@ mod tests {
                     None,
                     PairDemands::default(),
                 )
-                .map_err(|failure| stage.pd_selection_failure(model_id, failure, true))
+                .map_err(|failure| stage.pd_selection_failure(model_id, failure, REFS))
                 .expect("advertising pair");
             assert_eq!(prefill.url(), "grpc://127.0.0.1:8721");
             assert_eq!(decode.url(), "grpc://127.0.0.1:8731");
@@ -4640,7 +4741,7 @@ mod tests {
             matches!(failure, PdSelectionFailure::NoVisionCapablePrefill),
             "{failure:?}"
         );
-        let response = stage.pd_selection_failure(uniform, failure, false);
+        let response = stage.pd_selection_failure(uniform, failure, MediaDemands::NONE);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             error::extract_error_code_from_response(&response),
@@ -5021,7 +5122,7 @@ mod tests {
         let failure = stage
             .select_pd_pair(model_id, PlacementInputs::default(), None, None, demand)
             .expect_err("the admitted decode leg is all-overloaded under shedding");
-        let response = stage.pd_selection_failure(model_id, failure, false);
+        let response = stage.pd_selection_failure(model_id, failure, MediaDemands::NONE);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             error::extract_error_code_from_response(&response),

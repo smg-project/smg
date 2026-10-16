@@ -34,9 +34,10 @@ def expected_mm_processing(
     Only vLLM gRPC workers advertise worker-side processing, and only models
     whose placeholder anchor a vLLM worker can expand take the worker path,
     unless every registered worker runs the gateway's own pipeline (``smg``),
-    which expands any spec's anchor; every other combination stays on the
-    router path. ``all_workers_process_media`` is False when a worker of the
-    model advertises no processing (a language-model-only decode worker).
+    which expands any spec's image or video anchor; every other combination
+    stays on the router path. ``all_workers_process_media`` is False when a
+    worker of the model advertises no processing (a language-model-only
+    decode worker).
     """
     if get_mm_processing() == MM_PROCESSING_WORKER and is_vllm():
         if worker_expandable:

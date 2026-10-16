@@ -105,7 +105,7 @@ that flag is the one to raise; the router's `--max-payload-size` (default
 On the router side, `--mm-processing` selects `auto` (default: forward when
 every registered worker of the model advertises `mm_processor` and the model's
 spec opts in, or every one of those workers runs the router's own pipeline,
-`mm_processor=smg`, which expands any spec's anchor itself), `router` (always
+`mm_processor=smg`, which expands any spec's image or video anchor itself), `router` (always
 preprocess) or `worker` (strict: 400 when a request cannot be forwarded; a
 family without the opt-in forwards when every media-processing worker of the
 model runs `smg`, and its requests are placed on `smg` workers only, so a
