@@ -619,11 +619,17 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             supported.append(image_modality)
             if hf_config is not None and config_value(hf_config, "video_token_id") is not None:
                 supported.append(video_modality)
-        if (
-            bool(getattr(model_config, "is_audio_model", False))
-            and hf_config is not None
+        # A checkpoint that declares a waveform tower in its own config
+        # (`audio_config` with an `audio_token_id`) takes audio whether or not
+        # the engine's architecture list names it an audio model.
+        declares_audio_tower = (
+            hf_config is not None
+            and config_value(hf_config, "audio_config") is not None
             and config_value(hf_config, "audio_token_id") is not None
-        ):
+        )
+        if (
+            bool(getattr(model_config, "is_audio_model", False)) or declares_audio_tower
+        ) and config_value(hf_config, "audio_token_id") is not None:
             supported.append(audio_modality)
         return supported
 
