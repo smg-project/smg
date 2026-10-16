@@ -1992,12 +1992,17 @@ mod request_release_tests {
     };
     use metrics_exporter_prometheus::PrometheusBuilder;
     use openai_protocol::{
-        completion::CompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
+        completion::CompletionRequest, model_card::ModelCard, responses::ResponsesRequest,
+        worker::HealthCheckConfig,
     };
     use portpicker::pick_unused_port;
+    use smg_data_connector::{
+        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage, ResponseId,
+    };
     use smg_grpc_client::{
         common_proto as common, constraint_failed_status, tokenspeed_proto as ts, vllm_proto,
     };
+    use smg_mcp::{McpConfig, McpOrchestrator};
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
     use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
@@ -2008,16 +2013,27 @@ mod request_release_tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
-        routers::grpc::{
-            client::ModelInfo,
-            multimodal::{
-                MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
-                SUPPORTS_VISION_LABEL,
+        routers::{
+            common::openai_bridge::FormatRegistry,
+            grpc::{
+                client::ModelInfo,
+                common::responses::{
+                    background::{queued_response, store_record},
+                    BackgroundResponses, BackgroundStream,
+                },
+                multimodal::{
+                    MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
+                    SUPPORTS_VISION_LABEL,
+                },
+                proto_wrapper::ENGINE_ERROR_MESSAGE,
+                regular::{
+                    responses::{route_responses, route_responses_background_stream},
+                    symphony::template::Templates,
+                },
+                utils::tonic_ext::TonicStatusExt,
             },
-            proto_wrapper::ENGINE_ERROR_MESSAGE,
-            regular::symphony::template::Templates,
-            utils::tonic_ext::TonicStatusExt,
         },
+        tenant::TenantKey,
         worker::{
             circuit_breaker::{CircuitBreakerConfig, CircuitState},
             BasicWorkerBuilder, ConnectionMode, RequestCompletionSink, RuntimeType, Worker,
@@ -2086,6 +2102,9 @@ mod request_release_tests {
         /// Send the first frame, then hold the stream open with nothing on
         /// it: an engine whose generation wedged after its first token.
         hold_after_first: bool,
+        /// Send the first frame, then hold the next until the flag is set:
+        /// a generation whose end the test times itself.
+        gate_after_first: Option<Arc<AtomicBool>>,
         answer_after: Option<Duration>,
         frame_gap: Option<Duration>,
         calls: Arc<AtomicUsize>,
@@ -2228,6 +2247,7 @@ mod request_release_tests {
             let frame_gap = self.frame_gap;
             let fail_mid_stream = self.fail_mid_stream;
             let hold_after_first = self.hold_after_first;
+            let gate_after_first = self.gate_after_first.clone();
             tokio::spawn(async move {
                 if let Some(probe) = probe {
                     Self::await_probe(&probe, &released).await;
@@ -2249,6 +2269,11 @@ mod request_release_tests {
                         // for longer than any wait a test sets.
                         tokio::time::sleep(Duration::from_secs(30)).await;
                         return;
+                    }
+                    if let Some(gate) = gate_after_first.as_ref().filter(|_| index == 0) {
+                        while !gate.load(Ordering::SeqCst) {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
                     }
                 }
             });
@@ -4210,6 +4235,198 @@ mod request_release_tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    /// The Responses route over a chat pipeline of `worker_registry`: the
+    /// in-memory stores, no MCP servers, `background_slots` background
+    /// responses at once (0: the mode is off).
+    async fn responses_context(
+        worker_registry: &Arc<WorkerRegistry>,
+        background_slots: usize,
+    ) -> ResponsesContext {
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            None,
+            None,
+            Duration::from_secs(60),
+        );
+        let pipeline =
+            RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
+        ResponsesContext::new(
+            Arc::new(pipeline),
+            components(Arc::clone(worker_registry)).await,
+            Arc::new(MemoryResponseStorage::new()),
+            Arc::new(MemoryConversationStorage::new()),
+            Arc::new(MemoryConversationItemStorage::new()),
+            Arc::new(
+                McpOrchestrator::new(McpConfig::default())
+                    .await
+                    .expect("mcp orchestrator"),
+            ),
+            FormatRegistry::new(),
+            None,
+            Arc::new(BackgroundResponses::new(background_slots)),
+        )
+    }
+
+    /// A streamed Responses request for the stub's model, in the background
+    /// or not.
+    fn responses_request(background: bool) -> Arc<ResponsesRequest> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": MODEL,
+                "input": "hi",
+                "stream": true,
+                "background": background,
+            }))
+            .expect("responses request"),
+        )
+    }
+
+    /// The caller of these Responses requests: no tenant.
+    fn anonymous() -> TenantRequestMeta {
+        TenantRequestMeta::new(TenantKey::new("anonymous"))
+    }
+
+    /// The status of the response record stored under `id`; `Null` when
+    /// none is.
+    async fn stored_status(ctx: &ResponsesContext, id: &str) -> serde_json::Value {
+        ctx.response_storage
+            .get_response(&ResponseId::from(id))
+            .await
+            .expect("the store answers")
+            .map_or(serde_json::Value::Null, |stored| {
+                stored.raw_response["status"].clone()
+            })
+    }
+
+    /// Wait until `worker`'s load is back at 0, within `deadline`.
+    async fn wait_for_load_released(worker: &Arc<dyn Worker>, deadline: Instant) {
+        while worker.load() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the worker's load stayed at {} after the body was dropped",
+                worker.load()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Responses API over the gRPC regular path: the client leaves a
+    /// foreground stream while the engine's generation wedged after its
+    /// first token (read by the chat layer, whose body the Responses relay
+    /// waits on). The relay drops the chat body the moment the client is
+    /// gone and the abort reaches the engine through the chat layer at once,
+    /// not when the engine next speaks; the worker's load goes with it.
+    #[tokio::test]
+    async fn a_client_that_leaves_a_stalled_responses_stream_aborts_it_on_the_engine_at_once() {
+        let scheduler = GatedScheduler {
+            hold_after_first: true,
+            ..Default::default()
+        };
+        let port = spawn_stub(scheduler.clone()).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker(&worker_registry, port, WorkerType::Regular);
+        let ctx = responses_context(&worker_registry, 0).await;
+
+        let response = route_responses(
+            &ctx,
+            responses_request(false),
+            None,
+            anonymous(),
+            MODEL.to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        first_response_read(&worker).await;
+        assert!(
+            scheduler
+                .aborted_request_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "nothing is aborted while the client reads"
+        );
+        assert_eq!(worker.load(), 1);
+
+        drop(response);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        wait_for_abort(&scheduler, deadline).await;
+        wait_for_load_released(&worker, deadline).await;
+    }
+
+    /// Responses API, `background: true`: the generation outlives its
+    /// client on purpose. The client leaves the stream once the engine's
+    /// first token was read; nothing is aborted, the work runs to the
+    /// engine's end and the record under the response id completes.
+    #[tokio::test]
+    async fn a_client_that_leaves_a_background_responses_stream_leaves_its_generation_to_complete()
+    {
+        // The engine's first token after a second; its end only once the
+        // test releases it, after the client is gone.
+        let generation_end = Arc::new(AtomicBool::new(false));
+        let scheduler = GatedScheduler {
+            frame_gap: Some(Duration::from_secs(1)),
+            gate_after_first: Some(Arc::clone(&generation_end)),
+            ..Default::default()
+        };
+        let port = spawn_stub(scheduler.clone()).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker(&worker_registry, port, WorkerType::Regular);
+        let ctx = responses_context(&worker_registry, 1).await;
+        let request = responses_request(true);
+        let id = "resp_background_client_leaves";
+        let slot = ctx.background.admit(id).expect("a background slot");
+        store_record(
+            &ctx.response_storage,
+            &queued_response(id, &request),
+            &request,
+            None,
+            None,
+        )
+        .await
+        .expect("the queued record is stored");
+
+        let response = route_responses_background_stream(
+            &ctx,
+            request,
+            None,
+            anonymous(),
+            MODEL.to_string(),
+            BackgroundStream::new(slot),
+        )
+        .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        first_response_read(&worker).await;
+        assert_ne!(
+            stored_status(&ctx, id).await,
+            "completed",
+            "the client leaves before the generation ends"
+        );
+
+        drop(response);
+        generation_end.store(true, Ordering::SeqCst);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while stored_status(&ctx, id).await != "completed" {
+            assert!(
+                Instant::now() < deadline,
+                "the background response did not complete after its client left: {}",
+                stored_status(&ctx, id).await
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            scheduler
+                .aborted_request_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "a background generation is not aborted when its client leaves"
+        );
+        wait_for_load_released(&worker, deadline).await;
     }
 
     /// gRPC PD path: the prefill side answers on its own and reports when its
