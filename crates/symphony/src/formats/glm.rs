@@ -470,5 +470,25 @@ mod tests {
             events.last(),
             Some(Event::Finish { tool_calls: 0, .. })
         ));
+        // A whole pythonic call with a number and one with no arguments: no quote refuses
+        // these, only the parentheses rule does.
+        for output in [
+            "</think>Let me look:<tool_call>Read(offset=10)</tool_call>",
+            "</think>Let me look:<tool_call>Ls()</tool_call>",
+        ] {
+            let events = run_with(coding_tools(), PROMPT, &[output]);
+            assert_eq!(bytes(&events), output);
+            assert!(calls_of(&events).is_empty(), "{output}");
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, Event::Malformed { .. })),
+                "{output}"
+            );
+            assert!(
+                matches!(events.last(), Some(Event::Finish { tool_calls: 0, .. })),
+                "{output}"
+            );
+        }
     }
 }

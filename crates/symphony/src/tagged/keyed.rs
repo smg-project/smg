@@ -787,11 +787,14 @@ mod tests {
     #[test]
     fn text_that_is_not_a_name_starts_no_call() {
         // A JSON call quoted in a code fence (bellwether's probe), prose, a pythonic call written
-        // where the name goes (whole, or cut by the first tag), and a subscript.
+        // where the name goes (whole with a string, a number or nothing, or cut by the first
+        // tag), and a subscript.
         for text in [
             "\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n",
             "get weather<arg_key>n</arg_key><arg_value>1</arg_value>",
             "f(s=\"x\")",
+            "Read(offset=10)",
+            "f()",
             "f(s</arg_key><arg_value>x</arg_value>",
             "f[0]<arg_key>n</arg_key><arg_value>1</arg_value>",
         ] {
