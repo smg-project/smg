@@ -71,7 +71,7 @@ use crate::{
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{is_retryable_response, is_retryable_status, RetryExecutor},
             sse::SSE_CHANNEL_BUFFER,
-            sse_rechunk::{SseRechunker, IDLE_FLUSH},
+            sse_rechunk::{NoopObserver, SseRechunker, IDLE_FLUSH},
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
         error::{self, extract_error_code_from_response},
@@ -1416,7 +1416,8 @@ impl Router {
                 Some(ct) => ct.starts_with("text/event-stream"),
                 None => status.is_success(),
             };
-            let mut rechunker = (rechunk && upstream_sse).then(SseRechunker::new);
+            let mut rechunker =
+                (rechunk && upstream_sse).then(|| SseRechunker::with_observer(NoopObserver));
             if rechunker.is_some() {
                 // Re-chunking changes the body length.
                 response_headers.remove(CONTENT_LENGTH);
@@ -1479,6 +1480,12 @@ impl Router {
                                                 break;
                                             }
                                         }
+                                        // The observer ended the stream: its error
+                                        // event was the last frame, and letting go of
+                                        // the upstream cancels the engine's work.
+                                        if rechunker.as_ref().is_some_and(|r| r.stopped().is_some()) {
+                                            break;
+                                        }
                                     }
                                     Some(Err(e)) => {
                                         if let Some(tail) = rechunker.as_mut().map(SseRechunker::finish) {
@@ -1486,6 +1493,15 @@ impl Router {
                                                 note_sent(&mut sent_tail, &tail);
                                                 let _ = tx.send(Ok(tail)).await;
                                             }
+                                        }
+                                        // The observer ended the stream on its tail: its
+                                        // error event was the last frame. The cut stays the
+                                        // worker's to account.
+                                        if rechunker.as_ref().is_some_and(|r| r.stopped().is_some()) {
+                                            if status.is_success() {
+                                                source.account(&UpstreamCut::of(&e), relayed);
+                                            }
+                                            break;
                                         }
                                         // A head that was a success was answered as one; the
                                         // body ending in an error after it is the worker's
@@ -1524,6 +1540,9 @@ impl Router {
                                     if !tail.is_empty() && tx.send(Ok(tail)).await.is_err() {
                                         break;
                                     }
+                                }
+                                if rechunker.as_ref().is_some_and(|r| r.stopped().is_some()) {
+                                    break;
                                 }
                             }
                             // Client gone with no chunk in flight (long prefill,

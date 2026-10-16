@@ -337,7 +337,10 @@ impl StreamingProcessor {
 
         // Return SSE response
         if rechunk {
-            build_sse_response_from_stream(sse_rechunk::rechunk_stream(ReceiverStream::new(rx)))
+            build_sse_response_from_stream(sse_rechunk::rechunk_stream(
+                ReceiverStream::new(rx),
+                sse_rechunk::NoopObserver,
+            ))
         } else {
             build_sse_response(rx)
         }
