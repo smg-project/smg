@@ -20,6 +20,17 @@ runs the switch. A launcher imported after this package (something imported
 the servicer first, or a launcher that imports it lazily) is caught by a
 meta-path finder that binds the switch as the launcher loads.
 
+What the switch binds is specific to the launcher's shape: the module under
+one of :data:`LAUNCHER_MODULES` (imported under its name, or run as
+``__main__`` by ``python -m``), defining :data:`HOOK_ATTRIBUTE`. A launcher
+of another shape (a release that moved the module or renamed the
+coroutine) is never bound. Rather than let such a launcher build the
+engine and fail in the Python servicer's guard once the model has loaded,
+:func:`require_launcher_hook` checks the hook as soon as the Rust
+implementation is selected, from the launcher's own argument parse (the
+plugin's parse step, :mod:`smg_grpc_servicer.vllm.plugin`), and refuses with
+one line naming the installed vLLM and the launchers the switch binds.
+
 ``python -m`` on the launcher module itself runs it as ``__main__``, where it
 is never in ``sys.modules`` under its name: on 0.28 and 0.29 that is what
 ``python -m vllm.entrypoints.grpc_server`` does (from 0.30 the same command
@@ -39,12 +50,16 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import importlib
 import importlib.abc
+import importlib.metadata
 import re
 import sys
 import types
 from collections.abc import Awaitable, Callable
 from typing import Any
+
+from smg_grpc_servicer.vllm import SERVICER_IMPL_ENV
 
 
 @dataclasses.dataclass(frozen=True)
@@ -254,3 +269,141 @@ def install_launcher_switch() -> list[str]:
         if _bound(namespace):
             hooked.append("__main__")
     return hooked
+
+
+# ---------------------------------------------------------------------------
+# The hook, verified before the engine is built
+# ---------------------------------------------------------------------------
+
+# What the switch finds of the launcher (`LauncherHook.state`).
+BOUND = "bound"  # the switch is bound over the launcher's serve_grpc
+MISSING = "missing"  # a launcher module is loaded and defines no serve_grpc
+ABSENT = "absent"  # no launcher module is loaded, or importable under the known names
+PENDING = "pending"  # a launcher module is still importing (it is importing this package)
+UNKNOWN = "unknown"  # the launcher's import failed on something its own import reports
+
+
+@dataclasses.dataclass(frozen=True)
+class LauncherHook:
+    """What the switch found of the launcher: the ``state`` (one of the
+    constants above) and the module it describes, when there is one."""
+
+    state: str
+    module: str | None = None
+
+    @property
+    def bindable(self) -> bool:
+        """Whether the switch binds, or may still bind, on this launcher: the
+        hook is bound, the launcher is mid-import (its ``serve_grpc`` comes
+        after this package's import, and the hooked module binds it), or its
+        import failed on something its own import reports."""
+        return self.state in (BOUND, PENDING, UNKNOWN)
+
+
+def launcher_hook() -> LauncherHook:
+    """What the switch finds of the launcher in this process: the known
+    modules in ``sys.modules`` (bound, loaded without the hook, or still
+    importing), else a launcher running as ``__main__`` (bound in its own
+    namespace once its body defined the coroutine; this runs inside its
+    ``main()``, after the body, so a namespace without it has none to bind),
+    else nothing loaded."""
+    missing: str | None = None
+    pending = False
+    for name in LAUNCHER_MODULES:
+        module = sys.modules.get(name)
+        if module is None:
+            continue
+        if getattr(getattr(module, "__spec__", None), "_initializing", False):
+            pending = True
+            continue
+        namespace = vars(module)
+        _rebind(namespace)
+        hook = namespace.get(HOOK_ATTRIBUTE)
+        if callable(hook) and getattr(hook, _SWITCH_MARK, False):
+            return LauncherHook(BOUND, name)
+        missing = missing or name
+    if missing is not None:
+        return LauncherHook(MISSING, missing)
+    if pending:
+        return LauncherHook(PENDING)
+    main = launcher_main()
+    if main is not None:
+        namespace = vars(main)
+        _rebind(namespace)
+        state = BOUND if _bound(namespace) else MISSING
+        return LauncherHook(state, main.__spec__.name)
+    return LauncherHook(ABSENT)
+
+
+def _import_launcher() -> LauncherHook:
+    """Import the launcher under the known names the installed vLLM has, newest
+    first (what ``vllm serve --grpc`` does next; the finder binds the switch as
+    it loads) and report what the switch finds of it. A name the installation
+    lacks is skipped; a name whose module defines no hook is passed over for
+    the next known name (a tree may answer the newer name with a module that
+    is not the launcher) and judged only when no other name binds; an import
+    that fails on anything else is left to the launcher's own import to
+    report."""
+    found: LauncherHook | None = None
+    for name in LAUNCHER_MODULES:
+        try:
+            importlib.import_module(name)
+        except ModuleNotFoundError as error:
+            absent = error.name or ""
+            if absent and (name == absent or name.startswith(absent + ".")):
+                continue
+            return LauncherHook(UNKNOWN, name)
+        except Exception:  # noqa: BLE001 - the launcher's own import reports its failure
+            return LauncherHook(UNKNOWN, name)
+        hook = launcher_hook()
+        if hook.bindable:
+            return hook
+        found = hook
+    return found or LauncherHook(ABSENT)
+
+
+def require_launcher_hook(import_launcher: bool = True) -> LauncherHook:
+    """The hook as the switch finds it, once the Rust implementation is
+    selected: bound (or still binding), or a :class:`ServicerConfigError`
+    naming what the installed vLLM lacks and the launchers the switch binds.
+    A launcher not loaded yet is imported first under its known names when
+    ``import_launcher`` is set (``vllm serve --grpc`` imports it right after
+    its parse); a launcher running as ``__main__`` is never re-imported."""
+    from smg_grpc_servicer.rust_lifecycle import ServicerConfigError
+
+    hook = launcher_hook()
+    if hook.state == ABSENT and import_launcher:
+        hook = _import_launcher()
+    if hook.bindable:
+        return hook
+    raise ServicerConfigError(refusal_line(hook))
+
+
+def refusal_line(hook: LauncherHook) -> str:
+    """The one line a launcher the switch cannot bind is refused with: the
+    installed vLLM and what was found of its launcher, the launchers the
+    switch binds, and the way out."""
+    version = installed_engine_version()
+    installed = f"vLLM {version}" if version else "vLLM (version unknown)"
+    way_out = "install a vLLM release the switch binds"
+    if hook.state == MISSING:
+        found = f"its gRPC launcher {hook.module} defines no {HOOK_ATTRIBUTE}"
+    else:
+        found = f"it has no gRPC launcher module under {' or '.join(LAUNCHER_MODULES)}"
+    return (
+        f"--servicer-impl rust ({SERVICER_IMPL_ENV}=rust) refused: the servicer switch cannot "
+        f"bind on the installed {installed}: {found}; {supported_launchers()}; {way_out}, or "
+        f"select --servicer-impl python (or unset {SERVICER_IMPL_ENV}) for the Python servicer"
+    )
+
+
+def installed_engine_version() -> str | None:
+    """The installed vLLM's version: the imported package's, else the
+    distribution's; ``None`` when neither is known."""
+    version = getattr(sys.modules.get("vllm"), "__version__", None)
+    if not version:
+        try:
+            version = importlib.metadata.version("vllm")
+        except importlib.metadata.PackageNotFoundError:
+            version = None
+    return str(version) if version else None

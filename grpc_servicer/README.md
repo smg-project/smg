@@ -230,10 +230,21 @@ python -I grpc_servicer/scripts/launcher_switch_smoke.py --launcher-tree <dir> -
 python -I grpc_servicer/scripts/launcher_switch_smoke.py --installed
 ```
 
+The switch verifies its hook at start-up: once the Rust implementation is
+selected, the launcher's own argument parse (the plugin's parse step) checks
+that the switch is bound over the launcher (the table above; a launcher run
+as `__main__` is checked in its own namespace), importing the module under
+its known names where the CLI has not yet, and a launcher the switch cannot
+bind (one without `serve_grpc`, a release that moved the module) is refused
+with one ERROR line naming the installed vLLM version and the launchers the
+switch binds, exit code 2, before the engine is built, rather than by the
+Python servicer's guard after the model has loaded.
+
 `smg serve --backend vllm --connection-mode grpc --servicer-impl rust` sets
 the flag in each worker's environment, after checking that the installed
 vLLM's launcher will consult it (`smg_grpc_servicer.vllm.rust.upstream_hook_installed`:
-it imports this package at module level, or carries the check itself); the
+a launcher at a module path the switch binds imports this package at module
+level, or a launcher anywhere carries the check itself); the
 Python servicer refuses to start when the flag asks for Rust, so a launcher
 that reaches it anyway fails loudly instead of silently running Python. The
 headless engine is launched from the parsed namespace through vLLM's own
