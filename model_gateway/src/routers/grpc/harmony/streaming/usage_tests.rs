@@ -41,7 +41,7 @@ struct Counters {
 /// The tokens of one assistant turn in the Harmony format: the `analysis`
 /// channel (the reasoning the parser counts) when given, then the `final`
 /// channel's `text`.
-fn harmony_tokens(analysis: Option<&str>, text: &str) -> Vec<u32> {
+pub(super) fn harmony_tokens(analysis: Option<&str>, text: &str) -> Vec<u32> {
     let mut turn = String::new();
     if let Some(analysis) = analysis {
         turn.push_str("<|channel|>analysis<|message|>");

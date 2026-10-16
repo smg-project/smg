@@ -495,6 +495,28 @@ impl HarmonyStreamingProcessor {
                             &mut encoder,
                         )
                         .await?;
+                    } else {
+                        // The choice's only engine output is its Complete (a
+                        // completion with no tokens: a finish that carries
+                        // none comes without a Chunk, so no parser was made
+                        // for it). It opens with its role chunk and ends with
+                        // its finish chunk, as a choice with output does, and
+                        // is the stream's first output when nothing preceded.
+                        if first_token_time.is_none() {
+                            first_token_time = Some(Instant::now());
+                        }
+                        Self::emit_role_chunk(index, dispatch, original_request, tx, &mut encoder)
+                            .await?;
+                        Self::emit_final_chunk(
+                            index,
+                            complete_wrapper.finish_reason(),
+                            matched_stops.get(&index).and_then(|m| m.as_ref()),
+                            dispatch,
+                            original_request,
+                            tx,
+                            &mut encoder,
+                        )
+                        .await?;
                     }
                 }
                 ProtoResponseVariant::None => {}
@@ -582,22 +604,7 @@ impl HarmonyStreamingProcessor {
     ) -> Result<(), String> {
         // On first chunk, emit role announcement separately
         if is_first {
-            let role_chunk = ChatCompletionStreamResponse::builder(
-                &dispatch.request_id,
-                &original_request.model,
-            )
-            .created(dispatch.created)
-            .add_choice_role(index, "assistant")
-            .maybe_system_fingerprint(dispatch.weight_version.as_deref())
-            .build();
-
-            let sse_data = encoder
-                .encode_data(&role_chunk)
-                .map_err(|e| format!("JSON serialization error: {e}"))?;
-
-            tx.send(Ok(sse_data))
-                .await
-                .map_err(|_| "Failed to send role chunk".to_string())?;
+            Self::emit_role_chunk(index, dispatch, original_request, tx, encoder).await?;
         }
 
         // Emit content delta (role is always None for content chunks)
@@ -639,6 +646,33 @@ impl HarmonyStreamingProcessor {
         tx.send(Ok(sse_data))
             .await
             .map_err(|_| "Failed to send chunk".to_string())?;
+
+        Ok(())
+    }
+
+    /// The chunk that opens a choice: its role, as the engines' own servers
+    /// send it before any content.
+    async fn emit_role_chunk(
+        index: u32,
+        dispatch: &context::DispatchMetadata,
+        original_request: &ChatCompletionRequest,
+        tx: &SseSender,
+        encoder: &mut SseEncoder,
+    ) -> Result<(), String> {
+        let role_chunk =
+            ChatCompletionStreamResponse::builder(&dispatch.request_id, &original_request.model)
+                .created(dispatch.created)
+                .add_choice_role(index, "assistant")
+                .maybe_system_fingerprint(dispatch.weight_version.as_deref())
+                .build();
+
+        let sse_data = encoder
+            .encode_data(&role_chunk)
+            .map_err(|e| format!("JSON serialization error: {e}"))?;
+
+        tx.send(Ok(sse_data))
+            .await
+            .map_err(|_| "Failed to send role chunk".to_string())?;
 
         Ok(())
     }
@@ -1339,6 +1373,8 @@ impl Default for HarmonyStreamingProcessor {
     }
 }
 
+#[cfg(test)]
+mod lone_complete_tests;
 #[cfg(test)]
 mod usage_tests;
 
