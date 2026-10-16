@@ -1,6 +1,8 @@
 //! Symphony reading the chat stream: the assignment on the response spec switches the drivers
 //! from the tool and reasoning parsers to one engine per choice, with the same chunks on the wire.
 
+use std::sync::Arc;
+
 use llm_tokenizer::{
     encoders::deepseek_v4::{encode_messages, EncodeParams, ThinkingMode},
     registry::TokenizerRegistry,
@@ -39,7 +41,7 @@ use crate::{
 /// The spec with Symphony assigned `format`, replaying `prompt`.
 fn assigned(mut spec: ChatResponseSpec, format: Format, prompt: &str) -> ChatResponseSpec {
     spec.symphony = Some(Assignment {
-        format,
+        format: Arc::new(format),
         prompt: prompt.to_string(),
     });
     spec
@@ -470,7 +472,7 @@ fn assigned_message(format: Format, prompt: &str, thinking: bool) -> MessagesRes
         chat_tools: lookup_tools().into(),
         stop_sequences: None,
         symphony: Some(Assignment {
-            format,
+            format: Arc::new(format),
             prompt: prompt.to_string(),
         }),
     }

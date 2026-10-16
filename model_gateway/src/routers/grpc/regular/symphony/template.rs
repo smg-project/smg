@@ -46,10 +46,11 @@ pub(crate) struct Templates {
     hidden: RwLock<HashMap<String, Hidden>>,
 }
 
-/// What a model's tokenizer compiled into, bound to that tokenizer.
+/// What a model's tokenizer compiled into, bound to that tokenizer: the table, shared with every
+/// request and engine that reads with it.
 struct Entry {
     tokenizer: Weak<dyn Tokenizer>,
-    table: Result<Format, String>,
+    table: Result<Arc<Format>, String>,
 }
 
 /// Whether a table's markers are hidden by a model's decoder, bound to the tokenizer that decided
@@ -107,7 +108,7 @@ impl Templates {
 
     /// The table `model`'s response template compiles into, or why it has none: no tokenizer, no
     /// template, a template the crate does not read, or one the compile refuses.
-    pub(crate) fn format(&self, model: &str) -> Result<Format, String> {
+    pub(crate) fn format(&self, model: &str) -> Result<Arc<Format>, String> {
         let Some(tokenizer) = self.tokenizers.get(model) else {
             return Err(format!("no tokenizer is registered for model '{model}'"));
         };
@@ -117,7 +118,7 @@ impl Templates {
                 return entry.table.clone();
             }
         }
-        let table = compile(model, tokenizer.as_ref());
+        let table = compile(model, tokenizer.as_ref()).map(Arc::new);
         match &table {
             Ok(format) => info!(
                 model,

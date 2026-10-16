@@ -15,7 +15,7 @@
 //!
 //! Notes on what this module decides, and on what it leaves open: `docs/engine.md`.
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Arc};
 
 use crate::{
     event::{runs, DropReason, Event, Events, FinishReason, MalformedReason, Text},
@@ -48,7 +48,8 @@ enum Closed {
 /// A [`Format`] running as a [`Parser`]. One per generated choice.
 #[derive(Debug)]
 pub struct Engine {
-    format: Format,
+    /// The table, shared with every engine that runs it.
+    format: Arc<Format>,
     /// The request's tools, which type a tagged call's values.
     declared: Declared,
     scanner: Scanner,
@@ -296,11 +297,22 @@ impl Engine {
     /// a shaped call a stream cannot run, or one a table cannot open through its terminal (see
     /// [`Format::validate`]). Definitions are written in the crate, so that is a programming
     /// error; a shape built at run time is checked before its table is.
+    pub fn new(format: Format, declared: Declared) -> Self {
+        Self::shared(Arc::new(format), declared)
+    }
+
+    /// [`Self::new`] over a table other engines run too, the registry's
+    /// ([`Table::shared`](crate::formats::Table::shared)) or one the caller keeps: the engine
+    /// holds the one copy.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::new`]: a table [`Format::validate`] refuses.
     #[expect(
         clippy::panic,
         reason = "a table the crate wrote that fails its own check is a programming error"
     )]
-    pub fn new(format: Format, declared: Declared) -> Self {
+    pub fn shared(format: Arc<Format>, declared: Declared) -> Self {
         if let Err(why) = format.validate() {
             panic!("{why}");
         }

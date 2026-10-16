@@ -18,7 +18,7 @@
 //! renamed checkpoint (`Qwen3-8B-FP8`) is not matched and gives `None`, so the gateway keeps its
 //! older parsers for it until its group lists the name under `also`.
 
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use super::{
     deepseek_v4, deepseek_v4_1, dots3, function_gemma, gemma4, glm, glm4, hy4, inkling, iquest,
@@ -204,6 +204,16 @@ impl Table {
         ("muse", Table::MuseSpark),
     ];
 
+    /// The table, built once and shared: the engines that run it, and whoever asks the table
+    /// for its tags, read the one copy. [`Self::format`] builds a copy of one's own to change.
+    /// The copies stand at the tables' positions in [`Self::ALL`], which is the enum's order;
+    /// every table a name or a group can select is in `ALL` (the tests say so).
+    pub fn shared(self) -> Arc<Format> {
+        static SHARED: [OnceLock<Arc<Format>>; Table::ALL.len()] =
+            [const { OnceLock::new() }; Table::ALL.len()];
+        Arc::clone(SHARED[self as usize].get_or_init(|| Arc::new(self.format())))
+    }
+
     /// The table, built.
     pub fn format(self) -> Format {
         match self {
@@ -258,6 +268,15 @@ impl Group {
     /// The group's checkpoints, by repository name: the primary first.
     fn repositories(&self) -> impl Iterator<Item = &'static str> {
         std::iter::once(repository(self.model)).chain(self.also.iter().map(|also| repository(also)))
+    }
+
+    /// The group's table, with the group's own turn opener where its template writes one.
+    fn format(&self) -> Format {
+        let format = self.table.format();
+        match self.opener {
+            Some(opener) => format.opens_turn(opener),
+            None => format,
+        }
     }
 }
 
@@ -1201,18 +1220,23 @@ const GROUPS: &[Group] = &[
     },
 ];
 
-/// Every group's checkpoints by repository name, each with its group, in the registry's order:
-/// worked out once, since a request looks its model up more than once.
-static REPOSITORIES: LazyLock<Vec<(&'static str, &'static Group)>> = LazyLock::new(|| {
+/// Every group's checkpoints by repository name, each with its group's index, in the registry's
+/// order: worked out once, since a request looks its model up more than once.
+static REPOSITORIES: LazyLock<Vec<(&'static str, usize)>> = LazyLock::new(|| {
     GROUPS
         .iter()
-        .flat_map(|group| group.repositories().map(move |own| (own, group)))
+        .enumerate()
+        .flat_map(|(index, group)| group.repositories().map(move |own| (own, index)))
         .collect()
 });
 
+/// Every group's table ([`Group::format`]), built once and shared, by the group's index.
+static GROUP_FORMATS: [OnceLock<Arc<Format>>; GROUPS.len()] =
+    [const { OnceLock::new() }; GROUPS.len()];
+
 /// The group that holds `model`, by its repository name in any case: the first in the
-/// registry's order.
-fn group_for(model: &str) -> Option<&'static Group> {
+/// registry's order, with its index.
+fn group_for(model: &str) -> Option<(usize, &'static Group)> {
     let repository = repository(model);
     if repository.is_empty() {
         return None;
@@ -1220,24 +1244,28 @@ fn group_for(model: &str) -> Option<&'static Group> {
     REPOSITORIES
         .iter()
         .find(|(own, _)| own.eq_ignore_ascii_case(repository))
-        .map(|&(_, group)| group)
+        .map(|&(_, index)| (index, &GROUPS[index]))
 }
 
 /// The table that reads `model`'s output, with the model's own turn opener where its template has
-/// one; `None` for a model the registry does not know.
+/// one, as a copy of the caller's own; `None` for a model the registry does not know.
 pub fn for_model(model: &str) -> Option<Format> {
-    let group = group_for(model)?;
-    let format = group.table.format();
-    Some(match group.opener {
-        Some(opener) => format.opens_turn(opener),
-        None => format,
-    })
+    for_model_shared(model).map(|format| (*format).clone())
+}
+
+/// [`for_model`]'s table, built once and shared, as [`Table::shared`] shares a table: the engines
+/// that read a model's output hold the one copy.
+pub fn for_model_shared(model: &str) -> Option<Arc<Format>> {
+    let (index, group) = group_for(model)?;
+    Some(Arc::clone(
+        GROUP_FORMATS[index].get_or_init(|| Arc::new(group.format())),
+    ))
 }
 
 /// The table [`for_model`] builds for `model`, by name; `None` for a model the registry does not
 /// know.
 pub fn table_for(model: &str) -> Option<Table> {
-    group_for(model).map(|group| group.table)
+    group_for(model).map(|(_, group)| group.table)
 }
 
 /// Every group the registry knows: the primary's id, its other checkpoints by repository name,
@@ -1338,6 +1366,9 @@ mod tests {
                 "{alias} is a table's own name"
             );
             assert_eq!(Table::named(alias), None, "{alias} is a table's own name");
+            // Every table a name can select stands in `ALL`: `Table::shared` keeps its tables
+            // at their positions there.
+            assert!(Table::ALL.contains(&table), "{alias}'s table is not in ALL");
             assert_eq!(Table::answering_to(alias), Some(table), "{alias}");
             assert_eq!(
                 Table::answering_to(&alias.to_ascii_uppercase()),
@@ -1382,6 +1413,28 @@ mod tests {
         assert_eq!(Table::named(""), None);
         for group in GROUPS {
             assert!(Table::ALL.contains(&group.table), "{}", group.model);
+        }
+    }
+
+    #[test]
+    fn a_shared_table_is_one_copy_for_everyone_and_equal_to_a_fresh_build() {
+        for table in Table::ALL {
+            let shared = table.shared();
+            assert!(Arc::ptr_eq(&shared, &table.shared()), "{}", table.name());
+            assert_eq!(*shared, table.format(), "{}", table.name());
+        }
+        for (model, _, _) in groups() {
+            let shared = for_model_shared(model).unwrap_or_else(|| panic!("{model}"));
+            let again = for_model_shared(model).unwrap_or_else(|| panic!("{model}"));
+            assert!(Arc::ptr_eq(&shared, &again), "{model}");
+            assert_eq!(Some(&*shared), for_model(model).as_ref(), "{model}");
+        }
+    }
+
+    #[test]
+    fn every_table_stands_at_its_own_index_in_all() {
+        for (index, table) in Table::ALL.into_iter().enumerate() {
+            assert_eq!(table as usize, index, "{}", table.name());
         }
     }
 
