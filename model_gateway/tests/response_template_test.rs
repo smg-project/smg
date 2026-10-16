@@ -547,7 +547,8 @@ async fn always_constrains_the_calls_a_request_allows_under_auto() {
     chat(&requested, json!({"tools": tools()})).await;
     assert_eq!(requested.last_constraint(), None);
 
-    // On a registry table, the whole-turn tag composes a JSON response_format with callable tools.
+    // On a registry table, a JSON response_format is the engine's own schema constraint; the
+    // auto tag must not displace it (nor a prompt that continues the assistant's message).
     let registry = serve(Setup {
         constrained_decoding: Some(ConstrainedDecoding::Always),
         tool_parser: Some("qwen"),
@@ -563,10 +564,8 @@ async fn always_constrains_the_calls_a_request_allows_under_auto() {
         json!({"tools": tools(), "response_format": {"type": "json_object"}}),
     )
     .await;
-    let (kind, _) = registry
-        .last_constraint()
-        .expect("the whole-turn constraint");
-    assert_eq!(kind, "structural_tag");
+    let (kind, _) = registry.last_constraint().expect("the schema constraint");
+    assert_eq!(kind, "json_schema");
 }
 
 #[tokio::test]
