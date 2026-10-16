@@ -455,6 +455,56 @@ jobs:
       - name: cargo audit
         run: bash scripts/ci_cargo_audit.sh
 
+  # --- AArch64 ---
+
+  # The multimodal crate carries modules that compile only on AArch64 (the
+  # vector paths of pixel_convert and jpeg_turbo and of the vision stages
+  # orientation, rgb_runs and torch_resample), and the KV index's prefetch
+  # hint has an AArch64 arm. The jobs above run on x86_64 and never compile
+  # that code, so a compile error, a lint or a failing test in it surfaced
+  # first in a nightly image or a release build. This job lints the crates
+  # with target-specific code and runs their tests on an arm64 runner
+  # (GitHub-hosted, free for a public repository), on the pull requests the
+  # unit-tests job runs for. The cache key is the job's own: its target
+  # directory is another architecture's, and the entry fills from the runs
+  # on main (the action saves on main only).
+  rust-aarch64:
+    needs: [detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.detect-changes.result == 'success'
+      && (
+        github.event_name != 'pull_request'
+        || needs.detect-changes.outputs.rust-ci == 'true'
+      )
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-key: rust-aarch64
+
+      - name: Lint the crates with AArch64-only code
+        run: |
+          source "$HOME/.cargo/env"
+          rustup component add clippy
+          cargo clippy -p llm-multimodal -p kv-index --all-targets -- -D warnings
+
+      - name: Test the crates with AArch64-only code
+        run: |
+          source "$HOME/.cargo/env"
+          cargo test -p llm-multimodal -p kv-index
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
   # --- Benchmarks (standalone) ---
 
   # Advisory: the thresholds in e2e_test/benchmarks are absolute latencies on
@@ -1700,7 +1750,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-symphony, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, unit-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-symphony, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -1768,6 +1818,7 @@ jobs:
                 "${{ needs.python-unit-tests.result }}" =~ $bad || \
                 "${{ needs.unit-tests.result }}" =~ $bad || \
                 "${{ needs.cargo-audit.result }}" =~ $bad || \
+                "${{ needs.rust-aarch64.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-symphony.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-rust-servicer.result }}" =~ $bad || \
