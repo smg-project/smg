@@ -1988,21 +1988,33 @@ fn print_banner(host: &str, port: u16, mode: &str) {
 fn get_available_tool_call_parsers() -> Vec<String> {
     static PARSERS: OnceCell<Vec<String>> = OnceCell::new();
     PARSERS
-        .get_or_init(|| {
-            let factory = tool_parser::ParserFactory::new();
-            with_symphony_tables(factory.list_parsers())
-        })
+        .get_or_init(|| parser_choices(|tools, _| tools.list_parsers()))
         .clone()
 }
 
-/// The legacy parsers' names, Symphony's tables' (`symphony::formats::Table::name`), which
-/// `--parser symphony` reads with when both flags name one, and `hf`, the table a model's
-/// response template compiles into, sorted, each once.
-fn with_symphony_tables(mut names: Vec<String>) -> Vec<String> {
+/// The choices of one parser flag: the names `legacy` picks from the two legacy registries (the
+/// flag's own kind), Symphony's tables' (`symphony::formats::Table::name`), which `--parser
+/// symphony` reads with when both flags name one, the names a table answers to that no legacy
+/// parser of either kind has (`symphony::formats::Table::ALIASES`: a launcher's name for a model
+/// family whose table has no older parser, which the gateway takes in either flag), and `hf`,
+/// the table a model's response template compiles into, sorted, each once.
+fn parser_choices(
+    legacy: impl FnOnce(&tool_parser::ParserFactory, &reasoning_parser::ParserFactory) -> Vec<String>,
+) -> Vec<String> {
+    let tools = tool_parser::ParserFactory::new();
+    let reasoning = reasoning_parser::ParserFactory::new();
+    let mut names = legacy(&tools, &reasoning);
     names.extend(
         symphony::formats::Table::ALL
             .iter()
             .map(|table| table.name().to_string()),
+    );
+    names.extend(
+        symphony::formats::Table::ALIASES
+            .iter()
+            .map(|(alias, _)| *alias)
+            .filter(|alias| !tools.has_parser(alias) && !reasoning.registry().has_parser(alias))
+            .map(str::to_string),
     );
     names.push(config::TEMPLATE_PARSER.to_string());
     names.sort();
@@ -2015,10 +2027,7 @@ fn with_symphony_tables(mut names: Vec<String>) -> Vec<String> {
 fn get_available_reasoning_parsers() -> Vec<String> {
     static PARSERS: OnceCell<Vec<String>> = OnceCell::new();
     PARSERS
-        .get_or_init(|| {
-            let factory = reasoning_parser::ParserFactory::new();
-            with_symphony_tables(factory.list_parsers())
-        })
+        .get_or_init(|| parser_choices(|_, reasoning| reasoning.list_parsers()))
         .clone()
 }
 

@@ -424,15 +424,12 @@ impl AppContextBuilder {
             tool: configured_tool_parser.clone(),
             reasoning: configured_reasoning_parser.clone(),
         };
-        let legacy_tool = match (&names.tool, &self.tool_parser_factory) {
-            (Some(name), Some(factory)) => factory.has_parser(name),
-            _ => true,
-        };
-        let legacy_reasoning = match (&names.reasoning, &self.reasoning_parser_factory) {
-            (Some(name), Some(factory)) => factory.registry().has_parser(name),
-            _ => true,
-        };
-        if let Err(why) = check_names(router_config.parser, &names, legacy_tool, legacy_reasoning) {
+        if let Err(why) = check_names(
+            router_config.parser,
+            &names,
+            self.tool_parser_factory.as_ref(),
+            self.reasoning_parser_factory.as_ref(),
+        ) {
             let listed = |names: Option<Vec<String>>| names.unwrap_or_default().join(", ");
             let legacy_tool_parsers =
                 listed(self.tool_parser_factory.as_ref().map(|f| f.list_parsers()));
@@ -445,12 +442,20 @@ impl AppContextBuilder {
                 .iter()
                 .map(|table| table.name())
                 .collect();
+            // The other names a table answers to: the legacy names that read a table's format,
+            // and a launcher's name for a family whose table has no older parser, which is in
+            // no other list.
+            let symphony_aliases: Vec<&str> = symphony::formats::Table::ALIASES
+                .iter()
+                .map(|(alias, _)| *alias)
+                .collect();
             tracing::error!(
                 tool_call_parser = ?names.tool,
                 reasoning_parser = ?names.reasoning,
                 legacy_tool_parsers = %legacy_tool_parsers,
                 legacy_reasoning_parsers = %legacy_reasoning_parsers,
                 symphony_tables = %symphony_tables.join(", "),
+                symphony_aliases = %symphony_aliases.join(", "),
                 "Unknown parser name"
             );
             return Err(AppContextBuildError::InvalidConfig(why));
@@ -463,9 +468,9 @@ impl AppContextBuilder {
                 tool_call_parser = ?names.tool,
                 reasoning_parser = ?names.reasoning,
                 "The configured tool-call parser name selects no Symphony table, so every model \
-                 is read by the legacy parsers under --parser symphony; a table's name, or a \
-                 legacy name that reads a table's format (qwen, qwen_xml, ...), reads with that \
-                 table"
+                 is read by the legacy parsers under --parser symphony; a table's name, a \
+                 legacy name that reads a table's format (qwen, qwen_xml, ...), or a launcher's \
+                 name for a family whose table has no older parser (muse), reads with that table"
             );
         }
 

@@ -436,15 +436,13 @@ fn validate_parser_overrides(
         tool: card.tool_parser.clone(),
         reasoning: card.reasoning_parser.clone(),
     };
-    let legacy_tool = match (&names.tool, tool_parser_factory) {
-        (Some(name), Some(factory)) => factory.registry().has_parser(name),
-        _ => true,
-    };
-    let legacy_reasoning = match (&names.reasoning, reasoning_parser_factory) {
-        (Some(name), Some(factory)) => factory.registry().has_parser(name),
-        _ => true,
-    };
-    check_names(parser, &names, legacy_tool, legacy_reasoning).map_err(|why| {
+    check_names(
+        parser,
+        &names,
+        tool_parser_factory,
+        reasoning_parser_factory,
+    )
+    .map_err(|why| {
         format!(
             "worker {worker_url} declares a parser override for model '{}' the gateway cannot \
              read with: {why}",

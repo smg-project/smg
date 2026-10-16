@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 from smg.launch_router import RouterArgs, parse_router_args
 from smg.router import policy_from_str
+from smg.smg_rs import get_available_reasoning_parsers, get_available_tool_call_parsers
 
 
 class TestRouterArgs:
@@ -1980,3 +1981,31 @@ class TestParserFlag:
         RouterArgs.add_cli_args(parser)
         with pytest.raises(SystemExit):
             parser.parse_args(["--parser", "fast"])
+
+
+class TestParserNames:
+    """--tool-call-parser and --reasoning-parser take the legacy parsers' names, Symphony's tables'
+    names, and a name a table answers to that no legacy parser has, which a launcher passes for a
+    model family whose table has no older parser."""
+
+    def test_a_tables_name_without_a_legacy_parser_is_a_choice_of_both_flags(self):
+        for choices in (get_available_tool_call_parsers(), get_available_reasoning_parsers()):
+            assert choices == sorted(set(choices))
+            assert "muse" in choices
+            assert "muse_spark" in choices
+            assert "hf" in choices
+        # A legacy parser's name stays a choice of its own flag only.
+        assert "qwen_xml" in get_available_tool_call_parsers()
+        assert "qwen_xml" not in get_available_reasoning_parsers()
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        args = RouterArgs.from_cli_args(
+            parser.parse_args(
+                ["--parser", "symphony", "--reasoning-parser", "muse", "--tool-call-parser", "muse"]
+            )
+        )
+        assert (args.parser, args.tool_call_parser, args.reasoning_parser) == (
+            "symphony",
+            "muse",
+            "muse",
+        )

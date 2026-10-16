@@ -7,8 +7,9 @@
 //! `tool_parser` and `reasoning_parser` of the model's card (worker labels), else the
 //! `--tool-call-parser` and `--reasoning-parser` flags, resolved as the legacy path resolves them
 //! (`ParserResolver`). A name a table answers to (`symphony::formats::Table::answering_to`: its
-//! own name, or a legacy parser's that reads its format, `qwen` for `qwen3`, `qwen_xml` for
-//! `qwen3_tagged`) reads every request for the model with that table, whatever the model is, the
+//! own name, a legacy parser's that reads its format, `qwen` for `qwen3`, `qwen_xml` for
+//! `qwen3_tagged`, or a launcher's name for a family whose table has no older parser, `muse` for
+//! `muse_spark`) reads every request for the model with that table, whatever the model is, the
 //! tool-call name deciding; [`TEMPLATE_PARSER`] reads it with the table its tokenizer's
 //! `response_template` compiles into ([`template`]), and refuses the request when the model has
 //! none; any other legacy tool-call parser's name keeps the legacy parsers, which is the way back
@@ -99,9 +100,10 @@ fn names_template(names: &Names) -> bool {
 }
 
 /// The table the parser names set for a model select, when they do: the tool-call name's, else
-/// the reasoning name's when no tool-call name is set. A name is a table's own or a legacy
-/// parser's that reads its format ([`Table::answering_to`]); any other name selects none,
-/// `passthrough` and [`TEMPLATE_PARSER`] among them, and so do no names at all.
+/// the reasoning name's when no tool-call name is set. A name is one a table answers to
+/// ([`Table::answering_to`]): its own, a legacy parser's that reads its format, or a launcher's
+/// for a family whose table has no older parser; any other name selects none, `passthrough` and
+/// [`TEMPLATE_PARSER`] among them, and so do no names at all.
 pub(crate) fn named_table(names: &Names) -> Option<Table> {
     names
         .tool
@@ -148,21 +150,49 @@ pub(crate) fn reads(
 
 /// Whether the parser names set for a model (the flags, or one worker's labels) are names the
 /// gateway reads with under `parser`: a legacy parser's, or, with Symphony on, a table's or
-/// [`TEMPLATE_PARSER`]. `legacy_tool` and `legacy_reasoning` say whether the legacy registries have each
-/// name. A table no legacy parser shares, and [`TEMPLATE_PARSER`], bind the other name to the same or to
-/// nothing: the legacy parsers read a forced call the table has no tag for by the names they are
-/// given, and have no parser of that name. The
-/// error says what is wrong with which name, for the startup or registration failure.
+/// [`TEMPLATE_PARSER`]. `tools` and `reasoning` are the legacy registries; a name whose registry
+/// is absent is not checked (its parsers are unused in that configuration). A name no legacy
+/// parser has that a table answers to (the table's own name, or a launcher's name for a family
+/// whose table has no older parser), and [`TEMPLATE_PARSER`], bind the other name to the same or
+/// to nothing: the legacy parsers read a forced call the table has no tag for by the names they
+/// are given, and have no parser of that name. A legacy parser's name a table answers to is
+/// checked as the legacy name it is, in its own kind. The error says what is wrong with which
+/// name, for the startup or registration failure.
 pub(crate) fn check_names(
     parser: ParserChoice,
     names: &Names,
-    legacy_tool: bool,
-    legacy_reasoning: bool,
+    tools: Option<&tool_parser::ParserFactory>,
+    reasoning: Option<&reasoning_parser::ParserFactory>,
 ) -> Result<(), String> {
     let symphony = parser == ParserChoice::Symphony;
+    let legacy_tool = |name: &str| tools.is_some_and(|factory| factory.has_parser(name));
+    let legacy_reasoning =
+        |name: &str| reasoning.is_some_and(|factory| factory.registry().has_parser(name));
+    // The table a name selects when no legacy parser of its kind has it: the table named so,
+    // else the one that answers to it when no legacy parser of either kind has the name as the
+    // registries spell it (a table answers in any case, the registries in theirs); a legacy
+    // parser's name of the other kind selects none, whatever table answers to it.
+    let table = |name: &str| {
+        Table::named(name).or_else(|| {
+            let spelled = name.trim().to_ascii_lowercase();
+            (!legacy_tool(&spelled) && !legacy_reasoning(&spelled))
+                .then(|| Table::answering_to(name))
+                .flatten()
+        })
+    };
     let kinds = [
-        ("tool-call", &names.tool, legacy_tool, &names.reasoning),
-        ("reasoning", &names.reasoning, legacy_reasoning, &names.tool),
+        (
+            "tool-call",
+            names.tool.as_deref(),
+            tools.is_none() || names.tool.as_deref().is_some_and(legacy_tool),
+            names.reasoning.as_deref(),
+        ),
+        (
+            "reasoning",
+            names.reasoning.as_deref(),
+            reasoning.is_none() || names.reasoning.as_deref().is_some_and(legacy_reasoning),
+            names.tool.as_deref(),
+        ),
     ];
     for (kind, name, legacy, other) in kinds {
         let Some(name) = name else {
@@ -175,10 +205,7 @@ pub(crate) fn check_names(
                      --parser symphony reads with"
                 ));
             }
-            if let Some(other) = other
-                .as_deref()
-                .filter(|other| !is_named(Some(other), TEMPLATE_PARSER))
-            {
+            if let Some(other) = other.filter(|other| !is_named(Some(other), TEMPLATE_PARSER)) {
                 return Err(format!(
                     "{kind} parser '{name}' reads with the model's response template, so the \
                      other parser must name '{TEMPLATE_PARSER}' or nothing, not '{other}'"
@@ -189,14 +216,15 @@ pub(crate) fn check_names(
         if legacy {
             continue;
         }
-        match (symphony, Table::named(name)) {
-            (true, Some(table)) => {
+        match (symphony, table(name)) {
+            (true, Some(selected)) => {
                 if let Some(other) = other {
-                    if Table::named(other) != Some(table) {
+                    if table(other) != Some(selected) {
                         return Err(format!(
-                            "{kind} parser '{name}' is a Symphony table's name and no legacy \
-                             parser's, so the other parser must name the same table or \
-                             nothing, not '{other}'"
+                            "{kind} parser '{name}' selects the Symphony table '{}' and is no \
+                             legacy parser's name, so the other parser must name the same \
+                             table or nothing, not '{other}'",
+                            selected.name()
                         ));
                     }
                 }
@@ -206,10 +234,11 @@ pub(crate) fn check_names(
                     "unknown {kind} parser '{name}': neither a legacy parser nor a Symphony table"
                 ));
             }
-            (false, Some(_)) => {
+            (false, Some(selected)) => {
                 return Err(format!(
-                    "unknown {kind} parser '{name}': a Symphony table's name, which --parser \
-                     symphony reads with"
+                    "unknown {kind} parser '{name}': the Symphony table '{}', which --parser \
+                     symphony reads with",
+                    selected.name()
                 ));
             }
             (false, None) => return Err(format!("unknown {kind} parser '{name}'")),
@@ -878,6 +907,13 @@ mod tests {
         Templates::new(Arc::new(TokenizerRegistry::new()))
     }
 
+    /// [`super::check_names`] against the legacy registries as the gateway builds them.
+    fn check(parser: ParserChoice, names: &Names) -> Result<(), String> {
+        let tools = tool_parser::ParserFactory::new();
+        let reasoning = reasoning_parser::ParserFactory::new();
+        check_names(parser, names, Some(&tools), Some(&reasoning))
+    }
+
     /// [`super::assign`] with no templates: the names never say `hf`, so nothing is refused.
     fn assign(
         parser: ParserChoice,
@@ -938,6 +974,20 @@ mod tests {
             Some(Table::MinimaxM2)
         );
         assert_eq!(named_table(&names(None, Some("deepseek_r1"))), None);
+        // A launcher's name for a family whose table has no older parser reads with the table:
+        // in both flags, in the reasoning flag alone, or as the tool-call name beside another.
+        assert_eq!(
+            named_table(&names(Some("muse"), Some("muse"))),
+            Some(Table::MuseSpark)
+        );
+        assert_eq!(
+            named_table(&names(None, Some("muse"))),
+            Some(Table::MuseSpark)
+        );
+        assert_eq!(
+            named_table(&names(Some("muse"), Some("passthrough"))),
+            Some(Table::MuseSpark)
+        );
         // The tool-call name decides; a legacy name with no alias selects none.
         assert_eq!(
             named_table(&names(Some("kimi_k3"), Some("qwen3"))),
@@ -960,15 +1010,46 @@ mod tests {
     }
 
     #[test]
-    fn every_name_a_table_answers_to_besides_its_own_is_a_legacy_parsers() {
+    fn every_name_a_table_answers_to_besides_its_own_is_a_legacy_parsers_or_a_launchers() {
         let tools = tool_parser::ParserFactory::new();
         let reasoning = reasoning_parser::ParserFactory::new();
-        for (alias, _) in Table::ALIASES {
-            assert!(
-                tools.has_parser(alias) || reasoning.registry().has_parser(alias),
-                "{alias} is no legacy parser's name"
+        let symphony = ParserChoice::Symphony;
+        let mut launchers = Vec::new();
+        for (alias, table) in Table::ALIASES {
+            if tools.has_parser(alias) || reasoning.registry().has_parser(alias) {
+                // A legacy parser's name is checked as the legacy name it is
+                // (`names_are_checked_against_both_registries_by_the_parser_in_force`).
+                continue;
+            }
+            // A launcher's name for a family whose table has no older parser passes under
+            // Symphony in both flags, in either alone, and beside the table's own name.
+            launchers.push(alias);
+            let doubled = names(Some(alias), Some(alias));
+            assert_eq!(named_table(&doubled), Some(table), "{alias}");
+            assert_eq!(check(symphony, &doubled), Ok(()), "{alias}");
+            assert_eq!(
+                check(symphony, &names(Some(alias), None)),
+                Ok(()),
+                "{alias}"
+            );
+            assert_eq!(
+                check(symphony, &names(None, Some(alias))),
+                Ok(()),
+                "{alias}"
+            );
+            let own = table.name();
+            assert_eq!(
+                check(symphony, &names(Some(alias), Some(own))),
+                Ok(()),
+                "{alias}"
+            );
+            assert_eq!(
+                check(symphony, &names(Some(own), Some(alias))),
+                Ok(()),
+                "{alias}"
             );
         }
+        assert_eq!(launchers, ["muse"]);
     }
 
     #[test]
@@ -1131,57 +1212,102 @@ mod tests {
     fn names_are_checked_against_both_registries_by_the_parser_in_force() {
         let legacy = ParserChoice::Legacy;
         let symphony = ParserChoice::Symphony;
-        assert_eq!(check_names(legacy, &Names::default(), true, true), Ok(()));
-        assert_eq!(
-            check_names(legacy, &names(Some("qwen"), Some("qwen3")), true, true),
-            Ok(())
-        );
-        let why = check_names(legacy, &names(Some("nonsense"), None), false, true);
+        assert_eq!(check(legacy, &Names::default()), Ok(()));
+        assert_eq!(check(legacy, &names(Some("qwen"), Some("qwen3"))), Ok(()));
+        let why = check(legacy, &names(Some("nonsense"), None));
         assert_eq!(
             why.expect_err("unknown"),
             "unknown tool-call parser 'nonsense'"
         );
-        let why = check_names(legacy, &names(None, Some("ling")), true, false);
+        let why = check(legacy, &names(None, Some("ling")));
         assert_eq!(
             why.expect_err("a table under legacy"),
-            "unknown reasoning parser 'ling': a Symphony table's name, which --parser symphony \
+            "unknown reasoning parser 'ling': the Symphony table 'ling', which --parser symphony \
              reads with"
         );
         // Under Symphony a table's name passes alone or doubled, and binds the other name.
+        assert_eq!(check(symphony, &names(Some("ling"), None)), Ok(()));
+        assert_eq!(check(symphony, &names(Some("ling"), Some("LING"))), Ok(()));
+        // Legacy names pass as the legacy names they are, one a table's own name as well.
         assert_eq!(
-            check_names(symphony, &names(Some("ling"), None), false, true),
+            check(symphony, &names(Some("qwen"), Some("kimi_k3"))),
             Ok(())
         );
-        assert_eq!(
-            check_names(symphony, &names(Some("ling"), Some("LING")), false, false),
-            Ok(())
-        );
-        assert_eq!(
-            check_names(symphony, &names(Some("kimi_k3"), Some("qwen3")), true, true),
-            Ok(())
-        );
-        let why = check_names(symphony, &names(Some("ling"), Some("qwen3")), false, true);
+        let why = check(symphony, &names(Some("ling"), Some("qwen3")));
         assert_eq!(
             why.expect_err("bound to the table"),
-            "tool-call parser 'ling' is a Symphony table's name and no legacy parser's, so the \
-             other parser must name the same table or nothing, not 'qwen3'"
+            "tool-call parser 'ling' selects the Symphony table 'ling' and is no legacy parser's \
+             name, so the other parser must name the same table or nothing, not 'qwen3'"
         );
-        let why = check_names(symphony, &names(None, Some("nonsense")), true, false);
+        let why = check(symphony, &names(None, Some("nonsense")));
         assert_eq!(
             why.expect_err("unknown"),
             "unknown reasoning parser 'nonsense': neither a legacy parser nor a Symphony table"
         );
         // A legacy name a table answers to is checked as the legacy name it is: a tool parser's
         // given as the reasoning parser is unknown there, under either parser.
-        let why = check_names(symphony, &names(None, Some("qwen_xml")), true, false);
+        let why = check(symphony, &names(None, Some("qwen_xml")));
         assert_eq!(
             why.expect_err("wrong kind"),
             "unknown reasoning parser 'qwen_xml': neither a legacy parser nor a Symphony table"
         );
-        let why = check_names(legacy, &names(None, Some("qwen_xml")), true, false);
+        let why = check(legacy, &names(None, Some("qwen_xml")));
         assert_eq!(
             why.expect_err("wrong kind"),
             "unknown reasoning parser 'qwen_xml'"
+        );
+        // The legacy registries spell their names one way: a legacy parser's name in another
+        // case or with spaces around it is no legacy parser's, and selects no table either
+        // (a table's own name, which reads in any case, excepted).
+        let why = check(symphony, &names(Some("QWEN_XML"), None));
+        assert_eq!(
+            why.expect_err("not as spelled"),
+            "unknown tool-call parser 'QWEN_XML': neither a legacy parser nor a Symphony table"
+        );
+        let why = check(symphony, &names(None, Some(" hy_v4 ")));
+        assert_eq!(
+            why.expect_err("not as spelled"),
+            "unknown reasoning parser ' hy_v4 ': neither a legacy parser nor a Symphony table"
+        );
+        // A launcher's name for a family whose table has no older parser (`muse`) passes in
+        // either flag and binds the other name as the table's own name does; under `legacy` it
+        // is unknown, as the table's own name is.
+        assert_eq!(check(symphony, &names(Some("muse"), Some("muse"))), Ok(()));
+        assert_eq!(
+            check(symphony, &names(Some("MUSE"), Some("muse_spark"))),
+            Ok(())
+        );
+        assert_eq!(
+            check(symphony, &names(Some("muse_spark"), Some("muse"))),
+            Ok(())
+        );
+        let why = check(symphony, &names(Some("muse"), Some("qwen3")));
+        assert_eq!(
+            why.expect_err("bound to the table"),
+            "tool-call parser 'muse' selects the Symphony table 'muse_spark' and is no legacy \
+             parser's name, so the other parser must name the same table or nothing, not 'qwen3'"
+        );
+        let why = check(symphony, &names(Some("muse"), Some("passthrough")));
+        assert_eq!(
+            why.expect_err("bound to the table"),
+            "tool-call parser 'muse' selects the Symphony table 'muse_spark' and is no legacy \
+             parser's name, so the other parser must name the same table or nothing, not \
+             'passthrough'"
+        );
+        let why = check(legacy, &names(None, Some("muse")));
+        assert_eq!(
+            why.expect_err("a table under legacy"),
+            "unknown reasoning parser 'muse': the Symphony table 'muse_spark', which --parser \
+             symphony reads with"
+        );
+        // A registry that is absent checks nothing, as before.
+        assert_eq!(
+            check_names(symphony, &names(Some("nonsense"), Some("muse")), None, None),
+            Ok(())
+        );
+        assert_eq!(
+            check_names(legacy, &names(Some("muse"), Some("nonsense")), None, None),
+            Ok(())
         );
     }
 
@@ -1807,31 +1933,22 @@ mod tests {
     #[test]
     fn hf_is_a_name_under_symphony_alone_and_binds_the_other_name() {
         let symphony = ParserChoice::Symphony;
-        assert_eq!(
-            check_names(symphony, &names(Some("hf"), None), false, false),
-            Ok(())
-        );
-        assert_eq!(
-            check_names(symphony, &names(None, Some("hf")), false, false),
-            Ok(())
-        );
-        assert_eq!(
-            check_names(symphony, &names(Some("HF"), Some(" hf ")), false, false),
-            Ok(())
-        );
-        let why = check_names(symphony, &names(Some("hf"), Some("qwen3")), false, true);
+        assert_eq!(check(symphony, &names(Some("hf"), None)), Ok(()));
+        assert_eq!(check(symphony, &names(None, Some("hf"))), Ok(()));
+        assert_eq!(check(symphony, &names(Some("HF"), Some(" hf "))), Ok(()));
+        let why = check(symphony, &names(Some("hf"), Some("qwen3")));
         assert_eq!(
             why.expect_err("bound"),
             "tool-call parser 'hf' reads with the model's response template, so the other \
              parser must name 'hf' or nothing, not 'qwen3'"
         );
-        let why = check_names(symphony, &names(Some("qwen"), Some("hf")), true, false);
+        let why = check(symphony, &names(Some("qwen"), Some("hf")));
         assert_eq!(
             why.expect_err("bound"),
             "reasoning parser 'hf' reads with the model's response template, so the other \
              parser must name 'hf' or nothing, not 'qwen'"
         );
-        let why = check_names(ParserChoice::Legacy, &names(Some("hf"), None), false, true);
+        let why = check(ParserChoice::Legacy, &names(Some("hf"), None));
         assert_eq!(
             why.expect_err("legacy"),
             "unknown tool-call parser 'hf': the model's response template, which --parser \

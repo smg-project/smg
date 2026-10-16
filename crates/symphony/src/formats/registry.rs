@@ -186,8 +186,10 @@ impl Table {
     /// (`--tool-call-parser qwen_xml`) reads with the table (`qwen3_tagged`) when the gateway
     /// reads with Symphony. A parser that reads a format no table reads has no row and keeps its
     /// own parser; so does `passthrough`, which leaves its channel as written, which no table
-    /// reads for.
-    pub const ALIASES: [(&str, Table); 9] = [
+    /// reads for. A row may also be the name a downstream launcher passes for a model family
+    /// whose table has no older parser (`muse` for `muse_spark`), so that the launcher's flags
+    /// read with the table.
+    pub const ALIASES: [(&str, Table); 10] = [
         ("qwen", Table::Qwen3),
         ("qwen_xml", Table::Qwen3Tagged),
         ("qwen_coder", Table::Qwen3Tagged),
@@ -197,6 +199,7 @@ impl Table {
         ("hy_v4", Table::Hy4),
         ("deepseek_v41", Table::DeepSeekV4_1),
         ("minimax", Table::MinimaxM2),
+        ("muse", Table::MuseSpark),
     ];
 
     /// The table, built.
@@ -1309,6 +1312,9 @@ mod tests {
         }
         assert_eq!(Table::answering_to("llama"), None);
         assert_eq!(Table::answering_to("passthrough"), None);
+        // A launcher's name for a family whose table has no older parser answers for the table.
+        assert_eq!(Table::answering_to("muse"), Some(Table::MuseSpark));
+        assert_eq!(Table::named("muse"), None);
     }
 
     #[test]
