@@ -300,11 +300,24 @@ pub(crate) fn now_ms() -> u64 {
     u64::try_from(EPOCH.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Whether a gRPC status describes the connection rather than the request:
-/// what a dead peer, a reset or a failed keepalive produce. A deadline or an
+/// Whether a gRPC status code is one the connection produces rather than
+/// the request: what a dead peer, a reset, a failed keepalive or an engine
+/// that says it is unavailable end a stream with. A deadline or an
 /// engine-side error says the worker is slow or wrong, not gone, and a slow
 /// worker that still streams tokens must not flap in and out of routing.
-pub(crate) fn is_transport_failure(code: tonic::Code) -> bool {
+///
+/// The code alone decides, because the question is whether the peer is
+/// reachable for work, and every way of being unreachable ends the
+/// monitors' polls and streams with one of these codes; which layer
+/// produced the status does not matter here. The gRPC client's
+/// [`smg_grpc_client::is_transport_failure`] asks a different question of a
+/// status under a call, whether it is the HTTP/2 layer's doing rather than
+/// the worker's answer, and reads the status's source chain because the
+/// code cannot tell those apart. The two are not interchangeable: an
+/// `Unavailable` the worker answered with is a connection code here and no
+/// transport failure there; an `Internal` made of a protocol fault is a
+/// transport failure there and no connection code here.
+pub(crate) fn is_connection_code(code: tonic::Code) -> bool {
     matches!(
         code,
         tonic::Code::Unavailable
@@ -688,6 +701,7 @@ fn set(worker: &Arc<dyn Worker>, reason: Option<StallReason>, cause: &'static st
 mod tests {
     use std::thread;
 
+    use smg_grpc_client::{h2, is_transport_failure};
     use tokio::sync::mpsc;
 
     use super::*;
@@ -697,6 +711,106 @@ mod tests {
 
     fn worker() -> Arc<dyn Worker> {
         Arc::new(BasicWorkerBuilder::new("http://w1:8000").build())
+    }
+
+    /// The expectation the three callers share, for every gRPC code: the
+    /// load poll, the KV subscription and the KV stream all mark a worker
+    /// as contact failed when their call or stream ends with a connection
+    /// code, and leave it alone on any other code. Four codes are the
+    /// connection's; the rest describe the request. A `match` with no
+    /// wildcard arm: a code added to tonic is a build error here until it
+    /// has its row.
+    fn expectation(code: tonic::Code) -> (bool, &'static str) {
+        use tonic::Code;
+        match code {
+            Code::Ok => (false, "a clean end is not a failure"),
+            Code::Cancelled => (true, "a reset stream: the peer or the link went away"),
+            Code::Unknown => (
+                true,
+                "an error with no gRPC code: a closed or broken connection",
+            ),
+            Code::InvalidArgument => (false, "the request was wrong, the worker is there"),
+            Code::DeadlineExceeded => (false, "our own deadline: slow, not gone"),
+            Code::NotFound => (false, "the request's"),
+            Code::AlreadyExists => (false, "the request's"),
+            Code::PermissionDenied => (false, "the request's"),
+            Code::ResourceExhausted => (false, "the worker's capacity pushback: busy, not gone"),
+            Code::FailedPrecondition => (false, "the request's"),
+            Code::Aborted => (true, "the worker aborted the stream under us"),
+            Code::OutOfRange => (
+                false,
+                "the KV subscription resyncs on it before asking; never a contact failure",
+            ),
+            Code::Unimplemented => (false, "the request's"),
+            Code::Internal => (
+                false,
+                "the worker's own failure on a request: wrong, not gone",
+            ),
+            Code::Unavailable => (
+                true,
+                "a dead peer, a refused stream or a worker that says it is unavailable",
+            ),
+            Code::DataLoss => (
+                false,
+                "the KV stream resyncs on it before asking; never a contact failure",
+            ),
+            Code::Unauthenticated => (false, "the request's"),
+        }
+    }
+
+    /// Every gRPC code against the callers' expectation. The codes come
+    /// from tonic's own numbering: `from_i32` answers `Unknown` for a
+    /// number tonic has no code for, so the numbers must map back to
+    /// themselves (each a real code, once) and the 17th must not.
+    #[test]
+    fn a_connection_code_is_one_of_four_and_every_other_code_is_the_requests() {
+        use tonic::Code;
+        let codes: Vec<Code> = (0..=16).map(Code::from_i32).collect();
+        assert_eq!(
+            codes
+                .iter()
+                .map(|&code| i32::from(code))
+                .collect::<Vec<_>>(),
+            (0..=16).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            Code::from_i32(17),
+            Code::Unknown,
+            "tonic numbers a 17th code: give it a row"
+        );
+        for &code in &codes {
+            let (expected, why) = expectation(code);
+            assert_eq!(is_connection_code(code), expected, "{code:?}: {why}");
+        }
+        assert_eq!(codes.iter().filter(|&&code| expectation(code).0).count(), 4);
+    }
+
+    /// The gRPC client's `is_transport_failure` answers another question
+    /// (is this status the HTTP/2 layer's doing rather than the worker's
+    /// answer?) from the status's source chain, and the two disagree by
+    /// design in both directions.
+    #[test]
+    fn a_connection_code_and_a_transport_failure_are_different_questions() {
+        // An Unavailable the worker answered with: unreachable for work, yet
+        // not the transport's doing.
+        let answered = tonic::Status::unavailable("shutting down");
+        assert!(is_connection_code(answered.code()));
+        assert!(!is_transport_failure(&answered));
+
+        // An Internal tonic made of a protocol fault: the transport's doing,
+        // yet its code is the one a worker's own failure carries.
+        let fault =
+            tonic::Status::from_error(Box::new(h2::Error::from(h2::Reason::PROTOCOL_ERROR)));
+        assert_eq!(fault.code(), tonic::Code::Internal);
+        assert!(is_transport_failure(&fault));
+        assert!(!is_connection_code(fault.code()));
+
+        // A refused stream is both: an Unavailable with an HTTP/2 cause.
+        let refused =
+            tonic::Status::from_error(Box::new(h2::Error::from(h2::Reason::REFUSED_STREAM)));
+        assert_eq!(refused.code(), tonic::Code::Unavailable);
+        assert!(is_transport_failure(&refused));
+        assert!(is_connection_code(refused.code()));
     }
 
     #[test]

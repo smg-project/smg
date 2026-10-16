@@ -1166,7 +1166,7 @@ impl WorkerMonitor {
             }
             Ok(Err(e)) => {
                 debug!("backend GetLoads failed for {}: {e}", worker.url());
-                if liveness::is_transport_failure(e.code()) {
+                if liveness::is_connection_code(e.code()) {
                     liveness::on_contact_failed(worker, "load poll");
                 }
                 None

@@ -397,7 +397,7 @@ impl KvEventMonitor {
                         reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
                         continue;
                     }
-                    if liveness::is_transport_failure(e.code()) {
+                    if liveness::is_connection_code(e.code()) {
                         liveness::on_contact_failed(&worker, "kv subscribe");
                     }
                     warn!(
@@ -513,7 +513,7 @@ impl KvEventMonitor {
                         reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
                         continue;
                     }
-                    if liveness::is_transport_failure(e.code()) {
+                    if liveness::is_connection_code(e.code()) {
                         liveness::on_contact_failed(&worker, "kv stream");
                     }
                     warn!(
