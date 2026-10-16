@@ -151,8 +151,16 @@ class SGLangHealthServicer(health_pb2_grpc.HealthServicer):
         service_name = request.service
         logger.debug(f"Health watch request for service: '{service_name}'")
 
-        # Send current status
-        response = await self.Check(request, context)
+        # The current status once, computed as Check computes it but without
+        # Check's refusal on the context: a NOT_FOUND code set on a streaming
+        # call fails the stream, while the protocol answers an unknown service
+        # with a SERVICE_UNKNOWN status.
+        if service_name in (self.OVERALL_SERVER, self.SGLANG_SERVICE):
+            response = await self.Check(request, context)
+        else:
+            response = health_pb2.HealthCheckResponse(
+                status=health_pb2.HealthCheckResponse.SERVICE_UNKNOWN
+            )
         yield response
 
         # Note: Full Watch implementation would monitor status changes
