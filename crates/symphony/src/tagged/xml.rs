@@ -154,22 +154,14 @@ impl Assembler {
         }
     }
 
-    /// The table's ignored terminal arrived inside the call: `Dropped { Wrapper }` at once when
-    /// nothing is held before it, otherwise carried into the next fragment's source, so that its
-    /// bytes keep their place.
-    pub fn ignored(&mut self, bytes: &str, declared: &Declared, out: &mut Events) {
+    /// The table's ignored terminal arrived inside the call: a tag held before it is released, as
+    /// the separator ends it, and what follows stands after a separator. Its own bytes are the
+    /// engine's to place, in their order among the bytes this assembler holds.
+    pub fn ignored(&mut self, declared: &Declared, out: &mut Events) {
         if self.done {
             return;
         }
         self.release_tag(declared, out);
-        if self.carried.is_empty() {
-            out.push(Event::Dropped {
-                text: Text::uncounted(bytes),
-                why: DropReason::Wrapper,
-            });
-        } else {
-            self.carried.push_str(bytes);
-        }
         self.after_separator = true;
     }
 
@@ -716,8 +708,8 @@ impl crate::engine::CallAssembler for Assembler {
         text.len()
     }
 
-    fn ignored(&mut self, text: &str, declared: &Declared, out: &mut Events) {
-        self.ignored(text, declared, out);
+    fn ignored(&mut self, _text: &str, declared: &Declared, out: &mut Events) {
+        self.ignored(declared, out);
     }
 
     /// Only the invoke's closing tag is a started call's end; the next invoke's opening and the

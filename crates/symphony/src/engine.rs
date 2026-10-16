@@ -61,6 +61,23 @@ pub struct Engine {
     stay: Stay,
     /// A shaped call whose terminal arrived and whose header is still being read.
     pending: Option<Pending>,
+    /// The bytes of the call being assembled, and the ignored terminals that arrived among them
+    /// while the assembler held bytes.
+    region: Region,
+}
+
+/// The bytes of the call region being assembled: how many the assembler took, how many its events
+/// have carried out, and the table's ignored terminals that arrived while it held bytes, each at
+/// the offset it arrived at. A syntax may hold bytes until it can place them (a header until its
+/// marker, a word until it is spelled), and an ignored terminal pushed at once would leave before
+/// them; so one that arrives while bytes are held is carried into the source of the event that
+/// carries the bytes after it, and the output's bytes leave in their order whatever the syntax
+/// holds. When nothing is held it is dropped where it stands.
+#[derive(Debug, Default)]
+struct Region {
+    fed: usize,
+    out: usize,
+    carried: Vec<(usize, String)>,
 }
 
 /// A terminal whose row enters a shaped call, pending the call's header: nothing the row does has
@@ -95,6 +112,18 @@ enum Held {
     Ignored(String),
 }
 
+/// The text an event carries, for the events that carry output bytes.
+fn event_text(event: &mut Event) -> Option<&mut Text> {
+    match event {
+        Event::Content(text) | Event::Reasoning(text) => Some(text),
+        Event::Dropped { text, .. } | Event::Malformed { text, .. } => Some(text),
+        Event::ToolCallStart { source, .. }
+        | Event::ToolCallArguments { source, .. }
+        | Event::ToolCallEnd { source, .. } => Some(source),
+        Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => None,
+    }
+}
+
 /// Whitespace as Python's `str.strip` removes it: Unicode's white space and the information
 /// separators U+001C to U+001F, which `str.isspace` takes too.
 pub(crate) fn is_strip_space(c: char) -> bool {
@@ -111,14 +140,12 @@ pub(crate) trait CallAssembler: std::fmt::Debug + Send + Sync {
     /// reports it as text after the object; every other syntax takes every byte.
     fn feed(&mut self, text: &str, declared: &Declared, out: &mut Events) -> usize;
 
-    /// The table's ignored terminal arrived inside the call: dropped where it stands, unless the
-    /// syntax keeps its bytes in place among the bytes it holds (MiniMax M3's XML).
-    fn ignored(&mut self, text: &str, _declared: &Declared, out: &mut Events) {
-        out.push(Event::Dropped {
-            text: Text::uncounted(text),
-            why: DropReason::Wrapper,
-        });
-    }
+    /// The table's ignored terminal arrived inside the call. Its bytes are the engine's to place
+    /// ([`Region`]): dropped where it stands when the assembler holds nothing, carried into the
+    /// source of the event that carries the bytes after it otherwise. A syntax that reads the
+    /// terminal as its own separator does what it must here (MiniMax M3's XML releases a tag it
+    /// holds at it) and pushes nothing for its bytes.
+    fn ignored(&mut self, _text: &str, _declared: &Declared, _out: &mut Events) {}
 
     /// The call the engine entered through a matched header starts: the events of its start, and
     /// the bytes that followed the header, for the engine to read again inside the call. Every
@@ -267,6 +294,7 @@ impl Engine {
             at_turn_start,
             stay: Stay::default(),
             pending: None,
+            region: Region::default(),
         };
         // A table whose output starts inside a call (a bare list of calls, with no marker before
         // it) opens the call here, since no terminal will.
@@ -477,6 +505,9 @@ impl Engine {
             .as_mut()
             .map_or_else(String::new, |call| call.start(&mut started));
         self.push_call_events(started, out);
+        // The header's bytes went to the shape, not through `feed`: the start's events carried
+        // them out, so the region counts them as taken too.
+        self.region.fed = self.region.fed.max(self.region.out);
         again
     }
 
@@ -517,6 +548,7 @@ impl Engine {
                 };
                 let mut assembled = Events::new();
                 let taken = call.feed(text, &self.declared, &mut assembled);
+                self.region.fed += taken;
                 self.push_call_events(assembled, out);
                 self.wrapping(&text[taken..], TEXT_AFTER_THE_OBJECT, out);
             }
@@ -620,7 +652,9 @@ impl Engine {
     }
 
     /// A terminal arrived: move where the table says, or keep it as text where the model put it.
-    /// A terminal the table ignores is dropped where it stands, and moves nothing.
+    /// A terminal the table ignores is dropped where it stands, and moves nothing: inside a call
+    /// whose assembler holds bytes it is carried into the source of the event that carries the
+    /// bytes after it ([`Region`]), and in a trimmed stay's held run it keeps its place among them.
     fn terminal(&mut self, index: usize, out: &mut Events) {
         if self.format.ignored(index) {
             let text = self.format.terminal_text(index).to_string();
@@ -629,6 +663,14 @@ impl Engine {
                     let mut events = Events::new();
                     call.ignored(&text, &self.declared, &mut events);
                     self.push_call_events(events, out);
+                    if self.region.out < self.region.fed {
+                        self.region.carried.push((self.region.fed, text));
+                        return;
+                    }
+                    out.push(Event::Dropped {
+                        text: self.tokens.text(&text),
+                        why: DropReason::Wrapper,
+                    });
                     return;
                 }
             }
@@ -698,6 +740,7 @@ impl Engine {
             out.push(Event::ReasoningStart);
         }
         if to == Emits::Arguments {
+            self.region = Region::default();
             self.call = Some(call.unwrap_or_else(|| self.new_call()));
         }
         self.state = next;
@@ -707,6 +750,7 @@ impl Engine {
     /// The next call takes the next free index; the index is spent only when a call starts, so a
     /// `<tool_call>` block that held no call does not count and does not leave a gap.
     fn open_call(&mut self) {
+        self.region = Region::default();
         self.call = Some(self.new_call());
     }
 
@@ -742,6 +786,9 @@ impl Engine {
                 false
             }
         };
+        if taken {
+            self.region.fed += terminal.len();
+        }
         if closed == Closed::ByMarker {
             let mut renamed = Events::new();
             for event in finished.drain() {
@@ -759,19 +806,68 @@ impl Engine {
             finished = renamed;
         }
         self.push_call_events(finished, out);
+        // An ignored terminal no event carried out leaves here, before the region's close.
+        for (_, marker) in std::mem::take(&mut self.region.carried) {
+            out.push(Event::Dropped {
+                text: self.tokens.text(&marker),
+                why: DropReason::Wrapper,
+            });
+        }
+        self.region = Region::default();
         taken
     }
 
     /// Pushes a call's events with their tokens counted, and counts each call that starts: the
     /// index the next call takes, and `Finish::tool_calls`. A syntax that writes several calls in
-    /// one region starts each of them here.
+    /// one region starts each of them here. An event's bytes are counted as carried out of the
+    /// region, with the ignored terminals that arrived among them spliced in where they arrived.
     fn push_call_events(&mut self, mut events: Events, out: &mut Events) {
         for event in events.drain() {
             if matches!(event, Event::ToolCallStart { .. }) {
                 self.calls += 1;
             }
+            let event = self.carried_into(event);
             out.push(self.tokens.relabel(event));
         }
+    }
+
+    /// `event` with the ignored terminals that arrived among the bytes it carries spliced into
+    /// its text, each where it arrived, and its bytes counted as carried out of the region.
+    fn carried_into(&mut self, mut event: Event) -> Event {
+        let Some(text) = event_text(&mut event) else {
+            return event;
+        };
+        if text.text.is_empty() {
+            return event;
+        }
+        let from = self.region.out;
+        let to = from + text.text.len();
+        self.region.out = to;
+        if self.region.carried.is_empty() {
+            return event;
+        }
+        let (within, after): (Vec<_>, Vec<_>) = std::mem::take(&mut self.region.carried)
+            .into_iter()
+            .partition(|(at, _)| *at <= to);
+        self.region.carried = after;
+        if within.is_empty() {
+            return event;
+        }
+        let bytes = std::mem::take(&mut text.text);
+        let mut spliced = String::with_capacity(bytes.len());
+        let mut done = 0;
+        for (at, marker) in within {
+            let mut cut = at.saturating_sub(from).clamp(done, bytes.len());
+            while !bytes.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            spliced.push_str(&bytes[done..cut]);
+            spliced.push_str(&marker);
+            done = cut;
+        }
+        spliced.push_str(&bytes[done..]);
+        text.text = spliced;
+        event
     }
 
     /// Where the prompt leaves the engine: the table's replay of it ([`Format::replayed`], which
@@ -903,7 +999,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        formats::{glm, qwen3},
+        formats::{glm, inkling, qwen3},
         tagged::{Placement, Spelling},
     };
 
@@ -1646,6 +1742,67 @@ mod tests {
             );
             assert_eq!(bytes(&events), output);
         }
+    }
+
+    #[test]
+    fn an_ignored_terminal_inside_a_held_call_keeps_its_place() {
+        // Inkling holds a message's header until the marker says what the message is; the turn's
+        // end token inside the header leaves after the bytes before it, not before them, and
+        // the call still reads. Where nothing is held it is dropped where it stands.
+        let prompt = "<|message_model|>";
+        let held = concat!(
+            "get_<|content_model_end_sampling|>weather<|content_invoke_tool_json|>",
+            "{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|>"
+        );
+        let whole = run_after(inkling(), prompt, held);
+        assert_eq!(bytes(&whole), held);
+        assert_eq!(
+            calls(&whole),
+            [(r#"{"city":"Paris"}"#.to_string(), Some("}".to_string()))]
+        );
+        let [_, _, wrapping, malformed] = kinds(&whole);
+        assert!(
+            wrapping.contains("<|content_model_end_sampling|>"),
+            "{whole:?}"
+        );
+        assert_eq!(malformed, "");
+        for cut in (1..held.len()).filter(|&cut| held.is_char_boundary(cut)) {
+            let mut engine = Engine::new(inkling(), declared());
+            let mut out = Events::new();
+            for input in [
+                Input::Prompt {
+                    token_ids: &[],
+                    text: prompt,
+                },
+                Input::Delta {
+                    token_ids: &[],
+                    text: &held[..cut],
+                    spans: &[],
+                },
+                Input::Delta {
+                    token_ids: &[],
+                    text: &held[cut..],
+                    spans: &[],
+                },
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+            ] {
+                engine.feed(input, &mut out).expect("in order");
+            }
+            let events = out.drain();
+            assert_eq!(bytes(&events), held, "cut at {cut}");
+            assert_eq!(calls(&events), calls(&whole), "cut at {cut}");
+        }
+        let unheld = "<|content_text|>Hi<|content_model_end_sampling|> there<|end_message|>";
+        let events = run_after(inkling(), prompt, unheld);
+        assert_eq!(bytes(&events), unheld);
+        let [content, _, wrapping, _] = kinds(&events);
+        assert_eq!(content, "Hi there");
+        assert_eq!(
+            wrapping,
+            "<|content_text|><|content_model_end_sampling|><|end_message|>"
+        );
     }
 
     #[test]

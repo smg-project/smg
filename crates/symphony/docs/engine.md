@@ -18,9 +18,12 @@ What the engine decides for every format, and what it leaves open:
   `</think>` in content is content. A terminal inside a code fence, or inside a string in a
   call's arguments, is a terminal, as for every parser that reads markers: `</tool_call>` in an
   argument's text ends the call there. Bellwether #16 is where that policy is judged.
-- A terminal the table ignores (MiniMax M3's separator token) is `Dropped { Wrapper }` wherever
-  it stands and moves nothing; inside a call the assembler accounts for it, so that its bytes
-  keep their place among the bytes the assembler holds.
+- A terminal the table ignores (MiniMax M3's separator token, Inkling's end-of-sampling token)
+  is `Dropped { Wrapper }` wherever it stands and moves nothing. Inside a call whose assembler
+  holds bytes (a header until its marker, a word until it is spelled) it is carried into the
+  source of the event that carries the bytes after it, so that its bytes keep their place; a
+  syntax that reads it as its own separator (M3's XML) acts on it and leaves the bytes to the
+  engine.
 - A call region that never closes is finished at the end of the stream: a call with what
   arrived, or the bytes as `Malformed { UnterminatedRegion }`. A region whose closing terminal
   comes before a complete call gives what is left as `Malformed` with a reason that says so,

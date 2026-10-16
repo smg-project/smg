@@ -87,7 +87,7 @@ What this table says beyond the DSML one:
 - **An ignored terminal.** The template writes `]<]minimax[>[` before `<tool_call>`, before
   every tag inside an invoke and before `</tool_call>`; it is one token, and it never stands
   inside prose. The table ignores it: the engine drops it in every state and moves nowhere,
-  and inside an invoke the assembler keeps its bytes in place.
+  and inside an invoke its bytes keep their place among the invoke's.
 - **The model writes the thought, or closes an empty one.** The template renders an assistant
   turn as `<mm:think>…</mm:think>` when it has reasoning and as `</mm:think>` alone when it has
   none, and its generation prompt adds nothing in its default mode (`thinking_mode` unset or
@@ -156,7 +156,8 @@ What the table says beyond the others:
   template's framing, dropped, and the object is the call. The call's end is the object's close;
   `<|end_message|>` is the message's, dropped.
 - **The turn's end token is ignored.** The template writes `<|content_model_end_sampling|>`
-  after the turn; an engine that passes it through has it dropped wherever it stands.
+  after the turn; an engine that passes it through has it dropped wherever it stands, inside
+  a message's header or its call included, where its bytes keep their place.
 - **A forced call's tag is the gateway's.** `Format::grammar` writes the tag the gateway's old
   Inkling parser hand-writes: the call marker triggers it inside whatever message the model is
   writing, the first one included, then `{"name":"NAME","args":`, the schema, `}` and
