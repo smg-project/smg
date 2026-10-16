@@ -52,6 +52,15 @@
 //! plans, each delta carrying its tokens' pieces as bellwether records them in `output_pieces`, and
 //! checks that every token is counted once, in the event that carries its first byte.
 //!
+//! A fourth test corrupts the recorded outputs: three seeded corruptions of every sampled case of
+//! every recorded model (a span deleted or doubled, one of the table's own markers or a cut one
+//! inserted, the tail cut, a character swapped), each read through the model's table after its
+//! prompt tail, whole, on two seeded plans and, up to 512 bytes, a character at a time. Nothing
+//! may panic, every byte must land in exactly one event with `Finish` last, and the message the
+//! chat adapter folds from the events must be the same however the output was cut; a panic is
+//! caught per output, so one run reports every breach with the case, the round and the corrupted
+//! output that replay it. The sample switch applies as above.
+//!
 //! What a replay prints, per model: the cases that differ from the reference and nothing allows
 //! (`DIFFERS`, up to [`SHOWN`] of them) and the summary line of its sets. The per-case report, one
 //! verdict line per case with the reason of a listed one, followed by the failures, goes to a file
@@ -2709,6 +2718,322 @@ fn read_fixtures(dir: &std::path::Path) -> Result<Cases, String> {
         }
     }
     Ok(Cases { fixtures, ids })
+}
+
+/// A seeded generator for the corruptions, the same sequence for a seed every run.
+struct Scramble(u64);
+
+impl Scramble {
+    fn new(seed: u64) -> Self {
+        Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+    }
+
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        self.0 >> 33
+    }
+
+    /// A number below `n`; zero when `n` is.
+    fn below(&mut self, n: usize) -> usize {
+        if n == 0 {
+            0
+        } else {
+            (self.next() as usize) % n
+        }
+    }
+}
+
+/// The seed of a case's corruption round: a hash of the case's id and the round, so that a case is
+/// corrupted the same way every run, whatever the sample around it.
+fn corruption_seed(id: &str, round: u64) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in id.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash ^ round.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+/// The pieces a corruption puts into a recorded output: the table's own terminals and the tags
+/// of its call syntax, each whole and cut short at either end and in the middle, and the
+/// delimiters every syntax has a use for.
+fn markers_of(format: &symphony::Format) -> Vec<String> {
+    let mut markers: Vec<String> = format.terminal_texts().map(str::to_string).collect();
+    if let Some(syntax) = format.call_syntax() {
+        markers.extend(syntax.tag_texts().into_iter().map(str::to_string));
+    }
+    let mut pieces = markers.clone();
+    for marker in &markers {
+        let chars: Vec<char> = marker.chars().collect();
+        if chars.len() >= 2 {
+            pieces.push(chars[..chars.len() / 2].iter().collect());
+            pieces.push(chars[..chars.len() - 1].iter().collect());
+            pieces.push(chars[1..].iter().collect());
+        }
+    }
+    pieces.extend(
+        [
+            "{", "}", "[", "]", "\"", "\\", ",", ":", "<", ">", "/", "\n", " ",
+        ]
+        .iter()
+        .map(|piece| piece.to_string()),
+    );
+    pieces
+}
+
+/// `text` with one to three seeded corruptions, each on character boundaries: a span deleted, a
+/// span doubled, a piece inserted, the tail cut, or a span swapped for one character.
+fn corrupted(random: &mut Scramble, text: &str, pieces: &[String]) -> String {
+    let mut text = text.to_string();
+    for _ in 0..1 + random.below(3) {
+        let bounds: Vec<usize> = text
+            .char_indices()
+            .map(|(at, _)| at)
+            .chain(std::iter::once(text.len()))
+            .collect();
+        let (a, b) = (
+            bounds[random.below(bounds.len())],
+            bounds[random.below(bounds.len())],
+        );
+        let (from, to) = (a.min(b), a.max(b));
+        text = match random.below(5) {
+            0 => format!("{}{}", &text[..from], &text[to..]),
+            1 => format!("{}{}{}", &text[..to], &text[from..to], &text[to..]),
+            2 => format!(
+                "{}{}{}",
+                &text[..from],
+                pieces[random.below(pieces.len())],
+                &text[from..]
+            ),
+            3 => text[..to].to_string(),
+            _ => {
+                let swapped = ['<', '>', '"', '\n', ' ', 'x', '}', ']', 'é', '🌧'];
+                format!(
+                    "{}{}{}",
+                    &text[..from],
+                    swapped[random.below(swapped.len())],
+                    &text[to..]
+                )
+            }
+        };
+    }
+    text
+}
+
+/// A seeded plan of cuts into `text`, each piece one to eight characters.
+fn seeded_cuts(random: &mut Scramble, text: &str) -> Vec<usize> {
+    let starts: Vec<usize> = text.char_indices().map(|(at, _)| at).collect();
+    let mut cuts = Vec::new();
+    let mut at = 0;
+    while at < starts.len() {
+        at += 1 + random.below(8);
+        if at < starts.len() {
+            cuts.push(starts[at]);
+        }
+    }
+    cuts
+}
+
+/// Whether the events carry every byte of `text` in order, with `Finish` last.
+fn conserved(text: &str, events: &[Event]) -> Result<(), String> {
+    let carried: String = events.iter().map(bytes_of).collect();
+    if carried != text {
+        return Err(format!("the events carry {carried:?}"));
+    }
+    if !matches!(events.last(), Some(Event::Finish { .. })) {
+        return Err("Finish is not last".to_string());
+    }
+    Ok(())
+}
+
+/// One corrupted output through a fresh engine from `new_engine`, after the prompt's `tail`:
+/// whole, on two seeded plans and, up to 512 bytes, a character at a time; the first breach of
+/// conservation, or of the message the chat adapter folds from the events, if any.
+fn check_corrupted(
+    new_engine: &dyn Fn() -> Engine,
+    tail: &str,
+    text: &str,
+    finish: &EngineFinish,
+    random: &mut Scramble,
+) -> Result<(), String> {
+    let whole = replay_after(&mut new_engine(), tail, text, &[], finish, false)
+        .map_err(|e| format!("whole: {e}"))?;
+    conserved(text, &whole).map_err(|e| format!("whole: {e}"))?;
+    let expected = Said::of(&whole);
+    let mut plans = vec![
+        ("seeded plan 1", seeded_cuts(random, text)),
+        ("seeded plan 2", seeded_cuts(random, text)),
+    ];
+    if text.len() <= 512 {
+        plans.push((
+            "character by character",
+            text.char_indices().map(|(at, _)| at).skip(1).collect(),
+        ));
+    }
+    for (name, cuts) in plans {
+        let events = replay_after(&mut new_engine(), tail, text, &cuts, finish, false)
+            .map_err(|e| format!("{name}: {e}"))?;
+        conserved(text, &events).map_err(|e| format!("{name} {cuts:?}: {e}"))?;
+        let said = Said::of(&events);
+        if said != expected {
+            return Err(format!(
+                "{name} {cuts:?} says something else:\n    whole: {expected:?}\n    cut:   {said:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The message of a panic, as `panic!` formatted it.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_else(|| "a panic without a message".to_string())
+}
+
+/// What corrupting the recorded outputs of one of [`MODELS`] gave.
+enum Corrupted {
+    Skipped(String),
+    Done {
+        slug: &'static str,
+        cases: usize,
+        outputs: usize,
+        failures: Vec<String>,
+    },
+}
+
+/// Three seeded corruptions of every sampled output of `slug`'s parse sets, each replayed through
+/// the model's table after its prompt tail ([`check_corrupted`]), a panic caught per output.
+#[expect(
+    clippy::panic,
+    reason = "a set that cannot be read ends the test with its path"
+)]
+fn corrupt_model(
+    root: &std::path::Path,
+    slug: &'static str,
+    family: Family,
+    prompt: GenerationPrompt,
+) -> Corrupted {
+    let dir = root.join(slug).join("parse");
+    if !dir.is_dir() {
+        return Corrupted::Skipped(format!(
+            "skipping {slug}: bellwether has not recorded its parse sets yet"
+        ));
+    }
+    let Cases { fixtures, .. } = read_fixtures(&dir).unwrap_or_else(|e| panic!("{e}"));
+    let pieces = markers_of(&family.table(slug));
+    let mut failures = Vec::new();
+    let mut outputs = 0;
+    for fixture in &fixtures {
+        let tail = prompt.tail(fixture, family);
+        let finish = engine_finish(&fixture.reference.finish_reason);
+        for round in 0..3u64 {
+            let mut random = Scramble::new(corruption_seed(&fixture.id, round));
+            let text = corrupted(&mut random, &fixture.reference.text, &pieces);
+            outputs += 1;
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                check_corrupted(
+                    &|| family.engine(slug, fixture),
+                    &tail,
+                    &text,
+                    &finish,
+                    &mut random,
+                )
+            }));
+            let failure = match outcome {
+                Ok(Ok(())) => continue,
+                Ok(Err(breach)) => breach,
+                Err(payload) => format!("PANIC: {}", panic_message(payload)),
+            };
+            failures.push(format!(
+                "{} round {round} ({family:?}, prompt tail {tail:?}, finish {finish:?}), \
+                 corrupted output {text:?}:\n  {failure}",
+                fixture.id
+            ));
+        }
+    }
+    Corrupted::Done {
+        slug,
+        cases: fixtures.len(),
+        outputs,
+        failures,
+    }
+}
+
+#[test]
+#[expect(
+    clippy::print_stderr,
+    clippy::print_stdout,
+    clippy::panic,
+    reason = "the skip notices and the per-model counts are test diagnostic output; a report that \
+              cannot be written ends the test with its path"
+)]
+fn corrupted_recorded_outputs_never_panic_and_keep_the_contract() {
+    let Some(root) = std::env::var_os(FIXTURES_ENV).map(PathBuf::from) else {
+        eprintln!(
+            "skipping: {FIXTURES_ENV} is not set; \
+             point it at the fixtures/ directory of a bellwether checkout"
+        );
+        return;
+    };
+    let (mut cases, mut outputs, mut recorded) = (0, 0, 0);
+    let mut failures = Vec::new();
+    let mut file = ReportFile::create("bellwether_parse_fixtures-corrupted.txt")
+        .unwrap_or_else(|e| panic!("{e}"));
+    in_order(
+        MODELS,
+        |&(slug, family, prompt)| corrupt_model(&root, slug, family, prompt),
+        |outcome| match outcome {
+            Corrupted::Skipped(notice) => eprintln!("{notice}"),
+            Corrupted::Done {
+                slug,
+                cases: of_model,
+                outputs: of_outputs,
+                failures: of_model_failures,
+            } => {
+                let line = format!(
+                    "{slug}: {of_outputs} corrupted outputs of {of_model} cases, {} breaches\n",
+                    of_model_failures.len()
+                );
+                print!("{line}");
+                file.write(&line);
+                cases += of_model;
+                outputs += of_outputs;
+                recorded += 1;
+                failures.extend(of_model_failures);
+            }
+        },
+    );
+    if recorded == 0 {
+        eprintln!(
+            "skipping: none of the table's slugs is recorded under {}",
+            root.display()
+        );
+    }
+    println!(
+        "{outputs} corrupted outputs of {cases} recorded cases of {recorded} models replayed{}",
+        sample_note(sample_every())
+    );
+    let path = file.finish(&failures).unwrap_or_else(|e| panic!("{e}"));
+    println!("per-model report and every breach: {}", path.display());
+    assert!(
+        failures.is_empty(),
+        "{} corrupted outputs broke the contract or panicked; the first {} (every one in {}):\n{}",
+        failures.len(),
+        failures.len().min(SHOWN),
+        path.display(),
+        failures
+            .iter()
+            .take(SHOWN)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }
 
 #[test]
