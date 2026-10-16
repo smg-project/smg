@@ -45,7 +45,7 @@ use openai_protocol::common::Tool;
 use serde_json::Value;
 
 use super::{
-    schema::{json_bytes, keyword, kind, shape, string_enum, Definitions},
+    schema::{keyword, kind, sent_bytes, shape, string_enum, Definitions},
     CallMarkers, Count, Grammar, Tag,
 };
 
@@ -71,18 +71,25 @@ const NODES: usize = 1024;
 /// 5,000-word enum reached by a thousand number leaves is written while it fits, not a thousand
 /// times. Each invoke's own, as [`NODES`] is, and spent in the schema's order.
 const LEAF_BYTES: usize = 256 * 1024;
+/// How many bytes the walks behind one invoke's number leaves may size, the refused walks counted
+/// too. A walk stops at what the leaves may still spell, but a leaf that is refused spends none of
+/// that, so a thousand distinct leaves at a definition just past the budget would each walk it to
+/// the end; past this allowance a number leaf with pointers is any text without a walk.
+const WALK_BYTES: usize = 4 * LEAF_BYTES;
 /// What an enum's word costs beyond its length: the alternative that spells it.
 const WORD_FRAMING: usize = 36;
 
 /// The elements one invoke may still write, how many of them are held for the properties after
-/// the one being written, at every level of the descent together, and the bytes its leaves may
-/// still spell.
+/// the one being written, at every level of the descent together, the bytes its leaves may still
+/// spell and the bytes the walks behind its number leaves may still size.
 struct Budget {
     nodes: usize,
     reserved: usize,
     leaf_bytes: usize,
-    /// The serialized size of each root definition a fragment reached, by the entry's address,
-    /// worked out once per invoke.
+    /// The bytes the walks behind the number leaves may still size, refused walks counted too.
+    walk_bytes: usize,
+    /// The size, as the engine gets it, of each number leaf and each root definition a fragment
+    /// reached, by the schema's address, worked out once per invoke.
     entry_bytes: HashMap<usize, usize>,
     /// What each number leaf's fragment costs, by the leaf schema's address: `None` for a leaf
     /// the budget refused, which it refuses again, the budget only shrinking.
@@ -97,6 +104,7 @@ impl Budget {
             nodes: NODES,
             reserved: 0,
             leaf_bytes: LEAF_BYTES,
+            walk_bytes: WALK_BYTES,
             entry_bytes: HashMap::new(),
             fragment_bytes: HashMap::new(),
             enum_bytes: HashMap::new(),
@@ -118,21 +126,21 @@ impl Budget {
     /// What a number leaf's fragment would cost, with the definitions its pointers reach, when
     /// that fits what the leaves may still spell ([`Definitions::reached_within`]); `None` when
     /// it does not. Worked out once per leaf schema per invoke: a leaf refused once is refused
-    /// again, the budget only shrinking.
+    /// again, the budget only shrinking. The walks, refused ones too, spend [`WALK_BYTES`] at the
+    /// pace of the bytes they size; past it a leaf is refused without a walk.
     fn fragment_cost(&mut self, schema: &Value, definitions: Definitions<'_>) -> Option<usize> {
         let key = std::ptr::from_ref(schema) as usize;
         if let Some(known) = self.fragment_bytes.get(&key) {
             return known.filter(|cost| *cost <= self.leaf_bytes);
         }
-        let limit = self.leaf_bytes;
+        let limit = self.leaf_bytes.min(self.walk_bytes);
         let mut entry_bytes = std::mem::take(&mut self.entry_bytes);
-        let found = definitions
-            .reached_within(schema, limit, |entry| {
-                let key = std::ptr::from_ref(entry) as usize;
-                *entry_bytes.entry(key).or_insert_with(|| json_bytes(entry))
-            })
-            .map(|(cost, _)| cost);
+        let found = definitions.reached_within(schema, limit, |sized| {
+            let key = std::ptr::from_ref(sized) as usize;
+            *entry_bytes.entry(key).or_insert_with(|| sent_bytes(sized))
+        });
         self.entry_bytes = entry_bytes;
+        self.walk_bytes = self.walk_bytes.saturating_sub(found.unwrap_or(limit));
         self.fragment_bytes.insert(key, found);
         found
     }
@@ -1139,6 +1147,45 @@ mod tests {
         assert!(
             took.as_secs() < 5,
             "bounded and remembered per leaf: {took:?}"
+        );
+    }
+
+    #[test]
+    fn distinct_leaves_at_a_hub_past_the_budget_stop_walking() {
+        // A hub of 6,300 one-word definitions whose closure sits just past the byte budget,
+        // reached by 1,024 number leaves written inline, each its own schema: a refused walk
+        // spends none of the leaves' budget, so the walks have an allowance of their own, and
+        // the leaves after it are any text without a walk.
+        let mut defs = serde_json::Map::new();
+        let branches: Vec<Value> = (0..6300)
+            .map(|i| {
+                defs.insert(format!("d{i:05}"), value!({"type": "string"}));
+                value!({"$ref": format!("#/$defs/d{i:05}")})
+            })
+            .collect();
+        defs.insert("Hub".to_string(), value!({"anyOf": branches}));
+        let root: serde_json::Map<String, Value> = (0..1024)
+            .map(|i| {
+                (
+                    format!("n{i:04}"),
+                    value!({"type": "number", "not": {"$ref": "#/$defs/Hub"}}),
+                )
+            })
+            .collect();
+        let required: Vec<String> = root.keys().cloned().collect();
+        let started = std::time::Instant::now();
+        let invoke = first_invoke(&[tool(
+            "t",
+            value!({"type": "object", "$defs": defs, "properties": root, "required": required}),
+        )]);
+        let took = started.elapsed();
+        let payload = invoke.to_string();
+        assert!(payload.len() < 400_000, "{} bytes", payload.len());
+        assert_eq!(elements_written(&invoke), 1024);
+        assert!(fragments(&invoke).is_empty());
+        assert!(
+            took.as_secs() < 5,
+            "an allowance bounds the refused walks: {took:?}"
         );
     }
 

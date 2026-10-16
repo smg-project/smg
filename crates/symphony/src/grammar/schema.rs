@@ -206,9 +206,6 @@ pub(super) fn shape(
     Some((kind, grammar))
 }
 
-/// A definition a schema reaches: its block (`$defs` or `definitions`), its name and the entry.
-pub(super) type Reached<'a> = (&'static str, &'a str, &'a Value);
-
 /// The definitions at the root of a tool's schema, `$defs` and `definitions`. Each property's
 /// schema goes to the engine as a document of its own, and a `$ref` such as `#/$defs/Node` points
 /// from the root of the document it stands in, so the definitions travel with the property's
@@ -312,11 +309,7 @@ impl<'a> Definitions<'a> {
             };
             let entries: Vec<(&String, Value)> = entries
                 .iter()
-                .filter(|(key, _)| {
-                    reached.iter().any(|(block, reached_key, _)| {
-                        *block == name && *reached_key == key.as_str()
-                    })
-                })
+                .filter(|(key, _)| reached.contains(&(name, key.as_str())))
                 .map(|(key, value)| (key, without_annotations(value)))
                 .collect();
             if entries.is_empty() {
@@ -341,42 +334,38 @@ impl<'a> Definitions<'a> {
     }
 
     /// The root's definitions the pointers in `schema` reach, directly or through one another:
-    /// each as its block (`$defs` or `definitions`), its name, the first segment after the block,
-    /// since a pointer deeper into an entry needs the whole entry, and the entry itself, for a
-    /// writer that counts a fragment's bytes before it is attached.
-    pub(super) fn reached_from(self, schema: &Value) -> Vec<Reached<'a>> {
-        let mut reached: Vec<Reached<'a>> = Vec::new();
-        let mut seen: HashSet<(&'static str, &'a str)> = HashSet::new();
+    /// each as its block (`$defs` or `definitions`) and its name, the first segment after the
+    /// block, since a pointer deeper into an entry needs the whole entry.
+    fn reached_from(self, schema: &Value) -> HashSet<(&'static str, &'a str)> {
+        let mut reached: HashSet<(&'static str, &'a str)> = HashSet::new();
         let mut pending: Vec<&Value> = vec![schema];
         while let Some(node) = pending.pop() {
             for pointer in local_pointers(node) {
                 let Some((block, name, entry)) = self.entry_of(pointer) else {
                     continue;
                 };
-                if !seen.insert((block, name)) {
-                    continue;
+                if reached.insert((block, name)) {
+                    pending.push(entry);
                 }
-                reached.push((block, name, entry));
-                pending.push(entry);
             }
         }
         reached
     }
 
-    /// [`Self::reached_from`] with the bytes the fragment would cost (the leaf's schema with the
-    /// entries reached, each sized by `size`), within `limit`: `None` as soon as the running
-    /// count passes it, so a leaf a budget refuses costs the walk up to the budget and no more.
+    /// What a fragment of `schema` would cost, the leaf's schema and the entries
+    /// [`Self::reached_from`] finds each sized by `size`, within `limit`: `None` as soon as the
+    /// running count passes it, so a leaf a budget refuses costs the walk up to the budget and no
+    /// more.
     pub(super) fn reached_within(
         self,
         schema: &Value,
         limit: usize,
-        mut size: impl FnMut(&'a Value) -> usize,
-    ) -> Option<(usize, Vec<Reached<'a>>)> {
-        let mut cost = json_bytes(schema);
+        mut size: impl FnMut(&Value) -> usize,
+    ) -> Option<usize> {
+        let mut cost = size(schema);
         if cost > limit {
             return None;
         }
-        let mut reached: Vec<Reached<'a>> = Vec::new();
         let mut seen: HashSet<(&'static str, &'a str)> = HashSet::new();
         let mut pending: Vec<&Value> = vec![schema];
         while let Some(node) = pending.pop() {
@@ -391,16 +380,15 @@ impl<'a> Definitions<'a> {
                 if cost > limit {
                     return None;
                 }
-                reached.push((block, name, entry));
                 pending.push(entry);
             }
         }
-        Some((cost, reached))
+        Some(cost)
     }
 
     /// The block, the entry name and the entry a local pointer names, with the pointer's escapes
     /// undone (`~1` for `/`, `~0` for `~`), so an entry named `a/b` is followed by its name.
-    fn entry_of(self, pointer: &str) -> Option<Reached<'a>> {
+    fn entry_of(self, pointer: &str) -> Option<(&'static str, &'a str, &'a Value)> {
         let mut segments = pointer.strip_prefix("#/")?.split('/');
         let (block, entries) = match segments.next()? {
             "$defs" => ("$defs", self.defs?),
@@ -512,9 +500,15 @@ fn collect_local_pointers<'v>(schema: &'v Value, pointers: &mut Vec<&'v str>) {
     }
 }
 
-/// About how many bytes `value` takes serialized, the escapes counted: what a leaf costs an
-/// invoke's byte budget before it is written.
-pub(super) fn json_bytes(value: &Value) -> usize {
+/// About how many bytes `schema` takes as the engine gets it, its annotations dropped
+/// ([`json_bytes`] of [`without_annotations`]): what a number leaf, or a definition it reaches,
+/// costs an invoke's byte budget before it is written.
+pub(super) fn sent_bytes(schema: &Value) -> usize {
+    json_bytes(&without_annotations(schema))
+}
+
+/// About how many bytes `value` takes serialized, the escapes counted.
+fn json_bytes(value: &Value) -> usize {
     match value {
         Value::Null => 4,
         Value::Bool(flag) => {
