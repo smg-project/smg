@@ -21,7 +21,13 @@
 //!
 //! Every slice the stage emits, text or tool-call arguments, is shown to a
 //! [`DeltaObserver`] first, in the pieces the client will see and on both
-//! relays. The default, [`NoopObserver`], sees everything and never objects.
+//! relays. What the stage forwards whole passes the observer by: events with
+//! several choices or a later choice index (the stream is forwarded as it
+//! came from there on), events carrying `logprobs` or other choice-level
+//! metadata, frames after `[DONE]` or larger than `MAX_FRAME_BYTES`, and
+//! malformed frames; and the relays build the stage only for the streams
+//! whose provider profile asks for re-slicing. The default, [`NoopObserver`],
+//! sees every slice and never objects.
 //! An observer that answers [`Verdict::Terminate`] ends the stream in its
 //! place: the slice and the text still buffered are dropped, the gateway's
 //! error event goes out on a frame of its own, and nothing follows it, not
@@ -114,8 +120,12 @@ pub trait DeltaObserver {
     /// [`Verdict::Terminate`] withholds it and ends the stream.
     fn on_slice(&mut self, slice: DeltaSlice<'_>) -> Verdict;
 
-    /// The stream ended after its last slice: once, unless the observer
-    /// ended the stream itself.
+    /// The stream ended after its last slice: once, from the stage's
+    /// `finish`, which the relays call at the upstream's end and after an
+    /// upstream error alike. Not called when the observer ended the stream
+    /// itself, nor when the client left first: the relays drop the stage
+    /// then, without `finish`. An observer that must settle something per
+    /// stream does it in its own `Drop`.
     fn end(&mut self) {}
 }
 
@@ -1162,7 +1172,12 @@ where
                         if tail.is_empty() {
                             return Some((Err(err), st));
                         }
-                        st.deferred = Some(err);
+                        // A veto on the tail ends the stream with the policy's
+                        // error frame: the upstream's error is not yielded
+                        // after it, or the body would end as an aborted one.
+                        if st.rechunker.stopped().is_none() {
+                            st.deferred = Some(err);
+                        }
                         return Some((Ok(tail), st));
                     }
                     None => {
@@ -1874,6 +1889,18 @@ mod tests {
         let tail = out.next().await.unwrap().unwrap();
         assert_eq!(contents(&[tail]), vec!["ab"]);
         assert!(out.next().await.unwrap().is_err());
+        assert!(out.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_adapter_ends_cleanly_when_the_veto_lands_on_the_tail() {
+        // The upstream errors with text still held; the observer vetoes the
+        // tail's slice, so the policy's error frame is the last thing the
+        // client sees and the upstream's error is not yielded after it.
+        let upstream = stream::iter(vec![Ok(chunk("ab")), Err(io::Error::other("boom"))]);
+        let mut out = Box::pin(rechunk_stream(upstream, Watcher::vetoing_after(0)));
+        let frame = out.next().await.unwrap().unwrap();
+        assert_eq!(frame.as_ref(), POLICY_ERROR_FRAME.as_bytes());
         assert!(out.next().await.is_none());
     }
 
