@@ -15,6 +15,12 @@
 //! </｜DSML｜tool_calls><｜end▁of▁sentence｜>
 //! ```
 //!
+//! The template writes `<｜Assistant｜>` and the thought's opener (`<think>`, or `</think>` in chat
+//! mode) after a user message only: a conversation that ends with a system message rendered in
+//! place leaves the turn unopened, and the model, which thinks unless told not to, starts inside
+//! its thought. The table starts there too (the unopened row, `<｜end▁of▁sentence｜>` ending a turn
+//! the model wrote), so `</think>` closes the thought instead of reaching the content.
+//!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
 use crate::{
@@ -46,6 +52,7 @@ pub fn deepseek_v4() -> Format {
         .transition("calls", "calls_close", "content")
         .calls(CallSyntax::Attributed(Tags::DSML_V4))
         .opens_turn("<｜Assistant｜>")
+        .unopened_turn_starts_in("reasoning", "<｜end▁of▁sentence｜>")
 }
 
 #[cfg(test)]
@@ -274,7 +281,7 @@ mod tests {
             "is</｜DSML｜parameter>\n<｜DSML｜parameter name=\"n\" string=\"false\">1",
             "2</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
         ];
-        let events = run("<think>", &pieces);
+        let events = run("<｜Assistant｜><think>", &pieces);
         let fragments: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
@@ -291,7 +298,10 @@ mod tests {
 
     #[test]
     fn every_chunking_says_the_same_and_accounts_for_every_byte() {
-        for (prompt, output) in [("<think>", OUTPUT), ("</think>", ANSWER)] {
+        for (prompt, output) in [
+            ("<｜Assistant｜><think>", OUTPUT),
+            ("<｜Assistant｜></think>", ANSWER),
+        ] {
             let whole = run(prompt, &[output]);
             let whole_arguments = arguments_of(&whole, 0);
             let whole_content = content_of(&whole);
@@ -347,7 +357,7 @@ mod tests {
             "<｜DSML｜parameter name=\"a\" string=\"true\">x</｜DSML｜parameter>\n",
             "</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
         );
-        let events = run("<think>", &[output]);
+        let events = run("<｜Assistant｜><think>", &[output]);
         assert_eq!(bytes(&events), output);
         assert_eq!(
             events[..4],
@@ -366,7 +376,7 @@ mod tests {
         ));
         // Closed first, as the encoder renders it, the same block is the same call.
         let closed = format!("Let me call.</think>{}", &output["Let me call.".len()..]);
-        let events = run("<think>", &[&closed]);
+        let events = run("<｜Assistant｜><think>", &[&closed]);
         assert_eq!(reasoning_of(&events), "Let me call.");
         assert_eq!(calls_of(&events), [(0, "f".to_string())]);
         assert_eq!(arguments_of(&events, 0), r#"{"a": "x"}"#);
@@ -379,7 +389,7 @@ mod tests {
             "<｜DSML｜parameter name=\"a\" string=\"true\">x</｜DSML｜parameter>\n",
             "</｜DSML｜tool_calls>\nThe weather is sunny."
         );
-        let events = run("<think>", &[output]);
+        let events = run("<｜Assistant｜><think>", &[output]);
         assert_eq!(bytes(&events), output);
         assert_eq!(arguments_of(&events, 0), r#"{"a": "x"}"#);
         // The newline between `</think>` and the block is the template's spacing, dropped; the
@@ -494,7 +504,7 @@ mod tests {
             "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"f\">\n</｜DSML｜invoke>\n",
             "<｜DSML｜invoke name=\"g\">\n<｜DSML｜invoke name=\"h\">\n</｜DSML｜tool_calls>"
         );
-        let events = run("<think>\n\n</think>\n\n", &[output]);
+        let events = run("<｜Assistant｜></think>", &[output]);
         assert_eq!(bytes(&events), output);
         assert_eq!(
             calls_of(&events),
@@ -571,6 +581,162 @@ mod tests {
         }
     }
 
+    /// The prompt the family's template renders for a conversation that ends with a system
+    /// message, as a coding agent's client sends one (its environment notes after the user turn):
+    /// the template writes the turn opener after a user message only, so the prompt opens no turn,
+    /// and the model starts inside its thought as it would after `<｜Assistant｜><think>`.
+    const TRAILING_SYSTEM_PROMPT: &str = concat!(
+        "<｜begin▁of▁sentence｜>You are a coding assistant. Be brief.",
+        "<｜User｜>The test suite has a failing test. Find the bug under src/ and fix it.",
+        "# Environment\nYou have been invoked in the following environment:\n",
+        " - Platform: linux\n\nToday's date is 2026-10-16."
+    );
+
+    /// The same client's later request: the environment notes after the first user turn, the
+    /// model's turn after them, the tool's result as the template merges it into a user turn, and
+    /// a note after that, with `</think>` quoted in the result. The template wrote no opener before
+    /// the model's earlier turn either (a system message came before it), so the prompt holds none.
+    const AGENT_LATER_TURN_PROMPT: &str = concat!(
+        "<｜begin▁of▁sentence｜>You are a coding assistant. Be brief.",
+        "<｜User｜>Fix the failing test.# Environment\n - Platform: linux\n",
+        "Run the suite first.</think>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"run\">\n",
+        "<｜DSML｜parameter name=\"command\" string=\"true\">pytest -q</｜DSML｜parameter>\n",
+        "</｜DSML｜invoke>\n</｜DSML｜tool_calls><｜end▁of▁sentence｜>",
+        "<｜User｜><tool_result>FAILED tests/test_versions.py::test_parse - ",
+        "the fixture says </think> here</tool_result>",
+        "<total_tokens>10000 tokens left</total_tokens>"
+    );
+
+    /// What the turn said: the reasoning, the content, and the first call's arguments.
+    fn said(events: &[Event]) -> (String, String, String) {
+        (
+            reasoning_of(events),
+            content_of(events),
+            arguments_of(events, 0),
+        )
+    }
+
+    #[test]
+    fn a_conversation_that_ends_with_a_system_message_starts_the_output_inside_the_thought() {
+        let (thought, after) = OUTPUT.split_once("</think>").expect("the thought's close");
+        // The thought's close alone, then the calls block: an empty thought and no content, the
+        // close never reaching the content.
+        let events = run(TRAILING_SYSTEM_PROMPT, &["</think>", after]);
+        assert_eq!(events[0], Event::ReasoningStart);
+        assert!(events.contains(&Event::ReasoningEnd), "{events:?}");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Content(_))),
+            "{events:?}"
+        );
+        assert_eq!(reasoning_of(&events), "");
+        assert_eq!(content_of(&events), "");
+        assert_eq!(calls_of(&events), [(0, "get_weather".to_string())]);
+        assert_eq!(bytes(&events), format!("</think>{after}"));
+        // The thought, then the calls: read as after `<｜Assistant｜><think>`.
+        let events = run(TRAILING_SYSTEM_PROMPT, &[OUTPUT]);
+        assert_eq!(events[0], Event::ReasoningStart);
+        assert_eq!(
+            said(&events),
+            said(&run("<｜User｜>q<｜Assistant｜><think>", &[OUTPUT]))
+        );
+        assert_eq!(reasoning_of(&events), thought);
+        assert_eq!(content_of(&events), "");
+        assert_eq!(calls_of(&events), [(0, "get_weather".to_string())]);
+        // Content after the thought.
+        let events = run(
+            TRAILING_SYSTEM_PROMPT,
+            &["The notes are context.</think>Running the suite."],
+        );
+        assert_eq!(reasoning_of(&events), "The notes are context.");
+        assert_eq!(content_of(&events), "Running the suite.");
+    }
+
+    #[test]
+    fn a_later_turn_whose_prompt_opens_no_turn_starts_inside_the_thought_too() {
+        let (thought, _) = OUTPUT.split_once("</think>").expect("the thought's close");
+        // The earlier turn's `</think>` and calls block, and the `</think>` quoted in the tool's
+        // result, move nothing: the prompt opens no turn, and nothing of it is replayed.
+        let events = run(AGENT_LATER_TURN_PROMPT, &[OUTPUT]);
+        assert_eq!(events[0], Event::ReasoningStart);
+        assert_eq!(reasoning_of(&events), thought);
+        assert_eq!(content_of(&events), "");
+        assert_eq!(calls_of(&events), [(0, "get_weather".to_string())]);
+        // An earlier turn the template opened, then a user turn and a system note: the turn's end
+        // after the last opener says the prompt opens no turn for the model.
+        let prompt = concat!(
+            "<｜User｜>u1<｜Assistant｜><think>r1</think>a1<｜end▁of▁sentence｜>",
+            "<｜User｜>u2# Environment\n - Platform: linux"
+        );
+        let events = run(prompt, &["r2</think>a2"]);
+        assert_eq!(events[0], Event::ReasoningStart);
+        assert_eq!(reasoning_of(&events), "r2");
+        assert_eq!(content_of(&events), "a2");
+        // The model's own turn continued without its end is a prefill the output goes on with.
+        let events = run("<｜User｜>u<｜Assistant｜></think>Sure,", &[" here it is."]);
+        assert!(!events.contains(&Event::ReasoningStart), "{events:?}");
+        assert_eq!(content_of(&events), " here it is.");
+    }
+
+    #[test]
+    fn an_unopened_turn_reads_the_same_whole_at_every_byte_and_in_a_tokenizers_pieces() {
+        let whole = said(&run(TRAILING_SYSTEM_PROMPT, &[OUTPUT]));
+        for cut in 1..OUTPUT.len() {
+            if !OUTPUT.is_char_boundary(cut) {
+                continue;
+            }
+            let events = run(TRAILING_SYSTEM_PROMPT, &[&OUTPUT[..cut], &OUTPUT[cut..]]);
+            assert_eq!(bytes(&events), OUTPUT, "cut at {cut}");
+            assert_eq!(said(&events), whole, "cut at {cut}");
+            assert!(
+                matches!(events.last(), Some(Event::Finish { tool_calls: 1, .. })),
+                "cut at {cut}"
+            );
+        }
+        let per_char: Vec<&str> = OUTPUT
+            .char_indices()
+            .map(|(i, c)| &OUTPUT[i..i + c.len_utf8()])
+            .collect();
+        let (thought, block) = OUTPUT.split_once("</think>").expect("the thought's close");
+        let mut tokens = vec![thought, "</think>", "\n\n"];
+        tokens.extend(block["\n\n".len()..].split_inclusive('\n'));
+        for pieces in [per_char, tokens] {
+            let events = run(TRAILING_SYSTEM_PROMPT, &pieces);
+            assert_eq!(bytes(&events), OUTPUT, "{pieces:?}");
+            assert_eq!(said(&events), whole, "{pieces:?}");
+        }
+    }
+
+    #[test]
+    fn the_chat_and_messages_adapters_keep_an_unopened_turns_thought_out_of_the_content() {
+        use crate::adapt::{chat, messages};
+        let (thought, after) = OUTPUT.split_once("</think>").expect("the thought's close");
+        let kinds = |events: &[Event]| -> Vec<String> {
+            let blocks = serde_json::to_value(messages::output(events).content).expect("blocks");
+            blocks
+                .as_array()
+                .expect("an array")
+                .iter()
+                .map(|block| block["type"].as_str().unwrap_or("").to_string())
+                .collect()
+        };
+        // The Messages API: a thinking block and the call, never a text block with the close.
+        let events = run(TRAILING_SYSTEM_PROMPT, &[OUTPUT]);
+        assert_eq!(kinds(&events), ["thinking", "tool_use"]);
+        let blocks = serde_json::to_value(messages::output(&events).content).expect("blocks");
+        assert_eq!(blocks[0]["thinking"], thought);
+        // An empty thought is no block at all.
+        let events = run(TRAILING_SYSTEM_PROMPT, &["</think>", after]);
+        assert_eq!(kinds(&events), ["tool_use"]);
+        // Chat completions: the thought in `reasoning_content`, no content.
+        let events = run(TRAILING_SYSTEM_PROMPT, &[OUTPUT]);
+        let choice = chat::message(0, &events);
+        assert_eq!(choice.message.reasoning_content.as_deref(), Some(thought));
+        assert_eq!(choice.message.content, None);
+        assert_eq!(choice.message.tool_calls.as_ref().map(Vec::len), Some(1));
+    }
+
     #[test]
     fn the_spaced_spelling_of_the_later_checkpoint_is_content_here() {
         // The registry reads each checkpoint with its own table; under this one the spaced tags
@@ -580,7 +746,7 @@ mod tests {
             "<｜DSML｜ parameter name=\"a\" string=\"true\">x</｜DSML｜ parameter>\n",
             "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
         );
-        let events = run("<think>", &[output]);
+        let events = run("<｜Assistant｜><think>", &[output]);
         assert_eq!(bytes(&events), output);
         assert!(calls_of(&events).is_empty());
         assert_eq!(content_of(&events), &output["</think>".len()..]);

@@ -62,7 +62,19 @@ V4.1's, and the registry reads each checkpoint with its own. Beyond that:
   content, the model's own (the legacy parser trims them; bellwether #17's question, as for Qwen3).
   The family's reference parser is the one that looks for the block after the two newlines. The prompt ends with `<think>` in thinking mode and with `</think>` right after
   `<｜Assistant｜>` in chat mode, so the replay starts the output inside the thought or in the content;
-  bellwether has not recorded the group's set yet. The table is pinned against the turns the
+  bellwether has not recorded the group's set yet.
+- **A turn the prompt leaves unopened starts inside the thought.** The template writes
+  `<｜Assistant｜>` and the thought's opener after a user message only: a conversation that ends with
+  a system message rendered in place (a coding agent's environment notes after the user turn, and
+  after every tool result) has no opener for the model's turn, and the model, which thinks unless
+  told not to, writes its thought and `</think>` as it would after `<｜Assistant｜><think>`. The table
+  names the thought as the state an unopened turn starts in, with `<｜end▁of▁sentence｜>` as the end of
+  a turn the model wrote: a prompt with no opener, or whose last opener's turn ended, starts the
+  output in the thought, and nothing of it is replayed (an earlier turn's markers and a `</think>`
+  quoted in a tool result move nothing). The legacy reasoning parser for this checkpoint starts
+  inside the thought whenever the request leaves thinking on, whatever the prompt; the two agree
+  on this shape. The V4.1 template opens the turn after a mid-conversation system message too, so
+  its table meets no unopened turn. The table is pinned against the turns the
   family's reference encoder (the model repository's `encoding` module) renders for a tool-calling
   conversation, each read as the encoder's own parser reads it: every kind of value, two invokes in
   one block, a call after content, and an invoke with no parameters, which the encoder writes with

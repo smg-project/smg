@@ -93,6 +93,16 @@
 //! anchor; when the prompt leaves nothing to replay, it is the output's. A turn an anchor started
 //! in a state of its own has no start to choose.
 //!
+//! An **unopened row** names the state a turn starts in when the prompt opens no turn for the
+//! model. A template that writes the turn opener after a user message only (DeepSeek's) leaves
+//! the turn unopened when the conversation ends with a system message rendered in place, and the
+//! model starts its turn as its default has it: DeepSeek inside its thought. The prompt opens no
+//! turn when it holds no turn opener, or when the turn's end the row names (`<｜end▁of▁sentence｜>`)
+//! follows the last one: the turn it opened is over, and nothing opened the next. Nothing of such
+//! a prompt is replayed: what it holds is other roles' text, whose markers move nothing, as a
+//! marker quoted in an earlier turn moves nothing. An empty prompt is no prompt, and leaves the
+//! output in the first state.
+//!
 //! The table holds what is static about a format. What belongs to one request, the tools that
 //! type a tagged call's values, reaches the [`Engine`] with the request, not the table.
 //!
@@ -251,6 +261,9 @@ pub struct Format {
     anchors: Vec<Anchor>,
     /// The state a turn starts in when it does not start with a terminal.
     start: Option<usize>,
+    /// The state a turn starts in when the prompt opens no turn for the model, and the text that
+    /// ends a turn the model wrote in the prompt.
+    unopened: Option<Unopened>,
     structural_tokens: Vec<String>,
     /// The texts of the tokens the engine stops on that are terminals.
     stop_tokens: Vec<String>,
@@ -310,6 +323,15 @@ struct Anchor {
     state: usize,
 }
 
+/// The unopened row: the state the output starts in when the prompt opens no turn for the model,
+/// and the text that ends a turn the model wrote in the prompt, after which the turn opener would
+/// have to be written again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Unopened {
+    state: usize,
+    end: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Transition {
     from: usize,
@@ -339,6 +361,7 @@ impl Format {
             turn_opener: None,
             anchors: Vec::new(),
             start: None,
+            unopened: None,
             structural_tokens: Vec::new(),
             stop_tokens: Vec::new(),
             values: Values::Inferred,
@@ -551,6 +574,23 @@ impl Format {
     /// The state the start row names, if the table has one.
     pub(crate) fn start(&self) -> Option<usize> {
         self.start
+    }
+
+    /// The state a turn starts in when the prompt opens no turn for the model (see the unopened
+    /// row in [`crate::format`]): the prompt holds no turn opener, or `turn_end`, the text that
+    /// ends a turn the model wrote in the prompt (`<｜end▁of▁sentence｜>`), follows the last one.
+    /// DeepSeek's template writes the turn opener after a user message only, so a conversation
+    /// that ends with a system message rendered in place leaves the turn unopened, and the model,
+    /// which thinks unless told not to, starts inside its thought. Nothing of such a prompt is
+    /// replayed. The state must already be in the table; the table must name a turn opener.
+    #[must_use]
+    pub fn unopened_turn_starts_in(mut self, state: &str, turn_end: &str) -> Self {
+        let state = self.state_named(state);
+        self.unopened = Some(Unopened {
+            state,
+            end: turn_end.to_string(),
+        });
+        self
     }
 
     /// The template writes the thought before every call and answer it renders: a property of the
@@ -852,9 +892,18 @@ impl Format {
     /// the turn starts in, the turn's first piece deciding its start where the table has a start
     /// row ([`Self::opening`]), a terminal the table ignores, or one with no row from where the
     /// walk stands, moving nothing; and the stay the output continues. A call the prompt left
-    /// open is not entered: the walk rests where the turn started. The engine starts the output
-    /// where this leaves it, and [`Self::reasoning_open`] reads the same walk.
+    /// open is not entered: the walk rests where the turn started. A prompt that opens no turn
+    /// for the model, where the table has an unopened row ([`Self::unopened_turn`]), is not
+    /// replayed: the output starts in the row's state, with nothing begun. The engine starts the
+    /// output where this leaves it, and [`Self::reasoning_open`] reads the same walk.
     pub(crate) fn replayed(&self, prompt: &str) -> Replay {
+        if let Some(state) = self.unopened_turn(prompt) {
+            return Replay {
+                state,
+                at_turn_start: false,
+                begun: false,
+            };
+        }
         let (turn, start) = self.turn(prompt);
         // The turn opener's own bytes, where the replay begins with them: the template's framing,
         // not text of the stay.
@@ -904,6 +953,22 @@ impl Format {
             at_turn_start,
             begun,
         }
+    }
+
+    /// The state the unopened row names where `prompt` opens no turn for the model: the prompt is
+    /// not empty and holds no turn opener, or the turn's end follows its last opener. `None` for a
+    /// table without the row, and for a prompt that opens the turn, whose last opener is followed
+    /// by the template's framing or the model's own text and no turn end.
+    fn unopened_turn(&self, prompt: &str) -> Option<usize> {
+        let unopened = self.unopened.as_ref()?;
+        if prompt.is_empty() {
+            return None;
+        }
+        let opener = self.turn_opener()?;
+        let opened = prompt
+            .rfind(opener)
+            .is_some_and(|at| !prompt[at + opener.len()..].contains(unopened.end.as_str()));
+        (!opened).then_some(unopened.state)
     }
 
     /// The state `prompt` leaves the table in ([`Self::replayed`]): where the engine starts the
@@ -1053,10 +1118,11 @@ impl Format {
     /// its call opened by the engine), a call syntax when a state emits arguments, a text for
     /// every terminal, a turn opener and turn anchors that are not empty and not both named, a
     /// start row only where a turn's first byte is read from the first state and no opener replays
-    /// it, a stop row only for an arguments state, a framing row only for a state of content or
-    /// wrapping, a trim row only for a state of content or reasoning that is not framing, a kept
-    /// row only for a content state that is neither framing nor trimmed, a thought when the table
-    /// thinks first, and, for a shaped call, a shape a stream can run,
+    /// it, an unopened row only with a turn opener, a turn end that is not empty and a state that
+    /// holds no call, a stop row only for an arguments state, a framing row only for a state of
+    /// content or wrapping, a trim row only for a state of content or reasoning that is not
+    /// framing, a kept row only for a content state that is neither framing nor trimmed, a thought
+    /// when the table thinks first, and, for a shaped call, a shape a stream can run,
     /// opened only through its terminal (the turn does not start in its state), no terminal the
     /// table ignores, and, when its header is not empty, no row into its state from a state that
     /// holds a call. The builder keeps a row from naming what the table lacks; this checks the
@@ -1116,6 +1182,27 @@ impl Format {
                 return Err(format!(
                     "format {}: a start row needs the turn's start, which a turn opener replays",
                     self.name
+                ));
+            }
+        }
+        if let Some(unopened) = &self.unopened {
+            if self.turn_opener.is_none() {
+                return Err(format!(
+                    "format {}: an unopened row needs a turn opener, whose absence leaves the \
+                     turn unopened",
+                    self.name
+                ));
+            }
+            if unopened.end.is_empty() {
+                return Err(format!(
+                    "format {}: an unopened row with an empty turn end",
+                    self.name
+                ));
+            }
+            if self.states[unopened.state].emits == Emits::Arguments {
+                return Err(format!(
+                    "format {}: an unopened turn starts in {:?}, which holds a call",
+                    self.name, self.states[unopened.state].name
                 ));
             }
         }
@@ -1771,6 +1858,138 @@ mod tests {
         );
         assert_eq!(format.turn("<|im_start|>assistant\n<think>"), ("", 1));
         assert_eq!(format.turn("<|im_start|>assistant\n<think>x"), ("x", 1));
+    }
+
+    /// A table whose template writes the turn opener after a user message only: the thought is
+    /// where an unopened turn starts, and `<|end|>` ends a turn the model wrote.
+    fn opened_after_a_user_only() -> Format {
+        two_states()
+            .opens_turn("<|assistant|>")
+            .unopened_turn_starts_in("inside", "<|end|>")
+    }
+
+    #[test]
+    fn a_prompt_that_opens_no_turn_starts_the_output_where_the_unopened_row_says() {
+        let format = opened_after_a_user_only();
+        assert!(format.validate().is_ok());
+        let unopened = Replay {
+            state: 1,
+            at_turn_start: false,
+            begun: false,
+        };
+        // No turn opener at all: the row's state, nothing replayed, a marker in the text included.
+        assert_eq!(format.replayed("User: hi\nSystem: notes"), unopened);
+        assert_eq!(format.replayed("User: why </a> there?"), unopened);
+        // The last opener's turn ended and other roles' text followed: the same.
+        assert_eq!(
+            format.replayed("<|assistant|><a>t</a>answer<|end|>User: more</a>"),
+            unopened
+        );
+        assert!(format.reasoning_open("User: hi"));
+        // An opener last opens the turn: the template's framing after it is replayed as before.
+        let opened = |state, begun| Replay {
+            state,
+            at_turn_start: false,
+            begun,
+        };
+        assert_eq!(format.replayed("User: hi<|assistant|>"), opened(0, false));
+        assert_eq!(
+            format.replayed("User: hi<|assistant|><a>"),
+            opened(1, false)
+        );
+        assert_eq!(
+            format.replayed("User: hi<|assistant|><a></a>"),
+            opened(0, false)
+        );
+        // A turn continued without its end is the model's own text: a prefill, as before.
+        assert_eq!(
+            format.replayed("<|assistant|><a></a>Sure,"),
+            opened(0, true)
+        );
+        // An empty prompt is no prompt.
+        assert_eq!(format.replayed(""), opened(0, false));
+        // Without the row, a prompt without an opener replays whole, as before.
+        assert_eq!(
+            two_states()
+                .opens_turn("<|assistant|>")
+                .replayed("User: hi"),
+            opened(0, true)
+        );
+    }
+
+    #[test]
+    fn an_unopened_turn_starts_in_the_thought_and_the_close_leaves_it() {
+        let format = opened_after_a_user_only();
+        let output = "a thought</a>an answer";
+        for prompt in [
+            "User: hi\nSystem: notes",
+            "User: a</a>b<|assistant|><a>t</a>x<|end|>User: more\nSystem: notes",
+        ] {
+            let events = events(format.clone(), prompt, output);
+            assert_eq!(events[0], crate::event::Event::ReasoningStart, "{prompt:?}");
+            assert_eq!(
+                said(&events),
+                ("an answer".to_string(), "a thought".to_string(), 0),
+                "{prompt:?}"
+            );
+        }
+        // The replay a caller keeps gives itself.
+        for prompt in [
+            "User: hi",
+            "<|assistant|><a>t</a>x<|end|>User: more",
+            "<|assistant|><a>",
+        ] {
+            let kept = format.replay(prompt);
+            assert_eq!(format.replayed(kept), format.replayed(prompt), "{prompt:?}");
+        }
+        // Without its thought, as a request that keeps the reasoning in the content asks, the row
+        // stays and the thought's close is content.
+        let shown = events(format.without_reasoning(), "User: hi", output);
+        assert_eq!(
+            said(&shown),
+            ("a thought</a>an answer".to_string(), String::new(), 0)
+        );
+    }
+
+    #[test]
+    fn an_unopened_row_needs_a_turn_opener_a_turn_end_and_a_state_without_a_call() {
+        assert_eq!(
+            two_states()
+                .unopened_turn_starts_in("inside", "<|end|>")
+                .validate(),
+            Err(
+                "format t: an unopened row needs a turn opener, whose absence leaves the turn \
+                 unopened"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            two_states()
+                .opens_turn("<|assistant|>")
+                .unopened_turn_starts_in("inside", "")
+                .validate(),
+            Err("format t: an unopened row with an empty turn end".to_string())
+        );
+        assert_eq!(
+            Format::new("list")
+                .terminal("open", "<call>")
+                .state("content", Emits::Content)
+                .state("call", Emits::Arguments)
+                .transition("content", "open", "call")
+                .calls(CallSyntax::Json)
+                .opens_turn("<|assistant|>")
+                .unopened_turn_starts_in("call", "<|end|>")
+                .validate(),
+            Err("format list: an unopened turn starts in \"call\", which holds a call".to_string())
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "format t: no state named \"thought\"")]
+    fn an_unopened_row_for_a_state_the_table_lacks_is_a_programming_error() {
+        let _ = two_states()
+            .opens_turn("<|assistant|>")
+            .unopened_turn_starts_in("thought", "<|end|>");
     }
 
     #[test]
