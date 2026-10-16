@@ -108,3 +108,14 @@ pip install dist/smg-*.whl
 cd smg/bindings/python
 pytest tests/
 ```
+
+## Adding a router flag
+
+A flag lives in a few places, and the tests pin them against each other:
+
+1. `model_gateway/src/main.rs`: the clap flag, in its group of `CliArgs`. The Rust CLI is the reference: `tests/test_cli_parity.py` fails on a flag that exists on one side only.
+2. `src/smg/router_args.py`: a `RouterArgs` field, and its option in `add_cli_args` under the matching help group. The field goes at its alphabetical place among the keyword-only fields (every field after `worker_urls`, `host`, `port`), never at the tail: `tests/test_arg_parser.py` pins the order and says where a misplaced field belongs.
+3. `src/lib.rs`: the `Router` struct field, the `#[pyo3(signature)]` entry with the flag's default, the parameter of `new` and the field of the literal `new` builds, each at the same alphabetical place among the keyword-only parameters (every parameter after `worker_urls`, `policy`, `host`, `port`; pyo3 wants the signature and the parameters in one order), plus the line that hands the value to the router configuration in `to_router_config`. `tests/test_router_config.py` pins the order; `tests/test_router_args_parity.py` fails on a dataclass field the constructor does not take, and on a parameter the launcher never sets.
+4. The flag's own tests go next to the related ones, or in a file of their own, not at the end of `tests/test_arg_parser.py`, where every flag's tests would meet.
+
+The keyword-only parameters have no position, so two pull requests that each add a flag change different lines of each file and merge without a conflict.

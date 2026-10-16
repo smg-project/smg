@@ -5,6 +5,7 @@ These tests focus on testing the router configuration logic in isolation,
 including validation of configuration parameters and their interactions.
 """
 
+import inspect
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -481,58 +482,47 @@ class TestDiscoveryMapping:
             _Router(worker_urls=[], discovery={"provider": "zookeeper"})
 
 
-class TestRouterPositionalSignature:
-    """External callers construct ``_Router(...)`` positionally, so the order
-    of its parameters is a public contract: a new parameter is appended after
-    the last positional one and before the keyword-only ``discovery``."""
+def out_of_place(names: list[str]) -> str:
+    """Which name breaks the alphabetical order, and where it belongs."""
+    expected = sorted(names)
+    for i, (seen, wanted) in enumerate(zip(names, expected)):
+        if seen != wanted:
+            before = names[i - 1] if i else "the start"
+            return (
+                f"{wanted} is out of alphabetical order: it belongs after {before}, before {seen}"
+            )
+    return "in order"
+
+
+class TestRouterConstructorSignature:
+    """``_Router`` binds four parameters by position (worker_urls, policy, host,
+    port) and every other one by keyword, with a default, so the prefix's order is
+    the only one a caller can depend on. The keyword-only parameters are kept in
+    alphabetical order: a new parameter goes at its place in the signature, never
+    at the tail, so two additions do not touch the same lines."""
+
+    POSITIONAL_PREFIX = ["worker_urls", "policy", "host", "port"]
 
     @staticmethod
-    def positional_names():
-        import inspect
+    def parameters() -> list[inspect.Parameter]:
+        return list(inspect.signature(_Router).parameters.values())
 
-        params = list(inspect.signature(_Router).parameters.values())
-        keyword_only = [p.name for p in params if p.kind is inspect.Parameter.KEYWORD_ONLY]
-        assert "discovery" in keyword_only
-        return [p.name for p in params if p.kind is not inspect.Parameter.KEYWORD_ONLY]
-
-    def test_appended_parameters_follow_prefill_queue_timeout(self):
-        names = self.positional_names()
-        tail = names[names.index("prefill_queue_timeout_secs") :]
-        assert tail == [
-            "prefill_queue_timeout_secs",
-            "worker_overload_shed",
-            "kv_index",
-            "worker_stall_secs",
-            "worker_wedge_secs",
-            "worker_stale_secs",
-            "worker_warmup_secs",
-            "worker_warmup_share",
-            "worker_warmup_blocks",
-            "worker_warmup_thin_ratio",
-            "worker_warmup_divert_every",
-            "selection_policy",
-            "selection_accounting_ttl_ms",
-            "tenant_api_keys",
-            "priority_scheduler_enabled",
-            "priority_scheduler_default_max_class",
-            "priority_scheduler_config",
-            "priority_scheduler_tenant_metric_top_n",
-            "tenant_rate_limit_enabled",
-            "tenant_rate_limit_config",
-            "jemalloc_prof_dir",
-            "tokenizer_cache_l0_max_memory",
-            "max_background_responses",
-            "header_read_timeout_secs",
-            "idle_connection_timeout_secs",
-            "mm_allowed_media_domains",
-            "mm_allow_private_media_hosts",
-            "sse_keepalive_secs",
-            "history_memory_max_responses",
-            "history_memory_max_items",
-            "history_memory_retention_secs",
-            "admin_port",
-            "admin_host",
+    def test_the_positional_prefix_is_frozen(self):
+        positional = [
+            p.name for p in self.parameters() if p.kind is not inspect.Parameter.KEYWORD_ONLY
         ]
+        assert positional == self.POSITIONAL_PREFIX
+
+    def test_every_other_parameter_is_keyword_only_with_a_default(self):
+        tail = self.parameters()[len(self.POSITIONAL_PREFIX) :]
+        assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in tail)
+        assert all(p.default is not inspect.Parameter.empty for p in tail)
+        with pytest.raises(TypeError):
+            _Router(["http://w:8000"], PolicyType.RoundRobin, "0.0.0.0", 3001, 600)
+
+    def test_the_keyword_only_parameters_are_in_alphabetical_order(self):
+        tail = [p.name for p in self.parameters()[len(self.POSITIONAL_PREFIX) :]]
+        assert tail == sorted(tail), out_of_place(tail)
 
 
 class TestControlPlaneAuthHalfJwt:

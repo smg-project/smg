@@ -7,6 +7,7 @@ without starting actual router instances.
 
 import argparse
 import re
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -1652,309 +1653,50 @@ class TestFlagAliases:
         assert pinned_off.remove_unhealthy_workers is False
 
 
-class TestRouterArgsFieldOrder:
-    """RouterArgs generates a positional __init__, so field order is a public
-    contract: a mid-list insertion silently rebinds every later positional
-    argument. New fields must be APPENDED (after the reserve marker at
-    worker_startup_delay). The full-sequence snapshot below fails on any
-    reorder or insertion — when adding a field, append it both to the
-    dataclass tail and to the end of this list."""
-
-    EXPECTED_FIELD_SEQUENCE = [
-        "worker_urls",
-        "host",
-        "port",
-        "health_check_port",
-        "pd_disaggregation",
-        "epd_disaggregation",
-        "encode_urls",
-        "prefill_urls",
-        "decode_urls",
-        "policy",
-        "encode_policy",
-        "prefill_policy",
-        "decode_policy",
-        "worker_startup_timeout_secs",
-        "worker_startup_check_interval",
-        "load_monitor_interval",
-        "cache_threshold",
-        "balance_abs_threshold",
-        "balance_rel_threshold",
-        "balance_token_usage_threshold",
-        "overload_token_usage_threshold",
-        "eviction_interval_secs",
-        "max_tree_size",
-        "block_size",
-        "least_load_kv_pressure_weight",
-        "least_load_default_throughput",
-        "least_load_mean_prefill_tokens",
-        "max_idle_secs",
-        "assignment_mode",
-        "max_payload_size",
-        "bucket_adjust_interval_secs",
-        "dp_aware",
-        "multimodal_tensor_transport",
-        "multimodal_shm_min_bytes",
-        "routing_key_override",
-        "dp_minimum_tokens_scheduler",
-        "enable_igw",
-        "api_key",
-        "log_dir",
-        "log_level",
-        "log_json",
-        "service_discovery",
-        "selector",
-        "service_discovery_port",
-        "service_discovery_namespace",
-        "encode_selector",
-        "prefill_selector",
-        "decode_selector",
-        "router_selector",
-        "bootstrap_port_annotation",
-        "worker_ports_annotation",
-        "model_id_from",
-        "prometheus_port",
-        "prometheus_host",
-        "prometheus_duration_buckets",
-        "request_id_headers",
-        "storage_context_headers",
-        "request_timeout_secs",
-        "shutdown_grace_period_secs",
-        "max_concurrent_requests",
-        "queue_size",
-        "queue_timeout_secs",
-        "rate_limit_tokens_per_second",
-        "cors_allowed_origins",
-        "retry_max_retries",
-        "retry_initial_backoff_ms",
-        "retry_max_backoff_ms",
-        "retry_backoff_multiplier",
-        "retry_jitter_factor",
-        "disable_retries",
-        "health_failure_threshold",
-        "health_success_threshold",
-        "health_check_timeout_secs",
-        "health_check_interval_secs",
-        "health_check_endpoint",
-        "disable_health_check",
-        "remove_unhealthy_workers",
-        "cb_failure_threshold",
-        "cb_success_threshold",
-        "cb_timeout_duration_secs",
-        "cb_window_duration_secs",
-        "disable_circuit_breaker",
-        "model_path",
-        "tokenizer_path",
-        "chat_template",
-        "disable_tokenizer_autoload",
-        "tokenizer_cache_enable_l0",
-        "tokenizer_cache_l0_max_entries",
-        "tokenizer_cache_enable_l1",
-        "tokenizer_cache_l1_max_memory",
-        "reasoning_parser",
-        "tool_call_parser",
-        "mcp_config_path",
-        "backend",
-        "enable_wasm",
-        "storage_hook_wasm_path",
-        "history_backend",
-        "oracle_wallet_path",
-        "oracle_tns_alias",
-        "oracle_connect_descriptor",
-        "oracle_username",
-        "oracle_password",
-        "oracle_external_auth",
-        "oracle_pool_min",
-        "oracle_pool_max",
-        "oracle_pool_timeout_secs",
-        "postgres_db_url",
-        "postgres_pool_max",
-        "redis_url",
-        "redis_pool_max",
-        "redis_retention_days",
-        "schema_config",
-        "client_cert_path",
-        "client_key_path",
-        "ca_cert_paths",
-        "server_cert_path",
-        "server_key_path",
-        "enable_trace",
-        "otlp_traces_endpoint",
-        "control_plane_api_keys",
-        "control_plane_audit_enabled",
-        "jwt_issuer",
-        "jwt_audience",
-        "jwt_jwks_uri",
-        "jwt_role_mapping",
-        "enable_mesh",
-        "mesh_server_name",
-        "mesh_host",
-        "mesh_advertise_host",
-        "mesh_port",
-        "mesh_peer_urls",
-        "model_aliases",
-        "worker_startup_delay",
-        "zmq_engine_count",
-        "prefix_token_count",
-        "prefix_hash_load_factor",
-        "prefix_hash_balance_abs_threshold",
-        "upstream_http2",
-        "overlap_decay",
-        "selection_temperature",
-        "upstream_pool_idle_timeout_secs",
-        "least_load_max_waiting_requests",
-        "stream_body_stall_timeout_secs",
-        "routing_key_headers",
-        "cache_boundaries",
-        "cache_index",
-        "cache_ttl_secs",
-        "job_queue_capacity",
-        "job_queue_concurrency",
-        "worker_overload_waiting_requests",
-        "worker_overload_token_usage",
-        "worker_overload_protection",
-        "disable_load_monitoring",
-        "max_buffered_request_bytes",
-        "kv_connector_annotation",
-        "kv_engine_id_annotation",
-        "mm_per_request_image_limit",
-        "pd_admission_wait_secs",
-        "enable_rl",
-        "rl_control_timeout_secs",
-        "rl_fanout_concurrency",
-        "multimodal_max_inflight_bytes",
-        "mm_processing",
-        "mm_pixel_cache_mb",
-        "mm_pixel_rdma",
-        "rdma_listen_ip",
-        "rdma_slot_ttl_s",
-        "log_mm_timing",
-        "prefill_max_inflight_requests_per_worker",
-        "prefill_queue_size",
-        "prefill_queue_timeout_secs",
-        "discovery_provider",
-        "worker_overload_shed",
-        "kv_index",
-        "worker_stall_secs",
-        "worker_wedge_secs",
-        "worker_stale_secs",
-        "worker_warmup_secs",
-        "worker_warmup_share",
-        "worker_warmup_blocks",
-        "worker_warmup_thin_ratio",
-        "worker_warmup_divert_every",
-        "selection_policy",
-        "selection_accounting_ttl_ms",
-        "trust_tenant_header",
-        "tenant_header_name",
-        "tenant_api_keys",
-        "priority_scheduler_enabled",
-        "priority_scheduler_default_max_class",
-        "priority_scheduler_config",
-        "priority_scheduler_tenant_metric_top_n",
-        "tenant_rate_limit_enabled",
-        "tenant_rate_limit_config",
-        "jemalloc_prof_dir",
-        "mesh_tls_ca_cert",
-        "mesh_tls_cert",
-        "mesh_tls_key",
-        "tokenizer_cache_l0_max_memory",
-        "discovery_file",
-        "discovery_check_interval_secs",
-        "max_background_responses",
-        "power_of_two_load_metric",
-        "header_read_timeout_secs",
-        "idle_connection_timeout_secs",
-        "mm_allowed_media_domains",
-        "mm_allow_private_media_hosts",
-        "sse_keepalive_secs",
-        "postgres_op_timeout_secs",
-        "redis_op_timeout_secs",
-        "history_memory_max_responses",
-        "history_memory_max_items",
-        "history_memory_retention_secs",
-        "parser",
-        "drain_settle_secs",
-        "admin_port",
-        "admin_host",
-        "access_log_fields",
-    ]
-
-    def test_complete_field_sequence_is_frozen(self):
-        import dataclasses
-
-        names = [f.name for f in dataclasses.fields(RouterArgs)]
-        assert names == self.EXPECTED_FIELD_SEQUENCE, (
-            "RouterArgs field order changed. Positional callers bind by "
-            "position: fields may only be APPENDED at the tail (and to "
-            "EXPECTED_FIELD_SEQUENCE), never inserted or reordered."
-        )
-
-    def test_new_fields_appended_after_positional_reserve(self):
-        import dataclasses
-
-        names = [f.name for f in dataclasses.fields(RouterArgs)]
-        marker = names.index("worker_startup_delay")
-        for appended in (
-            "overlap_decay",
-            "selection_temperature",
-            "upstream_pool_idle_timeout_secs",
-            "least_load_max_waiting_requests",
-            "stream_body_stall_timeout_secs",
-            "routing_key_headers",
-            "cache_boundaries",
-            "cache_index",
-            "cache_ttl_secs",
-            "worker_overload_waiting_requests",
-            "worker_overload_token_usage",
-            "worker_overload_protection",
-            "disable_load_monitoring",
-            "max_buffered_request_bytes",
-            "kv_connector_annotation",
-            "kv_engine_id_annotation",
-            "mm_per_request_image_limit",
-            "enable_rl",
-            "rl_control_timeout_secs",
-            "rl_fanout_concurrency",
-            "worker_overload_shed",
-            "kv_index",
-            "worker_stall_secs",
-            "worker_wedge_secs",
-            "worker_stale_secs",
-            "worker_warmup_secs",
-            "worker_warmup_share",
-            "worker_warmup_blocks",
-            "worker_warmup_thin_ratio",
-            "worker_warmup_divert_every",
-            "selection_policy",
-            "selection_accounting_ttl_ms",
-            "trust_tenant_header",
-            "tenant_header_name",
-            "tenant_api_keys",
-            "priority_scheduler_enabled",
-            "priority_scheduler_default_max_class",
-            "priority_scheduler_config",
-            "priority_scheduler_tenant_metric_top_n",
-            "tenant_rate_limit_enabled",
-            "tenant_rate_limit_config",
-            "tokenizer_cache_l0_max_memory",
-            "max_background_responses",
-            "power_of_two_load_metric",
-            "header_read_timeout_secs",
-            "idle_connection_timeout_secs",
-            "sse_keepalive_secs",
-            "postgres_op_timeout_secs",
-            "redis_op_timeout_secs",
-            "history_memory_max_responses",
-            "history_memory_max_items",
-            "history_memory_retention_secs",
-            "admin_port",
-            "admin_host",
-        ):
-            assert names.index(appended) > marker, (
-                f"{appended} must be appended after worker_startup_delay to "
-                "preserve positional callers"
+def out_of_place(names: list[str]) -> str:
+    """Which name breaks the alphabetical order, and where it belongs."""
+    expected = sorted(names)
+    for i, (seen, wanted) in enumerate(zip(names, expected)):
+        if seen != wanted:
+            before = names[i - 1] if i else "the start"
+            return (
+                f"{wanted} is out of alphabetical order: it belongs after {before}, before {seen}"
             )
+    return "in order"
+
+
+class TestRouterArgsFieldOrder:
+    """``RouterArgs`` binds three fields by position (worker_urls, host, port) and
+    every other field by keyword, so the prefix's order is the only one a caller
+    can depend on. The keyword-only fields are kept in alphabetical order: a new
+    field goes at its place in the list, never at the tail, so two additions do
+    not touch the same lines of ``router_args.py`` (nor of the Rust constructor,
+    which keeps the same order; ``test_router_config.py`` pins it)."""
+
+    POSITIONAL_PREFIX = ["worker_urls", "host", "port"]
+
+    @staticmethod
+    def names() -> list[str]:
+        import dataclasses
+
+        return [f.name for f in dataclasses.fields(RouterArgs)]
+
+    def test_the_positional_prefix_is_frozen(self):
+        assert self.names()[: len(self.POSITIONAL_PREFIX)] == self.POSITIONAL_PREFIX
+
+    @pytest.mark.skipif(sys.version_info < (3, 10), reason="dataclasses.KW_ONLY needs 3.10")
+    def test_every_other_field_is_keyword_only(self):
+        import inspect
+
+        parameters = inspect.signature(RouterArgs).parameters.values()
+        positional = [p.name for p in parameters if p.kind is not inspect.Parameter.KEYWORD_ONLY]
+        assert positional == self.POSITIONAL_PREFIX
+        with pytest.raises(TypeError):
+            RouterArgs(["http://w:8000"], "0.0.0.0", 30000, None)
+
+    def test_the_keyword_only_fields_are_in_alphabetical_order(self):
+        tail = self.names()[len(self.POSITIONAL_PREFIX) :]
+        assert tail == sorted(tail), out_of_place(tail)
 
 
 class TestConnectionTimeouts:

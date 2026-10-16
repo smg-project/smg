@@ -1,10 +1,11 @@
 """The Python launcher's side of the gateway's command line.
 
-``RouterArgs`` carries the router settings the launcher exposes, in a frozen
-positional order (new fields are appended at the end, never inserted: callers
-build it positionally). ``add_cli_args`` is the argparse
-mapping of those settings, one option per Rust CLI flag with the same name,
-default and second spelling, grouped as the CLI's help headings;
+``RouterArgs`` carries the router settings the launcher exposes: three
+positional fields (``worker_urls``, ``host``, ``port``), then every other one
+keyword-only, in alphabetical order (a new field goes at its place in the list,
+never at the tail, so two additions do not touch the same lines). ``add_cli_args``
+is the argparse mapping of those settings, one option per Rust CLI flag with the
+same name, default and second spelling, grouped as the CLI's help headings;
 ``from_cli_args`` reads a parsed namespace back into ``RouterArgs`` (with the
 ``--router-`` prefixed spellings taking precedence over the backend's when
 the launcher is embedded in a serving command); the ``_parse_*`` helpers
@@ -21,6 +22,7 @@ import ipaddress
 import logging
 import os
 import re
+import sys
 from pathlib import Path
 
 from smg.smg_rs import get_available_reasoning_parsers, get_available_tool_call_parsers
@@ -259,90 +261,238 @@ class _ExtendAccessLogFields(argparse.Action):
 
 @dataclasses.dataclass
 class RouterArgs:
-    # Worker configuration
+    # The three positional fields, in this order. Every other field is keyword-only
+    # (enforced from Python 3.10 on) and the keyword-only fields are kept in
+    # alphabetical order: a new field goes at its place in the list, never at the
+    # tail, so two additions do not touch the same lines (tests/test_arg_parser.py
+    # pins the prefix and the order).
     worker_urls: list[str] = dataclasses.field(default_factory=list)
     host: str = "0.0.0.0"
     port: int = 30000
+    # The package installs on 3.9 too (its end of life behind it), where the fields stay
+    # positional-or-keyword: the order below is a contract on no version.
+    if sys.version_info >= (3, 10):  # noqa: UP036
+        _: dataclasses.KW_ONLY
+    # Optional fields of the access-log record; [] keeps the record's fields as they are
+    access_log_fields: list[str] = dataclasses.field(default_factory=list)
+    # The admin listener (bind host and port) for the control-plane routes; None = the
+    # control plane stays on the data listener
+    admin_host: str | None = None
+    admin_port: int | None = None
+    api_key: str | None = None
+    # Routing-key assignment; defaults: random (manual policy), delegate (override)
+    assignment_mode: str | None = None
+    backend: str = "sglang"
+    balance_abs_threshold: int = 64
+    balance_rel_threshold: float = 1.5
+    balance_token_usage_threshold: float = 1.0
+    block_size: int = 16
+    bootstrap_port_annotation: str = "sglang.ai/bootstrap-port"
+    bucket_adjust_interval_secs: int = 5
+    # CA certificates for mTLS to workers (with client_cert_path and client_key_path)
+    ca_cert_paths: list[str] = dataclasses.field(default_factory=list)
+    # Token positions at which serving engines retain reusable prefix state
+    cache_boundaries: list[int] = dataclasses.field(default_factory=list)
+    # cache_aware index under-layer: "tree" or "hash"
+    cache_index: str = "tree"
+    cache_threshold: float = 0.3
+    # Seconds a cache-affinity placement stays routable
+    cache_ttl_secs: int = 180
+    # Circuit breaker configuration (disable_circuit_breaker switches it off)
+    cb_failure_threshold: int = 10
+    cb_success_threshold: int = 3
+    cb_timeout_duration_secs: int = 60
+    cb_window_duration_secs: int = 120
+    chat_template: str | None = None
+    # mTLS for worker communication: the client certificate and key (with ca_cert_paths)
+    client_cert_path: str | None = None
+    client_key_path: str | None = None
+    # API keys for control plane auth (list of tuples: id, name, key, role)
+    control_plane_api_keys: list[tuple] = dataclasses.field(default_factory=list)
+    control_plane_audit_enabled: bool = False
+    cors_allowed_origins: list[str] = dataclasses.field(default_factory=list)
+    decode_policy: str | None = None  # Specific policy for decode nodes in PD mode
+    decode_selector: dict[str, str] = dataclasses.field(default_factory=dict)
+    decode_urls: list[str] = dataclasses.field(default_factory=list)
+    disable_circuit_breaker: bool = False
+    disable_health_check: bool = False
+    # Restore the conditional load-monitor poll gate (default: poll always)
+    disable_load_monitoring: bool = False
+    disable_retries: bool = False
+    # Disable automatic tokenizer loading at startup and worker registration
+    disable_tokenizer_autoload: bool = False
+    # File discovery (discovery_provider="file"): how often the JSON manifest is
+    # reread besides on every change (None = 30s), and the manifest's path.
+    discovery_check_interval_secs: int | None = None
+    discovery_file: str | None = None
+    # The worker discovery provider. service_discovery=True is the legacy
+    # spelling of discovery_provider="kubernetes"; set one or the other.
+    discovery_provider: str | None = None
+    dp_aware: bool = False
+    dp_minimum_tokens_scheduler: bool = False
+    # Seconds a Ready worker is kept in Draining before it leaves the registry,
+    # on every removal (a discovery deletion, an unhealthy worker's removal, the
+    # API); 0 removes it at once
+    drain_settle_secs: int = 5
+    enable_igw: bool = False  # Enable IGW (Inference Gateway) mode for multi-model support
+    # The mesh server (the mesh_* fields configure it)
+    enable_mesh: bool = False
+    enable_rl: bool = False  # Mount the RL control plane under /v1/rl
+    # Tracing (otlp_traces_endpoint names the collector)
+    enable_trace: bool = False
+    # WASM support
+    enable_wasm: bool = False
+    encode_policy: str | None = None  # Specific policy for encode nodes in EPD mode
+    encode_selector: dict[str, str] = dataclasses.field(default_factory=dict)
+    encode_urls: list[tuple] = dataclasses.field(
+        default_factory=list
+    )  # List of (url, bootstrap_port)
+    epd_disaggregation: bool = False  # Enable Encode-Prefill-Decode disaggregated mode
+    eviction_interval_secs: int = 60
+    # HTTP edge: seconds to receive a complete request head
+    header_read_timeout_secs: int = 30
+    # Health checks (disable_health_check switches them off)
+    health_check_endpoint: str = "/health"
+    health_check_interval_secs: int = 60
     # Dedicated port for liveness/readiness/health probes (k8s, load balancers, monitors), served from an
     # isolated runtime so probes are not starved by the request runtime.
     # None = dedicated probe listener off (routes stay on the main port).
     health_check_port: int | None = None
-
-    # PD/EPD-specific configuration
+    health_check_timeout_secs: int = 5
+    health_failure_threshold: int = 3
+    health_success_threshold: int = 2
+    # History backend: memory, oracle, postgres or redis (the oracle_*, postgres_* and
+    # redis_* fields configure the stores)
+    history_backend: str = "memory"
+    # Bounds of the memory history backend: the most stored conversation items and
+    # responses kept (the oldest go first) and how long a record is kept (0 = until
+    # a count bound drops it)
+    history_memory_max_items: int = 100000
+    history_memory_max_responses: int = 10000
+    history_memory_retention_secs: int = 86400
+    # HTTP edge: seconds a keep-alive connection may sit with no request in flight
+    # (0 disables)
+    idle_connection_timeout_secs: int = 90
+    # Heap profiles of the router process (a jemalloc-profiling build)
+    jemalloc_prof_dir: str | None = None
+    # Control-plane job queue sizing (worker registration/removal jobs)
+    job_queue_capacity: int = 1000
+    job_queue_concurrency: int = 200
+    # JWT/OIDC configuration for control plane auth
+    jwt_audience: str | None = None
+    jwt_issuer: str | None = None
+    jwt_jwks_uri: str | None = None
+    jwt_role_mapping: dict[str, str] = dataclasses.field(default_factory=dict)
+    kv_connector_annotation: str = "smg.ai/kv-connector"
+    kv_engine_id_annotation: str = "smg.ai/kv-engine-id"
+    # Deprecated: the chain index is the only KV index behind cache-aware
+    # routing, so "chain" is the one value and changes nothing; unset by
+    # default so that only a launch line that still passes it is warned
+    kv_index: str | None = None
+    least_load_default_throughput: float = 2000.0
+    least_load_kv_pressure_weight: float = 0.15
+    least_load_max_waiting_requests: int = 0
+    least_load_mean_prefill_tokens: int = 1024
+    load_monitor_interval: int = 10
+    log_dir: str | None = None
+    log_json: bool = False
+    log_level: str | None = None
+    # Per-request multimodal timing at INFO; False falls back to SMG_LOG_MM_TIMING
+    log_mm_timing: bool = False
+    # Most Responses API requests with background: true in flight at once;
+    # one beyond answers 429. 0 = background mode off (such requests run in
+    # the foreground)
+    max_background_responses: int = 1024
+    # Most bytes the router may buffer for a request it holds only to keep
+    # it retryable; larger eligible requests stream and forfeit router retries
+    max_buffered_request_bytes: int = 1048576
+    # Standing-concurrency cap (-1 to disable); permits span the full response
+    max_concurrent_requests: int = -1
+    max_idle_secs: int = 4 * 3600
+    max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
+    max_tree_size: int = 2**26
+    # MCP server configuration
+    mcp_config_path: str | None = None
+    mesh_advertise_host: str | None = None
+    mesh_host: str = "0.0.0.0"
+    mesh_peer_urls: list[str] = dataclasses.field(default_factory=list)
+    mesh_port: int = 39527
+    mesh_server_name: str | None = None
+    # Mesh mTLS: the CA, this node's certificate and key (PEM paths); all three or none.
+    mesh_tls_ca_cert: str | None = None
+    mesh_tls_cert: str | None = None
+    mesh_tls_key: str | None = None
+    # Allow media URLs on loopback, link-local or private addresses (an internal
+    # media origin); False falls back to SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS
+    mm_allow_private_media_hosts: bool = False
+    # Hosts the router fetches client-supplied media URLs from when it processes
+    # media itself (every redirect hop included); None allows any host the
+    # address policy passes
+    mm_allowed_media_domains: list[str] | None = None
+    # Per-request image-count limit replacing model spec limits; None keeps spec limits
+    mm_per_request_image_limit: int | None = None
+    # Pixel cache budget (MiB) for router-side preprocessed media; None falls
+    # back to SMG_MM_PIXEL_CACHE_MB, then 0 (off)
+    mm_pixel_cache_mb: int | None = None
+    # Legacy switch for the RDMA pixel lane; False falls back to SMG_MM_PIXEL_RDMA
+    mm_pixel_rdma: bool = False
+    # Where media for vLLM gRPC workers is fetched and preprocessed:
+    # auto | router | worker; None falls back to SMG_MM_PROCESSING, then auto
+    mm_processing: str | None = None
+    model_aliases: dict[str, str] = dataclasses.field(default_factory=dict)
+    model_id_from: str | None = None
+    model_path: str | None = None
+    multimodal_max_inflight_bytes: int | None = None
+    multimodal_shm_min_bytes: int | None = None
+    multimodal_tensor_transport: str | None = None
+    oracle_connect_descriptor: str | None = None
+    oracle_external_auth: bool = False
+    oracle_password: str | None = None
+    oracle_pool_max: int = 16
+    oracle_pool_min: int = 1
+    oracle_pool_timeout_secs: int = 30
+    oracle_tns_alias: str | None = None
+    oracle_username: str | None = None
+    oracle_wallet_path: str | None = None
+    otlp_traces_endpoint: str = "localhost:4317"
+    overlap_decay: float = 0.0
+    overload_token_usage_threshold: float = 1.0
+    # Which parser reads a chat completion's reasoning and tool calls: the per-model parsers
+    # ("legacy") or Symphony ("symphony") for the models its registry knows; a request's
+    # X-SMG-Parser header overrides it
+    parser: str = "legacy"
+    # Seconds a PD dispatch waits for a slot in the decode engine's running
+    # window before shedding; 0 sheds immediately
+    pd_admission_wait_secs: int = 30
     pd_disaggregation: bool = False  # Enable PD disaggregated mode
-    epd_disaggregation: bool = False  # Enable Encode-Prefill-Decode disaggregated mode
-    encode_urls: list[tuple] = dataclasses.field(
-        default_factory=list
-    )  # List of (url, bootstrap_port)
+    # Routing policy
+    policy: str = "cache_aware"
+    postgres_db_url: str | None = None
+    # The bound on one Postgres history-store call (pool wait, connect and the
+    # operation included)
+    postgres_op_timeout_secs: int = 5
+    postgres_pool_max: int = 16
+    power_of_two_load_metric: str = "expected_wait"
+    prefill_max_inflight_requests_per_worker: int = -1
+    prefill_policy: str | None = None  # Specific policy for prefill nodes in PD mode
+    prefill_queue_size: int | None = None
+    prefill_queue_timeout_secs: int | None = None
+    prefill_selector: dict[str, str] = dataclasses.field(default_factory=dict)
     prefill_urls: list[tuple] = dataclasses.field(
         default_factory=list
     )  # List of (url, bootstrap_port)
-    decode_urls: list[str] = dataclasses.field(default_factory=list)
-
-    # Routing policy
-    policy: str = "cache_aware"
-    encode_policy: str | None = None  # Specific policy for encode nodes in EPD mode
-    prefill_policy: str | None = None  # Specific policy for prefill nodes in PD mode
-    decode_policy: str | None = None  # Specific policy for decode nodes in PD mode
-    worker_startup_timeout_secs: int = 1800
-    worker_startup_check_interval: int = 30
-    load_monitor_interval: int = 10
-    cache_threshold: float = 0.3
-    balance_abs_threshold: int = 64
-    balance_rel_threshold: float = 1.5
-    balance_token_usage_threshold: float = 1.0
-    overload_token_usage_threshold: float = 1.0
-    eviction_interval_secs: int = 60
-    max_tree_size: int = 2**26
-    block_size: int = 16
-    least_load_kv_pressure_weight: float = 0.15
-    least_load_default_throughput: float = 2000.0
-    least_load_mean_prefill_tokens: int = 1024
-    max_idle_secs: int = 4 * 3600
-    # Routing-key assignment; defaults: random (manual policy), delegate (override)
-    assignment_mode: str | None = None
-    max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
-    bucket_adjust_interval_secs: int = 5
-    dp_aware: bool = False
-    multimodal_tensor_transport: str | None = None
-    multimodal_shm_min_bytes: int | None = None
-    routing_key_override: bool = False
-    dp_minimum_tokens_scheduler: bool = False
-    enable_igw: bool = False  # Enable IGW (Inference Gateway) mode for multi-model support
-    api_key: str | None = None
-    log_dir: str | None = None
-    log_level: str | None = None
-    log_json: bool = False
-    # Service discovery configuration
-    service_discovery: bool = False
-    selector: dict[str, str] = dataclasses.field(default_factory=dict)
-    service_discovery_port: int = 80
-    service_discovery_namespace: str | None = None
-    # PD/EPD service discovery configuration
-    encode_selector: dict[str, str] = dataclasses.field(default_factory=dict)
-    prefill_selector: dict[str, str] = dataclasses.field(default_factory=dict)
-    decode_selector: dict[str, str] = dataclasses.field(default_factory=dict)
-    router_selector: dict[str, str] = dataclasses.field(default_factory=dict)
-    bootstrap_port_annotation: str = "sglang.ai/bootstrap-port"
-    worker_ports_annotation: str = "smg.ai/worker-ports"
-    model_id_from: str | None = None
-    # Prometheus configuration
-    prometheus_port: int | None = None
-    prometheus_host: str | None = None
+    prefix_hash_balance_abs_threshold: int = 10
+    prefix_hash_load_factor: float = 1.25
+    prefix_token_count: int = 256
+    # Priority-aware admission scheduler
+    priority_scheduler_config: str | None = None
+    priority_scheduler_default_max_class: str = "default"
+    priority_scheduler_enabled: bool = False
+    priority_scheduler_tenant_metric_top_n: int = 32
+    # Prometheus exporter
     prometheus_duration_buckets: list[float] | None = None
-    # Request ID headers configuration
-    request_id_headers: list[str] | None = None
-    # Storage-hook request context read from HTTP headers, oriented
-    # {header name: context key}, as `--storage-context-headers
-    # header=context_key` lists them and as the Rust CLI parses the same
-    # entries (the header name is the key, never the value)
-    storage_context_headers: dict[str, str] = dataclasses.field(default_factory=dict)
-    # Request timeout in seconds
-    request_timeout_secs: int = 1800
-    # Grace period in seconds to wait for in-flight requests during shutdown
-    shutdown_grace_period_secs: int = 180
-    # Standing-concurrency cap (-1 to disable); permits span the full response
-    max_concurrent_requests: int = -1
+    prometheus_host: str | None = None
+    prometheus_port: int | None = None
     # Queue size for pending requests when max concurrent limit reached
     queue_size: int = 100
     # Maximum time (in seconds) a request can wait in queue before timing out
@@ -350,262 +500,115 @@ class RouterArgs:
     # Sustained admission rate (requests per second), bursting up to
     # max_concurrent_requests. Unset or 0 = no rate limit
     rate_limit_tokens_per_second: int | None = None
-    # CORS allowed origins
-    cors_allowed_origins: list[str] = dataclasses.field(default_factory=list)
-    # Retry configuration
-    retry_max_retries: int = 5
-    retry_initial_backoff_ms: int = 50
-    retry_max_backoff_ms: int = 30_000
-    retry_backoff_multiplier: float = 1.5
-    retry_jitter_factor: float = 0.2
-    disable_retries: bool = False
-    # Health check configuration
-    health_failure_threshold: int = 3
-    health_success_threshold: int = 2
-    health_check_timeout_secs: int = 5
-    health_check_interval_secs: int = 60
-    health_check_endpoint: str = "/health"
-    disable_health_check: bool = False
-    # None = follow service_discovery: recovery works by removal + discovery
-    # re-registration, so it defaults on exactly when discovery can complete
-    # the loop (resolved by the Rust core).
-    remove_unhealthy_workers: bool | None = None
-    # Circuit breaker configuration
-    cb_failure_threshold: int = 10
-    cb_success_threshold: int = 3
-    cb_timeout_duration_secs: int = 60
-    cb_window_duration_secs: int = 120
-    disable_circuit_breaker: bool = False
-    model_path: str | None = None
-    tokenizer_path: str | None = None
-    chat_template: str | None = None
-    # Disable automatic tokenizer loading at startup and worker registration
-    disable_tokenizer_autoload: bool = False
-    # Tokenizer cache configuration
-    tokenizer_cache_enable_l0: bool = False
-    tokenizer_cache_l0_max_entries: int = 10000
-    tokenizer_cache_enable_l1: bool = False
-    tokenizer_cache_l1_max_memory: int = 50 * 1024 * 1024  # 50MB
-    # Parser configuration
-    reasoning_parser: str | None = None
-    tool_call_parser: str | None = None
-    # MCP server configuration
-    mcp_config_path: str | None = None
-    # Backend selection
-    backend: str = "sglang"
-    # WASM support
-    enable_wasm: bool = False
-    # Storage hooks (WASM)
-    storage_hook_wasm_path: str | None = None
-    # History backend configuration
-    history_backend: str = "memory"
-    oracle_wallet_path: str | None = None
-    oracle_tns_alias: str | None = None
-    oracle_connect_descriptor: str | None = None
-    oracle_username: str | None = None
-    oracle_password: str | None = None
-    oracle_external_auth: bool = False
-    oracle_pool_min: int = 1
-    oracle_pool_max: int = 16
-    oracle_pool_timeout_secs: int = 30
-    postgres_db_url: str | None = None
-    postgres_pool_max: int = 16
-    redis_url: str | None = None
-    redis_pool_max: int = 16
-    redis_retention_days: int = 30
-    schema_config: str | None = None
-    # mTLS configuration for worker communication
-    client_cert_path: str | None = None
-    client_key_path: str | None = None
-    ca_cert_paths: list[str] = dataclasses.field(default_factory=list)
-    # Server TLS configuration
-    server_cert_path: str | None = None
-    server_key_path: str | None = None
-    # Trace
-    enable_trace: bool = False
-    otlp_traces_endpoint: str = "localhost:4317"
-    # Control plane authentication
-    # API keys for control plane auth (list of tuples: id, name, key, role)
-    control_plane_api_keys: list[tuple] = dataclasses.field(default_factory=list)
-    control_plane_audit_enabled: bool = False
-    # JWT/OIDC configuration for control plane auth
-    jwt_issuer: str | None = None
-    jwt_audience: str | None = None
-    jwt_jwks_uri: str | None = None
-    jwt_role_mapping: dict[str, str] = dataclasses.field(default_factory=dict)
-    # Mesh server configuration
-    enable_mesh: bool = False
-    mesh_server_name: str | None = None
-    mesh_host: str = "0.0.0.0"
-    mesh_advertise_host: str | None = None
-    mesh_port: int = 39527
-    mesh_peer_urls: list[str] = dataclasses.field(default_factory=list)
-    # Append new fields here to preserve positional callers.
-    model_aliases: dict[str, str] = dataclasses.field(default_factory=dict)
-    worker_startup_delay: int = 0
-    # DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped)
-    zmq_engine_count: int | None = None
-    prefix_token_count: int = 256
-    prefix_hash_load_factor: float = 1.25
-    prefix_hash_balance_abs_threshold: int = 10
-    upstream_http2: bool = False
-    overlap_decay: float = 0.0
-    selection_temperature: float = 0.0
-    upstream_pool_idle_timeout_secs: int = 3
-    least_load_max_waiting_requests: int = 0
-    stream_body_stall_timeout_secs: int = 300
-    # Ordered header names checked for the routing key; first valid wins
-    routing_key_headers: list[str] = dataclasses.field(
-        default_factory=lambda: ["x-smg-routing-key"]
-    )
-    # Token positions at which serving engines retain reusable prefix state
-    cache_boundaries: list[int] = dataclasses.field(default_factory=list)
-    # cache_aware index under-layer: "tree" or "hash"
-    cache_index: str = "tree"
-    # Seconds a cache-affinity placement stays routable
-    cache_ttl_secs: int = 180
-    # Control-plane job queue sizing (worker registration/removal jobs)
-    job_queue_capacity: int = 1000
-    job_queue_concurrency: int = 200
-    # Absolute per-worker overload thresholds, as the Rust CLI defaults them;
-    # None switches one signal off
-    worker_overload_waiting_requests: int | None = 8
-    worker_overload_token_usage: float | None = 0.8
-    # Worker overload protection is on by default; False switches both
-    # thresholds off (--disable-worker-overload-protection)
-    worker_overload_protection: bool = True
-    # Restore the conditional load-monitor poll gate (default: poll always)
-    disable_load_monitoring: bool = False
-    # Most bytes the router may buffer for a request it holds only to keep
-    # it retryable; larger eligible requests stream and forfeit router retries
-    max_buffered_request_bytes: int = 1048576
-    kv_connector_annotation: str = "smg.ai/kv-connector"
-    kv_engine_id_annotation: str = "smg.ai/kv-engine-id"
-    # Per-request image-count limit replacing model spec limits; None keeps spec limits
-    mm_per_request_image_limit: int | None = None
-    # Seconds a PD dispatch waits for a slot in the decode engine's running
-    # window before shedding; 0 sheds immediately
-    pd_admission_wait_secs: int = 30
-    enable_rl: bool = False  # Mount the RL control plane under /v1/rl
-    rl_control_timeout_secs: int = 600  # Timeout for one proxied engine control call
-    rl_fanout_concurrency: int = 32  # Max concurrent engine calls in one fan-out
-    # Appended last so callers that build RouterArgs positionally keep
-    # their existing field order.
-    multimodal_max_inflight_bytes: int | None = None
-    # Where media for vLLM gRPC workers is fetched and preprocessed:
-    # auto | router | worker; None falls back to SMG_MM_PROCESSING, then auto
-    mm_processing: str | None = None
-    # Pixel cache budget (MiB) for router-side preprocessed media; None falls
-    # back to SMG_MM_PIXEL_CACHE_MB, then 0 (off)
-    mm_pixel_cache_mb: int | None = None
-    # Legacy switch for the RDMA pixel lane; False falls back to SMG_MM_PIXEL_RDMA
-    mm_pixel_rdma: bool = False
     # Listener IP for the RDMA metadata exchange; None falls back to SMG_RDMA_LISTEN_IP
     rdma_listen_ip: str | None = None
     # Full-TTL override (seconds) for leased RDMA slots; None falls back to SMG_RDMA_SLOT_TTL_S
     rdma_slot_ttl_s: int | None = None
-    # Per-request multimodal timing at INFO; False falls back to SMG_LOG_MM_TIMING
-    log_mm_timing: bool = False
-    prefill_max_inflight_requests_per_worker: int = -1
-    prefill_queue_size: int | None = None
-    prefill_queue_timeout_secs: int | None = None
-    # The worker discovery provider. service_discovery=True is the legacy
-    # spelling of discovery_provider="kubernetes"; set one or the other.
-    discovery_provider: str | None = None
+    reasoning_parser: str | None = None
+    # The bound on one Redis history-store call (pool wait, connect and the
+    # operation included)
+    redis_op_timeout_secs: int = 5
+    redis_pool_max: int = 16
+    redis_retention_days: int = 30
+    redis_url: str | None = None
+    # None = follow service_discovery: recovery works by removal + discovery
+    # re-registration, so it defaults on exactly when discovery can complete
+    # the loop (resolved by the Rust core).
+    remove_unhealthy_workers: bool | None = None
+    request_id_headers: list[str] | None = None
+    # Request timeout in seconds
+    request_timeout_secs: int = 1800
+    # Retries (disable_retries switches them off)
+    retry_backoff_multiplier: float = 1.5
+    retry_initial_backoff_ms: int = 50
+    retry_jitter_factor: float = 0.2
+    retry_max_backoff_ms: int = 30_000
+    retry_max_retries: int = 5
+    rl_control_timeout_secs: int = 600  # Timeout for one proxied engine control call
+    rl_fanout_concurrency: int = 32  # Max concurrent engine calls in one fan-out
+    router_selector: dict[str, str] = dataclasses.field(default_factory=dict)
+    # Ordered header names checked for the routing key; first valid wins
+    routing_key_headers: list[str] = dataclasses.field(
+        default_factory=lambda: ["x-smg-routing-key"]
+    )
+    routing_key_override: bool = False
+    schema_config: str | None = None
+    # The optimistic accounting TTL (ms) of the cache-aware selection
+    selection_accounting_ttl_ms: int = 0
+    # The cache-aware selection policy
+    selection_policy: str = "cache-aware-default"
+    selection_temperature: float = 0.0
+    selector: dict[str, str] = dataclasses.field(default_factory=dict)
+    # Server TLS configuration
+    server_cert_path: str | None = None
+    server_key_path: str | None = None
+    # Kubernetes service discovery (the legacy spelling of discovery_provider="kubernetes")
+    service_discovery: bool = False
+    service_discovery_namespace: str | None = None
+    service_discovery_port: int = 80
+    # Grace period in seconds to wait for in-flight requests during shutdown
+    shutdown_grace_period_secs: int = 180
+    # Seconds of upstream silence after which an open SSE stream carries a
+    # keep-alive frame; 0 sends none
+    sse_keepalive_secs: int = 15
+    # Storage-hook request context read from HTTP headers, oriented
+    # {header name: context key}, as `--storage-context-headers
+    # header=context_key` lists them and as the Rust CLI parses the same
+    # entries (the header name is the key, never the value)
+    storage_context_headers: dict[str, str] = dataclasses.field(default_factory=dict)
+    # Storage hooks (WASM)
+    storage_hook_wasm_path: str | None = None
+    stream_body_stall_timeout_secs: int = 300
+    # Per-tenant data-plane keys as (tenant_id, key) pairs (--tenant-api-key)
+    tenant_api_keys: list[tuple] = dataclasses.field(default_factory=list)
+    # The tenant header trust_tenant_header reads
+    tenant_header_name: str = "x-smg-tenant-id"
+    # Per-tenant token/request rate limiting
+    tenant_rate_limit_config: str | None = None
+    tenant_rate_limit_enabled: bool = False
+    # Tokenizer cache configuration
+    tokenizer_cache_enable_l0: bool = False
+    tokenizer_cache_enable_l1: bool = False
+    tokenizer_cache_l0_max_entries: int = 10000
+    # Byte budget of the L0 tokenizer cache (--tokenizer-cache-l0-max-memory)
+    tokenizer_cache_l0_max_memory: int = 256 * 1024 * 1024  # 256MB
+    tokenizer_cache_l1_max_memory: int = 50 * 1024 * 1024  # 50MB
+    tokenizer_path: str | None = None
+    tool_call_parser: str | None = None
+    # Tenant resolution: trust an upstream tenant header (tenant_header_name names it)
+    trust_tenant_header: bool = False
+    upstream_http2: bool = False
+    upstream_pool_idle_timeout_secs: int = 3
+    # Worker overload protection is on by default; False switches both
+    # thresholds off (--disable-worker-overload-protection)
+    worker_overload_protection: bool = True
     # Refuse with a 503 when every worker a request could use is overloaded,
     # instead of routing it to the least-loaded one
     worker_overload_shed: bool = False
-    # Deprecated: the chain index is the only KV index behind cache-aware
-    # routing, so "chain" is the one value and changes nothing; unset by
-    # default so that only a launch line that still passes it is warned
-    kv_index: str | None = None
-    # Liveness: seconds without contact after a transport failure before a
-    # worker is vetoed; seconds without progress before a loaded one is wedged
-    worker_stall_secs: int = 2
-    worker_wedge_secs: int = 3
+    # Absolute per-worker overload thresholds (token usage, waiting requests), as
+    # the Rust CLI defaults them; None switches one signal off
+    worker_overload_token_usage: float | None = 0.8
+    worker_overload_waiting_requests: int | None = 8
+    worker_ports_annotation: str = "smg.ai/worker-ports"
     # Liveness: seconds without any contact from a worker whose KV-event
     # stream pushes load records before it is vetoed as unreachable (0 = off)
     worker_stale_secs: int = 15
+    # Liveness: seconds without contact after a transport failure before a
+    # worker is vetoed
+    worker_stall_secs: int = 2
+    worker_startup_check_interval: int = 30
+    worker_startup_delay: int = 0
+    worker_startup_timeout_secs: int = 1800
     # Warm-up slice for cache-aware routing (see the --worker-warmup-* flags)
+    worker_warmup_blocks: int = 1024
+    worker_warmup_divert_every: int = 8
     worker_warmup_secs: int = 60
     worker_warmup_share: float = 0.25
-    worker_warmup_blocks: int = 1024
     worker_warmup_thin_ratio: float = 0.5
-    worker_warmup_divert_every: int = 8
-    # The cache-aware selection policy and the optimistic accounting TTL
-    selection_policy: str = "cache-aware-default"
-    selection_accounting_ttl_ms: int = 0
-    # Tenant resolution: trust an upstream tenant header, and its name
-    trust_tenant_header: bool = False
-    tenant_header_name: str = "x-smg-tenant-id"
-    # Per-tenant data-plane keys as (tenant_id, key) pairs (--tenant-api-key)
-    tenant_api_keys: list[tuple] = dataclasses.field(default_factory=list)
-    # Priority-aware admission scheduler
-    priority_scheduler_enabled: bool = False
-    priority_scheduler_default_max_class: str = "default"
-    priority_scheduler_config: str | None = None
-    priority_scheduler_tenant_metric_top_n: int = 32
-    # Per-tenant token/request rate limiting
-    tenant_rate_limit_enabled: bool = False
-    tenant_rate_limit_config: str | None = None
-    # Heap profiles of the router process (a jemalloc-profiling build); appended
-    # last: positional callers bind the fields by position
-    jemalloc_prof_dir: str | None = None
-    # Mesh mTLS: the CA, this node's certificate and key (PEM paths); all three or none.
-    mesh_tls_ca_cert: str | None = None
-    mesh_tls_cert: str | None = None
-    mesh_tls_key: str | None = None
-    # Byte budget of the L0 tokenizer cache (--tokenizer-cache-l0-max-memory);
-    # appended last for the same reason
-    tokenizer_cache_l0_max_memory: int = 256 * 1024 * 1024  # 256MB
-    # File discovery (discovery_provider="file"): the JSON manifest, and how
-    # often to reread it besides on every change (None = 30s).
-    discovery_file: str | None = None
-    discovery_check_interval_secs: int | None = None
-    # Most Responses API requests with background: true in flight at once;
-    # one beyond answers 429. 0 = background mode off (such requests run in
-    # the foreground); appended last for the same reason
-    max_background_responses: int = 1024
-    power_of_two_load_metric: str = "expected_wait"
-    # HTTP edge: seconds to receive a complete request head, and seconds a
-    # keep-alive connection may sit with no request in flight (0 disables)
-    header_read_timeout_secs: int = 30
-    idle_connection_timeout_secs: int = 90
-    # Hosts the router fetches client-supplied media URLs from when it processes
-    # media itself (every redirect hop included); None allows any host the
-    # address policy passes
-    mm_allowed_media_domains: list[str] | None = None
-    # Allow media URLs on loopback, link-local or private addresses (an internal
-    # media origin); False falls back to SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS
-    mm_allow_private_media_hosts: bool = False
-    # Seconds of upstream silence after which an open SSE stream carries a
-    # keep-alive frame; 0 sends none; appended last for the same reason
-    sse_keepalive_secs: int = 15
-    # The bound on one history-store call (pool wait, connect and the
-    # operation included); appended last for positional callers
-    postgres_op_timeout_secs: int = 5
-    redis_op_timeout_secs: int = 5
-    # Bounds of the memory history backend: the most stored responses and
-    # conversation items kept (the oldest go first) and how long a record is
-    # kept (0 = until a count bound drops it); appended last for the same reason
-    history_memory_max_responses: int = 10000
-    history_memory_max_items: int = 100000
-    history_memory_retention_secs: int = 86400
-    # Which parser reads a chat completion's reasoning and tool calls: the per-model parsers
-    # ("legacy") or Symphony ("symphony") for the models its registry knows; a request's
-    # X-SMG-Parser header overrides it; appended last for the same reason
-    parser: str = "legacy"
-    # Seconds a Ready worker is kept in Draining before it leaves the registry,
-    # on every removal (a discovery deletion, an unhealthy worker's removal, the
-    # API); 0 removes it at once; appended last for the same reason
-    drain_settle_secs: int = 5
-    # The admin listener (port and bind host) for the control-plane routes; None = the control
-    # plane stays on the data listener; appended last for the same reason
-    admin_port: int | None = None
-    admin_host: str | None = None
-    # Optional fields of the access-log record; [] keeps the record's fields as they are;
-    # appended last for the same reason
-    access_log_fields: list[str] = dataclasses.field(default_factory=list)
+    # Liveness: seconds without progress before a loaded worker is wedged
+    worker_wedge_secs: int = 3
+    # DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped)
+    zmq_engine_count: int | None = None
 
     @staticmethod
     def add_cli_args(
