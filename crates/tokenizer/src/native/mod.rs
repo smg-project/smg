@@ -1136,6 +1136,9 @@ mod tests {
             "日本語のテキスト、한국어 텍스트, 中文文本。",
             "ครับ ผม ชื่อ นาย คำ ไทย",
             "कृपया यह पढ़ें और समझें",
+            "একটি নতুন প্রোগ্রাম 16টি",
+            "ఒక కొత్త కార్యక్రమం",
+            "يَتَلَقَّى مَرْحَبًا",
             "fn main() { println!(\"hi\"); }\n\n\n// done\r\n",
             "a\tb\u{A0}c\u{3000}d\u{2028}e",
             "<｜begin▁of▁sentence｜>hello<｜User｜>q<｜tool▁call▁begin｜>x<｜fim▁hole｜>",
@@ -1156,6 +1159,145 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The letters-only split of the Qwen2 family, under which a combining
+    /// mark (`\p{M}`) starts a new piece; the Qwen3.5-family files carry
+    /// [`QWEN35`], whose `[\p{L}\p{M}]+` keeps a letter and its marks together.
+    const LETTERS_ONLY: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+    /// A byte-level BPE that learned `letter` and `marks` byte by byte and
+    /// then their merge, the way a vocabulary that keeps letters and marks
+    /// together holds a cluster: the letter, the marks and the cluster are
+    /// tokens, and the cluster is reached only from the other two.
+    fn cluster_model(letter: &str, marks: &str) -> BPE {
+        let table = bytes_char();
+        let mut alphabet: Vec<char> = table.to_vec();
+        alphabet.sort_unstable();
+        let mut vocab = Vocab::default();
+        for ch in alphabet {
+            let next = vocab.len() as u32;
+            vocab.insert(ch.to_string(), next);
+        }
+        let mut merges = Merges::new();
+        let mut learn = |left: String, right: String| {
+            let merged = format!("{left}{right}");
+            if !vocab.contains_key(&merged) {
+                let next = vocab.len() as u32;
+                vocab.insert(merged.clone(), next);
+                merges.push((left, right));
+            }
+            merged
+        };
+        let mut chain = |word: &str| {
+            let mut mapped = word.bytes().map(|b| table[usize::from(b)].to_string());
+            let mut token = mapped.next().expect("a non-empty word");
+            for right in mapped {
+                token = learn(token, right);
+            }
+            token
+        };
+        let letter = chain(letter);
+        let marks = chain(marks);
+        learn(letter, marks);
+        BPE::builder()
+            .vocab_and_merges(vocab, merges)
+            .build()
+            .expect("bpe")
+    }
+
+    /// An NFC byte-level tokenizer over `model` with one split `pattern`.
+    fn split_tokenizer(pattern: &str, model: BPE) -> HfTokenizer {
+        let mut tokenizer = HfTokenizer::new(model);
+        tokenizer
+            .with_normalizer(Some(NormalizerWrapper::NFC(NFC)))
+            .expect("normalizer");
+        tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+            split(pattern, SplitDelimiterBehavior::Isolated, false),
+            byte_level(false),
+        ]))));
+        tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+        tokenizer.with_post_processor(Some(ByteLevelProcessor::default().trim_offsets(false)));
+        tokenizer
+    }
+
+    /// The pieces the native pre-tokenizer cuts `text` into.
+    fn native_pieces(native: &NativeEncoder, text: &str) -> Vec<String> {
+        let mut pieces = Vec::new();
+        native.pieces(0, text, &mut |piece| pieces.push(piece.to_owned()));
+        pieces
+    }
+
+    /// A letter followed by its combining `marks` is one piece under a split
+    /// that admits marks, and so one token when the vocabulary has it, and two
+    /// pieces and two tokens under the letters-only split: the native path
+    /// follows the file's pattern either way and gives `tokenizers`' ids on
+    /// the cluster and on `sentence`.
+    fn marks_stay_with_their_letter(letter: &str, marks: &str, sentence: &str) {
+        let cluster = format!("{letter}{marks}");
+        let model = || cluster_model(letter, marks);
+        let with_marks = split_tokenizer(QWEN35, model());
+        let letters_only = split_tokenizer(LETTERS_ONLY, model());
+        let native_with_marks = NativeEncoder::from_tokenizer(&with_marks).expect("native path");
+        let native_letters_only =
+            NativeEncoder::from_tokenizer(&letters_only).expect("native path");
+        assert_eq!(
+            native_pieces(&native_with_marks, &cluster),
+            std::slice::from_ref(&cluster)
+        );
+        assert_eq!(
+            native_pieces(&native_letters_only, &cluster),
+            [letter.to_owned(), marks.to_owned()]
+        );
+        let mut lengths = Vec::new();
+        for (tokenizer, native) in [
+            (&with_marks, &native_with_marks),
+            (&letters_only, &native_letters_only),
+        ] {
+            for text in [cluster.as_str(), sentence] {
+                let reference = tokenizer
+                    .encode(text, false)
+                    .expect("encode")
+                    .get_ids()
+                    .to_vec();
+                let ids = native
+                    .encode(tokenizer.get_model(), text)
+                    .expect("the native path takes NFC text");
+                assert_eq!(ids, reference, "{text:?}");
+            }
+            lengths.push(
+                native
+                    .encode(tokenizer.get_model(), &cluster)
+                    .unwrap()
+                    .len(),
+            );
+        }
+        assert_eq!(lengths, [1, 2], "{cluster:?}");
+    }
+
+    #[test]
+    fn bengali_marks_stay_with_their_letter() {
+        marks_stay_with_their_letter("ট", "\u{9BF}", "একটি নতুন প্রোগ্রাম 16টি");
+    }
+
+    #[test]
+    fn telugu_marks_stay_with_their_letter() {
+        marks_stay_with_their_letter("క", "\u{C3E}", "ఒక కొత్త కార్యక్రమం");
+    }
+
+    #[test]
+    fn thai_marks_stay_with_their_letter() {
+        marks_stay_with_their_letter("น", "\u{E47}", "โปรแกรมใหม่หนึ่ง เน็ต");
+    }
+
+    #[test]
+    fn devanagari_marks_stay_with_their_letter() {
+        marks_stay_with_their_letter("क", "\u{948}", "चाय कैसे बनाएँ");
+    }
+
+    #[test]
+    fn arabic_marks_stay_with_their_letter() {
+        marks_stay_with_their_letter("ق", "\u{64E}\u{651}", "يَتَلَقَّى مَرْحَبًا");
     }
 
     #[test]
