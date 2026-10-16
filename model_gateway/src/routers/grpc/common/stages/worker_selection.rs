@@ -1909,7 +1909,10 @@ mod tests {
         middleware::{ReportedRefusal, TenantRequestMeta},
         policies::{CacheAwareConfig, CacheAwarePolicy, PolicyFactory, TreeHandle, TreeKind},
         routers::{
-            common::{attempt_ledger::AttemptLedger, retry::is_retryable_response},
+            common::{
+                attempt_ledger::{mark_upstream_answer, AttemptLedger},
+                retry::is_retryable_response,
+            },
             grpc::{
                 context::{PreparationOutput, SharedComponents},
                 regular::symphony::template::Templates,
@@ -3104,7 +3107,7 @@ mod tests {
                 stage.reselect(&mut ctx).await.unwrap();
                 match ctx.workers.as_ref().unwrap() {
                     WorkerSelection::Single { worker } => {
-                        assert_eq!(worker.context_length(model_id), Some(64))
+                        assert_eq!(worker.context_length(model_id), Some(64));
                     }
                     WorkerSelection::Disaggregated {
                         prefill, decode, ..
@@ -3117,7 +3120,7 @@ mod tests {
             // Excluding the large worker after an engine answer must not
             // turn this same input into a permanent context-length error.
             let mut failure = error::internal_error("engine_failure", "engine failure");
-            crate::routers::common::attempt_ledger::mark_upstream_answer(&mut failure);
+            mark_upstream_answer(&mut failure);
             let pool = stage.worker_registry.get_by_model(model_id);
             ctx.ledger.settle(
                 &mut failure,
