@@ -1,6 +1,8 @@
 //! A TCP relay in front of a store, for the opt-in tests that need the store
 //! to misbehave on the wire: it can hold every byte (a store that accepts the
-//! connection and does not answer) or delay each chunk (a store far away).
+//! connection and does not answer), delay each chunk (a store far away) or
+//! drop the connection once the store has taken a request and before its
+//! answer arrives (a store that did the work the client never hears of).
 
 #![allow(dead_code)]
 
@@ -9,7 +11,7 @@ use std::{
     net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex, PoisonError,
     },
     thread,
     time::Duration,
@@ -19,6 +21,7 @@ pub struct Relay {
     local: String,
     hold: Arc<AtomicBool>,
     delay_ms: Arc<AtomicU64>,
+    cut_after: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 impl Relay {
@@ -46,7 +49,8 @@ impl Relay {
             .to_string();
         let hold = Arc::new(AtomicBool::new(false));
         let delay_ms = Arc::new(AtomicU64::new(0));
-        let (hold_flag, delay) = (hold.clone(), delay_ms.clone());
+        let cut_after: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+        let (hold_flag, delay, watched) = (hold.clone(), delay_ms.clone(), cut_after.clone());
         thread::spawn(move || {
             for client in listener.incoming() {
                 let Ok(client) = client else { break };
@@ -57,10 +61,18 @@ impl Relay {
                 else {
                     break;
                 };
+                // The two directions of one connection share its cut: the
+                // watched request arms it on the way to the store, the
+                // store's next answer trips it.
+                let cut = Arc::new(AtomicBool::new(false));
                 let (h, d) = (hold_flag.clone(), delay.clone());
-                thread::spawn(move || pump(client_rx, server, h, d));
+                let to_store = Direction::ToStore {
+                    watched: watched.clone(),
+                    arm: cut.clone(),
+                };
+                thread::spawn(move || pump(client_rx, server, h, d, to_store));
                 let (h, d) = (hold_flag.clone(), delay.clone());
-                thread::spawn(move || pump(server_rx, client, h, d));
+                thread::spawn(move || pump(server_rx, client, h, d, Direction::ToClient { cut }));
             }
         });
         let relayed_url = format!("{before}{local}{after}");
@@ -69,6 +81,7 @@ impl Relay {
                 local,
                 hold,
                 delay_ms,
+                cut_after,
             },
             relayed_url,
         ))
@@ -98,6 +111,28 @@ impl Relay {
             Ordering::SeqCst,
         );
     }
+
+    /// Lets the next request that carries `command` through to the store,
+    /// then drops the store's answer to it and closes that connection: the
+    /// store ran the command, the client never learns it. One request; every
+    /// other one, and every later connection, passes.
+    pub fn cut_after(&self, command: &str) {
+        *self
+            .cut_after
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(command.as_bytes().to_vec());
+    }
+}
+
+/// Which way a pump copies, with its part in a cut.
+enum Direction {
+    /// Client to store: a chunk carrying the watched command arms the cut.
+    ToStore {
+        watched: Arc<Mutex<Option<Vec<u8>>>>,
+        arm: Arc<AtomicBool>,
+    },
+    /// Store to client: an armed cut drops the next chunk with the connection.
+    ToClient { cut: Arc<AtomicBool> },
 }
 
 /// Splits `url` into what precedes its `host[:port]`, that authority, and
@@ -119,14 +154,39 @@ fn split_authority(url: &str) -> Result<(&str, &str, &str), String> {
 }
 
 /// Copies one direction of a relayed connection, holding or delaying each
-/// chunk as the relay is set.
-fn pump(mut from: TcpStream, mut to: TcpStream, hold: Arc<AtomicBool>, delay_ms: Arc<AtomicU64>) {
+/// chunk as the relay is set, and playing its part in a cut.
+fn pump(
+    mut from: TcpStream,
+    mut to: TcpStream,
+    hold: Arc<AtomicBool>,
+    delay_ms: Arc<AtomicU64>,
+    direction: Direction,
+) {
     let mut chunk = [0u8; 65536];
     loop {
         let n = match from.read(&mut chunk) {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
+        match &direction {
+            Direction::ToStore { watched, arm } => {
+                let mut watched = watched.lock().unwrap_or_else(PoisonError::into_inner);
+                if watched
+                    .as_deref()
+                    .is_some_and(|command| contains(&chunk[..n], command))
+                {
+                    *watched = None;
+                    arm.store(true, Ordering::SeqCst);
+                }
+            }
+            Direction::ToClient { cut } => {
+                if cut.swap(false, Ordering::SeqCst) {
+                    let _ = to.shutdown(Shutdown::Both);
+                    let _ = from.shutdown(Shutdown::Both);
+                    break;
+                }
+            }
+        }
         while hold.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_millis(20));
         }
@@ -139,4 +199,12 @@ fn pump(mut from: TcpStream, mut to: TcpStream, hold: Arc<AtomicBool>, delay_ms:
         }
     }
     let _ = to.shutdown(Shutdown::Write);
+}
+
+/// Whether `needle` occurs in `haystack`.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }

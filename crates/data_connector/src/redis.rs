@@ -86,6 +86,12 @@ impl RedisStore {
             Err(_elapsed) => Err(StoreContactError::NoAnswer),
         }
     }
+
+    /// The retention of a stored record and of the keys that go with it, in
+    /// seconds; `None` when records are kept for good.
+    fn retention_seconds(&self) -> Option<u64> {
+        self.retention_days.map(|days| days * 24 * 60 * 60)
+    }
 }
 
 impl Clone for RedisStore {
@@ -911,12 +917,13 @@ impl RedisResponseStorage {
     fn index_writes(&self, pipe: &mut redis::Pipeline, key: &str, response: &StoredResponse) {
         let sr = &self.store.schema.responses;
         let response_id_str = response.id.0.as_str();
+        let retention = self.store.retention_seconds();
         if !sr.is_skipped("raw_response") {
             for item_id in output_item_ids(&response.raw_response) {
                 let item_key = self.output_item_key(item_id);
-                match self.store.retention_days {
-                    Some(days) => {
-                        pipe.set_ex(item_key, response_id_str, days * 24 * 60 * 60);
+                match retention {
+                    Some(seconds) => {
+                        pipe.set_ex(item_key, response_id_str, seconds);
                     }
                     None => {
                         pipe.set(item_key, response_id_str);
@@ -924,9 +931,47 @@ impl RedisResponseStorage {
                 }
             }
         }
-        if let Some(days) = self.store.retention_days {
-            pipe.expire(key, (days * 24 * 60 * 60) as i64);
+        if let Some(seconds) = retention {
+            pipe.expire(key, seconds as i64);
         }
+    }
+
+    /// One run of [`store_if_open_script`] on the hash under `key`, answered
+    /// with the script's verdict: the output-item keys of `raw_response` go
+    /// with the hash as the further keys, then the response id they point
+    /// at, the retention and the hash's `fields`.
+    async fn write_if_open(
+        &self,
+        conn: &mut Connection,
+        key: &str,
+        response_id: &str,
+        raw_response: &Value,
+        fields: &[(&str, String)],
+    ) -> ResponseResult<String> {
+        let sr = &self.store.schema.responses;
+        let script = redis::Script::new(&store_if_open_script());
+        let mut invocation = script.key(key);
+        if !sr.is_skipped("raw_response") {
+            for item_id in output_item_ids(raw_response) {
+                invocation.key(self.output_item_key(item_id));
+            }
+        }
+        let retention = self
+            .store
+            .retention_seconds()
+            .map(|seconds| seconds.to_string())
+            .unwrap_or_default();
+        invocation
+            .arg(self.object_field_arg())
+            .arg(response_id)
+            .arg(retention);
+        for (field, value) in fields {
+            invocation.arg(*field).arg(value);
+        }
+        invocation
+            .invoke_async(conn)
+            .await
+            .map_err(ResponseStorageError::from_redis)
     }
 
     /// Index the response by its safety identifier, if it has one.
@@ -1118,25 +1163,24 @@ impl ResponseStorage for RedisResponseStorage {
             .await
             .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
 
-        // The status check and the hash write run as one script: nothing
-        // closes the record between them.
-        let script = redis::Script::new(&store_if_open_script());
-        let mut invocation = script.key(&key);
-        invocation.arg(self.object_field_arg());
-        for (field, value) in &fields {
-            invocation.arg(*field).arg(value);
-        }
-        let outcome: String = invocation
-            .invoke_async(&mut conn)
-            .await
-            .map_err(ResponseStorageError::from_redis)?;
+        // The status check, the hash write, the output-item keys and the
+        // expiry run as one script: nothing closes the record between the
+        // check and the write, and the record is never stored without the
+        // keys that find it, whatever becomes of the connection afterwards.
+        let outcome = self
+            .write_if_open(
+                &mut conn,
+                &key,
+                &response.id.0,
+                &response.raw_response,
+                &fields,
+            )
+            .await?;
         match outcome.as_str() {
             "stored" => {
-                let mut pipe = redis::pipe();
-                self.index_writes(&mut pipe, &key, &response);
-                pipe.query_async::<()>(&mut conn)
-                    .await
-                    .map_err(ResponseStorageError::from_redis)?;
+                // A repeat of the entry the record's first store made (the
+                // identifier does not change between the writes of one
+                // response), so a failure here loses nothing.
                 self.index_by_identifier(&mut conn, &response).await?;
                 Ok(ConditionalStore::Stored)
             }
@@ -1169,29 +1213,20 @@ impl ResponseStorage for RedisResponseStorage {
             .get()
             .await
             .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
-        // The same script as the full store, with the object's field alone.
-        let script = redis::Script::new(&store_if_open_script());
-        let outcome: String = script
-            .key(&key)
-            .arg(sr.col("raw_response"))
-            .arg(sr.col("raw_response"))
-            .arg(&json_raw_response)
-            .invoke_async(&mut conn)
-            .await
-            .map_err(ResponseStorageError::from_redis)?;
+        // The same script as the full store, with the object's field alone;
+        // the output-item keys and the expiry follow the object in the same
+        // run.
+        let outcome = self
+            .write_if_open(
+                &mut conn,
+                &key,
+                &id.0,
+                &raw_response,
+                &[(sr.col("raw_response"), json_raw_response)],
+            )
+            .await?;
         match outcome.as_str() {
-            "stored" => {
-                // The output-item keys and the expiry follow the object.
-                let mut moved = StoredResponse::new(None);
-                moved.id = id.clone();
-                moved.raw_response = raw_response;
-                let mut pipe = redis::pipe();
-                self.index_writes(&mut pipe, &key, &moved);
-                pipe.query_async::<()>(&mut conn)
-                    .await
-                    .map_err(ResponseStorageError::from_redis)?;
-                Ok(ConditionalStore::Stored)
-            }
+            "stored" => Ok(ConditionalStore::Stored),
             "closed" => {
                 drop(conn);
                 Ok(match self.get_response(id).await? {
@@ -1441,15 +1476,21 @@ impl ResponseStorage for RedisResponseStorage {
 }
 
 /// The script of [`ResponseStorage::store_response_if_open`]: `KEYS[1]` is
-/// the response's hash, `ARGV[1]` the name of the field holding the stored
-/// object (empty when the schema skips it), `ARGV[2..]` the hash's fields
-/// and values. It writes the fields only while the stored object's status is
-/// not terminal ([`TERMINAL_RESPONSE_STATUSES`]) and answers `stored`,
-/// `closed` or `missing`. A hash that exists without the object field, or
-/// without a status in it, counts as open, as a row whose object column is
-/// NULL does in the SQL stores; so does every existing hash under a schema
-/// that skips the field, where the SQL stores' update is plain. Only a hash
-/// that is gone is `missing`.
+/// the response's hash and `KEYS[2..]` the output-item keys that point at
+/// it; `ARGV[1]` the name of the field holding the stored object (empty when
+/// the schema skips it), `ARGV[2]` the response id (what each output-item
+/// key holds), `ARGV[3]` the retention in seconds (empty: none), `ARGV[4..]`
+/// the hash's fields and values. It writes only while the stored object's
+/// status is not terminal ([`TERMINAL_RESPONSE_STATUSES`]) and answers
+/// `stored`, `closed` or `missing`. A hash that exists without the object
+/// field, or without a status in it, counts as open, as a row whose object
+/// column is NULL does in the SQL stores; so does every existing hash under
+/// a schema that skips the field, where the SQL stores' update is plain.
+/// Only a hash that is gone is `missing`. The fields, the output-item keys
+/// and the hash's expiry are written in the one run: a record is never
+/// stored without the keys that find it, whatever becomes of the connection
+/// afterwards (a retry finds the record closed and writes nothing more, so
+/// the keys would never come).
 fn store_if_open_script() -> String {
     let closed = TERMINAL_RESPONSE_STATUSES
         .iter()
@@ -1467,7 +1508,11 @@ if raw then
   if ok and type(doc) == 'table' and type(doc['status']) == 'string' then status = doc['status'] end
 end
 if {closed} then return 'closed' end
-for i = 2, #ARGV - 1, 2 do redis.call('HSET', KEYS[1], ARGV[i], ARGV[i + 1]) end
+for i = 4, #ARGV - 1, 2 do redis.call('HSET', KEYS[1], ARGV[i], ARGV[i + 1]) end
+for k = 2, #KEYS do
+  if ARGV[3] == '' then redis.call('SET', KEYS[k], ARGV[2]) else redis.call('SETEX', KEYS[k], ARGV[3], ARGV[2]) end
+end
+if ARGV[3] ~= '' then redis.call('EXPIRE', KEYS[1], ARGV[3]) end
 return 'stored'
 "
     )
@@ -1546,6 +1591,28 @@ mod tests {
     }
 
     #[test]
+    fn store_if_open_script_writes_the_output_item_keys_and_the_expiry_with_the_fields() {
+        let script = store_if_open_script();
+        let check = script.find("return 'closed'").expect("the status check");
+        // Everything a stored record carries is written in the one run, after
+        // the check: the fields, one key per output item under the retention
+        // (a plain SET without one), the hash's expiry.
+        for write in [
+            "for i = 4, #ARGV - 1, 2 do redis.call('HSET', KEYS[1], ARGV[i], ARGV[i + 1]) end",
+            "for k = 2, #KEYS do",
+            "if ARGV[3] == '' then redis.call('SET', KEYS[k], ARGV[2]) \
+             else redis.call('SETEX', KEYS[k], ARGV[3], ARGV[2]) end",
+            "if ARGV[3] ~= '' then redis.call('EXPIRE', KEYS[1], ARGV[3]) end",
+        ] {
+            let at = script
+                .find(write)
+                .unwrap_or_else(|| panic!("the script writes: {write}"));
+            assert!(at > check, "written after the status check: {write}");
+        }
+        assert!(script.trim_end().ends_with("return 'stored'"));
+    }
+
+    #[test]
     fn the_object_field_argument_is_empty_when_the_schema_skips_the_column() {
         let storage = |schema: Option<SchemaConfig>| {
             RedisResponseStorage::new(
@@ -1572,5 +1639,21 @@ mod tests {
             .skip_columns
             .insert("raw_response".to_string());
         assert_eq!(storage(Some(skipped)).object_field_arg(), "");
+    }
+
+    #[test]
+    fn the_retention_in_seconds_is_the_configured_days() {
+        let store = |retention_days: Option<u64>| {
+            RedisStore::new(RedisConfig {
+                url: "redis://127.0.0.1:1/0".to_string(),
+                pool_max: 1,
+                op_timeout_secs: 1,
+                schema: None,
+                retention_days,
+            })
+            .expect("a pool is built without a connection")
+        };
+        assert_eq!(store(Some(2)).retention_seconds(), Some(172_800));
+        assert_eq!(store(None).retention_seconds(), None);
     }
 }

@@ -7,14 +7,18 @@
 //!   DATA_CONNECTOR_TEST_REDIS_URL=redis://127.0.0.1:6379/0 \
 //!       cargo test -p data-connector --test redis_integration -- --ignored
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use chrono::{TimeDelta, Utc};
 use data_connector::{
     create_storage, ConditionalStore, ConversationItemId, HistoryBackend, ListParams,
-    NewConversation, NewConversationItem, RedisConfig, ResponseId, SchemaConfig, SortOrder,
-    StorageBundle, StorageFactoryConfig, StoredResponse,
+    NewConversation, NewConversationItem, RedisConfig, ResponseId, ResponseStorage, SchemaConfig,
+    SortOrder, StorageBundle, StorageFactoryConfig, StoredResponse,
 };
+use redis::aio::MultiplexedConnection;
 use serde_json::json;
 
 mod common;
@@ -674,4 +678,215 @@ async fn a_conditional_store_without_an_object_column_writes_while_the_record_ex
         .expect("the record");
     assert_eq!(read.raw_response["status"], "completed");
     resp.delete_response(&id).await.expect("delete response");
+}
+
+/// A background record on its way through the store, reached through a
+/// relay: stored as `queued`, moved to `in_progress` once (which leaves the
+/// conditional script in the server's cache, so the next conditional write
+/// is one `EVALSHA` whose answer the relay can drop), its retention
+/// shortened to 600 s so a refresh shows. With it the result that closes it
+/// (two output items) and a connection of the test's own to the server for
+/// what the storage does not expose.
+struct OpenRecord {
+    relay: Relay,
+    storage: Arc<dyn ResponseStorage>,
+    server: MultiplexedConnection,
+    result: StoredResponse,
+    msg_id: String,
+    rs_id: String,
+    hash_key: String,
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "the helpers of the tests below: a failure in one fails the test"
+)]
+impl OpenRecord {
+    async fn through_a_relay(url: &str) -> Self {
+        let (relay, relayed_url) = Relay::in_front_of(url, 6379).expect("start the relay");
+        let storage = redis_bundle(&relayed_url)
+            .await
+            .expect("failed to initialize Redis storage")
+            .response_storage;
+        let mut server = redis::Client::open(url)
+            .expect("a client for the test's own commands")
+            .get_multiplexed_async_connection()
+            .await
+            .expect("connect");
+
+        let (mut result, msg_id, rs_id) = response_with_output_items();
+        result.raw_response["status"] = json!("completed");
+        let id = result.id.clone();
+        let mut queued = result.clone();
+        queued.raw_response = json!({"id": id.0, "status": "queued", "output": []});
+        storage
+            .store_response(queued)
+            .await
+            .expect("store the queued record");
+        assert!(matches!(
+            storage
+                .update_response_object_if_open(
+                    &id,
+                    json!({"id": id.0, "status": "in_progress", "output": []})
+                )
+                .await
+                .expect("the first transition"),
+            ConditionalStore::Stored
+        ));
+        let hash_key = format!("response:{}", id.0);
+        let _: () = redis::cmd("EXPIRE")
+            .arg(&hash_key)
+            .arg(600)
+            .query_async(&mut server)
+            .await
+            .expect("shorten the record's retention");
+        Self {
+            relay,
+            storage,
+            server,
+            result,
+            msg_id,
+            rs_id,
+            hash_key,
+        }
+    }
+
+    /// The seconds left on `key` (`-2`: no such key).
+    async fn ttl(&mut self, key: &str) -> i64 {
+        redis::cmd("TTL")
+            .arg(key)
+            .query_async(&mut self.server)
+            .await
+            .expect("TTL")
+    }
+
+    /// The response the output-item key of `item_id` finds.
+    async fn found_by(&self, item_id: &str) -> Option<ResponseId> {
+        self.storage
+            .find_response_by_output_item(item_id)
+            .await
+            .expect("lookup by output item id")
+            .map(|response| response.id)
+    }
+
+    /// The record holds the object in `status`, each of its output items
+    /// finds it, the keys carry the retention and the hash has it afresh.
+    async fn assert_holds(&mut self, status: &str) {
+        let current = self
+            .storage
+            .get_response(&self.result.id)
+            .await
+            .expect("read")
+            .expect("the record");
+        assert_eq!(current.raw_response["status"], status);
+        for item_id in [self.msg_id.clone(), self.rs_id.clone()] {
+            assert_eq!(
+                self.found_by(&item_id).await.as_ref(),
+                Some(&self.result.id),
+                "{item_id}: the record holds the object, so the item's key finds it"
+            );
+            let left = self.ttl(&format!("output_item:{item_id}")).await;
+            assert!(
+                left > 0 && left <= 86_400,
+                "{item_id}: the key carries the retention ({left} s left)"
+            );
+        }
+        let left = self.ttl(&self.hash_key.clone()).await;
+        assert!(
+            left > 600,
+            "the write refreshes the record's retention ({left} s left)"
+        );
+    }
+}
+
+/// The connection drops once the conditional store's script has run and
+/// before its answer arrives: the call fails, the record holds the result,
+/// and the retry finds it closed. The output-item keys that find the
+/// response and the refreshed retention are there all the same: the script
+/// writes them with the record. Before, a pipeline after the script wrote
+/// them, the drop lost it, and the retry (refused: the record is closed)
+/// never redid it, so an item reference to the response's output found
+/// nothing for good.
+#[tokio::test]
+#[ignore = "requires a live Redis server; set DATA_CONNECTOR_TEST_REDIS_URL and run with -- --ignored"]
+async fn a_conditional_store_whose_answer_is_lost_has_written_its_output_item_keys() {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let mut record = OpenRecord::through_a_relay(&url).await;
+
+    record.relay.cut_after("EVALSHA");
+    let lost = record
+        .storage
+        .store_response_if_open(record.result.clone())
+        .await;
+    assert!(
+        lost.is_err(),
+        "the answer went with the connection, so the call fails: {lost:?}"
+    );
+    record.assert_holds("completed").await;
+
+    // The retry finds the record closed with this very result and writes
+    // nothing more; the keys stay.
+    let ConditionalStore::Closed(current) = record
+        .storage
+        .store_response_if_open(record.result.clone())
+        .await
+        .expect("the retry")
+    else {
+        panic!("the retry finds the record closed");
+    };
+    assert_eq!(current.raw_response["status"], "completed");
+    record.assert_holds("completed").await;
+
+    record
+        .storage
+        .delete_response(&record.result.id)
+        .await
+        .expect("delete response");
+    assert!(record.found_by(&record.msg_id).await.is_none());
+}
+
+/// The same drop on a status transition that carries output items (a cancel
+/// with the output so far): the moved object's items find the response and
+/// the retention is refreshed, whatever became of the connection after the
+/// script.
+#[tokio::test]
+#[ignore = "requires a live Redis server; set DATA_CONNECTOR_TEST_REDIS_URL and run with -- --ignored"]
+async fn a_conditional_object_update_whose_answer_is_lost_has_written_its_output_item_keys() {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let mut record = OpenRecord::through_a_relay(&url).await;
+    let mut cancelled = record.result.raw_response.clone();
+    cancelled["status"] = json!("cancelled");
+
+    record.relay.cut_after("EVALSHA");
+    let lost = record
+        .storage
+        .update_response_object_if_open(&record.result.id, cancelled.clone())
+        .await;
+    assert!(
+        lost.is_err(),
+        "the answer went with the connection, so the call fails: {lost:?}"
+    );
+    record.assert_holds("cancelled").await;
+
+    let ConditionalStore::Closed(current) = record
+        .storage
+        .update_response_object_if_open(&record.result.id, cancelled)
+        .await
+        .expect("the retry")
+    else {
+        panic!("the retry finds the record closed");
+    };
+    assert_eq!(current.raw_response["status"], "cancelled");
+    record.assert_holds("cancelled").await;
+
+    record
+        .storage
+        .delete_response(&record.result.id)
+        .await
+        .expect("delete response");
+    assert!(record.found_by(&record.msg_id).await.is_none());
 }
