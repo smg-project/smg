@@ -1985,7 +1985,7 @@ mod request_release_tests {
     };
 
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-    use futures::Stream;
+    use futures::{Stream, StreamExt};
     use llm_tokenizer::{
         traits::{Decoder, Tokenizer},
         HuggingFaceTokenizer, MockTokenizer, TokenizerRegistry,
@@ -2021,6 +2021,7 @@ mod request_release_tests {
                     background::{queued_response, store_record},
                     BackgroundResponses, BackgroundStream,
                 },
+                harmony::serve_harmony_responses_stream,
                 multimodal::{
                     MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
                     SUPPORTS_VISION_LABEL,
@@ -4397,6 +4398,24 @@ mod request_release_tests {
         worker_registry: &Arc<WorkerRegistry>,
         background_slots: usize,
     ) -> ResponsesContext {
+        responses_context_over(
+            Endpoint::Chat,
+            Mode::Regular,
+            worker_registry,
+            background_slots,
+        )
+        .await
+    }
+
+    /// [`responses_context`] over the `endpoint` pipeline of `worker_registry`
+    /// in `mode`: the chat pipeline, whose body the Responses relay reads, or
+    /// the Harmony pipeline, whose engine stream the Harmony reader reads.
+    async fn responses_context_over(
+        endpoint: Endpoint,
+        mode: Mode,
+        worker_registry: &Arc<WorkerRegistry>,
+        background_slots: usize,
+    ) -> ResponsesContext {
         let deps = PipelineDeps::pair(
             worker_registry.clone(),
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
@@ -4404,8 +4423,8 @@ mod request_release_tests {
             None,
             Duration::from_secs(60),
         );
-        let pipeline =
-            RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
+        let pipeline = RequestPipeline::build(endpoint, mode, &deps)
+            .unwrap_or_else(|| panic!("a {endpoint:?} pipeline in {mode:?} mode"));
         ResponsesContext::new(
             Arc::new(pipeline),
             components(Arc::clone(worker_registry)).await,
@@ -4547,6 +4566,202 @@ mod request_release_tests {
             anonymous(),
             MODEL.to_string(),
             BackgroundStream::new(slot),
+        )
+        .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        first_response_read(&worker).await;
+        assert_ne!(
+            stored_status(&ctx, id).await,
+            "completed",
+            "the client leaves before the generation ends"
+        );
+
+        drop(response);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while stored_status(&ctx, id).await != "completed" {
+            assert!(
+                Instant::now() < deadline,
+                "the background response did not complete after its client left: {}",
+                stored_status(&ctx, id).await
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            scheduler
+                .aborted_request_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "a background generation is not aborted when its client leaves"
+        );
+        wait_for_load_released(&worker, deadline).await;
+    }
+
+    /// The id a streamed Responses body announces in its first frame
+    /// (`response.created`).
+    fn announced_response_id(frame: &[u8]) -> String {
+        let frame = std::str::from_utf8(frame).expect("UTF-8 SSE");
+        let data = frame
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("a data line in the first frame");
+        let event: serde_json::Value = serde_json::from_str(data).expect("SSE JSON");
+        assert_eq!(event["type"], "response.created", "{event}");
+        event["response"]["id"]
+            .as_str()
+            .expect("the response id")
+            .to_string()
+    }
+
+    /// Harmony Responses over the gRPC regular path, where the Harmony reader
+    /// reads the engine stream itself: the client leaves a foreground stream
+    /// while the engine's generation wedged after its first token. The abort
+    /// reaches the engine the moment the body is dropped, not when the engine
+    /// next speaks; the worker's load goes with the body; and nothing of the
+    /// abandoned stream is stored, not a completed record of its partial
+    /// output.
+    #[tokio::test]
+    async fn a_client_that_leaves_a_stalled_harmony_responses_stream_aborts_it_on_the_engine_at_once(
+    ) {
+        let scheduler = GatedScheduler {
+            hold_after_first: true,
+            ..Default::default()
+        };
+        let port = spawn_stub(scheduler.clone()).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker(&worker_registry, port, WorkerType::Regular);
+        let ctx =
+            responses_context_over(Endpoint::Harmony, Mode::Regular, &worker_registry, 0).await;
+
+        let response = serve_harmony_responses_stream(
+            &ctx,
+            Arc::unwrap_or_clone(responses_request(false)),
+            anonymous(),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        // The first frame announces the response; the rest of the body is
+        // left unread, as a client that stopped reading leaves it.
+        let mut body = response.into_body().into_data_stream();
+        let first = body
+            .next()
+            .await
+            .expect("the first frame")
+            .expect("a readable frame");
+        let id = announced_response_id(&first);
+        first_response_read(&worker).await;
+        assert!(
+            scheduler
+                .aborted_request_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "nothing is aborted while the client reads"
+        );
+        assert_eq!(worker.load(), 1);
+
+        drop(body);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        wait_for_abort(&scheduler, deadline).await;
+        wait_for_load_released(&worker, deadline).await;
+        assert_eq!(
+            stored_status(&ctx, &id).await,
+            serde_json::Value::Null,
+            "nothing of an abandoned foreground stream is stored"
+        );
+    }
+
+    /// Harmony Responses over the gRPC PD path: the same client leaves while
+    /// the decode side wedged after its first token. The decode engine receives
+    /// the abort at once and both sides end with their load released.
+    #[tokio::test]
+    async fn a_client_that_leaves_a_stalled_harmony_responses_pd_stream_aborts_the_decode_leg_at_once(
+    ) {
+        let prefill_port = spawn_stub(GatedScheduler::default()).await;
+        let decode_scheduler = GatedScheduler {
+            hold_after_first: true,
+            ..Default::default()
+        };
+        let decode_port = spawn_stub(decode_scheduler.clone()).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let prefill = register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+        let decode = register_worker(&worker_registry, decode_port, WorkerType::Decode);
+        let ctx =
+            responses_context_over(Endpoint::Harmony, Mode::PrefillDecode, &worker_registry, 0)
+                .await;
+
+        let response = serve_harmony_responses_stream(
+            &ctx,
+            Arc::unwrap_or_clone(responses_request(false)),
+            anonymous(),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        first_response_read(&decode).await;
+        assert!(
+            decode_scheduler
+                .aborted_request_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "nothing is aborted while the client reads"
+        );
+
+        drop(response);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        wait_for_abort(&decode_scheduler, deadline).await;
+        while prefill.load() != 0 || decode.load() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the sides' load stayed at {} and {} after the body was dropped",
+                prefill.load(),
+                decode.load()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Harmony Responses, `background: true`: the generation outlives its
+    /// client on purpose. The client leaves the stream once the engine's
+    /// first token was read; nothing is aborted, the work runs to the
+    /// engine's end and the record under the response id completes.
+    #[tokio::test]
+    async fn a_client_that_leaves_a_background_harmony_responses_stream_leaves_its_generation_to_complete(
+    ) {
+        // The engine's first token after a second, its end a second later:
+        // the client is gone in between.
+        let scheduler = GatedScheduler {
+            frame_gap: Some(Duration::from_secs(1)),
+            ..Default::default()
+        };
+        let port = spawn_stub(scheduler.clone()).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker(&worker_registry, port, WorkerType::Regular);
+        let ctx =
+            responses_context_over(Endpoint::Harmony, Mode::Regular, &worker_registry, 1).await;
+        let request = responses_request(true);
+        let id = "resp_background_harmony_client_leaves";
+        let slot = ctx.background.admit(id).expect("a background slot");
+        store_record(
+            &ctx.response_storage,
+            &queued_response(id, &request),
+            &request,
+            None,
+            None,
+        )
+        .await
+        .expect("the queued record is stored");
+
+        let response = serve_harmony_responses_stream(
+            &ctx,
+            Arc::unwrap_or_clone(request),
+            anonymous(),
+            Some(BackgroundStream::new(slot)),
         )
         .await;
         assert_eq!(response.status(), http::StatusCode::OK);
