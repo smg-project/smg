@@ -6,11 +6,13 @@ without starting actual router instances.
 """
 
 import argparse
+import re
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from smg.launch_router import RouterArgs, parse_router_args
-from smg.router import policy_from_str
+from smg.router import Router, policy_from_str
 from smg.smg_rs import get_available_reasoning_parsers, get_available_tool_call_parsers
 
 
@@ -1831,6 +1833,7 @@ class TestRouterArgsFieldOrder:
         "history_memory_max_items",
         "history_memory_retention_secs",
         "parser",
+        "drain_settle_secs",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -2016,3 +2019,92 @@ class TestParserNames:
             "muse",
             "muse",
         )
+
+
+class TestDrainSettleSecs:
+    """--drain-settle-secs is a launcher option with the Rust CLI's default (5 s), by
+    both spellings, and reaches the Rust router; a launcher-started router used to
+    drain for 5 s with no way to say otherwise."""
+
+    def test_default_is_the_rust_cli_default(self):
+        assert RouterArgs().drain_settle_secs == 5
+        assert parse_router_args([]).drain_settle_secs == 5
+
+    def test_value_lands_on_the_dataclass(self):
+        assert parse_router_args(["--drain-settle-secs", "0"]).drain_settle_secs == 0
+        assert parse_router_args(["--drain-settle-secs", "30"]).drain_settle_secs == 30
+
+    def test_negative_is_refused_at_parse_time(self):
+        with pytest.raises(SystemExit):
+            parse_router_args(["--drain-settle-secs", "-1"])
+
+    def test_router_prefixed_spelling(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        namespace = parser.parse_args(["--router-drain-settle-secs", "12"])
+        router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
+        assert router_args.drain_settle_secs == 12
+
+    def test_reaches_the_rust_router(self):
+        with patch("smg.router._Router") as rust_router:
+            Router.from_args(RouterArgs(worker_urls=["http://w:8000"], drain_settle_secs=12))
+        assert rust_router.call_args.kwargs["drain_settle_secs"] == 12
+
+
+class TestStorageContextHeadersEntries:
+    """A --storage-context-headers entry without '=' is refused with the Rust CLI's
+    message, where it used to be skipped and the router started with no mapping."""
+
+    REFUSAL = "Invalid value for field 'storage_context_headers': x-tenant - expected 'header-name=context-key'"
+
+    def test_entry_without_equals_is_refused(self):
+        with pytest.raises(ValueError, match=re.escape(self.REFUSAL)):
+            parse_router_args(["--storage-context-headers", "x-tenant"])
+
+    def test_router_prefixed_spelling_is_refused_too(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        namespace = parser.parse_args(
+            ["--router-storage-context-headers", "x-user=user_id", "x-tenant"]
+        )
+        with pytest.raises(ValueError, match=re.escape(self.REFUSAL)):
+            RouterArgs.from_cli_args(namespace, use_router_prefix=True)
+
+    def test_well_formed_entries_map_header_to_context_key(self):
+        router_args = parse_router_args(
+            ["--storage-context-headers", "x-tenant=tenant_id", "x-user=user=v2"]
+        )
+        assert router_args.storage_context_headers == {"x-tenant": "tenant_id", "x-user": "user=v2"}
+
+    def test_label_selectors_keep_skipping_a_bare_token(self):
+        # The Rust CLI skips a selector token without '=' too; only the header
+        # mapping is refused by it.
+        assert parse_router_args(["--selector", "app", "tier=engine"]).selector == {
+            "tier": "engine"
+        }
+
+
+class TestRustCliSecondSpellings:
+    """The Rust CLI's spellings of the options the launcher named differently parse
+    onto the same field, plain and --router- prefixed."""
+
+    @pytest.mark.parametrize(
+        ("cli_spelling", "launcher_spelling", "value", "field"),
+        [
+            ("--eviction-interval", "--eviction-interval-secs", "30", "eviction_interval_secs"),
+            ("--runtime", "--backend", "vllm", "backend"),
+            ("--oracle-dsn", "--oracle-connect-descriptor", "db_high", "oracle_connect_descriptor"),
+            ("--oracle-user", "--oracle-username", "admin", "oracle_username"),
+            ("--postgres-pool-max-size", "--postgres-pool-max", "8", "postgres_pool_max"),
+            ("--redis-pool-max-size", "--redis-pool-max", "8", "redis_pool_max"),
+        ],
+    )
+    def test_both_spellings_parse_alike(self, cli_spelling, launcher_spelling, value, field):
+        expected = int(value) if value.isdigit() else value
+        assert getattr(parse_router_args([cli_spelling, value]), field) == expected
+        assert getattr(parse_router_args([launcher_spelling, value]), field) == expected
+        parser = argparse.ArgumentParser(allow_abbrev=False)
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        namespace = parser.parse_args([f"--router-{cli_spelling[2:]}", value])
+        router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
+        assert getattr(router_args, field) == expected

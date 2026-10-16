@@ -1,15 +1,16 @@
 """The Python launcher's side of the gateway's command line.
 
-``RouterArgs`` carries the router settings the launcher exposes (the Rust
-core's ``Router`` takes one more, the drain settle time, which the launcher
-leaves at its default), in a frozen positional order (new fields are appended
-at the end, never inserted: callers build it positionally). ``add_cli_args`` is the argparse
+``RouterArgs`` carries the router settings the launcher exposes, in a frozen
+positional order (new fields are appended at the end, never inserted: callers
+build it positionally). ``add_cli_args`` is the argparse
 mapping of those settings, one option per Rust CLI flag with the same name,
 default and second spelling, grouped as the CLI's help headings;
 ``from_cli_args`` reads a parsed namespace back into ``RouterArgs`` (with the
 ``--router-`` prefixed spellings taking precedence over the backend's when
 the launcher is embedded in a serving command); the ``_parse_*`` helpers
 mirror the Rust parsers of the flags whose values have a shape.
+``tests/test_cli_parity.py`` reads the Rust CLI's flags from its source and
+pins the option set, second spellings included, against them.
 """
 
 from __future__ import annotations
@@ -407,6 +408,10 @@ class RouterArgs:
     # ("legacy") or Symphony ("symphony") for the models its registry knows; a request's
     # X-SMG-Parser header overrides it; appended last for the same reason
     parser: str = "legacy"
+    # Seconds a Ready worker is kept in Draining before it leaves the registry,
+    # on every removal (a discovery deletion, an unhealthy worker's removal, the
+    # API); 0 removes it at once; appended last for the same reason
+    drain_settle_secs: int = 5
 
     @staticmethod
     def add_cli_args(
@@ -968,6 +973,7 @@ class RouterArgs:
         )
         routing_group.add_argument(
             f"--{prefix}eviction-interval-secs",
+            f"--{prefix}eviction-interval",
             type=int,
             default=RouterArgs.eviction_interval_secs,
             help="Interval in seconds between cache eviction operations",
@@ -1912,6 +1918,17 @@ class RouterArgs:
                 " it off under discovery"
             ),
         )
+        health_group.add_argument(
+            f"--{prefix}drain-settle-secs",
+            type=_non_negative_int,
+            default=RouterArgs.drain_settle_secs,
+            help=(
+                "Seconds to keep a Ready worker in Draining before removing it from the"
+                " registry, on every removal (a discovery deletion, an unhealthy worker's"
+                f" removal under --{prefix}remove-unhealthy-workers, the API); a worker's"
+                " spec may override it per worker. 0 removes immediately without draining"
+            ),
+        )
         # Tokenizer configuration
         tokenizer_group.add_argument(
             f"--{prefix}model-path",
@@ -2023,6 +2040,7 @@ class RouterArgs:
         # Backend selection
         backend_group.add_argument(
             f"--{prefix}backend",
+            f"--{prefix}runtime",
             type=str,
             default=RouterArgs.backend,
             choices=["sglang", "openai", "anthropic", "vllm", "tokenspeed"],
@@ -2109,12 +2127,14 @@ class RouterArgs:
         )
         oracle_group.add_argument(
             f"--{prefix}oracle-connect-descriptor",
+            f"--{prefix}oracle-dsn",
             type=str,
             default=os.getenv("ATP_DSN"),
             help="Oracle connection descriptor/DSN (full connection string) (env: ATP_DSN)",
         )
         oracle_group.add_argument(
             f"--{prefix}oracle-username",
+            f"--{prefix}oracle-user",
             type=str,
             default=os.getenv("ATP_USER"),
             help="Oracle database username (env: ATP_USER)",
@@ -2159,6 +2179,7 @@ class RouterArgs:
         )
         postgres_group.add_argument(
             f"--{prefix}postgres-pool-max",
+            f"--{prefix}postgres-pool-max-size",
             type=int,
             default=int(os.getenv("POSTGRES_POOL_MAX", RouterArgs.postgres_pool_max)),
             help="Maximum PostgreSQL connection pool size (default: 16, env: POSTGRES_POOL_MAX)",
@@ -2180,6 +2201,7 @@ class RouterArgs:
         )
         redis_group.add_argument(
             f"--{prefix}redis-pool-max",
+            f"--{prefix}redis-pool-max-size",
             type=int,
             default=int(os.getenv("REDIS_POOL_MAX", RouterArgs.redis_pool_max)),
             help="Maximum Redis connection pool size (default: 16, env: REDIS_POOL_MAX)",
@@ -2485,7 +2507,7 @@ class RouterArgs:
         args_dict["router_selector"] = cls._parse_selector(
             cli_args_dict.get(f"{prefix}router_selector", None)
         )
-        args_dict["storage_context_headers"] = cls._parse_selector(
+        args_dict["storage_context_headers"] = cls._parse_storage_context_headers(
             cli_args_dict.get(f"{prefix}storage_context_headers", None)
         )
         args_dict["model_aliases"] = cls._parse_model_aliases(
@@ -2556,12 +2578,10 @@ class RouterArgs:
 
     @staticmethod
     def _parse_selector(selector_list):
-        """``key=value`` entries as ``{key: value}``: the label selectors, and
-        ``--storage-context-headers``, whose key is the header name and whose
-        value is the context key (the same orientation as the Rust CLI's). A
-        token without ``=`` is skipped here where the Rust CLI refuses it, and
-        one argv item may carry several space-separated pairs: the launcher's
-        own allowances (smg-lab#431 tracks the first)."""
+        """The label selectors' ``key=value`` entries as ``{key: value}``. A
+        token without ``=`` is skipped, as the Rust CLI skips it; one argv
+        item may carry several space-separated pairs, the launcher's own
+        allowance."""
         if not selector_list:
             return {}
 
@@ -2574,6 +2594,28 @@ class RouterArgs:
                     key, value = token.split("=", 1)
                     selector[key] = value
         return selector
+
+    @staticmethod
+    def _parse_storage_context_headers(entries):
+        """``--storage-context-headers`` entries as ``{header name: context
+        key}``, the Rust CLI's orientation. An entry without ``=`` is refused
+        with the Rust CLI's message (it used to be skipped, and the router
+        started with no mapping); as with the selectors, one argv item may
+        carry several space-separated entries, which the Rust CLI reads whole."""
+        if not entries:
+            return {}
+
+        headers = {}
+        for item in entries:
+            for token in item.split():
+                if "=" not in token:
+                    raise ValueError(
+                        f"Invalid value for field 'storage_context_headers': {token}"
+                        " - expected 'header-name=context-key'"
+                    )
+                header, context_key = token.split("=", 1)
+                headers[header] = context_key
+        return headers
 
     @staticmethod
     def _parse_model_aliases(alias_list):
