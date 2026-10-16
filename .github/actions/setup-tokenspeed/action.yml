@@ -20,11 +20,4 @@ runs:
 
     - name: Install TokenSpeed
       shell: bash
-      # Temporary pin. The 2026-10-15 nightly runtime was built after upstream
-      # lightseekorg/tokenspeed#2323 moved the gemm ops, and its pinned
-      # same-date kernel wheel was built before, so every worker fails at
-      # import (tokenspeed_kernel.ops.gemm._cute_dsl). Remove once a newer
-      # nightly pair imports cleanly.
-      env:
-        TOKENSPEED_VERSION: 0.1.1.post20261014
       run: bash scripts/ci_install_tokenspeed.sh
