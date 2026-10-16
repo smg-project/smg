@@ -482,10 +482,24 @@ pub trait ModelProcessorSpec: Send + Sync {
         None
     }
 
+    /// [`Self::default_video_sample_fps`] given the video preprocessor config
+    /// the checkpoint ships, for a family whose reference reads the rate from
+    /// it; the default ignores the config.
+    fn default_video_sample_fps_with(&self, _config: Option<&PreProcessorConfig>) -> Option<f32> {
+        self.default_video_sample_fps()
+    }
+
     /// Where a video's sampled frames sit: evenly spread, or one per interval
     /// from the start with the last frame kept, as the model's reference does.
     fn video_frame_sampling(&self) -> FrameSampling {
         FrameSampling::Even
+    }
+
+    /// [`Self::video_frame_sampling`] given the video preprocessor config the
+    /// checkpoint ships, for a family whose reference reads its frame budget
+    /// or grouping from it; the default ignores the config.
+    fn video_frame_sampling_with(&self, _config: Option<&PreProcessorConfig>) -> FrameSampling {
+        self.video_frame_sampling()
     }
 }
 

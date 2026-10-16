@@ -7,6 +7,7 @@ mod kimi_k3;
 mod llama4;
 mod llava;
 mod minimax_m3;
+mod muse_spark;
 mod nemotron_omni;
 mod phi3_v;
 pub mod qwen3_asr;
@@ -26,6 +27,7 @@ use kimi_k3::KimiK3VisionSpec;
 use llama4::Llama4Spec;
 use llava::{LlavaNextSpec, LlavaSpec};
 use minimax_m3::MiniMaxM3VisionSpec;
+use muse_spark::MuseSparkSpec;
 use nemotron_omni::NemotronOmniSpec;
 use once_cell::sync::Lazy;
 use phi3_v::Phi3VisionSpec;
@@ -60,6 +62,8 @@ impl ModelRegistry {
                 LazySpec::new(|| Box::new(KimiK25VisionSpec)),
                 LazySpec::new(|| Box::new(Llama4Spec)),
                 LazySpec::new(|| Box::new(MiniMaxM3VisionSpec)),
+                // Muse Spark matches its own model_type / architecture / id only.
+                LazySpec::new(|| Box::new(MuseSparkSpec)),
                 // Nemotron-H Omni matches its own model_type only.
                 LazySpec::new(|| Box::new(NemotronOmniSpec)),
                 // LlavaNext must be registered before Llava so "llava_next" model_type matches first.

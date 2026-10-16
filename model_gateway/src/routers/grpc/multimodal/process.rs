@@ -87,10 +87,11 @@ pub(crate) async fn process_multimodal_plan(
     let config_elapsed_ms = config_started.elapsed().as_secs_f64() * 1000.0;
 
     let media_started = Instant::now();
+    let video_config = model_config.video_preprocessor_config.as_ref();
     let mut tracker = AsyncMultiModalTracker::new(components.media_connector.clone())
-        .with_default_video_sample_fps(spec.default_video_sample_fps())
+        .with_default_video_sample_fps(spec.default_video_sample_fps_with(video_config))
         .with_video_frame_sampling(
-            spec.video_frame_sampling()
+            spec.video_frame_sampling_with(video_config)
                 .with_frame_budget(components.video_frame_budget),
         )
         .with_image_transparency(transparency);

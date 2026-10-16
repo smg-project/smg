@@ -151,6 +151,17 @@ pub enum FrameSampling {
     /// (`numpy.linspace(0, n - 1, max_frames)` truncated to integers), the
     /// way vLLM's default video loader samples. The rate is not a factor.
     UpTo { max_frames: usize },
+    /// `trunc(duration x rate)` frames, at most `max_frames` and never more
+    /// than the clip has, aligned down to a multiple of `frame_factor` (and
+    /// never below it unless the clip is shorter), at the positions of
+    /// `torch.linspace(0, n - 1, count)` in float32 truncated to integers:
+    /// the rule of the Muse Spark family's reference video processor, whose
+    /// prompt stamps every temporal group of `frame_factor` frames with the
+    /// time of the group's first frame.
+    TemporalGroups {
+        frame_factor: usize,
+        max_frames: usize,
+    },
 }
 
 impl FrameSampling {
@@ -1662,7 +1673,71 @@ pub fn sampled_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfi
         FrameSampling::Even => even_frame_indices(total_frames, fps, cfg),
         FrameSampling::EvenRounded => even_rounded_frame_indices(total_frames, fps, cfg),
         FrameSampling::Interval => interval_frame_indices(total_frames, fps, cfg),
+        FrameSampling::TemporalGroups {
+            frame_factor,
+            max_frames,
+        } => temporal_group_frame_indices(
+            total_frames,
+            fps,
+            cfg.sample_fps,
+            frame_factor,
+            max_frames,
+        ),
     }
+}
+
+/// The Muse Spark family's reference video processor sampling at `sample_fps`:
+/// `trunc(total x rate / fps)` frames (the reference's `int(total * fps /
+/// video_fps)`, evaluated in that order), at most `max_frames` and the clip's
+/// length, aligned down to a multiple of `frame_factor` and never below it
+/// unless the clip is shorter; a clip whose rate is unknown is taken at 24
+/// fps, as the reference assumes. The positions are torch's float32
+/// `linspace` truncated to integers ([`torch_linspace_indices`]).
+fn temporal_group_frame_indices(
+    total_frames: usize,
+    fps: f64,
+    sample_fps: f32,
+    frame_factor: usize,
+    max_frames: usize,
+) -> Vec<usize> {
+    const ASSUMED_FPS: f64 = 24.0;
+    let factor = frame_factor.max(1);
+    let fps = if fps.is_finite() && fps > 0.0 {
+        fps
+    } else {
+        ASSUMED_FPS
+    };
+    let by_rate = (total_frames as f64 * f64::from(sample_fps) / fps) as usize;
+    let count = by_rate.min(max_frames).min(total_frames);
+    let count = (count / factor * factor).max(factor).min(total_frames);
+    torch_linspace_indices(total_frames, count)
+}
+
+/// `torch.linspace(0, total_frames - 1, count).long()` as torch's CPU kernel
+/// computes it in float32: `step = (n - 1) / (count - 1)`, the first half of
+/// the positions `start + step * i` and the second half `end - step * (count
+/// - 1 - i)`, each a fused multiply-add, truncated toward zero.
+fn torch_linspace_indices(total_frames: usize, count: usize) -> Vec<usize> {
+    if total_frames == 0 || count == 0 {
+        return Vec::new();
+    }
+    if count == 1 {
+        return vec![0];
+    }
+    let start = 0.0_f32;
+    let end = (total_frames - 1) as f32;
+    let step = (end - start) / (count - 1) as f32;
+    let halfway = count / 2;
+    (0..count)
+        .map(|index| {
+            let position = if index < halfway {
+                step.mul_add(index as f32, start)
+            } else {
+                (-step).mul_add((count - 1 - index) as f32, end)
+            };
+            position as usize
+        })
+        .collect()
 }
 
 /// `max(1, min(max_frames, total_frames))` frames spread from the first to the
@@ -2739,7 +2814,10 @@ impl FrameSelection {
                     loader_frame_indices(claimed, visible, max_frames),
                 )
             }
-            FrameSampling::Even | FrameSampling::EvenRounded | FrameSampling::Interval => {
+            FrameSampling::Even
+            | FrameSampling::EvenRounded
+            | FrameSampling::Interval
+            | FrameSampling::TemporalGroups { .. } => {
                 let total_frames = metadata.total_frames.filter(|total| *total > 0)?;
                 (
                     total_frames,
@@ -3832,6 +3910,60 @@ mod tests {
         let indices = super::sampled_frame_indices(1, 30.0, cfg);
         assert_eq!(indices, vec![0, 0, 0, 0]);
         assert_eq!(super::counted_frame_indices(&indices), vec![(0, 4)]);
+    }
+
+    #[test]
+    fn temporal_group_sampling_picks_the_reference_processors_frames() {
+        // The frames the Muse Spark family's reference video processor picks
+        // at its 2 fps rate (`torch.linspace(0, n - 1, count).long()` for
+        // `count = min(trunc(n x 2 / fps), cap, n)` aligned down to pairs),
+        // recorded from torch for these clips.
+        let cfg = VideoFetchConfig {
+            sampling: FrameSampling::TemporalGroups {
+                frame_factor: 2,
+                max_frames: 600,
+            },
+            ..VideoFetchConfig::default()
+        };
+        assert_eq!(
+            super::sampled_frame_indices(17, 8.0, cfg),
+            vec![0, 5, 10, 16]
+        );
+        // Shorter than one pair: every frame; one frame alone.
+        assert_eq!(super::sampled_frame_indices(1, 30.0, cfg), vec![0]);
+        assert_eq!(super::sampled_frame_indices(3, 30.0, cfg), vec![0, 2]);
+        assert_eq!(super::sampled_frame_indices(45, 30.0, cfg), vec![0, 44]);
+        assert_eq!(super::sampled_frame_indices(11, 8.0, cfg), vec![0, 10]);
+        assert_eq!(super::sampled_frame_indices(8, 8.0, cfg), vec![0, 7]);
+        let long = super::sampled_frame_indices(300, 8.0, cfg);
+        assert_eq!(long.len(), 74);
+        assert_eq!(&long[..6], &[0, 4, 8, 12, 16, 20]);
+        assert_eq!(&long[35..39], &[143, 147, 151, 155]);
+        assert_eq!(&long[70..], &[286, 290, 294, 299]);
+        let ten_minutes = super::sampled_frame_indices(18000, 30.0, cfg);
+        assert_eq!(ten_minutes.len(), 600);
+        assert_eq!(&ten_minutes[..6], &[0, 30, 60, 90, 120, 150]);
+        assert_eq!(&ten_minutes[298..302], &[8954, 8984, 9014, 9044]);
+        assert_eq!(&ten_minutes[596..], &[17908, 17938, 17968, 17999]);
+        let ntsc = super::sampled_frame_indices(301, 29.970_029_970_029_97, cfg);
+        assert_eq!(ntsc.len(), 20);
+        assert_eq!(&ntsc[..6], &[0, 15, 31, 47, 63, 78]);
+        assert_eq!(&ntsc[8..12], &[126, 142, 157, 173]);
+        assert_eq!(&ntsc[16..], &[252, 268, 284, 300]);
+        // The reference classes' own 96-frame budget.
+        let class_default = VideoFetchConfig {
+            sampling: FrameSampling::TemporalGroups {
+                frame_factor: 2,
+                max_frames: 96,
+            },
+            ..VideoFetchConfig::default()
+        };
+        let capped = super::sampled_frame_indices(18000, 30.0, class_default);
+        assert_eq!(capped.len(), 96);
+        assert_eq!(&capped[..4], &[0, 189, 378, 568]);
+        assert_eq!(&capped[93..], &[17620, 17809, 17999]);
+        // An unknown rate is taken as 24 fps, as the reference assumes.
+        assert_eq!(super::sampled_frame_indices(48, 0.0, cfg).len(), 4);
     }
 
     #[test]
