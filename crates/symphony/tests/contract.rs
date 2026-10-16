@@ -36,14 +36,14 @@ use symphony::{
         self, Arguments, Atom, CallShape, Class, Dialect, End, NameSource, Path, Pattern, Slot,
         ValueParser,
     },
-    tagged::{Placement, Spelling},
     CallSyntax, Declared, DropReason, Emits, Engine, EngineFinish, Event, Events, FinishReason,
     Format, Input, MalformedReason, ParseError, Parser, TokenSpan,
 };
 
 /// A subject under test: how to make its parser, the outputs it is checked over, and the registry
-/// table it stands for, when it is one ([`every_registry_table_has_a_subject`] keeps every table
-/// of [`Table::ALL`] in the contract).
+/// table it stands for, when it is one: such a subject builds its parser from `Table::format`, so
+/// the label is what is tested ([`every_registry_table_has_a_subject`] keeps every table of
+/// [`Table::ALL`] in the contract).
 struct Subject {
     name: &'static str,
     new: fn() -> Box<dyn Parser>,
@@ -52,15 +52,12 @@ struct Subject {
 }
 
 fn qwen3() -> Box<dyn Parser> {
-    Box::new(Engine::new(
-        formats::qwen3(CallSyntax::Json),
-        Declared::default(),
-    ))
+    Box::new(Engine::new(Table::Qwen3.format(), Declared::default()))
 }
 
 fn qwen3_tagged() -> Box<dyn Parser> {
     Box::new(Engine::new(
-        formats::qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
+        Table::Qwen3Tagged.format(),
         Declared::of(&[Tool {
             tool_type: "function".to_string(),
             function: Function {
@@ -79,12 +76,12 @@ fn qwen3_tagged() -> Box<dyn Parser> {
 }
 
 fn qwen2_5() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::qwen2_5(), Declared::default()))
+    Box::new(Engine::new(Table::Qwen2_5.format(), Declared::default()))
 }
 
 fn seed_oss() -> Box<dyn Parser> {
     Box::new(Engine::new(
-        formats::seed_oss(),
+        Table::SeedOss.format(),
         Declared::of(&[Tool {
             tool_type: "function".to_string(),
             function: Function {
@@ -103,7 +100,10 @@ fn seed_oss() -> Box<dyn Parser> {
 }
 
 fn deepseek_v4_1() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::deepseek_v4_1(), Declared::default()))
+    Box::new(Engine::new(
+        Table::DeepSeekV4_1.format(),
+        Declared::default(),
+    ))
 }
 
 fn keyed_tools() -> Declared {
@@ -124,15 +124,15 @@ fn keyed_tools() -> Declared {
 }
 
 fn hy4() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::hy4(), keyed_tools()))
+    Box::new(Engine::new(Table::Hy4.format(), keyed_tools()))
 }
 
 fn ling() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::ling(), keyed_tools()))
+    Box::new(Engine::new(Table::Ling.format(), keyed_tools()))
 }
 
 fn glm() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::glm(), keyed_tools()))
+    Box::new(Engine::new(Table::Glm.format(), keyed_tools()))
 }
 
 /// The GLM table where the stream's stop closes the last call, as when a family's last call ends
@@ -261,24 +261,24 @@ fn inkling_template() -> Box<dyn Parser> {
 }
 
 fn iquest() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::iquest(), keyed_tools()))
+    Box::new(Engine::new(Table::IQuest.format(), keyed_tools()))
 }
 
 fn olmo3() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::olmo3(), Declared::default()))
+    Box::new(Engine::new(Table::Olmo3.format(), Declared::default()))
 }
 
 fn lfm2_5() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::lfm2_5(), Declared::default()))
+    Box::new(Engine::new(Table::Lfm2_5.format(), Declared::default()))
 }
 
 fn xlam() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::xlam(), Declared::default()))
+    Box::new(Engine::new(Table::Xlam.format(), Declared::default()))
 }
 
 fn minimax_m3() -> Box<dyn Parser> {
     Box::new(Engine::new(
-        formats::minimax_m3(),
+        Table::MinimaxM3.format(),
         Declared::of(&[Tool {
             tool_type: "function".to_string(),
             function: Function {
@@ -298,23 +298,29 @@ fn minimax_m3() -> Box<dyn Parser> {
 }
 
 fn kimi_k3() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::kimi_k3(), Declared::default()))
+    Box::new(Engine::new(Table::KimiK3.format(), Declared::default()))
 }
 
 fn muse_spark() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::muse_spark(), Declared::default()))
+    Box::new(Engine::new(Table::MuseSpark.format(), Declared::default()))
 }
 
 fn mistral_v13() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::mistral_v13(), Declared::default()))
+    Box::new(Engine::new(Table::MistralV13.format(), Declared::default()))
 }
 
 fn llama_nemotron() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::llama_nemotron(), Declared::default()))
+    Box::new(Engine::new(
+        Table::LlamaNemotron.format(),
+        Declared::default(),
+    ))
 }
 
 fn function_gemma() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::function_gemma(), Declared::default()))
+    Box::new(Engine::new(
+        Table::FunctionGemma.format(),
+        Declared::default(),
+    ))
 }
 
 fn forced() -> Box<dyn Parser> {
@@ -325,7 +331,7 @@ fn forced() -> Box<dyn Parser> {
 }
 
 fn plain() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::plain(), Declared::default()))
+    Box::new(Engine::new(Table::Plain.format(), Declared::default()))
 }
 
 /// A tool of bellwether's common set, by name and parameters.
@@ -371,45 +377,45 @@ fn recorded_tools() -> Declared {
 
 fn qwen3_tagged_direct() -> Box<dyn Parser> {
     Box::new(Engine::new(
-        formats::qwen3(CallSyntax::Tagged(Spelling::Json, Placement::Direct)),
+        Table::Qwen3TaggedDirect.format(),
         recorded_tools(),
     ))
 }
 
 fn deepseek_v4() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::deepseek_v4(), Declared::default()))
+    Box::new(Engine::new(Table::DeepSeekV4.format(), Declared::default()))
 }
 
 fn json() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::json(), Declared::default()))
+    Box::new(Engine::new(Table::Json.format(), Declared::default()))
 }
 
 fn minimax_m2() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::minimax_m2(), recorded_tools()))
+    Box::new(Engine::new(Table::MinimaxM2.format(), recorded_tools()))
 }
 
 fn minicpm5() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::minicpm5(), recorded_tools()))
+    Box::new(Engine::new(Table::MiniCpm5.format(), recorded_tools()))
 }
 
 fn dots3() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::dots3(), recorded_tools()))
+    Box::new(Engine::new(Table::Dots3.format(), recorded_tools()))
 }
 
 fn glm4() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::glm4(), recorded_tools()))
+    Box::new(Engine::new(Table::Glm4.format(), recorded_tools()))
 }
 
 fn k2_horizon() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::k2_horizon(), recorded_tools()))
+    Box::new(Engine::new(Table::K2Horizon.format(), recorded_tools()))
 }
 
 fn gemma4() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::gemma4(), Declared::default()))
+    Box::new(Engine::new(Table::Gemma4.format(), Declared::default()))
 }
 
 fn inkling() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::inkling(), Declared::default()))
+    Box::new(Engine::new(Table::Inkling.format(), Declared::default()))
 }
 
 /// `\w` as these outputs need it: the ASCII letters, digits and `_` their names are written in.
