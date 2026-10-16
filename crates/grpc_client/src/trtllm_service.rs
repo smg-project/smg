@@ -787,6 +787,7 @@ impl TrtllmServiceClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channel::testing::refused_endpoint;
 
     #[test]
     fn test_proto_types_compilation() {
@@ -893,9 +894,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_client_connect_invalid_endpoint() {
-        let result = TrtllmServiceClient::connect("invalid://endpoint").await;
-        assert!(result.is_err());
+    async fn connect_fails_on_a_malformed_or_refused_endpoint() {
+        let malformed = TrtllmServiceClient::connect("not an endpoint").await;
+        assert!(
+            malformed.is_err(),
+            "a malformed endpoint fails before the dial"
+        );
+        let refused = refused_endpoint();
+        let result = TrtllmServiceClient::connect(&refused.url).await;
+        assert!(result.is_err(), "a refused dial fails the connect");
     }
 
     #[test]

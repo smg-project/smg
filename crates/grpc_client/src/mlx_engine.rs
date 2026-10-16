@@ -452,3 +452,21 @@ fn convert_logit_bias(bias: Option<&HashMap<String, f32>>) -> HashMap<i32, f32> 
         None => HashMap::new(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::channel::testing::refused_endpoint;
+
+    #[tokio::test]
+    async fn connect_fails_on_a_malformed_or_refused_endpoint() {
+        let malformed = MlxEngineClient::connect("not an endpoint").await;
+        assert!(
+            malformed.is_err(),
+            "a malformed endpoint fails before the dial"
+        );
+        let refused = refused_endpoint();
+        let result = MlxEngineClient::connect(&refused.url).await;
+        assert!(result.is_err(), "a refused dial fails the connect");
+    }
+}

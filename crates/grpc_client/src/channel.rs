@@ -143,6 +143,38 @@ pub fn is_transport_failure(status: &tonic::Status) -> bool {
     false
 }
 
+/// For the tests that need a dial to fail.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    use tokio::net::TcpSocket;
+
+    /// A loopback endpoint whose dial is refused at once on any host: the
+    /// port is bound, so nothing else can take it while this value lives, and
+    /// not listening, so the host's own stack answers the connect with a
+    /// reset. No name is resolved and nothing leaves the host. (A made-up
+    /// scheme such as `invalid://endpoint` is no such endpoint: it is dialled
+    /// as plain HTTP/2 at port 80 of the host `endpoint`, and the connect
+    /// succeeds wherever that name resolves to a listener.)
+    pub(crate) struct RefusedEndpoint {
+        _reservation: TcpSocket,
+        pub(crate) url: String,
+    }
+
+    pub(crate) fn refused_endpoint() -> RefusedEndpoint {
+        let socket = TcpSocket::new_v4().expect("a TCP socket");
+        socket
+            .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("a loopback port of the system's choice");
+        let port = socket.local_addr().expect("the bound port").port();
+        RefusedEndpoint {
+            _reservation: socket,
+            url: format!("grpc://127.0.0.1:{port}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{

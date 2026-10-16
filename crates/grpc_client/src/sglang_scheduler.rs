@@ -910,6 +910,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::channel::testing::refused_endpoint;
 
     #[test]
     fn score_request_uses_unscaled_prefill_only_logprobs() {
@@ -1230,9 +1231,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_client_connect_invalid_endpoint() {
-        let result = SglangSchedulerClient::connect("invalid://endpoint").await;
-        assert!(result.is_err());
+    async fn connect_fails_on_a_malformed_or_refused_endpoint() {
+        let malformed = SglangSchedulerClient::connect("not an endpoint").await;
+        assert!(
+            malformed.is_err(),
+            "a malformed endpoint fails before the dial"
+        );
+        let refused = refused_endpoint();
+        let result = SglangSchedulerClient::connect(&refused.url).await;
+        assert!(result.is_err(), "a refused dial fails the connect");
     }
 
     #[test]
