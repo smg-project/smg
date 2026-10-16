@@ -68,6 +68,7 @@ Key env knobs for `launch_arm.sh`: `BFCL_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`)
 | MiniMax-M3 MXFP8 (`minimax-m3`) | `blackwell` | 4 | `minimax_m3` / `minimax_m3` (+`--trust-remote-code --block-size 128 --attention_config.indexer_kv_dtype fp8`) | `minimax_m3` / `minimax_m3` |
 | GLM-5.3-Flash (`glm-5.3-flash`) | `blackwell` | 4 | `glm47` / `glm45` (+`--trust-remote-code --kv-cache-dtype fp8`; per-commit vLLM main wheel) | `glm47_moe` / `glm45` |
 | DeepSeek-V4.1-Flash (`deepseek-v4.1-amd`) | `8-gpu-mi300x` | 4 | `deepseek_v41` / `deepseek_v41` (+`--tokenizer-mode deepseek_v41 --trust-remote-code --moe-backend aiter --engram-config {"cpu_offload":true} --compilation-config {"cudagraph_mode":"FULL_DECODE_ONLY"}`; vLLM ROCm 10.0 nightly image) | `deepseek_v41` / `deepseek_v41` |
+| MiniMax-M3 MXFP8 (`minimax-m3-amd`) | `8-gpu-mi300x` | 8 (seq) | `minimax_m3` / `minimax_m3` (+`--trust-remote-code --block-size 128 --attention-backend TRITON_ATTN --language-model-only --async-scheduling --max-num-batched-tokens 16384`; vLLM ROCm nightly image) | `minimax_m3` / `minimax_m3` |
 
 > **gpt-oss has no SMG tool-call-parser.** SMG handles gpt-oss through its harmony
 > pipeline (`model_gateway/src/routers/grpc/harmony/`), auto-activated by
@@ -109,6 +110,8 @@ a GitHub Actions matrix — one leg per model, `fail-fast: false`, each on its o
   marks verified on MI300X:
   - `deepseek-v4.1-amd` — DeepSeek-V4.1-Flash, TP=4 per arm with the Engram
     tables in host memory, both arms concurrent (GPUs 0-3 + 4-7).
+  - `minimax-m3-amd` — MiniMax-M3 MXFP8 on the whole node (TP=8, arms
+    sequential).
 
 All legs use `max_model_len` **32768**: the `multi_turn` categories emit ~18k-token
 prompts that 400'd ("decoder prompt longer than the maximum model length") at 16384.
@@ -119,7 +122,7 @@ Each leg sets `arm_mode`:
 
 - **concurrent** (the half-node legs) — both arms serve at once on opposite GPU halves;
   `run_ab.py` scores them **in parallel** (separate servers/GPUs, no contention) and diffs.
-- **sequential** (`deepseek-v4.1`) — for a model that needs the whole node (TP=8)
+- **sequential** (`deepseek-v4.1`, `minimax-m3-amd`) — for a model that needs the whole node (TP=8)
   so the arms can't coexist: `run_ab.py --score-arm` scores arm A alone → tears it
   down → scores arm B alone → `--diff-baseline/--diff-candidate` compares the two
   saved score files. Flip a leg's `arm_mode` to enable it.

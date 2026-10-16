@@ -29,7 +29,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: "Run only this matrix leg (qwen3.8|gpt-oss|deepseek-v4.1|minimax-m3|glm-5.3-flash|gpt-oss-amd|qwen3.8-amd|deepseek-v4.1-amd); empty = all"
+        description: "Run only this matrix leg (qwen3.8|gpt-oss|deepseek-v4.1|minimax-m3|glm-5.3-flash|gpt-oss-amd|qwen3.8-amd|deepseek-v4.1-amd|minimax-m3-amd); empty = all"
         required: false
         default: ""
       hardware:
@@ -156,6 +156,7 @@ jobs:
           # main at vllm-project/vllm@3f1bcfd8 (2026-10-15). The AMD legs cannot take
           # a per-commit wheel (vllm_commit) — those are CUDA builds.
           amd_nightly_rocm100_image = "vllm/vllm-openai-rocm:nightly-rocm100-3f1bcfd82bb2e93fcd364fc7a5491718453a77e2@sha256:5b69e07038150da74968bf7755176f1ab9f5109f46634c166a91bfa355969549"
+          amd_nightly_image = "vllm/vllm-openai-rocm:nightly-3f1bcfd82bb2e93fcd364fc7a5491718453a77e2@sha256:1b61c6c8cf063a6ee08651c82e14169eb39fa800cc1691a5f3eebcecfbe6648c"
           # max_model_len "auto": largest window that fits in GPU memory (capped at
           # native max). A fixed 32768 400'd on multi_turn_long_context (>32k prompts).
           #
@@ -301,6 +302,28 @@ jobs:
                # Per-arm cap: concurrent arms get the job's full budget after startup.
                "run_timeout": "14400",
                "model_cache": "/models", "arm_mode": "concurrent", "max_model_len": "auto"},
+              # MiniMax-M3, the Blackwell leg's official MXFP8 checkpoint (~444GB) and
+              # parsers, in the MI300X command of vLLM's recipe, which marks MI300X
+              # verified (recipes.vllm.ai/MiniMaxAI/MiniMax-M3). MI300X has no MX matrix
+              # cores and the command uses plain TP=8, the whole node, so unlike on
+              # Blackwell the arms run sequential. --block-size 128 is mandatory (MSA
+              # sparse_block_size), MSA runs on TRITON_ATTN, the vision tower is skipped
+              # (BFCL is text-only), and the indexer KV stays at its bf16 default (the
+              # command does not set the Blackwell leg's fp8). Env: AITER on but not for
+              # MHA, no breakable CUDA graphs, hipBLASLt GEMMs, and the command's RCCL
+              # channel and HW-queue settings. In the ROCm nightly the recipe names.
+              {"name": "minimax-m3-amd", "runner": amd_runner, "vendor": "amd", "tp": 8,
+               "image": amd_nightly_image,
+               "gpu_a": "0,1,2,3,4,5,6,7", "gpu_b": "",  # sequential: arm B reuses GPU_A (whole node)
+               "model": "MiniMaxAI/MiniMax-M3-MXFP8", "bfcl_model": "MiniMaxAI/MiniMax-M3-MXFP8-FC",
+               "vllm_tool": "minimax_m3", "vllm_reason": "minimax_m3",
+               "smg_tool": "minimax_m3", "smg_reason": "minimax_m3",
+               "vllm_extra": "--trust-remote-code --block-size 128 --attention-backend TRITON_ATTN --language-model-only --async-scheduling --max-num-batched-tokens 16384",
+               "vllm_env": "VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_MHA=0 VLLM_USE_BREAKABLE_CUDAGRAPH=0 TORCH_BLAS_PREFER_HIPBLASLT=1 NCCL_MIN_NCHANNELS=112 GPU_MAX_HW_QUEUES=2 VLLM_ENGINE_READY_TIMEOUT_S=3600",
+               "gpu_mem": "0.90", "startup_timeout": "3000",
+               # Sequential: both arms and both startups share the 360m job.
+               "run_timeout": "7200",
+               "model_cache": "/models", "arm_mode": "sequential", "max_model_len": "auto"},
           ]
           only = os.environ.get("ONLY", "")
           hardware = os.environ.get("HARDWARE") or "both"
