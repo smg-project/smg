@@ -61,6 +61,7 @@ class RustCli:
     flags: dict[str, object] = field(default_factory=dict)  # primary spelling -> default
     aliases: dict[str, str] = field(default_factory=dict)  # second spelling -> primary
     pre_clap: set[str] = field(default_factory=set)  # read from argv ahead of clap
+    attributes: int = 0  # #[arg(...)] attributes read, flags and skipped fields alike
 
     @property
     def spellings(self) -> set[str]:
@@ -92,13 +93,23 @@ def literal_default(attribute: str) -> object:
         return None
 
 
+def arg_attributes(text: str) -> int:
+    """How many ``#[arg(...)]`` attributes a source holds, wherever they are."""
+    return len(re.findall(r"^\s*#\[arg\(", text, re.MULTILINE))
+
+
 def parse_rust_cli(text: str, struct_name: str = "CliArgs") -> RustCli:
     """The flags of ``struct CliArgs``: each ``#[arg(...)]`` attribute and the field
     it annotates, recursively including ``#[command(flatten)]`` argument groups.
     The long flag is the explicit ``long = ".."`` or the field
-    name with dashes, the second spellings its ``alias``/``visible_alias``."""
+    name with dashes, the second spellings its ``alias``/``visible_alias``.
+    ``attributes`` counts every attribute read, so held against
+    ``arg_attributes(text)`` it shows a group the reader did not reach."""
     lines = text.splitlines()
-    start = lines.index(f"struct {struct_name} {{")
+    header = re.compile(rf"^\s*(?:pub(?:\([^)]*\))?\s+)?struct\s+{struct_name}\s*\{{\s*$")
+    starts = [n for n, line in enumerate(lines) if header.match(line)]
+    assert len(starts) == 1, f"struct {struct_name}: {len(starts)} definitions found, one expected"
+    start = starts[0]
     end = lines.index("}", start)
     cli = RustCli(pre_clap=set(re.findall(r'args\[i\] == "(--[a-z-]+)"', text)))
     i = start + 1
@@ -119,14 +130,19 @@ def parse_rust_cli(text: str, struct_name: str = "CliArgs") -> RustCli:
             continue
         while not lines[i].strip() or lines[i].lstrip().startswith(("#", "/")):
             i += 1
-        declared = re.match(r"\s*(?:pub\s+)?([a-z0-9_]+)\s*:\s*([A-Za-z0-9_]+)", lines[i])
+        declared = re.match(
+            r"\s*(?:pub(?:\([^)]*\))?\s+)?([a-z0-9_]+)\s*:\s*(?:(?:Option|Box)<)?([A-Za-z0-9_]+)",
+            lines[i],
+        )
         assert declared is not None, f"no field after the attribute ending at line {i}"
         if flattened:
             group = parse_rust_cli(text, declared.group(2))
             cli.flags.update(group.flags)
             cli.aliases.update(group.aliases)
+            cli.attributes += group.attributes
             i += 1
             continue
+        cli.attributes += 1
         if re.fullmatch(r"#\[arg\(\s*skip\s*(=.*)?\)\]", attribute):
             # A field clap never reads from the command line (a record filled
             # after parsing): no flag to mirror.
@@ -184,6 +200,40 @@ struct Unrelated {
     assert cli.aliases == {"--url": "--worker-url"}
 
 
+def test_parse_rust_cli_accounts_for_every_attribute_it_reads():
+    """Visibility and an Option/Box wrapper do not hide a group; the attribute count
+    covers flags and skipped fields of every group reached, so a group left out
+    shows as a shortfall against the source's attribute count."""
+    source = """
+pub(crate) struct CliArgs {
+    #[arg(long)]
+    retries: usize,
+    #[command(flatten)]
+    pub worker: Option<WorkerArgs>,
+}
+pub struct WorkerArgs {
+    #[arg(long = "worker-url")]
+    endpoint: String,
+    #[arg(skip)]
+    internal: usize,
+}
+struct Unrelated {
+    #[arg(long)]
+    ignored: String,
+}
+"""
+    cli = parse_rust_cli(source)
+    assert cli.flags == {"--retries": None, "--worker-url": None}
+    assert cli.attributes == 3
+    assert arg_attributes(source) == 4
+
+
+def test_parse_rust_cli_names_a_group_it_cannot_find():
+    source = "struct CliArgs {\n    #[command(flatten)]\n    workers: MissingArgs,\n}\n"
+    with pytest.raises(AssertionError, match="struct MissingArgs"):
+        parse_rust_cli(source)
+
+
 def launcher_options(use_router_prefix: bool = False) -> dict[str, argparse.Action]:
     parser = argparse.ArgumentParser(allow_abbrev=False, add_help=False)
     RouterArgs.add_cli_args(parser, use_router_prefix=use_router_prefix)
@@ -198,8 +248,13 @@ def launcher_options(use_router_prefix: bool = False) -> dict[str, argparse.Acti
 def rust() -> RustCli:
     if not MAIN_RS.exists():
         pytest.skip("the Rust CLI's source is not in this checkout")
-    cli = parse_rust_cli(MAIN_RS.read_text())
-    assert len(cli.flags) > 150, "struct CliArgs parsed short: the parser needs updating"
+    text = MAIN_RS.read_text()
+    cli = parse_rust_cli(text)
+    assert cli.attributes == arg_attributes(text), (
+        f"{MAIN_RS}: {arg_attributes(text)} #[arg] attributes, {cli.attributes} reached from"
+        " struct CliArgs; a group it flattens is declared in a shape parse_rust_cli does not"
+        " follow (or the rest belong to a struct outside the launch CLI: teach the reader)"
+    )
     assert cli.pre_clap == {"--prefill", "--encode"}, (
         "the CLI's pre-clap flags changed: update the parser"
     )
