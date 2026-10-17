@@ -9,11 +9,10 @@ use serde_with::skip_serializing_none;
 use validator::{Validate, ValidationError};
 
 use super::{
-    common::{default_true, deserialize_null_as_false, Function, GenerationRequest},
+    common::{default_true, deserialize_null_as_false, invalid, Function, GenerationRequest},
     sampling_params::validate_top_p_value,
     validated::Normalizable,
 };
-use crate::common::invalid;
 
 // ============================================================================
 // Request Type
@@ -1231,4 +1230,102 @@ fn validate_stop_sequences(seqs: &[String]) -> Result<(), ValidationError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refusal(result: Result<(), ValidationError>) -> (String, String) {
+        let err = result.expect_err("a refusal");
+        (
+            err.code.to_string(),
+            err.message.as_deref().unwrap_or("").to_string(),
+        )
+    }
+
+    /// Each cross-field refusal keeps its code and its message.
+    #[test]
+    fn the_cross_field_refusals_keep_their_codes_and_messages() {
+        let agent = || InteractionsRequest {
+            agent: Some("deep-research".to_string()),
+            ..Default::default()
+        };
+        let cases = [
+            (
+                InteractionsRequest {
+                    model: Some("m".to_string()),
+                    agent: Some("a".to_string()),
+                    ..Default::default()
+                },
+                "model_and_agent_mutually_exclusive",
+                "Cannot set both model and agent. Provide exactly one.",
+            ),
+            (
+                InteractionsRequest {
+                    background: false,
+                    ..agent()
+                },
+                "agent_requires_background",
+                "Agent interactions require background mode to be enabled.",
+            ),
+            (
+                InteractionsRequest {
+                    model: Some("m".to_string()),
+                    background: true,
+                    ..Default::default()
+                },
+                "background_requires_agent",
+                "Background mode is only supported for agent interactions.",
+            ),
+            (
+                InteractionsRequest {
+                    background: true,
+                    stream: true,
+                    ..agent()
+                },
+                "background_conflicts_with_stream",
+                "Cannot set both background and stream to true.",
+            ),
+        ];
+        for (request, code, message) in cases {
+            assert_eq!(
+                refusal(validate_interactions_request(&request)),
+                (code.to_string(), message.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_input_is_refused_with_its_message() {
+        assert_eq!(
+            refusal(validate_input(&InteractionsInput::Text("  ".to_string()))),
+            (
+                "input_cannot_be_empty".to_string(),
+                "Input text cannot be empty".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn stop_sequences_are_refused_when_too_many_or_blank() {
+        let six: Vec<String> = (0..6).map(|i| format!("s{i}")).collect();
+        assert_eq!(
+            refusal(validate_stop_sequences(&six)),
+            (
+                "too_many_stop_sequences".to_string(),
+                "Maximum 5 stop sequences allowed".to_string()
+            )
+        );
+        assert_eq!(
+            refusal(validate_stop_sequences(&[
+                "ok".to_string(),
+                " ".to_string()
+            ])),
+            (
+                "stop_sequences_cannot_be_empty".to_string(),
+                "Stop sequences cannot contain empty strings".to_string()
+            )
+        );
+    }
 }
