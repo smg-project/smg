@@ -77,13 +77,28 @@ the prompt's tail at the front of the text, a scale for the pieces (one to eight
 `any_table`, the table. Bytes that are not UTF-8 read as the replacement character, as a decoder
 would release them. An input shorter than twelve bytes is an output read whole with a stop.
 
-`examples/prepare.rs` writes a seed per recorded slice of `../tests/fixtures/slices/` in this
-layout, so a seed replays as its table's own output and every mutation of it stays a case, and a
-dictionary per target: every terminal of its table (of every table for `any_table`), the declared
-names and the atoms of the call syntaxes, which lets libFuzzer compose markers it would otherwise
-have to discover byte by byte. A dictionary word is at most 64 bytes, libFuzzer's limit; `prepare`
-refuses a longer entry rather than let the driver skip it without a word. The harness's tests
-decode the seeds as written and read the dictionaries back.
+`examples/prepare.rs` writes a seed per recorded output slice in this layout, so a seed replays as
+its table's own output and every mutation of it stays a case, and a dictionary per target: every
+terminal of its table (of every table for `any_table`), the declared names and the atoms of the
+call syntaxes, which lets libFuzzer compose markers it would otherwise have to discover byte by
+byte. A dictionary word is at most 64 bytes, libFuzzer's limit; `prepare` refuses a longer entry
+rather than let the driver skip it without a word. The harness's tests decode the seeds as written
+and read the dictionaries back.
+
+The slices come from bellwether's recorded sets, not from this repository (`../tests/common/slices.rs`,
+shared with the crate's bench): for each table that stands for a call syntax, the hand-written
+parse sets (`common`, `turns`) of the checkpoint group it reads, as `<slug>/parse/<set>.jsonl` of
+the tree `bellwether unpack` writes. `BELLWETHER_FIXTURES` names that tree; `run.sh` and the
+harness's seed tests refuse to run, or skip with the reason, without it. Locally, check out
+smg-project/bellwether at the commit in `.github/versions/bellwether.ref` and point the variable at
+its `fixtures/` directory: bellwether keeps the hand-written sets plain there, so no Git LFS fetch
+is needed and `bellwether unpack` writes the same files for them beside the benchmark sets. Per
+table, the seed of a family is the longest recorded output whose message has the family's shape
+(content alone; one call with arguments; two or more calls; a thought and a call), placed after
+the prompt the group's template leaves; the malformed seed is the one call's output with the last
+character of the call's body before its closing marker cut (the `}` of a JSON object, the `>` of
+a tag, the `]` of a list), so the call reaches its close malformed. A group the tree has not
+recorded is named and left out; a tree with no group recorded fails `prepare`.
 
 ## When a target crashes
 

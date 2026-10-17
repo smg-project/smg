@@ -30,6 +30,10 @@
 //! tokenization of each output. A subject joins the contract with one entry in [`FORMATS`], its
 //! constructor and its corpus.
 
+#[expect(
+    dead_code,
+    reason = "the integration tests share these helpers, and this one asks nothing of the fixture tree"
+)]
 mod common;
 
 use common::{bytes_of, chunkings, delta, prompt};

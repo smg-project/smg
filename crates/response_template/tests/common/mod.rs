@@ -6,9 +6,10 @@
     clippy::allow_attributes,
     clippy::expect_used,
     clippy::panic,
+    clippy::print_stderr,
     clippy::unwrap_used,
     dead_code,
-    reason = "test helpers shared by the replay test and the unit tests; a bad fixture should panic"
+    reason = "test helpers shared by the replay test and the unit tests; a bad fixture should panic, and a skipped test says why"
 )]
 
 use std::{
@@ -19,6 +20,30 @@ use std::{
 
 use serde_json::{Map, Number, Value};
 use sha2::{Digest, Sha256};
+
+/// The directory of bellwether's shape patterns in the tree `BELLWETHER_FIXTURES` names: what
+/// Python's `regex` module says about the patterns public response templates write, which
+/// `bellwether patterns` records and `bellwether unpack` writes as `patterns/` beside the models'
+/// sets. None, with the reason printed, when the variable is not set or the pinned commit does not
+/// hold them yet: a test that needs them returns then, and the run says so.
+pub fn patterns() -> Option<PathBuf> {
+    let Some(root) = std::env::var_os("BELLWETHER_FIXTURES").map(PathBuf::from) else {
+        eprintln!(
+            "skipping: BELLWETHER_FIXTURES is not set; point it at the tree `bellwether unpack` writes"
+        );
+        return None;
+    };
+    let dir = root.join("patterns");
+    if !dir.is_dir() {
+        eprintln!(
+            "awaiting fixtures: {} is not in the fixture pin yet (bellwether's shape patterns, \
+             recorded by `bellwether patterns`)",
+            dir.display()
+        );
+        return None;
+    }
+    Some(dir)
+}
 
 /// The fixture directory: `RESPONSE_TEMPLATE_HF_FIXTURES` for local extra
 /// cases, else the committed recordings.
