@@ -3,7 +3,7 @@
 //! an engine, which is the parser's per-request setup. One subject per call syntax, each a turn as
 //! the table's own tests spell it: a thought, an answer and two calls, the tools declared as a
 //! request declares them. The parse and prose rows time the reading alone: the engine is made
-//! before the timed closure and dropped after it, and the setup rows time the making.
+//! before the timed closure and dropped after it, and the setup rows time the making and the drop.
 //!
 //! `cargo bench -p smg-symphony --bench throughput`; a filter narrows it (`-- parse/whole`).
 #![allow(clippy::expect_used)]
