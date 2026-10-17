@@ -266,6 +266,15 @@ pub(crate) enum ResponsesIterationResult {
     },
 }
 
+impl ResponsesIterationResult {
+    /// The token usage of this iteration, whichever way it ended.
+    pub(crate) fn usage(&self) -> &Usage {
+        match self {
+            Self::ToolCallsFound { usage, .. } | Self::Completed { usage, .. } => usage,
+        }
+    }
+}
+
 impl HarmonyResponseProcessor {
     /// Process a single Responses API iteration
     ///

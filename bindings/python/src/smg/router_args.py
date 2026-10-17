@@ -600,13 +600,12 @@ class RouterArgs:
     # Per-tenant token/request rate limiting
     tenant_rate_limit_config: str | None = None
     tenant_rate_limit_enabled: bool = False
-    # Tokenizer cache configuration
     # Per-tenant usage accounting (requests, prompt and completion tokens and time by
     # tenant and model, the smg_tenant_usage_* families and GET /v1/usage/tenants): off
     # by default, and the maximum of tenants with rows of their own
-    # the same reason
     tenant_usage_accounting_enabled: bool = False
     tenant_usage_accounting_max_tenants: int = 128
+    # Tokenizer cache configuration
     tokenizer_cache_enable_l0: bool = False
     tokenizer_cache_enable_l1: bool = False
     tokenizer_cache_l0_max_entries: int = 10000

@@ -812,13 +812,10 @@ async fn stop_profile(
         .into_response()
 }
 
-/// `POST /heap_profile`: a heap profile of this gateway process, written
-/// under `--jemalloc-prof-dir` by a `jemalloc-profiling` build (see
-/// [`heap_profile`]).
-/// The per-tenant usage table (`tenant_usage_accounting_enabled`): every
-/// tracked tenant's requests, tokens and time by model, and the `other` row.
-/// 404 while accounting is off, so a poller can tell the feature apart from
-/// an empty table.
+/// `GET /v1/usage/tenants`: the per-tenant usage table
+/// (`tenant_usage_accounting_enabled`): every tracked tenant's requests,
+/// tokens and time by model, and the `other` row. 404 while accounting is
+/// off, so a poller can tell the feature apart from an empty table.
 async fn v1_usage_tenants() -> Response {
     match tenant_usage::installed() {
         Some(table) => Json(table.snapshot()).into_response(),
@@ -829,6 +826,9 @@ async fn v1_usage_tenants() -> Response {
     }
 }
 
+/// `POST /heap_profile`: a heap profile of this gateway process, written
+/// under `--jemalloc-prof-dir` by a `jemalloc-profiling` build (see
+/// [`heap_profile`]).
 async fn dump_heap_profile(State(state): State<Arc<AppState>>) -> Response {
     heap_profile::dump_blocking(state.context.router_config.jemalloc_prof_dir.clone())
         .await
