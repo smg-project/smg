@@ -460,22 +460,32 @@ impl PolicyRegistry {
         self.each_policy(|policy| policy.set_load_receiver(rx.clone()));
     }
 
-    /// Visit every policy the registry holds: the default, the PD and EPD
-    /// legs, then the per-model policies. A policy shared between slots is
-    /// visited once per slot.
+    /// Visit every policy the registry holds once: the default, the PD and
+    /// EPD legs, then the per-model policies. A policy shared between slots
+    /// (a model with no hint takes the default) is visited for the first
+    /// slot it stands in only, so a visit that does work, a worker's
+    /// removal, is not repeated per model.
     fn each_policy(&self, mut visit: impl FnMut(&Arc<dyn LoadBalancingPolicy>)) {
-        visit(&self.default_policy);
+        let mut seen: Vec<*const ()> = Vec::new();
+        let mut once = |policy: &Arc<dyn LoadBalancingPolicy>| {
+            let ptr = Arc::as_ptr(policy) as *const ();
+            if !seen.contains(&ptr) {
+                seen.push(ptr);
+                visit(policy);
+            }
+        };
+        once(&self.default_policy);
         for leg in [
             &self.prefill_policy,
             &self.decode_policy,
             &self.encode_policy,
         ] {
             if let Some(policy) = leg.get() {
-                visit(policy);
+                once(policy);
             }
         }
         for entry in self.model_policies.iter() {
-            visit(entry.value());
+            once(entry.value());
         }
     }
 
@@ -2135,6 +2145,27 @@ mod tests {
         registry.on_worker_removed("llama-3");
         assert!(registry.get_policy("llama-3").is_none());
         assert_eq!(registry.get_worker_counts().get("llama-3"), None);
+    }
+
+    /// A policy shared between slots is visited once: a model with no hint
+    /// takes the registry's default, so one worker's removal reaches that
+    /// policy once, however many models stand on it, not once per model.
+    #[test]
+    fn a_policy_shared_between_slots_is_visited_once() {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        for model in ["m1", "m2", "m3"] {
+            registry.on_worker_added(model, None);
+        }
+        registry.on_worker_added("hinted", Some("least_load"));
+        let mut visits: Vec<*const ()> = Vec::new();
+        registry.each_policy(|policy| visits.push(Arc::as_ptr(policy) as *const ()));
+        assert_eq!(
+            visits.len(),
+            2,
+            "the shared default once, the hinted policy once"
+        );
+        let default = Arc::as_ptr(&registry.default_policy) as *const ();
+        assert_eq!(visits.iter().filter(|p| **p == default).count(), 1);
     }
 
     #[test]
