@@ -1,0 +1,57 @@
+name: symphony fuzz campaign
+
+# The Symphony crate's coverage-guided fuzz targets (crates/symphony/fuzz, cargo-fuzz on
+# nightly): the engine over every table, with random bytes cut into random deltas, checked
+# against the crate's contract on every input. They run here nightly, bounded, so that the
+# parser's robustness does not depend on someone remembering to run them; a crash fails the
+# job and its artifact is uploaded for the report crates/symphony/fuzz/README.md describes.
+# Budget: nine targets, three at a time, ten minutes each on a hosted runner.
+
+on:
+  schedule:
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Minutes per target"
+        default: "10"
+      targets:
+        description: "Targets to run (space separated; empty for all)"
+        default: ""
+
+concurrency:
+  group: symphony-fuzz
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  campaign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: symphony-fuzz
+          workspaces: crates/symphony/fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Run the targets
+        env:
+          MINUTES: ${{ github.event.inputs.minutes || '10' }}
+          TARGETS: ${{ github.event.inputs.targets || '' }}
+        run: |
+          # shellcheck disable=SC2086
+          crates/symphony/fuzz/run.sh --minutes "$MINUTES" --jobs 3 $TARGETS
+      - name: Upload crashes and logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: symphony-fuzz-${{ github.sha }}
+          path: |
+            crates/symphony/fuzz/artifacts/
+            crates/symphony/fuzz/logs/
+          if-no-files-found: ignore

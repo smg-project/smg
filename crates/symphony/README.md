@@ -127,6 +127,14 @@ per second of a turn fed whole and in eight-byte pieces, one subject per call sy
 second of prose with no marker in it, and the construction of an engine, which is the parser's
 per-request setup. A change to the decode path carries its rows.
 
+`fuzz/` holds coverage-guided fuzz targets for the engine over every table (cargo-fuzz on a
+nightly toolchain, a workspace of its own): the fuzzer's bytes, cut into deltas it also chooses,
+are replayed whole and in pieces and checked against the contract on every input, with the
+recorded slices of `tests/fixtures/slices/` (one output per table and family: plain text, one
+call, parallel calls, a thought and a call, a malformed call) as the seeds. `fuzz/README.md` says
+how a target is run, what it checks and how a crash is minimized and filed; the nightly workflow
+runs every target for a bounded time.
+
 ## Models
 
 Symphony's target is every checkpoint group bellwether has a manifest for; a group is the

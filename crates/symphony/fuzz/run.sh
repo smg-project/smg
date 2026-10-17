@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# Runs the fuzz targets for a bounded time each, seeded from the crate's recorded output slices
+# and guided by a dictionary of the table's markers, and prints one row per target: executions,
+# executions per second, coverage edges, corpus units and crashes. Exits 1 when any target found
+# a crash; its artifact is under artifacts/<target>/ and the log under logs/<target>.log.
+#
+#   run.sh [--minutes N] [--jobs J] [--sanitizer none|address] [--max-len BYTES] [--keep-going]
+#          [--allow NAMES] [--label NAME] [--summary-only] [target ...]
+#
+# Defaults: every target, 10 minutes each, one at a time, no sanitizer (the crate forbids unsafe
+# code; without it a target runs two to three times as many executions), inputs up to 8 KiB.
+# A target stops at its first crash; with --keep-going it runs libFuzzer's fork mode, which keeps
+# every crash's artifact and goes on, so that one campaign collects every class of breach. The
+# summary counts a target's artifacts by the `breach <name>` the harness names when it replays
+# them. --allow NAMES (comma separated) makes the harness look past breaches already reported
+# (SYMPHONY_FUZZ_ALLOW); --label NAME keeps a run's logs and artifacts under logs/NAME and
+# artifacts/NAME, apart from other runs'; --summary-only prints the table of a run already made.
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+minutes=10
+jobs=1
+sanitizer=none
+max_len=8192
+keep_going=()
+label=run
+summary_only=
+targets=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    --minutes) minutes=$2; shift 2 ;;
+    --jobs) jobs=$2; shift 2 ;;
+    --sanitizer) sanitizer=$2; shift 2 ;;
+    --max-len) max_len=$2; shift 2 ;;
+    --keep-going) keep_going=(-fork=1 -ignore_crashes=1 -ignore_timeouts=1 -ignore_ooms=1); shift ;;
+    --allow) export SYMPHONY_FUZZ_ALLOW=$2; shift 2 ;;
+    --label) label=$2; shift 2 ;;
+    --summary-only) summary_only=1; shift ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -*) echo "run.sh: unknown option $1" >&2; exit 2 ;;
+    *) targets+=("$1"); shift ;;
+  esac
+done
+
+cd "$here"
+if [ ${#targets[@]} -eq 0 ]; then
+  mapfile -t targets < <(cargo +nightly fuzz list)
+fi
+# A target dir of its own when the caller names one, so that the instrumented build never mixes
+# with the workspace's artifacts.
+target_dir=()
+build_dir=$here/target
+if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+  build_dir=$CARGO_TARGET_DIR/symphony-fuzz
+  target_dir=(--target-dir "$build_dir")
+fi
+triple=$(rustc +nightly -vV | sed -n 's/^host: //p')
+logs=logs/$label
+artifacts=artifacts/$label
+mkdir -p "$logs" "$artifacts" corpus prepared
+
+if [ -z "$summary_only" ]; then
+  cargo +nightly run --quiet --release --example prepare -- ../tests/fixtures/slices prepared
+  # `cargo fuzz build` takes one target or all of them.
+  if [ ${#targets[@]} -eq $(cargo +nightly fuzz list | wc -l) ]; then
+    cargo +nightly fuzz build --sanitizer "$sanitizer" "${target_dir[@]}"
+  else
+    for target in "${targets[@]}"; do
+      cargo +nightly fuzz build --sanitizer "$sanitizer" "${target_dir[@]}" "$target"
+    done
+  fi
+fi
+
+run_one() {
+  local target=$1
+  mkdir -p "corpus/$target" "$artifacts/$target"
+  # A seed's name is its family; two tables' slices of one family would collide, so name by table.
+  for seed in prepared/seeds/*/*; do
+    cp -n "$seed" "corpus/$target/$(basename "$(dirname "$seed")")-$(basename "$seed")"
+  done
+  cargo +nightly fuzz run --sanitizer "$sanitizer" "${target_dir[@]}" "$target" "corpus/$target" -- \
+    -max_total_time=$((minutes * 60)) -max_len="$max_len" -timeout=10 \
+    -dict="prepared/dict/$target.dict" -print_final_stats=1 "${keep_going[@]}" \
+    -artifact_prefix="$artifacts/$target/" > "$logs/$target.log" 2>&1 || true
+}
+
+# The breach each artifact of `target` names when the target's binary replays it, counted; at
+# most two hundred artifacts are replayed.
+classes_of() {
+  local target=$1 binary="$build_dir/$triple/release/$1" class
+  local -a found
+  mapfile -t found < <(find "$artifacts/$target" -type f | sort)
+  for artifact in "${found[@]:0:200}"; do
+    class=$("$binary" "$artifact" 2>&1 | grep -oE 'breach [a-z-]+' | head -1 | cut -d' ' -f2 || true)
+    echo "${class:-other}"
+  done | sort | uniq -c | sort -rn | awk '{printf "%s%s (%d)", (NR>1?", ":""), $2, $1}'
+}
+
+if [ -z "$summary_only" ]; then
+  running=0
+  for target in "${targets[@]}"; do
+    run_one "$target" &
+    running=$((running + 1))
+    if [ "$running" -ge "$jobs" ]; then
+      wait -n
+      running=$((running - 1))
+    fi
+  done
+  wait
+fi
+
+crashed=0
+echo
+echo "run $label: $minutes min per target, sanitizer $sanitizer, max_len $max_len${keep_going[0]:+, keep going}${SYMPHONY_FUZZ_ALLOW:+, allowed: $SYMPHONY_FUZZ_ALLOW}"
+echo
+echo "| target | minutes | executions | exec/s | edges | corpus units | crashes | classes |"
+echo "|---|---|---|---|---|---|---|---|"
+for target in "${targets[@]}"; do
+  log="$logs/$target.log"
+  # The last status line carries the executions (`#N`, cumulative in fork mode too) and the
+  # edges (`cov:`); the rate is over the whole run.
+  executions=$(grep -oE '^#[0-9]+' "$log" | tail -1 | tr -d '#' || true)
+  per_second=$(( ${executions:-0} / (minutes * 60) ))
+  edges=$(grep -o 'cov: [0-9]*' "$log" | tail -1 | awk '{print $2}' || true)
+  units=$(find "corpus/$target" -type f | wc -l | tr -d ' ')
+  crashes=$(find "$artifacts/$target" -type f | wc -l | tr -d ' ')
+  classes=none
+  if [ "$crashes" -gt 0 ]; then
+    crashed=1
+    classes=$(classes_of "$target")
+  fi
+  echo "| $target | $minutes | ${executions:-?} | $per_second | ${edges:-?} | $units | $crashes | $classes |"
+done
+exit $crashed
