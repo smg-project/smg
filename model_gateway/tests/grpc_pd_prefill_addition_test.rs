@@ -103,6 +103,12 @@ impl Bed {
     /// Register one more prefill worker, then do what the registration
     /// workflow's policy step does once it is in: hand the bucket policy
     /// every prefill worker again. Returns the newcomer's URL.
+    ///
+    /// This mirrors `UpdatePoliciesStep` rather than running it: the bed
+    /// registers its mock workers directly, where the removal test drives the
+    /// removal job. Driving the registration job here, so that the step's
+    /// own listing is what the test exercises, is owed, together with the
+    /// helpers this file shares with the removal test.
     #[expect(
         clippy::unwrap_used,
         reason = "test helper - panicking on failure is intentional"

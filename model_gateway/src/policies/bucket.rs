@@ -251,12 +251,14 @@ impl LoadBalancingPolicy for BucketPolicy {
     }
 }
 
+/// The declared span of request sizes a listing of the workers splits evenly
+/// among them; the last range is open-ended regardless. A constant, so that no
+/// path can widen it: the adjustment learns the real sizes from the requests
+/// seen.
+const L_MAX: usize = 4096;
+
 #[derive(Debug, Clone)]
 pub struct Bucket {
-    /// The declared span of request sizes a listing of the workers splits
-    /// evenly among them; the last range is open-ended regardless. Fixed:
-    /// the adjustment learns the real sizes from the requests seen.
-    l_max: usize,
     bucket_cnt: usize,
     pub prefill_worker_urls: Arc<Mutex<Vec<String>>>,
     load_total: usize,
@@ -290,8 +292,6 @@ impl Boundary {
 
 impl Bucket {
     pub fn new(period: usize) -> Self {
-        let l_max = 4096;
-
         let bucket_cnt = 0;
 
         let load_total = 0;
@@ -307,7 +307,6 @@ impl Bucket {
         let prefill_worker_urls = Arc::new(Mutex::new(Vec::new()));
 
         Bucket {
-            l_max,
             bucket_cnt,
             prefill_worker_urls,
             load_total,
@@ -325,9 +324,9 @@ impl Bucket {
     /// every prefill worker again). The same set again, in any order, is a
     /// no-op: the partition and the load counters stay. A changed set keeps
     /// the counters of the workers that stay, starts the newcomers at zero
-    /// and splits the declared span `l_max` evenly among all of them with
-    /// the last range open-ended, exactly as the first split does; `l_max`
-    /// never changes, so no later split divides the open end. The even split
+    /// and splits the declared span [`L_MAX`] evenly among all of them with
+    /// the last range open-ended, exactly as the first split does; the span
+    /// is a constant, so no later split divides the open end. The even split
     /// is provisional: the next adjustment rebuilds it from the sizes seen
     /// without waiting for the per-worker load to double
     /// ([`Self::adjust_boundary`]).
@@ -350,7 +349,7 @@ impl Bucket {
         }
         let worker_cnt = prefill_worker_urls.len();
         self.bucket_cnt = worker_cnt;
-        self.boundary = match self.l_max.checked_div(worker_cnt) {
+        self.boundary = match L_MAX.checked_div(worker_cnt) {
             None => Vec::new(),
             Some(gap) => {
                 let gap = gap.max(1);
