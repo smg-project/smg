@@ -384,32 +384,38 @@ impl PolicyRegistry {
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
-        self.select_worker_for_model_following(policy, model_id, workers, info, None)
+        self.select_worker_for_model_split(policy, model_id, workers, info, None)
+            .map(|(selected, _)| selected)
     }
 
-    /// [`Self::select_worker_for_model`] for a leg of a request whose earlier
-    /// leg landed in `group` (the decode leg after the prefill's): under
-    /// `--traffic-split` the choice stays in that group while it has an
-    /// available member of positive weight among `workers`, so a
-    /// prefill-decode pair never spans two groups (two engine builds, which
-    /// lenient pairing would otherwise pair). A group absent or drained among
-    /// `workers`, or no group, leaves the key or the draw to decide as for a
-    /// first leg. Every confined selection counts in
+    /// [`Self::select_worker_for_model`] for one leg of a request, reporting
+    /// the group the split confined it to (`None` when the split did not
+    /// run: off, exempt, or one group among `workers`). `follow` is the group
+    /// an earlier leg reported (the decode leg after the prefill's): under
+    /// `--traffic-split` the choice stays in it while it has an available
+    /// member of positive weight among `workers`, so a prefill-decode pair
+    /// never spans two groups (two engine builds, which lenient pairing would
+    /// otherwise pair). A first leg that was not split reports `None`, and
+    /// the later leg then decides for itself, so a canary only the decode
+    /// pool carries keeps its share; a followed group absent or drained among
+    /// `workers` leaves the key or the draw to decide as for a first leg.
+    /// Every confined selection counts in
     /// `smg_traffic_split_selections_total`, one per leg.
-    pub fn select_worker_for_model_following(
+    pub fn select_worker_for_model_split<'w>(
         &self,
         policy: &Arc<dyn LoadBalancingPolicy>,
         model_id: &str,
-        workers: &[Arc<dyn Worker>],
+        workers: &'w [Arc<dyn Worker>],
         info: &SelectWorkerInfo,
-        group: Option<&str>,
-    ) -> Option<usize> {
+        follow: Option<&str>,
+    ) -> Option<(usize, Option<&'w str>)> {
         if self.traffic_split && Self::traffic_split_applies(policy.name(), info) {
             if let Some(split) = Split::plan(workers) {
-                // The group an earlier leg chose is followed; otherwise the
-                // same key the sticky override would pin by keeps a session
-                // in one group, and a keyless request draws at random.
-                let arm = match group.and_then(|name| split.arm_named(name)) {
+                // The group an earlier leg was split into is followed;
+                // otherwise the same key the sticky override would pin by
+                // keeps a session in one group, and a keyless request draws
+                // at random.
+                let arm = match follow.and_then(|name| split.arm_named(name)) {
                     Some(arm) => arm,
                     None => match self.effective_sticky_key(info) {
                         Some((key, _)) => split.arm_for_key(key),
@@ -423,10 +429,11 @@ impl PolicyRegistry {
                     .map(|&idx| Arc::clone(&workers[idx]))
                     .collect();
                 let picked = self.select_within(policy, model_id, &members, info)?;
-                return Some(arm.members[picked]);
+                return Some((arm.members[picked], Some(arm.name)));
             }
         }
         self.select_within(policy, model_id, workers, info)
+            .map(|selected| (selected, None))
     }
 
     /// Whether the traffic split may confine this selection: `bucket` places
@@ -3187,10 +3194,10 @@ mod tests {
             assert!(picks(&reg, &workers, 50).iter().all(|&idx| idx != 1));
         }
 
-        /// Under a disaggregated pair the decode leg follows the prefill's
-        /// group: the pair never spans two groups while the decode pool has
-        /// that group live, and a group drained on the decode side is not
-        /// followed into.
+        /// Under a disaggregated pair the decode leg follows the group the
+        /// prefill leg was split into: the pair never spans two groups while
+        /// the decode pool has that group live, and a group drained on the
+        /// decode side is not followed into.
         #[test]
         fn the_decode_leg_follows_the_prefills_group() {
             use crate::policies::traffic_split::group_of;
@@ -3202,12 +3209,16 @@ mod tests {
             let info = SelectWorkerInfo::default();
             let mut canary_pairs = 0;
             for _ in 0..400 {
-                let prefill_idx = pick(&reg, &prefill, &info);
-                let group = group_of(prefill[prefill_idx].as_ref());
-                let decode_idx = reg
-                    .select_worker_for_model_following(&policy, "m", &decode, &info, Some(group))
+                let (prefill_idx, group) = reg
+                    .select_worker_for_model_split(&policy, "m", &prefill, &info, None)
+                    .expect("a prefill worker is selected");
+                let group = group.expect("the prefill leg was split");
+                assert_eq!(group_of(prefill[prefill_idx].as_ref()), group);
+                let (decode_idx, followed) = reg
+                    .select_worker_for_model_split(&policy, "m", &decode, &info, Some(group))
                     .expect("a decode worker is selected");
                 assert_eq!(group_of(decode[decode_idx].as_ref()), group);
+                assert_eq!(followed, Some(group));
                 if group == "canary" {
                     canary_pairs += 1;
                 }
@@ -3219,17 +3230,48 @@ mod tests {
             );
             let drained = fleet("0");
             for _ in 0..50 {
-                let decode_idx = reg
-                    .select_worker_for_model_following(
-                        &policy,
-                        "m",
-                        &drained,
-                        &info,
-                        Some("canary"),
-                    )
+                let (decode_idx, _) = reg
+                    .select_worker_for_model_split(&policy, "m", &drained, &info, Some("canary"))
                     .expect("a decode worker is selected");
                 assert_ne!(decode_idx, 1, "a drained group was followed into");
             }
+        }
+
+        /// A prefill pool of one group is not split and reports no group, so
+        /// the decode leg decides for itself: a canary only the decode pool
+        /// carries keeps its share next to an unlabelled fleet.
+        #[test]
+        fn a_decode_only_canary_keeps_its_share_next_to_an_unsplit_prefill_pool() {
+            let reg = registry(true);
+            let policy = reg.get_default_policy();
+            let prefill: Vec<Arc<dyn Worker>> = (0..3)
+                .map(|i| grouped(&format!("http://p{i}:8000"), None, None))
+                .collect();
+            let decode = vec![
+                grouped("http://d1:8000", None, None),
+                grouped("http://c1:8000", Some("canary"), Some("50")),
+                grouped("http://d2:8000", None, None),
+            ];
+            let info = SelectWorkerInfo::default();
+            let mut canary_decodes = 0;
+            for _ in 0..400 {
+                let (_, group) = reg
+                    .select_worker_for_model_split(&policy, "m", &prefill, &info, None)
+                    .expect("a prefill worker is selected");
+                assert_eq!(group, None, "a single-group pool was split");
+                let (decode_idx, _) = reg
+                    .select_worker_for_model_split(&policy, "m", &decode, &info, group)
+                    .expect("a decode worker is selected");
+                if decode_idx == 1 {
+                    canary_decodes += 1;
+                }
+            }
+            // Weight 50 against the default group's 100: about a third of
+            // the decodes, a wide band.
+            assert!(
+                (70..=200).contains(&canary_decodes),
+                "{canary_decodes} canary decodes of 400"
+            );
         }
     }
 }

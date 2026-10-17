@@ -77,6 +77,12 @@ fn validate_spec(spec: &WorkerSpec, traffic_split: bool) -> Result<(), WorkerSer
         )));
     }
     validate_labels(&spec.labels, traffic_split)?;
+    // A registration carries the worker's whole label set: a named group
+    // needs its weight, or a stable fleet labelled without one would hand a
+    // canary every request. A PATCH is a partial set and is not held to it.
+    if traffic_split {
+        traffic_split::validate_named_group_has_weight(&spec.labels).map_err(bad_request)?;
+    }
     validate_cost(spec.cost)?;
     if spec.kv_block_size == Some(0) {
         return Err(bad_request(
@@ -1360,5 +1366,40 @@ mod tests {
 
         assert!(validate_labels(&bad_weight, false).is_ok());
         assert!(validate_labels(&bad_group, false).is_ok());
+    }
+
+    /// A registration with a named group and no weight is refused while the
+    /// split is on: a stable fleet labelled without one next to a canary at
+    /// 5 would hand the canary every request. A PATCH that sends the group
+    /// alone onto a worker that has the weight is a partial set and passes.
+    #[test]
+    fn a_named_group_registers_only_with_a_weight() {
+        let canary: WorkerSpec = serde_json::from_value(json!({
+            "url": "http://c1:8000",
+            "labels": { "traffic_group": "canary", "traffic_weight": "5" }
+        }))
+        .expect("worker spec");
+        assert!(validate_spec(&canary, true).is_ok());
+
+        let stable: WorkerSpec = serde_json::from_value(json!({
+            "url": "http://s1:8000",
+            "labels": { "traffic_group": "stable" }
+        }))
+        .expect("worker spec");
+        let err = validate_spec(&stable, true).expect_err("a named group without a weight");
+        assert!(matches!(err, WorkerServiceError::BadRequest { .. }));
+        assert!(
+            err.to_string()
+                .contains("label 'traffic_group' \"stable\" needs a 'traffic_weight'"),
+            "{err}"
+        );
+        // Off, the labels are inert and the registration passes.
+        assert!(validate_spec(&stable, false).is_ok());
+
+        let group_alone: WorkerUpdateRequest = serde_json::from_value(json!({
+            "labels": { "traffic_group": "stable" }
+        }))
+        .expect("update request");
+        assert!(validate_update(&group_alone, true).is_ok());
     }
 }
