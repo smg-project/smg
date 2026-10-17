@@ -100,17 +100,14 @@ PYTHON_PACKAGES=(
 # Format: "label|file|type"
 #   type: "cargo"  → first `version = "X.Y.Z"` line in a Cargo.toml
 #         "pyproject" → first `version = "X.Y.Z"` line in a pyproject.toml
-#         "workflow"  → `default: 'vX.Y.Z'` for smg_commit in a workflow file
+#         "workflow"  → the `SMG_RELEASE_TAG: vX.Y.Z` line of a workflow file
 # ---------------------------------------------------------------------------
 SMG_VERSION_SYNC=(
     "smg-python|bindings/python/Cargo.toml|cargo"
     "smg-golang|bindings/golang/Cargo.toml|cargo"
     "smg pyproject|bindings/python/pyproject.toml|pyproject"
     "helm chart|deploy/helm/smg/Chart.yaml|helm"
-    "sglang-docker|.github/workflows/release-sglang-docker.yml|workflow"
-    "vllm-docker|.github/workflows/release-vllm-docker.yml|workflow"
-    "trtllm-docker|.github/workflows/release-trtllm-docker.yml|workflow"
-    "tokenspeed-docker|.github/workflows/release-tokenspeed-docker.yml|workflow"
+    "engine-docker|.github/workflows/release-engine-docker.yml|workflow"
 )
 
 # ---------------------------------------------------------------------------
@@ -395,22 +392,21 @@ set_helm_chart_version() {
     fi
 }
 
-# Extract smg_commit default version from a workflow file (e.g. "default: 'v1.2.0'")
+# Extract the SMG release tag a workflow file pins (its "SMG_RELEASE_TAG: v1.2.0" line)
 get_workflow_smg_version() {
     local file="$1"
-    grep -m1 "default: 'v[0-9]" "$file" | sed "s/.*default: 'v\([^']*\)'.*/\1/"
+    grep -m1 "SMG_RELEASE_TAG: v[0-9]" "$file" | sed "s/.*SMG_RELEASE_TAG: v\([^[:space:]]*\).*/\1/"
 }
 
-# Update all smg version references in a workflow file.
-# Replaces the version in default: values, || fallbacks, and description examples.
+# Update the SMG release tag a workflow file pins (its one "SMG_RELEASE_TAG: vX.Y.Z" line).
 set_workflow_smg_version() {
     local file="$1"
     local old_version="$2"
     local new_version="$3"
     local escaped_old
     escaped_old=$(escape_version "$old_version")
-    sed_inplace "s/v${escaped_old}/v${new_version}/g" "$file"
-    if ! grep -q "default: 'v${new_version}'" "$file"; then
+    sed_inplace "s/SMG_RELEASE_TAG: v${escaped_old}/SMG_RELEASE_TAG: v${new_version}/" "$file"
+    if ! grep -q "SMG_RELEASE_TAG: v${new_version}" "$file"; then
         echo -e "    ${RED}FAILED to update $file${NC}" >&2
         return 1
     fi
