@@ -2268,14 +2268,15 @@ impl StreamingProcessor {
     }
 
     /// Ends Symphony's reading of the message: `flushed`, the text the decoder released last,
-    /// then the engine's `finish`; the events go through the machine ([`Self::send_symphony_blocks`])
-    /// and the reasoning tokens they cost are added to `thinking_tokens`.
+    /// then the engine's `finish`; the events go through the machine ([`Self::send_symphony_blocks`],
+    /// `thinking_text` as there) and the reasoning tokens they cost are added to `thinking_tokens`.
     async fn end_symphony_message(
         tx: &SseSender,
         buffer: &mut Vec<u8>,
         (reader, machine): (&mut Reader, &mut adapt::messages::Stream),
         flushed: Option<&str>,
         finish: EngineFinish,
+        thinking_text: bool,
         thinking_tokens: &mut u32,
     ) -> Result<Option<messages::StopReason>, utils::StreamFailure> {
         let mut events = match flushed {
@@ -2284,16 +2285,19 @@ impl StreamingProcessor {
         };
         events.extend(reader.end(finish)?);
         *thinking_tokens += reasoning_text_tokens(&events);
-        Self::send_symphony_blocks(tx, buffer, machine, &events).await
+        Self::send_symphony_blocks(tx, buffer, machine, &events, thinking_text).await
     }
 
     /// Feeds Symphony's `events` to the content-block `machine` and sends the stream events it
-    /// gives, in order; the stop reason when a `Finish` was among the events.
+    /// gives, in order, the `thinking_delta`s only when `thinking_text` (a `thinking.display` of
+    /// `omitted` keeps the thinking block, its start and its stop, and no text); the stop reason
+    /// when a `Finish` was among the events.
     async fn send_symphony_blocks(
         tx: &SseSender,
         buffer: &mut Vec<u8>,
         machine: &mut adapt::messages::Stream,
         events: &[Event],
+        thinking_text: bool,
     ) -> Result<Option<messages::StopReason>, utils::StreamFailure> {
         let mut stop = None;
         let mut blocks = Vec::new();
@@ -2301,6 +2305,16 @@ impl StreamingProcessor {
             stop = machine.feed(event, &mut blocks).or(stop);
         }
         for block in &blocks {
+            let thinking_delta = matches!(
+                block,
+                MessageStreamEvent::ContentBlockDelta {
+                    delta: ContentBlockDelta::ThinkingDelta { .. },
+                    ..
+                }
+            );
+            if thinking_delta && !thinking_text {
+                continue;
+            }
             Self::send_messages_event(tx, buffer, block).await?;
         }
         Ok(stop)
@@ -2574,6 +2588,9 @@ impl StreamingProcessor {
         let model = &dispatch.model;
 
         let has_tools = original_request.has_tools;
+        // Whether the thinking deltas leave: `thinking.display: "omitted"`
+        // keeps the thinking block, its start and its stop, and no text.
+        let thinking_text_returned = original_request.thinking_text_returned;
 
         // Content block state machine
         let mut current_block_index: u32 = 0;
@@ -2775,10 +2792,15 @@ impl StreamingProcessor {
                                 .map(|s| Value::String(s.to_string()));
                         }
                         parsed_thinking_tokens += reasoning_text_tokens(&events);
-                        symphony_stop =
-                            Self::send_symphony_blocks(tx, &mut sse_buffer, machine, &events)
-                                .await?
-                                .or(symphony_stop);
+                        symphony_stop = Self::send_symphony_blocks(
+                            tx,
+                            &mut sse_buffer,
+                            machine,
+                            &events,
+                            thinking_text_returned,
+                        )
+                        .await?
+                        .or(symphony_stop);
                         continue;
                     }
 
@@ -2845,6 +2867,7 @@ impl StreamingProcessor {
                             (reader, machine),
                             flushed.as_deref(),
                             engine_finish(&finish_reason_str),
+                            thinking_text_returned,
                             &mut parsed_thinking_tokens,
                         )
                         .await?
@@ -2894,6 +2917,7 @@ impl StreamingProcessor {
                             (reader, machine),
                             flushed.as_deref(),
                             finish,
+                            thinking_text_returned,
                             &mut parsed_thinking_tokens,
                         )
                         .await?
@@ -2971,17 +2995,19 @@ impl StreamingProcessor {
                     .await?;
                     thinking_block_open = true;
                 }
-                Self::send_messages_event(
-                    tx,
-                    &mut sse_buffer,
-                    &MessageStreamEvent::ContentBlockDelta {
-                        index: current_block_index,
-                        delta: ContentBlockDelta::ThinkingDelta {
-                            thinking: reasoning_chunk_text,
+                if thinking_text_returned {
+                    Self::send_messages_event(
+                        tx,
+                        &mut sse_buffer,
+                        &MessageStreamEvent::ContentBlockDelta {
+                            index: current_block_index,
+                            delta: ContentBlockDelta::ThinkingDelta {
+                                thinking: reasoning_chunk_text,
+                            },
                         },
-                    },
-                )
-                .await?;
+                    )
+                    .await?;
+                }
             }
 
             if final_chunk && normal_text.is_empty() {
@@ -4433,6 +4459,8 @@ mod failure_tests;
 mod pd_usage_tests;
 #[cfg(test)]
 mod symphony_tests;
+#[cfg(test)]
+mod thinking_display_tests;
 #[cfg(test)]
 mod usage_chunk_tests;
 

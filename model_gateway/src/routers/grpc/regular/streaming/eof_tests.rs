@@ -651,6 +651,7 @@ async fn byte_fallback_messages_eof_emits_exact_text_before_block_stop() {
     let (tx, rx) = sse_channel();
     let spec = MessagesResponseSpec {
         thinking_requested: false,
+        thinking_text_returned: true,
         reasoning_in_prefill: false,
         tool_choice: None,
         has_tools: false,
@@ -747,6 +748,7 @@ fn byte_fallback_reasoning_tokenizer() -> Arc<dyn Tokenizer> {
 fn byte_fallback_messages_spec(thinking: bool) -> MessagesResponseSpec {
     MessagesResponseSpec {
         thinking_requested: thinking,
+        thinking_text_returned: true,
         reasoning_in_prefill: false,
         tool_choice: None,
         has_tools: false,
@@ -1916,6 +1918,7 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
         let (tx, rx) = sse_channel();
         let spec = MessagesResponseSpec {
             thinking_requested: true,
+            thinking_text_returned: true,
             reasoning_in_prefill: false,
             tool_choice: None,
             has_tools: false,
@@ -2001,6 +2004,7 @@ async fn messages_stream_stop_reason_follows_what_the_engine_matched() {
         let (tx, rx) = sse_channel();
         let spec = MessagesResponseSpec {
             thinking_requested: false,
+            thinking_text_returned: true,
             reasoning_in_prefill: false,
             tool_choice: None,
             has_tools: false,
@@ -2375,6 +2379,7 @@ async fn messages_blocks_and_inputs(
 ) -> (Vec<String>, Vec<Value>) {
     let spec = MessagesResponseSpec {
         thinking_requested: true,
+        thinking_text_returned: true,
         reasoning_in_prefill: false,
         tool_choice,
         has_tools: true,

@@ -847,11 +847,52 @@ pub(crate) fn anthropic_tool_use_id(id: &str) -> String {
     }
 }
 
+/// Empties the text of the thinking blocks in `content`, as a
+/// `thinking.display` of `omitted` returns them: the blocks and their
+/// signature stay where they are, the reasoning does not leave the gateway
+/// (see `ThinkingDisplay::returns_text`).
+pub(crate) fn omit_thinking_text(content: &mut [messages::ContentBlock]) {
+    for block in content {
+        if let messages::ContentBlock::Thinking { thinking, .. } = block {
+            thinking.clear();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use messages::{InputMessage, Role, TextBlock};
 
     use super::*;
+
+    /// `omit_thinking_text` empties the thinking blocks' text and touches
+    /// nothing else: the blocks stay, with their signature, in their place.
+    #[test]
+    fn omit_thinking_text_keeps_the_blocks_and_drops_their_text() {
+        let mut content = vec![
+            messages::ContentBlock::Thinking {
+                thinking: "plan".to_string(),
+                signature: "sig".to_string(),
+            },
+            messages::ContentBlock::Text {
+                text: "Hello".to_string(),
+                citations: None,
+            },
+            messages::ContentBlock::Thinking {
+                thinking: "more".to_string(),
+                signature: String::new(),
+            },
+        ];
+        omit_thinking_text(&mut content);
+        assert_eq!(
+            serde_json::to_value(&content).unwrap(),
+            json!([
+                {"type": "thinking", "thinking": "", "signature": "sig"},
+                {"type": "text", "text": "Hello"},
+                {"type": "thinking", "thinking": "", "signature": ""},
+            ])
+        );
+    }
 
     #[test]
     fn anthropic_tool_use_id_swaps_standard_prefix() {

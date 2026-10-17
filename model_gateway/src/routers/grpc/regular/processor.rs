@@ -433,7 +433,10 @@ impl ResponseProcessor {
             complete.finish_reason()
         };
         events.extend(reader.end(engine_finish(reason))?);
-        let output = adapt::messages::output(&events);
+        let mut output = adapt::messages::output(&events);
+        if !request.thinking_text_returned {
+            utils::message_utils::omit_thinking_text(&mut output.content);
+        }
         let stop_sequence = stop_decoder.matched_stop().map(String::from).or_else(|| {
             complete
                 .matched_stop_json()
@@ -1042,6 +1045,9 @@ impl ResponseProcessor {
                     caller: messages::ToolUseCaller::Direct,
                 });
             }
+        }
+        if !messages_request.thinking_text_returned {
+            utils::message_utils::omit_thinking_text(&mut content_blocks);
         }
 
         // Step 4: Determine stop_reason and stop_sequence (derived from same conditions).

@@ -157,6 +157,12 @@ impl CreateMessageRequest {
         self.thinking.as_ref().map(ThinkingConfig::enabled)
     }
 
+    /// The `thinking.display` the `thinking` block states, none without one;
+    /// [`ThinkingDisplay::returns_text`] says what it decides.
+    pub fn thinking_display(&self) -> Option<ThinkingDisplay> {
+        self.thinking.as_ref().and_then(ThinkingConfig::display)
+    }
+
     /// The thinking preference the prompt is rendered with.
     pub fn template_thinking(&self) -> Option<bool> {
         template_thinking(&self.model, self.thinking_toggle(), self.reasoning_effort())
@@ -1072,22 +1078,33 @@ impl ThinkingConfig {
     pub fn enabled(&self) -> bool {
         matches!(self, Self::Enabled { .. } | Self::Adaptive { .. })
     }
+
+    /// The `display` the block states, under `enabled` and `adaptive` alike;
+    /// `disabled` states none.
+    pub fn display(&self) -> Option<ThinkingDisplay> {
+        match self {
+            Self::Enabled { display, .. } | Self::Adaptive { display } => *display,
+            Self::Disabled => None,
+        }
+    }
 }
 
 /// How thinking content is returned in API responses: the documented set,
 /// `summarized`, `omitted` and `updates` (the beta value that returns the
-/// model's progress notes between tool calls). The gateway keeps the
-/// preference on the request and returns the thinking blocks the engine
-/// produces whatever it says.
+/// model's progress notes between tool calls). What each value returns from
+/// the gateway is [`ThinkingDisplay::returns_text`]'s to say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingDisplay {
-    /// Thinking blocks contain summarized reasoning text
+    /// Thinking blocks carry readable reasoning text: a summary where the
+    /// provider writes one, the reasoning itself here
     Summarized,
-    /// Thinking blocks return empty text; signature still carries encrypted content
+    /// Thinking blocks return an empty text; the block and its signature
+    /// still arrive
     Omitted,
     /// As `omitted`, with the model's progress notes between tool calls as
-    /// short thinking blocks (beta `thinking-display-updates-2026-08-18`)
+    /// short thinking blocks (beta `thinking-display-updates-2026-08-18`);
+    /// the reasoning as it arrives here
     Updates,
 }
 
@@ -1101,6 +1118,20 @@ impl ThinkingDisplay {
 
     /// The set as a refusal lists it.
     const EXPECTED: &'static str = "one of `summarized`, `omitted`, `updates`";
+
+    /// Whether the thinking blocks of the response carry their text.
+    ///
+    /// `omitted` returns them empty: the block, its `signature` and the
+    /// thinking tokens in `usage` still arrive, the text does not.
+    /// `summarized` and `updates` return the reasoning as the engine wrote
+    /// it, as it arrives: the gateway has no summarizer, and a model served
+    /// through it writes no progress notes apart from its reasoning, so the
+    /// live text is the readable form the one asks for and the update stream
+    /// the other does; returned, the client can send it back, and a template
+    /// that reads the reasoning of the turn's earlier calls then has it.
+    pub fn returns_text(self) -> bool {
+        !matches!(self, Self::Omitted)
+    }
 }
 
 /// A `display` outside the documented set is refused with the field's name:
@@ -3139,6 +3170,38 @@ mod tests {
         let cfg: ThinkingConfig =
             serde_json::from_value(json!({"type": "adaptive", "display": null})).unwrap();
         assert!(matches!(cfg, ThinkingConfig::Adaptive { display: None }));
+    }
+
+    /// `omitted` is the one value that returns the thinking blocks without
+    /// their text; the request states the display under `adaptive` and
+    /// `enabled` alike, and none under `disabled` or without `thinking`.
+    #[test]
+    fn thinking_display_decides_whether_the_thinking_text_is_returned() {
+        assert!(ThinkingDisplay::Summarized.returns_text());
+        assert!(ThinkingDisplay::Updates.returns_text());
+        assert!(!ThinkingDisplay::Omitted.returns_text());
+        let display = |thinking: Value| -> Option<ThinkingDisplay> {
+            let request: CreateMessageRequest = serde_json::from_value(json!({
+                "model": "m", "max_tokens": 16, "messages": [], "thinking": thinking
+            }))
+            .expect("the request deserializes");
+            request.thinking_display()
+        };
+        assert_eq!(
+            display(json!({"type": "adaptive", "display": "omitted"})),
+            Some(ThinkingDisplay::Omitted)
+        );
+        assert_eq!(
+            display(json!({"type": "enabled", "budget_tokens": 1024, "display": "updates"})),
+            Some(ThinkingDisplay::Updates)
+        );
+        assert_eq!(
+            display(json!({"type": "enabled", "budget_tokens": 1024, "display": "summarized"})),
+            Some(ThinkingDisplay::Summarized)
+        );
+        assert_eq!(display(json!({"type": "adaptive"})), None);
+        assert_eq!(display(json!({"type": "disabled"})), None);
+        assert_eq!(display(Value::Null), None);
     }
 
     /// The first request of a coding agent: an adaptive thinking with

@@ -174,6 +174,9 @@ impl From<&GenerateRequest> for GenerateResponseSpec {
 pub(crate) struct MessagesResponseSpec {
     /// The `thinking` block asks for thinking (`enabled` or `adaptive`).
     pub thinking_requested: bool,
+    /// The thinking blocks carry their text: a `thinking.display` other than
+    /// `omitted`, or none (see `ThinkingDisplay::returns_text`).
+    pub thinking_text_returned: bool,
     /// Whether the prompt ends inside the model's thinking block, decided by
     /// request building from the rendered prompt.
     pub reasoning_in_prefill: bool,
@@ -197,6 +200,9 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
     fn from(request: &CreateMessageRequest) -> Self {
         Self {
             thinking_requested: request.thinking_toggle().unwrap_or(false),
+            thinking_text_returned: request
+                .thinking_display()
+                .is_none_or(messages::ThinkingDisplay::returns_text),
             reasoning_in_prefill: false,
             tool_choice: request.tool_choice.clone(),
             has_tools: request.tools.is_some(),
