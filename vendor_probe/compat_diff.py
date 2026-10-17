@@ -341,6 +341,34 @@ def request_choices(record) -> int:
     return n if isinstance(n, int) and not isinstance(n, bool) and n > 1 else 1
 
 
+_CHAT_ROLE_CHUNK = re.compile(r"^delta\.([a-z_]+(?:\+[a-z_]+)*)")
+
+
+def role_chunks(names) -> int:
+    """How many chunks of a chat stream carry ``role`` (``names`` are the raw
+    chunk names, one per chunk): one per choice index in a conforming stream,
+    whatever order the indexes' chunks come in."""
+    count = 0
+    for n in names:
+        m = _CHAT_ROLE_CHUNK.match(n)
+        if m and "role" in m.group(1).split("+"):
+            count += 1
+    return count
+
+
+def fold_role_cores(core: tuple) -> tuple:
+    """Adjacent ``delta.role`` cores as one: a multi-choice stream's opening
+    role chunks sit next to each other once the content-bound parts are gone,
+    whether the vendor interleaved the indexes' chunks or a gateway sent the
+    opening chunks back to back."""
+    out: list = []
+    for n in core:
+        if n == "delta.role" and out and out[-1] == "delta.role":
+            continue
+        out.append(n)
+    return tuple(out)
+
+
 def collapse_runs(names: list) -> tuple:
     """a b b b c -> (a, b+, c): delta repetition must not read as drift."""
     out: list = []
@@ -704,7 +732,12 @@ def split_paths(vendor_paths, smg_paths, provider):
 def compare_events(v_names, s_names, provider, multi_choice: bool = False):
     """Compare collapsed event sequences; returns (divergent, detail).
     ``multi_choice``: the request asked for several choices, whose chat stream
-    sends one ``role`` chunk per choice index (see ``chat_core_name``)."""
+    sends one ``role`` chunk per choice index (see ``chat_core_name``): the
+    vendor interleaves the indexes' chunks and a gateway may open the indexes
+    back to back, so adjacent ``delta.role`` cores fold on both sides
+    (``fold_role_cores``) and the number of chunks carrying ``role`` has to
+    agree instead (``role_chunks``), which keeps a role repeated on every
+    chunk of such a stream structural."""
     v_seq, s_seq = collapse_runs(v_names), collapse_runs(s_names)
     if v_seq == s_seq:
         return False, None
@@ -731,12 +764,20 @@ def compare_events(v_names, s_names, provider, multi_choice: bool = False):
         return tuple(out)
 
     v_core, s_core = strip(v_seq), strip(s_seq)
+    chat_choices = multi_choice and provider == "openai-chat"
+    if chat_choices:
+        v_core, s_core = fold_role_cores(v_core), fold_role_cores(s_core)
     detail = {
         "vendor_events": list(v_seq),
         "smg_events": list(s_seq),
         "vendor_core": list(v_core),
         "smg_core": list(s_core),
     }
+    if chat_choices:
+        v_roles, s_roles = role_chunks(v_names), role_chunks(s_names)
+        if v_roles != s_roles:
+            detail["role_chunks"] = {"vendor": v_roles, "smg": s_roles}
+            return True, detail
     if v_core == s_core:
         return False, detail  # differences confined to content-bound events
 

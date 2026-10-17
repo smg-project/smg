@@ -127,6 +127,10 @@ treats the content-bound delta parts (which kinds a chunk carries, and whether
 the first rides along with `role`) and the stop/length/tool_calls finish
 classes as mock-limited, like the other families; a `role` that repeats on
 every chunk of a single-choice stream stays structural (`delta.role.repeated`).
+In a multi-choice stream (`n > 1`) the vendor interleaves the choices' opening
+role chunks and a gateway may send them back to back, so adjacent role cores
+fold on both sides and the number of chunks carrying `role` has to agree
+instead: a role on every chunk of such a stream still reads as structural.
 
 ## Dual-target replay (SMG diff)
 
