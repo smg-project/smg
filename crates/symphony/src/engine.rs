@@ -54,6 +54,9 @@ pub struct Engine {
     calls: u32,
     /// Where the output's call ids count from.
     ids: CallIds,
+    /// The ids this output's calls were given, in order: a table that carries the model's id
+    /// falls back to the minted one where a header repeats an id already given.
+    given_ids: Vec<String>,
     tokens: Ledger,
     reasoning_tokens: u32,
     stage: Stage,
@@ -266,7 +269,7 @@ fn assembler(
         // validates enters the state no other way.
         Some(CallSyntax::Shaped(shape)) => Box::new(ShapedCall {
             call: shape::Assembler::new(index, id, shape, values, None)
-                .with_call_id(CallId::Minted),
+                .with_call_id(CallId::Minted, &[]),
             declared: declared.clone(),
         }),
     }
@@ -333,6 +336,7 @@ impl Engine {
             call: None,
             calls: 0,
             ids,
+            given_ids: Vec::new(),
             tokens: Ledger::new(),
             reasoning_tokens: 0,
             stage: Stage::Fresh,
@@ -504,7 +508,7 @@ impl Engine {
         let values = self.format.value_reader();
         let call =
             shape::Assembler::new(self.calls, id, shape, values, terminal.chars().next_back())
-                .with_call_id(self.format.call_id_source());
+                .with_call_id(self.format.call_id_source(), &self.given_ids);
         Some(Pending {
             terminal: index,
             from,
@@ -919,8 +923,9 @@ impl Engine {
     /// region, with the ignored terminals that arrived among them placed where they arrived.
     fn push_call_events(&mut self, mut events: Events, out: &mut Events) {
         for event in events.drain() {
-            if matches!(event, Event::ToolCallStart { .. }) {
+            if let Event::ToolCallStart { id, .. } = &event {
                 self.calls += 1;
+                self.given_ids.push(id.clone());
             }
             for event in self.carried_into(event) {
                 out.push(self.tokens.relabel(event));

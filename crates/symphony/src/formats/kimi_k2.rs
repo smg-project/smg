@@ -466,6 +466,20 @@ mod tests {
         // The older parser's spelling without `functions.` is carried as written too.
         let bare = "<|tool_calls_section_begin|><|tool_call_begin|>get_weather:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>";
         assert_eq!(ids(&run(PROMPT, &[bare])), ["get_weather:0"]);
+        // Two calls the model gave one id: the second takes the minted id, so the response's ids
+        // stay distinct and a tool result still names one call.
+        let repeated = concat!(
+            "<|tool_calls_section_begin|>",
+            "<|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|>",
+            "<|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Rome\"}<|tool_call_end|>",
+            "<|tool_calls_section_end|>"
+        );
+        let events = run(PROMPT, &[repeated]);
+        let given = ids(&events);
+        assert_eq!(given.len(), 2);
+        assert_eq!(given[0], "functions.get_weather:0");
+        assert!(crate::ids::is_minted(given[1]), "{given:?}");
+        assert_eq!(finish(&events), (FinishReason::Stop, 2));
     }
 
     #[test]

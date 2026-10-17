@@ -268,8 +268,9 @@ pub enum CallId {
     /// The call's header as the model wrote it, its surrounding whitespace and the literal that
     /// ends the header left out (`functions.get_weather:0` for the Kimi K2 line): a family whose
     /// templates render a turn's ids back into the prompt keeps the id the model will see again,
-    /// and a tool result pairs with its call by the id the model gave. Only a call given as data
-    /// whose header names the call has one.
+    /// and a tool result pairs with its call by the id the model gave. A header whose id repeats
+    /// one already given in the response takes the minted id instead, so a response's ids stay
+    /// distinct. Only a call given as data whose header names the call has one.
     Header,
 }
 

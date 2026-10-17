@@ -67,7 +67,9 @@ What the engine decides for every format, and what it leaves open:
   `Engine::with_call_ids` names the nonce for a replay that wants the ids reproducible. No
   assembler chooses an id (`ids.rs`); a table whose call header writes the id and whose
   templates render it back into the prompt (Kimi K2) carries the model's own id on the call
-  instead (`Format::call_id(CallId::Header)`: the header's text without its ending literal).
+  instead (`Format::call_id(CallId::Header)`: the header's text without its ending literal); a
+  header id that repeats one already given in the response falls back to the minted id, so a
+  response's ids stay distinct either way.
 - Every text event says how many tokens it carries, counted by the `Ledger` from the deltas'
   spans: a token in the event that carries its first byte, a byte-less span (a held half of a
   character, or a hidden special token) into the run that carries the next byte, and the tokens

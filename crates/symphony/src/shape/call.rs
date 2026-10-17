@@ -91,6 +91,9 @@ pub struct Assembler {
     id: String,
     /// Where the call's id comes from: the one minted for it, or its header as written.
     call_id: CallId,
+    /// The ids the output's earlier calls were given: a header id that repeats one of them
+    /// falls back to the minted id, so the ids of one response stay distinct.
+    taken: Vec<String>,
     shape: &'static CallShape,
     /// How the call's values read.
     values: Values,
@@ -199,6 +202,7 @@ impl Assembler {
             index,
             id: id.into(),
             call_id: CallId::Minted,
+            taken: Vec::new(),
             shape,
             values,
             before,
@@ -206,10 +210,15 @@ impl Assembler {
         }
     }
 
-    /// Where the call's id comes from; the minted one unless the table says otherwise.
+    /// Where the call's id comes from; the minted one unless the table says otherwise, and the
+    /// minted one again where the header's id repeats one of `taken`, the ids the output's
+    /// earlier calls were given.
     #[must_use]
-    pub(crate) fn with_call_id(mut self, source: CallId) -> Self {
+    pub(crate) fn with_call_id(mut self, source: CallId, taken: &[String]) -> Self {
         self.call_id = source;
+        if source == CallId::Header {
+            self.taken = taken.to_vec();
+        }
         self
     }
 
@@ -303,11 +312,14 @@ impl Assembler {
                 .map(|span| held[span].to_string())
                 .unwrap_or_default(),
         };
-        // The call's id: the one minted for it, or the header's as the model wrote it, which a
-        // header that leaves nothing after its literal falls back from.
+        // The call's id: the one minted for it, or the header's as the model wrote it; a header
+        // that leaves nothing after its literal, or repeats an id this output gave already, falls
+        // back to the minted one, so a response's ids stay distinct.
         let id = match self.call_id {
             CallId::Minted => self.id.clone(),
-            CallId::Header => header_id(header, &shape.header).unwrap_or_else(|| self.id.clone()),
+            CallId::Header => header_id(header, &shape.header)
+                .filter(|id| !self.taken.contains(id))
+                .unwrap_or_else(|| self.id.clone()),
         };
         out.push(Event::ToolCallStart {
             index: self.index,

@@ -2178,6 +2178,10 @@ fn calls_are_numbered_from_zero_in_order_with_ids_that_count_from_a_nonce_of_the
                     subject.name
                 );
             }
+            let mut distinct: Vec<&String> = calls.iter().map(|(_, id, _)| id).collect();
+            distinct.sort();
+            distinct.dedup();
+            assert_eq!(distinct.len(), calls.len(), "{}: {text:?}", subject.name);
             let again = replay(subject, text, &[], false)
                 .unwrap_or_else(|e| panic!("{}: {text:?}: {e}", subject.name));
             assert_eq!(calls, starts(&again), "{}: {text:?}", subject.name);
