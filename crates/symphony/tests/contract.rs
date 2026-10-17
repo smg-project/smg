@@ -1215,6 +1215,8 @@ const KIMI_K2_OUTPUTS: &[&str] = &[
     "<|tool_calls_section_begin|><|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>{} trailing<|tool_call_end|><|tool_calls_section_end|>",
     "<|tool_calls_section_begin|>stray<|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>",
     "<|tool_calls_section_begin|><|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>{}<|tool_calls_section_end|>",
+    // Two calls the model gave one id: the second takes a minted id, under every cut.
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Rome\"}<|tool_call_end|><|tool_calls_section_end|>",
     "<think>unfinished",
     "",
 ];
@@ -2177,21 +2179,54 @@ fn calls_are_numbered_from_zero_in_order_with_ids_that_count_from_a_nonce_of_the
             .table
             .is_some_and(|table| table.format().call_id_source() == CallId::Header);
         if from_header {
+            // A call's id is its header's, found in the header's bytes; a header whose text
+            // repeats an earlier call's gets a minted id instead, so the ids stay distinct.
+            let mut headers: Vec<&String> = Vec::new();
             for (position, (index, id, source)) in calls.iter().enumerate() {
                 assert_eq!(*index as usize, position, "{}: {text:?}", subject.name);
-                assert!(
-                    !id.is_empty() && common::minted_id(id).is_none() && source.contains(id),
-                    "{}: {text:?}: id {id:?} is not the header's ({source:?})",
-                    subject.name
-                );
+                let repeated = headers.contains(&source);
+                headers.push(source);
+                if repeated {
+                    assert!(
+                        common::minted_id(id).is_some(),
+                        "{}: {text:?}: a repeated header ({source:?}) gave {id:?}, not a minted id",
+                        subject.name
+                    );
+                } else {
+                    assert!(
+                        !id.is_empty() && common::minted_id(id).is_none() && source.contains(id),
+                        "{}: {text:?}: id {id:?} is not the header's ({source:?})",
+                        subject.name
+                    );
+                }
             }
             let mut distinct: Vec<&String> = calls.iter().map(|(_, id, _)| id).collect();
             distinct.sort();
             distinct.dedup();
             assert_eq!(distinct.len(), calls.len(), "{}: {text:?}", subject.name);
+            // Another engine gives the same ids, the minted fallbacks compared by their shape:
+            // each engine draws its own nonce.
+            let shaped = |calls: &[(u32, String, String)]| -> Vec<(u32, String, String)> {
+                calls
+                    .iter()
+                    .map(|(index, id, source)| {
+                        let id = if common::minted_id(id).is_some() {
+                            "<minted>".to_string()
+                        } else {
+                            id.clone()
+                        };
+                        (*index, id, source.clone())
+                    })
+                    .collect()
+            };
             let again = replay(subject, text, &[], false)
                 .unwrap_or_else(|e| panic!("{}: {text:?}: {e}", subject.name));
-            assert_eq!(calls, starts(&again), "{}: {text:?}", subject.name);
+            assert_eq!(
+                shaped(&calls),
+                shaped(&starts(&again)),
+                "{}: {text:?}",
+                subject.name
+            );
             continue;
         }
         let first = calls.first().and_then(|(_, id, _)| common::minted_id(id));
