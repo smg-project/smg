@@ -37,12 +37,6 @@ use crate::{
 pub struct WasmRuntime {
     config: WasmRuntimeConfig,
     thread_pool: Arc<WasmThreadPool>,
-    // Metrics
-    total_executions: AtomicU64,
-    successful_executions: AtomicU64,
-    failed_executions: AtomicU64,
-    total_execution_time_ms: AtomicU64,
-    max_execution_time_ms: AtomicU64,
 }
 
 pub struct WasmThreadPool {
@@ -76,11 +70,6 @@ impl WasmRuntime {
         Self {
             config,
             thread_pool,
-            total_executions: AtomicU64::new(0),
-            successful_executions: AtomicU64::new(0),
-            failed_executions: AtomicU64::new(0),
-            total_execution_time_ms: AtomicU64::new(0),
-            max_execution_time_ms: AtomicU64::new(0),
         }
     }
 
@@ -109,7 +98,6 @@ impl WasmRuntime {
         attach_point: WasmModuleAttachPoint,
         input: WasmComponentInput,
     ) -> Result<WasmComponentOutput> {
-        let start_time = std::time::Instant::now();
         let (response_tx, response_rx) = oneshot::channel();
 
         let task = WasmTask::ExecuteComponent {
@@ -124,38 +112,11 @@ impl WasmRuntime {
             WasmRuntimeError::CallFailed(format!("Failed to send task to thread pool: {e}"))
         })?;
 
-        let result = response_rx.await.map_err(|e| {
+        response_rx.await.map_err(|e| {
             WasmRuntimeError::CallFailed(format!(
                 "Failed to receive response from thread pool: {e}"
             ))
-        })?;
-
-        let execution_time_ms = start_time.elapsed().as_millis() as u64;
-        self.total_executions.fetch_add(1, Ordering::Relaxed);
-        self.total_execution_time_ms
-            .fetch_add(execution_time_ms, Ordering::Relaxed);
-        // Update max execution time
-        self.max_execution_time_ms
-            .fetch_max(execution_time_ms, Ordering::Relaxed);
-
-        if result.is_ok() {
-            self.successful_executions.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.failed_executions.fetch_add(1, Ordering::Relaxed);
-        }
-
-        result
-    }
-
-    /// Get current metrics
-    pub fn get_metrics(&self) -> (u64, u64, u64, u64, u64) {
-        (
-            self.total_executions.load(Ordering::Relaxed),
-            self.successful_executions.load(Ordering::Relaxed),
-            self.failed_executions.load(Ordering::Relaxed),
-            self.total_execution_time_ms.load(Ordering::Relaxed),
-            self.max_execution_time_ms.load(Ordering::Relaxed),
-        )
+        })?
     }
 }
 

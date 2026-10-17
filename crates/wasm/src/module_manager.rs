@@ -167,22 +167,24 @@ impl WasmModuleManager {
             .execute_component_async(sha256_hash, wasm_bytes, attach_point, input)
             .await;
 
-        // Record metrics
-        let execution_time_ms = start_time.elapsed().as_millis() as u64;
+        self.record_execution(start_time.elapsed().as_millis() as u64, result.is_ok());
+
+        result
+    }
+
+    /// Count one execution that took `elapsed_ms` and ended `ok` or not:
+    /// the totals, the running maximum, and the outcome's counter.
+    fn record_execution(&self, elapsed_ms: u64, ok: bool) {
         self.total_executions.fetch_add(1, Ordering::Relaxed);
         self.total_execution_time_ms
-            .fetch_add(execution_time_ms, Ordering::Relaxed);
-        // Update max execution time
+            .fetch_add(elapsed_ms, Ordering::Relaxed);
         self.max_execution_time_ms
-            .fetch_max(execution_time_ms, Ordering::Relaxed);
-
-        if result.is_ok() {
+            .fetch_max(elapsed_ms, Ordering::Relaxed);
+        if ok {
             self.successful_executions.fetch_add(1, Ordering::Relaxed);
         } else {
             self.failed_executions.fetch_add(1, Ordering::Relaxed);
         }
-
-        result
     }
 
     /// Get current metrics
@@ -228,5 +230,21 @@ impl WasmModuleManager {
 impl Default for WasmModuleManager {
     fn default() -> Self {
         Self::with_default_config()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The five counters the route reports, after one success and one
+    /// failure: the totals, the running maximum, and the outcome split.
+    #[test]
+    fn the_execution_counters_add_up_over_a_success_and_a_failure() {
+        let manager = WasmModuleManager::with_default_config();
+        assert_eq!(manager.get_metrics(), (0, 0, 0, 0, 0));
+        manager.record_execution(7, true);
+        manager.record_execution(3, false);
+        assert_eq!(manager.get_metrics(), (2, 1, 1, 10, 7));
     }
 }
