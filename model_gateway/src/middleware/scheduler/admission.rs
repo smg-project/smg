@@ -191,8 +191,17 @@ pub async fn priority_admission_middleware(
 /// the preempt CAS either way), and a layer between here and the edge that
 /// replaces the body while keeping the extensions (the Messages error
 /// envelope) would have it end the rebuilt body before its first byte.
+///
+/// The header alone does not say so: a worker's response carries its own
+/// headers through the relays, this one included (a gateway one tier down
+/// writes it). The scheduler's own mark does: nothing has asked the permit
+/// about a first frame yet, so a handle that is no longer preemptible was
+/// preempted by this scheduler, which no worker can fake. A relayed header
+/// on an admitted stream leaves the permit on the body, the slot held and
+/// TTFT marked, as before.
 fn carry_permit(response: &mut Response, permit: SchedulerPermit) {
-    if response.headers().contains_key(HEADER_X_SMG_PREEMPTED) {
+    if response.headers().contains_key(HEADER_X_SMG_PREEMPTED) && !permit.handle().is_preemptible()
+    {
         drop(permit);
         return;
     }
@@ -347,5 +356,32 @@ mod permit_tests {
             .expect("whole")
             .to_bytes();
         assert_eq!(&body[..], b"{\"error\":\"overloaded\"}");
+    }
+
+    /// The preemption header a worker's response carries through the relays
+    /// is not this scheduler's word: an admitted stream keeps its permit,
+    /// the slot stays held and the first frame marks TTFT.
+    #[tokio::test]
+    async fn a_relayed_preemption_header_on_an_admitted_stream_keeps_the_permit() {
+        let sched = scheduler();
+        let p = permit(&sched, "req-relayed");
+        let handle = Arc::clone(p.handle());
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .header(HEADER_X_SMG_PREEMPTED, "true")
+            .body(Body::from("data: x\n\n"))
+            .expect("response");
+        carry_permit(&mut response, p);
+        assert_eq!(
+            sched.inflight_for_test(Class::Default),
+            1,
+            "the slot stays held: the header is the worker's, not the scheduler's"
+        );
+        let mut body = at_the_edge(response).into_body();
+        let frame = body.frame().await.expect("a frame").expect("frame ok");
+        assert!(frame.is_data());
+        assert!(!handle.is_preemptible(), "the first frame marked TTFT");
+        drop(body);
+        assert_eq!(sched.inflight_for_test(Class::Default), 0);
     }
 }
