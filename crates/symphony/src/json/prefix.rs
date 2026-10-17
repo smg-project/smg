@@ -16,9 +16,10 @@
 //! lacks that it lets through, a raw control character inside a string, which the fragment that
 //! carries it writes as its escape ([`Prefix::escaped`]), so that what a client assembles is JSON
 //! again. One place it is wider than `serde_json`: it reads a number's grammar, not its size, so a
-//! number out of the reader's range (`1e400`, an integer past what fits) passes, and a call that
-//! carries one closes whole while a client's reader may refuse the number; the templates' own
-//! readers differ there too (Python's reads it as infinity), so the judge leaves it to the client. What it refuses, at the first byte a strict reader refuses: a value left out before a
+//! number out of the reader's range (`1e400`, an integer past `f64`'s range) passes, and a call
+//! that carries one closes whole while a client's reader may refuse the number; the templates' own
+//! readers differ there too (Python's reads it as infinity), so the judge leaves it to the client.
+//! What it refuses, at the first byte a strict reader refuses: a value left out before a
 //! comma or a close (`[,,]`, `{"a": }`), a trailing comma before a close (`[1, ]`), a bracket
 //! closed by the wrong kind (`{"a": [1}`), whitespace JSON lacks between tokens (a no-break
 //! space), a number or a word cut short before a delimiter (`1.}`, `nu}`), a container nested
