@@ -15,7 +15,10 @@
 //! so every gateway replica agrees); a request without one draws at random.
 //!
 //! Weights are labels, so a canary ramp is a `PATCH /workers/{id}` with new
-//! labels, and a weight of 0 drains a group while it stays registered.
+//! labels, and a weight of 0 drains a group while it stays registered, also
+//! when it is the only group left open (the others unavailable or at
+//! capacity): the selection then misses, and the caller reports that,
+//! rather than serve from the drained build.
 //!
 //! The split confines the regular selection and the prefill and decode legs
 //! of a disaggregated pair, whose decode follows the group the prefill leg
@@ -262,6 +265,33 @@ impl<'a> Split<'a> {
         // sound answer should it ever not be.
         &self.arms[self.arms.len() - 1]
     }
+}
+
+/// Whether every available worker of `workers` is in a group that weighs 0
+/// over them, so nothing in the slice may take a request: the case
+/// [`Split::plan`] declines to split (one group, or every group drained) in
+/// which the policy must not run over the slice either. A member of a named
+/// group counts only an explicit weight (as [`Arm::weight`] has it); one of
+/// the default group without a label weighs the default, so an unlabelled
+/// slice is never drained, and neither is an empty or all-unavailable one
+/// (the policy answers those). Returns at the first member that weighs
+/// anything, so the usual slice costs one worker's labels.
+pub fn drained(workers: &[Arc<dyn Worker>]) -> bool {
+    let mut any = false;
+    for worker in workers.iter().filter(|worker| worker.is_available()) {
+        any = true;
+        let labels = &worker.metadata().spec.labels;
+        match labels
+            .get(WEIGHT_LABEL)
+            .and_then(|value| parse_weight(value).ok())
+        {
+            Some(0) => {}
+            Some(_) => return false,
+            None if group_of(worker.as_ref()) == DEFAULT_GROUP => return false,
+            None => {}
+        }
+    }
+    any
 }
 
 /// The group a worker is in: its `traffic_group` label, else [`DEFAULT_GROUP`].

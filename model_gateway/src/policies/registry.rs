@@ -403,7 +403,10 @@ impl PolicyRegistry {
     /// named group (its slice shrunk to that group, the others unavailable
     /// or at capacity) still pins the later leg to it; a followed group
     /// absent or drained among `workers` leaves the key or the draw to decide
-    /// as for a first leg. Every confined selection counts in
+    /// as for a first leg. A slice whose groups all weigh 0 (a drained group
+    /// left alone by availability or capacity) selects nothing under the
+    /// split, so the caller reports the miss rather than serve from the
+    /// drained build. Every confined selection counts in
     /// `smg_traffic_split_selections_total`, one per leg.
     pub fn select_worker_for_model_split<'w>(
         &self,
@@ -434,6 +437,14 @@ impl PolicyRegistry {
                     .collect();
                 let picked = self.select_within(policy, model_id, &members, info)?;
                 return Some((arm.members[picked], Some(arm.name)));
+            }
+            // Not split: one group, or every group drained. A slice whose
+            // groups all weigh 0 serves nothing: a weight of 0 drains a
+            // group also when it is the only one left open (the others
+            // unavailable or at capacity), and the caller reports the miss
+            // rather than use the drained build.
+            if traffic_split::drained(workers) {
+                return None;
             }
         }
         let selected = self.select_within(policy, model_id, workers, info)?;
@@ -3101,6 +3112,56 @@ mod tests {
                 (900..=1_200).contains(&canary),
                 "canary took {canary} of 2000"
             );
+        }
+
+        /// A drained group that is the only one left open (the others at
+        /// capacity or unavailable) takes nothing either: a weight of 0
+        /// drains a group whatever the slice around it, so the selection
+        /// misses and the caller reports that rather than use the drained
+        /// build. One member that weighs anything lifts the group; an
+        /// unlabelled slice weighs the default and serves; off, the labels
+        /// are inert and the slice serves.
+        #[test]
+        fn a_drained_group_alone_in_the_slice_takes_nothing() {
+            let reg = registry(true);
+            let policy = reg.get_default_policy();
+            let info = SelectWorkerInfo::default();
+            let drained = vec![
+                grouped("http://c1:8000", Some("canary"), Some("0")),
+                grouped("http://c2:8000", Some("canary"), Some("0")),
+            ];
+            assert_eq!(
+                reg.select_worker_for_model_split(&policy, "m", &drained, &info, None),
+                None
+            );
+            assert_eq!(
+                reg.select_worker_for_model(&policy, "m", &drained, &info),
+                None
+            );
+            let lifted = vec![
+                grouped("http://c1:8000", Some("canary"), Some("0")),
+                grouped("http://c2:8000", Some("canary"), Some("5")),
+            ];
+            let (_, group) = reg
+                .select_worker_for_model_split(&policy, "m", &lifted, &info, None)
+                .expect("a group that weighs something serves");
+            assert_eq!(group, Some("canary"));
+            let unlabelled: Vec<Arc<dyn Worker>> = (0..2)
+                .map(|i| grouped(&format!("http://d{i}:8000"), None, None))
+                .collect();
+            assert!(reg
+                .select_worker_for_model_split(&policy, "m", &unlabelled, &info, None)
+                .is_some());
+            let off = registry(false);
+            assert!(off
+                .select_worker_for_model_split(
+                    &off.get_default_policy(),
+                    "m",
+                    &drained,
+                    &info,
+                    None
+                )
+                .is_some());
         }
 
         #[test]
