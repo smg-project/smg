@@ -1469,9 +1469,13 @@ struct ModelArgs {
     /// per-model parsers (legacy) or Symphony. With Symphony, a model's
     /// worker labels decide, else Symphony's registry for a model it knows,
     /// else --tool-call-parser and --reasoning-parser: a Symphony table's
-    /// name reads with that table, a legacy parser's keeps the legacy
-    /// parsers, and no name leaves the legacy parsers to detect. A request's
-    /// X-SMG-Parser header overrides the flag for that request.
+    /// name reads with that table, and so does a legacy parser's name whose
+    /// format a table reads (qwen for qwen3, qwen_xml for qwen3_tagged: the
+    /// table's aliases, so existing flags keep a working parser); any other
+    /// legacy parser's name keeps the legacy parsers (the Symphony crate lists
+    /// each with the reason, passthrough among them), and no name leaves the
+    /// legacy parsers to detect. A request's X-SMG-Parser header overrides
+    /// the flag for that request.
     #[arg(long, default_value = "legacy", value_parser = ["legacy", "symphony"], help_heading = "Parsers")]
     parser: String,
 
