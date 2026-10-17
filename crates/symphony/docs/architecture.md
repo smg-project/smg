@@ -99,8 +99,9 @@ they go. The bytes a format consumed (`Dropped`) never reach a client; `Reasonin
 nothing, and `ReasoningEnd` and `ToolCallEnd` write no bytes of their own: Chat Completions renders
 nothing for them, Responses and Messages close their item or block on them. `Malformed` text is
 content, since the model wrote it and a client should see it rather than lose it; whitespace-only
-content opens nothing; a natural stop after at least one call is reported as `tool_calls` (or its
-API's equivalent), while `length`, `abort` and an engine's own reasons stay what the engine said.
+content opens nothing; after at least one call, Chat Completions reports a natural stop as
+`tool_calls` (`length`, `abort` and an engine's own reasons stay what the engine said), Messages
+reports any reason but `length` as `tool_use`, and Responses completes the response as for any stop.
 `adapters.md` lists where each API says less than the events do and what the adapter decides there.
 
 ## How to add a table
