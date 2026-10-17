@@ -1403,6 +1403,26 @@ const GROUPS: &[Group] = &[
         status: Status::Replaying,
     },
     Group {
+        slug: "llama-3.2-11b-vision-instruct",
+        model: "meta-llama/Llama-3.2-11B-Vision-Instruct",
+        also: &["Llama-3.2-90B-Vision-Instruct"],
+        released: "2024-09-18",
+        smg: (Some("llama"), None),
+        table: Some(Table::Json),
+        set: Some(458_203),
+        status: Status::Replaying,
+    },
+    Group {
+        slug: "llama-3.2-1b-instruct",
+        model: "meta-llama/Llama-3.2-1B-Instruct",
+        also: &["Llama-3.2-3B-Instruct"],
+        released: "2024-09-18",
+        smg: (Some("llama"), None),
+        table: Some(Table::Json),
+        set: Some(458_185),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "llama-3.3-nemotron-70b-reward-principle",
         model: "nvidia/Llama-3.3-Nemotron-70B-Reward-Principle",
         also: &[

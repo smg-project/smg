@@ -6,9 +6,9 @@
 //! at the output's start and dropped, so an output with it and one without read the same. The
 //! format the gateway's older `json` parser reads for a model that names it, and its older
 //! `llama` parser's (Llama 3.2 writes the same). The recorded groups that write it (Nemotron
-//! Ultra CPT, UltraLong, Safety Guard, the 70B Reward Principle) record the template's bare
-//! object; the marker and the `;` form stand on the unit tests, which hold a model's output
-//! verbatim.
+//! Ultra CPT, UltraLong, Safety Guard, the 70B Reward Principle, Llama 3.2 1B/3B Instruct and
+//! 11B/90B Vision Instruct) record the template's bare object; the marker and the `;` form stand
+//! on the unit tests, which hold a model's output verbatim.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 use crate::format::{CallSyntax, Emits, Format};

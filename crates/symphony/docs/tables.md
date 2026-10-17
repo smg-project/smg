@@ -385,12 +385,13 @@ What the table says beyond the others:
   forced calls were written; the call token is not in the grammar, since the template never
   renders it.
 
-What the table leaves open: six recorded groups write the format (Nemotron Ultra 253B CPT, the
-UltraLong 1M, 2M and 4M, Safety Guard 8B v3, the 70B Reward Principle), as the template renders
-it: one call alone, `parameters` naming the arguments, and never a list, content beside a call or a
-thought, since the template refuses them; the call token and the `;` between calls are what a
-served Llama 3.1 Instruct checkpoint writes, held verbatim in the table's unit tests, and the list
-and the wrapping after an object rest on the unit tests until a group writes them.
+What the table leaves open: eight recorded groups write the format (Nemotron Ultra 253B CPT, the
+UltraLong 1M, 2M and 4M, Safety Guard 8B v3, the 70B Reward Principle, Llama 3.2 1B/3B Instruct
+and 11B/90B Vision Instruct), as the templates render it: one call alone, `parameters` naming the
+arguments, and never a list, content beside a call or a thought, since the templates refuse them;
+the call token and the `;` between calls are what a served Llama 3.1 Instruct checkpoint writes,
+held verbatim in the table's unit tests, and the list and the wrapping after an object rest on the
+unit tests until a group writes them.
 
 ## Llama 4 (`llama4`)
 
