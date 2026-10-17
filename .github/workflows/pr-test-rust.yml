@@ -610,8 +610,10 @@ jobs:
       pull-requests: read
       packages: read
     outputs:
-      # Only PRs use this shortcut; main pushes keep their existing test coverage.
-      docs-only: ${{ github.event_name == 'pull_request' && steps.filter.outputs.docs == 'true' && steps.filter.outputs.non-docs == 'false' && steps.filter.outputs.tests == 'false' }}
+      # The two shortcuts (defined in the "Decide the e2e lanes" step): a docs-only
+      # pull request, a change confined to the Symphony crate.
+      docs-only: ${{ steps.lanes.outputs.docs-only }}
+      symphony-only: ${{ steps.lanes.outputs.symphony-only }}
       common: ${{ steps.filter.outputs.common }}
       chat-completions: ${{ steps.filter.outputs.chat-completions }}
       completions: ${{ steps.filter.outputs.completions }}
@@ -621,9 +623,15 @@ jobs:
       go-bindings: ${{ steps.filter.outputs.go-bindings }}
       rust-ci: ${{ steps.filter.outputs.rust-ci }}
       dependencies: ${{ steps.filter.outputs.dependencies }}
-      # Symphony is not wired into the gateway yet: a change confined to its crate and the
-      # lock file runs the CPU checks only, and every GPU lane below skips on this flag.
-      symphony-only: ${{ steps.filter.outputs.symphony == 'true' && steps.filter.outputs.outside-symphony == 'false' }}
+      # The GPU e2e lanes' decisions, one per area (the same step).
+      skip-chat-completions: ${{ steps.lanes.outputs.skip-chat-completions }}
+      skip-chat-symphony: ${{ steps.lanes.outputs.skip-chat-symphony }}
+      skip-completions: ${{ steps.lanes.outputs.skip-completions }}
+      skip-embeddings: ${{ steps.lanes.outputs.skip-embeddings }}
+      skip-realtime: ${{ steps.lanes.outputs.skip-realtime }}
+      skip-agentic: ${{ steps.lanes.outputs.skip-agentic }}
+      skip-vendor: ${{ steps.lanes.outputs.skip-vendor }}
+      skip-go-bindings: ${{ steps.lanes.outputs.skip-go-bindings }}
       tokenspeed-image: ${{ steps.tokenspeed-image.outputs.image }}
     steps:
       - uses: actions/checkout@v7
@@ -785,6 +793,66 @@ jobs:
               - 'scripts/ci_cargo_audit.sh'
               - '.github/workflows/pr-test-rust.yml'
 
+      # The two shortcuts and whether each GPU e2e lane skips, decided here once.
+      # A lane's `if:` reads its `skip-<area>` output and adds only what is its
+      # own: `always() && !cancelled()`, its prerequisite's result and, on a pull
+      # request, this job's success. The step runs when the filter failed too: its
+      # outputs then skip nothing, so a push still runs every lane, and a pull
+      # request runs none through the lanes' own condition on this job's result.
+      - name: Decide the e2e lanes
+        id: lanes
+        if: always()
+        env:
+          PULL_REQUEST: ${{ github.event_name == 'pull_request' }}
+          CHANGED: ${{ toJSON(steps.filter.outputs) }}
+        run: |
+          python3 - <<'EOF'
+          import json, os
+
+          pull_request = os.environ["PULL_REQUEST"] == "true"
+          changed = json.loads(os.environ["CHANGED"])
+
+          # Only pull requests take the docs-only shortcut; a push keeps its coverage.
+          docs_only = (
+              pull_request
+              and changed.get("docs") == "true"
+              and changed.get("non-docs") == "false"
+              and changed.get("tests") == "false"
+          )
+          # Symphony is not wired into the gateway yet: a change confined to its crate and
+          # the lock file runs the CPU checks and the Symphony chat lane only.
+          symphony_only = (
+              changed.get("symphony") == "true" and changed.get("outside-symphony") == "false"
+          )
+
+          def pull_request_without(*areas):
+              """A pull request that touched neither the common paths nor one of `areas`."""
+              return pull_request and not any(changed.get(a) == "true" for a in ("common", *areas))
+
+          # No lane for a docs-only or a Symphony-only change; a push and a manual run
+          # take every lane; a pull request takes the lanes whose area or the common
+          # paths changed.
+          skip = {
+              area: docs_only or symphony_only or pull_request_without(area)
+              for area in ("chat-completions", "completions", "embeddings", "realtime", "agentic", "go-bindings")
+          }
+          # The Symphony chat lane runs for a Symphony-only change too: it is the one
+          # lane that exercises a table against a real engine.
+          skip["chat-symphony"] = docs_only or (
+              pull_request_without("chat-completions") and not symphony_only
+          )
+          # The vendor lanes have no docs-only shortcut.
+          skip["vendor"] = symphony_only or pull_request_without("agentic")
+
+          decided = {"docs-only": docs_only, "symphony-only": symphony_only}
+          decided.update((f"skip-{area}", skipped) for area, skipped in skip.items())
+          with open(os.environ["GITHUB_OUTPUT"], "a") as outputs:
+              for name, value in decided.items():
+                  line = f"{name}={str(value).lower()}"
+                  print(line)
+                  print(line, file=outputs)
+          EOF
+
   # --- GPU E2E: organized by GPU tier + API, engine as matrix axis ---
 
   # === 1 GPU ===
@@ -795,13 +863,9 @@ jobs:
     if: >-
       always()
       && !cancelled()
-      && needs.detect-changes.outputs.docs-only != 'true'
-      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
     # Now also runs the previously-2-GPU chat tests (gpt-oss-20b,
     # Qwen2.5-14B) since they're tp=1.
     strategy:
@@ -858,13 +922,9 @@ jobs:
     if: >-
       always()
       && !cancelled()
-      && needs.detect-changes.outputs.docs-only != 'true'
       && needs.build-wheel.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true'
-                  || needs.detect-changes.outputs.symphony-only == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-symphony != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -901,13 +961,9 @@ jobs:
     if: >-
       always()
       && !cancelled()
-      && needs.detect-changes.outputs.docs-only != 'true'
-      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
     # Now also runs the previously-2-GPU chat tests (gpt-oss-20b,
     # Qwen2.5-14B) since they're tp=1.
     strategy:
@@ -959,13 +1015,9 @@ jobs:
     if: >-
       always()
       && !cancelled()
-      && needs.detect-changes.outputs.docs-only != 'true'
-      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: vllm
@@ -984,13 +1036,9 @@ jobs:
     if: >-
       always()
       && !cancelled()
-      && needs.detect-changes.outputs.docs-only != 'true'
-      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
     # Same single-worker chat suite as e2e-1gpu-chat, driven over the ZMQ
     # direct-backend wire. The collection hook deselects the gRPC-only
     # families (PD, EPD, multi-worker) for a ZMQ lane, so this covers the
@@ -1036,13 +1084,9 @@ jobs:
     if: >-
       always()
       && !cancelled()
-      && needs.detect-changes.outputs.docs-only != 'true'
-      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
     # The 1-GPU ZMQ suite with grouped workers: each ZMQ worker launches two
     # DP engines on one socket set (tp=1 models, one GPU per engine), so the
     # gateway's handshake, the connector's least-loaded selection, and
@@ -1086,13 +1130,9 @@ jobs:
     if: >-
       always()
       && !cancelled()
-      && needs.detect-changes.outputs.docs-only != 'true'
-      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.completions == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-completions != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -1119,13 +1159,9 @@ jobs:
     if: >-
       always()
       && !cancelled()
-      && needs.detect-changes.outputs.docs-only != 'true'
-      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.embeddings == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-embeddings != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -1152,13 +1188,9 @@ jobs:
     if: >-
       always()
       && !cancelled()
-      && needs.detect-changes.outputs.docs-only != 'true'
-      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.realtime == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-realtime != 'true'
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: vllm
@@ -1176,13 +1208,9 @@ jobs:
     if: >-
       always()
       && !cancelled()
-      && needs.detect-changes.outputs.docs-only != 'true'
-      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -1215,13 +1243,9 @@ jobs:
     if: >-
       always()
       && !cancelled()
-      && needs.detect-changes.outputs.docs-only != 'true'
-      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.agentic == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-agentic != 'true'
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: sglang
@@ -1240,12 +1264,9 @@ jobs:
     if: >-
       always()
       && !cancelled()
-      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.e2e-1gpu-gateway.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -1300,12 +1321,9 @@ jobs:
     if: >-
       always()
       && !cancelled()
-      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.e2e-1gpu-chat-mm-worker.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: vllm
@@ -1385,12 +1403,9 @@ jobs:
     if: >-
       always()
       && !cancelled()
-      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.e2e-1gpu-gateway.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -1455,12 +1470,9 @@ jobs:
     if: >-
       always()
       && !cancelled()
-      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.agentic == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-vendor != 'true'
     permissions:
       contents: read
     strategy:
@@ -1619,13 +1631,9 @@ jobs:
     if: >-
       always()
       && !cancelled()
-      && needs.detect-changes.outputs.docs-only != 'true'
-      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.go-bindings == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-go-bindings != 'true'
     runs-on: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     # 19 min on a quiet host (SGLang setup ~6.5 min, Go ~4 min, tests ~6.5
