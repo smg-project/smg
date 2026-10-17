@@ -8,7 +8,7 @@
 //! one call's growing object into the events of that call, on top of the outline and the prefix;
 //! [`named_arguments`] does the same for a call whose name stands before a marker and whose object
 //! is the arguments alone, both accounting for the argument bytes they send, hold or report
-//! through one judge ([`fragments`]); [`arguments`] for a call's arguments alone, written as one
+//! through one judge (`fragments`); [`arguments`] for a call's arguments alone, written as one
 //! value, the call named elsewhere; [`forced`] runs it for the call the request forces, whose
 //! arguments are the whole output.
 
