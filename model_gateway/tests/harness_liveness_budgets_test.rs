@@ -1,8 +1,8 @@
-//! The test harness applies the liveness budgets its configuration carries,
-//! the way the server's start-up does: a context built with non-default
-//! stall, wedge, stale and warm-up budgets runs under them. One test in its
-//! own binary, as the budgets are process-wide and the first context built
-//! sets them.
+//! Building an application context applies the liveness budgets its
+//! configuration carries, for the test harness as for the server: a context
+//! built with non-default stall, wedge, stale and warm-up budgets runs under
+//! them. One test in its own binary, as the budgets are process-wide and the
+//! first context built sets them.
 
 use std::time::Duration;
 
@@ -12,7 +12,7 @@ use smg::config::RouterConfig;
 mod common;
 
 #[tokio::test]
-async fn the_harness_applies_the_configurations_liveness_budgets() {
+async fn a_built_context_applies_its_configurations_liveness_budgets() {
     let mut config = RouterConfig::builder()
         .regular_mode(vec![])
         .random_policy()

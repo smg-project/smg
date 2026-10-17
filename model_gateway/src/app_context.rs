@@ -373,18 +373,6 @@ impl AppContextBuilder {
         self
     }
 
-    /// Apply the configuration's liveness budgets (the stall, wedge and stale
-    /// thresholds and the warm-up slice) to this process. The server's
-    /// start-up applies them in its worker-monitor step; a context built by
-    /// hand from the public setters (the test harness) calls this so the
-    /// budgets its configuration carries are the ones in force. They are
-    /// process-wide and the first call wins, so the first context built in a
-    /// process sets them.
-    pub fn liveness_budgets(self, config: &RouterConfig) -> Self {
-        liveness::configure_from(config);
-        self
-    }
-
     pub fn worker_monitor(mut self, worker_monitor: Option<Arc<WorkerMonitor>>) -> Self {
         self.worker_monitor = worker_monitor;
         self
@@ -437,6 +425,12 @@ impl AppContextBuilder {
         let router_config = self
             .router_config
             .ok_or(AppContextBuildError::MissingField("router_config"))?;
+        // The configuration's liveness budgets (the stall, wedge and stale
+        // thresholds and the warm-up slice, see `worker::liveness`) take
+        // effect for every context built from it, the server's and a test's
+        // alike, here and nowhere else. They are process-wide and the first
+        // call wins, so the first context built in a process sets them.
+        liveness::configure_from(&router_config);
         let configured_reasoning_parser = router_config.reasoning_parser.clone();
         let configured_tool_parser = router_config.tool_call_parser.clone();
 
@@ -861,8 +855,6 @@ impl AppContextBuilder {
         if let Some(registry) = self.worker_registry.as_ref() {
             registry.set_overload_shed(config.worker_overload_shed);
         }
-        // Progress-based liveness budgets (see `worker::liveness`).
-        liveness::configure_from(config);
         // PD dispatch waits here, not in the decode engine's queue, when the
         // pair's running window is full.
         pd_admission::set_pd_admission_wait_secs(config.pd_admission_wait_secs);
