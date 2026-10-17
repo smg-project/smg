@@ -239,14 +239,23 @@ What the table says beyond the others:
   a model that explains its JSON in a sentence wrote that sentence and the reference keeps it.
 - **Prose before the JSON is content, whole.** The gateway's older `json` parser searches the
   output for the first `{` or `[`; this table does not, as no other table scans for a marker.
+- **`<|python_tag|>` is wrapping wherever it stands.** Llama 3.2's template writes the call object
+  alone, and the model writes the tag before it as often as not (the family's prompt format gives
+  the tag to its built-in tools); the gateway's older `llama` parser strips it, and the engines'
+  readers for the family start the object after it. The table ignores the terminal, so the object
+  after it reads as the call and prose around it as content; the replay sees the same bytes with
+  or without it.
 - **A forced call is the list.** `Format::grammar` writes the `xlam` list, as the older parser's
   forced calls were written.
 
-What the table leaves open: the format is Llama 3.1's own template's, which six recorded groups
-write (Nemotron Ultra 253B CPT, the UltraLong 1M, 2M and 4M, Safety Guard 8B v3, the 70B Reward
-Principle): one call alone, `parameters` naming the arguments, and never a list, content beside a
-call or a thought, since the template refuses them; the list and the wrapping after an object rest
-on the unit tests until a group writes them.
+What the table leaves open: the format is Llama 3.1's and Llama 3.2's own templates', which eight
+recorded groups write (Nemotron Ultra 253B CPT, the UltraLong 1M, 2M and 4M, Safety Guard 8B v3,
+the 70B Reward Principle, Llama 3.2 1B/3B Instruct and 11B/90B Vision Instruct): one call alone,
+`parameters` naming the arguments, and never a list, content beside a call or a thought, since the
+templates refuse them; the list and the wrapping after an object rest on the unit tests until a
+group writes them. The older `llama` parser also reads several objects joined by `;`, a spelling
+no template writes; after the first object such text is malformed here, counted and visible, and
+the live reading on an engine (owed) says whether the family writes it.
 
 ## Llama 4 (`llama4`)
 
@@ -342,8 +351,8 @@ What the table says beyond the others:
   cards, not on a replay.
 - **The tag is one tag around the list.** `Format::grammar` writes `<TOOLCALL>`, the tools' calls
   as the list, `</TOOLCALL>`, and the table's thought takes the prefix the JSON syntax takes. The
-  gateway's older parsers have no tag for this syntax (`llama` reads Llama 3.2's pythonic calls,
-  `json` the bare object), so nothing is pinned.
+  gateway's older parsers have no tag for this syntax (`llama` reads Llama 3.2's call object behind
+  `<|python_tag|>`, `json` the bare object), so nothing is pinned.
 - **The v1 checkpoints bring their vendor's syntax, not their template's.** The chat templates of
   Llama-3_3-Nemotron-Super-49B-v1 and Llama-3_1-Nemotron-Ultra-253B-v1 are a Llama 3 header
   template that renders no tool and no call and keeps an assistant message from its `</think>` on:
