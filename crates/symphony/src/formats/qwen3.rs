@@ -47,7 +47,7 @@ mod tests {
         Engine::with_call_ids(Arc::new(format), declared, ids())
     }
     use crate::{
-        engine::{Engine, BLOCK_WITHOUT_A_COMPLETE_CALL, TEXT_AFTER_THE_OBJECT},
+        engine::Engine,
         event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
         input::{EngineFinish, Input, TokenSpan},
         parser::{ParseError, Parser},
@@ -554,7 +554,7 @@ mod tests {
                 &dropped("\n "),
                 &Event::Malformed {
                     text: Text::uncounted("x"),
-                    why: MalformedReason::Other(TEXT_AFTER_THE_OBJECT.into()),
+                    why: MalformedReason::TextAfterTheArguments,
                 },
                 &dropped("\n"),
                 &dropped("</tool_call>"),
@@ -598,7 +598,7 @@ mod tests {
                 },
                 Event::Malformed {
                     text: Text::uncounted(","),
-                    why: MalformedReason::Other(BLOCK_WITHOUT_A_COMPLETE_CALL.into()),
+                    why: MalformedReason::BlockWithoutACompleteCall,
                 },
                 Event::ToolCallEnd {
                     index: 0,
@@ -623,7 +623,7 @@ mod tests {
             events[1],
             Event::Malformed {
                 text: Text::uncounted("junk"),
-                why: MalformedReason::Other(BLOCK_WITHOUT_A_COMPLETE_CALL.into()),
+                why: MalformedReason::BlockWithoutACompleteCall,
             },
             "the block closed at its marker, so the stream did not end inside it"
         );

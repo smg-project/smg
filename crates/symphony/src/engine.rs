@@ -32,12 +32,6 @@ use crate::{
     tokens::Ledger,
 };
 
-pub(crate) const BLOCK_WITHOUT_A_COMPLETE_CALL: &str =
-    "a tool-call block that closed without a complete call";
-pub(crate) const TEXT_AFTER_THE_OBJECT: &str =
-    "text between a call's object and its closing marker";
-const TEXT_BETWEEN_CALLS: &str = "text between a block's calls";
-
 /// Why a call region closed: its closing terminal (or the next opener) arrived, or the stream
 /// stopped where the table says a stop closes it; or the stream ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,10 +125,7 @@ fn text_event_like(like: &Event, text: &str) -> Event {
     match like {
         Event::Reasoning(_) => Event::Reasoning(text),
         Event::Dropped { why, .. } => Event::Dropped { text, why: *why },
-        Event::Malformed { why, .. } => Event::Malformed {
-            text,
-            why: why.clone(),
-        },
+        Event::Malformed { why, .. } => Event::Malformed { text, why: *why },
         _ => Event::Content(text),
     }
 }
@@ -619,9 +610,9 @@ impl Engine {
                 let taken = call.feed(text, &self.declared, &mut assembled);
                 self.region.fed += taken;
                 self.push_call_events(assembled, out);
-                self.wrapping(&text[taken..], TEXT_AFTER_THE_OBJECT, out);
+                self.wrapping(&text[taken..], MalformedReason::TextAfterTheArguments, out);
             }
-            Emits::Wrapper => self.wrapping(text, TEXT_BETWEEN_CALLS, out),
+            Emits::Wrapper => self.wrapping(text, MalformedReason::TextBetweenCalls, out),
         }
     }
 
@@ -726,7 +717,7 @@ impl Engine {
     /// between a block's calls. Each run of whitespace is the template's and is dropped, each run
     /// of anything else is malformed with `why`. Classifying run by run keeps the result the same
     /// wherever the chunks were cut.
-    fn wrapping(&mut self, surplus: &str, why: &'static str, out: &mut Events) {
+    fn wrapping(&mut self, surplus: &str, why: MalformedReason, out: &mut Events) {
         for (run, space) in runs(surplus) {
             let run = self.tokens.text(run);
             out.push(if space {
@@ -735,10 +726,7 @@ impl Engine {
                     why: DropReason::Wrapper,
                 }
             } else {
-                Event::Malformed {
-                    text: run,
-                    why: MalformedReason::Other(why.into()),
-                }
+                Event::Malformed { text: run, why }
             });
         }
     }
@@ -904,7 +892,7 @@ impl Engine {
                         why: MalformedReason::UnterminatedRegion,
                     } => Event::Malformed {
                         text,
-                        why: MalformedReason::Other(BLOCK_WITHOUT_A_COMPLETE_CALL.into()),
+                        why: MalformedReason::BlockWithoutACompleteCall,
                     },
                     event => event,
                 });

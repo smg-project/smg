@@ -37,8 +37,6 @@ use crate::{
     tagged::{assembler::push_quoted, value::Declared},
 };
 
-pub(super) const KEY_WRITTEN_TWICE: &str = "a parameter whose key the call already wrote";
-
 /// The parameters of one shaped call, from the bytes after its header.
 #[derive(Clone, Debug)]
 pub(crate) struct Params {
@@ -299,7 +297,7 @@ impl Params {
         if again && self.values.reader().duplicates() == Duplicates::First {
             out.push(Event::Malformed {
                 text: Text::uncounted(parameter),
-                why: MalformedReason::Other(KEY_WRITTEN_TWICE.into()),
+                why: MalformedReason::KeyWrittenTwice,
             });
             return;
         }

@@ -23,8 +23,6 @@ use crate::{
     tagged::Declared,
 };
 
-const NO_FORCED_FUNCTION: &str = "arguments with no forced function to name them";
-
 /// The events of the forced call, from the output's first byte.
 #[derive(Debug)]
 pub struct Assembler {
@@ -114,7 +112,7 @@ impl Assembler {
 fn unnamed(bytes: &str, out: &mut Events) {
     out.push(Event::Malformed {
         text: Text::uncounted(bytes),
-        why: MalformedReason::Other(NO_FORCED_FUNCTION.into()),
+        why: MalformedReason::NoForcedFunction,
     });
 }
 
@@ -228,8 +226,8 @@ mod tests {
             .filter_map(|e| match e {
                 Event::Malformed {
                     text,
-                    why: MalformedReason::Other(why),
-                } if why == NO_FORCED_FUNCTION => Some(text.text.as_str()),
+                    why: MalformedReason::NoForcedFunction,
+                } => Some(text.text.as_str()),
                 _ => None,
             })
             .collect();

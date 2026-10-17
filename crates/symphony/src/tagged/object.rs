@@ -73,13 +73,13 @@ impl Object {
     }
 
     /// The carried bytes as `Malformed` with `why`, whitespace included; nothing when none.
-    pub(super) fn report(&mut self, why: &'static str, out: &mut Events) {
+    pub(super) fn report(&mut self, why: MalformedReason, out: &mut Events) {
         if self.carried.is_empty() {
             return;
         }
         out.push(Event::Malformed {
             text: Text::uncounted(std::mem::take(&mut self.carried)),
-            why: MalformedReason::Other(why.into()),
+            why,
         });
     }
 
@@ -246,13 +246,13 @@ mod tests {
     fn carried_bytes_are_reported_or_dropped_once_and_nothing_is_pushed_for_none() {
         let mut object = Object::new(0);
         let mut out = Events::new();
-        object.report("why", &mut out);
+        object.report(MalformedReason::TextBetweenTags, &mut out);
         object.drop_carried(&mut out);
         assert!(out.is_empty());
         object.carried.push_str("  ");
         object.drop_carried(&mut out);
         object.carried.push('x');
-        object.report("why", &mut out);
+        object.report(MalformedReason::TextBetweenTags, &mut out);
         assert_eq!(
             fragments(&out),
             vec![

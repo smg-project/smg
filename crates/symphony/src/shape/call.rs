@@ -50,7 +50,6 @@
 
 use super::params::Params;
 use crate::{
-    engine::TEXT_AFTER_THE_OBJECT,
     event::{runs, DropReason, Event, Events, MalformedReason, Text},
     json::{self, arguments::Strings},
     shape::{
@@ -59,8 +58,6 @@ use crate::{
     },
     tagged::Declared,
 };
-
-const TEXT_AFTER_THE_ARGUMENTS: &str = "text after a call's arguments";
 
 /// What a call's header says, once the bytes fed after the terminal decide it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,13 +165,7 @@ impl JsonReader {
         if ended_where_refused {
             return MalformedReason::InvalidArguments;
         }
-        MalformedReason::Other(
-            match self {
-                Self::Json(_) => TEXT_AFTER_THE_ARGUMENTS,
-                Self::Envelope(_) => TEXT_AFTER_THE_OBJECT,
-            }
-            .into(),
-        )
+        MalformedReason::TextAfterTheArguments
     }
 }
 
@@ -480,7 +471,7 @@ impl Value {
             }
         }
         if shape.trailer.0.is_empty() {
-            wrapping(rest, &self.reader.surplus(), out);
+            wrapping(rest, self.reader.surplus(), out);
             return;
         }
         let tail = self.tail.get_or_insert_with(|| {
@@ -531,7 +522,7 @@ impl Value {
                 true
             }
         };
-        wrapping(between, &surplus, out);
+        wrapping(between, surplus, out);
         if enveloped {
             if !trailer.is_empty() {
                 out.push(Event::Dropped {
@@ -551,12 +542,12 @@ impl Value {
         match self.reader {
             JsonReader::Json(mut arguments) => {
                 arguments.finish(out);
-                wrapping(&self.after, &MalformedReason::UnterminatedRegion, out);
+                wrapping(&self.after, MalformedReason::UnterminatedRegion, out);
                 true
             }
             JsonReader::Envelope(assembler) => {
                 assembler.finish(out);
-                wrapping(&self.after, &MalformedReason::UnterminatedRegion, out);
+                wrapping(&self.after, MalformedReason::UnterminatedRegion, out);
                 false
             }
         }
@@ -566,7 +557,7 @@ impl Value {
 /// Bytes after a call's arguments that are no part of the call: each run of whitespace dropped as
 /// wrapping, each run of anything else `Malformed` for `why`. Classifying run by run keeps the
 /// result the same wherever the chunks were cut.
-fn wrapping(text: &str, why: &MalformedReason, out: &mut Events) {
+fn wrapping(text: &str, why: MalformedReason, out: &mut Events) {
     for (run, space) in runs(text) {
         let run = Text::uncounted(run);
         out.push(if space {
@@ -575,10 +566,7 @@ fn wrapping(text: &str, why: &MalformedReason, out: &mut Events) {
                 why: DropReason::Wrapper,
             }
         } else {
-            Event::Malformed {
-                text: run,
-                why: why.clone(),
-            }
+            Event::Malformed { text: run, why }
         });
     }
 }
@@ -1070,7 +1058,7 @@ mod tests {
                 arguments("{\"a\": 1}"),
                 Event::Malformed {
                     text: Text::uncounted("</c>x"),
-                    why: MalformedReason::Other(TEXT_AFTER_THE_ARGUMENTS.into()),
+                    why: MalformedReason::TextAfterTheArguments,
                 },
                 end("</f></c>"),
                 finish(1),
@@ -1241,7 +1229,7 @@ mod tests {
                 end(", "),
                 Event::Malformed {
                     text: Text::uncounted("junk"),
-                    why: MalformedReason::Other(TEXT_AFTER_THE_OBJECT.into()),
+                    why: MalformedReason::TextAfterTheArguments,
                 },
                 wrapper("</f>\n</c>"),
                 content("Done."),
@@ -1990,7 +1978,7 @@ mod tests {
                 member("{\"n\": 7, \"s\": \"x\"", "<k=n> 7 </k><k=s> x </k>"),
                 Event::Malformed {
                     text: Text::uncounted("<k=n>8</k>"),
-                    why: MalformedReason::Other(super::super::params::KEY_WRITTEN_TWICE.into()),
+                    why: MalformedReason::KeyWrittenTwice,
                 },
                 closed(),
                 end("</c>"),

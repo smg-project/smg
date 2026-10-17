@@ -72,12 +72,6 @@ const OPEN: usize = 0;
 const CLOSE: usize = 1;
 /// The marker that ends a tag's tail, where the family has one ([`TagEnd::Marker`]).
 const END: usize = 2;
-const TEXT_BETWEEN_TAGS: &str = "text between a call's tags";
-const TAG_OUT_OF_PLACE: &str = "a tag where the call's syntax has none";
-const TAG_CUT_SHORT: &str = "a tag that another tag cut short";
-const EMPTY_NAME: &str = "a tag without a name";
-const TAG_TAIL: &str = "text after a tag's name";
-const CLOSED_EARLY: &str = "an invoke that closed before its function name closed";
 /// The two tails a DSML parameter tag has after the name's quote: the attribute that types it.
 const STRING_TRUE: &str = " string=\"true\"";
 const STRING_FALSE: &str = " string=\"false\"";
@@ -386,9 +380,9 @@ impl Assembler {
             let why = if self.object.carried.is_empty() && terminal.is_empty() {
                 None
             } else if matches!(self.stage, Stage::FunctionName) && self.object.carried.is_empty() {
-                Some(EMPTY_NAME)
+                Some(MalformedReason::EmptyName)
             } else {
-                Some(CLOSED_EARLY)
+                Some(MalformedReason::ClosedBeforeTheName)
             };
             self.object.carried.push_str(terminal);
             if let Some(why) = why {
@@ -415,7 +409,7 @@ impl Assembler {
             }
             // A name, a tag or a value held for its close that the end cut short: its bytes are
             // reported, its member is never written, and the object closes.
-            _ => self.object.report(TAG_CUT_SHORT, out),
+            _ => self.object.report(MalformedReason::TagCutShort, out),
         }
         let source = Text::uncounted(std::mem::take(&mut self.object.carried));
         self.object.close(source, out);
@@ -476,14 +470,14 @@ impl Assembler {
             // A tag cuts a name or a tag's tail short: the bytes so far are reported, and the tag
             // is read where they began.
             _ => {
-                self.object.report(TAG_CUT_SHORT, out);
+                self.object.report(MalformedReason::TagCutShort, out);
                 self.stage = Stage::Between;
                 if self.started() {
                     self.tag_between(tag, out);
                 } else {
                     out.push(Event::Malformed {
                         text: Text::uncounted(bytes),
-                        why: MalformedReason::Other(TAG_OUT_OF_PLACE.into()),
+                        why: MalformedReason::TagOutOfPlace,
                     });
                 }
             }
@@ -503,7 +497,7 @@ impl Assembler {
             self.object.drop_carried(out);
             out.push(Event::Malformed {
                 text: Text::uncounted(bytes),
-                why: MalformedReason::Other(TAG_OUT_OF_PLACE.into()),
+                why: MalformedReason::TagOutOfPlace,
             });
         }
     }
@@ -517,7 +511,7 @@ impl Assembler {
                     let name = self.object.carried.clone();
                     self.object.carried.push('"');
                     if name.is_empty() {
-                        self.object.report(EMPTY_NAME, out);
+                        self.object.report(MalformedReason::EmptyName, out);
                         self.stage = Stage::Between;
                     } else {
                         self.stage = Stage::FunctionTail {
@@ -557,7 +551,7 @@ impl Assembler {
                         let key = self.object.carried[start..].to_string();
                         self.object.carried.push('"');
                         if key.is_empty() {
-                            self.object.report(EMPTY_NAME, out);
+                            self.object.report(MalformedReason::EmptyName, out);
                             self.stage = Stage::Between;
                         } else {
                             self.stage = Stage::ParameterTail {
@@ -614,7 +608,7 @@ impl Assembler {
                 self.object.drop_carried(out);
                 out.push(Event::Malformed {
                     text: Text::uncounted(run),
-                    why: MalformedReason::Other(TEXT_BETWEEN_TAGS.into()),
+                    why: MalformedReason::TextBetweenTags,
                 });
             }
         }
@@ -646,7 +640,7 @@ impl Assembler {
             });
             out.push(Event::Malformed {
                 text: Text::uncounted(after),
-                why: MalformedReason::Other(TAG_TAIL.into()),
+                why: MalformedReason::TagTail,
             });
             self.object.carried.push_str(&close);
         }
@@ -676,7 +670,7 @@ impl Assembler {
             }
             (Typing::TypeAttribute, tail) if typed(tail).is_some() => (None, Mode::Whole),
             _ => {
-                self.object.report(TAG_TAIL, out);
+                self.object.report(MalformedReason::TagTail, out);
                 self.stage = Stage::Between;
                 return;
             }
@@ -951,14 +945,11 @@ mod tests {
             .collect()
     }
 
-    fn malformed(events: &[Event]) -> Vec<(String, String)> {
+    fn malformed(events: &[Event]) -> Vec<(String, MalformedReason)> {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed {
-                    text,
-                    why: MalformedReason::Other(why),
-                } => Some((text.text.clone(), why.to_string())),
+                Event::Malformed { text, why } => Some((text.text.clone(), *why)),
                 _ => None,
             })
             .collect()
@@ -1172,10 +1163,15 @@ mod tests {
                 "{tag}"
             );
             assert_eq!(arguments(&events), "{}", "{tag}");
-            let why: Vec<String> = malformed(&events).into_iter().map(|(_, why)| why).collect();
+            let why: Vec<MalformedReason> =
+                malformed(&events).into_iter().map(|(_, why)| why).collect();
             assert_eq!(
                 why,
-                [TAG_TAIL, TEXT_BETWEEN_TAGS, TAG_OUT_OF_PLACE],
+                [
+                    MalformedReason::TagTail,
+                    MalformedReason::TextBetweenTags,
+                    MalformedReason::TagOutOfPlace
+                ],
                 "{tag}"
             );
         }
@@ -1265,16 +1261,16 @@ mod tests {
             format!("{text}{}", Tags::MINIMAX_M2.invoke_close)
         );
         let reported = malformed(&events);
-        assert_eq!(reported[0].1, TAG_TAIL);
+        assert_eq!(reported[0].1, MalformedReason::TagTail);
         // The template's newline before the tag rides in the report, as every report carries
         // what was held before it.
         assert_eq!(reported[0].0, "\n<parameter name=\"n\" type=\"int\">");
         // `1` is text where the syntax has tags, and the stray close has no place.
         assert_eq!(
             reported[1],
-            ("1".to_string(), TEXT_BETWEEN_TAGS.to_string())
+            ("1".to_string(), MalformedReason::TextBetweenTags)
         );
-        assert_eq!(reported[2].1, TAG_OUT_OF_PLACE);
+        assert_eq!(reported[2].1, MalformedReason::TagOutOfPlace);
         assert_eq!(arguments(&events), "{}");
     }
 
@@ -1285,7 +1281,10 @@ mod tests {
             bytes(&events),
             format!("get_wea{}", Tags::MINIMAX_M2.invoke_close)
         );
-        assert_eq!(malformed(&events)[0].1, CLOSED_EARLY);
+        assert_eq!(
+            malformed(&events)[0].1,
+            MalformedReason::ClosedBeforeTheName
+        );
         assert!(!events
             .iter()
             .any(|e| matches!(e, Event::ToolCallStart { .. })));
@@ -1306,7 +1305,7 @@ mod tests {
             malformed(&cut)[0],
             (
                 "\n<parameter name=\"n\">12".to_string(),
-                TAG_CUT_SHORT.to_string()
+                MalformedReason::TagCutShort
             )
         );
     }
@@ -1454,7 +1453,7 @@ mod tests {
         assert_eq!(arguments(&events), r#"{"s": "x"}"#);
         assert_eq!(
             malformed(&events),
-            vec![("tail".to_string(), TEXT_BETWEEN_TAGS.to_string())]
+            vec![("tail".to_string(), MalformedReason::TextBetweenTags)]
         );
         // Cut with a `]` held: the byte is value text, not lost.
         let cut = run_with(Tags::MINICPM5, &["f\"><param name=\"s\"><![CDATA[x]"], true);

@@ -43,11 +43,6 @@ use crate::{
     json,
 };
 
-const TEXT_BETWEEN_OBJECTS: &str = "text between a list's calls";
-const TEXT_AFTER_THE_LIST: &str = "text after the list's end";
-const TEXT_AFTER_THE_OBJECT: &str = "text after the call's object";
-const TEXT_IN_PLACE_OF_THE_LIST: &str = "text where the list of calls should be";
-
 /// The events of a JSON list of calls, each call with its own index from `first` and its id from
 /// the engine's [`CallIds`].
 #[derive(Debug)]
@@ -205,7 +200,7 @@ impl Assembler {
             Stage::Malformed => {
                 out.push(Event::Malformed {
                     text: Text::uncounted(text),
-                    why: MalformedReason::Other(TEXT_IN_PLACE_OF_THE_LIST.into()),
+                    why: MalformedReason::TextInPlaceOfTheList,
                 });
                 ""
             }
@@ -250,7 +245,7 @@ impl Assembler {
                         self.drop_carried(out);
                         out.push(Event::Malformed {
                             text: Text::uncounted(&text[at..end]),
-                            why: MalformedReason::Other(TEXT_BETWEEN_OBJECTS.into()),
+                            why: MalformedReason::TextBetweenCalls,
                         });
                         &text[end..]
                     }
@@ -286,14 +281,11 @@ impl Assembler {
                 self.carried.push_str(text);
                 out.push(Event::Malformed {
                     text: Text::uncounted(std::mem::take(&mut self.carried)),
-                    why: MalformedReason::Other(
-                        if self.listed {
-                            TEXT_AFTER_THE_LIST
-                        } else {
-                            TEXT_AFTER_THE_OBJECT
-                        }
-                        .into(),
-                    ),
+                    why: if self.listed {
+                        MalformedReason::TextAfterTheList
+                    } else {
+                        MalformedReason::TextAfterTheArguments
+                    },
                 });
                 ""
             }
@@ -309,7 +301,7 @@ impl Assembler {
             self.stage = Stage::Malformed;
             out.push(Event::Malformed {
                 text,
-                why: MalformedReason::Other(TEXT_IN_PLACE_OF_THE_LIST.into()),
+                why: MalformedReason::TextInPlaceOfTheList,
             });
         } else {
             self.stage = Stage::Content;
@@ -556,8 +548,8 @@ mod tests {
         assert_eq!(bytes(&events), output);
         assert!(events.iter().any(|event| matches!(
             event,
-            Event::Malformed { text, why: MalformedReason::Other(why) }
-                if text.text == " tail" && why == TEXT_AFTER_THE_OBJECT
+            Event::Malformed { text, why: MalformedReason::TextAfterTheArguments }
+                if text.text == " tail"
         )));
         // A list reads as before, prose is content, and a cut object closes nothing.
         assert_eq!(calls(&run_alone(&[LIST])).len(), 2);
@@ -579,14 +571,13 @@ mod tests {
     }
 
     /// The malformed text of `events` under `why`, joined.
-    fn malformed(events: &[Event], why: &str) -> String {
+    fn malformed(events: &[Event], why: MalformedReason) -> String {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed {
-                    text,
-                    why: MalformedReason::Other(reason),
-                } if reason == why => Some(text.text.as_str()),
+                Event::Malformed { text, why: reason } if *reason == why => {
+                    Some(text.text.as_str())
+                }
                 _ => None,
             })
             .collect()
@@ -609,13 +600,13 @@ mod tests {
         let prose = " \nA baseball game can be described as exciting.";
         let whole = run_alone(&[output]);
         assert_eq!(bytes(&whole), output);
-        assert_eq!(malformed(&whole, TEXT_AFTER_THE_OBJECT), prose);
+        assert_eq!(malformed(&whole, MalformedReason::TextAfterTheArguments), prose);
         assert!(dropped(&whole).is_empty(), "{whole:?}");
         let pieces: Vec<String> = output.chars().map(String::from).collect();
         let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
         let cut = run_alone(&refs);
         assert_eq!(bytes(&cut), output);
-        assert_eq!(malformed(&cut, TEXT_AFTER_THE_OBJECT), prose);
+        assert_eq!(malformed(&cut, MalformedReason::TextAfterTheArguments), prose);
         assert!(dropped(&cut).is_empty(), "{cut:?}");
         // After a call too, and after a list's `]`.
         let output = "{\"name\": \"f\", \"arguments\": {}}\n\nDone, see above.";
@@ -628,7 +619,7 @@ mod tests {
         ] {
             assert_eq!(calls(&events).len(), 1);
             assert_eq!(
-                malformed(&events, TEXT_AFTER_THE_OBJECT),
+                malformed(&events, MalformedReason::TextAfterTheArguments),
                 "\n\nDone, see above."
             );
             assert!(dropped(&events).is_empty(), "{events:?}");
@@ -638,7 +629,7 @@ mod tests {
             run(&[output]),
             run(&["[{\"name\": \"f\", \"arguments\": {}}]", " ", "and so on"]),
         ] {
-            assert_eq!(malformed(&events, TEXT_AFTER_THE_LIST), " and so on");
+            assert_eq!(malformed(&events, MalformedReason::TextAfterTheList), " and so on");
             assert_eq!(dropped(&events), ["[", "]"]);
         }
         // Whitespace alone after the object or the list stays the template's wrapping.
@@ -647,7 +638,7 @@ mod tests {
             run_alone(&["{\"name\": \"f\", \"arguments\": {}}", " ", "\n"]),
         ] {
             assert_eq!(dropped(&events), [" \n"]);
-            assert!(malformed(&events, TEXT_AFTER_THE_OBJECT).is_empty());
+            assert!(malformed(&events, MalformedReason::TextAfterTheArguments).is_empty());
         }
     }
 

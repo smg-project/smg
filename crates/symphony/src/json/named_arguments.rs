@@ -32,8 +32,6 @@ use crate::{
     json::{fragments::Fragments, is_complete, outline::Scanner},
 };
 
-const NAME_WITHOUT_ARGUMENTS: &str = "a call that names a tool and writes no arguments";
-
 /// The events of one call, from the bytes after the call's opener.
 #[derive(Clone, Debug)]
 pub struct Assembler {
@@ -102,10 +100,9 @@ impl Assembler {
     pub fn close(self, out: &mut Events) {
         match self.arguments {
             Some(arguments) => arguments.finish(out),
-            None => self.header.ended(
-                || MalformedReason::Other(NAME_WITHOUT_ARGUMENTS.into()),
-                out,
-            ),
+            None => self
+                .header
+                .ended(|| MalformedReason::NameWithoutArguments, out),
         }
     }
 
@@ -374,7 +371,7 @@ mod tests {
             events,
             vec![Event::Malformed {
                 text: Text::uncounted("get_weather"),
-                why: MalformedReason::Other(NAME_WITHOUT_ARGUMENTS.into()),
+                why: MalformedReason::NameWithoutArguments,
             }]
         );
         let (events, _) = run(&["get_wea"], true);

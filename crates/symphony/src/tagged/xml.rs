@@ -35,13 +35,6 @@ use crate::{
 /// drops them.
 pub const INVOKE_CLOSE: &str = "</invoke>";
 
-const TEXT_BETWEEN_TAGS: &str = "text between a call's tags";
-const TAG_OUT_OF_PLACE: &str = "a tag where the call's syntax has none";
-const TAG_CUT_SHORT: &str = "a tag that another tag cut short";
-const TAG_TAIL: &str = "text after a tag's name";
-const EMPTY_NAME: &str = "an invoke with no name";
-const WITHOUT_A_NAME: &str = "an invoke block without a name";
-
 /// The events of one invoke, from the bytes after `<invoke name="`.
 #[derive(Clone, Debug)]
 pub struct Assembler {
@@ -180,7 +173,7 @@ impl Assembler {
         self.hold_tag();
         if self.stage != Stage::Body || !self.started() {
             self.carried.push_str(terminal);
-            self.report(WITHOUT_A_NAME, out);
+            self.report(MalformedReason::CallWithoutName, out);
             return;
         }
         if let Some(Element {
@@ -212,7 +205,7 @@ impl Assembler {
                 // bytes are reported, and its member is never written.
                 Shape::Leaf(_) | Shape::Open => {
                     self.value.clear();
-                    self.report(TAG_CUT_SHORT, out);
+                    self.report(MalformedReason::TagCutShort, out);
                 }
             }
             self.open.pop();
@@ -291,7 +284,7 @@ impl Assembler {
         if name.is_empty() {
             self.carried.push_str(&tail_bytes);
             self.carried.push('>');
-            self.report(EMPTY_NAME, out);
+            self.report(MalformedReason::EmptyName, out);
             return;
         }
         out.push(Event::ToolCallStart {
@@ -304,7 +297,7 @@ impl Assembler {
         if !tail_bytes.is_empty() {
             out.push(Event::Malformed {
                 text: Text::uncounted(tail_bytes),
-                why: MalformedReason::Other(TAG_TAIL.into()),
+                why: MalformedReason::TagTail,
             });
         }
         self.carried.push('>');
@@ -375,7 +368,7 @@ impl Assembler {
             self.drop_carried(out);
             out.push(Event::Malformed {
                 text: Text::uncounted(bytes),
-                why: MalformedReason::Other(TAG_OUT_OF_PLACE.into()),
+                why: MalformedReason::TagOutOfPlace,
             });
             return;
         }
@@ -435,7 +428,7 @@ impl Assembler {
                 self.drop_carried(out);
                 out.push(Event::Malformed {
                     text: Text::uncounted(bytes),
-                    why: MalformedReason::Other(TAG_OUT_OF_PLACE.into()),
+                    why: MalformedReason::TagOutOfPlace,
                 });
             }
         }
@@ -516,7 +509,7 @@ impl Assembler {
                 self.drop_carried(out);
                 out.push(Event::Malformed {
                     text: Text::uncounted(run),
-                    why: MalformedReason::Other(TEXT_BETWEEN_TAGS.into()),
+                    why: MalformedReason::TextBetweenTags,
                 });
             }
         }
@@ -667,13 +660,13 @@ impl Assembler {
     }
 
     /// Reports the carried bytes as `Malformed` with `why`, whitespace included.
-    fn report(&mut self, why: &'static str, out: &mut Events) {
+    fn report(&mut self, why: MalformedReason, out: &mut Events) {
         if self.carried.is_empty() {
             return;
         }
         out.push(Event::Malformed {
             text: Text::uncounted(std::mem::take(&mut self.carried)),
-            why: MalformedReason::Other(why.into()),
+            why,
         });
     }
 

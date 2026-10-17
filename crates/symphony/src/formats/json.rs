@@ -112,7 +112,7 @@ mod tests {
         )));
         assert!(whole.iter().any(|event| matches!(
             event,
-            Event::Malformed { text, why: MalformedReason::Other(_) } if text.text == " tail"
+            Event::Malformed { text, why: MalformedReason::TextAfterTheArguments } if text.text == " tail"
         )));
         for cut in 1..output.len() {
             let events = run(&[&output[..cut], &output[cut..]]);

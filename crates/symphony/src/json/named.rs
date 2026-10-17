@@ -31,8 +31,6 @@ use crate::{
     json,
 };
 
-const NAME_WITHOUT_A_CALL: &str = "a message that names a tool and writes no call";
-
 /// The events of one call message, from the bytes after `<|message_model|>`.
 #[derive(Clone, Debug)]
 pub struct Assembler {
@@ -87,9 +85,7 @@ impl Assembler {
     pub fn close(self, out: &mut Events) {
         match self.object {
             Some(object) => object.finish(out),
-            None => self
-                .header
-                .ended(|| MalformedReason::Other(NAME_WITHOUT_A_CALL.into()), out),
+            None => self.header.ended(|| MalformedReason::NameWithoutACall, out),
         }
     }
 
@@ -270,7 +266,7 @@ mod tests {
             events,
             [Event::Malformed {
                 text: Text::uncounted("get_weather"),
-                why: MalformedReason::Other(NAME_WITHOUT_A_CALL.into()),
+                why: MalformedReason::NameWithoutACall,
             }]
         );
     }

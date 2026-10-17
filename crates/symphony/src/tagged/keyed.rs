@@ -36,12 +36,6 @@ const KEY_OPEN: usize = 0;
 const KEY_CLOSE: usize = 1;
 const VALUE_OPEN: usize = 2;
 const VALUE_CLOSE: usize = 3;
-const TEXT_BETWEEN_TAGS: &str = "text between a call's tags";
-const TAG_OUT_OF_PLACE: &str = "a tag where the call's syntax has none";
-const TAG_CUT_SHORT: &str = "a tag that another tag cut short";
-const EMPTY_KEY: &str = "a key with no text";
-const WITHOUT_A_NAME: &str = "a call block without a name";
-const NOT_A_NAME: &str = "text where the call's name should be";
 
 /// Whether `text` can be a function's name: no whitespace, quote, brace, bracket, parenthesis or
 /// angle bracket, the delimiters of prose, a string, JSON, a list, a pythonic call and a tag.
@@ -280,7 +274,7 @@ impl Assembler {
         }
         if !self.started() {
             self.object.carried.push_str(terminal);
-            self.object.report(WITHOUT_A_NAME, out);
+            self.object.report(MalformedReason::CallWithoutName, out);
             return;
         }
         match std::mem::replace(&mut self.stage, Stage::Between) {
@@ -301,7 +295,7 @@ impl Assembler {
             }
             // A key, a tag or a value held for its close that the end cut short: its bytes are
             // reported, its member is never written, and the object closes.
-            _ => self.object.report(TAG_CUT_SHORT, out),
+            _ => self.object.report(MalformedReason::TagCutShort, out),
         }
         let source = Text::uncounted(std::mem::take(&mut self.object.carried));
         self.object.close(source, out);
@@ -359,7 +353,7 @@ impl Assembler {
                     self.object.drop_carried(out);
                     out.push(Event::Malformed {
                         text: Text::uncounted(bytes),
-                        why: MalformedReason::Other(TAG_OUT_OF_PLACE.into()),
+                        why: MalformedReason::TagOutOfPlace,
                     });
                 }
             }
@@ -368,7 +362,7 @@ impl Assembler {
                 let key = self.object.carried[*start..].to_string();
                 self.object.carried.push_str(bytes);
                 if key.is_empty() {
-                    self.object.report(EMPTY_KEY, out);
+                    self.object.report(MalformedReason::EmptyKey, out);
                     self.stage = Stage::Between;
                 } else {
                     self.stage = Stage::Keyed { key };
@@ -385,7 +379,7 @@ impl Assembler {
             // A tag cuts a key short, or stands where the syntax has another: the bytes so far
             // are reported, and the tag is read as between keys.
             _ => {
-                self.object.report(TAG_CUT_SHORT, out);
+                self.object.report(MalformedReason::TagCutShort, out);
                 self.stage = Stage::Between;
                 self.tag_between(tag, out);
             }
@@ -405,7 +399,7 @@ impl Assembler {
             self.object.drop_carried(out);
             out.push(Event::Malformed {
                 text: Text::uncounted(bytes),
-                why: MalformedReason::Other(TAG_OUT_OF_PLACE.into()),
+                why: MalformedReason::TagOutOfPlace,
             });
         }
     }
@@ -427,7 +421,7 @@ impl Assembler {
                 self.object.drop_carried(out);
                 out.push(Event::Malformed {
                     text: Text::uncounted(run),
-                    why: MalformedReason::Other(TEXT_BETWEEN_TAGS.into()),
+                    why: MalformedReason::TextBetweenTags,
                 });
             }
         }
@@ -445,7 +439,8 @@ impl Assembler {
         if !is_name(&name) {
             // Text where the name should be, a JSON call inside a code fence or prose: reported,
             // and no call starts.
-            self.object.report(NOT_A_NAME, out);
+            self.object
+                .report(MalformedReason::TextWhereTheNameShouldBe, out);
             self.stage = Stage::Between;
             return;
         }
@@ -594,15 +589,11 @@ mod tests {
         fragments(events).concat()
     }
 
-    fn malformed(events: &[Event]) -> Vec<(&str, &str)> {
+    fn malformed(events: &[Event]) -> Vec<(&str, MalformedReason)> {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed {
-                    text,
-                    why: MalformedReason::Other(why),
-                } => Some((text.text.as_str(), why.as_ref())),
-                Event::Malformed { text, .. } => Some((text.text.as_str(), "unterminated")),
+                Event::Malformed { text, why } => Some((text.text.as_str(), *why)),
                 _ => None,
             })
             .collect()
@@ -664,7 +655,7 @@ mod tests {
         assert_eq!(bytes(&events), format!("{output}{CLOSE}"));
         assert!(malformed(&events)
             .iter()
-            .any(|(text, why)| *text == "<arg_key>" && *why == TAG_OUT_OF_PLACE));
+            .any(|(text, why)| *text == "<arg_key>" && *why == MalformedReason::TagOutOfPlace));
     }
 
     #[test]
@@ -686,7 +677,9 @@ mod tests {
             assert!(fragments(&events).is_empty(), "{text:?}");
             assert!(ends(&events).is_empty(), "{text:?}");
             assert!(
-                malformed(&events).iter().any(|(_, why)| *why == NOT_A_NAME),
+                malformed(&events)
+                    .iter()
+                    .any(|(_, why)| *why == MalformedReason::TextWhereTheNameShouldBe),
                 "{text:?}"
             );
             assert_eq!(bytes(&events), format!("{text}{CLOSE}"));
@@ -703,7 +696,9 @@ mod tests {
             false,
         );
         assert_eq!(arguments(&events), r#"{"n": 1}"#);
-        assert!(malformed(&events).iter().any(|(_, why)| *why == EMPTY_KEY));
+        assert!(malformed(&events)
+            .iter()
+            .any(|(_, why)| *why == MalformedReason::EmptyKey));
     }
 
     #[test]
@@ -715,7 +710,7 @@ mod tests {
         assert_eq!(arguments(&events), r#"{"n": 1}"#);
         assert!(malformed(&events)
             .iter()
-            .any(|(text, why)| *text == "<arg_key>na" && *why == TAG_CUT_SHORT));
+            .any(|(text, why)| *text == "<arg_key>na" && *why == MalformedReason::TagCutShort));
     }
 
     #[test]
@@ -763,7 +758,7 @@ mod tests {
         assert_eq!(fragments(&events), Vec::<&str>::new());
         assert_eq!(
             malformed(&events),
-            [("<arg_key>n</arg_key><arg_value>12", "unterminated")]
+            [("<arg_key>n</arg_key><arg_value>12", MalformedReason::UnterminatedRegion)]
         );
         assert_eq!(ends(&events), [""]);
         // A block with no name at all, cut: its bytes are unterminated, and no call started.
@@ -780,7 +775,7 @@ mod tests {
     fn the_calls_end_inside_a_streamed_string_leaves_it_open_and_says_so() {
         let events = run(&["f<arg_key>s</arg_key><arg_value>a <"], false);
         assert_eq!(fragments(&events), [r#"{"s": ""#, "a "]);
-        assert_eq!(malformed(&events), [("<", "unterminated")]);
+        assert_eq!(malformed(&events), [("<", MalformedReason::UnterminatedRegion)]);
         assert!(matches!(
             &events[events.len() - 2..],
             [Event::Malformed { .. }, Event::ToolCallEnd { .. }]
@@ -817,7 +812,7 @@ mod tests {
         assert_eq!(arguments(&events), r#"{"n": 1}"#);
         assert!(malformed(&events)
             .iter()
-            .any(|(text, why)| *text == "junk" && *why == TEXT_BETWEEN_TAGS));
+            .any(|(text, why)| *text == "junk" && *why == MalformedReason::TextBetweenTags));
         // The whitespace before the text is the template's; the key's tags carried before it go
         // out with it, since nothing before the text can take them.
         assert!(events.iter().any(|e| matches!(

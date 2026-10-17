@@ -60,11 +60,6 @@ impl Spelling {
 }
 /// The call's header up to the tool's name.
 const HEADER: &str = "call:";
-const NOT_A_CALL: &str = "a call that does not start with `call:NAME{`";
-const TEXT_AFTER_THE_OBJECT: &str = "text after the arguments closed";
-const EMPTY_KEY: &str = "a key without a name";
-const KEY_CUT_SHORT: &str = "a key the call's end cut short";
-const VALUE_CUT_SHORT: &str = "a value the call's end cut short";
 
 /// The events of one call, from the bytes after `<|tool_call>`.
 #[derive(Clone, Debug)]
@@ -174,7 +169,7 @@ impl Assembler {
         } else if !terminal.is_empty() {
             out.push(Event::Malformed {
                 text: Text::uncounted(terminal),
-                why: MalformedReason::Other(NOT_A_CALL.into()),
+                why: MalformedReason::TextBetweenCalls,
             });
         }
         self.done = true;
@@ -237,7 +232,7 @@ impl Assembler {
             _ => {
                 out.push(Event::Malformed {
                     text: Text::uncounted(&rest[..=brace]),
-                    why: MalformedReason::Other(NOT_A_CALL.into()),
+                    why: MalformedReason::TextBetweenCalls,
                 });
                 self.stage = Stage::Closed;
             }
@@ -264,7 +259,7 @@ impl Assembler {
             // value that follows it stays inside a valid object.
             out.push(Event::Malformed {
                 text: Text::uncounted(&rest[..=colon]),
-                why: MalformedReason::Other(EMPTY_KEY.into()),
+                why: MalformedReason::EmptyKey,
             });
             let mut json = self.separator();
             json.push_str("\"\": ");
@@ -394,7 +389,7 @@ impl Assembler {
                 if space > 0 {
                     out.push(Event::Malformed {
                         text: Text::uncounted(&rest[..space]),
-                        why: MalformedReason::Other(VALUE_CUT_SHORT.into()),
+                        why: MalformedReason::ValueCutShort,
                     });
                 }
                 let next = &rest[space..];
@@ -465,16 +460,16 @@ impl Assembler {
         match self.stage {
             Stage::Header if !held.is_empty() => out.push(Event::Malformed {
                 text: Text::uncounted(held),
-                why: MalformedReason::Other(NOT_A_CALL.into()),
+                why: MalformedReason::TextBetweenCalls,
             }),
             Stage::Key if !held.trim().is_empty() => out.push(Event::Malformed {
                 text: Text::uncounted(held),
-                why: MalformedReason::Other(KEY_CUT_SHORT.into()),
+                why: MalformedReason::KeyCutShort,
             }),
             Stage::Value if !held.trim().is_empty() || self.value_missing() => {
                 out.push(Event::Malformed {
                     text: Text::uncounted(held),
-                    why: MalformedReason::Other(VALUE_CUT_SHORT.into()),
+                    why: MalformedReason::ValueCutShort,
                 });
             }
             Stage::Text => {
@@ -529,7 +524,7 @@ fn after_the_object(text: &str, out: &mut Events) -> usize {
         } else {
             Event::Malformed {
                 text: Text::uncounted(run),
-                why: MalformedReason::Other(TEXT_AFTER_THE_OBJECT.into()),
+                why: MalformedReason::TextAfterTheArguments,
             }
         });
     }
@@ -617,14 +612,11 @@ mod tests {
             .collect()
     }
 
-    fn malformed(events: &[Event]) -> Vec<(String, String)> {
+    fn malformed(events: &[Event]) -> Vec<(String, MalformedReason)> {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed {
-                    text,
-                    why: MalformedReason::Other(why),
-                } => Some((text.text.clone(), why.to_string())),
+                Event::Malformed { text, why } => Some((text.text.clone(), *why)),
                 _ => None,
             })
             .collect()
@@ -887,19 +879,19 @@ mod tests {
         assert_eq!(arguments(&closed), r#"{"city": }"#);
         assert_eq!(
             malformed(&closed),
-            vec![(String::new(), VALUE_CUT_SHORT.to_string())]
+            vec![(String::new(), MalformedReason::ValueCutShort)]
         );
         assert_eq!(bytes(&closed), format!("call:get_weather{{city:{CLOSE}"));
         let second = run(&["call:get_weather{city:<|\"|>Paris<|\"|>,days:"], false);
         assert_eq!(arguments(&second), r#"{"city": "Paris", "days": }"#);
         assert_eq!(
             malformed(&second),
-            vec![(String::new(), VALUE_CUT_SHORT.to_string())]
+            vec![(String::new(), MalformedReason::ValueCutShort)]
         );
         let spaced = run(&["call:get_weather{city: "], false);
         assert_eq!(
             malformed(&spaced),
-            vec![(" ".to_string(), VALUE_CUT_SHORT.to_string())]
+            vec![(" ".to_string(), MalformedReason::ValueCutShort)]
         );
         let cut = run(&["call:get_weather{city:"], true);
         assert_eq!(arguments(&cut), r#"{"city": }"#);
@@ -932,7 +924,7 @@ mod tests {
             .iter()
             .any(|event| matches!(event, Event::ToolCallStart { .. })));
         assert_eq!(bytes(&not), format!("hello{{x:1}}{CLOSE}"));
-        assert_eq!(malformed(&not)[0].1, NOT_A_CALL);
+        assert_eq!(malformed(&not)[0].1, MalformedReason::TextBetweenCalls);
         // The space before the text is the template's wrapping, the text is reported: the same
         // two events however the bytes are cut.
         for pieces in [&["call:f{x:1} trailing"][..], &["call:f{x:1} ", "trailing"]] {
@@ -940,7 +932,10 @@ mod tests {
             assert_eq!(arguments(&tail), r#"{"x": 1}"#);
             assert_eq!(
                 malformed(&tail),
-                vec![("trailing".to_string(), TEXT_AFTER_THE_OBJECT.to_string())]
+                vec![(
+                    "trailing".to_string(),
+                    MalformedReason::TextAfterTheArguments
+                )]
             );
             assert!(tail.iter().any(|event| matches!(
                 event,

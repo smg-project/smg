@@ -68,12 +68,6 @@ impl Dialect {
     };
 }
 
-const TEXT_BETWEEN_CALLS: &str = "text where a call should begin";
-const TEXT_WHERE_AN_ARGUMENT_SHOULD_BEGIN: &str = "text where an argument should begin";
-const NAME_WITHOUT_A_CALL: &str = "a name without a call";
-const ARGUMENT_CUT_SHORT: &str = "an argument the call's end cut short";
-const KEY_WITHOUT_A_VALUE: &str = "a key without a value";
-
 /// The events of the pythonic calls in one region, each call with its own index from `first` and
 /// its id from the engine's [`CallIds`].
 #[derive(Clone, Debug)]
@@ -172,17 +166,17 @@ impl Assembler {
     pub fn close(mut self, out: &mut Events) {
         match std::mem::replace(&mut self.stage, Stage::Between) {
             Stage::Between => self.drop_carried(out),
-            Stage::Name { .. } => self.report(NAME_WITHOUT_A_CALL, out),
+            Stage::Name { .. } => self.report(MalformedReason::NameWithoutACall, out),
             Stage::Arguments => {
                 let source = Text::uncounted(std::mem::take(&mut self.carried));
                 self.end_call(source, "", out);
             }
             Stage::Key { .. } => {
-                self.report(KEY_WITHOUT_A_VALUE, out);
+                self.report(MalformedReason::KeyWithoutAValue, out);
                 self.end_call(Text::uncounted(String::new()), "", out);
             }
             Stage::Value { .. } => {
-                self.report(ARGUMENT_CUT_SHORT, out);
+                self.report(MalformedReason::ArgumentCutShort, out);
                 self.end_call(Text::uncounted(String::new()), "", out);
             }
         }
@@ -222,7 +216,7 @@ impl Assembler {
                     self.drop_carried(out);
                     out.push(Event::Malformed {
                         text: Text::uncounted(c.to_string()),
-                        why: MalformedReason::Other(TEXT_BETWEEN_CALLS.into()),
+                        why: MalformedReason::TextBetweenCalls,
                     });
                 }
             },
@@ -252,7 +246,7 @@ impl Assembler {
                 c => {
                     // Not a call after all: the name's bytes are reported, and the character is
                     // read where a call could begin.
-                    self.report(NAME_WITHOUT_A_CALL, out);
+                    self.report(MalformedReason::NameWithoutACall, out);
                     self.stage = Stage::Between;
                     self.take(c, out);
                 }
@@ -277,7 +271,7 @@ impl Assembler {
                     self.drop_carried(out);
                     out.push(Event::Malformed {
                         text: Text::uncounted(c.to_string()),
-                        why: MalformedReason::Other(TEXT_WHERE_AN_ARGUMENT_SHOULD_BEGIN.into()),
+                        why: MalformedReason::TextWhereAnArgumentShouldBegin,
                     });
                 }
             },
@@ -299,7 +293,7 @@ impl Assembler {
                     };
                 }
                 c => {
-                    self.report(KEY_WITHOUT_A_VALUE, out);
+                    self.report(MalformedReason::KeyWithoutAValue, out);
                     self.stage = Stage::Arguments;
                     self.take(c, out);
                 }
@@ -355,13 +349,13 @@ impl Assembler {
         });
     }
 
-    fn report(&mut self, why: &'static str, out: &mut Events) {
+    fn report(&mut self, why: MalformedReason, out: &mut Events) {
         if self.carried.is_empty() {
             return;
         }
         out.push(Event::Malformed {
             text: Text::uncounted(std::mem::take(&mut self.carried)),
-            why: MalformedReason::Other(why.into()),
+            why,
         });
     }
 
@@ -521,7 +515,10 @@ mod tests {
         let events = run(&["get_weather(city=\"Par"]);
         assert!(events.iter().any(|event| matches!(
             event,
-            Event::Malformed { why: MalformedReason::Other(why), .. } if why == ARGUMENT_CUT_SHORT
+            Event::Malformed {
+                why: MalformedReason::ArgumentCutShort,
+                ..
+            }
         )));
         assert!(events
             .iter()
@@ -583,8 +580,10 @@ mod tests {
         );
         assert!(events.iter().any(|event| matches!(
             event,
-            Event::Malformed { why: MalformedReason::Other(why), .. }
-                if why == TEXT_WHERE_AN_ARGUMENT_SHOULD_BEGIN
+            Event::Malformed {
+                why: MalformedReason::TextWhereAnArgumentShouldBegin,
+                ..
+            }
         )));
     }
 }

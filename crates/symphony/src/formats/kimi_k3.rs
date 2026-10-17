@@ -435,7 +435,7 @@ mod tests {
         assert!(events.contains(&dropped("\n")));
         assert!(events.iter().any(|event| matches!(
             event,
-            Event::Malformed { text, why: MalformedReason::Other(_) } if text.text == "Hello"
+            Event::Malformed { text, why: MalformedReason::TextBetweenCalls } if text.text == "Hello"
         )));
     }
 
