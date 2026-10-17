@@ -10,7 +10,7 @@
 //! a conversation longer than [`MAX_CONVERSATION_HISTORY_ITEMS`] replays its
 //! newest items.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use axum::response::Response;
 use openai_protocol::responses::{
@@ -83,6 +83,8 @@ pub(crate) async fn load_history(
         continues = true;
     }
 
+    drop_results_of_unloaded_calls(&mut history);
+
     let mut loaded = request.clone();
     if continues {
         history.extend(current_input_items(&request.input));
@@ -111,6 +113,42 @@ pub(crate) async fn load_history(
     );
 
     Ok(loaded)
+}
+
+/// Drops from the loaded `history` the tool results whose calls did not
+/// survive the reload. A chain is cut at the store's depth cap, at an expired
+/// or deleted record or at another tenant's, and a conversation window at its
+/// size: the oldest turn kept then opens with the result of a call the turn
+/// before it issued, which is gone. Such a result answers nothing the request
+/// replays, and the contract profiles refuse a tool result with no call
+/// before it (`ProviderProfile::unanswerable_tool_result`), so keeping it
+/// would refuse every later request on the history for a call the client
+/// never sent. The request's own input items are not touched here: a result
+/// among them with no call before it is the client's and keeps its refusal.
+fn drop_results_of_unloaded_calls(history: &mut Vec<ResponseInputOutputItem>) {
+    let mut issued: HashSet<String> = HashSet::new();
+    let mut dropped: Vec<String> = Vec::new();
+    history.retain(|item| match item {
+        ResponseInputOutputItem::FunctionToolCall { call_id, .. }
+        | ResponseInputOutputItem::CustomToolCall { call_id, .. } => {
+            issued.insert(call_id.clone());
+            true
+        }
+        ResponseInputOutputItem::FunctionCallOutput { call_id, .. }
+        | ResponseInputOutputItem::CustomToolCallOutput { call_id, .. }
+            if !issued.contains(call_id) =>
+        {
+            dropped.push(call_id.clone());
+            false
+        }
+        _ => true,
+    });
+    if !dropped.is_empty() {
+        debug!(
+            call_ids = ?dropped,
+            "dropped stored tool results whose calls did not survive the history's reload"
+        );
+    }
 }
 
 /// The request's own input as items: a text input is the user message it
@@ -633,6 +671,39 @@ pub(crate) mod tests {
             ResponseInputOutputItem::FunctionToolCall { name, arguments, .. }
                 if name == "calc" && arguments == "{\"expr\":\"6*7\"}"
         ));
+    }
+
+    /// The results whose calls did not survive a reload are left out of the
+    /// loaded history: the one that opens a cut chain or window, and a later
+    /// one whose call is gone, a custom tool's as a function's; a result
+    /// whose call is loaded stays in its place.
+    #[test]
+    fn results_of_unloaded_calls_are_dropped_from_the_loaded_history() {
+        let mut history: Vec<ResponseInputOutputItem> = serde_json::from_value(json!([
+            {"type": "function_call_output", "call_id": "call_0", "output": "gone"},
+            {"type": "message", "id": "msg_1", "role": "assistant", "content": [
+                {"type": "output_text", "text": "Next.", "annotations": []}]},
+            {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "calc",
+             "arguments": "{}", "status": "completed"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "42"},
+            {"type": "custom_tool_call_output", "call_id": "call_x", "output": "gone too"},
+            {"type": "custom_tool_call", "call_id": "call_2", "name": "sh", "input": "ls"},
+            {"type": "custom_tool_call_output", "call_id": "call_2", "output": "ok"}
+        ]))
+        .expect("history items");
+
+        drop_results_of_unloaded_calls(&mut history);
+
+        assert_eq!(
+            shape(&history),
+            [
+                "message:assistant",
+                "function_call:call_1",
+                "function_call_output:call_1",
+                "custom_tool_call",
+                "custom_tool_call_output"
+            ]
+        );
     }
 
     /// A stored row of a kind no conversion replays (a hosted image

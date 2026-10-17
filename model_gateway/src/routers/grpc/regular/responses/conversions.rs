@@ -117,8 +117,10 @@ fn responses_to_chat_with_tools(
     // under an unknown id or with no call before it at all, is a malformed
     // history under the contracts that say so (the public API's words for
     // it), answered as a bad request, not sent to the engine as a turn the
-    // model never asked for. A stored turn arrives with its calls, so such a
-    // result is the client's.
+    // model never asked for. The history loader keeps a stored turn with its
+    // calls and drops a stored result whose call did not survive the reload
+    // (`history::load_history`), so a result with no call before it here is
+    // the client's.
     if let Some(call_id) = ProviderProfile::for_model(&model).unanswerable_tool_result(&messages) {
         return Err(format!(
             "No tool call found for function call output with call_id '{call_id}'"
@@ -978,9 +980,10 @@ mod tests {
 
     /// A result with no call before it answers nothing: refused in the same
     /// words after the user's message and as the only item. The stored turns
-    /// a request continues arrive with their calls, so such a result is the
-    /// client's, not a reload that lost the call; a model under no such
-    /// contract converts it either way.
+    /// a request continues arrive with their calls, and the loader drops a
+    /// stored result whose call did not survive the reload, so such a result
+    /// is the client's, not a reload that lost the call; a model under no
+    /// such contract converts it either way.
     #[test]
     fn an_orphan_tool_result_does_not_convert_under_the_deepseek_contract() {
         let after_user = serde_json::json!([

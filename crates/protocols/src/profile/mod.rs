@@ -299,10 +299,13 @@ impl ProviderProfile {
     /// assistant turn right before it, so a result with no call before it at
     /// all, whether it opens the history or follows another role, answers
     /// nothing and is refused as the public API refuses it, not sent to the
-    /// engine as a turn the model never asked for. A stored turn is reloaded
-    /// with its calls, so such a result is the client's. The chat endpoint's
-    /// own history gets the full pairing rule, unanswered calls included,
-    /// through [`Self::validate_chat`].
+    /// engine as a turn the model never asked for. The gateway's history
+    /// loader keeps a stored turn with its calls and drops a stored result
+    /// whose call did not survive the reload (a chain cut at a depth cap, at
+    /// an expired or deleted record or at another tenant's; a conversation
+    /// window), so a result with no call before it is the client's. The chat
+    /// endpoint's own history gets the full pairing rule, unanswered calls
+    /// included, through [`Self::validate_chat`].
     pub fn unanswerable_tool_result(self, messages: &[ChatMessage]) -> Option<&str> {
         if !matches!(self, ProviderProfile::OpenAi | ProviderProfile::DeepSeek) {
             return None;
