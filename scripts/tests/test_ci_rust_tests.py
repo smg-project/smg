@@ -220,6 +220,16 @@ class ShardTableTests(unittest.TestCase):
             "deploy/helm/smg/templates/grafana-dashboard.yaml",
         ):
             self.assertTrue(filter_matches(filters["rust-gateway"], path), path)
+        # Only the Rust sources under those roots: a Python client, a Java
+        # client or a README there changes no Rust test's result.
+        for path in (
+            "bindings/python/src/smg/router_args.py",
+            "clients/python/smg_client/client.py",
+            "clients/java/pom.xml",
+            "examples/rl/refit_from_disk.py",
+            "examples/wasm/README.md",
+        ):
+            self.assertFalse(filter_matches(filters["rust-gateway"], path), path)
 
     def test_every_shard_has_a_filter_and_setup_flags_the_workflow_knows(self):
         filters = path_filters()
