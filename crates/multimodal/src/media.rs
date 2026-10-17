@@ -2094,6 +2094,12 @@ async fn decode_video_with_ffmpeg_runners(
                 .and_then(|info| video_metadata_from(info, false))
             {
                 Ok(probed) => {
+                    // The cap was judged on the container's stated size; the
+                    // probe's is the decoder's, so it is judged again before a
+                    // second decoder starts on it.
+                    if let Some(selection) = selection {
+                        ensure_decode_work_limit(selection.sequential_frames(), selection, probed)?;
+                    }
                     metadata = probed;
                     started = Instant::now();
                     headed =
@@ -2327,7 +2333,7 @@ fn ensure_decode_work_limit(
         return Ok(());
     }
     Err(MediaConnectorError::VideoDecode(format!(
-        "sampling {} frames of {} means decoding {frames} of its {} source frames of {}x{}, {pixels} pixels, over SMG_VIDEO_MAX_DECODE_PIXELS={limit}; a shorter or smaller clip or a smaller frame budget fits it",
+        "sampling {} frames of {} means decoding {frames} of its {} source frames of {}x{}, {pixels} pixels, over {VIDEO_MAX_DECODE_PIXELS_KNOB}={limit}; a shorter or smaller clip or a smaller frame budget fits it",
         selection.frame_indices.len(),
         clip_length(metadata),
         selection.total_frames,
@@ -2391,11 +2397,17 @@ fn is_video_command_timeout(error: &MediaConnectorError) -> bool {
 /// What `ensure_decoded_byte_limit` names in the error of a decode refused for its size.
 const VIDEO_DECODED_BYTES_KNOB: &str = "SMG_VIDEO_MAX_DECODED_BYTES";
 
-/// `true` for the error of a decode refused for its size or ended for its
-/// time: a budget no other runner over the same stream, and no resampling of
-/// it, can answer, so it ends the decode instead of starting the next runner.
+/// What `ensure_decode_work_limit` names in the error of a decode refused for its work.
+const VIDEO_MAX_DECODE_PIXELS_KNOB: &str = "SMG_VIDEO_MAX_DECODE_PIXELS";
+
+/// `true` for the error of a decode refused for its size or its work, or
+/// ended for its time: a budget no other runner over the same stream, and no
+/// resampling of it, can answer, so it ends the decode instead of starting
+/// the next runner.
 fn is_video_budget_error(error: &MediaConnectorError) -> bool {
-    is_video_command_timeout(error) || matches!(error, MediaConnectorError::DecodedTooLarge { .. })
+    is_video_command_timeout(error)
+        || matches!(error, MediaConnectorError::DecodedTooLarge { .. })
+        || matches!(error, MediaConnectorError::VideoDecode(message) if message.contains(VIDEO_DECODED_BYTES_KNOB) || message.contains(VIDEO_MAX_DECODE_PIXELS_KNOB))
 }
 
 /// Runs a decoder command to completion under the video process timeout. A
@@ -2688,6 +2700,14 @@ fn video_metadata_from(
     let height = info.height.ok_or_else(|| {
         MediaConnectorError::VideoDecode("ffprobe did not return video height".to_string())
     })?;
+    // ffprobe states `0x0` for a stream whose codec parameters it could not
+    // find: no decoder frames such a stream, and the work cap would count no
+    // pixels for it (the container's tables refuse a zero size already).
+    if width == 0 || height == 0 {
+        return Err(MediaConnectorError::VideoDecode(format!(
+            "ffprobe reported a video size of {width}x{height}: a stream of unknown size is not decoded"
+        )));
+    }
     Ok(VideoMetadata {
         width,
         height,
@@ -3919,9 +3939,10 @@ mod tests {
         decoder_unavailable, effective_sample_fps, ensure_input_byte_limit,
         expected_sampled_frame_count, fallback_failed, fps_filter_for_metadata,
         parse_ffmpeg_duration_seconds, parse_ffprobe_video_info, parse_ppm_stream,
-        read_file_with_limit, run_video_command_output, split_png_stream, video_temp_suffix,
-        write_temp_video_file, FrameSampling, MediaConnector, MediaConnectorConfig,
-        MediaConnectorError, MediaSource, VideoFetchConfig, VideoMetadata,
+        read_file_with_limit, run_video_command_output, split_png_stream, video_metadata_from,
+        video_temp_suffix, write_temp_video_file, FrameSampling, MediaConnector,
+        MediaConnectorConfig, MediaConnectorError, MediaSource, ProbedVideoInfo, VideoFetchConfig,
+        VideoMetadata,
     };
     use crate::error::MediaFault;
 
@@ -3950,6 +3971,28 @@ mod tests {
     fn parses_ffmpeg_duration() {
         let stderr = "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'video.mp4':\n  Duration: 00:01:23.45, start: 0.000000, bitrate: 123 kb/s";
         assert_eq!(parse_ffmpeg_duration_seconds(stderr), Some(83.45));
+    }
+
+    /// A probe that states no size (ffprobe's `0x0` for a stream whose codec
+    /// parameters it could not find) is refused: no decoder frames such a
+    /// stream, and the work cap would count no pixels for it.
+    #[test]
+    fn ffprobe_metadata_refuses_a_zero_size() {
+        for (width, height) in [(0, 48), (64, 0), (0, 0)] {
+            let info = ProbedVideoInfo {
+                width: Some(width),
+                height: Some(height),
+                duration_seconds: Some(1.0),
+                source_fps: Some(30.0),
+                total_frames: Some(30),
+                container_frames: Some(30),
+            };
+            let error = video_metadata_from(info, false).expect_err("a zero size is refused");
+            assert!(
+                error.to_string().contains(&format!("{width}x{height}")),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -7373,6 +7416,10 @@ mod seek_decode_tests {
         };
         let error = ensure_decode_work_limit(selection.sequential_frames(), &selection, full_hd)
             .expect_err("ten hours of 1920x1080 at 30 fps are over the cap");
+        assert!(
+            is_video_budget_error(&error),
+            "the refusal ends the decode; no fallback runner or resampling answers it"
+        );
         let text = error.to_string();
         assert!(
             text.contains(
