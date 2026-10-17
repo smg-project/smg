@@ -409,15 +409,19 @@ struct Replayed {
     before_end: usize,
 }
 
-/// `case` through a new engine, its output cut at `cuts`, the events drained after every feed as
-/// a stream's reader drains them.
 /// The nonce both replays of a case count their call ids from: an engine draws its own at random
 /// (one request, one nonce), so two engines over one output would name the same call differently
 /// and the chunking check could never compare them.
 const NONCE: &str = "0123456789abcdef00000000";
 
+/// `case` through a new engine, its output cut at `cuts`, the events drained after every feed as
+/// a stream's reader drains them.
 fn replay(case: &Case, cuts: &[usize]) -> Replayed {
-    let ids = CallIds::from_nonce(NONCE).unwrap_or_else(CallIds::fresh);
+    // The nonce is this module's constant; `the_nonce_is_one_the_engine_takes` holds it valid, so
+    // an invalid one fails that test rather than falling back to a random nonce in silence.
+    let Some(ids) = CallIds::from_nonce(NONCE) else {
+        unreachable!("NONCE is not 24 hex characters")
+    };
     let mut engine = Engine::with_call_ids(case.table.shared(), declared_shared(), ids);
     let mut out = Events::new();
     let mut events = Vec::new();
@@ -888,6 +892,20 @@ mod tests {
             );
             check(&case);
             check(&decode(&data, Some(*table)));
+            // The malformed slice is the one call's with its body cut short before the call's
+            // close: the table says so, where a cut before another terminal would read whole.
+            if slice.family == "malformed" {
+                let whole = replay(&case, &[]);
+                assert!(
+                    whole.events.iter().any(|event| matches!(
+                        event,
+                        Event::Malformed { why, .. } if *why != MalformedReason::UnknownTool
+                    )),
+                    "{}: the malformed slice reads whole: {:?}",
+                    table.name(),
+                    slice.output
+                );
+            }
         }
         Ok(())
     }
@@ -909,7 +927,7 @@ mod tests {
     }
 
     #[test]
-    fn the_seeds_prepare_writes_decode_as_the_slices_and_its_words_fit() -> Result<(), String> {
+    fn the_seeds_prepare_writes_decode_as_the_slices() -> Result<(), String> {
         let Some(root) = fixtures() else {
             return Ok(());
         };
@@ -969,6 +987,11 @@ mod tests {
         assert_eq!(case.finish, EngineFinish::Stop);
         check(&case);
         check(&decode(b"", None));
+    }
+
+    #[test]
+    fn the_nonce_is_one_the_engine_takes() {
+        assert!(CallIds::from_nonce(NONCE).is_some(), "{NONCE}");
     }
 
     #[test]

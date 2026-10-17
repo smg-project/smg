@@ -1054,14 +1054,25 @@ fn a_field_written_twice_reads_as_both_stays() {
 
 #[test]
 fn every_table_here_is_valid_and_names_its_stop_tokens() {
+    // The tables spelled without the recorded classes are checked whatever the tree holds.
+    for (format, stops) in [
+        (gemma4(), &["<|tool_response>"][..]),
+        (ernie(), &[][..]),
+        (inkling(), &[][..]),
+    ] {
+        assert_eq!(format.validate(), Ok(()), "{}", format.name());
+        for stop in stops {
+            assert!(format.is_stop_token(stop), "{}: {stop}", format.name());
+        }
+    }
+    // A terminal that ends a message inside the turn is not a stop token.
+    assert!(!gemma4().is_stop_token("<turn|>"));
+    assert!(!inkling().is_stop_token("<|end_message|>"));
     let Some((word, space)) = classes() else {
         return;
     };
     for (format, stops) in [
         (gpt_oss(&word), &[][..]),
-        (gemma4(), &["<|tool_response>"][..]),
-        (ernie(), &[][..]),
-        (inkling(), &[][..]),
         (muse(&word), &["<|eot|>"][..]),
         (serve_qwen3_5(&word, &space), &[][..]),
     ] {
@@ -1070,12 +1081,9 @@ fn every_table_here_is_valid_and_names_its_stop_tokens() {
             assert!(format.is_stop_token(stop), "{}: {stop}", format.name());
         }
     }
-    // A stop token that is not a terminal is not kept, and a terminal that ends a message inside
-    // the turn is not a stop token.
+    // A stop token that is not a terminal is not kept.
     assert!(gpt_oss(&word).is_stop_token("<|call|>"));
     assert!(!gpt_oss(&word).is_stop_token("<|return|>"));
-    assert!(!gemma4().is_stop_token("<turn|>"));
-    assert!(!inkling().is_stop_token("<|end_message|>"));
     assert!(!muse(&word).is_stop_token("<|eom|>"));
 }
 

@@ -220,6 +220,7 @@ jobs:
           # exercise v1; unsupported configurations retain the existing encoder.
           features=(--features smg/tokenizers-v1)
           cargo test -p llm-tokenizer -p smg -p smg-symphony "${features[@]}" --test 'bellwether_*' --no-run
+          cargo test -p smg-response-template --features symphony --lib --test layout --no-run
           targets=()
           for file in crates/symphony/tests/bellwether_*.rs model_gateway/tests/bellwether_*.rs crates/tokenizer/tests/bellwether_*.rs; do
             targets+=("$(basename "$file" .rs)")
@@ -230,7 +231,6 @@ jobs:
               > "$RUNNER_TEMP/$target.log" 2>&1 &
             pid[$target]=$!
           done
-          cargo test -p smg-response-template --features symphony --lib --test layout --no-run
           cargo test -p smg-response-template --features symphony --lib -- --nocapture \
             > "$RUNNER_TEMP/response_template_lib.log" 2>&1 &
           pid[response_template_lib]=$!

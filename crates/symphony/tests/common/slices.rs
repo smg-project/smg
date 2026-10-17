@@ -15,8 +15,12 @@
 //! among equals: content alone, with none of the table's markers in it (a probe that fences a
 //! call in its text is not plain text); one call with arguments and nothing else; two or more
 //! calls and nothing else; a thought and a call. The malformed slice is derived from the one call's: the
-//! last character of the call's body before its closing marker is cut (the `}` of a JSON object,
-//! the `>` of a tag, the `]` of a list), so the call reaches its close malformed.
+//! fewest trailing characters of the call's body before the terminal that closes the call (each
+//! group names its table's, [`Group::call_close`]) are cut that make the table report the call
+//! malformed, which the table itself is asked: one character for most (the `}` of a JSON object,
+//! the `>` of a tag, the `]` of a list), more where the table forgives a cut at the close (Gemma 4
+//! closes an open object at the call's end, so the string before it is cut open). A message's or
+//! a list's close after the call's, and the separators a table ignores, are not the call's close.
 //!
 //! Included by path from `benches/throughput.rs` and from the fuzz crate: one definition for both.
 
@@ -25,9 +29,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use openai_protocol::common::{Function as ToolFunction, Tool};
 use serde::Deserialize;
 use serde_json::Value;
-use symphony::formats::Table;
+use symphony::{
+    formats::Table, Declared, Engine, EngineFinish, Event, Events, Input, MalformedReason, Parser,
+};
 
 /// The variable that names the tree `bellwether unpack` writes.
 pub const ENV: &str = "BELLWETHER_FIXTURES";
@@ -45,15 +52,17 @@ pub const FAMILIES: [&str; 5] = [
 pub const HAND_WRITTEN_SETS: [&str; 2] = ["common", "turns"];
 
 /// A table that stands for a call syntax, the bellwether group whose recorded outputs it reads,
-/// and the prompt its template leaves: the turn's opener, then the bytes that open or close the
+/// the prompt its template leaves (the turn's opener, then the bytes that open or close the
 /// thought when the request leaves thinking on, or turns it off (`enable_thinking: false`); a
-/// template with no switch, or no thought, writes the same for both.
+/// template with no switch, or no thought, writes the same for both), and the terminal that
+/// closes one call in the table, before which the malformed slice is cut.
 pub struct Group {
     pub table: &'static str,
     pub slug: &'static str,
     pub opener: &'static str,
     pub thinking_on: &'static str,
     pub thinking_off: &'static str,
+    pub call_close: &'static str,
 }
 
 /// The eight tables and their groups: the groups bellwether recorded first, one per call syntax,
@@ -66,6 +75,7 @@ pub const GROUPS: [Group; 8] = [
         opener: "<|im_start|>assistant\n",
         thinking_on: "",
         thinking_off: "<think>\n\n</think>\n\n",
+        call_close: "</tool_call>",
     },
     // Qwen 3.5: the prompt opens the thought, or closes an empty one when thinking is off.
     Group {
@@ -74,6 +84,7 @@ pub const GROUPS: [Group; 8] = [
         opener: "<|im_start|>assistant\n",
         thinking_on: "<think>\n",
         thinking_off: "<think>\n\n</think>\n\n",
+        call_close: "</tool_call>",
     },
     // GLM 5.3: the prompt always opens the thought.
     Group {
@@ -82,6 +93,7 @@ pub const GROUPS: [Group; 8] = [
         opener: "<|assistant|>",
         thinking_on: "<think>\n",
         thinking_off: "<think>\n",
+        call_close: "</tool_call>",
     },
     // DeepSeek V4.1: the prompt opens the thought, or closes an empty one when thinking is off.
     Group {
@@ -90,6 +102,7 @@ pub const GROUPS: [Group; 8] = [
         opener: "<｜Assistant｜>",
         thinking_on: "<think>\n",
         thinking_off: "<think>\n\n</think>\n\n",
+        call_close: "</｜DSML｜ invoke>",
     },
     // Kimi K3: the turn of messages opens with the thought, whatever the request says.
     Group {
@@ -98,6 +111,7 @@ pub const GROUPS: [Group; 8] = [
         opener: "<|open|>message role=\"assistant\"<|sep|>",
         thinking_on: "<|open|>think<|sep|>\n",
         thinking_off: "<|open|>think<|sep|>\n",
+        call_close: "<|close|>call<|sep|>",
     },
     // MiniMax M3: the model writes `<mm:think>` itself, or closes an empty thought at once.
     Group {
@@ -106,6 +120,7 @@ pub const GROUPS: [Group; 8] = [
         opener: "]~b]ai\n",
         thinking_on: "",
         thinking_off: "",
+        call_close: "</invoke>",
     },
     // Gemma 4: the model writes its thought channel itself.
     Group {
@@ -114,6 +129,7 @@ pub const GROUPS: [Group; 8] = [
         opener: "<|turn>model\n",
         thinking_on: "",
         thinking_off: "",
+        call_close: "<tool_call|>",
     },
     // LFM2.5: the model writes its own `<think>`.
     Group {
@@ -122,6 +138,7 @@ pub const GROUPS: [Group; 8] = [
         opener: "<|im_start|>assistant\n",
         thinking_on: "",
         thinking_off: "",
+        call_close: "<|tool_call_end|>",
     },
 ];
 
@@ -182,7 +199,7 @@ pub fn recorded(root: &Path) -> Result<Recorded, String> {
         }
         let terminals: Vec<String> = table.format().terminal_texts().map(str::to_owned).collect();
         slices.extend(
-            select(group, &cases, &terminals)
+            select(group, table, &cases, &terminals)
                 .into_iter()
                 .map(|slice| (table, slice)),
         );
@@ -237,10 +254,29 @@ struct Call {
 #[derive(Deserialize)]
 struct Function {
     #[serde(default)]
+    name: String,
+    #[serde(default)]
     arguments: Option<Value>,
 }
 
 impl Case {
+    /// The names of the tools the message's calls name, in order, each once.
+    fn tool_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for call in self
+            .reference
+            .message
+            .as_ref()
+            .and_then(|message| message.tool_calls.as_deref())
+            .unwrap_or(&[])
+        {
+            if !names.contains(&call.function.name) {
+                names.push(call.function.name.clone());
+            }
+        }
+        names
+    }
+
     /// Whether the request turns thinking off, which places the prompt's tail.
     fn thinking_off(&self) -> bool {
         self.request
@@ -309,27 +345,31 @@ fn read_cases(path: &Path) -> Result<Vec<Case>, String> {
 /// The group's slices from its cases: for each shaped family the longest recorded output of that
 /// shape, the first in order among equals, placed after the prompt its request asks for; then the
 /// malformed slice derived from the one call's.
-fn select(group: &Group, cases: &[Case], terminals: &[String]) -> Vec<Slice> {
+fn select(group: &Group, table: Table, cases: &[Case], terminals: &[String]) -> Vec<Slice> {
     let mut picked: Vec<Slice> = Vec::new();
+    let mut one_call_tools: Vec<String> = Vec::new();
     for family in FAMILIES.iter().filter(|family| **family != "malformed") {
         let longest = cases
             .iter()
             .filter_map(|case| {
                 let message = case.reference.message.as_ref()?;
                 let text = case.reference.text.as_deref()?;
-                (message.family(terminals)? == *family).then_some((text, case.thinking_off()))
+                (message.family(terminals)? == *family).then_some((text, case))
             })
             // `max_by_key` keeps the last of equals; the first is wanted.
-            .fold(None, |best: Option<(&str, bool)>, candidate| match best {
+            .fold(None, |best: Option<(&str, &Case)>, candidate| match best {
                 Some((text, _)) if text.len() >= candidate.0.len() => best,
                 _ => Some(candidate),
             });
-        if let Some((output, thinking_off)) = longest {
-            let tail = if thinking_off {
+        if let Some((output, case)) = longest {
+            let tail = if case.thinking_off() {
                 group.thinking_off
             } else {
                 group.thinking_on
             };
+            if *family == "one_call" {
+                one_call_tools = case.tool_names();
+            }
             picked.push(Slice {
                 family: (*family).to_string(),
                 prompt: format!("{}{tail}", group.opener),
@@ -338,7 +378,7 @@ fn select(group: &Group, cases: &[Case], terminals: &[String]) -> Vec<Slice> {
         }
     }
     if let Some(one_call) = picked.iter().find(|slice| slice.family == "one_call") {
-        if let Some(output) = malformed(&one_call.output, terminals) {
+        if let Some(output) = malformed(table, one_call, &one_call_tools, group.call_close) {
             picked.push(Slice {
                 family: "malformed".to_string(),
                 prompt: one_call.prompt.clone(),
@@ -349,20 +389,83 @@ fn select(group: &Group, cases: &[Case], terminals: &[String]) -> Vec<Slice> {
     picked
 }
 
-/// `output` with the last character of its call's body cut: the last character that is not
-/// whitespace before the last of the table's terminals in it, the call's close. None when the
-/// output holds no terminal, or nothing before it.
-fn malformed(output: &str, terminals: &[String]) -> Option<String> {
-    let close = terminals
-        .iter()
-        .filter_map(|terminal| output.rfind(terminal.as_str()))
-        .max()?;
-    let (at, c) = output[..close]
+/// How many trailing characters of a call's body a cut may take before the search gives up: a
+/// table that forgives that much at its close has no malformed slice from this call.
+const CUT_AT_MOST: usize = 8;
+
+/// The one call's output with the fewest trailing characters of its call's body cut that make
+/// `table` report the call malformed: the characters that are not whitespace before the last
+/// `call_close` in it, the terminal that closes the call (not a message's or a list's close after
+/// it, nor a separator the table ignores), taken away one more at a time and the output replayed
+/// through the table after each. None when the output holds no call close, nothing before it, or
+/// no cut of [`CUT_AT_MOST`] characters that the table reports.
+fn malformed(table: Table, one_call: &Slice, tools: &[String], call_close: &str) -> Option<String> {
+    let output = one_call.output.as_str();
+    let close = output.rfind(call_close)?;
+    let body: Vec<(usize, char)> = output[..close]
         .char_indices()
         .rev()
-        .find(|(_, c)| !c.is_whitespace())?;
-    let mut cut = String::with_capacity(output.len());
-    cut.push_str(&output[..at]);
-    cut.push_str(&output[at + c.len_utf8()..]);
-    Some(cut)
+        .filter(|(_, c)| !c.is_whitespace())
+        .take(CUT_AT_MOST)
+        .collect();
+    let mut cut = output.to_string();
+    for (at, c) in body {
+        cut.replace_range(at..at + c.len_utf8(), "");
+        if reads_malformed(table, &one_call.prompt, &cut, tools) {
+            return Some(cut);
+        }
+    }
+    None
+}
+
+/// Whether `table` reports a malformed call in `output` after `prompt`: the output fed whole and
+/// ended with a stop, any `Malformed` event but one for a tool the request did not declare (the
+/// slice's tools are declared by name, their parameters an open object, so a reader typed by the
+/// declaration reads the arguments as written).
+fn reads_malformed(table: Table, prompt: &str, output: &str, tools: &[String]) -> bool {
+    let declared: Vec<Tool> = tools
+        .iter()
+        .map(|name| Tool {
+            tool_type: "function".to_string(),
+            function: ToolFunction {
+                name: name.clone(),
+                description: None,
+                parameters: serde_json::json!({"type": "object"}),
+                strict: None,
+                extra: Default::default(),
+            },
+        })
+        .collect();
+    let mut engine = Engine::new(table.format(), Declared::of(&declared));
+    let mut out = Events::new();
+    let fed = engine
+        .feed(
+            Input::Prompt {
+                token_ids: &[],
+                text: prompt,
+            },
+            &mut out,
+        )
+        .is_ok()
+        && engine
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: output,
+                    spans: &[],
+                },
+                &mut out,
+            )
+            .is_ok()
+        && engine
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .is_ok();
+    fed && out.drain().iter().any(|event| {
+        matches!(event, Event::Malformed { why, .. } if *why != MalformedReason::UnknownTool)
+    })
 }
