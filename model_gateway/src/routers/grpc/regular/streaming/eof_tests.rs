@@ -373,6 +373,67 @@ async fn byte_fallback_completion_sse_keeps_tail_and_exact_usage() {
 }
 
 #[tokio::test]
+async fn completion_sse_opens_with_an_empty_first_delta_when_text_is_pending() {
+    let tokenizer = byte_fallback_tokenizer();
+    let ids = [2, 1];
+    let mut frames = byte_fallback_chunks(&ids);
+    let mut terminal = complete(0, "length");
+    if let Some(GenerationEvent::Complete(complete)) = &mut terminal.response {
+        complete.completion_tokens = ids.len() as u32;
+    }
+    frames.push(terminal);
+
+    let (stream, server) = scripted_stream(frames, "0").await;
+    let request: openai_protocol::completion::CompletionRequest = serde_json::from_value(
+        serde_json::json!({"model":"eof-test", "prompt":"test", "stream":true,
+            "ignore_eos":true, "max_tokens":ids.len(),
+            "stream_options":{"include_usage":true}}),
+    )
+    .unwrap();
+    let dispatch = dispatch();
+    let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_COMPLETIONS);
+    let response = Arc::new(processor(false))
+        .process_completion_streaming_response(
+            context::ExecutionResult::Single { stream },
+            CompletionResponseSpec::from(&request),
+            dispatch,
+            tokenizer,
+            None,
+            source,
+        )
+        .await;
+    let body = timeout(
+        Duration::from_secs(5),
+        axum::body::to_bytes(response.into_body(), 65536),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.abort();
+
+    let events: Vec<Value> = String::from_utf8(body.to_vec())
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("data: ")
+                .filter(|json| *json != "[DONE]")
+                .map(|json| serde_json::from_str(json).unwrap())
+        })
+        .collect();
+    let first = events
+        .iter()
+        .find(|event| event["choices"][0]["text"].as_str().is_some())
+        .expect("a first choice delta");
+    assert_eq!(first["choices"][0]["text"], "", "{events:?}");
+
+    let text: String = events
+        .iter()
+        .filter_map(|event| event["choices"][0]["text"].as_str())
+        .collect();
+    assert_eq!(text, "\u{FFFD}t", "{events:?}");
+}
+
+#[tokio::test]
 async fn byte_fallback_generate_mid_run_stop_reports_gateway_stop() {
     // `t` `t` then <0xF2>: the string stop `tt` closes at the second token,
     // mid-run, not in the end-of-input tail; the response reports it.
