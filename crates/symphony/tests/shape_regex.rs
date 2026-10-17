@@ -617,7 +617,7 @@ fn the_matcher_answers_as_the_regex_module_does_at_every_chunking() {
         let before = one_before(id, recorded.before.as_deref());
         patterns += 1;
         for case in &recorded.cases {
-            let text = case.text.as_str();
+            let text = &*case.text;
             texts += 1;
             for cuts in plans(text) {
                 let got = replay(&lowered, &classes.word, before, text, &cuts);
@@ -719,7 +719,7 @@ fn the_search_finds_where_the_regex_module_closes_a_region_at_every_chunking() {
         let next = recorded.terminal.chars().next();
         trailers += 1;
         for case in &recorded.cases {
-            let text = case.text.as_str();
+            let text = &*case.text;
             texts += 1;
             for cuts in plans(text) {
                 let got = search(&lowered, &classes.word, before, text, &cuts, next);

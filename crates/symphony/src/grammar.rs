@@ -2786,7 +2786,7 @@ mod tests {
                 &mut out,
             )
             .expect("the end");
-        let events = out.drain();
+        let events = out.into_owned().drain();
         let message = adapt::chat::message(0, &events).message;
         let calls: Vec<Value> = message
             .tool_calls

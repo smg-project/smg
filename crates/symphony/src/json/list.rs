@@ -196,12 +196,12 @@ impl Assembler {
                 }
             }
             Stage::Content => {
-                out.push(Event::Content(Text::uncounted(text)));
+                out.push(Event::Content(Text::uncounted(text.to_owned())));
                 ""
             }
             Stage::Malformed => {
                 out.push(Event::Malformed {
-                    text: Text::uncounted(text),
+                    text: Text::uncounted(text.to_owned()),
                     why: MalformedReason::Other(TEXT_IN_PLACE_OF_THE_LIST.into()),
                 });
                 ""
@@ -246,7 +246,7 @@ impl Assembler {
                             .map_or(text.len(), |(i, _)| at + i);
                         self.drop_carried(out);
                         out.push(Event::Malformed {
-                            text: Text::uncounted(&text[at..end]),
+                            text: Text::uncounted(text[at..end].to_owned()),
                             why: MalformedReason::Other(TEXT_BETWEEN_OBJECTS.into()),
                         });
                         &text[end..]
@@ -350,25 +350,25 @@ mod tests {
         "{\"name\": \"get_stock_price\", \"arguments\": {}}]"
     );
 
-    fn run(pieces: &[&str]) -> Vec<Event> {
+    fn run(pieces: &[&str]) -> Vec<Event<'static>> {
         let mut assembler = Assembler::new(0);
         let mut out = Events::new();
         for piece in pieces {
             assembler.feed(piece, &mut out);
         }
         assembler.finish(&mut out);
-        out.drain()
+        out.into_owned().drain()
     }
 
     fn bytes(events: &[Event]) -> String {
         events
             .iter()
             .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
+                Event::Content(t) | Event::Reasoning(t) => &*t.text,
+                Event::Dropped { text, .. } | Event::Malformed { text, .. } => &*text.text,
                 Event::ToolCallStart { source, .. }
                 | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
+                | Event::ToolCallEnd { source, .. } => &*source.text,
                 Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
             })
             .collect()
@@ -436,7 +436,7 @@ mod tests {
         let dropped: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::Dropped { text, .. } => Some(text.text.as_str()),
+                Event::Dropped { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect();
@@ -449,7 +449,7 @@ mod tests {
         let content: String = events
             .iter()
             .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
+                Event::Content(text) => Some(&*text.text),
                 _ => None,
             })
             .collect();
@@ -490,7 +490,7 @@ mod tests {
         let malformed: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(text.text.as_str()),
+                Event::Malformed { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect();
@@ -508,7 +508,7 @@ mod tests {
             let content: String = events
                 .iter()
                 .filter_map(|event| match event {
-                    Event::Content(text) => Some(text.text.as_str()),
+                    Event::Content(text) => Some(&*text.text),
                     _ => None,
                 })
                 .collect();
@@ -517,14 +517,14 @@ mod tests {
         }
     }
 
-    fn run_alone(pieces: &[&str]) -> Vec<Event> {
+    fn run_alone(pieces: &[&str]) -> Vec<Event<'static>> {
         let mut assembler = Assembler::object_or_list(0);
         let mut out = Events::new();
         for piece in pieces {
             assembler.feed(piece, &mut out);
         }
         assembler.finish(&mut out);
-        out.drain()
+        out.into_owned().drain()
     }
 
     #[test]
@@ -539,7 +539,7 @@ mod tests {
         let dropped: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::Dropped { text, .. } => Some(text.text.as_str()),
+                Event::Dropped { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect();
@@ -579,7 +579,7 @@ mod tests {
                 Event::Malformed {
                     text,
                     why: MalformedReason::Other(reason),
-                } if reason == why => Some(text.text.as_str()),
+                } if reason == why => Some(text.text.as_ref()),
                 _ => None,
             })
             .collect()
@@ -589,7 +589,7 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Dropped { text, .. } => Some(text.text.clone()),
+                Event::Dropped { text, .. } => Some(text.text.to_string()),
                 _ => None,
             })
             .collect()
@@ -655,7 +655,7 @@ mod tests {
             let mut out = Events::new();
             assembler.feed(output, &mut out);
             assembler.close(&mut out);
-            let events = out.drain();
+            let events = out.into_owned().drain();
             assert_eq!(bytes(&events), output, "{output:?}");
             assert!(calls(&events).is_empty(), "{output:?}");
             assert!(
@@ -670,7 +670,7 @@ mod tests {
         let mut out = Events::new();
         assembler.feed(LIST, &mut out);
         assembler.close(&mut out);
-        let events = out.drain();
+        let events = out.into_owned().drain();
         assert_eq!(bytes(&events), LIST);
         assert_eq!(calls(&events).len(), 2);
     }

@@ -337,7 +337,7 @@ impl Assembler {
     }
 
     /// `}` (or `{}`) with `source`, then `ToolCallEnd` with the closing parenthesis.
-    fn end_call(&mut self, source: Text, close: &str, out: &mut Events) {
+    fn end_call<'d>(&mut self, source: Text<'d>, close: &str, out: &mut Events<'d>) {
         out.push(Event::ToolCallArguments {
             index: self.index,
             json: if self.written == 0 { "{}" } else { "}" }.to_string(),
@@ -345,7 +345,7 @@ impl Assembler {
         });
         out.push(Event::ToolCallEnd {
             index: self.index,
-            source: Text::uncounted(close),
+            source: Text::uncounted(close.to_owned()),
         });
     }
 
@@ -391,25 +391,25 @@ impl crate::engine::CallAssembler for Assembler {
 mod tests {
     use super::*;
 
-    fn run(pieces: &[&str]) -> Vec<Event> {
+    fn run(pieces: &[&str]) -> Vec<Event<'static>> {
         let mut assembler = Assembler::new(0);
         let mut out = Events::new();
         for piece in pieces {
             assembler.feed(piece, &mut out);
         }
         assembler.close(&mut out);
-        out.drain()
+        out.into_owned().drain()
     }
 
     fn bytes(events: &[Event]) -> String {
         events
             .iter()
             .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
+                Event::Content(t) | Event::Reasoning(t) => &*t.text,
+                Event::Dropped { text, .. } | Event::Malformed { text, .. } => &*text.text,
                 Event::ToolCallStart { source, .. }
                 | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
+                | Event::ToolCallEnd { source, .. } => &*source.text,
                 Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
             })
             .collect()
@@ -484,7 +484,7 @@ mod tests {
         let dropped: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::Dropped { text, .. } => Some(text.text.as_str()),
+                Event::Dropped { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect();
@@ -522,7 +522,7 @@ mod tests {
         let mut out = Events::new();
         assembler.feed("get_weather(city=\"Par", &mut out);
         assembler.finish(&mut out);
-        let events = out.drain();
+        let events = out.into_owned().drain();
         // The call ends with no bytes of its own; its arguments stay cut.
         assert!(events.iter().any(|event| matches!(
             event,

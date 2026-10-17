@@ -973,7 +973,7 @@ mod tests {
         for input in inputs {
             engine.feed(input, &mut out).expect("a parse");
         }
-        let message = adapt::chat::message(0, &out.drain()).message;
+        let message = adapt::chat::message(0, &out.into_owned().drain()).message;
         let calls: Vec<Value> = message
             .tool_calls
             .unwrap_or_default()

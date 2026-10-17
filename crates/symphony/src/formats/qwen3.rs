@@ -52,14 +52,14 @@ mod tests {
         }
     }
 
-    fn run(pieces: &[&str], finish: EngineFinish) -> Vec<Event> {
+    fn run(pieces: &[&str], finish: EngineFinish) -> Vec<Event<'static>> {
         let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
         for piece in pieces {
             parser.feed(delta(piece), &mut out).expect("delta");
         }
         parser.feed(Input::End { finish }, &mut out).expect("end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     /// Every byte of every event, in order: the proof that nothing was lost or invented.
@@ -67,11 +67,11 @@ mod tests {
         events
             .iter()
             .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
+                Event::Content(t) | Event::Reasoning(t) => &*t.text,
+                Event::Dropped { text, .. } | Event::Malformed { text, .. } => &*text.text,
                 Event::ToolCallStart { source, .. }
                 | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
+                | Event::ToolCallEnd { source, .. } => &*source.text,
                 Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
             })
             .collect()
@@ -79,16 +79,18 @@ mod tests {
 
     /// Events with adjacent text of one kind joined and argument fragments joined per call, so two
     /// chunkings compare by what they said.
-    fn joined(events: Vec<Event>) -> Vec<Event> {
-        let mut out: Vec<Event> = Vec::new();
+    fn joined<'d>(events: Vec<Event<'d>>) -> Vec<Event<'d>> {
+        let mut out: Vec<Event<'d>> = Vec::new();
         for event in events {
             match (out.last_mut(), event) {
                 (Some(Event::Content(a)), Event::Content(b))
-                | (Some(Event::Reasoning(a)), Event::Reasoning(b)) => a.text.push_str(&b.text),
+                | (Some(Event::Reasoning(a)), Event::Reasoning(b)) => {
+                    a.text.to_mut().push_str(&b.text);
+                }
                 (
                     Some(Event::Dropped { text: a, why: wa }),
                     Event::Dropped { text: b, why: wb },
-                ) if *wa == wb => a.text.push_str(&b.text),
+                ) if *wa == wb => a.text.to_mut().push_str(&b.text),
                 (
                     Some(Event::ToolCallArguments {
                         index: i,
@@ -102,7 +104,7 @@ mod tests {
                     },
                 ) if *i == j => {
                     json.push_str(&more);
-                    source.text.push_str(&more_source.text);
+                    source.text.to_mut().push_str(&more_source.text);
                 }
                 (_, event) => out.push(event),
             }
@@ -110,9 +112,9 @@ mod tests {
         out
     }
 
-    fn dropped(text: &str) -> Event {
+    fn dropped(text: &str) -> Event<'static> {
         Event::Dropped {
-            text: Text::uncounted(text),
+            text: Text::uncounted(text.to_owned()),
             why: DropReason::Wrapper,
         }
     }
@@ -250,21 +252,21 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
+                Event::Content(text) => Some(&*text.text),
                 _ => None,
             })
             .collect()
     }
 
     /// The whitespace the engine dropped as the template's spacing, event by event.
-    fn spacing(events: &[Event]) -> Vec<&str> {
+    fn spacing<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
                 Event::Dropped {
                     text,
                     why: DropReason::Whitespace,
-                } => Some(text.text.as_str()),
+                } => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -297,7 +299,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        deltas.push(content_of(&out.drain()));
+        deltas.push(content_of(&out.into_owned().drain()));
         deltas.retain(|delta| !delta.is_empty());
         deltas
     }
@@ -429,14 +431,14 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        let events = out.drain();
+        let events = out.into_owned().drain();
         let whitespace: Vec<(String, Option<u32>)> = events
             .iter()
             .filter_map(|event| match event {
                 Event::Dropped {
                     text,
                     why: DropReason::Whitespace,
-                } => Some((text.text.clone(), text.tokens)),
+                } => Some((text.text.to_string(), text.tokens)),
                 _ => None,
             })
             .collect();
@@ -555,8 +557,8 @@ mod tests {
             events
                 .iter()
                 .filter_map(|e| match e {
-                    Event::Dropped { text, .. } if dropped => Some(text.text.as_str()),
-                    Event::Malformed { text, .. } if !dropped => Some(text.text.as_str()),
+                    Event::Dropped { text, .. } if dropped => Some(&*text.text),
+                    Event::Malformed { text, .. } if !dropped => Some(&*text.text),
                     _ => None,
                 })
                 .collect()
@@ -679,13 +681,15 @@ mod tests {
         events
             .iter()
             .filter_map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => Some((t.text.clone(), t.tokens)),
+                Event::Content(t) | Event::Reasoning(t) => Some((t.text.to_string(), t.tokens)),
                 Event::Dropped { text, .. } | Event::Malformed { text, .. } => {
-                    Some((text.text.clone(), text.tokens))
+                    Some((text.text.to_string(), text.tokens))
                 }
                 Event::ToolCallStart { source, .. }
                 | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => Some((source.text.clone(), source.tokens)),
+                | Event::ToolCallEnd { source, .. } => {
+                    Some((source.text.to_string(), source.tokens))
+                }
                 _ => None,
             })
             .collect()
@@ -725,7 +729,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        let events = out.drain();
+        let events = out.into_owned().drain();
         assert_eq!(
             counted(&events),
             vec![
@@ -773,22 +777,27 @@ mod tests {
         ];
         let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
-        for (text, ranges) in pieces {
-            let spans: Vec<TokenSpan> = ranges
-                .iter()
-                .map(|&(start, end)| TokenSpan {
-                    token_id: 0,
-                    start,
-                    end,
-                    continued: false,
-                })
-                .collect();
+        let spans: Vec<Vec<TokenSpan>> = pieces
+            .iter()
+            .map(|(_, ranges)| {
+                ranges
+                    .iter()
+                    .map(|&(start, end)| TokenSpan {
+                        token_id: 0,
+                        start,
+                        end,
+                        continued: false,
+                    })
+                    .collect()
+            })
+            .collect();
+        for (&(text, _), spans) in pieces.iter().zip(&spans) {
             parser
                 .feed(
                     Input::Delta {
                         token_ids: &[],
                         text,
-                        spans: &spans,
+                        spans,
                     },
                     &mut out,
                 )
@@ -802,7 +811,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        let events = out.drain();
+        let events = out.into_owned().drain();
         assert_eq!(
             counted(&events),
             vec![
@@ -889,7 +898,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        let events = out.drain();
+        let events = out.into_owned().drain();
         assert_eq!(
             counted(&events),
             vec![("<think>".into(), Some(1)), ("x".into(), Some(2))],
@@ -987,7 +996,7 @@ mod tests {
         "\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>"
     );
 
-    fn run_tagged(pieces: &[&str], finish: EngineFinish) -> Vec<Event> {
+    fn run_tagged(pieces: &[&str], finish: EngineFinish) -> Vec<Event<'static>> {
         let mut parser = Engine::new(
             qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
             declared(),
@@ -997,7 +1006,7 @@ mod tests {
             parser.feed(delta(piece), &mut out).expect("delta");
         }
         parser.feed(Input::End { finish }, &mut out).expect("end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     fn arguments_of(events: &[Event], call: u32) -> String {
@@ -1160,7 +1169,7 @@ mod tests {
     }
 
     /// The prompt, then the whole output in one delta, then the engine's stop.
-    fn after_prompt(prompt: &str, output: &str) -> Vec<Event> {
+    fn after_prompt(prompt: &str, output: &str) -> Vec<Event<'static>> {
         let mut parser = Engine::new(
             qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
             declared(),
@@ -1184,7 +1193,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     #[test]
@@ -1241,7 +1250,7 @@ mod tests {
 
     /// The prompt, then the whole output in one delta, then the engine's stop, under the JSON
     /// syntax.
-    fn after_prompt_json(prompt: &str, output: &str) -> Vec<Event> {
+    fn after_prompt_json(prompt: &str, output: &str) -> Vec<Event<'static>> {
         let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
         parser
@@ -1262,14 +1271,14 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     fn reasoning_of(events: &[Event]) -> String {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
+                Event::Reasoning(text) => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -1337,7 +1346,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        let events = out.drain();
+        let events = out.into_owned().drain();
         assert!(matches!(
             events.first(),
             Some(Event::ToolCallStart { index: 0, name, .. }) if name == "f"
@@ -1381,7 +1390,7 @@ mod tests {
                 &mut out,
             )
             .expect("delta");
-        let events = out.drain();
+        let events = out.into_owned().drain();
         assert_eq!(events[0], Event::ReasoningStart);
         assert_eq!(reasoning_of(&events), "The user asks about the marker.\n");
     }
@@ -1457,7 +1466,7 @@ mod tests {
                         &mut out,
                     )
                     .expect("end");
-                let events = out.drain();
+                let events = out.into_owned().drain();
                 assert_eq!(
                     arguments_of(&events, 0),
                     expected,
@@ -1485,7 +1494,7 @@ mod tests {
                 )
                 .expect("end");
             assert_eq!(
-                arguments_of(&out.drain(), 0),
+                arguments_of(&out.into_owned().drain(), 0),
                 format!("{{\"patch\": {expected}}}"),
                 "{value:?}"
             );

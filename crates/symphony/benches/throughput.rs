@@ -214,7 +214,7 @@ fn engine(table: Table, prompt: &str, declared: &Declared) -> Engine {
 
 /// Feeds `pieces` and the end of the stream; the events drained after every piece, as a stream's
 /// reader drains them.
-fn read(engine: &mut Engine, pieces: &[&str], out: &mut Events) {
+fn read<'d>(engine: &mut Engine, pieces: &[&'d str], out: &mut Events<'d>) {
     for piece in pieces {
         engine
             .feed(

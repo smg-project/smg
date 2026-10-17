@@ -131,7 +131,7 @@ mod tests {
         "{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}"
     );
 
-    fn run(pieces: &[&str], cut: bool) -> (Vec<Event>, usize) {
+    fn run(pieces: &[&str], cut: bool) -> (Vec<Event<'static>>, usize) {
         let mut assembler = Assembler::new(0, "call_0", MARKER);
         let mut out = Events::new();
         let mut taken = 0;
@@ -143,18 +143,18 @@ mod tests {
         } else {
             assembler.close(&mut out);
         }
-        (out.drain(), taken)
+        (out.into_owned().drain(), taken)
     }
 
     fn bytes(events: &[Event]) -> String {
         events
             .iter()
             .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
+                Event::Content(t) | Event::Reasoning(t) => &*t.text,
+                Event::Dropped { text, .. } | Event::Malformed { text, .. } => &*text.text,
                 Event::ToolCallStart { source, .. }
                 | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
+                | Event::ToolCallEnd { source, .. } => &*source.text,
                 Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
             })
             .collect()

@@ -50,7 +50,7 @@ pub struct Output {
 }
 
 /// The message's content and stop reason, folded from a whole event sequence.
-pub fn output<'a>(events: impl IntoIterator<Item = &'a Event>) -> Output {
+pub fn output<'a, 'd: 'a>(events: impl IntoIterator<Item = &'a Event<'d>>) -> Output {
     let folded = fold(events);
     let mut blocks = Vec::new();
     if !folded.reasoning.is_empty() {
@@ -114,7 +114,11 @@ impl Stream {
 
     /// Appends the stream events `event` produces to `out`, in order. Returns the stop reason when
     /// `event` is `Finish`, after closing the open block.
-    pub fn feed(&mut self, event: &Event, out: &mut Vec<MessageStreamEvent>) -> Option<StopReason> {
+    pub fn feed(
+        &mut self,
+        event: &Event<'_>,
+        out: &mut Vec<MessageStreamEvent>,
+    ) -> Option<StopReason> {
         match event {
             Event::Content(text) | Event::Malformed { text, .. } => self.text(&text.text, out),
             Event::Reasoning(text) => self.reasoning(&text.text, out),
@@ -295,7 +299,7 @@ mod tests {
     use super::*;
     use crate::event::{DropReason, MalformedReason, Text};
 
-    fn call(index: u32, name: &str) -> Event {
+    fn call(index: u32, name: &str) -> Event<'static> {
         Event::ToolCallStart {
             index,
             id: format!("call_{index}"),
@@ -304,7 +308,7 @@ mod tests {
         }
     }
 
-    fn arguments(index: u32, json: &str) -> Event {
+    fn arguments(index: u32, json: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index,
             json: json.into(),
@@ -312,14 +316,14 @@ mod tests {
         }
     }
 
-    fn end(index: u32) -> Event {
+    fn end(index: u32) -> Event<'static> {
         Event::ToolCallEnd {
             index,
             source: Text::default(),
         }
     }
 
-    fn finish(reason: FinishReason, tool_calls: u32) -> Event {
+    fn finish(reason: FinishReason, tool_calls: u32) -> Event<'static> {
         Event::Finish {
             reason,
             tool_calls,

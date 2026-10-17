@@ -1,4 +1,12 @@
 //! Typed events. Every byte of model output appears in exactly one event.
+//!
+//! An event's text borrows the delta it came from where the engine held nothing back, so the
+//! common content delta costs no copy; a run the engine held (whitespace waiting for the text that
+//! decides whose it is, a header until its marker), a run merged with an earlier one, and the
+//! events an assembler builds carry their text owned. The lifetime `'d` is the delta's: a step's
+//! events live in the caller's [`Events`] until the caller has read them, [`Events::recycle`]
+//! readies the buffer for the next step without giving its allocation back, and a caller that
+//! keeps events past the step takes them with [`Event::into_owned`].
 
 use std::borrow::Cow;
 
@@ -6,17 +14,18 @@ use serde::{Deserialize, Serialize};
 
 /// A run of text and, when the parser saw token ids, the number of engine tokens it came from.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Text {
-    /// The text.
-    pub text: String,
+pub struct Text<'d> {
+    /// The text: borrowed from the delta it came from, or owned where the engine held or merged
+    /// it or an assembler built it.
+    pub text: Cow<'d, str>,
     /// How many engine tokens produced it. `None` when the parser was not given token ids, as
     /// through the compatibility bridge over the old crates.
     pub tokens: Option<u32>,
 }
 
-impl Text {
+impl<'d> Text<'d> {
     /// A text run with a known token count.
-    pub fn new(text: impl Into<String>, tokens: u32) -> Self {
+    pub fn new(text: impl Into<Cow<'d, str>>, tokens: u32) -> Self {
         Self {
             text: text.into(),
             tokens: Some(tokens),
@@ -24,10 +33,18 @@ impl Text {
     }
 
     /// A text run whose token count is not known.
-    pub fn uncounted(text: impl Into<String>) -> Self {
+    pub fn uncounted(text: impl Into<Cow<'d, str>>) -> Self {
         Self {
             text: text.into(),
             tokens: None,
+        }
+    }
+
+    /// The same run with its text owned, free of the delta it came from.
+    pub fn into_owned(self) -> Text<'static> {
+        Text {
+            text: Cow::Owned(self.text.into_owned()),
+            tokens: self.tokens,
         }
     }
 
@@ -35,8 +52,8 @@ impl Text {
         self.text.is_empty() && self.tokens.unwrap_or(0) == 0
     }
 
-    fn append(&mut self, other: &Text) {
-        self.text.push_str(&other.text);
+    fn append(&mut self, other: &Text<'_>) {
+        self.text.to_mut().push_str(&other.text);
         self.tokens = match (self.tokens, other.tokens) {
             (Some(a), Some(b)) => Some(a + b),
             _ => None,
@@ -49,16 +66,23 @@ impl Text {
 /// into `text`. The parsers read the text between a format's structure by it: whitespace is the
 /// template's wrapping, anything else is reported.
 pub(crate) fn runs(text: &str) -> impl Iterator<Item = (&str, bool)> {
-    let mut rest = text;
+    runs_at(text).map(move |(range, space)| (&text[range], space))
+}
+
+/// The runs of `text` as [`runs`] has them, each as its byte range in `text`: for a reader that
+/// holds the text in a [`Cow`] and keeps a run of a borrowed delta borrowed.
+pub(crate) fn runs_at(text: &str) -> impl Iterator<Item = (std::ops::Range<usize>, bool)> + '_ {
+    let mut at = 0;
     std::iter::from_fn(move || {
+        let rest = &text[at..];
         let space = rest.chars().next()?.is_whitespace();
         let length = rest
             .char_indices()
             .find(|(_, c)| c.is_whitespace() != space)
-            .map_or(rest.len(), |(at, _)| at);
-        let (run, after) = rest.split_at(length);
-        rest = after;
-        Some((run, space))
+            .map_or(rest.len(), |(end, _)| end);
+        let start = at;
+        at += length;
+        Some((start..at, space))
     })
 }
 
@@ -105,16 +129,18 @@ pub enum FinishReason {
     Other(String),
 }
 
-/// One parsed unit of model output, in wire order.
+/// One parsed unit of model output, in wire order. Its text borrows the delta it came from for
+/// the life of the step (`'d`), as the module doc says; [`Event::into_owned`] frees it of the
+/// delta.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Event {
+pub enum Event<'d> {
     /// Visible assistant text.
-    Content(Text),
+    Content(Text<'d>),
     /// A reasoning region opened.
     ReasoningStart,
     /// Reasoning text.
-    Reasoning(Text),
+    Reasoning(Text<'d>),
     /// The reasoning region closed.
     ReasoningEnd,
     /// A tool call began; the id is assigned by the parser so the caller never mints one.
@@ -126,7 +152,7 @@ pub enum Event {
         /// The function name.
         name: String,
         /// The output bytes this event accounts for: the opening marker and the name as written.
-        source: Text,
+        source: Text<'d>,
     },
     /// A fragment of the call's arguments. Concatenated fragments for one index are always a
     /// valid JSON prefix and equal the final arguments when the call ends.
@@ -137,7 +163,7 @@ pub enum Event {
         json: String,
         /// The output bytes this event accounts for, in the format's own syntax. Empty when the
         /// fragment came from bytes an earlier event already accounted for.
-        source: Text,
+        source: Text<'d>,
     },
     /// The call's region closed.
     ToolCallEnd {
@@ -145,19 +171,19 @@ pub enum Event {
         index: u32,
         /// The output bytes this event accounts for: the closing marker, and any buffered bytes
         /// no earlier event of this call accounted for.
-        source: Text,
+        source: Text<'d>,
     },
     /// Text the format consumed without showing it.
     Dropped {
         /// The text.
-        text: Text,
+        text: Text<'d>,
         /// Why it was dropped.
         why: DropReason,
     },
     /// Text of a region the parser gave up on; the adapter decides what to do with it.
     Malformed {
         /// The text, returned whole.
-        text: Text,
+        text: Text<'d>,
         /// Why parsing stopped.
         why: MalformedReason,
     },
@@ -172,28 +198,92 @@ pub enum Event {
     },
 }
 
-/// An ordered list of events that merges adjacent text of the same kind.
+impl Event<'_> {
+    /// The same event with its text owned, free of the delta it came from: for a caller that
+    /// keeps events past the step that produced them.
+    pub fn into_owned(self) -> Event<'static> {
+        match self {
+            Event::Content(text) => Event::Content(text.into_owned()),
+            Event::ReasoningStart => Event::ReasoningStart,
+            Event::Reasoning(text) => Event::Reasoning(text.into_owned()),
+            Event::ReasoningEnd => Event::ReasoningEnd,
+            Event::ToolCallStart {
+                index,
+                id,
+                name,
+                source,
+            } => Event::ToolCallStart {
+                index,
+                id,
+                name,
+                source: source.into_owned(),
+            },
+            Event::ToolCallArguments {
+                index,
+                json,
+                source,
+            } => Event::ToolCallArguments {
+                index,
+                json,
+                source: source.into_owned(),
+            },
+            Event::ToolCallEnd { index, source } => Event::ToolCallEnd {
+                index,
+                source: source.into_owned(),
+            },
+            Event::Dropped { text, why } => Event::Dropped {
+                text: text.into_owned(),
+                why,
+            },
+            Event::Malformed { text, why } => Event::Malformed {
+                text: text.into_owned(),
+                why,
+            },
+            Event::Finish {
+                reason,
+                tool_calls,
+                reasoning_tokens,
+            } => Event::Finish {
+                reason,
+                tool_calls,
+                reasoning_tokens,
+            },
+        }
+    }
+}
+
+/// An ordered list of events that merges adjacent text of the same kind: the buffer a parser
+/// fills.
 ///
 /// A parser pushes what it has as soon as it has it; two consecutive `Content` events become one,
 /// and so do two consecutive `Reasoning` events. Nothing else is merged, and a text event with no
 /// text and no tokens is not recorded.
 ///
-/// Merging only ever touches events the caller has not taken yet. The caller takes events with
-/// [`Events::drain`] after each `feed`; what it took is final, and the next push starts a new
-/// event even when it is text of the same kind.
+/// Merging only ever touches events the caller has not taken yet. A stream's caller keeps one
+/// buffer and, after each `feed`, reads the events in place and then hands the buffer to the next
+/// step with [`Events::recycle`], which empties it and keeps its allocation; what was read is
+/// final, and the next push starts a new event even when it is text of the same kind. A caller
+/// that reads a whole output at once takes the events with [`Events::drain`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Events {
-    items: Vec<Event>,
+pub struct Events<'d> {
+    items: Vec<Event<'d>>,
 }
 
-impl Events {
+impl<'d> Events<'d> {
     /// An empty list.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// An empty list with room for `capacity` events before it grows.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            items: Vec::with_capacity(capacity),
+        }
+    }
+
     /// Append an event, merging it into the previous one when both are text of the same kind.
-    pub fn push(&mut self, event: Event) {
+    pub fn push(&mut self, event: Event<'d>) {
         match (&event, self.items.last_mut()) {
             (Event::Content(t), _) | (Event::Reasoning(t), _) if t.is_nothing() => {}
             (Event::Content(t), Some(Event::Content(prev))) => prev.append(t),
@@ -203,18 +293,28 @@ impl Events {
     }
 
     /// Append visible text.
-    pub fn push_content(&mut self, text: Text) {
+    pub fn push_content(&mut self, text: Text<'d>) {
         self.push(Event::Content(text));
     }
 
     /// Append reasoning text.
-    pub fn push_reasoning(&mut self, text: Text) {
+    pub fn push_reasoning(&mut self, text: Text<'d>) {
         self.push(Event::Reasoning(text));
     }
 
     /// The events so far.
-    pub fn as_slice(&self) -> &[Event] {
+    pub fn as_slice(&self) -> &[Event<'d>] {
         &self.items
+    }
+
+    /// The events so far, to change in place.
+    pub fn as_mut_slice(&mut self) -> &mut [Event<'d>] {
+        &mut self.items
+    }
+
+    /// The events so far, in order.
+    pub fn iter(&self) -> std::slice::Iter<'_, Event<'d>> {
+        self.items.iter()
     }
 
     /// Number of events.
@@ -225,6 +325,11 @@ impl Events {
     /// Whether no event was recorded.
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
+    }
+
+    /// How many events the list holds before it grows.
+    pub fn capacity(&self) -> usize {
+        self.items.capacity()
     }
 
     /// The output bytes these events account for, in order: content, reasoning, dropped and
@@ -246,19 +351,64 @@ impl Events {
         out
     }
 
+    /// Keep the events `keep` says to, in order.
+    pub fn retain(&mut self, keep: impl FnMut(&Event<'d>) -> bool) {
+        self.items.retain(keep);
+    }
+
+    /// Forget every event, keeping the allocation. What was recorded is final: later pushes never
+    /// merge into it.
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+
     /// Take every event recorded so far, leaving the list empty. What is taken is final: later
     /// pushes never merge into it.
-    pub fn drain(&mut self) -> Vec<Event> {
+    pub fn drain(&mut self) -> Vec<Event<'d>> {
         std::mem::take(&mut self.items)
+    }
+
+    /// The events so far, moved out one by one; the list is left empty with its room kept. For a
+    /// step whose events are rendered once: what an event owns (a call's id and name, a
+    /// fragment's JSON) moves into the rendering, and the buffer goes on to the next step.
+    pub fn consume(&mut self) -> std::vec::Drain<'_, Event<'d>> {
+        self.items.drain(..)
+    }
+
+    /// The same list for the next step: empty, free of this step's delta, with its allocation
+    /// kept, so a stream of many steps fills one buffer. An empty vector collected into the next
+    /// lifetime's keeps its buffer (the standard library collects a vector into one of the same
+    /// layout in place), which [`Events::capacity`] shows.
+    pub fn recycle<'e>(mut self) -> Events<'e> {
+        self.items.clear();
+        Events {
+            items: self.items.into_iter().map(Event::into_owned).collect(),
+        }
+    }
+
+    /// The same events with their text owned, free of the delta they came from.
+    pub fn into_owned(self) -> Events<'static> {
+        Events {
+            items: self.items.into_iter().map(Event::into_owned).collect(),
+        }
     }
 }
 
-impl IntoIterator for Events {
-    type Item = Event;
-    type IntoIter = std::vec::IntoIter<Event>;
+impl<'d> IntoIterator for Events<'d> {
+    type Item = Event<'d>;
+    type IntoIter = std::vec::IntoIter<Event<'d>>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.items.into_iter()
+    }
+}
+
+impl<'a, 'd> IntoIterator for &'a Events<'d> {
+    type Item = &'a Event<'d>;
+    type IntoIter = std::slice::Iter<'a, Event<'d>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.iter()
     }
 }
 
@@ -430,6 +580,49 @@ mod tests {
         );
         for text in ["", " ", "a", " a b ", "\u{e9}\u{a0}\u{65e5} \u{1f327}"] {
             assert_eq!(runs(text).map(|(run, _)| run).collect::<String>(), text);
+        }
+    }
+
+    #[test]
+    fn a_run_borrowed_from_the_delta_is_owned_once_merged_or_taken_past_the_step() {
+        let delta = String::from("Hello, world");
+        let mut events = Events::new();
+        events.push_content(Text::new(&delta[..5], 1));
+        assert!(matches!(
+            events.as_slice(),
+            [Event::Content(Text {
+                text: Cow::Borrowed("Hello"),
+                ..
+            })]
+        ));
+        events.push_content(Text::new(&delta[5..], 2));
+        let [Event::Content(merged)] = events.as_slice() else {
+            panic!("one merged event, got {events:?}");
+        };
+        assert!(matches!(merged.text, Cow::Owned(_)), "a merge copies once");
+        assert_eq!(*merged, Text::new("Hello, world", 3));
+        let kept = events.drain().remove(0).into_owned();
+        drop(delta);
+        assert_eq!(kept, Event::Content(Text::new("Hello, world", 3)));
+    }
+
+    #[test]
+    fn a_recycled_buffer_is_empty_and_keeps_its_allocation_for_the_next_step() {
+        let mut spare: Events<'static> = Events::with_capacity(16);
+        let buffer = spare.as_slice().as_ptr().cast::<u8>();
+        for step in ["one", "two", "three"] {
+            let delta = step.to_string();
+            let mut events: Events<'_> = spare;
+            events.push_content(Text::uncounted(delta.as_str()));
+            events.push(Event::ReasoningStart);
+            assert_eq!(events.len(), 2);
+            spare = events.recycle();
+            assert!(spare.is_empty());
+            assert_eq!(spare.capacity(), 16, "the allocation outlives the step");
+            assert!(
+                std::ptr::eq(spare.as_slice().as_ptr().cast::<u8>(), buffer),
+                "the same buffer"
+            );
         }
     }
 }

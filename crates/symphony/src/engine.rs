@@ -15,10 +15,10 @@
 //!
 //! Notes on what this module decides, and on what it leaves open: `docs/engine.md`.
 
-use std::{collections::VecDeque, sync::Arc};
+use std::{borrow::Cow, collections::VecDeque, ops::Range, sync::Arc};
 
 use crate::{
-    event::{runs, DropReason, Event, Events, FinishReason, MalformedReason, Text},
+    event::{runs_at, DropReason, Event, Events, FinishReason, MalformedReason, Text},
     format::{CallSyntax, Emits, Format, Replay},
     gemma,
     input::{EngineFinish, Input},
@@ -123,7 +123,7 @@ enum Held {
 }
 
 /// A text event of `like`'s kind carrying `text`, uncounted: the piece of a split text event.
-fn text_event_like(like: &Event, text: &str) -> Event {
+fn text_event_like<'d>(like: &Event<'_>, text: Cow<'d, str>) -> Event<'d> {
     let text = Text::uncounted(text);
     match like {
         Event::Reasoning(_) => Event::Reasoning(text),
@@ -137,7 +137,7 @@ fn text_event_like(like: &Event, text: &str) -> Event {
 }
 
 /// The text an event carries, for the events that carry output bytes.
-fn event_text(event: &mut Event) -> Option<&mut Text> {
+fn event_text<'e, 'd>(event: &'e mut Event<'d>) -> Option<&'e mut Text<'d>> {
     match event {
         Event::Content(text) | Event::Reasoning(text) => Some(text),
         Event::Dropped { text, .. } | Event::Malformed { text, .. } => Some(text),
@@ -145,6 +145,16 @@ fn event_text(event: &mut Event) -> Option<&mut Text> {
         | Event::ToolCallArguments { source, .. }
         | Event::ToolCallEnd { source, .. } => Some(source),
         Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => None,
+    }
+}
+
+/// `text[range]` as `text` is: a slice of a borrowed run stays borrowed from the delta, a slice
+/// of an owned run is copied. The pieces of a run the engine cuts (a lead, a body, a tail, the
+/// runs of a wrapper) keep the run's claim on the delta.
+fn part<'d>(text: &Cow<'d, str>, range: Range<usize>) -> Cow<'d, str> {
+    match text {
+        Cow::Borrowed(text) => Cow::Borrowed(&text[range]),
+        Cow::Owned(text) => Cow::Owned(text[range].to_owned()),
     }
 }
 
@@ -356,7 +366,7 @@ impl Engine {
             while let Some(piece) = queue.pop_front() {
                 let again = match piece {
                     Piece::Text(text) if at_end && self.cut_tag(&text) => {
-                        self.drop_cut_tag(&text, out);
+                        self.drop_cut_tag(text, out);
                         None
                     }
                     piece => self.take(piece, out),
@@ -425,7 +435,7 @@ impl Engine {
                 if !self.call_closes(&terminal) {
                     // The trailer does not end at the terminal: it closes nothing and is the
                     // call's text, as the template's closing pattern reads past it.
-                    self.text(&terminal, out);
+                    self.text(Cow::Owned(terminal), out);
                     return None;
                 }
             }
@@ -443,17 +453,18 @@ impl Engine {
     fn place(&mut self, piece: Piece, out: &mut Events) {
         self.open_turn(&piece, out);
         match piece {
-            Piece::Text(text) => self.text(&text, out),
+            Piece::Text(text) => self.text(Cow::Owned(text), out),
             Piece::Marker(index) => self.terminal(index, out),
         }
     }
 
     /// Takes a delta that is text whole ([`Scanner::reads_as_text`]) where [`Self::place`] would
-    /// take it as one text piece, without the piece: the common delta of a content or reasoning
-    /// stay, and of a call's arguments, is one.
-    fn place_text(&mut self, text: &str, out: &mut Events) {
+    /// take it as one text piece, without the piece and without a copy: the common delta of a
+    /// content or reasoning stay, and of a call's arguments, is one, and the events it makes
+    /// borrow the delta.
+    fn place_text<'d>(&mut self, text: &'d str, out: &mut Events<'d>) {
         self.open_turn(&Piece::Text(String::new()), out);
-        self.text(text, out);
+        self.text(Cow::Borrowed(text), out);
     }
 
     /// The turn's first piece decides where the turn starts, for a table with a start row.
@@ -576,7 +587,9 @@ impl Engine {
         again
     }
 
-    fn text(&mut self, text: &str, out: &mut Events) {
+    /// Text of the state the engine is in: borrowed from the delta when it came whole, owned when
+    /// the scan cut it or the engine held it.
+    fn text<'d>(&mut self, text: Cow<'d, str>, out: &mut Events<'d>) {
         if self.format.is_framing(self.state) {
             out.push(Event::Dropped {
                 text: self.tokens.text(text),
@@ -599,17 +612,19 @@ impl Engine {
                     return;
                 };
                 let mut assembled = Events::new();
-                let taken = call.feed(text, &self.declared, &mut assembled);
+                let taken = call.feed(&text, &self.declared, &mut assembled);
                 self.region.fed += taken;
                 self.push_call_events(assembled, out);
-                self.wrapping(&text[taken..], TEXT_AFTER_THE_OBJECT, out);
+                if taken < text.len() {
+                    self.wrapping(part(&text, taken..text.len()), TEXT_AFTER_THE_OBJECT, out);
+                }
             }
             Emits::Wrapper => self.wrapping(text, TEXT_BETWEEN_CALLS, out),
         }
     }
 
     /// Text of the content or reasoning state the engine is in, as the client sees it.
-    fn show(&mut self, text: &str, out: &mut Events) {
+    fn show<'d>(&mut self, text: Cow<'d, str>, out: &mut Events<'d>) {
         let counted = self.tokens.text(text);
         if self.emits() == Emits::Reasoning {
             self.reasoning_tokens += counted.tokens.unwrap_or(0);
@@ -622,14 +637,14 @@ impl Engine {
     /// Text in a trimmed stay: whitespace before the stay's first other character is dropped as it
     /// arrives; a run of it after the last one is held, and released as the state's text before
     /// more text that is not whitespace.
-    fn trimmed(&mut self, text: &str, out: &mut Events) {
-        let mut rest = text;
+    fn trimmed<'d>(&mut self, text: Cow<'d, str>, out: &mut Events<'d>) {
+        let mut from = 0;
         if !self.stay.begun {
-            let body = rest.trim_start_matches(is_strip_space);
-            let lead = &rest[..rest.len() - body.len()];
-            if !lead.is_empty() {
+            let body = text.trim_start_matches(is_strip_space);
+            let lead = text.len() - body.len();
+            if lead > 0 {
                 out.push(Event::Dropped {
-                    text: self.tokens.text(lead),
+                    text: self.tokens.text(part(&text, 0..lead)),
                     why: DropReason::Whitespace,
                 });
             }
@@ -637,14 +652,15 @@ impl Engine {
                 return;
             }
             self.stay.begun = true;
-            rest = body;
+            from = lead;
         }
-        let body = rest.trim_end_matches(is_strip_space);
-        if !body.is_empty() {
+        let rest = &text[from..];
+        let body = rest.trim_end_matches(is_strip_space).len();
+        if body > 0 {
             self.release_stay(out);
-            self.show(body, out);
+            self.show(part(&text, from..from + body), out);
         }
-        self.hold(&rest[body.len()..]);
+        self.hold(&rest[body..]);
     }
 
     /// Text at the start of a content stay, before the stay's first character that is not
@@ -654,15 +670,16 @@ impl Engine {
     /// after a thought nothing follows), dropped. The whole answer's message shows no content
     /// for whitespace alone, and a stream that showed it as it arrived carried what the whole
     /// answer does not.
-    fn lead(&mut self, text: &str, out: &mut Events) {
+    fn lead<'d>(&mut self, text: Cow<'d, str>, out: &mut Events<'d>) {
         let body = text.trim_start_matches(is_strip_space);
-        self.hold(&text[..text.len() - body.len()]);
+        let lead = text.len() - body.len();
+        self.hold(&text[..lead]);
         if body.is_empty() {
             return;
         }
         self.stay.begun = true;
         self.release_stay(out);
-        self.show(body, out);
+        self.show(part(&text, lead..text.len()), out);
     }
 
     /// Holds `space`, a run of whitespace, after what the stay holds.
@@ -681,9 +698,9 @@ impl Engine {
     fn release_stay(&mut self, out: &mut Events) {
         for held in std::mem::take(&mut self.stay.held) {
             match held {
-                Held::Space(space) => self.show(&space, out),
+                Held::Space(space) => self.show(Cow::Owned(space), out),
                 Held::Ignored(terminal) => out.push(Event::Dropped {
-                    text: self.tokens.text(&terminal),
+                    text: self.tokens.text(terminal),
                     why: DropReason::Wrapper,
                 }),
             }
@@ -699,7 +716,7 @@ impl Engine {
                 Held::Ignored(terminal) => (terminal, DropReason::Wrapper),
             };
             out.push(Event::Dropped {
-                text: self.tokens.text(&text),
+                text: self.tokens.text(text),
                 why,
             });
         }
@@ -709,9 +726,9 @@ impl Engine {
     /// between a block's calls. Each run of whitespace is the template's and is dropped, each run
     /// of anything else is malformed with `why`. Classifying run by run keeps the result the same
     /// wherever the chunks were cut.
-    fn wrapping(&mut self, surplus: &str, why: &'static str, out: &mut Events) {
-        for (run, space) in runs(surplus) {
-            let run = self.tokens.text(run);
+    fn wrapping<'d>(&mut self, surplus: Cow<'d, str>, why: &'static str, out: &mut Events<'d>) {
+        for (range, space) in runs_at(&surplus) {
+            let run = self.tokens.text(part(&surplus, range));
             out.push(if space {
                 Event::Dropped {
                     text: run,
@@ -744,7 +761,7 @@ impl Engine {
                         return;
                     }
                     out.push(Event::Dropped {
-                        text: self.tokens.text(&text),
+                        text: self.tokens.text(text),
                         why: DropReason::Wrapper,
                     });
                     return;
@@ -756,14 +773,14 @@ impl Engine {
                 return;
             }
             out.push(Event::Dropped {
-                text: self.tokens.text(&text),
+                text: self.tokens.text(text),
                 why: DropReason::Wrapper,
             });
             return;
         }
         let Some(next) = self.format.next(self.state, index) else {
             let text = self.format.terminal_text(index).to_string();
-            self.text(&text, out);
+            self.text(Cow::Owned(text), out);
             return;
         };
         self.take_row(index, next, None, out);
@@ -793,7 +810,7 @@ impl Engine {
             self.emits() == Emits::Arguments && self.close_call(Closed::ByMarker, &terminal, out);
         let shown = !taken && self.format.shown(index);
         if !taken {
-            let text = self.tokens.text(&terminal);
+            let text = self.tokens.text(terminal);
             if shown {
                 // A marker of a channel the request does not separate: the client sees it.
                 out.push_content(text);
@@ -897,7 +914,7 @@ impl Engine {
         // An ignored terminal no event carried out leaves here, before the region's close.
         for (_, marker) in std::mem::take(&mut self.region.carried) {
             out.push(Event::Dropped {
-                text: self.tokens.text(&marker),
+                text: self.tokens.text(marker),
                 why: DropReason::Wrapper,
             });
         }
@@ -909,7 +926,7 @@ impl Engine {
     /// index the next call takes, and `Finish::tool_calls`. A syntax that writes several calls in
     /// one region starts each of them here. An event's bytes are counted as carried out of the
     /// region, with the ignored terminals that arrived among them placed where they arrived.
-    fn push_call_events(&mut self, mut events: Events, out: &mut Events) {
+    fn push_call_events<'d>(&mut self, mut events: Events<'d>, out: &mut Events<'d>) {
         for event in events.drain() {
             if matches!(event, Event::ToolCallStart { .. }) {
                 self.calls += 1;
@@ -925,7 +942,7 @@ impl Engine {
     /// spliced into its source, which no client reads; a text event is split around them, each
     /// terminal a `Dropped { Wrapper }` event of its own, so that none joins text a client reads
     /// (a syntax that hands held bytes back as content, as the bare list does).
-    fn carried_into(&mut self, mut event: Event) -> Vec<Event> {
+    fn carried_into<'d>(&mut self, mut event: Event<'d>) -> Vec<Event<'d>> {
         let Some(text) = event_text(&mut event) else {
             return vec![event];
         };
@@ -972,7 +989,7 @@ impl Engine {
             }
             spliced.push_str(&bytes[done..]);
             if let Some(text) = event_text(&mut event) {
-                text.text = spliced;
+                text.text = Cow::Owned(spliced);
             }
             return vec![event];
         }
@@ -980,7 +997,7 @@ impl Engine {
         let mut done = 0;
         for (cut, marker) in cuts {
             if cut > done {
-                events.push(text_event_like(&event, &bytes[done..cut]));
+                events.push(text_event_like(&event, part(&bytes, done..cut)));
             }
             events.push(Event::Dropped {
                 text: Text::uncounted(marker),
@@ -989,7 +1006,7 @@ impl Engine {
             done = cut;
         }
         if done < bytes.len() {
-            events.push(text_event_like(&event, &bytes[done..]));
+            events.push(text_event_like(&event, part(&bytes, done..bytes.len())));
         }
         events
     }
@@ -1023,7 +1040,7 @@ impl Engine {
     /// A tag the end cut short is dropped as the whole tag would have been. Inside a call the
     /// assembler still holds the call's bytes, which came before the tail: the call ends first, so
     /// every byte leaves in order.
-    fn drop_cut_tag(&mut self, text: &str, out: &mut Events) {
+    fn drop_cut_tag(&mut self, text: String, out: &mut Events) {
         self.end_stay(out);
         if self.emits() == Emits::Arguments {
             self.close_call(Closed::ByEnd, "", out);
@@ -1082,7 +1099,7 @@ impl Engine {
 }
 
 impl Parser for Engine {
-    fn feed(&mut self, input: Input<'_>, out: &mut Events) -> Result<(), ParseError> {
+    fn feed<'d>(&mut self, input: Input<'d>, out: &mut Events<'d>) -> Result<(), ParseError> {
         match input {
             Input::Prompt { text, .. } => {
                 if self.stage != Stage::Fresh {
@@ -1159,7 +1176,7 @@ mod tests {
         "<arg_key>days</arg_key><arg_value>3</arg_value>"
     );
 
-    fn run(format: Format, output: &str, finish: EngineFinish) -> Vec<Event> {
+    fn run(format: Format, output: &str, finish: EngineFinish) -> Vec<Event<'static>> {
         let mut engine = Engine::new(format, declared());
         let mut out = Events::new();
         for input in [
@@ -1172,11 +1189,11 @@ mod tests {
         ] {
             engine.feed(input, &mut out).expect("in order");
         }
-        out.drain()
+        out.into_owned().drain()
     }
 
     /// The events of `output` after `prompt`, ended by a stop.
-    fn run_after(format: Format, prompt: &str, output: &str) -> Vec<Event> {
+    fn run_after(format: Format, prompt: &str, output: &str) -> Vec<Event<'static>> {
         let mut engine = Engine::new(format, declared());
         let mut out = Events::new();
         for input in [
@@ -1195,7 +1212,7 @@ mod tests {
         ] {
             engine.feed(input, &mut out).expect("in order");
         }
-        out.drain()
+        out.into_owned().drain()
     }
 
     /// Each call's arguments as the client joins them, and the bytes of each call's end.
@@ -1211,7 +1228,7 @@ mod tests {
                 }
                 Event::ToolCallEnd { source, .. } => {
                     if let Some((_, end)) = calls.last_mut() {
-                        *end = Some(source.text.clone());
+                        *end = Some(source.text.to_string());
                     }
                 }
                 _ => {}
@@ -1298,7 +1315,7 @@ mod tests {
         ] {
             let stopped = run(glm().closes_at_stop("call"), output, EngineFinish::Stop);
             let marked = run(glm(), &format!("{output}</tool_call>"), EngineFinish::Stop);
-            let without_end_bytes = |events: &[Event]| -> Vec<Event> {
+            let without_end_bytes = |events: &[Event<'static>]| -> Vec<Event<'static>> {
                 events
                     .iter()
                     .filter(|event| !matches!(event, Event::Dropped { .. }))
@@ -1685,7 +1702,7 @@ mod tests {
                     &mut out,
                 )
                 .expect("end");
-            let [content, reasoning, ..] = kinds(&out.drain());
+            let [content, reasoning, ..] = kinds(&out.into_owned().drain());
             assert_eq!([content, reasoning], expected, "{pieces:?}");
         }
     }
@@ -1708,7 +1725,7 @@ mod tests {
                 Event::Dropped {
                     text,
                     why: DropReason::Whitespace,
-                } => Some(text.text.as_str()),
+                } => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -1752,7 +1769,7 @@ mod tests {
                     &mut out,
                 )
                 .expect("end");
-            let events = out.drain();
+            let events = out.into_owned().drain();
             assert_eq!(bytes(&events), output, "{cuts:?}");
             (kinds(&events), trimmed_space(&events), bytes(&events))
         };
@@ -1979,7 +1996,7 @@ mod tests {
                     &mut out,
                 )
                 .expect("end");
-            let [content, ..] = kinds(&out.drain());
+            let [content, ..] = kinds(&out.into_owned().drain());
             deltas.push(content);
             deltas.retain(|delta| !delta.is_empty());
             deltas
@@ -2102,12 +2119,12 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        let events = out.drain();
+        let events = out.into_owned().drain();
         let lead: Vec<(String, Option<u32>)> = events
             .iter()
             .take(3)
             .filter_map(|event| match event {
-                Event::Dropped { text, .. } => Some((text.text.clone(), text.tokens)),
+                Event::Dropped { text, .. } => Some((text.text.to_string(), text.tokens)),
                 _ => None,
             })
             .collect();
@@ -2179,7 +2196,7 @@ mod tests {
             ] {
                 engine.feed(input, &mut out).expect("in order");
             }
-            let events = out.drain();
+            let events = out.into_owned().drain();
             assert_eq!(bytes(&events), held, "cut at {cut}");
             assert_eq!(calls(&events), calls(&whole), "cut at {cut}");
         }
