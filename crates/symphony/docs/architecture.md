@@ -38,9 +38,9 @@ engine knows the assemblers through one crate-private trait (`CallAssembler`: `f
 `start`, `closes`, `close`, `finish`) and picks one from the table's call syntax. The grammar reads
 the table's rows (which terminal enters a region, which closes it, which states a block is entered
 from) and dispatches on the call syntax for the spelling inside a call. The adapters read events
-only: they share one fold of a whole sequence (`adapt/fold.rs`) and render it three ways. The one
-crate outside this one the library depends on holds the request's tool shape and the three APIs'
-response shapes.
+only: the whole-response shapes share one fold of the sequence (`adapt/fold.rs`), and each stream
+folds as it goes. The one crate outside this one the library depends on holds the request's tool
+shape and the three APIs' response shapes.
 
 ## What each part promises
 
@@ -59,10 +59,11 @@ one already drained. These are checked for every registry table by `tests/contra
 **The table.** `Format::validate` holds every table to the rows the engine can run, and a table is
 checked when it is built (the registry's tables in the crate's tests, a compiled response template
 by its compiler) and once more by `Engine::new`: a table with no state; a first state that emits
-reasoning (a thought the output starts inside is entered by the prompt, never by the table); an
-arguments state with no call syntax; a terminal with no text; an empty turn opener or anchor, or an
-opener beside anchors (a table names one or the other); a start row where the first state holds a
-call, or without a turn opener to replay; a stop row on a state that holds no call; framing, trim or
+reasoning (a thought the output starts inside is entered by the prompt's replay or by a start row,
+never by the table's first state); an arguments state with no call syntax; a terminal with no text;
+an empty turn opener or anchor, or an opener beside anchors (a table names one or the other); a
+start row where the first state holds a call, or beside a turn opener (which replays the turn's
+start itself); a stop row on a state that holds no call; framing, trim or
 kept rows on states they do not fit (framing on a call's state, a trimmed state that is framing, a
 kept state that is trimmed); a table that thinks first without a thought; a shaped call whose
 pattern a stream cannot decide, or that a table could not open through its terminal (the turn may
@@ -93,11 +94,14 @@ values as text, or from the syntax where it writes JSON; a value's bytes are the
 never re-serialized. `feed` returns how many bytes the syntax took, so the engine routes what
 follows a JSON object itself. The ids of the calls are the engine's to mint, not the assembler's.
 
-**The adapters.** One fold, three renderings: `ReasoningStart`, `ReasoningEnd`, `ToolCallEnd` and
-`Dropped` reach no client; `Malformed` text is content, since the model wrote it and a client should
-see it rather than lose it; whitespace-only content opens nothing; the finish reason becomes
-`tool_calls` (or its API's equivalent) after at least one call. `adapters.md` lists where each API
-says less than the events do and what the adapter decides there.
+**The adapters.** One fold for the whole shapes, three renderings, and three streams that fold as
+they go. The bytes a format consumed (`Dropped`) never reach a client; `ReasoningStart` writes
+nothing, and `ReasoningEnd` and `ToolCallEnd` write no bytes of their own: Chat Completions renders
+nothing for them, Responses and Messages close their item or block on them. `Malformed` text is
+content, since the model wrote it and a client should see it rather than lose it; whitespace-only
+content opens nothing; a natural stop after at least one call is reported as `tool_calls` (or its
+API's equivalent), while `length`, `abort` and an engine's own reasons stay what the engine said.
+`adapters.md` lists where each API says less than the events do and what the adapter decides there.
 
 ## How to add a table
 
