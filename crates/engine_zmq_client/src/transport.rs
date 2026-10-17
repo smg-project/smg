@@ -666,7 +666,7 @@ mod tests {
     }
 
     /// Once every expected engine has said HELLO, a further HELLO is refused
-    /// with the error the READY phase gave it before.
+    /// with the "after INIT phase" error.
     #[tokio::test]
     async fn a_hello_after_every_engine_is_known_is_refused() {
         let ns = IpcNamespace::new().unwrap();
