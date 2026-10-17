@@ -25,14 +25,18 @@
 //! there, as the engine reads every table (bellwether #16), and the block's close ends a call
 //! still open with what arrived; a second `<|tool_call_begin|>` inside an open call is the
 //! call's text, since a shaped call's opener may open none and the engine cannot send it back
-//! into a state that holds calls. Every marker is one token of the vocabulary. bellwether holds
-//! the line's manifests and no recorded set yet: the table stands on the turns the six templates
-//! render, held in the tests below; the recorded sets replay from the fixture pin once bellwether
-//! has them. The gateway's older `kimik2` parser reads the same spelling, with the
+//! into a state that holds calls. Every marker is one token of the vocabulary. bellwether holds the
+//! line's manifests and no recorded set yet: the table stands on the tests below, which hold a
+//! hand-picked set of the turns the six templates render for the shapes a tool-calling conversation
+//! takes (an answer, a call, two calls, content before a call, a thought and a call, the turn after
+//! a tool result, a call with thinking off, arguments that nest and hold text outside ASCII, a
+//! brace inside a string value), read whole and at every cut, and on the id contract; the six slugs
+//! are listed in the corpus harness, which replays their recorded sets from the fixture pin once
+//! bellwether has them. The gateway's older `kimik2` parser reads the same spelling, with the
 //! `kimi_thinking` and `kimi_k25` thought parsers; one departure from `kimi_thinking`, which read
 //! everything before `</think>` as the thought whether or not `<think>` came first: this table
-//! starts K2 Thinking in content, so an output that closes a thought it never opened is content
-//! as written, the marker included (the templates always write the opener; the tests pin it).
+//! starts K2 Thinking in content, so an output that closes a thought it never opened is content as
+//! written, the marker included (the templates always write the opener; the tests pin it).
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
@@ -164,6 +168,35 @@ mod tests {
         "<|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|>",
         "<|tool_call_begin|>functions.get_weather:1<|tool_call_argument_begin|>{\"city\": \"Rome\", \"days\": 3}<|tool_call_end|>",
         "<|tool_calls_section_end|>"
+    );
+    /// The tail of the generation prompt after a tool result, as the templates render it: the
+    /// result names the call it answers by the id the model gave.
+    const PROMPT_AFTER_RESULT: &str = concat!(
+        "<|im_system|>tool<|im_middle|>## Return of functions.get_weather:0\n{\"temperature\": 18}",
+        "<|im_end|><|im_assistant|>assistant<|im_middle|>"
+    );
+    /// The same tail as K2.5, K2.6 and K2.7-Code end it: the thought opened.
+    const PROMPT_AFTER_RESULT_THOUGHT_OPEN: &str = concat!(
+        "<|im_system|>tool<|im_middle|>## Return of functions.get_weather:0\n{\"temperature\": 18}",
+        "<|im_end|><|im_assistant|>assistant<|im_middle|><think>"
+    );
+    /// The thought and a call after a tool result, as K2.5's template renders them after the
+    /// prompt's `<think>`.
+    const THOUGHT_CALL_AFTER_RESULT: &str = concat!(
+        "Rome too.</think><|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0",
+        "<|tool_call_argument_begin|>{\"city\": \"Rome\"}<|tool_call_end|><|tool_calls_section_end|>"
+    );
+    /// A call whose arguments nest and hold text outside ASCII, as the templates write them
+    /// (`tojson` with `ensure_ascii` off, the escapes JSON's own).
+    const CALL_NESTED: &str = concat!(
+        "<|tool_calls_section_begin|><|tool_call_begin|>functions.save_note:0<|tool_call_argument_begin|>",
+        "{\"title\": \"計画 🌍\", \"body\": \"a \\\"q\\\" \\\\ b\\nc\", \"tags\": [\"a\", \"b\"], ",
+        "\"meta\": {\"nested\": {\"deep\": [1, 2.5, true, null]}}}<|tool_call_end|><|tool_calls_section_end|>"
+    );
+    /// A call with a brace inside a string value.
+    const CALL_BRACE_IN_STRING: &str = concat!(
+        "<|tool_calls_section_begin|><|tool_call_begin|>functions.save_note:0<|tool_call_argument_begin|>",
+        "{\"title\": \"Braces\", \"body\": \"a } b { c\"}<|tool_call_end|><|tool_calls_section_end|>"
     );
 
     fn run_with(prompt: &str, pieces: &[&str], finish: EngineFinish) -> Vec<Event> {
@@ -426,12 +459,91 @@ mod tests {
         }
     }
 
-    /// The tail of the generation prompt after a tool result, as the templates render it: the
-    /// result names the call it answers by the id the model gave.
-    const PROMPT_AFTER_RESULT: &str = concat!(
-        "<|im_system|>tool<|im_middle|>## Return of functions.get_weather:0\n{\"temperature\": 18}",
-        "<|im_end|><|im_assistant|>assistant<|im_middle|>"
-    );
+    /// The shapes the templates render that the turns above do not hold, each read whole and at
+    /// every cut: a call with thinking off (the prompt closed the thought), the thought and a
+    /// call after a tool result where the prompt opens the thought, arguments that nest and hold
+    /// text outside ASCII (a cut falls between its characters, never inside one), and a brace
+    /// inside a string value, which closes nothing.
+    #[test]
+    fn every_cut_reads_the_same_shape() {
+        let shapes: [(&str, &str, &str, u32); 4] = [
+            (PROMPT_THOUGHT_CLOSED, CALL, "", 1),
+            (
+                PROMPT_AFTER_RESULT_THOUGHT_OPEN,
+                THOUGHT_CALL_AFTER_RESULT,
+                "Rome too.",
+                1,
+            ),
+            (PROMPT, CALL_NESTED, "", 1),
+            (PROMPT, CALL_BRACE_IN_STRING, "", 1),
+        ];
+        for (prompt, turn, thought, count) in shapes {
+            let whole = run(prompt, &[turn]);
+            assert_eq!(bytes(&whole), turn);
+            assert_eq!(reasoning(&whole), thought, "{turn:?}");
+            assert_eq!(content(&whole), "", "{turn:?}");
+            assert_eq!(calls(&whole).len() as u32, count, "{turn:?}");
+            assert_eq!(malformed(&whole), "", "{turn:?}");
+            assert_eq!(finish(&whole), (FinishReason::Stop, count), "{turn:?}");
+            for (at, _) in turn.char_indices().skip(1) {
+                let (head, rest) = turn.split_at(at);
+                let events = run(prompt, &[head, rest]);
+                assert_eq!(bytes(&events), turn, "{turn:?} cut at {at}");
+                assert_eq!(reasoning(&events), thought, "{turn:?} cut at {at}");
+                assert_eq!(content(&events), "", "{turn:?} cut at {at}");
+                assert_eq!(calls(&events), calls(&whole), "{turn:?} cut at {at}");
+                assert_eq!(ids(&events), ids(&whole), "{turn:?} cut at {at}");
+                assert_eq!(framing(&events), framing(&whole), "{turn:?} cut at {at}");
+                assert_eq!(malformed(&events), "", "{turn:?} cut at {at}");
+                assert_eq!(finish(&events), finish(&whole), "{turn:?} cut at {at}");
+            }
+        }
+        // What each call carries: the thinking-off call's arguments and the id as written; the
+        // call after the result named by the id the template renders for a new turn; the nested
+        // arguments as the value the template was given; the brace kept inside its string.
+        let events = run(PROMPT_THOUGHT_CLOSED, &[CALL]);
+        assert_eq!(
+            calls(&events),
+            [(
+                "get_weather".to_string(),
+                "{\"city\": \"Paris\"}".to_string()
+            )]
+        );
+        assert_eq!(ids(&events), ["functions.get_weather:0"]);
+        let events = run(
+            PROMPT_AFTER_RESULT_THOUGHT_OPEN,
+            &[THOUGHT_CALL_AFTER_RESULT],
+        );
+        assert_eq!(
+            calls(&events),
+            [(
+                "get_weather".to_string(),
+                "{\"city\": \"Rome\"}".to_string()
+            )]
+        );
+        assert_eq!(ids(&events), ["functions.get_weather:0"]);
+        let events = run(PROMPT, &[CALL_NESTED]);
+        let (name, arguments) = &calls(&events)[0];
+        assert_eq!(name, "save_note");
+        let value: serde_json::Value = serde_json::from_str(arguments).expect("JSON arguments");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "title": "計画 🌍",
+                "body": "a \"q\" \\ b\nc",
+                "tags": ["a", "b"],
+                "meta": {"nested": {"deep": [1, 2.5, true, null]}},
+            })
+        );
+        let events = run(PROMPT, &[CALL_BRACE_IN_STRING]);
+        assert_eq!(
+            calls(&events),
+            [(
+                "save_note".to_string(),
+                "{\"title\": \"Braces\", \"body\": \"a } b { c\"}".to_string()
+            )]
+        );
+    }
 
     #[test]
     fn a_call_carries_the_id_the_model_wrote() {
