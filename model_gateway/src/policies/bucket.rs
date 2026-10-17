@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -527,6 +527,18 @@ impl Bucket {
         }
     }
 
+    /// Re-partition the sizes among the workers from the requests of the
+    /// last window, once the per-worker share of the load moved by a factor
+    /// of two since the last rebuild (or the membership changed). The walk
+    /// is over the size histogram in ascending order: each worker but the
+    /// last takes whole size classes until its share is reached and its
+    /// range ends at the last class it took; the last worker takes the open
+    /// end, as after the first split. Every bound is a size seen, the size
+    /// after one, or the open end. A class is never split between two
+    /// workers, so with few distinct sizes the shares stay coarse, and a
+    /// worker that finds the classes used up owns no range until the next
+    /// adjustment; the load spill of [`BucketPolicy::select_worker`] feeds
+    /// it meanwhile.
     pub fn adjust_boundary(&mut self) {
         if self.t_req_loads.is_empty() {
             return;
@@ -549,63 +561,61 @@ impl Bucket {
 
         info!("Before adjusting boundary | {:?}", self.boundary);
         self.bucket_load = new_single_bucket_load;
-        let mut new_boundary = Vec::new();
-        let mut hist_load: Vec<usize> = self.t_req_loads.values().copied().collect();
-        hist_load.sort_unstable();
-        let mut upper_bound: usize = 0;
-        let mut last_load_index: usize = 0;
-        let max_value = usize::MAX;
-
-        let worker_url = {
-            let guard = self.prefill_worker_urls.lock();
-            (*guard).clone()
-        };
-
-        let mut iter = worker_url.iter().peekable();
-        // let mut curr_worker_id = 0;
-        while let Some(url) = iter.next() {
-            if last_load_index >= hist_load.len() && iter.peek().is_none() {
-                new_boundary.push(Boundary::new(url.clone(), [upper_bound, max_value]));
+        // The size histogram of the window: each distinct size with the load
+        // its requests add up to.
+        let mut histogram: BTreeMap<usize, usize> = BTreeMap::new();
+        for &size in self.t_req_loads.values() {
+            *histogram.entry(size).or_default() += size;
+        }
+        let worker_urls = self.prefill_worker_urls.lock().clone();
+        let mut classes = histogram.iter();
+        let mut new_boundary = Vec::with_capacity(worker_urls.len());
+        let mut lower = 0;
+        for (i, url) in worker_urls.iter().enumerate() {
+            if i + 1 == worker_urls.len() {
+                new_boundary.push(Boundary::new(url.clone(), [lower, usize::MAX]));
                 break;
             }
-            let mut load_accumulator = 0;
-            let mut break_flag = false;
-            for &load in &hist_load[last_load_index..] {
-                load_accumulator += load;
-                if load_accumulator >= new_single_bucket_load {
-                    if iter.peek().is_none() {
-                        new_boundary.push(Boundary::new(url.clone(), [upper_bound, max_value]));
-                        break_flag = true;
-                        break;
-                    }
-                    let real_load = upper_bound + new_single_bucket_load;
-                    if load <= upper_bound {
-                        new_boundary.push(Boundary::new(url.clone(), [upper_bound, real_load]));
-                        upper_bound = real_load + 1;
-                    } else {
-                        new_boundary.push(Boundary::new(url.clone(), [upper_bound, load]));
-                        upper_bound = load + 1;
-                    }
-                    last_load_index += 1;
-                    break_flag = true;
+            let mut share = 0;
+            let mut upper = None;
+            for (&size, &load) in classes.by_ref() {
+                share += load;
+                upper = Some(size);
+                if share >= new_single_bucket_load {
                     break;
-                } else {
-                    last_load_index += 1;
                 }
             }
-            if !break_flag {
-                let mut right_bound_value = upper_bound + new_single_bucket_load;
-                if iter.peek().is_none() {
-                    right_bound_value = max_value;
-                    new_boundary.push(Boundary::new(url.clone(), [upper_bound, right_bound_value]));
-                    break;
-                }
-                new_boundary.push(Boundary::new(url.clone(), [upper_bound, right_bound_value]));
-                upper_bound = right_bound_value + 1;
+            // A worker that finds the classes used up owns no range until
+            // the next adjustment.
+            if let Some(size) = upper {
+                new_boundary.push(Boundary::new(url.clone(), [lower, size]));
+                lower = size.saturating_add(1);
             }
         }
+        debug_assert!(
+            Self::partitions_the_sizes(&new_boundary, &histogram),
+            "the adjustment left the size domain: {new_boundary:?} over {histogram:?}"
+        );
         self.boundary = new_boundary;
         info!("After adjusting boundary | {:?}", self.boundary);
+    }
+
+    /// Whether `boundary` partitions the sizes: contiguous from 0, every
+    /// upper bound a size of `histogram`, the last range open-ended.
+    fn partitions_the_sizes(boundary: &[Boundary], histogram: &BTreeMap<usize, usize>) -> bool {
+        let mut next_lower = 0;
+        boundary.iter().enumerate().all(|(i, b)| {
+            let [lower, upper] = b.range;
+            let open_end = i + 1 == boundary.len();
+            let upper_is_a_size = if open_end {
+                upper == usize::MAX
+            } else {
+                histogram.contains_key(&upper)
+            };
+            let contiguous = lower == next_lower && lower <= upper;
+            next_lower = upper.saturating_add(1);
+            contiguous && upper_is_a_size
+        })
     }
 }
 
@@ -718,7 +728,8 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(11)).await;
         {
             let boundaries = boundaries(&policy, &prefill_workers);
-            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (33, 67));
+            // Expected Boundary: [0, 33] [34, 34] [35, MAX]
+            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (33, 34));
         }
         // === Phase S2: Validate load balancing ===
         // Three consecutive len=33 requests (Should route to different buckets)
@@ -1079,7 +1090,10 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(4)).await;
         {
             let boundaries = boundaries(&policy, &prefill_workers);
-            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 27));
+            // Expected Boundary: [0, 20] [21, MAX]: one size seen, the
+            // second worker owns no range, the third takes the open end.
+            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, usize::MAX));
+            assert_eq!(boundaries.len(), 2);
         }
 
         policy
@@ -1095,7 +1109,9 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(4)).await;
         {
             let boundaries = boundaries(&policy, &prefill_workers);
-            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (7, 10));
+            // Expected Boundary: [0, 7] [8, MAX]
+            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (7, usize::MAX));
+            assert_eq!(boundaries.len(), 2);
         }
     }
 
@@ -1418,12 +1434,14 @@ mod tests {
 
         policy.remove_worker("http://w2:8000");
         assert_eq!(bucket.read().bucket_load, 0);
+        // The first rebuild gave w1 the three sizes and w3 the open end: w2
+        // owned no range, so its removal moves no range.
         let merged = boundaries(&policy, &workers);
         assert_eq!(
             merged,
             [
-                ("http://w1:8000".to_string(), [0, 4101]),
-                ("http://w3:8000".to_string(), [4102, usize::MAX]),
+                ("http://w1:8000".to_string(), [0, 3000]),
+                ("http://w3:8000".to_string(), [3001, usize::MAX]),
             ]
         );
 
