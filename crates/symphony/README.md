@@ -12,8 +12,9 @@ the families recorded so far, and the models table below says which, and how far
 
 ## Architecture
 
-`docs/architecture.md` is the fuller account: how the parts depend on one another, what each promises, how a
-table is added without touching the engine, and how a failure is classified and surfaced.
+[`docs/architecture.md`](docs/architecture.md) is the fuller account: how the parts depend on one another,
+what each promises, how a table is added without touching the engine, and how a failure is classified and
+surfaced.
 
 Symphony is a library, not a service: a caller feeds it a model's output and takes typed events
 back. SMG's gateway is its first caller, and the one crate of SMG's it depends on is
