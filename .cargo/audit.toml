@@ -56,7 +56,7 @@ ignore = [
     "RUSTSEC-2025-0098",
     # RUSTSEC-2024-0449: unsafe-libyaml 0.2 under serde_yaml 0.9 (deprecated), the YAML reader of
     # the gateway's config, scheduler and rate-limit files, of crates/mcp, of the Python binding
-    # (bindings/python) and of kube-client 3, and under serde_yaml_ng 0.10 (crates/openapi-gen),
+    # (bindings/python) and of kube-client 3, and under serde_yaml_ng 0.10 (clients/openapi-gen),
     # which depends on it too, so that crate is no exit. Goes with a YAML crate that does not build
     # on it in the three crates and in openapi-gen, and the kube release that dropped serde_yaml.
     # Review by 2027-01-15.
