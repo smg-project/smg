@@ -194,12 +194,18 @@ pub async fn connect_handshake(
 
     let mut engines: BTreeMap<EngineId, EngineStartupState> = BTreeMap::new();
 
-    // 3. Receive HELLO from every engine and send a matching INIT.
-    while engines.len() < engine_count {
-        let message = clock.wait("HELLO", handshake_socket.recv()).await??;
+    // 3. Drive HELLO -> INIT -> READY for every engine in one loop, until
+    //    every engine has said both. READY may overlap the HELLO phase, so a
+    //    HELLO is answered with INIT while engines are still missing and
+    //    refused once all are known, and a READY marks its engine whenever
+    //    it arrives.
+    while engines.len() < engine_count || engines.values().any(|state| !state.is_ready_received()) {
+        let awaiting_hello = engines.len() < engine_count;
+        let stage = if awaiting_hello { "HELLO" } else { "READY" };
+        let message = clock.wait(stage, handshake_socket.recv()).await??;
         let (engine_id, handshake_message) = decode_handshake_message(message)?;
         match handshake_message.status.as_deref() {
-            Some("HELLO") => {
+            Some("HELLO") if awaiting_hello => {
                 if engines.contains_key(&engine_id) {
                     return Err(unexpected_handshake(format!(
                         "duplicate engine id {engine_id:?} during startup handshake"
@@ -215,32 +221,11 @@ pub async fn connect_handshake(
                 .await?;
                 engines.insert(engine_id, EngineStartupState::HelloReceived);
             }
-            Some("READY") => {
-                // READY may overlap the HELLO phase.
-                match engines.get_mut(&engine_id) {
-                    Some(state) if !state.is_ready_received() => {
-                        *state = EngineStartupState::ReadyReceived;
-                    }
-                    _ => {
-                        return Err(unexpected_handshake(format!(
-                            "READY for unexpected or duplicate engine id {engine_id:?}"
-                        )));
-                    }
-                }
-            }
-            other => {
+            Some("HELLO") => {
                 return Err(unexpected_handshake(format!(
-                    "unexpected handshake status {other:?}"
-                )))
+                    "duplicate HELLO for engine id {engine_id:?} after INIT phase"
+                )));
             }
-        }
-    }
-
-    // 4. Every engine may now send READY (no coordinator gate in this scope).
-    while engines.values().any(|state| !state.is_ready_received()) {
-        let message = clock.wait("READY", handshake_socket.recv()).await??;
-        let (engine_id, handshake_message) = decode_handshake_message(message)?;
-        match handshake_message.status.as_deref() {
             Some("READY") => match engines.get_mut(&engine_id) {
                 Some(state) if !state.is_ready_received() => {
                     debug!(?engine_id, "received READY from engine");
@@ -252,11 +237,6 @@ pub async fn connect_handshake(
                     )));
                 }
             },
-            Some("HELLO") => {
-                return Err(unexpected_handshake(format!(
-                    "duplicate HELLO for engine id {engine_id:?} after INIT phase"
-                )));
-            }
             other => {
                 return Err(unexpected_handshake(format!(
                     "unexpected handshake status {other:?}"
@@ -265,7 +245,7 @@ pub async fn connect_handshake(
         }
     }
 
-    // 5. Wait for every engine to register on the shared input socket.
+    // 4. Wait for every engine to register on the shared input socket.
     let engines =
         wait_for_input_registrations(&mut input_socket, engines.into_keys(), &clock).await?;
     info!(engine_count = engines.len(), "engines connected");
@@ -474,7 +454,7 @@ mod tests {
     use super::*;
     use crate::{
         codec::encode_msgpack,
-        mock_engine::{connect_to_frontend, default_ready_response, IpcNamespace},
+        mock_engine::{connect_to_frontend, default_ready_response, hello, IpcNamespace},
         protocol::vllm::{
             output::{
                 EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
@@ -632,5 +612,90 @@ mod tests {
             .unwrap();
         let received = out_rx.recv().await.expect("sentinel delivered");
         assert!(matches!(received, Err(Error::EngineCoreDead)));
+    }
+
+    /// READY may overlap the HELLO phase: the first engine says HELLO and
+    /// READY while the second has not said HELLO yet, and both are kept.
+    #[tokio::test]
+    async fn a_ready_that_overlaps_the_hello_phase_is_kept() {
+        let ns = IpcNamespace::new().unwrap();
+        let (handshake, input, output) = (
+            ns.handshake_endpoint(),
+            ns.input_endpoint(),
+            ns.output_endpoint(),
+        );
+        let engines = async {
+            let first = connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                default_ready_response(),
+            )
+            .await;
+            // The frontend, idle on its socket, has taken the first READY
+            // long before this pause ends; the second HELLO then finds one
+            // engine known and ready and one still missing.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let second = connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(1),
+                default_ready_response(),
+            )
+            .await;
+            (first, second)
+        };
+        let (transport, (first, second)) = tokio::join!(
+            connect_handshake(&handshake, 2, &input, &output, TIMEOUT),
+            engines
+        );
+        let transport = transport.expect("frontend handshake");
+        first.expect("first mock engine");
+        second.expect("second mock engine");
+        let mut ids: Vec<EngineId> = transport
+            .engines
+            .iter()
+            .map(|engine| engine.engine_id.clone())
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                EngineId::from_engine_index(0),
+                EngineId::from_engine_index(1)
+            ]
+        );
+    }
+
+    /// Once every expected engine has said HELLO, a further HELLO is refused
+    /// with the error the READY phase gave it before.
+    #[tokio::test]
+    async fn a_hello_after_every_engine_is_known_is_refused() {
+        let ns = IpcNamespace::new().unwrap();
+        let (handshake, input, output) = (
+            ns.handshake_endpoint(),
+            ns.input_endpoint(),
+            ns.output_endpoint(),
+        );
+        let mocks_handshake = handshake.clone();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the mock engines are torn down when the test ends"
+        )]
+        let mocks = tokio::spawn(async move {
+            // The one expected engine has said HELLO and holds its INIT; a
+            // second engine's HELLO arrives while the first is not ready.
+            let _first = hello(&mocks_handshake, EngineId::from_engine_index(0))
+                .await
+                .expect("first HELLO");
+            let _second = hello(&mocks_handshake, EngineId::from_engine_index(1)).await;
+        });
+        let Err(err) = connect_handshake(&handshake, 1, &input, &output, TIMEOUT).await else {
+            panic!("a HELLO after every engine is known must be refused");
+        };
+        mocks.abort();
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("duplicate HELLO") && message.contains("after INIT phase"),
+            "{message}"
+        );
     }
 }
