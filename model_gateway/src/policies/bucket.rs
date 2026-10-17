@@ -118,10 +118,13 @@ impl LoadBalancingPolicy for BucketPolicy {
             .get(model_key)
             .map(|entry| entry.value().clone());
         if let Some(bucket) = bucket {
+            // The bucket chooses among the workers it lists; the caller offers
+            // the ones available now (on a retry, the ones not yet tried).
+            let is_offered = |url: &str| healthy_indices.iter().any(|&i| workers[i].url() == url);
             let (choiced_url, chars_per_url_snapshot) = {
                 let buc = bucket.read();
                 let chars_per_url_snapshot = buc.chars_per_url.lock().clone();
-                let choiced_url = buc.find_boundary(char_count);
+                let choiced_url = buc.find_offered_boundary(char_count, is_offered);
                 (choiced_url, chars_per_url_snapshot)
             };
             // The imbalance test and the spill weigh the offered healthy
@@ -130,11 +133,7 @@ impl LoadBalancingPolicy for BucketPolicy {
             // worker that cannot serve.
             let offered: Vec<(&String, usize)> = chars_per_url_snapshot
                 .iter()
-                .filter(|(url, _)| {
-                    healthy_indices
-                        .iter()
-                        .any(|&i| workers[i].url() == url.as_str())
-                })
+                .filter(|(url, _)| is_offered(url))
                 .map(|(url, &chars)| (url, chars))
                 .collect();
             let max_load = offered.iter().map(|&(_, chars)| chars).max().unwrap_or(0);
@@ -165,34 +164,25 @@ impl LoadBalancingPolicy for BucketPolicy {
             } else {
                 debug!("select prefill instance by Bucket policy");
                 match choiced_url {
-                    Some(url) if !url.is_empty() => url,
-                    _ => {
+                    Some(url) => url,
+                    None => {
                         let idx = rng.random_range(0..healthy_indices.len());
                         let selected_url = workers[healthy_indices[idx]].url();
-                        warn!("Boundary not found, randomly selection: {}", selected_url);
+                        warn!(
+                            "The bucket lists none of the offered workers for a size of {}, randomly selecting: {}",
+                            char_count, selected_url
+                        );
                         selected_url.to_string()
                     }
                 }
             };
 
-            // The bucket chooses among the workers it lists; the caller offers
-            // the ones available now (on a retry, the ones not yet tried). A
-            // listed worker that is not offered, or not healthy, gives way to
-            // an offered one, and the load is booked to the worker that serves
-            // the request.
+            // Every branch above names an offered worker, and the load is
+            // booked to the worker that serves the request.
             let position = healthy_indices
                 .iter()
                 .copied()
-                .find(|&i| workers[i].url() == prefill_url)
-                .unwrap_or_else(|| {
-                    let fallback = healthy_indices[rng.random_range(0..healthy_indices.len())];
-                    warn!(
-                        "Bucket worker {} is not among the offered workers, randomly selecting: {}",
-                        prefill_url,
-                        workers[fallback].url()
-                    );
-                    fallback
-                });
+                .find(|&i| workers[i].url() == prefill_url)?;
 
             {
                 let mut buc = bucket.write();
@@ -456,25 +446,51 @@ impl Bucket {
         true
     }
 
-    pub fn find_boundary(&self, char_count: usize) -> Option<String> {
-        let mut left = 0;
-        let mut right = self.boundary.len();
-        let mut _steps = 0;
+    /// The index of the range a size of `char_count` falls in.
+    fn range_index(&self, char_count: usize) -> Option<usize> {
+        self.boundary
+            .binary_search_by(|b| {
+                if char_count < b.range[0] {
+                    std::cmp::Ordering::Greater
+                } else if char_count > b.range[1] {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .ok()
+    }
 
-        while left < right {
-            _steps += 1;
-            let mid = left + (right - left) / 2;
-            let range = self.boundary[mid].range;
+    /// The owner of the range a size of `char_count` falls in, offered or
+    /// not: the tests read the partition through it.
+    #[cfg(test)]
+    fn find_boundary(&self, char_count: usize) -> Option<String> {
+        self.range_index(char_count)
+            .map(|i| self.boundary[i].url.clone())
+    }
 
-            if char_count < range[0] {
-                right = mid;
-            } else if char_count > range[1] {
-                left = mid + 1;
-            } else {
-                return Some(self.boundary[mid].url.clone());
-            }
-        }
-        None
+    /// The worker that serves a size of `char_count` among the workers
+    /// `is_offered` admits: the owner of its range, or, when the owner is not
+    /// offered (draining before its removal, unhealthy, or tried already on
+    /// a retry), the nearest offered worker below it in the partition, else
+    /// the nearest above. The worker below is the one
+    /// [`Self::remove_prefill_worker_url`] hands the range to, so a draining
+    /// worker's range moves once, at the first request it cannot take, and
+    /// is where the removal leaves it. `None` when the size has no range or
+    /// no listed worker is offered.
+    pub fn find_offered_boundary(
+        &self,
+        char_count: usize,
+        is_offered: impl Fn(&str) -> bool,
+    ) -> Option<String> {
+        let owner = self.range_index(char_count)?;
+        let below = (0..=owner).rev();
+        let above = owner + 1..self.boundary.len();
+        below
+            .chain(above)
+            .map(|i| &self.boundary[i])
+            .find(|b| is_offered(&b.url))
+            .map(|b| b.url.clone())
     }
 
     pub fn get_total_load(&self) -> usize {
