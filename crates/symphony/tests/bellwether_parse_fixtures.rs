@@ -2785,42 +2785,61 @@ fn markers_of(format: &symphony::Format) -> Vec<String> {
 }
 
 /// `text` with one to three seeded corruptions, each on character boundaries: a span deleted, a
-/// span doubled, a piece inserted, the tail cut, or a span swapped for one character.
+/// span doubled, a piece inserted, the tail cut, or a span swapped for one character. Every
+/// corruption changes the text: one that drew an empty span (or a cut at the end) is drawn again,
+/// and an empty text takes an insertion, so a counted output is never the recorded one.
 fn corrupted(random: &mut Scramble, text: &str, pieces: &[String]) -> String {
     let mut text = text.to_string();
     for _ in 0..1 + random.below(3) {
-        let bounds: Vec<usize> = text
-            .char_indices()
-            .map(|(at, _)| at)
-            .chain(std::iter::once(text.len()))
-            .collect();
-        let (a, b) = (
-            bounds[random.below(bounds.len())],
-            bounds[random.below(bounds.len())],
-        );
-        let (from, to) = (a.min(b), a.max(b));
-        text = match random.below(5) {
-            0 => format!("{}{}", &text[..from], &text[to..]),
-            1 => format!("{}{}{}", &text[..to], &text[from..to], &text[to..]),
-            2 => format!(
-                "{}{}{}",
-                &text[..from],
-                pieces[random.below(pieces.len())],
-                &text[from..]
-            ),
-            3 => text[..to].to_string(),
-            _ => {
-                let swapped = ['<', '>', '"', '\n', ' ', 'x', '}', ']', 'é', '🌧'];
-                format!(
-                    "{}{}{}",
-                    &text[..from],
-                    swapped[random.below(swapped.len())],
-                    &text[to..]
-                )
-            }
-        };
+        let before = std::mem::take(&mut text);
+        text = (0..8)
+            .map(|_| corrupted_once(random, &before, pieces))
+            .find(|after| *after != before)
+            .unwrap_or_else(|| inserted(random, &before, 0, pieces));
     }
     text
+}
+
+/// `text` with `piece`, drawn from `pieces`, inserted at the character boundary `at`.
+fn inserted(random: &mut Scramble, text: &str, at: usize, pieces: &[String]) -> String {
+    format!(
+        "{}{}{}",
+        &text[..at],
+        pieces[random.below(pieces.len())],
+        &text[at..]
+    )
+}
+
+/// One seeded corruption of `text`; it may draw a span that changes nothing (see [`corrupted`]).
+fn corrupted_once(random: &mut Scramble, text: &str, pieces: &[String]) -> String {
+    if text.is_empty() {
+        return inserted(random, text, 0, pieces);
+    }
+    let bounds: Vec<usize> = text
+        .char_indices()
+        .map(|(at, _)| at)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let (a, b) = (
+        bounds[random.below(bounds.len())],
+        bounds[random.below(bounds.len())],
+    );
+    let (from, to) = (a.min(b), a.max(b));
+    match random.below(5) {
+        0 => format!("{}{}", &text[..from], &text[to..]),
+        1 => format!("{}{}{}", &text[..to], &text[from..to], &text[to..]),
+        2 => inserted(random, text, from, pieces),
+        3 => text[..to].to_string(),
+        _ => {
+            let swapped = ['<', '>', '"', '\n', ' ', 'x', '}', ']', 'é', '🌧'];
+            format!(
+                "{}{}{}",
+                &text[..from],
+                swapped[random.below(swapped.len())],
+                &text[to..]
+            )
+        }
+    }
 }
 
 /// A seeded plan of cuts into `text`, each piece one to eight characters.
@@ -2837,21 +2856,48 @@ fn seeded_cuts(random: &mut Scramble, text: &str) -> Vec<usize> {
     cuts
 }
 
-/// Whether the events carry every byte of `text` in order, with `Finish` last.
+/// Whether the events carry every byte of `text` in order, with exactly one `Finish`, last.
 fn conserved(text: &str, events: &[Event]) -> Result<(), String> {
     let carried: String = events.iter().map(bytes_of).collect();
     if carried != text {
         return Err(format!("the events carry {carried:?}"));
     }
-    if !matches!(events.last(), Some(Event::Finish { .. })) {
-        return Err("Finish is not last".to_string());
+    let finishes = events
+        .iter()
+        .filter(|event| matches!(event, Event::Finish { .. }))
+        .count();
+    if finishes != 1 || !matches!(events.last(), Some(Event::Finish { .. })) {
+        return Err(format!(
+            "{finishes} Finish events, where one must come last"
+        ));
     }
     Ok(())
 }
 
+/// One replay of `text` cut at `cuts`, with a panic inside the parser caught and named by the
+/// plan, so a breach says which replay broke.
+fn replay_plan(
+    name: &str,
+    new_engine: &dyn Fn() -> Engine,
+    tail: &str,
+    text: &str,
+    cuts: &[usize],
+    finish: &EngineFinish,
+) -> Result<Vec<Event>, String> {
+    let replayed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        replay_after(&mut new_engine(), tail, text, cuts, finish, false)
+    }));
+    match replayed {
+        Ok(Ok(events)) => Ok(events),
+        Ok(Err(e)) => Err(format!("{name}: {e}")),
+        Err(payload) => Err(format!("{name}: PANIC: {}", panic_message(payload))),
+    }
+}
+
 /// One corrupted output through a fresh engine from `new_engine`, after the prompt's `tail`:
 /// whole, on two seeded plans and, up to 512 bytes, a character at a time; the first breach of
-/// conservation, or of the message the chat adapter folds from the events, if any.
+/// conservation, or of the message the chat adapter folds from the events, if any, named by its
+/// plan.
 fn check_corrupted(
     new_engine: &dyn Fn() -> Engine,
     tail: &str,
@@ -2859,8 +2905,7 @@ fn check_corrupted(
     finish: &EngineFinish,
     random: &mut Scramble,
 ) -> Result<(), String> {
-    let whole = replay_after(&mut new_engine(), tail, text, &[], finish, false)
-        .map_err(|e| format!("whole: {e}"))?;
+    let whole = replay_plan("whole", new_engine, tail, text, &[], finish)?;
     conserved(text, &whole).map_err(|e| format!("whole: {e}"))?;
     let expected = Said::of(&whole);
     let mut plans = vec![
@@ -2874,8 +2919,7 @@ fn check_corrupted(
         ));
     }
     for (name, cuts) in plans {
-        let events = replay_after(&mut new_engine(), tail, text, &cuts, finish, false)
-            .map_err(|e| format!("{name}: {e}"))?;
+        let events = replay_plan(name, new_engine, tail, text, &cuts, finish)?;
         // The plan is named, not spelled out: the seeded plans are rebuilt from the case's id and
         // round, and the character plan from the text.
         conserved(text, &events).map_err(|e| format!("{name}: {e}"))?;
@@ -2965,9 +3009,11 @@ fn corrupt_model(
                 Ok(Err(breach)) => breach,
                 Err(payload) => format!("PANIC: {}", panic_message(payload)),
             };
+            // The breach and its plan first, the output last: a window on the
+            // message keeps what names the failure.
             failures.push(format!(
-                "{} round {round} ({family:?}, prompt tail {tail:?}, finish {finish:?}), \
-                 corrupted output {text:?}:\n  {failure}",
+                "{} round {round} ({family:?}, prompt tail {tail:?}, finish {finish:?}):\n  \
+                 {failure}\n  corrupted output {text:?}",
                 fixture.id
             ));
         }
