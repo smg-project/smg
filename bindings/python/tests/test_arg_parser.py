@@ -827,6 +827,8 @@ class TestParseRouterArgs:
                 "--tenant-rate-limit-enabled",
                 "--tenant-rate-limit-config",
                 "/etc/smg/rate-limit.yaml",
+                "--tenant-model-policy-config",
+                "/etc/smg/model-policy.yaml",
             ]
         )
         assert router_args.trust_tenant_header is True
@@ -841,6 +843,7 @@ class TestParseRouterArgs:
         assert router_args.priority_scheduler_tenant_metric_top_n == 8
         assert router_args.tenant_rate_limit_enabled is True
         assert router_args.tenant_rate_limit_config == "/etc/smg/rate-limit.yaml"
+        assert router_args.tenant_model_policy_config == "/etc/smg/model-policy.yaml"
 
         defaults = parse_router_args([])
         assert defaults.trust_tenant_header is False
@@ -852,6 +855,7 @@ class TestParseRouterArgs:
         assert defaults.priority_scheduler_tenant_metric_top_n == 32
         assert defaults.tenant_rate_limit_enabled is False
         assert defaults.tenant_rate_limit_config is None
+        assert defaults.tenant_model_policy_config is None
 
     def test_tenant_api_key_without_separator_is_rejected(self):
         """A key without the ':' separator fails to parse, and the error does
@@ -872,6 +876,8 @@ class TestParseRouterArgs:
                 "--router-tenant-rate-limit-enabled",
                 "--router-tenant-rate-limit-config",
                 "/etc/smg/rate-limit.yaml",
+                "--router-tenant-model-policy-config",
+                "/etc/smg/model-policy.yaml",
             ]
         )
 
@@ -881,6 +887,7 @@ class TestParseRouterArgs:
         assert router_args.tenant_api_keys == [("team-red", "secret-red")]
         assert router_args.tenant_rate_limit_enabled is True
         assert router_args.tenant_rate_limit_config == "/etc/smg/rate-limit.yaml"
+        assert router_args.tenant_model_policy_config == "/etc/smg/model-policy.yaml"
 
     def test_prefixed_disable_overload_protection_flag(self):
         """The --router-prefixed disable flag reaches the same field."""

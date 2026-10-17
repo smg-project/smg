@@ -106,15 +106,18 @@ impl TenantResolutionState {
 /// value is longer than [`MAX_TENANT_ID_LEN`] (the key is stored with every
 /// response and conversation; a longer one would fail on the SQL backends
 /// only, and silently dropping it would leave the request without a tenant).
-fn resolve_raw_tenant_key(
+/// From the request's `headers` and `extensions`, so a route outside the
+/// serving middleware (`/v1/models`) resolves its caller the same way.
+pub fn resolve_tenant_key(
     state: &TenantResolutionState,
-    request: &Request<Body>,
+    headers: &HeaderMap,
+    extensions: &Extensions,
 ) -> Result<TenantKey, Response> {
-    if let Some(caller) = request.extensions().get::<DataPlaneCaller>() {
+    if let Some(caller) = extensions.get::<DataPlaneCaller>() {
         return Ok(caller.tenant_key().clone());
     }
     if state.trust_tenant_header {
-        if let Some(tenant_id) = extract_trusted_tenant_id(state, request.headers()) {
+        if let Some(tenant_id) = extract_trusted_tenant_id(state, headers) {
             if tenant_id.len() > MAX_TENANT_ID_LEN {
                 return Err(error::bad_request(
                     "invalid_tenant_header",
@@ -130,7 +133,7 @@ fn resolve_raw_tenant_key(
         }
     }
 
-    if let Some(ConnectInfo(addr)) = request.extensions().get::<ConnectInfo<SocketAddr>>() {
+    if let Some(ConnectInfo(addr)) = extensions.get::<ConnectInfo<SocketAddr>>() {
         return Ok(canonical_tenant_key(TenantIdentity::IpAddress(addr.ip())));
     }
 
@@ -154,8 +157,12 @@ pub fn resolve_route_request_meta(
     state: &TenantResolutionState,
     request: &Request<Body>,
 ) -> Result<RouteRequestMeta, Response> {
-    let meta = RouteRequestMeta::new(resolve_raw_tenant_key(state, request)?)
-        .with_extension(AcceptedAt::now());
+    let meta = RouteRequestMeta::new(resolve_tenant_key(
+        state,
+        request.headers(),
+        request.extensions(),
+    )?)
+    .with_extension(AcceptedAt::now());
     // Carry the middleware request id so backend request ids derive from it
     // (RequestIdLayer runs outside this middleware).
     Ok(match request.extensions().get::<RequestId>() {

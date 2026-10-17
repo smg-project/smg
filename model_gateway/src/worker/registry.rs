@@ -869,6 +869,16 @@ impl WorkerRegistry {
             .then(|| Arc::clone(&canonical_id))
     }
 
+    /// The aliases registered for the canonical `model_id`, in no particular
+    /// order: the names besides its own a model is known by.
+    pub fn model_aliases(&self, model_id: &str) -> Vec<String> {
+        self.model_alias_index
+            .iter()
+            .filter(|entry| entry.value().as_ref() == model_id)
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
     /// Return all workers of a given type as an immutable shared slice.
     ///
     /// Unified with [`Self::get_by_model`] on `Arc<[_]>` so callers can

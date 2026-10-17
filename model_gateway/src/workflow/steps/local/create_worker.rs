@@ -955,6 +955,7 @@ mod tests {
 
         Arc::new(crate::app_context::AppContext {
             gateway_auth: AuthConfig::new(None),
+            tenant_model_policy: None,
             client: crate::http_client::client(),
             router_config: router_config.clone(),
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),

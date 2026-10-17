@@ -42,6 +42,7 @@ use openai_protocol::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+use smg_external_router::realtime::webrtc::parse_webrtc_request;
 use smg_mesh::{MeshServerBuilder, MeshServerConfig, MeshServerHandler};
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
@@ -69,7 +70,9 @@ use crate::{
         error as route_error,
         gateway::Gateway,
         grpc::common::responses::spawn_unstored_sweeper,
-        http::router::{stream_eligible_request_bodies, StreamBodyState},
+        http::router::{
+            stream_eligible_request_bodies, StreamBodyState, WEBRTC_REQUEST_BODY_LIMIT,
+        },
         RouterTrait,
     },
     server::{
@@ -180,7 +183,7 @@ async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Re
 
 async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let request_id = middleware::request_id_of(&req);
-    models::list_models(&state.context, req.headers(), request_id).await
+    models::list_models(&state.context, req.headers(), req.extensions(), request_id).await
 }
 
 async fn v1_model(
@@ -189,11 +192,34 @@ async fn v1_model(
     req: Request,
 ) -> Response {
     let request_id = middleware::request_id_of(&req);
-    models::retrieve_model(&state.context, req.headers(), &model_id, request_id).await
+    models::retrieve_model(
+        &state.context,
+        req.headers(),
+        req.extensions(),
+        &model_id,
+        request_id,
+    )
+    .await
 }
 
 async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
     state.router.get_model_info(req).await
+}
+
+/// The answer to a request whose tenant may not name `model` under the
+/// tenant model policy (the 404 of a model nobody serves), or `None` when the
+/// request may go on: asked on every serving route that names a model, before
+/// the request reaches a router.
+fn tenant_model_refusal(
+    state: &AppState,
+    tenant_meta: &middleware::TenantRequestMeta,
+    model: &str,
+) -> Option<Response> {
+    state.context.tenant_model_policy.as_ref()?.refusal(
+        tenant_meta.tenant_key(),
+        model,
+        &state.context.worker_registry,
+    )
 }
 
 async fn generate(
@@ -204,6 +230,9 @@ async fn generate(
     Json(body): Json<GenerateRequest>,
 ) -> Response {
     let model = body.model.clone();
+    if let Some(refused) = tenant_model_refusal(&state, &tenant_meta, &model) {
+        return refused;
+    }
     cancel
         .guard(
             state
@@ -221,6 +250,9 @@ async fn v1_chat_completions(
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
     let model = body.model.clone();
+    if let Some(refused) = tenant_model_refusal(&state, &tenant_meta, &model) {
+        return refused;
+    }
     cancel
         .guard(
             state
@@ -238,6 +270,9 @@ async fn v1_completions(
     ValidatedJson(body): ValidatedJson<CompletionRequest>,
 ) -> Response {
     let model = body.model.clone();
+    if let Some(refused) = tenant_model_refusal(&state, &tenant_meta, &model) {
+        return refused;
+    }
     cancel
         .guard(
             state
@@ -255,6 +290,9 @@ async fn rerank(
     ValidatedJson(body): ValidatedJson<RerankRequest>,
 ) -> Response {
     let model = body.model.clone();
+    if let Some(refused) = tenant_model_refusal(&state, &tenant_meta, &model) {
+        return refused;
+    }
     cancel
         .guard(
             state
@@ -273,6 +311,9 @@ async fn v1_rerank(
 ) -> Response {
     let rerank_body: RerankRequest = body.into();
     let model = rerank_body.model.clone();
+    if let Some(refused) = tenant_model_refusal(&state, &tenant_meta, &model) {
+        return refused;
+    }
     cancel
         .guard(
             state
@@ -290,6 +331,9 @@ async fn v1_responses(
     ValidatedJson(body): ValidatedJson<ResponsesRequest>,
 ) -> Response {
     let model = body.model.clone();
+    if let Some(refused) = tenant_model_refusal(&state, &tenant_meta, &model) {
+        return refused;
+    }
     cancel
         .guard(
             state
@@ -307,6 +351,12 @@ async fn v1_interactions(
     ValidatedJson(body): ValidatedJson<InteractionsRequest>,
 ) -> Response {
     let model_id = body.model.clone().or_else(|| body.agent.clone());
+    if let Some(refused) = model_id
+        .as_deref()
+        .and_then(|model| tenant_model_refusal(&state, &tenant_meta, model))
+    {
+        return refused;
+    }
     cancel
         .guard(state.router.route_interactions(
             Some(&headers),
@@ -325,6 +375,9 @@ async fn v1_decisions(
     ValidatedJson(body): ValidatedJson<DecisionsRequest>,
 ) -> Response {
     let model = body.model.clone();
+    if let Some(refused) = tenant_model_refusal(&state, &tenant_meta, &model) {
+        return refused;
+    }
     cancel
         .guard(
             state
@@ -342,6 +395,9 @@ async fn v1_systemone(
     ValidatedJson(body): ValidatedJson<SystemOneRequest>,
 ) -> Response {
     let model = body.model.clone();
+    if let Some(refused) = tenant_model_refusal(&state, &tenant_meta, &model) {
+        return refused;
+    }
     cancel
         .guard(
             state
@@ -359,6 +415,9 @@ async fn v1_embeddings(
     Json(body): Json<EmbeddingRequest>,
 ) -> Response {
     let model = body.model.clone();
+    if let Some(refused) = tenant_model_refusal(&state, &tenant_meta, &model) {
+        return refused;
+    }
     cancel
         .guard(
             state
@@ -457,6 +516,9 @@ async fn v1_messages(
         return refused;
     }
     let model = body.model.clone();
+    if let Some(refused) = tenant_model_refusal(&state, &tenant_meta, &model) {
+        return refused;
+    }
     cancel
         .guard(
             state
@@ -477,6 +539,9 @@ async fn v1_messages_count_tokens(
         return refused;
     }
     let model = body.model.clone();
+    if let Some(refused) = tenant_model_refusal(&state, &tenant_meta, &model) {
+        return refused;
+    }
     cancel
         .guard(
             state
@@ -494,6 +559,9 @@ async fn v1_classify(
     Json(body): Json<ClassifyRequest>,
 ) -> Response {
     let model = body.model.clone();
+    if let Some(refused) = tenant_model_refusal(&state, &tenant_meta, &model) {
+        return refused;
+    }
     cancel
         .guard(
             state
@@ -510,6 +578,9 @@ async fn v1_audio_transcriptions(
     cancel: middleware::scheduler::PreemptionGuard,
     AudioTranscriptionMultipart { request, audio }: AudioTranscriptionMultipart,
 ) -> Response {
+    if let Some(refused) = tenant_model_refusal(&state, &tenant_meta, &request.model) {
+        return refused;
+    }
     cancel
         .guard(state.router.route_audio_transcriptions(
             Some(&headers),
@@ -723,17 +794,62 @@ async fn v1_conversations_delete_item(
 async fn v1_realtime_webrtc(
     State(state): State<Arc<AppState>>,
     Query(params): Query<RealtimeQueryParams>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     req: Request,
 ) -> Response {
     // Model may come from query param (application/sdp) or session body
     // (multipart/form-data). Let the handler validate per content type.
     let model = params.model.unwrap_or_default();
-    state.router.route_realtime_webrtc(req, &model).await
+    let Some(policy) = state.context.tenant_model_policy.as_ref() else {
+        return state.router.route_realtime_webrtc(req, &model).await;
+    };
+    // Under a policy the call is held on the model it names, wherever it
+    // names it: the query first, as before, then the body, read and parsed
+    // here as the router parses it, so a multipart call cannot name one
+    // model in the query and another in its session part. The parse errors
+    // are the router's own.
+    if !model.is_empty() {
+        if let Some(refused) = tenant_model_refusal(&state, &tenant_meta, &model) {
+            return refused;
+        }
+    }
+    let (parts, body) = req.into_parts();
+    let body = match axum::body::to_bytes(body, WEBRTC_REQUEST_BODY_LIMIT).await {
+        Ok(body) => body,
+        Err(e) => {
+            if std::error::Error::source(&e)
+                .and_then(|s| s.downcast_ref::<http_body_util::LengthLimitError>())
+                .is_some()
+            {
+                return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+            }
+            return route_error::bad_request("invalid_body", format!("Failed to read body: {e}"));
+        }
+    };
+    let parsed = match parse_webrtc_request(&parts, &body, &model).await {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    if let Some(refused) = policy.refusal(
+        tenant_meta.tenant_key(),
+        &parsed.model,
+        &state.context.worker_registry,
+    ) {
+        return refused;
+    }
+    state
+        .router
+        .route_realtime_webrtc(
+            Request::from_parts(parts, axum::body::Body::from(body)),
+            &model,
+        )
+        .await
 }
 
 async fn v1_realtime_ws(
     State(state): State<Arc<AppState>>,
     Query(params): Query<RealtimeQueryParams>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     req: Request,
 ) -> Response {
     let model = match params.model {
@@ -746,14 +862,25 @@ async fn v1_realtime_ws(
                 .into_response();
         }
     };
+    if let Some(refused) = tenant_model_refusal(&state, &tenant_meta, &model) {
+        return refused;
+    }
     state.router.route_realtime_ws(req, &model).await
 }
 
 async fn v1_realtime_session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     ValidatedJson(body): ValidatedJson<RealtimeSessionCreateRequest>,
 ) -> Response {
+    if let Some(refused) = body
+        .model
+        .as_deref()
+        .and_then(|model| tenant_model_refusal(&state, &tenant_meta, model))
+    {
+        return refused;
+    }
     state
         .router
         .route_realtime_session(Some(&headers), &body)
@@ -763,8 +890,17 @@ async fn v1_realtime_session(
 async fn v1_realtime_client_secret(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     ValidatedJson(body): ValidatedJson<RealtimeClientSecretCreateRequest>,
 ) -> Response {
+    if let Some(refused) = body
+        .session
+        .model
+        .as_deref()
+        .and_then(|model| tenant_model_refusal(&state, &tenant_meta, model))
+    {
+        return refused;
+    }
     state
         .router
         .route_realtime_client_secret(Some(&headers), &body)
@@ -774,8 +910,16 @@ async fn v1_realtime_client_secret(
 async fn v1_realtime_transcription_session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     ValidatedJson(body): ValidatedJson<RealtimeTranscriptionSessionCreateRequest>,
 ) -> Response {
+    if let Some(refused) = body
+        .model
+        .as_deref()
+        .and_then(|model| tenant_model_refusal(&state, &tenant_meta, model))
+    {
+        return refused;
+    }
     state
         .router
         .route_realtime_transcription_session(Some(&headers), &body)

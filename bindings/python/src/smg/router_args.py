@@ -597,6 +597,8 @@ class RouterArgs:
     tenant_api_keys: list[tuple] = dataclasses.field(default_factory=list)
     # The tenant header trust_tenant_header reads
     tenant_header_name: str = "x-smg-tenant-id"
+    # Path to the per-tenant model allow-list YAML (--tenant-model-policy-config)
+    tenant_model_policy_config: str | None = None
     # Per-tenant token/request rate limiting
     tenant_rate_limit_config: str | None = None
     tenant_rate_limit_enabled: bool = False
@@ -744,6 +746,9 @@ class RouterArgs:
         )
         tenant_rate_limit_group = parser.add_argument_group(
             "Tenant Rate Limit", "Per-tenant token and request rate limiting"
+        )
+        tenant_model_policy_group = parser.add_argument_group(
+            "Tenant Model Policy", "Per-tenant model allow-list"
         )
 
         if use_router_prefix:
@@ -2097,6 +2102,22 @@ class RouterArgs:
             help=(
                 "Path to the tenant-rate-limit YAML. Required when"
                 " --tenant-rate-limit-enabled is set."
+            ),
+        )
+
+        # Tenant model policy configuration
+        tenant_model_policy_group.add_argument(
+            f"--{prefix}tenant-model-policy-config",
+            type=str,
+            default=None,
+            help=(
+                "Path to the per-tenant model allow-list YAML: a default policy and"
+                " per-tenant lists of model patterns (exact ids, 'prefix*', or '*'),"
+                " keyed by canonical tenant key (auth:<tenant_id> of a tenant API key,"
+                " header:<id> of the trusted tenant header). A request for a model"
+                " outside its tenant's list answers the 404 of an unknown model, and"
+                " /v1/models lists the allowed subset. Unset (default): every tenant"
+                " may name every model."
             ),
         )
 

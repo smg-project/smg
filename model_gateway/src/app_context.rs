@@ -34,6 +34,7 @@ use crate::{
             utils::Names,
         },
     },
+    tenant_model_policy::TenantModelPolicy,
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
     worker::{
         http_client::build_client, liveness, KvEventMonitor, PrefillAdmission,
@@ -69,6 +70,10 @@ pub struct AppContext {
     /// The serving auth layer and the `/v1/models` BYOK short-circuit both
     /// read this set, so they cannot drift apart.
     pub gateway_auth: AuthConfig,
+    /// The per-tenant model allow-list, compiled once from
+    /// `router_config.tenant_model_policy_config`; `None` without one, when
+    /// every tenant may name every model.
+    pub tenant_model_policy: Option<Arc<TenantModelPolicy>>,
     pub rate_limiter: Option<Arc<TokenBucket>>,
     pub rate_limit_manager: Option<Arc<RateLimitManager>>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
@@ -523,6 +528,10 @@ impl AppContextBuilder {
             router_config.api_key.clone(),
             &router_config.tenant_api_keys,
         );
+        let tenant_model_policy =
+            TenantModelPolicy::from_config(&router_config).map_err(|reason| {
+                AppContextBuildError::InvalidConfig(format!("tenant_model_policy_config: {reason}"))
+            })?;
 
         let rl = crate::rl_adapter::build_rl_state(
             &worker_registry,
@@ -532,6 +541,7 @@ impl AppContextBuilder {
 
         Ok(AppContext {
             gateway_auth,
+            tenant_model_policy,
             client: self
                 .client
                 .ok_or(AppContextBuildError::MissingField("client"))?,

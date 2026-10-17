@@ -59,7 +59,7 @@ use crate::{
             body_policy::{
                 decide_body_path, BodyPath, BodyPathInputs, BODY_PATH_BUFFERED, BODY_PATH_STREAMED,
                 REASON_MODEL_AMBIGUOUS, REASON_MODEL_SELECTION, REASON_NO_AVAILABLE_WORKER,
-                REASON_WORKER_MUTATES_BODY,
+                REASON_TENANT_MODEL_POLICY, REASON_WORKER_MUTATES_BODY,
             },
             decisions::{SglangDecisionAdapter, UPSTREAM_ROUTE},
             header_utils, overload,
@@ -98,7 +98,7 @@ use crate::{
 };
 
 /// Max body size for a WebRTC `/v1/realtime/calls` SDP offer (10 MiB).
-const WEBRTC_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
+pub(crate) const WEBRTC_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
 
 /// Error codes for streamed-body aborts the client caused. They carry no
 /// worker verdict: recording a circuit-breaker sample for them would let slow
@@ -2166,6 +2166,12 @@ pub async fn stream_eligible_request_bodies(
     };
     if let BodyPolicy::MustBuffer(reason) = state.router.request_body_policy() {
         Metrics::record_request_body_path(BODY_PATH_BUFFERED, reason);
+        return next.run(req).await;
+    }
+    // A tenant model policy is held on the model the body names, by the
+    // handlers: a body forwarded unread would carry a held model past it.
+    if state.context.tenant_model_policy.is_some() {
+        Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_TENANT_MODEL_POLICY);
         return next.run(req).await;
     }
     // ForwardCapable: resolve the concrete regular router behind an optional

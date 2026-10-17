@@ -466,6 +466,16 @@ pub struct RouterConfig {
     /// `tenant_rate_limit_enabled` is true.
     #[serde(default)]
     pub tenant_rate_limit_config: Option<String>,
+    /// Path to the per-tenant model allow-list YAML: a default policy and
+    /// per-tenant lists of model patterns (exact ids, `prefix*`, or `*`),
+    /// keyed by canonical tenant key. Unset (default): every tenant may name
+    /// every model and `/v1/models` lists the whole inventory. Set, a file
+    /// that cannot be read, parsed or validated is a configuration error
+    /// (`ConfigValidator`); a request for a model outside its tenant's list
+    /// answers the 404 of an unknown model and `/v1/models` lists the
+    /// allowed subset (see `tenant_model_policy`).
+    #[serde(default)]
+    pub tenant_model_policy_config: Option<String>,
     pub cors_allowed_origins: Vec<String>,
     pub retry: RetryConfig,
     pub circuit_breaker: CircuitBreakerConfig,
@@ -1830,6 +1840,7 @@ impl Default for RouterConfig {
             ),
             tenant_rate_limit_enabled: false,
             tenant_rate_limit_config: None,
+            tenant_model_policy_config: None,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),

@@ -15,6 +15,7 @@ pub mod routers;
 pub mod server;
 pub mod service_discovery;
 pub mod tenant;
+pub mod tenant_model_policy;
 pub mod tls;
 pub mod version;
 pub mod wasm;
