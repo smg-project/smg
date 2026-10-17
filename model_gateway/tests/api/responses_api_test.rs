@@ -10,7 +10,7 @@ use openai_protocol::{
     },
 };
 use smg::{
-    config::RouterConfig,
+    config::{RouterConfig, RouterConfigBuilder},
     endpoints::conversations,
     routers::RouterFactory,
     tenant::{RouteRequestMeta, TenantKey},
@@ -26,6 +26,41 @@ const TEST_INTERNAL_MCP_ERROR_MARKER: &str = "internal-mcp-failure-marker";
 
 fn test_tenant_meta() -> smg::middleware::TenantRequestMeta {
     RouteRequestMeta::new(TenantKey::from("test-tenant"))
+}
+
+/// What every router of these tests shares: OpenAI mode over `worker_urls`,
+/// the random policy, the loopback host on an ephemeral port, an 8 MiB
+/// payload cap, a one-minute request timeout, a one-second startup check
+/// interval and a five-second queue timeout.
+fn router_builder(worker_urls: Vec<String>) -> RouterConfigBuilder {
+    RouterConfig::builder()
+        .openai_mode(worker_urls)
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .queue_timeout_secs(5)
+}
+
+/// The router of a test that drives a mock worker at `worker_url`: five
+/// seconds for the worker to come up, 32 requests in flight.
+fn worker_router_config(worker_url: String) -> RouterConfig {
+    router_builder(vec![worker_url])
+        .worker_startup_timeout_secs(5)
+        .max_concurrent_requests(32)
+        .build_unchecked()
+}
+
+/// The router of the conversation tests: a worker address nothing calls, one
+/// second for it to come up, 8 requests in flight.
+fn conversation_router_config() -> RouterConfig {
+    router_builder(vec!["http://localhost".to_string()])
+        .worker_startup_timeout_secs(1)
+        .max_concurrent_requests(8)
+        .build_unchecked()
 }
 
 #[tokio::test]
@@ -52,20 +87,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    // Build router config (HTTP OpenAI mode)
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     // Create router and context with MCP config from file
     let ctx =
@@ -258,19 +280,7 @@ async fn test_non_streaming_mcp_e2e_accepts_forwardable_request_headers() {
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     let ctx =
         crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
@@ -407,19 +417,7 @@ async fn test_non_streaming_mcp_returns_approval_request_when_required() {
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     let ctx =
         crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
@@ -542,19 +540,7 @@ async fn test_final_response_hides_internal_mcp_trace_items() {
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     let ctx =
         crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
@@ -676,19 +662,7 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     let ctx =
         crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
@@ -859,19 +833,7 @@ async fn test_final_response_hides_internal_mcp_error_details() {
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     let ctx =
         crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
@@ -959,19 +921,7 @@ async fn test_final_response_hides_internal_mcp_error_details() {
 #[tokio::test]
 async fn test_conversations_crud_basic() {
     // Router in OpenAI mode (no actual upstream calls in these tests)
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec!["http://localhost".to_string()])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(1)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(8)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = conversation_router_config();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
@@ -1029,24 +979,6 @@ async fn test_conversations_crud_basic() {
     // Get again -> 404
     let not_found = conversations::get_conversation(&ctx.conversation_storage, None, conv_id).await;
     assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
-}
-
-/// The router configuration of the conversation tests: OpenAI mode, no
-/// upstream calls, the memory storage backends.
-fn conversation_router_config() -> RouterConfig {
-    RouterConfig::builder()
-        .openai_mode(vec!["http://localhost".to_string()])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(1)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(8)
-        .queue_timeout_secs(5)
-        .build_unchecked()
 }
 
 /// The JSON body of a response that must be a 200.
@@ -1551,20 +1483,7 @@ async fn test_multi_turn_loop_with_mcp() {
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    // Build router config
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("info")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     let ctx = crate::common::create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
@@ -1717,19 +1636,7 @@ async fn test_max_tool_calls_limit() {
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("info")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     let ctx = crate::common::create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
@@ -1854,19 +1761,7 @@ async fn setup_streaming_mcp_test() -> (
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("info")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     let ctx =
         crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
@@ -2296,19 +2191,7 @@ async fn test_streaming_multi_turn_with_mcp() {
 #[tokio::test]
 async fn test_conversation_items_create_and_get() {
     // Test creating items and getting a specific item
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec!["http://localhost".to_string()])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(1)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(8)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = conversation_router_config();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
@@ -2413,19 +2296,7 @@ async fn items_of_one_add_call_are_listed_in_request_order(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Items that share a stamp are listed by their random ids, which is request order about
     // half of the time: twenty rounds, each with two items in one call and a third in the next.
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec!["http://localhost".to_string()])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(1)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(8)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = conversation_router_config();
     let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
@@ -2543,19 +2414,7 @@ async fn items_of_one_add_call_are_listed_in_request_order(
 #[tokio::test]
 async fn a_reference_to_an_item_already_in_the_conversation_is_refused(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec!["http://localhost".to_string()])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(1)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(8)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = conversation_router_config();
     let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
@@ -2667,19 +2526,7 @@ async fn a_reference_to_an_item_already_in_the_conversation_is_refused(
 #[tokio::test]
 async fn test_conversation_items_delete() {
     // Test deleting an item from a conversation
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec!["http://localhost".to_string()])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(1)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(8)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = conversation_router_config();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
@@ -2780,19 +2627,7 @@ async fn test_conversation_items_delete() {
 #[tokio::test]
 async fn test_conversation_items_max_limit() {
     // Test that creating > 20 items returns error
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec!["http://localhost".to_string()])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(1)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(8)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = conversation_router_config();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
@@ -2838,19 +2673,7 @@ async fn test_conversation_items_max_limit() {
 #[tokio::test]
 async fn test_conversation_items_unsupported_type() {
     // Test that unsupported item types return error
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec!["http://localhost".to_string()])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(1)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(8)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = conversation_router_config();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
@@ -2895,19 +2718,7 @@ async fn test_conversation_items_unsupported_type() {
 #[tokio::test]
 async fn test_conversation_items_multi_conversation_sharing() {
     // Test that items can be shared across conversations via soft delete
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec!["http://localhost".to_string()])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(1)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(8)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = conversation_router_config();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");

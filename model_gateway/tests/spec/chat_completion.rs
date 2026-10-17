@@ -9,6 +9,44 @@ use openai_protocol::{
 use serde_json::json;
 use validator::Validate;
 
+/// A function tool named `name` with an empty parameter schema.
+fn function_tool(name: &str, description: &str) -> Tool {
+    Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: name.to_string(),
+            description: Some(description.to_string()),
+            parameters: json!({}),
+            strict: None,
+            extra: Default::default(),
+        },
+    }
+}
+
+/// A request with one user message, `tools` and `tool_choice`: what the
+/// tool-choice rules look at.
+fn tool_choice_request(tools: Vec<Tool>, tool_choice: ToolChoice) -> ChatCompletionRequest {
+    ChatCompletionRequest {
+        model: "test-model".to_string(),
+        messages: vec![ChatMessage::User {
+            ext: Default::default(),
+            content: MessageContent::Text("hello".to_string()),
+            name: None,
+        }],
+        tools: Some(tools),
+        tool_choice: Some(tool_choice),
+        ..Default::default()
+    }
+}
+
+/// `tool_choice_request` over the one `get_weather` tool.
+fn weather_tool_request(tool_choice: ToolChoice) -> ChatCompletionRequest {
+    tool_choice_request(
+        vec![function_tool("get_weather", "Get weather")],
+        tool_choice,
+    )
+}
+
 // Deprecated fields normalization tests
 
 #[test]
@@ -354,31 +392,12 @@ fn test_stream_options_continuous_usage_stats_valid() {
 // Tool choice validation tests
 #[test]
 fn test_tool_choice_function_not_found() {
-    let req = ChatCompletionRequest {
-        model: "test-model".to_string(),
-        messages: vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Text("hello".to_string()),
-            name: None,
-        }],
-        tools: Some(vec![Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "get_weather".to_string(),
-                description: Some("Get weather".to_string()),
-                parameters: json!({}),
-                strict: None,
-                extra: Default::default(),
-            },
-        }]),
-        tool_choice: Some(ToolChoice::Function {
-            function: FunctionChoice {
-                name: "nonexistent_function".to_string(),
-            },
-            tool_type: "function".to_string(),
-        }),
-        ..Default::default()
-    };
+    let req = weather_tool_request(ToolChoice::Function {
+        function: FunctionChoice {
+            name: "nonexistent_function".to_string(),
+        },
+        tool_type: "function".to_string(),
+    });
 
     let result = req.validate();
     assert!(result.is_err(), "Should reject nonexistent function name");
@@ -391,31 +410,12 @@ fn test_tool_choice_function_not_found() {
 
 #[test]
 fn test_tool_choice_function_exists_valid() {
-    let req = ChatCompletionRequest {
-        model: "test-model".to_string(),
-        messages: vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Text("hello".to_string()),
-            name: None,
-        }],
-        tools: Some(vec![Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "get_weather".to_string(),
-                description: Some("Get weather".to_string()),
-                parameters: json!({}),
-                strict: None,
-                extra: Default::default(),
-            },
-        }]),
-        tool_choice: Some(ToolChoice::Function {
-            function: FunctionChoice {
-                name: "get_weather".to_string(),
-            },
-            tool_type: "function".to_string(),
-        }),
-        ..Default::default()
-    };
+    let req = weather_tool_request(ToolChoice::Function {
+        function: FunctionChoice {
+            name: "get_weather".to_string(),
+        },
+        tool_type: "function".to_string(),
+    });
 
     let result = req.validate();
     assert!(result.is_ok(), "Should accept existing function name");
@@ -423,32 +423,13 @@ fn test_tool_choice_function_exists_valid() {
 
 #[test]
 fn test_tool_choice_allowed_tools_invalid_mode() {
-    let req = ChatCompletionRequest {
-        model: "test-model".to_string(),
-        messages: vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Text("hello".to_string()),
-            name: None,
+    let req = weather_tool_request(ToolChoice::AllowedTools {
+        mode: "invalid_mode".to_string(),
+        tools: vec![ToolReference::Function {
+            name: "get_weather".to_string(),
         }],
-        tools: Some(vec![Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "get_weather".to_string(),
-                description: Some("Get weather".to_string()),
-                parameters: json!({}),
-                strict: None,
-                extra: Default::default(),
-            },
-        }]),
-        tool_choice: Some(ToolChoice::AllowedTools {
-            mode: "invalid_mode".to_string(),
-            tools: vec![ToolReference::Function {
-                name: "get_weather".to_string(),
-            }],
-            tool_type: "allowed_tools".to_string(),
-        }),
-        ..Default::default()
-    };
+        tool_type: "allowed_tools".to_string(),
+    });
 
     let result = req.validate();
     assert!(result.is_err(), "Should reject invalid mode");
@@ -461,32 +442,13 @@ fn test_tool_choice_allowed_tools_invalid_mode() {
 
 #[test]
 fn test_tool_choice_allowed_tools_valid_mode_auto() {
-    let req = ChatCompletionRequest {
-        model: "test-model".to_string(),
-        messages: vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Text("hello".to_string()),
-            name: None,
+    let req = weather_tool_request(ToolChoice::AllowedTools {
+        mode: "auto".to_string(),
+        tools: vec![ToolReference::Function {
+            name: "get_weather".to_string(),
         }],
-        tools: Some(vec![Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "get_weather".to_string(),
-                description: Some("Get weather".to_string()),
-                parameters: json!({}),
-                strict: None,
-                extra: Default::default(),
-            },
-        }]),
-        tool_choice: Some(ToolChoice::AllowedTools {
-            mode: "auto".to_string(),
-            tools: vec![ToolReference::Function {
-                name: "get_weather".to_string(),
-            }],
-            tool_type: "allowed_tools".to_string(),
-        }),
-        ..Default::default()
-    };
+        tool_type: "allowed_tools".to_string(),
+    });
 
     let result = req.validate();
     assert!(result.is_ok(), "Should accept 'auto' mode");
@@ -494,32 +456,13 @@ fn test_tool_choice_allowed_tools_valid_mode_auto() {
 
 #[test]
 fn test_tool_choice_allowed_tools_valid_mode_required() {
-    let req = ChatCompletionRequest {
-        model: "test-model".to_string(),
-        messages: vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Text("hello".to_string()),
-            name: None,
+    let req = weather_tool_request(ToolChoice::AllowedTools {
+        mode: "required".to_string(),
+        tools: vec![ToolReference::Function {
+            name: "get_weather".to_string(),
         }],
-        tools: Some(vec![Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "get_weather".to_string(),
-                description: Some("Get weather".to_string()),
-                parameters: json!({}),
-                strict: None,
-                extra: Default::default(),
-            },
-        }]),
-        tool_choice: Some(ToolChoice::AllowedTools {
-            mode: "required".to_string(),
-            tools: vec![ToolReference::Function {
-                name: "get_weather".to_string(),
-            }],
-            tool_type: "allowed_tools".to_string(),
-        }),
-        ..Default::default()
-    };
+        tool_type: "allowed_tools".to_string(),
+    });
 
     let result = req.validate();
     assert!(result.is_ok(), "Should accept 'required' mode");
@@ -527,32 +470,13 @@ fn test_tool_choice_allowed_tools_valid_mode_required() {
 
 #[test]
 fn test_tool_choice_allowed_tools_tool_not_found() {
-    let req = ChatCompletionRequest {
-        model: "test-model".to_string(),
-        messages: vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Text("hello".to_string()),
-            name: None,
+    let req = weather_tool_request(ToolChoice::AllowedTools {
+        mode: "auto".to_string(),
+        tools: vec![ToolReference::Function {
+            name: "nonexistent_tool".to_string(),
         }],
-        tools: Some(vec![Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "get_weather".to_string(),
-                description: Some("Get weather".to_string()),
-                parameters: json!({}),
-                strict: None,
-                extra: Default::default(),
-            },
-        }]),
-        tool_choice: Some(ToolChoice::AllowedTools {
-            mode: "auto".to_string(),
-            tools: vec![ToolReference::Function {
-                name: "nonexistent_tool".to_string(),
-            }],
-            tool_type: "allowed_tools".to_string(),
-        }),
-        ..Default::default()
-    };
+        tool_type: "allowed_tools".to_string(),
+    });
 
     let result = req.validate();
     assert!(result.is_err(), "Should reject nonexistent tool name");
@@ -565,36 +489,12 @@ fn test_tool_choice_allowed_tools_tool_not_found() {
 
 #[test]
 fn test_tool_choice_allowed_tools_multiple_tools_valid() {
-    let req = ChatCompletionRequest {
-        model: "test-model".to_string(),
-        messages: vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Text("hello".to_string()),
-            name: None,
-        }],
-        tools: Some(vec![
-            Tool {
-                tool_type: "function".to_string(),
-                function: Function {
-                    name: "get_weather".to_string(),
-                    description: Some("Get weather".to_string()),
-                    parameters: json!({}),
-                    strict: None,
-                    extra: Default::default(),
-                },
-            },
-            Tool {
-                tool_type: "function".to_string(),
-                function: Function {
-                    name: "get_time".to_string(),
-                    description: Some("Get time".to_string()),
-                    parameters: json!({}),
-                    strict: None,
-                    extra: Default::default(),
-                },
-            },
-        ]),
-        tool_choice: Some(ToolChoice::AllowedTools {
+    let req = tool_choice_request(
+        vec![
+            function_tool("get_weather", "Get weather"),
+            function_tool("get_time", "Get time"),
+        ],
+        ToolChoice::AllowedTools {
             mode: "auto".to_string(),
             tools: vec![
                 ToolReference::Function {
@@ -605,9 +505,8 @@ fn test_tool_choice_allowed_tools_multiple_tools_valid() {
                 },
             ],
             tool_type: "allowed_tools".to_string(),
-        }),
-        ..Default::default()
-    };
+        },
+    );
 
     let result = req.validate();
     assert!(result.is_ok(), "Should accept all valid tool references");
@@ -615,36 +514,12 @@ fn test_tool_choice_allowed_tools_multiple_tools_valid() {
 
 #[test]
 fn test_tool_choice_allowed_tools_one_invalid_among_valid() {
-    let req = ChatCompletionRequest {
-        model: "test-model".to_string(),
-        messages: vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Text("hello".to_string()),
-            name: None,
-        }],
-        tools: Some(vec![
-            Tool {
-                tool_type: "function".to_string(),
-                function: Function {
-                    name: "get_weather".to_string(),
-                    description: Some("Get weather".to_string()),
-                    parameters: json!({}),
-                    strict: None,
-                    extra: Default::default(),
-                },
-            },
-            Tool {
-                tool_type: "function".to_string(),
-                function: Function {
-                    name: "get_time".to_string(),
-                    description: Some("Get time".to_string()),
-                    parameters: json!({}),
-                    strict: None,
-                    extra: Default::default(),
-                },
-            },
-        ]),
-        tool_choice: Some(ToolChoice::AllowedTools {
+    let req = tool_choice_request(
+        vec![
+            function_tool("get_weather", "Get weather"),
+            function_tool("get_time", "Get time"),
+        ],
+        ToolChoice::AllowedTools {
             mode: "auto".to_string(),
             tools: vec![
                 ToolReference::Function {
@@ -655,9 +530,8 @@ fn test_tool_choice_allowed_tools_one_invalid_among_valid() {
                 },
             ],
             tool_type: "allowed_tools".to_string(),
-        }),
-        ..Default::default()
-    };
+        },
+    );
 
     let result = req.validate();
     assert!(
