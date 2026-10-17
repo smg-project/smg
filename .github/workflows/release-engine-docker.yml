@@ -2,9 +2,8 @@ name: Release SMG+Engine Docker Image
 
 run-name: >-
   SMG+${{ inputs.engine || 'all engines' }} |
-  base=${{ inputs.base_image_ref || (github.event_name == 'push' && 'release bases' || 'engine default') }} |
+  base=${{ inputs.base_image_ref || (inputs.source_build && 'source build') || (github.event_name == 'push' && 'release bases' || 'engine default') }} |
   engine=${{ inputs.engine_commit || 'latest' }} |
-  ${{ inputs.source_build && 'source build |' || '' }}
   smg=${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'release tag' }} |
   ${{ github.event_name == 'pull_request' && 'dry-run |' || '' }}
   by @${{ github.actor }}
@@ -83,11 +82,14 @@ jobs:
           ENGINE: ${{ inputs.engine }}
           BASE_IMAGE_REF: ${{ inputs.base_image_ref }}
           ENGINE_REPO: ${{ inputs.engine_repo }}
+          ENGINE_COMMIT: ${{ inputs.engine_commit || 'latest' }}
           SOURCE_BUILD: ${{ inputs.source_build }}
         run: |
           # The release bases per engine; the first is the engine's default. An empty base means
           # the latest dated TokenSpeed nightly carrier (resolved by the build). source_build marks
-          # the engines the build can compile from their repository instead of pulling a base.
+          # the engines the build can compile from their repository instead of pulling a base; a
+          # source build's row carries the repository and the ref, so the table and this plan are
+          # the only places that decide which engine is built from source.
           engines='{
             "vllm": {"release_bases": ["vllm/vllm-openai:v0.31.0", "vllm/vllm-openai:v0.27.1", "vllm/vllm-openai:v0.26.0"]},
             "sglang": {"release_bases": ["lmsysorg/sglang:v0.5.21"]},
@@ -113,7 +115,8 @@ jobs:
                   echo "::error::source_build and base_image_ref exclude each other: the build makes the base"
                   exit 1
                 fi
-                rows=$(jq -c --arg engine "${ENGINE}" '[{engine: $engine, base_image: ""}]' <<< "${engines}")
+                rows=$(jq -c --arg engine "${ENGINE}" --arg repo "${ENGINE_REPO}" --arg ref "${ENGINE_COMMIT}" \
+                  '[{engine: $engine, base_image: "", source_build_repo: $repo, source_build_ref: $ref}]' <<< "${engines}")
               else
                 rows=$(jq -c --arg engine "${ENGINE}" --arg base "${BASE_IMAGE_REF}" \
                   '[{engine: $engine, base_image: (if $base == "" then .[$engine].release_bases[0] else $base end)}]' <<< "${engines}")
@@ -153,7 +156,7 @@ jobs:
       smg_repo: ${{ inputs.smg_repo || 'https://github.com/smg-project/smg' }}
       smg_commit: ${{ needs.plan.outputs.smg_commit }}
       tag: ${{ inputs.tag }}
-      source_build_repo: ${{ matrix.engine == 'trtllm' && inputs.engine_repo || '' }}
-      source_build_ref: ${{ matrix.engine == 'trtllm' && inputs.engine_commit || 'latest' }}
+      source_build_repo: ${{ matrix.source_build_repo || '' }}
+      source_build_ref: ${{ matrix.source_build_ref || 'latest' }}
       dry_run: ${{ github.event_name == 'pull_request' }}
     secrets: inherit
