@@ -99,6 +99,7 @@ benchmark/llava_bench/mme_pack
 *.jsonl
 # Parity fixtures recorded from transformers
 !crates/response_template/tests/fixtures/hf/*.jsonl
+!crates/symphony/tests/fixtures/slices/*.jsonl
 tmp*.txt
 
 # Torch Compile logs
