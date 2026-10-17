@@ -59,7 +59,7 @@ fn response_processor() -> ResponseProcessor {
     ResponseProcessor::new(
         ToolParserFactory::new(),
         ReasoningParserFactory::new(),
-        utils::ParserResolver::new(
+        utils::ParserResolver::with_flags(
             Arc::new(WorkerRegistry::new()),
             None,
             Some("qwen3".to_string()),

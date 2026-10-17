@@ -19,7 +19,7 @@
 //! the legacy parsers, which is the labels' way back for one model when its table misbehaves,
 //! `passthrough` among them (the legacy parsers then take the labels' names, and from the flags
 //! only names they read: a table's name or [`TEMPLATE_PARSER`] there is nothing to them,
-//! `ParserResolver::with_legacy_registries`); no name at all, or a reasoning name alone that no table answers to,
+//! `ParserResolver::new`); no name at all, or a reasoning name alone that no table answers to,
 //! other than `passthrough`, selects nothing. The names are checked at startup and at a worker's
 //! registration ([`check_names`]), which also says, once per model, when the registry's table
 //! sets the flags' choice aside ([`set_aside_by_the_registry`]). Every request read with `legacy`

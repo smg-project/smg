@@ -30,7 +30,7 @@ fn processor() -> StreamingProcessor {
     StreamingProcessor::new(
         ToolParserFactory::new(),
         ReasoningParserFactory::new(),
-        utils::ParserResolver::new(Arc::new(WorkerRegistry::new()), None, None),
+        utils::ParserResolver::with_flags(Arc::new(WorkerRegistry::new()), None, None),
         metrics_labels::BACKEND_PD,
     )
 }
