@@ -661,7 +661,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "needs a live engine on a local port; run with --ignored"]
     async fn test_sglang_http_metadata() {
         let labels =
             fetch_sglang_http_metadata(&crate::http_client::client(), "http://0.0.0.0:30000", None)
@@ -672,7 +672,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "needs a live engine on a local port; run with --ignored"]
     async fn test_vllm_http_metadata() {
         let labels =
             fetch_vllm_http_metadata(&crate::http_client::client(), "http://0.0.0.0:20000", None)
@@ -683,7 +683,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "needs a live engine on a local port; run with --ignored"]
     async fn test_sglang_grpc_metadata() {
         let (labels, _) = fetch_grpc_metadata("grpc://0.0.0.0:30001", "sglang")
             .await
@@ -693,7 +693,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "needs a live engine on a local port; run with --ignored"]
     async fn test_vllm_grpc_metadata() {
         let (labels, _) = fetch_grpc_metadata("grpc://0.0.0.0:20001", "vllm")
             .await
