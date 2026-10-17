@@ -676,7 +676,9 @@ pub(crate) enum AutoTag {
         parser: ParserChoice,
         names: Names,
         request: Arc<CreateMessageRequest>,
-        tools: Vec<Tool>,
+        /// The tools as the template declares them: the spec's own slice, shared, unless
+        /// `tool_choice` narrows it (then the narrowed list, owned here).
+        tools: Arc<[Tool]>,
         /// The prompt leaves the model inside its thought.
         reasoning_open: bool,
         /// The prompt continues the assistant's message.
@@ -3130,7 +3132,7 @@ mod tests {
                 parser: ParserChoice::Symphony,
                 names: names.clone(),
                 request: Arc::new(messages.clone()),
-                tools: tools(),
+                tools: tools().into(),
                 reasoning_open: true,
                 continues: false,
                 templates: Arc::clone(&templates),

@@ -1,6 +1,6 @@
 //! Message request building stage: Build proto GenerateRequest for message requests
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use async_trait::async_trait;
 use axum::response::Response;
@@ -208,15 +208,21 @@ impl BuildStage for MessageRequestBuildingStage {
                 )
             },
             || {
-                let tools = ctx
+                // The tag shares the spec's tools where `tool_choice` narrows
+                // nothing (the common case): no copy of the schemas on the
+                // first attempt; a narrowed list is the one the narrowing owns.
+                let tools: Arc<[_]> = ctx
                     .tokenizer_arc()
                     .map(|tokenizer| {
-                        utils::template_tools(
+                        match utils::template_tools(
                             &spec.chat_tools,
                             messages_request.tool_choice.as_ref(),
                             tokenizer.renderer_capabilities(),
-                        )
-                        .into_owned()
+                        ) {
+                            Cow::Owned(narrowed) => Arc::from(narrowed),
+                            Cow::Borrowed([]) => Arc::default(),
+                            Cow::Borrowed(_) => Arc::clone(&spec.chat_tools),
+                        }
                     })
                     .unwrap_or_default();
                 symphony::AutoTag::Messages {
