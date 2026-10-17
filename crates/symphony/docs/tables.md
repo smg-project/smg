@@ -402,7 +402,8 @@ What the table says:
   model's to write before them, as gpt-oss's analysis channel is: the template renders a thought
   only when the message has one, so the tags do not require it.
 
-What the table leaves open, for want of fixtures: the recorded sets, once bellwether has them;
+What the table leaves open: the Spark checkpoint's own recorded set, once bellwether has it (the
+table replays Muse Glimmer 30B's set, whose template writes the same turn of messages, bitwise);
 whether the model ever writes a message to a recipient the table has no row for (its text is
 framing today); and whether `commentary` should reach the client as content or as a channel of its
 own, which the API has no place for.
