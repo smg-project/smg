@@ -304,11 +304,12 @@ pub(crate) async fn prepare_chat_like(
                 multimodal_refs = Some(media_plan);
             } else {
                 // The dtype every worker the selection can pick reads image
-                // pixels in, when they agree and the one-pass write is opted
-                // in (`ONE_PASS_WIRE_ENV`): the preprocessor then writes it
-                // directly; otherwise `None`, and the write happens at
-                // assembly. Resolved over the pools of this pipeline's mode,
-                // the legs the pixels can reach, as the selection draws them.
+                // pixels in, when they agree (and the one-pass write is not
+                // switched off, `SMG_MM_ONE_PASS_WIRE=0`): the preprocessor
+                // then writes it directly; otherwise `None`, and the write
+                // happens at assembly. Resolved over the pools of this
+                // pipeline's mode, the legs the pixels can reach, as the
+                // selection draws them.
                 let image_wire_dtype = multimodal::mm_shared_image_wire_dtype_over(
                     &ctx.components.worker_registry,
                     model_id,

@@ -57,6 +57,9 @@ const ENV_LOG_MM_TIMING: &str = "SMG_LOG_MM_TIMING";
 /// not a legacy name: it is also how a worker's own media pipeline, which has
 /// no flags, is told (the worker reads it through [`mm_settings`]).
 const ENV_ALLOW_PRIVATE_MEDIA_HOSTS: &str = "SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS";
+/// The switch of the one-pass wire write, on by default; not a legacy name
+/// either: it is the way back to the two-pass write without a rebuild.
+const ENV_ONE_PASS_WIRE: &str = "SMG_MM_ONE_PASS_WIRE";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MultimodalSettings {
@@ -81,6 +84,11 @@ pub(crate) struct MultimodalSettings {
     /// link-local, private or otherwise non-public address; off, such URLs
     /// are refused before anything is connected.
     pub allow_private_media_hosts: Setting<bool>,
+    /// Whether the images of a request whose workers all read one wire dtype
+    /// are preprocessed straight into it, in one pass; off, every request
+    /// takes the two passes (the patch layout, then the write in the
+    /// worker's dtype at assembly). The bytes are the same either way.
+    pub one_pass_wire: Setting<bool>,
 }
 
 impl Default for MultimodalSettings {
@@ -94,6 +102,7 @@ impl Default for MultimodalSettings {
             log_mm_timing: Setting::from_default(false),
             allowed_media_domains: Setting::from_default(None),
             allow_private_media_hosts: Setting::from_default(false),
+            one_pass_wire: Setting::from_default(true),
         }
     }
 }
@@ -106,9 +115,10 @@ impl MultimodalSettings {
 
     /// Resolve with an explicit env reader, so tests never touch the process.
     ///
-    /// Every setting is flag > env > default through [`resolve`]; the three
-    /// env switches share one spelling ([`switch`]); an unreadable
-    /// `SMG_MM_PROCESSING` stops startup ([`processing_mode`]).
+    /// Every setting is flag > env > default through [`resolve`]; the env
+    /// switches share one spelling ([`switch`]; the one that is on by
+    /// default reads the off spellings too, [`two_way_switch`]); an
+    /// unreadable `SMG_MM_PROCESSING` stops startup ([`processing_mode`]).
     pub(crate) fn resolve_with(
         config: &RouterConfig,
         env: impl Fn(&str) -> Option<String>,
@@ -187,6 +197,16 @@ impl MultimodalSettings {
                 ENV_ALLOW_PRIVATE_MEDIA_HOSTS,
                 None,
             ),
+            // No flag and no deprecation line: a switch that is on by
+            // default, read both ways.
+            one_pass_wire: resolve(
+                None,
+                env_nonempty(ENV_ONE_PASS_WIRE),
+                ENV_ONE_PASS_WIRE,
+                None,
+                defaults.one_pass_wire,
+                two_way_switch,
+            ),
         })
     }
 }
@@ -245,11 +265,19 @@ fn resolve<T>(
 /// other spelling leaves it at its default without a word, as before (an
 /// operator's typo in a legacy switch is not an outage).
 fn switch(raw: &str) -> Option<bool> {
-    matches!(
-        raw.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-    .then_some(true)
+    two_way_switch(raw).filter(|&on| on)
+}
+
+/// A switch that is on by default reads the off spellings as well: `0`,
+/// `false`, `no` or `off` turn it off, the on spellings of [`switch`] turn
+/// it on, anything else leaves the default without a word, as [`switch`]
+/// does.
+fn two_way_switch(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 /// A numeric env value; one that is not a number is logged with its
@@ -348,6 +376,7 @@ mod tests {
         assert_eq!(settings, MultimodalSettings::default());
         assert_eq!(settings.processing.value, MmProcessingMode::Auto);
         assert_eq!(settings.processing.source, SettingSource::Default);
+        assert_eq!(settings.one_pass_wire, Setting::from_default(true));
     }
 
     #[test]
@@ -362,6 +391,7 @@ mod tests {
                 ("SMG_RDMA_SLOT_TTL_S", "600"),
                 ("SMG_LOG_MM_TIMING", "YES"),
                 ("SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS", "True"),
+                ("SMG_MM_ONE_PASS_WIRE", "off"),
             ]),
         )
         .unwrap();
@@ -375,6 +405,7 @@ mod tests {
         assert_eq!(settings.rdma_slot_ttl_s, from_env(Some(600)));
         assert_eq!(settings.log_mm_timing, from_env(true));
         assert_eq!(settings.allow_private_media_hosts, from_env(true));
+        assert_eq!(settings.one_pass_wire, from_env(false));
         // The allow-list is a flag only: nothing in the environment lists hosts.
         assert_eq!(settings.allowed_media_domains, Setting::from_default(None));
     }
@@ -508,10 +539,45 @@ mod tests {
                 ("SMG_RDMA_SLOT_TTL_S", "soon"),
                 ("SMG_LOG_MM_TIMING", "0"),
                 ("SMG_RDMA_LISTEN_IP", "   "),
+                ("SMG_MM_ONE_PASS_WIRE", "sometimes"),
             ]),
         )
         .unwrap();
         assert_eq!(settings, MultimodalSettings::default());
+    }
+
+    /// The one-pass wire write is on unless its switch says off: the off
+    /// spellings turn it off, the on spellings leave it on (an opt-in from
+    /// before it became the default still reads), anything else is the
+    /// default; and the switch reads its own name only.
+    #[test]
+    fn the_one_pass_wire_switch_is_on_by_default_and_reads_off_as_well() {
+        let config = RouterConfig::default();
+        let unset = MultimodalSettings::resolve_with(&config, no_env).unwrap();
+        assert_eq!(unset.one_pass_wire, Setting::from_default(true));
+        for (value, expected) in [
+            ("0", from_env(false)),
+            ("false", from_env(false)),
+            ("no", from_env(false)),
+            ("OFF", from_env(false)),
+            (" Off ", from_env(false)),
+            ("1", from_env(true)),
+            ("true", from_env(true)),
+            ("yes", from_env(true)),
+            ("ON", from_env(true)),
+            ("", Setting::from_default(true)),
+            ("sometimes", Setting::from_default(true)),
+        ] {
+            let settings =
+                MultimodalSettings::resolve_with(&config, env(&[("SMG_MM_ONE_PASS_WIRE", value)]))
+                    .unwrap();
+            assert_eq!(settings.one_pass_wire, expected, "{value:?}");
+            assert_eq!(
+                settings.pixel_rdma,
+                Setting::from_default(false),
+                "{value:?} reaches no other switch"
+            );
+        }
     }
 
     /// The env listener address keeps the lenient reading of the other env
@@ -545,9 +611,11 @@ mod tests {
         assert_eq!(settings.rdma_listen_ip, flag(Some("10.0.0.7".to_string())));
     }
 
-    /// The three env switches read one set of spellings: `1`, `true`, `yes`
-    /// and `on` in any case turn them on, anything else leaves the default.
-    /// (`SMG_MM_PIXEL_RDMA` took `1` and `true` only before.)
+    /// The three off-by-default env switches read one set of spellings: `1`,
+    /// `true`, `yes` and `on` in any case turn them on, anything else leaves
+    /// the default; the one-pass wire switch keeps its own default under
+    /// every one of their names. (`SMG_MM_PIXEL_RDMA` took `1` and `true`
+    /// only before.)
     #[test]
     fn every_env_switch_reads_the_same_spellings() {
         for name in [
@@ -591,6 +659,11 @@ mod tests {
                 assert_eq!(actual, expected, "{name}={value:?}");
                 // Each switch reads its own name only.
                 assert_eq!(others, [off, off], "{name}={value:?}");
+                assert_eq!(
+                    settings.one_pass_wire,
+                    Setting::from_default(true),
+                    "{name}={value:?}"
+                );
             }
         }
     }
