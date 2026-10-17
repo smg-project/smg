@@ -1884,8 +1884,10 @@ mod tests {
         assert_eq!(named_table(&pair(Some("pythonic"), Some("qwen3"))), None);
         // The older `llama` parser's format is the json table's.
         assert_eq!(named_table(&pair(Some("llama"), None)), Some(Table::Json));
-        // The older DeepSeek pairings read with the tables, the thought included: R1-0528 behind
-        // `deepseek` + `deepseek_r1` writes V3's calls after a thought, and the V3 table reads it.
+        // The older DeepSeek pairings read with the tables, the thought included: the R1 line
+        // behind `deepseek` + `deepseek_r1` writes V3's calls after a thought, and the V3 table
+        // reads it, whether the prompt opens the thought (the original R1's tail, below) or the
+        // model writes `<think>` itself (R1-0528).
         assert_eq!(
             named_table(&pair(Some("deepseek"), Some("deepseek_r1"))),
             Some(Table::DeepSeekV3)
