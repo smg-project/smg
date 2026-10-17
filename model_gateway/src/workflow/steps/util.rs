@@ -47,16 +47,16 @@ pub(crate) fn grpc_base_url(url: &str) -> String {
     }
 }
 
-fn http_health_url(url: &str) -> Result<String, String> {
+fn http_health_url(url: &str, endpoint: &str) -> Result<String, String> {
     match url_scheme(url).as_deref() {
-        Some("http") | Some("https") => Ok(format!("{}/health", url.trim_end_matches('/'))),
+        Some("http") | Some("https") => Ok(format!("{}{endpoint}", url.trim_end_matches('/'))),
         Some("grpc") | Some("grpcs") => Err(format!(
             "HTTP health check does not accept gRPC URL scheme: {url}"
         )),
         Some(scheme) => Err(format!(
             "HTTP health check does not accept URL scheme '{scheme}': {url}"
         )),
-        None => Ok(format!("http://{}/health", url.trim_end_matches('/'))),
+        None => Ok(format!("http://{}{endpoint}", url.trim_end_matches('/'))),
     }
 }
 
@@ -73,13 +73,14 @@ fn grpc_reachable_url(url: &str) -> Result<String, String> {
     }
 }
 
-/// Try HTTP health check (2xx response required).
+/// Try HTTP health check at the configured `endpoint` (2xx response required).
 pub(crate) async fn try_http_reachable(
     url: &str,
+    endpoint: &str,
     timeout_secs: u64,
     client: &Client,
 ) -> Result<(), String> {
-    let health_url = http_health_url(url)?;
+    let health_url = http_health_url(url, endpoint)?;
 
     client
         .get(&health_url)
@@ -231,23 +232,23 @@ mod tests {
     #[test]
     fn http_health_url_accepts_http_https_and_bare_urls() {
         assert_eq!(
-            http_health_url("http://localhost:30000").unwrap(),
+            http_health_url("http://localhost:30000", "/health").unwrap(),
             "http://localhost:30000/health"
         );
         assert_eq!(
-            http_health_url("https://example.com/").unwrap(),
-            "https://example.com/health"
+            http_health_url("https://example.com/", "/healthz").unwrap(),
+            "https://example.com/healthz"
         );
         assert_eq!(
-            http_health_url("localhost:30000").unwrap(),
+            http_health_url("localhost:30000", "/health").unwrap(),
             "http://localhost:30000/health"
         );
     }
 
     #[test]
     fn http_health_url_rejects_grpc_schemes() {
-        assert!(http_health_url("grpc://localhost:30001").is_err());
-        assert!(http_health_url("grpcs://localhost:30001").is_err());
+        assert!(http_health_url("grpc://localhost:30001", "/health").is_err());
+        assert!(http_health_url("grpcs://localhost:30001", "/health").is_err());
     }
 
     #[test]
