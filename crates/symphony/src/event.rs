@@ -474,6 +474,32 @@ mod tests {
         let other = serde_json::to_string(&FinishReason::Other("content_filter".into()))
             .expect("serializes");
         assert_eq!(other, r#"{"other":"content_filter"}"#);
+        // A malformed region's reason is the variant's name on the wire, and a sentence in prose.
+        let malformed = serde_json::to_string(&Event::Malformed {
+            text: Text::uncounted("<parameter"),
+            why: MalformedReason::TextBetweenTags,
+        })
+        .expect("serializes");
+        assert_eq!(
+            malformed,
+            r#"{"kind":"malformed","text":{"text":"<parameter","tokens":null},"why":"text_between_tags"}"#
+        );
+        let back: Event = serde_json::from_str(&malformed).expect("deserializes");
+        assert!(matches!(
+            back,
+            Event::Malformed {
+                why: MalformedReason::TextBetweenTags,
+                ..
+            }
+        ));
+        assert_eq!(
+            MalformedReason::TextBetweenTags.to_string(),
+            "text between a call's tags"
+        );
+        assert_eq!(
+            MalformedReason::BlockWithoutACompleteCall.sentence(),
+            "a tool-call block that closed without a complete call"
+        );
     }
 
     #[test]

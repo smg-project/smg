@@ -61,6 +61,17 @@ impl Spelling {
 /// The call's header up to the tool's name.
 const HEADER: &str = "call:";
 
+/// Why a header is no call's, from the name after `call:` when the header has the prefix: no
+/// prefix is text where a call should begin, an empty name a call without one, a name with
+/// whitespace in it text where the name should be.
+fn header_reason(name: Option<&str>) -> MalformedReason {
+    match name {
+        None => MalformedReason::TextBetweenCalls,
+        Some("") => MalformedReason::CallWithoutName,
+        Some(_) => MalformedReason::TextWhereTheNameShouldBe,
+    }
+}
+
 /// The events of one call, from the bytes after `<|tool_call>`.
 #[derive(Clone, Debug)]
 pub struct Assembler {
@@ -169,7 +180,7 @@ impl Assembler {
         } else if !terminal.is_empty() {
             out.push(Event::Malformed {
                 text: Text::uncounted(terminal),
-                why: MalformedReason::TextBetweenCalls,
+                why: MalformedReason::BlockWithoutACompleteCall,
             });
         }
         self.done = true;
@@ -229,10 +240,10 @@ impl Assembler {
                 });
                 self.stage = Stage::Key;
             }
-            _ => {
+            other => {
                 out.push(Event::Malformed {
                     text: Text::uncounted(&rest[..=brace]),
-                    why: MalformedReason::TextBetweenCalls,
+                    why: header_reason(other),
                 });
                 self.stage = Stage::Closed;
             }
@@ -458,10 +469,18 @@ impl Assembler {
     fn end(&mut self, out: &mut Events) {
         let held = std::mem::take(&mut self.carried);
         match self.stage {
-            Stage::Header if !held.is_empty() => out.push(Event::Malformed {
-                text: Text::uncounted(held),
-                why: MalformedReason::TextBetweenCalls,
-            }),
+            Stage::Header if !held.is_empty() => {
+                let why = match held.strip_prefix(HEADER).map(str::trim) {
+                    Some(name) if !name.is_empty() && !name.contains(char::is_whitespace) => {
+                        MalformedReason::NameWithoutACall
+                    }
+                    other => header_reason(other),
+                };
+                out.push(Event::Malformed {
+                    text: Text::uncounted(held),
+                    why,
+                });
+            }
             Stage::Key if !held.trim().is_empty() => out.push(Event::Malformed {
                 text: Text::uncounted(held),
                 why: MalformedReason::KeyCutShort,

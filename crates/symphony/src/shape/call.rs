@@ -154,9 +154,7 @@ impl JsonReader {
 
     /// Why text after the arguments that is not whitespace is malformed: for a value or an object
     /// that ended where its arguments were refused, its invalid arguments, since the text continues
-    /// them; else the reason the JSON syntax gives for text between a call's object and its closing
-    /// marker, for an object that names the call (one that closed after its arguments broke
-    /// included), or for text after the arguments.
+    /// them; else text after the arguments.
     fn surplus(&self) -> MalformedReason {
         let ended_where_refused = match self {
             Self::Json(arguments) => arguments.ended_where_refused(),
