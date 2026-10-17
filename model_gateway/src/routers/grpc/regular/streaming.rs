@@ -3200,33 +3200,13 @@ impl StreamingProcessor {
                         .await?;
                     }
 
-                    let finish_reason = if stopped_indices.contains(&index) {
-                        Some("stop".to_string())
-                    } else {
-                        let reason = complete.finish_reason();
-                        if reason.is_empty() || reason == "stop" {
-                            Some("stop".to_string())
-                        } else if reason == "length" || reason == "content_filter" {
-                            Some(reason.to_string())
-                        } else if let Ok(json) = serde_json::from_str::<Value>(reason) {
-                            json.get("type")
-                                .and_then(|v| v.as_str())
-                                .map(|t| match t {
-                                    "stop" | "length" | "content_filter" => t.to_string(),
-                                    other => {
-                                        warn!(unexpected_finish_reason = other, "Unmapped finish_reason type from backend, defaulting to stop");
-                                        "stop".to_string()
-                                    }
-                                })
-                                .or_else(|| Some("stop".to_string()))
-                        } else {
-                            warn!(
-                                unexpected_finish_reason = reason,
-                                "Unrecognized finish_reason from backend, defaulting to stop"
-                            );
-                            Some("stop".to_string())
-                        }
-                    };
+                    let finish_reason = Some(
+                        utils::completion_finish_reason(
+                            stopped_indices.contains(&index),
+                            complete.finish_reason(),
+                        )
+                        .to_string(),
+                    );
 
                     Self::send_completion_chunk(
                         tx,

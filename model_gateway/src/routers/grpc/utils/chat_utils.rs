@@ -1084,6 +1084,42 @@ pub(crate) fn generate_tool_call_id(
     }
 }
 
+/// The completion API's finish reason from the engine's: a local stop beats
+/// the engine's reason (which is "length" when stop strings are enforced
+/// gateway-side rather than by the backend); `stop`, `length` and
+/// `content_filter` pass, as a plain word or as a JSON object's `type`;
+/// anything else (an empty reason, an unmapped type, an unrecognized word)
+/// is `stop`, logged once with the raw value. One table for the streamed and
+/// the non-streamed completion.
+pub(crate) fn completion_finish_reason(local_stop: bool, engine: &str) -> &'static str {
+    if local_stop {
+        return "stop";
+    }
+    let known = |word: &str| -> Option<&'static str> {
+        match word {
+            "stop" => Some("stop"),
+            "length" => Some("length"),
+            "content_filter" => Some("content_filter"),
+            _ => None,
+        }
+    };
+    if let Some(reason) = known(engine) {
+        return reason;
+    }
+    if let Ok(json) = serde_json::from_str::<Value>(engine) {
+        if let Some(reason) = json.get("type").and_then(Value::as_str).and_then(known) {
+            return reason;
+        }
+    }
+    if !engine.is_empty() {
+        warn!(
+            unexpected_finish_reason = engine,
+            "Unrecognized finish_reason from backend, defaulting to stop"
+        );
+    }
+    "stop"
+}
+
 /// Parse finish_reason string into GenerateFinishReason enum
 ///
 /// Uses serde to deserialize the finish_reason, which handles all tagged variants automatically.
@@ -2686,6 +2722,30 @@ mod tests {
             assert!(message.contains("served-model"), "{message}");
             assert!(message.contains(reason), "{message}");
             assert!(!message.contains("/models/secret"), "{message}");
+        }
+    }
+
+    /// One table for both completion paths: the engine's word or its JSON
+    /// `type` when the API knows it, else "stop"; a local stop beats all.
+    #[test]
+    fn the_completion_finish_reason_is_one_table() {
+        for (local_stop, engine, expected) in [
+            (false, "", "stop"),
+            (false, "stop", "stop"),
+            (false, "length", "length"),
+            (false, "content_filter", "content_filter"),
+            (false, r#"{"type":"stop"}"#, "stop"),
+            (false, r#"{"type":"length","length":7}"#, "length"),
+            (false, r#"{"type":"content_filter"}"#, "content_filter"),
+            (false, r#"{"type":"abort"}"#, "stop"),
+            (false, "abort", "stop"),
+            (true, "length", "stop"),
+        ] {
+            assert_eq!(
+                completion_finish_reason(local_stop, engine),
+                expected,
+                "local_stop={local_stop} engine={engine:?}"
+            );
         }
     }
 }

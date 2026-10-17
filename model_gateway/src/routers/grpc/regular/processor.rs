@@ -1064,27 +1064,8 @@ impl ResponseProcessor {
                 total_spec_accepted += complete.spec_accepted_tokens();
                 total_spec_drafted += complete.spec_draft_tokens();
 
-                // A local stop-decoder match takes precedence over the engine's
-                // reason (which is "length" when stop strings are enforced
-                // gateway-side rather than by the backend).
-                let finish_reason = if stopped {
-                    Some("stop".to_string())
-                } else {
-                    let reason = complete.finish_reason();
-                    if reason.is_empty() {
-                        None
-                    } else if reason == "stop" || reason == "length" {
-                        Some(reason.to_string())
-                    } else if let Ok(json) = serde_json::from_str::<serde_json::Value>(reason) {
-                        json.get("type").and_then(|v| v.as_str()).map(|s| match s {
-                            "length" => "length".to_string(),
-                            "stop" => "stop".to_string(),
-                            other => other.to_string(),
-                        })
-                    } else {
-                        Some(reason.to_string())
-                    }
-                };
+                let finish_reason =
+                    utils::completion_finish_reason(stopped, complete.finish_reason());
 
                 let matched_stop = matched_stop_value(stop_decoder, &complete);
 
@@ -1107,7 +1088,7 @@ impl ResponseProcessor {
                     text,
                     index: index_offset + i as u32,
                     logprobs: None, // TODO: wire legacy LogProbs from backend token_logprobs
-                    finish_reason: finish_reason.or_else(|| Some("stop".to_string())),
+                    finish_reason: Some(finish_reason.to_string()),
                     matched_stop,
                 });
             }
