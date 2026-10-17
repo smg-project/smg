@@ -979,6 +979,13 @@ def test_launch_headless_engine_spawns_a_fresh_interpreter(monkeypatch):
     assert engine.pid == 7
 
 
+# The fake cores' pids lie above the kernel's PID_MAX_LIMIT (2^22): never a
+# live process on the test host, so the process-tree passes over the fakes
+# (at construction, on poll, before a kill) find nothing real to record, and
+# nothing real is signalled when a fake group is killed.
+_FAKE_CORE_PID = 4_194_304 + 1000
+
+
 class _FakeCore:
     """A `multiprocessing`-shaped engine-core process the fake manager started."""
 
@@ -1009,7 +1016,9 @@ class _FakeManager:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.started_in = os.getpid()
-        self.processes = [_FakeCore(1000 + i) for i in range(kwargs["local_engine_count"])]
+        self.processes = [
+            _FakeCore(_FAKE_CORE_PID + i) for i in range(kwargs["local_engine_count"])
+        ]
         self.events: list[str] = []
         _FakeManager.instances.append(self)
 
@@ -1113,7 +1122,11 @@ def test_launch_engine_cores_builds_the_manager_in_this_process_as_run_headless_
     ((config_args, usage_context, headless),) = recorded["configs"]
     assert config_args is ns and usage_context == 1 and headless is True
     assert ns.headless is True and ns.data_parallel_rpc_port == 24321
-    assert engine.pids == [1000, 1001] and engine.pid == 1000 and engine.poll() is None
+    assert (
+        engine.pids == [_FAKE_CORE_PID, _FAKE_CORE_PID + 1]
+        and engine.pid == _FAKE_CORE_PID
+        and engine.poll() is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -1385,7 +1398,7 @@ def test_supervise_terminates_the_engine_cores_through_the_manager_on_a_signal()
 def test_engine_process_group_is_popen_shaped():
     manager = _FakeManager(local_engine_count=2)
     engine = rust_lifecycle.EngineProcessGroup(manager)
-    assert engine.pid == 1000 and engine.pids == [1000, 1001]
+    assert engine.pid == _FAKE_CORE_PID and engine.pids == [_FAKE_CORE_PID, _FAKE_CORE_PID + 1]
     assert engine.poll() is None and manager.events == []
     with pytest.raises(subprocess.TimeoutExpired):
         engine.wait(timeout=0.1)
