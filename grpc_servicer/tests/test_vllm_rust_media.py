@@ -142,6 +142,19 @@ def test_a_pd_prefill_leg_gets_the_media_identity(loop):
     assert identity.mm_inputs.mm_placeholders[0].offset == 1
 
 
+def test_the_kind_sort_keeps_the_callers_codes_apart_and_sends_unknown_codes_to_internal():
+    import grpc
+    from smg_grpc_servicer.vllm.rust_media import kind_for_code
+
+    code = grpc.StatusCode
+    for retryable in (code.UNAVAILABLE, code.RESOURCE_EXHAUSTED, code.DEADLINE_EXCEEDED):
+        assert kind_for_code(retryable) == "unavailable", retryable
+    for callers in (code.INVALID_ARGUMENT, code.NOT_FOUND):
+        assert kind_for_code(callers) == "invalid", callers
+    for other in (code.INTERNAL, code.UNIMPLEMENTED, code.PERMISSION_DENIED, code.UNKNOWN):
+        assert kind_for_code(other) == "internal", other
+
+
 def test_failures_are_classified_like_the_python_servicers_statuses(loop):
     kind, message = submit(bridge(loop, FakeProcessor(MmProcessorUnavailable("sidecar_timeout"))))
     assert (kind, message) == ("unavailable", "sidecar_timeout")
