@@ -1440,9 +1440,12 @@ const DECODE_SILENCE_MESSAGE: &str = "decode worker produced nothing within";
 const DECODE_LEG_SILENCE_MESSAGE: &str = "decode leg produced nothing within";
 
 /// The bound on one prefill leg's silence, counted from its dispatch (see
-/// [`liveness::prefill_leg_bound`]).
+/// [`liveness::prefill_leg_bound`]); the dispatch instant stays with it,
+/// as a reprieve past the deadline may count from there (see
+/// [`liveness::prefill_leg_reprieve`]).
 #[derive(Clone, Copy, Debug)]
 struct PrefillLegBound {
+    dispatched: Instant,
     deadline: Instant,
     bound: Duration,
 }
@@ -1454,7 +1457,11 @@ impl PrefillLegBound {
         let bound = liveness::prefill_leg_bound(worker, prompt_tokens)?;
         // A bound past the clock's range never expires: the leg stays unbounded.
         let deadline = dispatched.checked_add(bound)?;
-        Some(Self { deadline, bound })
+        Some(Self {
+            dispatched,
+            deadline,
+            bound,
+        })
     }
 }
 
@@ -1676,7 +1683,9 @@ async fn dispatch_prefill_within(
         if let Ok(result) = tokio::time::timeout_at(deadline.into(), &mut dispatch).await {
             return result;
         }
-        let Some(more) = liveness::prefill_leg_reprieve(&worker, bound.bound) else {
+        let Some(more) =
+            liveness::prefill_leg_reprieve(&worker, bound.bound, bound.dispatched.elapsed())
+        else {
             retire_pd_leg(
                 PdLeg::Prefill,
                 connection,
@@ -1733,7 +1742,9 @@ async fn first_prefill_response_within(
         if let Ok(first) = stream.first_response_within(deadline).await {
             return Ok(first);
         }
-        let Some(more) = liveness::prefill_leg_reprieve(worker, bound.bound) else {
+        let Some(more) =
+            liveness::prefill_leg_reprieve(worker, bound.bound, bound.dispatched.elapsed())
+        else {
             return Err(match stalled_decode_partner(partner, bound.bound) {
                 Some((decode, silence)) => decode_partner_silent(
                     worker,
@@ -3007,8 +3018,10 @@ mod tests {
     }
 
     fn three_second_bound() -> PrefillLegBound {
+        let dispatched = Instant::now();
         PrefillLegBound {
-            deadline: Instant::now() + Duration::from_secs(3),
+            dispatched,
+            deadline: dispatched + Duration::from_secs(3),
             bound: Duration::from_secs(3),
         }
     }
@@ -3149,6 +3162,7 @@ mod tests {
         let (result, ()) = tokio::join!(
             dispatch_prefill_within(
                 Some(PrefillLegBound {
+                    dispatched: started,
                     deadline: started + bound,
                     bound,
                 }),
@@ -3170,6 +3184,53 @@ mod tests {
         );
     }
 
+    /// A leg's bound is read at its dispatch. The longest prompt yet landing
+    /// on the worker behind it blocks the engine for the leg too while it
+    /// builds, so the leg is not given up on at its own bound: it waits out
+    /// the cold-shape grace a bound at a time, and once the shape is shown
+    /// (the longer prompt's first token) it is judged by the worker's
+    /// answers as before, a bound after that answer. (Real time, as above.)
+    #[tokio::test]
+    async fn a_prefill_dispatch_in_flight_before_a_longer_prompt_waits_through_the_build() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        prefill.note_prefill_started(256, true);
+        prefill.note_prefill_ended(256, true, Some(0));
+        let bound = Duration::from_secs(1);
+        let landed_at = Duration::from_millis(500);
+        let shown_at = Duration::from_millis(2_500);
+        let longer_prompt = async {
+            tokio::time::sleep(landed_at).await;
+            prefill.note_prefill_started(8_192, true);
+            tokio::time::sleep(shown_at - landed_at).await;
+            prefill.note_prefill_ended(8_192, true, Some(0));
+        };
+        let started = Instant::now();
+        let (result, ()) = tokio::join!(
+            dispatch_prefill_within(
+                Some(PrefillLegBound {
+                    dispatched: started,
+                    deadline: started + bound,
+                    bound,
+                }),
+                never_answers(),
+                Some(Arc::clone(&prefill)),
+                None,
+                metrics_labels::CONNECTION_GRPC,
+                "chatcmpl-behind-a-build".to_string(),
+                256,
+            ),
+            longer_prompt
+        );
+        let elapsed = started.elapsed();
+        let status = failure(result);
+        assert!(is_prefill_silence(&status), "{status:?}");
+        assert!(
+            elapsed >= shown_at + bound && elapsed < shown_at + 3 * bound,
+            "given up on a bound after the shape was shown, not at its own bound: {elapsed:?}"
+        );
+    }
+
     /// On the parallel shape a prefill leg's first response waits for the
     /// decode side, so a decode worker that stopped producing mid-stream
     /// makes the prefill look silent. At the prefill's exhausted reprieve
@@ -3187,6 +3248,7 @@ mod tests {
         let bound = Duration::from_secs(1);
         let at = |started: Instant| {
             Some(PrefillLegBound {
+                dispatched: started,
                 deadline: started + bound,
                 bound,
             })

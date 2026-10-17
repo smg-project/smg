@@ -83,7 +83,8 @@
 //!   bound ([`prefill_leg_reprieve`]): a worker that keeps answering other
 //!   legs is backed up (on the parallel dispatch shape a leg's first
 //!   response also waits for the decode side), not frozen, and its leg
-//!   waits on.
+//!   waits on; a leg in flight when the longest prompt yet lands behind
+//!   it is given what is left of the cold-shape grace since its dispatch.
 //!
 //! - **stale records** (an unreachable veto by another rule): a worker whose
 //!   KV-event stream has pushed load records is heard from every few
@@ -222,10 +223,46 @@ pub(crate) fn decode_leg_bound(prefills: &Arc<dyn Worker>, prompt_tokens: u64) -
 /// another leg a moment ago is backed up, not frozen (on the parallel
 /// dispatch shape a leg's first response also waits for the decode side to
 /// admit it), so the leg waits until a bound has passed since that answer.
-/// `None` when the worker has answered nothing within the bound, or ever:
-/// the verdict.
-pub(crate) fn prefill_leg_reprieve(worker: &Arc<dyn Worker>, bound: Duration) -> Option<Duration> {
-    reprieve(worker.prefill_answered_ago(), bound)
+/// The bound was read at the leg's dispatch, `dispatched_ago` back: a
+/// prompt longer than any the worker has answered that landed behind the
+/// leg since blocks the engine for the leg too while it builds, so while
+/// the worker is on that shape the leg is given what is left of the
+/// cold-shape grace since its dispatch, as a leg dispatched now would be
+/// ([`prefill_leg_bound`]), a bound at a time so the shape's first token
+/// returns it to the rule above. `None` when the worker has answered
+/// nothing within the bound, or ever, and no grace is left: the verdict.
+pub(crate) fn prefill_leg_reprieve(
+    worker: &Arc<dyn Worker>,
+    bound: Duration,
+    dispatched_ago: Duration,
+) -> Option<Duration> {
+    leg_reprieve(
+        cold_shape_grace(worker, 0),
+        worker.prefill_answered_ago(),
+        bound,
+        dispatched_ago,
+    )
+}
+
+/// [`prefill_leg_reprieve`] for a worker under a cold-shape `grace` (zero:
+/// on no such shape) whose latest first response was `answered_ago`
+/// (`None`: never). A grace the leg's own bound already covers (a longer
+/// configured threshold) adds nothing.
+fn leg_reprieve(
+    grace: Duration,
+    answered_ago: Option<Duration>,
+    bound: Duration,
+    dispatched_ago: Duration,
+) -> Option<Duration> {
+    if grace > bound {
+        if let Some(left) = grace
+            .checked_sub(dispatched_ago)
+            .filter(|left| !left.is_zero())
+        {
+            return Some(left.min(bound));
+        }
+    }
+    reprieve(answered_ago, bound)
 }
 
 /// [`prefill_leg_reprieve`] for a worker whose latest first response was
@@ -1062,15 +1099,85 @@ mod tests {
         assert_eq!(reprieve(Some(Duration::from_secs(10)), bound), None);
         let w = worker();
         assert_eq!(
-            prefill_leg_reprieve(&w, bound),
+            prefill_leg_reprieve(&w, bound, Duration::ZERO),
             None,
             "a fresh worker has answered nothing"
         );
         w.note_prefill_started(256, true);
         w.note_prefill_ended(256, true, Some(0));
         assert!(
-            prefill_leg_reprieve(&w, bound).is_some_and(|left| left > Duration::from_secs(2)),
+            prefill_leg_reprieve(&w, bound, Duration::ZERO)
+                .is_some_and(|left| left > Duration::from_secs(2)),
             "answered just now: a bound's reprieve, less the moment since"
+        );
+    }
+
+    /// A leg's bound is read at its dispatch; the longest prompt yet
+    /// landing behind it blocks the engine for the leg too while it builds,
+    /// so the leg in flight is given what is left of the grace since its
+    /// dispatch, a bound at a time, and the verdict as before once the
+    /// shape is shown or the grace has passed.
+    #[test]
+    fn a_prefill_leg_in_flight_before_a_longer_prompt_waits_through_the_build() {
+        let bound = DEFAULT_WEDGE;
+        let silent = Some(Duration::from_secs(10));
+        assert_eq!(
+            reprieve(silent, bound),
+            None,
+            "silent for a bound: the verdict"
+        );
+        assert_eq!(
+            leg_reprieve(COLD_SHAPE_GRACE, silent, bound, Duration::from_secs(10)),
+            Some(bound),
+            "on a cold shape: the grace since the dispatch, a bound at a time"
+        );
+        assert_eq!(
+            leg_reprieve(
+                COLD_SHAPE_GRACE,
+                silent,
+                bound,
+                COLD_SHAPE_GRACE - Duration::from_secs(1)
+            ),
+            Some(Duration::from_secs(1)),
+            "what is left of it"
+        );
+        assert_eq!(
+            leg_reprieve(COLD_SHAPE_GRACE, silent, bound, COLD_SHAPE_GRACE),
+            None,
+            "the grace has passed: the verdict"
+        );
+        assert_eq!(
+            leg_reprieve(Duration::ZERO, silent, bound, Duration::from_secs(10)),
+            None,
+            "on no cold shape: the rule above"
+        );
+        let long = Duration::from_secs(600);
+        assert_eq!(
+            leg_reprieve(COLD_SHAPE_GRACE, silent, long, Duration::from_secs(10)),
+            reprieve(silent, long),
+            "a longer configured threshold already covers the grace: the rule above alone"
+        );
+        // The worker: a short leg dispatched, then the longest prompt yet
+        // behind it.
+        let w = worker();
+        w.note_prefill_started(1_024, true);
+        w.note_prefill_ended(1_024, true, Some(0));
+        w.note_prefill_started(512, true);
+        assert!(!w.prefill_cold_shape(0));
+        w.note_prefill_started(8_192, true);
+        assert!(w.prefill_cold_shape(0));
+        let late = COLD_SHAPE_GRACE - Duration::from_secs(1);
+        assert_eq!(
+            prefill_leg_reprieve(&w, bound, late),
+            Some(Duration::from_secs(1)),
+            "the short leg, dispatched before the longer prompt, waits out the grace"
+        );
+        // The shape shown: the leg is judged by the worker's answers again.
+        w.note_prefill_ended(8_192, true, Some(0));
+        assert!(!w.prefill_cold_shape(0));
+        assert!(
+            prefill_leg_reprieve(&w, bound, late).is_some_and(|left| left > Duration::from_secs(2)),
+            "answered just now: a bound's reprieve"
         );
     }
 
