@@ -739,6 +739,41 @@ mod tests {
         log::info!("All nodes converged to expected state");
     }
 
+    /// A member whose join peer is not up at its first round keeps dialing
+    /// it: B starts with A's address while nothing listens there, A comes up
+    /// a few rounds later, and the two still find each other.
+    #[tokio::test]
+    async fn a_member_keeps_dialing_its_join_peer_until_it_is_up() {
+        init();
+        // A's address, reserved by a bind that is released at once: B's
+        // first dials are refused, as they are while the peer is not up yet.
+        let (listener_a, addr_a) = bind_node().await;
+        drop(listener_a);
+        let (listener_b, addr_b) = bind_node().await;
+        let handler_b = mesh_run!("B", listener_b, addr_b, Some(addr_a));
+
+        // B's first round and its dial pass before A binds its address.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(
+            handler_b.state.read().len(),
+            1,
+            "B found a member while nothing listened on A's address"
+        );
+        let listener_a = TcpListener::bind(addr_a)
+            .await
+            .expect("A's address is free again");
+        let handler_a = mesh_run!("A", listener_a, addr_a, None);
+
+        wait_for(
+            || handler_a.state.read().len() == 2 && handler_b.state.read().len() == 2,
+            Duration::from_secs(20),
+            "B joins A once A is up",
+        )
+        .await;
+        handler_a.shutdown();
+        handler_b.shutdown();
+    }
+
     /// A gossip peer answering over TLS with the test node certificate (IP
     /// SANs for both loopback addresses), bound to an ephemeral port of
     /// `loopback`.
