@@ -205,7 +205,7 @@ What the table says beyond the others:
 
 - **A call has no closing marker.** `[TOOL_CALLS]` opens the call state, and the state's own rows
   are the next `[TOOL_CALLS]` and the end of the turn: the arguments object's close ends the call
-  (`json::named_arguments`), the next opener or the turn's end ends the region. Text after a closed
+  (`json::named`, reading the arguments alone), the next opener or the turn's end ends the region. Text after a closed
   object and before the next opener is the template's wrapping: whitespace dropped, anything else
   malformed. The tool's name is the text between the opener and `[ARGS]`, taken as written; the
   object after `[ARGS]` is the arguments alone, so `ToolCallStart` carries the name and the marker

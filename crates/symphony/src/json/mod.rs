@@ -6,11 +6,12 @@
 //! far, for the places that need the value rather than its bytes; [`prefix`] judges, byte by byte
 //! as they arrive, whether the argument bytes are still a prefix of a value. [`assembler`] turns
 //! one call's growing object into the events of that call, on top of the outline and the prefix;
-//! [`named_arguments`] does the same for a call whose name stands before a marker and whose object
-//! is the arguments alone, both accounting for the argument bytes they send, hold or report
-//! through one judge (`fragments`); [`arguments`] for a call's arguments alone, written as one
-//! value, the call named elsewhere; [`forced`] runs it for the call the request forces, whose
-//! arguments are the whole output.
+//! [`named`] reads a call whose name stands before a marker, with the call's object or the
+//! arguments object alone (`named_arguments`) after it, both object readers accounting for the
+//! argument bytes they send, hold or report through one judge (`fragments`); [`list`] reads a
+//! list of call objects; [`arguments`] a call's arguments alone, written as one value, the call
+//! named elsewhere; [`forced`] runs it for the call the request forces, whose arguments are the
+//! whole output.
 
 pub mod arguments;
 pub mod assembler;
@@ -19,7 +20,7 @@ mod fragments;
 mod header;
 pub mod list;
 pub mod named;
-pub mod named_arguments;
+mod named_arguments;
 pub mod outline;
 pub mod partial;
 pub mod prefix;

@@ -73,8 +73,10 @@ and a client that wants the raw text back can have it.
 - `engine`, `markers`, `tokens`: the engine, its scanner and its token ledger.
 - `json`: the JSON family's assembler (`{"name": ..., "arguments": {...}}` as it arrives,
   streaming the model's own argument bytes), the JSON list (xLAM's bare, Llama Nemotron's between
-  markers), the arguments object alone (Mistral's after its marker, the forced call's as the whole
-  output), and the partial-JSON and prefix readers they rest on.
+  markers), the named call (a tool's name, a marker, then the call's object as Inkling writes it
+  or the arguments alone as Mistral does: one reader, what follows the marker its parameter), the
+  forced call's arguments as the whole output, and the partial-JSON and prefix readers they rest
+  on.
 - `tagged`: the assemblers for arguments written as tags: Qwen 3.5's `<function=`/`<parameter=`,
   the keyed `<arg_key>`/`<arg_value>` pairs (GLM, Ling, Hy4, IQuest), the attributed
   `<parameter name="…">` tags in four spellings (MiniMax M2, dots3, MiniCPM5, DeepSeek's DSML,

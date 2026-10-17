@@ -1,8 +1,7 @@
 //! The header of a call written as its tool's name, a marker, then JSON: the bytes before the
 //! marker, held until the marker arrives, and what follows it in the piece that completes it.
-//! The named-call reader ([`named`](super::named)) and the named-arguments reader
-//! ([`named_arguments`](super::named_arguments)) read their header with it and differ in what the
-//! framing becomes and in the JSON reader they hand the rest to.
+//! The named reader ([`named`](super::named)) reads its header with it; what the framing becomes
+//! and which JSON reader takes the rest is its parameter ([`After`](super::named::After)).
 
 use crate::event::{Event, Events, MalformedReason, Text};
 

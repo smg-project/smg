@@ -253,12 +253,19 @@ fn assembler(
         Some(CallSyntax::Attributed(tags)) => {
             Box::new(tagged::attributed::Assembler::new(index, id, tags))
         }
-        Some(CallSyntax::NamedJson(marker)) => {
-            Box::new(json::named::Assembler::new(index, id, marker))
-        }
-        Some(CallSyntax::NamedArguments(marker)) => {
-            Box::new(json::named_arguments::Assembler::new(index, id, marker))
-        }
+        // The named call: a tool's name, a marker, then the call's object or its arguments alone.
+        Some(CallSyntax::NamedJson(marker)) => Box::new(json::named::Assembler::new(
+            index,
+            id,
+            marker,
+            json::named::After::Object,
+        )),
+        Some(CallSyntax::NamedArguments(marker)) => Box::new(json::named::Assembler::new(
+            index,
+            id,
+            marker,
+            json::named::After::Arguments,
+        )),
         Some(CallSyntax::ForcedArguments) => Box::new(json::forced::Assembler::new(index, id)),
         Some(CallSyntax::Gemma(spelling)) => Box::new(gemma::Assembler::new(index, id, spelling)),
         // A shaped call opens through its terminal's header, which the engine reads before it

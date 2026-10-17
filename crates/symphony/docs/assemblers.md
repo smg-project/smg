@@ -60,6 +60,24 @@ What the assembler does not decide: the call's index and id (the format mints th
 to `Assembler::new`), whether the name is a declared tool, and whether a string-valued arguments
 member should be decoded. The format decides those with the events in hand.
 
+## The named reader (`json::named`)
+
+A call written as its tool's name, a marker, then JSON is read by one assembler whose parameter
+(`After`) says what the JSON is: the call's object (Inkling's `<|content_invoke_tool_json|>`, after
+which the object names the function again) or the arguments object alone (Mistral's `[ARGS]`). The
+header is the same either way (`json::header`): the bytes before the marker are held until the
+marker's last byte arrives, the search covering only the new bytes and the marker's length before
+them, so a name that never meets its marker costs each piece its own length. What differs is said
+once, at the marker: with the object after it the header is the template's wrapping, `Dropped`,
+and the JSON assembler reads the object and starts the call at its name; with the arguments after
+it the header names the call, `ToolCallStart` carries the name with the marker as its source, and
+the arguments-object reader (`json::named_arguments`) streams the object's bytes as the fragments,
+accounted for through the JSON assembler's judge. Both end the call at the object's brace and
+leave the bytes after it to the engine. A name the region ends after with no marker is reported by
+the reason the syntax names (`NameWithoutACall`, `NameWithoutArguments`), and as
+`UnterminatedRegion` when the stream is cut; an empty header leaves nothing, which is how a thought
+or an answer message reads under the Inkling table.
+
 ## The Qwen tagged assembler (`tagged::assembler`)
 
 Every byte of the call lands in exactly one event. Whitespace between tags is the template's and
