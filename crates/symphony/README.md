@@ -188,10 +188,13 @@ choice, and on the `message` and `message_delta` of the Messages API. The gatewa
 `--parse-failures` policy sets what a client can get: `log` (the default) writes the line and
 reports on request, `surface` reports every output that is not clean as well, `silent` keeps
 the counters alone and ignores the header. A client that cannot tolerate a folded call asks for
-strictness with `X-SMG-Parse-Strict: on`: an output that is not clean then finishes with
-`finish_reason: "parse_failure"` (the Messages API's `stop_reason` likewise), its report attached
-whatever the report mode and its bytes still in the content; status stays 200, a clean output
-keeps its finish reason, and `silent` ignores this header too.
+strictness with `X-SMG-Parse-Strict: on`: an output in which the table gave up on a run then
+finishes with `finish_reason: "parse_failure"` in place of a natural stop (`stop` / `tool_calls`;
+the Messages API's `stop_reason` likewise, for `end_turn` / `tool_use`), its report attached
+whatever the report mode and its bytes still in the content. A truncation (`length` /
+`max_tokens`) and every other engine finish keep their reason even then, a call dropped under
+`parallel_tool_calls: false` is not a failure, status stays 200, and `silent` ignores this header
+too.
 
 ## Models
 

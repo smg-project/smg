@@ -110,7 +110,8 @@ pub(crate) struct ChatResponseSpec {
     pub parse_report: Report,
     /// `--parse-failures silent`: the counters alone, no line about the output.
     pub parse_silent: bool,
-    /// Whether an output that is not clean finishes with `parse_failure` (`X-SMG-Parse-Strict`).
+    /// Whether an output the table gave up on a run of finishes with `parse_failure` in place of a
+    /// natural stop (`X-SMG-Parse-Strict`); a truncation keeps its reason.
     pub parse_strict: bool,
 }
 
@@ -211,7 +212,8 @@ pub(crate) struct MessagesResponseSpec {
     pub parse_report: Report,
     /// `--parse-failures silent`: the counters alone, no line about the output.
     pub parse_silent: bool,
-    /// Whether an output that is not clean finishes with `parse_failure` (`X-SMG-Parse-Strict`).
+    /// Whether an output the table gave up on a run of finishes with `parse_failure` in place of a
+    /// natural stop (`X-SMG-Parse-Strict`); a truncation keeps its reason.
     pub parse_strict: bool,
 }
 

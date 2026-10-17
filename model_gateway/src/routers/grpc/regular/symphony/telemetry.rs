@@ -41,11 +41,12 @@ use crate::config::ParseFailures;
 
 /// The request header that asks for the report: `on`, `off` or `detail`.
 pub(crate) const REPORT_HEADER: &str = "x-smg-parse-report";
-/// The request header that asks for strictness: `on` or `off`. An output that is not clean then
-/// finishes with [`PARSE_FAILURE`] and carries its report whatever the report mode.
+/// The request header that asks for strictness: `on` or `off`. An output the table gave up on a
+/// run of then finishes with [`PARSE_FAILURE`] in place of a natural stop (a truncation and every
+/// other engine finish keep their reason) and carries its report whatever the report mode.
 pub(crate) const STRICT_HEADER: &str = "x-smg-parse-strict";
-/// The finish reason (and the Messages stop reason) of an output that is not clean under
-/// strictness.
+/// The finish reason (and the Messages stop reason) of an output the table gave up on a run of,
+/// under strictness, where a natural stop would have been.
 pub(crate) const PARSE_FAILURE: &str = "parse_failure";
 
 /// Whether the request asks for strictness: its `X-SMG-Parse-Strict` header says `on`, and the

@@ -80,8 +80,8 @@ impl MessagePreparationStage {
             ctx.input.headers.as_ref(),
         )
         .map_err(|why| error::bad_request("invalid_parse_report_header", why))?;
-        // Strictness (X-SMG-Parse-Strict): an output that is not clean finishes with
-        // `parse_failure` and is reported whatever the report mode.
+        // Strictness (X-SMG-Parse-Strict): an output the table gave up on a run of finishes with
+        // `parse_failure` in place of a natural stop and is reported whatever the report mode.
         ctx.state.parse_strict = symphony::telemetry::strict_mode(
             ctx.components.parse_failures,
             ctx.input.headers.as_ref(),

@@ -917,47 +917,9 @@ async fn fold_reported(output: &str, report: Report, with_symphony: bool) -> Opt
 
 /// [`fold`] under strictness: the choice as the non-streaming processor builds it, with the
 /// report mode `report` (strictness raises `Off` to `OnFailure` in preparation; here the spec is
-/// set as preparation would leave it).
+/// set as preparation would leave it), the engine finishing with `stop`.
 async fn fold_strict(output: &str, report: Report) -> (ChatChoice, Option<ParseReport>) {
-    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
-    let output_ids: Vec<u32> = output.chars().map(u32::from).collect();
-    let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
-        output_ids,
-        finish_reason: "stop".to_string(),
-        ..Default::default()
-    });
-    let mut decoder =
-        StopSequenceDecoder::new(tokenizer.clone(), StopSequenceConfig::default(), false);
-    let mut spec = assigned(
-        chat_spec(true),
-        qwen3(CallSyntax::Json),
-        "<|im_start|>assistant\n",
-    );
-    spec.parse_report = report.at_least_on_failure();
-    spec.parse_strict = true;
-    let processor = ResponseProcessor::new(
-        ToolParserFactory::new(),
-        ReasoningParserFactory::new(),
-        utils::ParserResolver::disabled(),
-    );
-    let (choice, _, report) = processor
-        .process_single_choice(
-            "test-request",
-            &complete,
-            0,
-            &spec,
-            "Qwen/Qwen3-8B",
-            &tokenizer,
-            &mut decoder,
-            0,
-            false,
-            false,
-            None,
-            None,
-        )
-        .await
-        .expect("a choice");
-    (choice, report)
+    fold_strict_finishing(output, "stop", false, report).await
 }
 
 #[tokio::test]
@@ -989,8 +951,13 @@ async fn under_strictness_a_clean_answer_keeps_its_finish_reason() {
     assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
 }
 
-/// [`fold_strict`] with the engine's finish reason chosen.
-async fn fold_strict_finishing(output: &str, finish: &str, first_call_only: bool) -> ChatChoice {
+/// [`fold_strict`] with the engine's finish reason and the single-call request chosen.
+async fn fold_strict_finishing(
+    output: &str,
+    finish: &str,
+    first_call_only: bool,
+    report: Report,
+) -> (ChatChoice, Option<ParseReport>) {
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
     let output_ids: Vec<u32> = output.chars().map(u32::from).collect();
     let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
@@ -1005,7 +972,7 @@ async fn fold_strict_finishing(output: &str, finish: &str, first_call_only: bool
         qwen3(CallSyntax::Json),
         "<|im_start|>assistant\n",
     );
-    spec.parse_report = Report::OnFailure;
+    spec.parse_report = report.at_least_on_failure();
     spec.parse_strict = true;
     spec.first_tool_call_only = first_call_only;
     let processor = ResponseProcessor::new(
@@ -1013,7 +980,7 @@ async fn fold_strict_finishing(output: &str, finish: &str, first_call_only: bool
         ReasoningParserFactory::new(),
         utils::ParserResolver::disabled(),
     );
-    let (choice, _, _) = processor
+    let (choice, _, report) = processor
         .process_single_choice(
             "test-request",
             &complete,
@@ -1030,37 +997,46 @@ async fn fold_strict_finishing(output: &str, finish: &str, first_call_only: bool
         )
         .await
         .expect("a choice");
-    choice
+    (choice, report)
 }
 
 #[tokio::test]
 async fn under_strictness_a_truncated_call_stays_a_truncation() {
     // The token limit cut the output inside the call region: the table gives the region up as
-    // unterminated, and the finish stays `length`, which a client's truncation guard reads.
-    let choice = fold_strict_finishing(
+    // unterminated (the report says so), and the finish stays `length`, which a client's
+    // truncation guard reads.
+    let (choice, report) = fold_strict_finishing(
         "<tool_call>\n{\"name\": \"lookup\", \"argu",
         "length",
         false,
+        Report::Off,
     )
     .await;
+    let report = report.expect("a report: the table gave the region up");
+    assert_eq!(report.outcome.as_deref(), Some("malformed"));
     assert_eq!(choice.finish_reason.as_deref(), Some("length"));
 }
 
 #[tokio::test]
 async fn under_strictness_a_suppressed_call_is_not_a_parse_failure() {
     // Two calls under `parallel_tool_calls: false`: the table read both, the reader dropped the
-    // second as asked; the answer is a call and finishes as one.
-    let choice = fold_strict_finishing(
+    // second as asked; the answer is a call and finishes as one, and the report (wanted for the
+    // suppressed call) has no malformed run.
+    let (choice, report) = fold_strict_finishing(
         concat!(
             "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {}}\n</tool_call>\n",
             "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {}}\n</tool_call>"
         ),
         "stop",
         true,
+        Report::Off,
     )
     .await;
     assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
     assert_eq!(choice.message.tool_calls.as_ref().map(Vec::len), Some(1));
+    let report = report.expect("a report: a call was suppressed");
+    assert_eq!(report.outcome.as_deref(), Some("clean"));
+    assert_eq!(report.suppressed_calls, 1);
 }
 
 #[tokio::test]
@@ -1088,6 +1064,98 @@ async fn under_strictness_a_streamed_folded_call_finishes_as_a_parse_failure() {
         .expect("a finish chunk");
     assert_eq!(finish["choices"][0]["finish_reason"], "parse_failure");
     assert_eq!(finish["smg"]["parse"]["outcome"], "malformed");
+}
+
+#[tokio::test]
+async fn under_strictness_a_streamed_truncated_call_stays_a_truncation() {
+    // The streamed finish chunk decides on its own: the token limit cut the output inside the
+    // call region, the reader saw the unterminated region (the report says so), and the chunk
+    // keeps `length` for the client's truncation guard.
+    let mut spec = assigned(
+        chat_spec(true),
+        qwen3(CallSyntax::Json),
+        "<|im_start|>assistant\n",
+    );
+    spec.parse_report = Report::OnFailure;
+    spec.parse_strict = true;
+    let (result, events) = stream_events(
+        vec![
+            chunk(0, "<tool_call>\n{\"name\": \"lookup\", \"argu"),
+            complete(0, "length"),
+        ],
+        true,
+        spec,
+    )
+    .await;
+    result.expect("the stream ends well");
+    let finish = events
+        .iter()
+        .find(|e| e["choices"][0]["finish_reason"].is_string())
+        .expect("a finish chunk");
+    assert_eq!(finish["smg"]["parse"]["outcome"], "malformed");
+    assert_eq!(finish["choices"][0]["finish_reason"], "length");
+}
+
+#[tokio::test]
+async fn under_strictness_a_streamed_suppressed_call_is_not_a_parse_failure() {
+    // Two calls under `parallel_tool_calls: false`, streamed: the second is dropped as asked and
+    // the finish chunk says `tool_calls`, its report clean.
+    let mut spec = assigned(
+        chat_spec(true),
+        qwen3(CallSyntax::Json),
+        "<|im_start|>assistant\n",
+    );
+    spec.parse_report = Report::OnFailure;
+    spec.parse_strict = true;
+    spec.first_tool_call_only = true;
+    let (result, events) = stream_events(
+        vec![
+            chunk(
+                0,
+                concat!(
+                    "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {}}\n</tool_call>\n",
+                    "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {}}\n</tool_call>"
+                ),
+            ),
+            complete(0, "stop"),
+        ],
+        true,
+        spec,
+    )
+    .await;
+    result.expect("the stream ends well");
+    let finish = events
+        .iter()
+        .find(|e| e["choices"][0]["finish_reason"].is_string())
+        .expect("a finish chunk");
+    assert_eq!(finish["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(finish["smg"]["parse"]["outcome"], "clean");
+    assert_eq!(finish["smg"]["parse"]["suppressed_calls"], 1);
+}
+
+#[tokio::test]
+async fn under_strictness_a_streamed_truncated_message_stops_with_max_tokens() {
+    // The Messages stream's own gate: the output cut inside the call region stops with
+    // `max_tokens`, the report on `message_delta` saying the table gave the region up.
+    let mut spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    spec.parse_report = Report::OnFailure;
+    spec.parse_strict = true;
+    let (result, events) = message_events(
+        vec![
+            chunk(0, "<tool_call>\n{\"name\": \"lookup\", \"argu"),
+            complete(0, "length"),
+        ],
+        spec,
+        None,
+    )
+    .await;
+    result.expect("the stream ends well");
+    let delta = events
+        .iter()
+        .find(|e| e["type"] == "message_delta")
+        .expect("a message_delta");
+    assert_eq!(delta["delta"]["smg"]["parse"]["outcome"], "malformed");
+    assert_eq!(message_stop_reason(&events), "max_tokens");
 }
 
 #[tokio::test]

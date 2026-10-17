@@ -245,7 +245,8 @@ pub(crate) struct ProcessingState {
     pub parse_report: Report,
 
     /// Whether the request asked for strictness (`X-SMG-Parse-Strict: on` under a policy that
-    /// is not `silent`): an output that is not clean finishes with `parse_failure`.
+    /// is not `silent`): an output the table gave up on a run of finishes with `parse_failure` in
+    /// place of a natural stop; a truncation keeps its reason.
     pub parse_strict: bool,
 
     /// Owned here rather than inside `PreparationOutput` so EPD's `EncodeStage`
