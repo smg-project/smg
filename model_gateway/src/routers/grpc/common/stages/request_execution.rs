@@ -35,7 +35,7 @@ use crate::{
         grpc::{
             common::stages::encode::EncodeDispatchPlan,
             context::{
-                ClientSelection, DispatchContext, ExecutionPlan, ExecutionPlanKind,
+                stage_output, ClientSelection, DispatchContext, ExecutionPlan, ExecutionPlanKind,
                 ExecutionResult, LoadGuards, PdTiming, WorkerSelection,
             },
             multimodal::worker_language_model_only,
@@ -329,27 +329,12 @@ pub(crate) async fn execute_plan(
     // drops them and reclaims the SHM.
     let encode_dispatch = ctx.encode_outputs.take().map(|o| o.dispatch);
 
-    let clients = ctx.clients.as_mut().ok_or_else(|| {
-        error!(
-            function = "execute_plan",
-            "Client acquisition not completed"
-        );
-        error::internal_error(
-            "client_acquisition_not_completed",
-            "Client acquisition not completed",
-        )
-    })?;
+    let clients = stage_output(ctx.clients.as_mut(), "execute_plan")?;
 
     // Create load guards for worker load tracking (increment load when created)
     // They will be automatically dropped (and decrement load) when the
     // dispatch context (or the streaming body they are attached to) drops.
-    let workers = ctx.workers.as_ref().ok_or_else(|| {
-        error!(function = "execute_plan", "Worker selection not completed");
-        error::internal_error(
-            "worker_selection_not_completed",
-            "Worker selection not completed",
-        )
-    })?;
+    let workers = stage_output(ctx.workers.as_ref(), "execute_plan")?;
     // Every breaker sample of this attempt goes through the request's
     // ledger, which charges a worker once per request however often the
     // request retried on it.

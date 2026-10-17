@@ -404,6 +404,55 @@ impl DispatchContext {
     }
 }
 
+/// An output one pipeline stage leaves on the context for the stages after
+/// it, with the failure those stages report when it is not there.
+pub(crate) trait StageOutput {
+    /// The code and the message of that failure: one pair per output,
+    /// whichever stage notices it missing.
+    const NOT_COMPLETED: (&'static str, &'static str);
+}
+
+impl StageOutput for PreparationOutput {
+    const NOT_COMPLETED: (&'static str, &'static str) =
+        ("preparation_not_completed", "Preparation not completed");
+}
+
+impl StageOutput for WorkerSelection {
+    const NOT_COMPLETED: (&'static str, &'static str) = (
+        "worker_selection_not_completed",
+        "Worker selection not completed",
+    );
+}
+
+impl StageOutput for ClientSelection {
+    const NOT_COMPLETED: (&'static str, &'static str) = (
+        "client_acquisition_not_completed",
+        "Client acquisition not completed",
+    );
+}
+
+impl<T: StageOutput> StageOutput for &T {
+    const NOT_COMPLETED: (&'static str, &'static str) = T::NOT_COMPLETED;
+}
+
+impl<T: StageOutput> StageOutput for &mut T {
+    const NOT_COMPLETED: (&'static str, &'static str) = T::NOT_COMPLETED;
+}
+
+/// `output` as the stage `function` found it on the context, or the failure
+/// every stage reports when the earlier stage that produces it has not run:
+/// logged once, under the output's one code, whichever stage noticed.
+pub(crate) fn stage_output<T: StageOutput>(
+    output: Option<T>,
+    function: &'static str,
+) -> Result<T, axum::response::Response> {
+    output.ok_or_else(|| {
+        let (code, message) = T::NOT_COMPLETED;
+        error!(function = function, "{message}");
+        internal_error(code, message)
+    })
+}
+
 /// Everything request building hands the dispatch phase.
 pub(crate) struct BuildOutput {
     pub plan: ExecutionPlan,
@@ -991,30 +1040,15 @@ impl RequestContext {
                 "Routing snapshot not captured",
             )
         })?;
-        let wire = state
-            .workers
-            .as_ref()
-            .map(|workers| {
-                WireConstraint::of(
-                    workers,
-                    state.media_refs_forwarded,
-                    if state.media_refs_forwarded {
-                        state.media_refs_pipeline
-                    } else {
-                        PipelinePin::Any
-                    },
-                )
-            })
-            .ok_or_else(|| {
-                error!(
-                    function = "RequestContext::into_dispatch",
-                    "Worker selection not completed"
-                );
-                internal_error(
-                    "worker_selection_not_completed",
-                    "Worker selection not completed",
-                )
-            })?;
+        let wire = WireConstraint::of(
+            stage_output(state.workers.as_ref(), "RequestContext::into_dispatch")?,
+            state.media_refs_forwarded,
+            if state.media_refs_forwarded {
+                state.media_refs_pipeline
+            } else {
+                PipelinePin::Any
+            },
+        );
         let request_id =
             super::common::stages::helpers::middleware_request_id(tenant_request_meta.as_ref())
                 .map(str::to_owned);
@@ -1553,6 +1587,106 @@ pub(crate) enum FinalResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The status of a failure a stage reports and the code of its JSON
+    /// error object.
+    async fn failure_shape(failure: axum::response::Response) -> (http::StatusCode, String) {
+        let status = failure.status();
+        let body = axum::body::to_bytes(failure.into_body(), usize::MAX)
+            .await
+            .expect("drain body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+        let code = body["error"]["code"]
+            .as_str()
+            .unwrap_or_else(|| panic!("an error code: {body}"))
+            .to_owned();
+        (status, code)
+    }
+
+    /// The failure a read of a missing output reports (the outputs have no
+    /// `Debug` to `expect_err` against).
+    fn failure_of<T>(read: Result<T, axum::response::Response>) -> axum::response::Response {
+        match read {
+            Ok(_) => panic!("the output was there"),
+            Err(failure) => failure,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_preparation_output_is_one_failure_whichever_stage_reads_it() {
+        let mut slot: Option<PreparationOutput> = None;
+        for failure in [
+            failure_of(stage_output(slot.as_ref(), "a_stage")),
+            failure_of(stage_output(slot.take(), "another_stage")),
+        ] {
+            assert_eq!(
+                failure_shape(failure).await,
+                (
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "preparation_not_completed".to_owned()
+                )
+            );
+        }
+
+        slot = Some(completion_prep(&["a prompt"], None));
+        assert!(matches!(
+            stage_output(slot.as_ref(), "a_stage"),
+            Ok(PreparationOutput::Completion { .. })
+        ));
+        assert!(matches!(
+            stage_output(slot.take(), "the_last_reader"),
+            Ok(PreparationOutput::Completion { .. })
+        ));
+        assert!(slot.is_none(), "the taking reader consumes the output");
+    }
+
+    #[tokio::test]
+    async fn a_missing_worker_selection_is_one_failure_whichever_stage_reads_it() {
+        use crate::worker::{BasicWorkerBuilder, WorkerType};
+
+        let mut slot: Option<WorkerSelection> = None;
+        let failure = failure_of(stage_output(slot.as_ref(), "a_stage"));
+        assert_eq!(
+            failure_shape(failure).await,
+            (
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                "worker_selection_not_completed".to_owned()
+            )
+        );
+
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill-selected")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode-selected")
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+        slot = Some(pd_selection(&prefill, &decode));
+        assert!(matches!(
+            stage_output(slot.as_ref(), "a_stage"),
+            Ok(WorkerSelection::Disaggregated { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_missing_client_selection_is_one_failure_whichever_stage_reads_it() {
+        let mut slot: Option<ClientSelection> = None;
+        for failure in [
+            failure_of(stage_output(slot.as_ref(), "a_stage")),
+            failure_of(stage_output(slot.as_mut(), "the_dispatch")),
+        ] {
+            assert_eq!(
+                failure_shape(failure).await,
+                (
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "client_acquisition_not_completed".to_owned()
+                )
+            );
+        }
+    }
 
     fn completion_prep(texts: &[&str], joined: Option<&str>) -> PreparationOutput {
         PreparationOutput::Completion {

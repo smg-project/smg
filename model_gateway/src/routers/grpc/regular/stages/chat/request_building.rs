@@ -12,8 +12,8 @@ use crate::{
             client::GenerateRequestBuildOptions,
             common::stages::{helpers, BuildStage},
             context::{
-                AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, ExecutionPlanKind,
-                PreparationOutput, RequestContext,
+                stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan,
+                ExecutionPlanKind, PreparationOutput, RequestContext,
             },
             multimodal::{
                 assemble_media_refs, assemble_multimodal_data,
@@ -94,16 +94,7 @@ pub(crate) async fn build_chat_backed_plan(
     inject_pd_metadata: bool,
     plan_kind: ExecutionPlanKind,
 ) -> Result<(ExecutionPlan, AttemptStamp, bool), Response> {
-    let clients = ctx.state.clients.as_ref().ok_or_else(|| {
-        error!(
-            function = "build_chat_backed_plan",
-            "Client acquisition not completed"
-        );
-        error::internal_error(
-            "client_acquisition_not_completed",
-            "Client acquisition not completed",
-        )
-    })?;
+    let clients = stage_output(ctx.state.clients.as_ref(), "build_chat_backed_plan")?;
 
     // Get client for building request (use prefill client in disaggregated mode)
     let builder_client = match clients {
@@ -271,13 +262,10 @@ pub(crate) async fn build_chat_backed_plan(
 impl BuildStage for ChatRequestBuildingStage {
     async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
         // Take preparation state (last consumer — worker_selection already ran)
-        let prep = ctx.state.preparation.take().ok_or_else(|| {
-            error!(
-                function = "ChatRequestBuildingStage::build",
-                "Preparation not completed"
-            );
-            error::internal_error("preparation_not_completed", "Preparation not completed")
-        })?;
+        let prep = stage_output(
+            ctx.state.preparation.take(),
+            "ChatRequestBuildingStage::build",
+        )?;
 
         let chat_request = ctx.chat_request_arc();
 

@@ -501,23 +501,11 @@ impl RequestPipeline {
             stages.worker_selection.name(),
             stages.worker_selection.execute(ctx).await
         )?;
-        let workers = ctx.state.workers.as_ref().ok_or_else(|| {
-            error!(function = "run_ingress", "Worker selection not completed");
-            error::internal_error(
-                "worker_selection_not_completed",
-                "Worker selection not completed",
-            )
-        })?;
+        let workers = stage_output(ctx.state.workers.as_ref(), "run_ingress")?;
         // Keep the post-selection guard for paths without pre-filtering
         // (EPD and direct ZMQ), and for a model card updated during selection.
         // No rejected request acquires a client or reaches an engine (#2380).
-        let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
-            error!(function = "run_ingress", "Preparation stage not completed");
-            error::internal_error(
-                "preparation_stage_not_completed",
-                "Preparation stage not completed",
-            )
-        })?;
+        let prep = stage_output(ctx.state.preparation.as_ref(), "run_ingress")?;
         step!(
             "ContextLength",
             enforce_context_length(prep, workers, &ctx.input.model_id)
@@ -566,16 +554,7 @@ impl RequestPipeline {
             // call's shape, PD rooms) for the new workers. Buffered decode
             // state from the failed attempt is reset.
             self.stages.worker_selection.reselect(dctx).await?;
-            let workers = dctx.workers.as_ref().ok_or_else(|| {
-                error!(
-                    function = "run_attempt",
-                    "Worker re-selection not completed"
-                );
-                error::internal_error(
-                    "worker_selection_not_completed",
-                    "Worker selection not completed",
-                )
-            })?;
+            let workers = stage_output(dctx.workers.as_ref(), "run_attempt")?;
             dctx.clients = Some(
                 acquire_clients(
                     workers,

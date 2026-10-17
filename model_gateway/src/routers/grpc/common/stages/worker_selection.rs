@@ -30,7 +30,7 @@ use crate::{
         error,
         grpc::{
             context::{
-                DispatchContext, EncodeWorkerAssignment, RequestContext, RequestType,
+                stage_output, DispatchContext, EncodeWorkerAssignment, RequestContext, RequestType,
                 RoutingSnapshot, WireConstraint, WorkerSelection,
             },
             multimodal,
@@ -305,16 +305,10 @@ impl WorkerSelectionStage {
         if let Some(refused) = accepted.and_then(|accepted| self.refuse_if_expired(ctx, accepted)) {
             return Err(refused);
         }
-        let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
-            error!(
-                function = "WorkerSelectionStage::execute",
-                "Preparation stage not completed"
-            );
-            error::internal_error(
-                "preparation_stage_not_completed",
-                "Preparation stage not completed",
-            )
-        })?;
+        let prep = stage_output(
+            ctx.state.preparation.as_ref(),
+            "WorkerSelectionStage::execute",
+        )?;
 
         let intermediate = ctx.state.multimodal_intermediate.as_ref();
         // Media references only go to workers that advertise worker-side processing.

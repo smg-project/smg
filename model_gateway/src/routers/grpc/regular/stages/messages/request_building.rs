@@ -12,8 +12,8 @@ use crate::{
             client::GenerateRequestBuildOptions,
             common::stages::{helpers, BuildStage},
             context::{
-                AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, ExecutionPlanKind,
-                PreparationOutput, RequestContext,
+                stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan,
+                ExecutionPlanKind, PreparationOutput, RequestContext,
             },
             multimodal::{
                 assemble_media_refs, assemble_multimodal_data,
@@ -49,24 +49,15 @@ impl MessageRequestBuildingStage {
 impl BuildStage for MessageRequestBuildingStage {
     async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
         // Take preparation state (last consumer — worker_selection already ran)
-        let prep = ctx.state.preparation.take().ok_or_else(|| {
-            error!(
-                function = "MessageRequestBuildingStage::build",
-                "Preparation not completed"
-            );
-            error::internal_error("preparation_not_completed", "Preparation not completed")
-        })?;
+        let prep = stage_output(
+            ctx.state.preparation.take(),
+            "MessageRequestBuildingStage::build",
+        )?;
 
-        let clients = ctx.state.clients.as_ref().ok_or_else(|| {
-            error!(
-                function = "MessageRequestBuildingStage::build",
-                "Client acquisition not completed"
-            );
-            error::internal_error(
-                "client_acquisition_not_completed",
-                "Client acquisition not completed",
-            )
-        })?;
+        let clients = stage_output(
+            ctx.state.clients.as_ref(),
+            "MessageRequestBuildingStage::build",
+        )?;
 
         let messages_request = ctx.messages_request_arc();
 
