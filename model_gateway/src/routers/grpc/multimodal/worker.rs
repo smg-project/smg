@@ -104,8 +104,10 @@ pub struct WorkerMediaSettings {
     /// What the pipeline does when libjpeg-turbo cannot be loaded, as the
     /// launcher resolved it: `Require` refuses to construct the pipeline, so
     /// the servicer does not start, rather than serve the fallback decoder's
-    /// pixels. `None` leaves it to `SMG_MM_TURBOJPEG`, as the router's own
-    /// pipeline reads it, for a launcher without the setting.
+    /// pixels. `None` leaves it to `SMG_MM_TURBOJPEG`, read as the router
+    /// reads it, strictly (an unreadable value refuses the pipeline, never
+    /// passes as the default), for a launcher without the setting or one
+    /// that was not given it.
     pub turbojpeg: Option<TurboJpegPolicy>,
 }
 
@@ -375,11 +377,14 @@ impl WorkerMediaPipeline {
             }
         }
         super::report_jpeg_decoder();
-        super::enforce_jpeg_decoder_policy(
-            settings
-                .turbojpeg
-                .unwrap_or_else(|| mm_settings().turbojpeg.value),
-        )?;
+        // The launcher's policy, else `SMG_MM_TURBOJPEG` read strictly: the
+        // lazily resolved process settings would read an unreadable value as
+        // the default, the one misreading this policy must not have.
+        let turbojpeg = match settings.turbojpeg {
+            Some(policy) => policy,
+            None => super::settings::turbojpeg_policy_from_env()?,
+        };
+        super::enforce_jpeg_decoder_policy(turbojpeg)?;
         let config_registry = Arc::new(MultimodalConfigRegistry::new());
         let loaded = config_registry
             .get_or_load(CONFIG_KEY, &settings.model_dir)

@@ -364,6 +364,17 @@ class TestMmSettings:
             assert resolved.source == "env" and resolved.sources["max_item_bytes"] == "env"
             assert resolved.flags_defined == frozenset()
 
+    def test_the_turbojpeg_variable_is_not_deprecated_beside_its_flag(self, caplog):
+        """`SMG_VLLM_MM_TURBOJPEG` is documented beside `--mm-turbojpeg` as a
+        supported way to set the policy (as the router's `SMG_MM_TURBOJPEG`
+        is), not a legacy spelling of it: a launcher that defines the flag
+        reads the variable without a deprecation line."""
+        settings = mm_processor.MmSettings.from_args(self._launcher_with_the_flags())
+        with caplog.at_level("WARNING", logger=self.LOGGER):
+            resolved = settings.resolve(env={"SMG_VLLM_MM_TURBOJPEG": "require"})
+        assert not [r for r in caplog.records if "deprecated" in r.getMessage()]
+        assert (resolved.turbojpeg, resolved.sources["turbojpeg"]) == ("require", "env")
+
     def test_the_deprecation_line_follows_the_flags_the_launcher_defines(self, caplog):
         """A launcher with some of the flags: the variable behind a flag it
         defines logs the line, the variable behind one it lacks does not."""

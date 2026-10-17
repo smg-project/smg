@@ -750,6 +750,10 @@ _MM_SETTING_SPECS: dict[str, tuple[str, str, Any]] = {
 _MM_INT_SETTINGS = frozenset(
     {"max_inflight", "max_item_bytes", "max_items", "sidecar_timeout_ms", "sidecar_max_queue"}
 )
+# The variables that are not legacy spellings of their flag: documented beside
+# it as a supported way to set the value (as the router's SMG_MM_TURBOJPEG
+# is), so no deprecation line when the launcher defines the flag.
+_ENV_NOT_LEGACY = frozenset({"turbojpeg"})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -829,7 +833,9 @@ class MmSettings:
                 continue
             from_env = _read_env(name, env, env_name)
             if from_env is not None:
-                if name in self.flags_defined or name in (flags or {}):
+                if (
+                    name in self.flags_defined or name in (flags or {})
+                ) and name not in _ENV_NOT_LEGACY:
                     logger.warning(
                         "%s is deprecated in favour of %s; env support ends in the next minor release",
                         env_name,
