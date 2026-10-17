@@ -212,7 +212,7 @@ All under the admin API; `{worker}` is a worker name (`grpc:<port>`,
 `http:<port>`, `zmq:<index>`) or `all`. A hook applies to every KV-event
 transport of the worker (gRPC `SubscribeKvEvents` and the ZMQ publisher alike)
 and answers with the worker's hook state (`drop_pending`, `dropped_total`,
-`delay_ms`, `admit_delay_ms`, `admit_per_sec`, `paused`, `generation`,
+`delay_ms`, `admit_delay_ms`, `admit_per_sec`, `cold_shape_ms`, `paused`, `generation`,
 `restarts`, and the request fault's `fail_status`, `fail_pending`,
 `fail_secs_left`, `fail_after_tokens`, `fail_finish_error`, `fail_stall_ms`, `failed_total`,
 `cut_total`, `stalled_total`). The hooks need `--engine realistic`: the canned
@@ -224,6 +224,7 @@ path has no engine to hook.
 | `POST /admin/fault/{worker}/delay?ms=D` | every batch is published D ms after its pass ends (0 clears) |
 | `POST /admin/fault/{worker}/admit-delay?ms=D` | every new gRPC request is held D ms before the engine sees it (0 clears): the gateway has dispatched it, the load record does not count it yet, as a backlog in transit between the two would behave |
 | `POST /admin/fault/{worker}/admit-rate?per_sec=R` | at most R new gRPC requests per second enter the engine (0 clears); the rest wait their turn, unseen by the load record: a throttled input path whose backlog grows while the gateway keeps sending |
+| `POST /admin/fault/{worker}/cold-shape?ms=D` | the engine holds D ms before the pass that first runs a prompt longer than any it has run (0 clears): a kernel built for a new shape. It produces nothing meanwhile, its load record keeps flowing with its silence growing; paid once per new longest prompt, and the lengths run before the hook was set count as run |
 | `POST /admin/fault/{worker}/restart-publisher` | the publisher restarts: gRPC sequence numbers start over at 1 and the ZMQ sequence at 0, the replay buffers are emptied, the cache is kept (no `AllBlocksCleared`); `generation` increments |
 | `POST /admin/fault/{worker}/pause` | the engine freezes after its current pass: no passes, no tokens, no events; requests queue (and count as waiting); health and `GetLoads` keep answering |
 | `POST /admin/fault/{worker}/resume` | the engine runs again |
