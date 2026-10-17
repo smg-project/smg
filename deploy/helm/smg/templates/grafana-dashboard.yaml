@@ -21,28 +21,28 @@ data:
           "title": "Request Rate",
           "type": "timeseries",
           "datasource": "Prometheus",
-          "targets": [{ "expr": "rate(smg_requests_total[5m])", "legendFormat": "{{ "{{" }}method{{ "}}" }} {{ "{{" }}status{{ "}}" }}" }],
+          "targets": [{ "expr": "sum by (model, endpoint) (rate(smg_router_requests_total[5m]))", "legendFormat": "{{ "{{" }}model{{ "}}" }} {{ "{{" }}endpoint{{ "}}" }}" }],
           "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 }
         },
         {
           "title": "Request Latency (p99)",
           "type": "timeseries",
           "datasource": "Prometheus",
-          "targets": [{ "expr": "histogram_quantile(0.99, rate(smg_request_duration_seconds_bucket[5m]))", "legendFormat": "p99" }],
+          "targets": [{ "expr": "histogram_quantile(0.99, sum by (le) (rate(smg_router_request_duration_seconds_bucket[5m])))", "legendFormat": "p99" }],
           "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 }
         },
         {
           "title": "Active Workers",
           "type": "stat",
           "datasource": "Prometheus",
-          "targets": [{ "expr": "smg_active_workers", "legendFormat": "workers" }],
+          "targets": [{ "expr": "sum(max by (worker) (smg_worker_health))", "legendFormat": "workers" }],
           "gridPos": { "h": 4, "w": 6, "x": 0, "y": 8 }
         },
         {
           "title": "Queue Depth",
           "type": "timeseries",
           "datasource": "Prometheus",
-          "targets": [{ "expr": "smg_queue_depth", "legendFormat": "queue" }],
+          "targets": [{ "expr": "sum(smg_admission_queue_depth)", "legendFormat": "queue" }],
           "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 }
         }
       ],
