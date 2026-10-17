@@ -32,70 +32,95 @@ use crate::{
     tagged::{Placement, Spelling},
 };
 
-/// A table under [`formats`](super), by the function that builds it and, where the function
-/// takes one, its call syntax. [`Table::name`] is how an operator names one: the gateway's
-/// `--tool-call-parser` and `--reasoning-parser` flags, and a worker's labels, take a table's
-/// name in place of a legacy parser's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Table {
+/// The tables, each spelled once: the variant with its doc, the name an operator spells it by
+/// and the function that builds it. [`Table`] and [`ROWS`] are written from this one list, so a
+/// table cannot be added without its row, wherever in the list it goes; the rows stand in the
+/// variants' order, at their discriminants, and their count is the list's.
+macro_rules! tables {
+    ($( $(#[$doc:meta])* $variant:ident => $name:literal, $build:expr; )*) => {
+        /// A table under [`formats`](super), by the function that builds it and, where the function
+        /// takes one, its call syntax. [`Table::name`] is how an operator names one: the gateway's
+        /// `--tool-call-parser` and `--reasoning-parser` flags, and a worker's labels, take a table's
+        /// name in place of a legacy parser's.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Table {
+            $( $(#[$doc])* $variant, )*
+        }
+
+        /// Every table's row, in the enum's order: the one place a table is spelled after its
+        /// variant. [`Table::ALL`], [`Table::name`], [`Table::format`] and the lookups by name
+        /// read it; a table reads its own by `self as usize`.
+        const ROWS: [Row; tables!(@count $($variant)*)] = [
+            $( row(Table::$variant, $name, $build), )*
+        ];
+    };
+    (@count $($variant:ident)*) => { <[()]>::len(&[$( tables!(@unit $variant) ),*]) };
+    (@unit $variant:ident) => { () };
+}
+
+tables! {
     /// [`qwen3()`] with JSON calls.
-    Qwen3,
+    Qwen3 => "qwen3", || qwen3(CallSyntax::Json);
     /// [`qwen3()`] with tagged calls, each value on its own line: Qwen 3.5 and later, Qwen3-Coder.
-    Qwen3Tagged,
+    Qwen3Tagged => "qwen3_tagged", || {
+        qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine))
+    };
     /// [`qwen3()`] with tagged calls and the value between the tags directly: MiMo.
-    Qwen3TaggedDirect,
+    Qwen3TaggedDirect => "qwen3_tagged_direct", || {
+        qwen3(CallSyntax::Tagged(Spelling::Json, Placement::Direct))
+    };
     /// [`qwen2_5()`].
-    Qwen2_5,
+    Qwen2_5 => "qwen2.5", qwen2_5;
     /// [`deepseek_v4()`].
-    DeepSeekV4,
+    DeepSeekV4 => "deepseek_v4", deepseek_v4;
     /// [`deepseek_v4_1()`].
-    DeepSeekV4_1,
+    DeepSeekV4_1 => "deepseek_v4.1", deepseek_v4_1;
     /// [`seed_oss()`].
-    SeedOss,
+    SeedOss => "seed_oss", seed_oss;
     /// [`hy4()`].
-    Hy4,
+    Hy4 => "hy4", hy4;
     /// [`ling()`].
-    Ling,
+    Ling => "ling", ling;
     /// [`iquest()`].
-    IQuest,
+    IQuest => "iquest", iquest;
     /// [`olmo3()`].
-    Olmo3,
+    Olmo3 => "olmo3", olmo3;
     /// [`lfm2_5()`].
-    Lfm2_5,
+    Lfm2_5 => "lfm2.5", lfm2_5;
     /// [`xlam()`].
-    Xlam,
+    Xlam => "xlam", xlam;
     /// [`json()`].
-    Json,
+    Json => "json", json;
     /// [`minimax_m2()`].
-    MinimaxM2,
+    MinimaxM2 => "minimax_m2", minimax_m2;
     /// [`minimax_m3()`].
-    MinimaxM3,
+    MinimaxM3 => "minimax_m3", minimax_m3;
     /// [`mistral_v13()`].
-    MistralV13,
+    MistralV13 => "mistral_v13", mistral_v13;
     /// [`llama_nemotron()`].
-    LlamaNemotron,
+    LlamaNemotron => "llama_nemotron", llama_nemotron;
     /// [`kimi_k3()`].
-    KimiK3,
+    KimiK3 => "kimi_k3", kimi_k3;
     /// [`inkling()`].
-    Inkling,
+    Inkling => "inkling", inkling;
     /// [`minicpm5()`].
-    MiniCpm5,
+    MiniCpm5 => "minicpm5", minicpm5;
     /// [`dots3()`].
-    Dots3,
+    Dots3 => "dots3", dots3;
     /// [`gemma4()`].
-    Gemma4,
+    Gemma4 => "gemma4", gemma4;
     /// [`function_gemma()`].
-    FunctionGemma,
+    FunctionGemma => "function_gemma", function_gemma;
     /// [`glm()`].
-    Glm,
+    Glm => "glm", glm;
     /// [`glm4()`].
-    Glm4,
+    Glm4 => "glm4", glm4;
     /// [`k2_horizon()`].
-    K2Horizon,
+    K2Horizon => "k2_horizon", k2_horizon;
     /// [`muse_spark()`].
-    MuseSpark,
+    MuseSpark => "muse_spark", muse_spark;
     /// [`plain()`].
-    Plain,
+    Plain => "plain", plain;
 }
 
 /// A table's row in the registry: the table, its name and the function that builds it. The rows
@@ -110,62 +135,6 @@ struct Row {
 const fn row(table: Table, name: &'static str, build: fn() -> Format) -> Row {
     Row { table, name, build }
 }
-
-/// Every table's row, in the enum's order: the one place a table is spelled after its variant.
-/// [`Table::ALL`], [`Table::name`], [`Table::format`] and the lookups by name read it. The rows
-/// end with `plain`, the table that reads nothing, so that a table added without its row, or a
-/// row out of its table's place, does not build (the checks below): a new table goes before it.
-const ROWS: [Row; 29] = [
-    row(Table::Qwen3, "qwen3", || qwen3(CallSyntax::Json)),
-    row(Table::Qwen3Tagged, "qwen3_tagged", || {
-        qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine))
-    }),
-    row(Table::Qwen3TaggedDirect, "qwen3_tagged_direct", || {
-        qwen3(CallSyntax::Tagged(Spelling::Json, Placement::Direct))
-    }),
-    row(Table::Qwen2_5, "qwen2.5", qwen2_5),
-    row(Table::DeepSeekV4, "deepseek_v4", deepseek_v4),
-    row(Table::DeepSeekV4_1, "deepseek_v4.1", deepseek_v4_1),
-    row(Table::SeedOss, "seed_oss", seed_oss),
-    row(Table::Hy4, "hy4", hy4),
-    row(Table::Ling, "ling", ling),
-    row(Table::IQuest, "iquest", iquest),
-    row(Table::Olmo3, "olmo3", olmo3),
-    row(Table::Lfm2_5, "lfm2.5", lfm2_5),
-    row(Table::Xlam, "xlam", xlam),
-    row(Table::Json, "json", json),
-    row(Table::MinimaxM2, "minimax_m2", minimax_m2),
-    row(Table::MinimaxM3, "minimax_m3", minimax_m3),
-    row(Table::MistralV13, "mistral_v13", mistral_v13),
-    row(Table::LlamaNemotron, "llama_nemotron", llama_nemotron),
-    row(Table::KimiK3, "kimi_k3", kimi_k3),
-    row(Table::Inkling, "inkling", inkling),
-    row(Table::MiniCpm5, "minicpm5", minicpm5),
-    row(Table::Dots3, "dots3", dots3),
-    row(Table::Gemma4, "gemma4", gemma4),
-    row(Table::FunctionGemma, "function_gemma", function_gemma),
-    row(Table::Glm, "glm", glm),
-    row(Table::Glm4, "glm4", glm4),
-    row(Table::K2Horizon, "k2_horizon", k2_horizon),
-    row(Table::MuseSpark, "muse_spark", muse_spark),
-    row(Table::Plain, "plain", plain),
-];
-
-// Every row stands at its table's discriminant, and the last table has the last row.
-const _: () = {
-    let mut i = 0;
-    while i < ROWS.len() {
-        assert!(
-            ROWS[i].table as usize == i,
-            "a table's row is not at its discriminant"
-        );
-        i += 1;
-    }
-    assert!(
-        Table::Plain as usize + 1 == ROWS.len(),
-        "a table has no row: a new table and its row go before `Plain`"
-    );
-};
 
 impl Table {
     /// Every table, in the rows' order, which is the enum's.
