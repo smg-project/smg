@@ -47,10 +47,7 @@ def test_reads_the_first_version_line_of_a_manifest(mod):
         )
         == "1.5.0"
     )
-    assert (
-        mod.read_version("workflow", "env:\n  SMG_RELEASE_TAG: v1.13.0\n", "w.yml")
-        == "1.13.0"
-    )
+    assert mod.read_version("workflow", "env:\n  SMG_RELEASE_TAG: v1.13.0\n", "w.yml") == "1.13.0"
 
 
 def test_workspace_versioning_is_refused(mod):

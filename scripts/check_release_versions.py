@@ -169,7 +169,11 @@ def write_version(kind: str, text: str, old: str, new: str) -> str | None:
     elif kind == "workflow":
         # the one SMG_RELEASE_TAG line pins the release; the run names and fallbacks read it from there
         text = re.sub(
-            rf"(SMG_RELEASE_TAG:\s*)v{re.escape(old)}(?=\s|$)", rf"\g<1>v{new}", text, count=1, flags=re.M
+            rf"(SMG_RELEASE_TAG:\s*)v{re.escape(old)}(?=\s|$)",
+            rf"\g<1>v{new}",
+            text,
+            count=1,
+            flags=re.M,
         )
         done = re.search(rf"SMG_RELEASE_TAG:\s*v{re.escape(new)}(?=\s|$)", text, re.M)
     else:
