@@ -281,7 +281,7 @@ impl MessagePreparationStage {
                 .tool_parser_factory
                 .registry()
                 .generate_tool_constraint(
-                    names.tool.as_deref(),
+                    names.tool(),
                     &filtered_tools,
                     tool_choice,
                     reasoning,

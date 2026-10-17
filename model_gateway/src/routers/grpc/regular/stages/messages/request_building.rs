@@ -186,7 +186,8 @@ impl BuildStage for MessageRequestBuildingStage {
                     .unwrap_or_default();
                 symphony::AutoTag::Messages {
                     parser,
-                    names: names.clone(),
+                    labels: names.labels.clone(),
+                    flags: names.flags.clone(),
                     request: Arc::clone(&messages_request),
                     tools,
                     reasoning_open: require_reasoning,

@@ -26,11 +26,13 @@ use crate::{
 
 /// Per-request parser-name resolution.
 ///
-/// Precedence: the model's `ModelCard` override (`tool_parser` /
-/// `reasoning_parser`, populated from worker labels or an explicit
-/// `WorkerSpec` card) → the process-wide configured name
+/// For the legacy parsers, each kind's name is the model's `ModelCard`
+/// override (`tool_parser` / `reasoning_parser`, populated from worker labels
+/// or an explicit `WorkerSpec` card) → the process-wide configured name
 /// (`--tool-call-parser` / `--reasoning-parser`) → `None`, which lets the
 /// factory helpers fall back to their name-based auto-detection, unchanged.
+/// Symphony takes the two sources apart ([`Self::names`]), with its registry
+/// between them (`regular::symphony::reads`).
 ///
 /// Lookups borrow straight from worker metadata (no card clones); only the
 /// resolved name is cloned.
@@ -38,8 +40,8 @@ use crate::{
 pub(crate) struct ParserResolver {
     /// `None` disables card lookups (parser-free endpoints, tests).
     worker_registry: Option<Arc<WorkerRegistry>>,
-    configured_tool_parser: Option<String>,
-    configured_reasoning_parser: Option<String>,
+    /// The gateway's `--tool-call-parser` and `--reasoning-parser`.
+    flags: Names,
 }
 
 impl ParserResolver {
@@ -50,8 +52,10 @@ impl ParserResolver {
     ) -> Self {
         Self {
             worker_registry: Some(worker_registry),
-            configured_tool_parser,
-            configured_reasoning_parser,
+            flags: Names {
+                tool: configured_tool_parser,
+                reasoning: configured_reasoning_parser,
+            },
         }
     }
 
@@ -60,29 +64,40 @@ impl ParserResolver {
     pub(crate) fn disabled() -> Self {
         Self {
             worker_registry: None,
-            configured_tool_parser: None,
-            configured_reasoning_parser: None,
+            flags: Names::default(),
         }
     }
 
     /// Effective tool-parser name for `model`, if any.
     pub(crate) fn tool_parser(&self, model: &str) -> Option<String> {
         self.card_parser(model, |card| card.tool_parser.as_ref())
-            .or_else(|| self.configured_tool_parser.clone())
+            .or_else(|| self.flags.tool.clone())
     }
 
     /// Effective reasoning-parser name for `model`, if any.
     pub(crate) fn reasoning_parser(&self, model: &str) -> Option<String> {
         self.card_parser(model, |card| card.reasoning_parser.as_ref())
-            .or_else(|| self.configured_reasoning_parser.clone())
+            .or_else(|| self.flags.reasoning.clone())
     }
 
-    /// Both names for `model`, as [`Self::tool_parser`] and [`Self::reasoning_parser`] resolve
-    /// them: Symphony reads them as a pair (`regular::symphony::reads`).
-    pub(crate) fn names(&self, model: &str) -> Names {
+    /// The parser names set for `model`, apart by who set them: its card's
+    /// (its workers' labels), and the gateway's flags. Symphony reads them in
+    /// that order with its registry between (`regular::symphony::reads`); the
+    /// legacy parsers take each kind's first ([`Self::tool_parser`],
+    /// [`Self::reasoning_parser`]).
+    pub(crate) fn names(&self, model: &str) -> ModelNames<'_> {
+        ModelNames {
+            labels: self.card_names(model),
+            flags: &self.flags,
+        }
+    }
+
+    /// The names `model`'s own cards set (worker labels), without the process-wide fallback:
+    /// what the workers say of the model, each `None` when no card names one.
+    fn card_names(&self, model: &str) -> Names {
         Names {
-            tool: self.tool_parser(model),
-            reasoning: self.reasoning_parser(model),
+            tool: self.card_parser(model, |card| card.tool_parser.as_ref()),
+            reasoning: self.card_parser(model, |card| card.reasoning_parser.as_ref()),
         }
     }
 
@@ -126,12 +141,68 @@ impl ParserResolver {
     }
 }
 
-/// The parser names set for one model, resolved by [`ParserResolver`]: the tool-call parser's
-/// and the reasoning parser's, each `None` when nothing names one.
+/// The parser names one source sets for a model: the tool-call parser's and the reasoning
+/// parser's, each `None` when nothing names one. A source is a model's card (its workers' labels,
+/// or the operator's card for it) or the gateway's `--tool-call-parser` and `--reasoning-parser`
+/// flags, which every model shares; [`ModelNames`] holds a model's two.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Names {
     pub tool: Option<String>,
     pub reasoning: Option<String>,
+}
+
+/// No names at all.
+static NO_NAMES: Names = Names {
+    tool: None,
+    reasoning: None,
+};
+
+/// The parser names set for one model, apart by who set them ([`ParserResolver::names`]): the
+/// names of its card, which its workers' labels (or the operator's card) set for the one model,
+/// and the gateway's flags, which every model shares. Symphony reads the two in that order with
+/// its registry between them (`regular::symphony::reads`): the card's names when they select
+/// anything, else the registry's table for a model it knows, else the flags; the legacy parsers
+/// take each kind's first name ([`ParserResolver::tool_parser`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ModelNames<'a> {
+    pub labels: Names,
+    pub flags: &'a Names,
+}
+
+impl ModelNames<'_> {
+    /// The tool-call parser's name as the legacy parsers take it: the labels', else the flags'
+    /// ([`ParserResolver::tool_parser`], without another lookup).
+    pub(crate) fn tool(&self) -> Option<&str> {
+        self.labels.tool.as_deref().or(self.flags.tool.as_deref())
+    }
+}
+
+impl Default for ModelNames<'_> {
+    fn default() -> Self {
+        Self {
+            labels: Names::default(),
+            flags: &NO_NAMES,
+        }
+    }
+}
+
+#[cfg(test)]
+impl ModelNames<'_> {
+    /// The names a model's workers label it with, and no flags.
+    pub(crate) fn labeled(labels: Names) -> ModelNames<'static> {
+        ModelNames {
+            labels,
+            flags: &NO_NAMES,
+        }
+    }
+
+    /// The gateway's flags, for a model whose workers label nothing.
+    pub(crate) fn flagged(flags: &Names) -> ModelNames<'_> {
+        ModelNames {
+            labels: Names::default(),
+            flags,
+        }
+    }
 }
 
 /// Determine if thinking is effectively ON based on the template's thinking

@@ -153,15 +153,17 @@ difference. **Pending** means no table yet.
 **SMG today** is what the gateway takes for the group's primary before Symphony is wired in: the
 `--tool-call-parser` and `--reasoning-parser` names its registries resolve from the model id, as
 in `smg serve --model-path Qwen/Qwen3-8B --tool-call-parser qwen --reasoning-parser qwen3`; none
-means passthrough, the output read as content. Under `--parser symphony`, the name `hf` in both
-flags reads a model with the table its tokenizer's `response_template` compiles into
-(`smg-response-template`), whatever the registry has for it. Symphony's tables carry one name each, the
-**Table** column, and the Qwen3 table takes its call syntax as a second selector (JSON calls, or
-the tagged calls of Qwen 3.5 and later and Qwen3-Coder). `formats::for_model` picks the table
-from the model id by its exact repository name in any case, the group's primary or any checkpoint
-under **Also**, so a model listed here with a table needs neither flag once the gateway reads it
-with Symphony (a quantized or renamed checkpoint is not listed, and keeps the older parsers until
-its group names it); whether the flags stay as aliases is an open question of the design.
+means passthrough, the output read as content. Under `--parser symphony`, a worker's parser labels
+decide for its model, else the registry's table for a model it knows, else the two flags, for the
+models the registry does not know: a table's name in them reads those models with that table, and
+the name `hf` reads each with the table its tokenizer's `response_template` compiles into
+(`smg-response-template`). Symphony's tables carry one name each, the **Table** column, and the
+Qwen3 table takes its call syntax as a second selector (JSON calls, or the tagged calls of Qwen 3.5
+and later and Qwen3-Coder). `formats::for_model` picks the table from the model id by its exact
+repository name in any case, the group's primary or any checkpoint under **Also**, so a model
+listed here with a table needs neither flag once the gateway reads it with Symphony (a quantized
+or renamed checkpoint is not listed: the flags, or its workers' labels, name its table until its
+group names it, else it keeps the older parsers).
 
 <!-- models: begin -->
 202 groups, 343 checkpoints, newest first.

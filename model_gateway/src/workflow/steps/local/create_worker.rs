@@ -15,7 +15,9 @@ use super::discover_dp::DpInfo;
 use crate::{
     config::ParserChoice,
     routers::grpc::{
-        multimodal::SUPPORTS_VISION_LABEL, regular::symphony::check_names, utils::Names,
+        multimodal::SUPPORTS_VISION_LABEL,
+        regular::symphony::{check_names, labels_select_nothing, set_aside_by_the_registry},
+        utils::Names,
         zmq_client::zmq_handshake_address,
     },
     worker::{
@@ -124,6 +126,23 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             &config.url,
             &app_context.worker_registry,
         );
+
+        // Under Symphony the registry's table reads a model it knows for a
+        // worker whose labels select no reader, whatever the gateway's flags
+        // name (`regular::symphony::reads`): the model's first such worker
+        // says so.
+        if let Some(message) = registry_reads_over_the_flags(
+            &model_card,
+            &config.url,
+            app_context.router_config.parser,
+            &Names {
+                tool: app_context.router_config.tool_call_parser.clone(),
+                reasoning: app_context.router_config.reasoning_parser.clone(),
+            },
+            &app_context.worker_registry,
+        ) {
+            warn!(model = %model_card.id, worker = %config.url, "{message}");
+        }
 
         let runtime_type = match context.data.detected_runtime_type.as_deref() {
             Some(s) => s.parse::<RuntimeType>().unwrap_or(config.runtime_type),
@@ -454,6 +473,46 @@ pub(super) fn validate_parser_overrides(
             card.id
         )
     })
+}
+
+/// Under `--parser symphony`, the registry's table reads a model it knows for every worker whose
+/// labels select no reader (none, or a reasoning name alone that no table answers to), whatever the
+/// gateway's `--tool-call-parser` and `--reasoning-parser` name (`regular::symphony::reads`). When
+/// they name another reader, the registration of the model's first worker says so: `Some(message)`
+/// while no worker of the model is registered, naming the model, both readers and the one used;
+/// `None` for the model's later workers, a worker whose labels select a reader, a model the
+/// registry does not know, flags that select nothing or the registry's own table, and the legacy
+/// parser choice. Workers of one model registering at the same moment may each say it, as the
+/// override check above may: the registry gains the worker a step later.
+pub(super) fn registry_reads_over_the_flags(
+    card: &ModelCard,
+    worker_url: &str,
+    parser: ParserChoice,
+    flags: &Names,
+    registry: &WorkerRegistry,
+) -> Option<String> {
+    let labels = Names {
+        tool: card.tool_parser.clone(),
+        reasoning: card.reasoning_parser.clone(),
+    };
+    if parser != ParserChoice::Symphony
+        || !labels_select_nothing(&labels)
+        || !registry.get_by_model(&card.id).is_empty()
+    {
+        return None;
+    }
+    let (table, named) = set_aside_by_the_registry(flags, &card.id)?;
+    let spell =
+        |name: Option<&str>| name.map_or_else(|| "unset".to_string(), |name| format!("'{name}'"));
+    Some(format!(
+        "the registry's table '{}' reads model '{}' for worker {worker_url}, whose labels select \
+         no reader; the gateway's --tool-call-parser {} / --reasoning-parser {} name {named}, which \
+         reads only the models the registry does not know",
+        table.name(),
+        card.id,
+        spell(flags.tool.as_deref()),
+        spell(flags.reasoning.as_deref()),
+    ))
 }
 
 /// The card a worker is registered with: the operator's card for `model_id`,
@@ -934,6 +993,127 @@ fn validate_zmq_dp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Under `--parser symphony`, the registration of a model's first worker whose labels select
+    /// no reader (none, or a reasoning name no table answers to) says that the registry's table
+    /// reads the model, not what the gateway's flags name, naming both; the model's next worker,
+    /// a worker whose labels select a reader, a model the registry does not know, flags that name
+    /// the registry's own table or nothing, and the legacy parser choice, say nothing.
+    #[test]
+    fn the_registrys_table_over_the_flags_is_said_once_per_model_at_registration() {
+        let flags = Names {
+            tool: Some("mistral_v13".to_string()),
+            reasoning: None,
+        };
+        let known = ModelCard::new("Qwen/Qwen3-8B");
+        let registry = WorkerRegistry::new();
+        let said =
+            |card: &ModelCard, url: &str, parser, flags: &Names, registry: &WorkerRegistry| {
+                registry_reads_over_the_flags(card, url, parser, flags, registry)
+            };
+
+        let first = said(
+            &known,
+            "grpc://a:1",
+            ParserChoice::Symphony,
+            &flags,
+            &registry,
+        )
+        .expect("the model's first worker says so");
+        assert!(
+            first.contains("'Qwen/Qwen3-8B'")
+                && first.contains("'qwen3'")
+                && first.contains("the table 'mistral_v13'")
+                && first.contains("grpc://a:1"),
+            "{first}"
+        );
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("grpc://a:1")
+                    .model(known.clone())
+                    .build(),
+            ))
+            .expect("register");
+        assert_eq!(
+            said(
+                &known,
+                "grpc://b:1",
+                ParserChoice::Symphony,
+                &flags,
+                &registry
+            ),
+            None,
+            "the model's second worker"
+        );
+
+        let fresh = WorkerRegistry::new();
+        let mut labeled = known.clone();
+        labeled.reasoning_parser = Some("qwen3".to_string());
+        assert_eq!(
+            said(
+                &labeled,
+                "grpc://a:1",
+                ParserChoice::Symphony,
+                &flags,
+                &fresh
+            ),
+            None,
+            "a worker whose labels select a reader"
+        );
+        assert_eq!(
+            said(
+                &ModelCard::new("acme/ministral-3-14b-instruct-w4a16"),
+                "grpc://a:1",
+                ParserChoice::Symphony,
+                &flags,
+                &fresh
+            ),
+            None,
+            "a model the registry does not know"
+        );
+        let own = Names {
+            tool: Some("qwen".to_string()),
+            reasoning: None,
+        };
+        assert_eq!(
+            said(&known, "grpc://a:1", ParserChoice::Symphony, &own, &fresh),
+            None,
+            "the registry's own table"
+        );
+        // A label that selects nothing (a reasoning name no table answers to) falls through to
+        // the registry as no label does, so the worker says it too.
+        let mut idle_label = known.clone();
+        idle_label.reasoning_parser = Some("deepseek_r1".to_string());
+        assert!(
+            said(
+                &idle_label,
+                "grpc://a:1",
+                ParserChoice::Symphony,
+                &flags,
+                &fresh
+            )
+            .is_some_and(|message| {
+                message.contains("'qwen3'") && message.contains("whose labels select no reader")
+            }),
+            "a label that selects nothing"
+        );
+        assert_eq!(
+            said(
+                &known,
+                "grpc://a:1",
+                ParserChoice::Symphony,
+                &Names::default(),
+                &fresh
+            ),
+            None,
+            "no flags"
+        );
+        assert_eq!(
+            said(&known, "grpc://a:1", ParserChoice::Legacy, &flags, &fresh),
+            None,
+            "the legacy parsers"
+        );
+    }
 
     fn make_app_context() -> Arc<crate::app_context::AppContext> {
         use crate::{

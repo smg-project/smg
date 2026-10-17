@@ -412,7 +412,7 @@ pub(crate) async fn prepare_chat_like(
                 .tool_parser_factory
                 .registry()
                 .generate_tool_constraint(
-                    names.tool.as_deref(),
+                    names.tool(),
                     &constraint_tools,
                     tool_choice,
                     reasoning,

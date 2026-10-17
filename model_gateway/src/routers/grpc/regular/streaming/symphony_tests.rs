@@ -34,7 +34,7 @@ use crate::{
             processor::ResponseProcessor,
             symphony::{assign, template::Templates, Assignment},
         },
-        utils::Names,
+        utils::ModelNames,
     },
 };
 
@@ -188,7 +188,7 @@ async fn a_call_the_conversation_established_is_a_call_without_a_tool_inventory(
     let request = retry_request();
     let assignment = assign(
         ParserChoice::Symphony,
-        &Names::default(),
+        &ModelNames::default(),
         &request,
         None,
         RETRY_PROMPT,

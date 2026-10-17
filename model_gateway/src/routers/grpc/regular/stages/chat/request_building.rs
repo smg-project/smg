@@ -262,7 +262,8 @@ impl BuildStage for ChatRequestBuildingStage {
             },
             || symphony::AutoTag::Chat {
                 parser,
-                names: names.clone(),
+                labels: names.labels.clone(),
+                flags: names.flags.clone(),
                 request: Arc::clone(&chat_request),
                 reasoning_open: reasoning_decision(
                     ctx,

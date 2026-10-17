@@ -1446,30 +1446,32 @@ struct ModelArgs {
 
     // ==================== Parsers ====================
     /// Parser for reasoning models (e.g., deepseek-r1, qwen3). Under --parser
-    /// symphony, a Symphony table's name here (and in --tool-call-parser, or
-    /// there alone) reads every model with that table; `hf` reads each model
-    /// with the table its tokenizer's response_template compiles into; a
-    /// legacy parser's name keeps the legacy parsers. A worker's labels set
-    /// the names per model.
+    /// symphony, a worker's labels decide for its model, else Symphony's
+    /// registry for a model it knows, and this flag for the models the
+    /// registry does not know: a Symphony table's name here (and in
+    /// --tool-call-parser, or there alone) reads them with that table; `hf`
+    /// reads each with the table its tokenizer's response_template compiles
+    /// into; a legacy parser's name keeps the legacy parsers for them.
     #[arg(long, help_heading = "Parsers")]
     reasoning_parser: Option<String>,
 
     /// Parser for tool-call interactions (e.g., json, qwen). Under --parser
-    /// symphony, a Symphony table's name here (and in --reasoning-parser, or
-    /// here alone) reads every model with that table; `hf` reads each model
-    /// with the table its tokenizer's response_template compiles into; a
-    /// legacy parser's name keeps the legacy parsers. A worker's labels set
-    /// the names per model.
+    /// symphony, a worker's labels decide for its model, else Symphony's
+    /// registry for a model it knows, and this flag for the models the
+    /// registry does not know: a Symphony table's name here (and in
+    /// --reasoning-parser, or here alone) reads them with that table; `hf`
+    /// reads each with the table its tokenizer's response_template compiles
+    /// into; a legacy parser's name keeps the legacy parsers for them.
     #[arg(long, help_heading = "Parsers")]
     tool_call_parser: Option<String>,
 
     /// Which parser reads a chat completion's reasoning and tool calls: the
-    /// per-model parsers (legacy) or Symphony. With Symphony, the parser names
-    /// set for a model decide (its worker labels, else --tool-call-parser and
-    /// --reasoning-parser): a Symphony table's name reads with that table, a
-    /// legacy parser's keeps the legacy parsers, and no name takes Symphony's
-    /// registry for the models it knows. A request's X-SMG-Parser header
-    /// overrides the flag for that request.
+    /// per-model parsers (legacy) or Symphony. With Symphony, a model's
+    /// worker labels decide, else Symphony's registry for a model it knows,
+    /// else --tool-call-parser and --reasoning-parser: a Symphony table's
+    /// name reads with that table, a legacy parser's keeps the legacy
+    /// parsers, and no name leaves the legacy parsers to detect. A request's
+    /// X-SMG-Parser header overrides the flag for that request.
     #[arg(long, default_value = "legacy", value_parser = ["legacy", "symphony"], help_heading = "Parsers")]
     parser: String,
 

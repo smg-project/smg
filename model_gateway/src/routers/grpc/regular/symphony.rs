@@ -3,21 +3,25 @@
 //!
 //! The switch is the gateway's `--parser` flag (`RouterConfig::parser`, `legacy` by default),
 //! which a request's `X-SMG-Parser` header overrides for that one request ([`choice`]). With
-//! `symphony` on, the parser names set for the model decide ([`reads`]): the
-//! `tool_parser` and `reasoning_parser` of the model's card (worker labels), else the
-//! `--tool-call-parser` and `--reasoning-parser` flags, resolved as the legacy path resolves them
-//! (`ParserResolver`). A name a table answers to (`symphony::formats::Table::answering_to`: its
-//! own name, a legacy parser's that reads its format, `qwen` for `qwen3`, `qwen_xml` for
-//! `qwen3_tagged`, or a launcher's name for a family whose table has no older parser, `muse` for
-//! `muse_spark`) reads every request for the model with that table, whatever the model is, the
-//! tool-call name deciding; [`TEMPLATE_PARSER`] reads it with the table its tokenizer's
-//! `response_template` compiles into ([`template`]), and refuses the request when the model has
-//! none; any other legacy tool-call parser's name keeps the legacy parsers, which is the way back
-//! for one model when its table misbehaves, `passthrough` among them; no name at all, or a
-//! reasoning name alone that no table answers to, other than `passthrough`, takes the registry's
-//! table for the model (`symphony::formats::for_model`), and the legacy parsers with their own
-//! detection when it has none. The names are checked at startup and at a worker's registration
-//! ([`check_names`]). Every request read with `legacy` keeps the older parsers. The response names
+//! `symphony` on, one precedence decides what reads a model ([`reads`]), among the parser names
+//! set for it (`ParserResolver::names`: the `tool_parser` and `reasoning_parser` of the model's
+//! card, its workers' labels, apart from the gateway's `--tool-call-parser` and
+//! `--reasoning-parser` flags) and the registry: the labels, when they select anything; else the
+//! registry's table for a model it knows (`symphony::formats::for_model`); else the flags, for a
+//! model the registry does not know, so that a fleet-wide name never reads a family the registry
+//! has a table for; else the legacy parsers with their own detection. Names select a table when
+//! it answers to them (`symphony::formats::Table::answering_to`: its own name, a legacy parser's
+//! that reads its format, `qwen` for `qwen3`, `qwen_xml` for `qwen3_tagged`, or a launcher's name
+//! for a family whose table has no older parser, `muse` for `muse_spark`), the tool-call name
+//! deciding, and the table then reads every request for the model; [`TEMPLATE_PARSER`] selects
+//! the table the model's tokenizer's `response_template` compiles into ([`template`]), which
+//! refuses the request when the model has none; any other legacy tool-call parser's name selects
+//! the legacy parsers, which is the labels' way back for one model when its table misbehaves,
+//! `passthrough` among them; no name at all, or a reasoning name alone that no table answers to,
+//! other than `passthrough`, selects nothing. The names are checked at startup and at a worker's
+//! registration ([`check_names`]), which also says, once per model, when the registry's table
+//! sets the flags' choice aside ([`set_aside_by_the_registry`]). Every request read with `legacy`
+//! keeps the older parsers. The response names
 //! the parser that read it in `x-smg-parser`, legacy when the choice was Symphony but no table
 //! took the request, so a client comparing the two can tell which one read each answer. What a
 //! request asks of the channels takes a variant of the table rather than another reader: where the
@@ -70,7 +74,7 @@ use crate::{
     routers::grpc::{
         common::stages::helpers::TagForStart,
         spec::scans_for_tool_calls,
-        utils::{Names, WorkerDecoding},
+        utils::{ModelNames, Names, WorkerDecoding},
     },
     worker::{Worker, WorkerType},
 };
@@ -126,41 +130,136 @@ pub(crate) fn named_table(names: &Names) -> Option<Table> {
         .and_then(Table::answering_to)
 }
 
-/// The table that reads `model`'s responses under `parser`, if one does: the response template's
-/// when the `names` say [`TEMPLATE_PARSER`] (an error when the model has none that compiles, which
-/// refuses the request, since the names ask for what the model cannot give); else the one the
-/// names select ([`named_table`]), whatever the model; else the registry's for the model when no
-/// name is set, or when a reasoning name alone selects none, since every table reads the thought
-/// channel; `passthrough` alone is the choice to leave the thought as written, which no table
-/// does. A tool-call name no table answers to leaves the response to the legacy parsers. What a
-/// request asks of the channels takes a variant of the table ([`assign`]). Preparation and
-/// request building both decide with this one predicate. The table comes shared, built once
-/// for every request and engine that reads with it; a variant is a copy.
-pub(crate) fn reads(
+/// What one source's parser names select: the response template's table ([`TEMPLATE_PARSER`] in
+/// either name); a table ([`named_table`]); the legacy parsers, by a tool-call name no table
+/// answers to, which is the way back for one model when its table misbehaves, or by `passthrough`
+/// alone, the choice to leave the thought as written, which no table does; or nothing, by no name
+/// at all, or a reasoning name alone that no table answers to, since every table reads the thought
+/// channel.
+enum Selection {
+    Template,
+    Table(Table),
+    Legacy,
+    Nothing,
+}
+
+fn selection(names: &Names) -> Selection {
+    if names_template(names) {
+        return Selection::Template;
+    }
+    match named_table(names) {
+        Some(table) => Selection::Table(table),
+        None if names.tool.is_none() && !is_passthrough(names.reasoning.as_deref()) => {
+            Selection::Nothing
+        }
+        None => Selection::Legacy,
+    }
+}
+
+/// Whether `names`, one source's, select nothing (no name at all, or a reasoning name alone that no
+/// table answers to, `passthrough` excepted), so that [`decision`] passes them over for the next
+/// source: a worker labeled so is read by the registry's table, as an unlabeled one is.
+pub(crate) fn labels_select_nothing(names: &Names) -> bool {
+    matches!(selection(names), Selection::Nothing)
+}
+
+/// What reads a model's responses under Symphony ([`decision`]).
+enum Decision {
+    /// The response template's table, compiled when the request comes ([`Templates`]).
+    Template,
+    /// A table, shared with every request and engine that reads with it: the registry's, or
+    /// the one the names select.
+    Table(Arc<Format>),
+    /// The legacy parsers.
+    Legacy,
+}
+
+/// The reader of `model`'s responses under Symphony, by the one precedence among the parser names
+/// set for the model ([`ModelNames`]) and the registry: the names of the model's card (its
+/// workers' labels), when they select anything; else the registry's table, for a model it knows
+/// (`symphony::formats::for_model`); else the gateway's `--tool-call-parser` and
+/// `--reasoning-parser`, for a model the registry does not know; else the legacy parsers, with
+/// their own detection. So a fleet-wide name reads the models the registry has no table for and
+/// never a family it has one for, and a worker's labels read their model whatever the registry
+/// has. A table the labels select reads a model the registry gives the same table with the model's
+/// own turn opener; another model, or one the registry does not know, replays from the table's
+/// own. The registry is asked once per path, as before the flags came apart.
+fn decision(names: &ModelNames<'_>, model: &str) -> Decision {
+    match selection(&names.labels) {
+        Selection::Template => Decision::Template,
+        Selection::Legacy => Decision::Legacy,
+        Selection::Table(table) => Decision::Table(match for_model_shared(model) {
+            Some(format) if table_for(model) == Some(table) => format,
+            _ => table.shared(),
+        }),
+        Selection::Nothing => match for_model_shared(model) {
+            Some(format) => Decision::Table(format),
+            // The registry does not know the model: the flags read it, a table they name from
+            // its own opener.
+            None => match selection(names.flags) {
+                Selection::Template => Decision::Template,
+                Selection::Table(table) => Decision::Table(table.shared()),
+                Selection::Legacy | Selection::Nothing => Decision::Legacy,
+            },
+        },
+    }
+}
+
+/// The table that reads `model`'s responses under `parser`, if one does ([`decision`]), and whether
+/// it is the response template's, compiled for the model (an error when the model has none that
+/// compiles, which refuses the request, since the names ask for what the model cannot give): a
+/// constraint is compiled against that table, and a worker may take its whole turn's grammar.
+/// `None` under `legacy`, and when the legacy parsers read the response.
+fn table_reading(
     parser: ParserChoice,
-    names: &Names,
+    names: &ModelNames<'_>,
     model: &str,
     templates: &Templates,
-) -> Result<Option<Arc<Format>>, String> {
+) -> Result<Option<(Arc<Format>, bool)>, String> {
     if parser != ParserChoice::Symphony {
         return Ok(None);
     }
-    if names_template(names) {
-        return templates.format(model).map(Some);
-    }
-    let table = match named_table(names) {
-        Some(table) => table,
-        None if names.tool.is_none() && !is_passthrough(names.reasoning.as_deref()) => {
-            return Ok(for_model_shared(model))
-        }
-        None => return Ok(None),
-    };
-    // The registry's table comes with the model's own turn opener; a table named for a model
-    // the registry reads with another, or does not know, replays from the table's own.
-    Ok(match for_model_shared(model) {
-        Some(format) if table_for(model) == Some(table) => Some(format),
-        _ => Some(table.shared()),
+    Ok(match decision(names, model) {
+        Decision::Template => Some((templates.format(model)?, true)),
+        Decision::Table(format) => Some((format, false)),
+        Decision::Legacy => None,
     })
+}
+
+/// The table that reads `model`'s responses under `parser`, if one does: the response template's,
+/// the registry's, or the one the parser names select, by the precedence [`decision`] states; `None`
+/// under `legacy`, and when the legacy parsers read the response. What a request asks of the
+/// channels takes a variant of the table ([`assign`]). Preparation and request building both
+/// decide with this one predicate. The table comes shared, built once for every request and
+/// engine that reads with it; a variant is a copy.
+pub(crate) fn reads(
+    parser: ParserChoice,
+    names: &ModelNames<'_>,
+    model: &str,
+    templates: &Templates,
+) -> Result<Option<Arc<Format>>, String> {
+    table_reading(parser, names, model, templates).map(|read| read.map(|(format, _)| format))
+}
+
+/// What the gateway's flags select for `model`, a model the registry knows, that the precedence of
+/// [`decision`] sets aside for a worker labeling no parser: the registry's table, which reads the
+/// model, and the flags' choice spelled for a log line (`the table 'mistral_v13'`, `the model's
+/// response template`, `the legacy parsers`). `None` when the flags select nothing or the
+/// registry's own table, or when the registry does not know the model. Registration warns with it
+/// once per model (`workflow::steps::local::create_worker`).
+pub(crate) fn set_aside_by_the_registry(
+    flags: &Names,
+    model: &str,
+) -> Option<(Table, Cow<'static, str>)> {
+    let table = table_for(model)?;
+    let spelled = match selection(flags) {
+        Selection::Nothing => return None,
+        Selection::Table(named) if named == table => return None,
+        Selection::Table(named) => Cow::Owned(format!("the table '{}'", named.name())),
+        Selection::Template => Cow::Borrowed("the model's response template"),
+        Selection::Legacy => Cow::Borrowed("the legacy parsers"),
+    };
+    Some((table, spelled))
 }
 
 /// Whether the parser names set for a model (the flags, or one worker's labels) are names the
@@ -362,7 +461,7 @@ fn answer_tag(
 /// reasoning. `false` when no table reads the response, leaving the switch's answer as it was.
 pub(crate) fn reasoning_open(
     parser: ParserChoice,
-    names: &Names,
+    names: &ModelNames<'_>,
     model: &str,
     templates: &Templates,
     prompt: &str,
@@ -384,7 +483,7 @@ pub(crate) fn reasoning_open(
 /// ([`Templates::markers_hidden`]).
 pub(crate) fn keeps_special_tokens(
     parser: ParserChoice,
-    names: &Names,
+    names: &ModelNames<'_>,
     model: &str,
     templates: &Templates,
     tokenizer: &Arc<dyn Tokenizer>,
@@ -464,17 +563,16 @@ pub(crate) fn grammar_start_of(workers: &[Arc<dyn Worker>]) -> GrammarStart {
 /// constrain what is asked, or a `regex` or `ebnf` constraint would apply outside its format.
 pub(crate) fn constraint(
     parser: ParserChoice,
-    names: &Names,
+    names: &ModelNames<'_>,
     request: &ChatCompletionRequest,
     tools: &[Tool],
     reasoning_open: bool,
     start: GrammarStart,
     templates: &Templates,
 ) -> Result<Option<ToolConstraint>, String> {
-    let Some(format) = reads(parser, names, &request.model, templates)? else {
+    let Some((format, compiled)) = table_reading(parser, names, &request.model, templates)? else {
         return Ok(None);
     };
-    let compiled = names_template(names);
     if compiled && (request.regex.is_some() || request.ebnf.is_some()) {
         return Err(format!(
             "model '{}' writes its output in the format its response template declares, and a \
@@ -527,7 +625,7 @@ pub(crate) fn constraint(
 /// table has no tag for the calls. A thought and an answer alone are not constrained today.
 pub(crate) fn auto_constraint(
     parser: ParserChoice,
-    names: &Names,
+    names: &ModelNames<'_>,
     request: &ChatCompletionRequest,
     tools: &[Tool],
     reasoning_open: bool,
@@ -590,7 +688,7 @@ fn auto_tag(
 )]
 pub(crate) fn constraint_messages(
     parser: ParserChoice,
-    names: &Names,
+    names: &ModelNames<'_>,
     request: &CreateMessageRequest,
     tools: &[Tool],
     reasoning_open: bool,
@@ -598,7 +696,7 @@ pub(crate) fn constraint_messages(
     continues: bool,
     templates: &Templates,
 ) -> Result<Option<ToolConstraint>, String> {
-    let Some(format) = reads(parser, names, &request.model, templates)? else {
+    let Some((format, compiled)) = table_reading(parser, names, &request.model, templates)? else {
         return Ok(None);
     };
     let one_call = match &request.tool_choice {
@@ -609,7 +707,7 @@ pub(crate) fn constraint_messages(
     };
     calls_tag(
         &format,
-        names_template(names),
+        compiled,
         &request.model,
         tools,
         one_call,
@@ -629,7 +727,7 @@ pub(crate) fn constraint_messages(
 )]
 pub(crate) fn auto_constraint_messages(
     parser: ParserChoice,
-    names: &Names,
+    names: &ModelNames<'_>,
     request: &CreateMessageRequest,
     tools: &[Tool],
     reasoning_open: bool,
@@ -688,7 +786,10 @@ pub(crate) enum AutoTag {
     /// A chat request's, over the tools its `tool_choice` leaves callable.
     Chat {
         parser: ParserChoice,
-        names: Names,
+        /// The model's parser names, both sources owned ([`ModelNames`] borrows the flags from
+        /// the resolver, which the stamp outlives).
+        labels: Names,
+        flags: Names,
         request: Arc<ChatCompletionRequest>,
         /// The prompt leaves the model inside its thought.
         reasoning_open: bool,
@@ -697,7 +798,9 @@ pub(crate) enum AutoTag {
     /// A Messages request's, over `tools` as the template declares them.
     Messages {
         parser: ParserChoice,
-        names: Names,
+        /// The model's parser names, both sources owned, as for `Chat`.
+        labels: Names,
+        flags: Names,
         request: Arc<CreateMessageRequest>,
         /// The tools as the template declares them: the spec's own slice, shared, unless
         /// `tool_choice` narrows it (then the narrowed list, owned here).
@@ -717,13 +820,17 @@ impl AutoTag {
         match self {
             Self::Chat {
                 parser,
-                names,
+                labels,
+                flags,
                 request,
                 reasoning_open,
                 templates,
             } => auto_constraint(
                 *parser,
-                names,
+                &ModelNames {
+                    labels: labels.clone(),
+                    flags,
+                },
                 request,
                 &request.callable_tools(),
                 *reasoning_open,
@@ -732,7 +839,8 @@ impl AutoTag {
             ),
             Self::Messages {
                 parser,
-                names,
+                labels,
+                flags,
                 request,
                 tools,
                 reasoning_open,
@@ -740,7 +848,10 @@ impl AutoTag {
                 templates,
             } => auto_constraint_messages(
                 *parser,
-                names,
+                &ModelNames {
+                    labels: labels.clone(),
+                    flags,
+                },
                 request,
                 tools,
                 *reasoning_open,
@@ -852,17 +963,14 @@ pub(crate) fn worker_constraint(
 /// what it cannot hold.
 pub(crate) fn turn_constraint(
     parser: ParserChoice,
-    names: &Names,
+    names: &ModelNames<'_>,
     request: &ChatCompletionRequest,
     prompt: &str,
     templates: &Templates,
 ) -> Result<Option<ToolConstraint>, String> {
-    if !names_template(names) {
-        return Ok(None);
-    }
-    match reads(parser, names, &request.model, templates)? {
-        Some(format) => chat_turn(&format, request, prompt),
-        None => Ok(None),
+    match table_reading(parser, names, &request.model, templates)? {
+        Some((format, true)) => chat_turn(&format, request, prompt),
+        _ => Ok(None),
     }
 }
 
@@ -904,19 +1012,16 @@ fn chat_turn(
 /// format (an `output_format` is refused before this).
 pub(crate) fn turn_constraint_messages(
     parser: ParserChoice,
-    names: &Names,
+    names: &ModelNames<'_>,
     request: &CreateMessageRequest,
     tools: &[Tool],
     prompt: &str,
     continues: bool,
     templates: &Templates,
 ) -> Result<Option<ToolConstraint>, String> {
-    if !names_template(names) {
-        return Ok(None);
-    }
-    match reads(parser, names, &request.model, templates)? {
-        Some(format) => messages_turn(&format, request, tools, prompt, continues),
-        None => Ok(None),
+    match table_reading(parser, names, &request.model, templates)? {
+        Some((format, true)) => messages_turn(&format, request, tools, prompt, continues),
+        _ => Ok(None),
     }
 }
 
@@ -1020,7 +1125,7 @@ fn asked(format: Arc<Format>, no_calls: bool, no_reasoning: bool) -> Arc<Format>
 /// established without a tool inventory comes back as a call under either parser.
 pub(crate) fn assign(
     parser: ParserChoice,
-    names: &Names,
+    names: &ModelNames<'_>,
     request: &ChatCompletionRequest,
     constraint: Option<&(String, String)>,
     prompt: &str,
@@ -1040,7 +1145,7 @@ pub(crate) fn assign(
 /// declares tools, an empty list included, and for no other, so the calls stay exactly then.
 pub(crate) fn assign_messages(
     parser: ParserChoice,
-    names: &Names,
+    names: &ModelNames<'_>,
     request: &CreateMessageRequest,
     constraint: Option<&(String, String)>,
     prompt: &str,
@@ -1344,11 +1449,17 @@ mod tests {
 
     const PROMPT: &str = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n";
 
-    fn names(tool: Option<&str>, reasoning: Option<&str>) -> Names {
+    /// One source's names.
+    fn pair(tool: Option<&str>, reasoning: Option<&str>) -> Names {
         Names {
             tool: tool.map(str::to_string),
             reasoning: reasoning.map(str::to_string),
         }
+    }
+
+    /// The names a model's workers label it with, and no flags.
+    fn names(tool: Option<&str>, reasoning: Option<&str>) -> ModelNames<'static> {
+        ModelNames::labeled(pair(tool, reasoning))
     }
 
     /// No tokenizer registered: the response template's table is never there.
@@ -1356,17 +1467,18 @@ mod tests {
         Templates::new(Arc::new(TokenizerRegistry::new()))
     }
 
-    /// [`super::check_names`] against the legacy registries as the gateway builds them.
-    fn check(parser: ParserChoice, names: &Names) -> Result<(), String> {
+    /// [`super::check_names`] of the labels, against the legacy registries as the gateway builds
+    /// them.
+    fn check(parser: ParserChoice, names: &ModelNames<'_>) -> Result<(), String> {
         let tools = tool_parser::ParserFactory::new();
         let reasoning = reasoning_parser::ParserFactory::new();
-        check_names(parser, names, Some(&tools), Some(&reasoning))
+        check_names(parser, &names.labels, Some(&tools), Some(&reasoning))
     }
 
     /// [`super::assign`] with no templates: the names never say `hf`, so nothing is refused.
     fn assign(
         parser: ParserChoice,
-        names: &Names,
+        names: &ModelNames<'_>,
         request: &ChatCompletionRequest,
         constraint: Option<&(String, String)>,
         prompt: &str,
@@ -1377,7 +1489,7 @@ mod tests {
     /// [`super::constraint`] with no templates, as [`assign`].
     fn constraint(
         parser: ParserChoice,
-        names: &Names,
+        names: &ModelNames<'_>,
         request: &ChatCompletionRequest,
         tools: &[Tool],
         reasoning_open: bool,
@@ -1606,72 +1718,69 @@ mod tests {
     fn the_tool_call_name_selects_the_table_that_answers_to_it() {
         assert_eq!(named_table(&Names::default()), None);
         assert_eq!(
-            named_table(&names(Some("kimi_k3"), Some("kimi_k3"))),
+            named_table(&pair(Some("kimi_k3"), Some("kimi_k3"))),
             Some(Table::KimiK3)
         );
-        assert_eq!(named_table(&names(None, Some("Ling"))), Some(Table::Ling));
+        assert_eq!(named_table(&pair(None, Some("Ling"))), Some(Table::Ling));
         assert_eq!(
-            named_table(&names(Some("qwen3_tagged"), None)),
+            named_table(&pair(Some("qwen3_tagged"), None)),
             Some(Table::Qwen3Tagged)
         );
         // A legacy name reads with the table of the format it reads.
-        assert_eq!(named_table(&names(Some("qwen"), None)), Some(Table::Qwen3));
+        assert_eq!(named_table(&pair(Some("qwen"), None)), Some(Table::Qwen3));
         assert_eq!(
-            named_table(&names(Some("qwen"), Some("qwen3"))),
+            named_table(&pair(Some("qwen"), Some("qwen3"))),
             Some(Table::Qwen3)
         );
         assert_eq!(
-            named_table(&names(Some(" QWEN_XML "), Some("qwen3"))),
+            named_table(&pair(Some(" QWEN_XML "), Some("qwen3"))),
             Some(Table::Qwen3Tagged)
         );
         assert_eq!(
-            named_table(&names(Some("glm45_moe"), Some("glm45"))),
+            named_table(&pair(Some("glm45_moe"), Some("glm45"))),
             Some(Table::Glm4)
         );
         assert_eq!(
-            named_table(&names(Some("glm47_moe"), Some("glm45"))),
+            named_table(&pair(Some("glm47_moe"), Some("glm45"))),
             Some(Table::Glm)
         );
         // The reasoning name counts only without a tool-call name.
-        assert_eq!(named_table(&names(None, Some("hy_v4"))), Some(Table::Hy4));
+        assert_eq!(named_table(&pair(None, Some("hy_v4"))), Some(Table::Hy4));
         assert_eq!(
-            named_table(&names(None, Some("minimax"))),
+            named_table(&pair(None, Some("minimax"))),
             Some(Table::MinimaxM2)
         );
-        assert_eq!(named_table(&names(None, Some("deepseek_r1"))), None);
+        assert_eq!(named_table(&pair(None, Some("deepseek_r1"))), None);
         // A launcher's name for a family whose table has no older parser reads with the table:
         // in both flags, in the reasoning flag alone, or as the tool-call name beside another.
         assert_eq!(
-            named_table(&names(Some("muse"), Some("muse"))),
+            named_table(&pair(Some("muse"), Some("muse"))),
             Some(Table::MuseSpark)
         );
         assert_eq!(
-            named_table(&names(None, Some("muse"))),
+            named_table(&pair(None, Some("muse"))),
             Some(Table::MuseSpark)
         );
         assert_eq!(
-            named_table(&names(Some("muse"), Some("passthrough"))),
+            named_table(&pair(Some("muse"), Some("passthrough"))),
             Some(Table::MuseSpark)
         );
         // The tool-call name decides; a legacy name with no alias selects none.
         assert_eq!(
-            named_table(&names(Some("kimi_k3"), Some("qwen3"))),
+            named_table(&pair(Some("kimi_k3"), Some("qwen3"))),
             Some(Table::KimiK3)
         );
-        assert_eq!(named_table(&names(Some("llama"), None)), None);
-        assert_eq!(named_table(&names(Some("llama"), Some("qwen3"))), None);
+        assert_eq!(named_table(&pair(Some("llama"), None)), None);
+        assert_eq!(named_table(&pair(Some("llama"), Some("qwen3"))), None);
         // `passthrough` leaves a channel as written, which no table reads for: the legacy
         // parsers keep it, alone or beside another name.
         assert_eq!(
-            named_table(&names(Some("passthrough"), Some(" Passthrough "))),
+            named_table(&pair(Some("passthrough"), Some(" Passthrough "))),
             None
         );
-        assert_eq!(named_table(&names(Some("passthrough"), None)), None);
-        assert_eq!(named_table(&names(None, Some("passthrough"))), None);
-        assert_eq!(
-            named_table(&names(Some("passthrough"), Some("qwen3"))),
-            None
-        );
+        assert_eq!(named_table(&pair(Some("passthrough"), None)), None);
+        assert_eq!(named_table(&pair(None, Some("passthrough"))), None);
+        assert_eq!(named_table(&pair(Some("passthrough"), Some("qwen3"))), None);
     }
 
     #[test]
@@ -1690,7 +1799,7 @@ mod tests {
             // Symphony in both flags, in either alone, and beside the table's own name.
             launchers.push(alias);
             let doubled = names(Some(alias), Some(alias));
-            assert_eq!(named_table(&doubled), Some(table), "{alias}");
+            assert_eq!(named_table(&doubled.labels), Some(table), "{alias}");
             assert_eq!(check(symphony, &doubled), Ok(()), "{alias}");
             assert_eq!(
                 check(symphony, &names(Some(alias), None)),
@@ -1737,7 +1846,7 @@ mod tests {
         let xlam = request(json!({"model": "Salesforce/Llama-xLAM-2-8b-fc-r"}));
         let by_registry = assign(
             ParserChoice::Symphony,
-            &Names::default(),
+            &ModelNames::default(),
             &xlam,
             None,
             PROMPT,
@@ -1856,7 +1965,7 @@ mod tests {
         let by_name = assign(ParserChoice::Symphony, &qwen3, &exaone, None, prompt);
         let by_registry = assign(
             ParserChoice::Symphony,
-            &Names::default(),
+            &ModelNames::default(),
             &exaone,
             None,
             prompt,
@@ -1877,7 +1986,7 @@ mod tests {
     fn names_are_checked_against_both_registries_by_the_parser_in_force() {
         let legacy = ParserChoice::Legacy;
         let symphony = ParserChoice::Symphony;
-        assert_eq!(check(legacy, &Names::default()), Ok(()));
+        assert_eq!(check(legacy, &ModelNames::default()), Ok(()));
         assert_eq!(check(legacy, &names(Some("qwen"), Some("qwen3"))), Ok(()));
         let why = check(legacy, &names(Some("nonsense"), None));
         assert_eq!(
@@ -1967,11 +2076,11 @@ mod tests {
         );
         // A registry that is absent checks nothing, as before.
         assert_eq!(
-            check_names(symphony, &names(Some("nonsense"), Some("muse")), None, None),
+            check_names(symphony, &pair(Some("nonsense"), Some("muse")), None, None),
             Ok(())
         );
         assert_eq!(
-            check_names(legacy, &names(Some("muse"), Some("nonsense")), None, None),
+            check_names(legacy, &pair(Some("muse"), Some("nonsense")), None, None),
             Ok(())
         );
     }
@@ -2003,7 +2112,7 @@ mod tests {
     fn the_legacy_choice_assigns_nothing_and_asks_for_no_constraint() {
         assert!(assign(
             ParserChoice::Legacy,
-            &Names::default(),
+            &ModelNames::default(),
             &request(json!({})),
             None,
             PROMPT
@@ -2012,7 +2121,7 @@ mod tests {
         let required = request(json!({"tool_choice": "required"}));
         assert!(constraint(
             ParserChoice::Legacy,
-            &Names::default(),
+            &ModelNames::default(),
             &required,
             &tools(),
             false
@@ -2027,7 +2136,7 @@ mod tests {
         let table = |request: &ChatCompletionRequest| {
             reads(
                 ParserChoice::Symphony,
-                &Names::default(),
+                &ModelNames::default(),
                 &request.model,
                 &templates(),
             )
@@ -2037,7 +2146,7 @@ mod tests {
         let assigned = |request: &ChatCompletionRequest| {
             assign(
                 ParserChoice::Symphony,
-                &Names::default(),
+                &ModelNames::default(),
                 request,
                 None,
                 PROMPT,
@@ -2055,7 +2164,7 @@ mod tests {
         );
         assert!(constraint(
             ParserChoice::Symphony,
-            &Names::default(),
+            &ModelNames::default(),
             &kept,
             &tools(),
             false
@@ -2068,7 +2177,7 @@ mod tests {
         );
         assert!(constraint(
             ParserChoice::Symphony,
-            &Names::default(),
+            &ModelNames::default(),
             &no_calls,
             &tools(),
             false
@@ -2110,7 +2219,7 @@ mod tests {
         let table = |request: &ChatCompletionRequest| {
             reads(
                 ParserChoice::Symphony,
-                &Names::default(),
+                &ModelNames::default(),
                 &request.model,
                 &templates(),
             )
@@ -2120,7 +2229,7 @@ mod tests {
         let assigned = |request: &ChatCompletionRequest| {
             assign(
                 ParserChoice::Symphony,
-                &Names::default(),
+                &ModelNames::default(),
                 request,
                 None,
                 PROMPT,
@@ -2161,7 +2270,7 @@ mod tests {
         let messages = |extra: Value| {
             assign_messages(
                 ParserChoice::Symphony,
-                &Names::default(),
+                &ModelNames::default(),
                 &message_request(extra),
                 None,
                 PROMPT,
@@ -2179,7 +2288,7 @@ mod tests {
     fn a_known_model_is_assigned_its_table_and_the_prompts_replay() {
         let assignment = assign(
             ParserChoice::Symphony,
-            &Names::default(),
+            &ModelNames::default(),
             &request(json!({})),
             None,
             PROMPT,
@@ -2193,7 +2302,7 @@ mod tests {
     fn an_unknown_model_and_a_json_schema_constraint_are_not_assigned() {
         assert!(assign(
             ParserChoice::Symphony,
-            &Names::default(),
+            &ModelNames::default(),
             &request(json!({"model": "unknown"})),
             None,
             PROMPT
@@ -2202,7 +2311,7 @@ mod tests {
         let schema = ("json_schema".to_string(), "{}".to_string());
         assert!(assign(
             ParserChoice::Symphony,
-            &Names::default(),
+            &ModelNames::default(),
             &request(json!({})),
             Some(&schema),
             PROMPT
@@ -2211,7 +2320,7 @@ mod tests {
         let tag = ("structural_tag".to_string(), "{}".to_string());
         assert!(assign(
             ParserChoice::Symphony,
-            &Names::default(),
+            &ModelNames::default(),
             &request(json!({})),
             Some(&tag),
             PROMPT
@@ -2224,7 +2333,7 @@ mod tests {
         let required = request(json!({"tool_choice": "required"}));
         let Some(ToolConstraint::StructuralTag(tag)) = constraint(
             ParserChoice::Symphony,
-            &Names::default(),
+            &ModelNames::default(),
             &required,
             &tools(),
             false,
@@ -2236,7 +2345,7 @@ mod tests {
         let auto = request(json!({"tool_choice": "auto"}));
         assert!(constraint(
             ParserChoice::Symphony,
-            &Names::default(),
+            &ModelNames::default(),
             &auto,
             &tools(),
             false
@@ -2245,7 +2354,7 @@ mod tests {
         let unknown = request(json!({"model": "unknown", "tool_choice": "required"}));
         assert!(constraint(
             ParserChoice::Symphony,
-            &Names::default(),
+            &ModelNames::default(),
             &unknown,
             &tools(),
             false
@@ -2276,7 +2385,7 @@ mod tests {
         });
         let muse = names(Some("muse_spark"), Some("muse_spark"));
         let any_object = json!({"model": "muse-spark", "response_format": {"type": "json_object"}});
-        let answer = |names: &Names, extra: Value, reasoning_open: bool| {
+        let answer = |names: &ModelNames<'_>, extra: Value, reasoning_open: bool| {
             super::constraint(
                 ParserChoice::Symphony,
                 names,
@@ -2327,7 +2436,7 @@ mod tests {
         // The registry's tables whose answer is a message take theirs too.
         for model in ["moonshotai/Kimi-K3", "thinkingmachines/Inkling"] {
             let tag = tag_of(answer(
-                &Names::default(),
+                &ModelNames::default(),
                 json!({"model": model, "response_format": {"type": "json_object"}}),
                 false,
             ));
@@ -2340,12 +2449,12 @@ mod tests {
         // A table whose output starts in content (the registry's Qwen3 table) has the schema
         // alone for its tag with the thought closed: the engine's own constraint, which stands.
         let content_first = json!({"response_format": {"type": "json_object"}});
-        assert!(answer(&Names::default(), content_first.clone(), false)
+        assert!(answer(&ModelNames::default(), content_first.clone(), false)
             .expect("read")
             .is_none());
         // With the prompt inside the thought, the schema follows the prefix a forced call takes,
         // free text that closes the thought, so the JSON is not written inside it.
-        let led = tag_of(answer(&Names::default(), content_first, true));
+        let led = tag_of(answer(&ModelNames::default(), content_first, true));
         assert_eq!(led["format"]["type"], "sequence", "{led}");
         assert_eq!(led["format"]["elements"][0]["type"], "any_text", "{led}");
         assert_eq!(
@@ -2356,7 +2465,7 @@ mod tests {
         // A table that admits a thought before its answer (MiniMax M3's) keeps that tag with the
         // thought closed: the thought the model may write first, then the schema.
         let thought_first = tag_of(answer(
-            &Names::default(),
+            &ModelNames::default(),
             json!({"model": "MiniMaxAI/MiniMax-M3", "response_format": {"type": "json_object"}}),
             false,
         ));
@@ -2408,7 +2517,7 @@ mod tests {
         let auto = request(json!({"tool_choice": "auto"}));
         let tag = auto_constraint(
             ParserChoice::Symphony,
-            &Names::default(),
+            &ModelNames::default(),
             &auto,
             &tools(),
             false,
@@ -2423,7 +2532,7 @@ mod tests {
         assert!(tag["format"].is_object(), "{tag}");
         let Some(ToolConstraint::StructuralTag(forced)) = constraint(
             ParserChoice::Symphony,
-            &Names::default(),
+            &ModelNames::default(),
             &request(json!({"tool_choice": "required"})),
             &tools(),
             false,
@@ -2434,7 +2543,7 @@ mod tests {
         assert_ne!(tag, forced, "the auto tag requires no call");
         assert!(auto_constraint(
             ParserChoice::Symphony,
-            &Names::default(),
+            &ModelNames::default(),
             &auto,
             &[],
             false,
@@ -2445,7 +2554,7 @@ mod tests {
         .is_none());
         assert!(auto_constraint(
             ParserChoice::Legacy,
-            &Names::default(),
+            &ModelNames::default(),
             &auto,
             &tools(),
             false,
@@ -2456,7 +2565,7 @@ mod tests {
         .is_none());
         assert!(auto_constraint(
             ParserChoice::Symphony,
-            &Names::default(),
+            &ModelNames::default(),
             &request(json!({"tool_choice": "none"})),
             &tools(),
             false,
@@ -2480,7 +2589,7 @@ mod tests {
             assert!(
                 auto_constraint(
                     ParserChoice::Symphony,
-                    &Names::default(),
+                    &ModelNames::default(),
                     &request(own.clone()),
                     &tools(),
                     false,
@@ -2503,7 +2612,7 @@ mod tests {
         assert!(matches!(
             auto_constraint_messages(
                 ParserChoice::Symphony,
-                &Names::default(),
+                &ModelNames::default(),
                 &messages_auto,
                 &tools,
                 false,
@@ -2516,7 +2625,7 @@ mod tests {
         ));
         assert!(auto_constraint_messages(
             ParserChoice::Symphony,
-            &Names::default(),
+            &ModelNames::default(),
             &messages_auto,
             &tools,
             false,
@@ -2532,7 +2641,7 @@ mod tests {
         }));
         assert!(auto_constraint_messages(
             ParserChoice::Symphony,
-            &Names::default(),
+            &ModelNames::default(),
             &messages_any,
             &tools,
             false,
@@ -2705,7 +2814,7 @@ mod tests {
         let templates = templates();
         let (counting, tokenizer) = Counting::shared();
         let qwen3 = names(Some("qwen3"), None);
-        let decide = |names: &Names, tokenizer: &Arc<dyn Tokenizer>| {
+        let decide = |names: &ModelNames<'_>, tokenizer: &Arc<dyn Tokenizer>| {
             keeps_special_tokens(
                 ParserChoice::Symphony,
                 names,
@@ -2801,7 +2910,7 @@ mod tests {
         )
         .await;
         let hf = names(Some("hf"), Some(" HF "));
-        let read = |names: &Names, request: &ChatCompletionRequest| {
+        let read = |names: &ModelNames<'_>, request: &ChatCompletionRequest| {
             reads(ParserChoice::Symphony, names, &request.model, &templates)
         };
         // The template's table reads the model the registry knows with another table, named
@@ -2978,7 +3087,7 @@ mod tests {
     #[tokio::test]
     async fn messages_are_read_by_the_same_tables_and_their_tool_choice_forces_calls() {
         let symphony = ParserChoice::Symphony;
-        let plain = Names::default();
+        let plain = ModelNames::default();
         let read = reads(symphony, &plain, "Qwen/Qwen3-8B", &templates())
             .expect("read")
             .expect("the registry's table");
@@ -3205,7 +3314,8 @@ mod tests {
         let templates = Arc::new(templates());
         let auto_tag = || AutoTag::Chat {
             parser: ParserChoice::Symphony,
-            names: names(Some("deepseek_v4"), Some("deepseek_v4")),
+            labels: pair(Some("deepseek_v4"), Some("deepseek_v4")),
+            flags: Names::default(),
             request: Arc::new(request(json!({"tools": tools()}))),
             reasoning_open: true,
             templates: Arc::clone(&templates),
@@ -3327,7 +3437,8 @@ mod tests {
             || Ok(None),
             || AutoTag::Chat {
                 parser: ParserChoice::Symphony,
-                names: names(Some("deepseek_v4"), Some("deepseek_v4")),
+                labels: pair(Some("deepseek_v4"), Some("deepseek_v4")),
+                flags: Names::default(),
                 request: Arc::new(request(json!({}))),
                 reasoning_open: true,
                 templates: Arc::clone(&templates),
@@ -3358,14 +3469,16 @@ mod tests {
         let tags = [
             AutoTag::Chat {
                 parser: ParserChoice::Symphony,
-                names: names.clone(),
+                labels: names.labels.clone(),
+                flags: Names::default(),
                 request: Arc::new(chat.clone()),
                 reasoning_open: true,
                 templates: Arc::clone(&templates),
             },
             AutoTag::Messages {
                 parser: ParserChoice::Symphony,
-                names: names.clone(),
+                labels: names.labels.clone(),
+                flags: Names::default(),
                 request: Arc::new(messages.clone()),
                 tools: tools().into(),
                 reasoning_open: true,
@@ -3422,7 +3535,8 @@ mod tests {
         // A tag the table gives no engine (no tool to call) derives as none for every start.
         let none = AutoTag::Chat {
             parser: ParserChoice::Symphony,
-            names,
+            labels: names.labels,
+            flags: Names::default(),
             request: Arc::new(request(json!({}))),
             reasoning_open: true,
             templates,
@@ -3700,5 +3814,145 @@ mod tests {
         )
         .expect_err("refused");
         assert_eq!(why, "no tokenizer is registered for model 'Qwen/Qwen3-8B'");
+    }
+
+    /// The precedence among the parser names set for a model, which [`super::reads`] states
+    /// once: the labels of the model's workers read over the registry; the registry's table
+    /// reads over the gateway's flags, for a model it knows; the flags read a model it does not
+    /// know; and nothing names a table for the rest. Each rule in turn.
+    #[test]
+    fn the_labels_read_over_the_registry_which_reads_over_the_flags_for_the_models_it_knows() {
+        let known = "Qwen/Qwen3-8B";
+        let unknown = "acme/ministral-3-14b-instruct-w4a16";
+        assert_eq!(table_for(known), Some(Table::Qwen3));
+        assert_eq!(table_for(unknown), None);
+        let read = |names: &ModelNames<'_>, model: &str| {
+            reads(ParserChoice::Symphony, names, model, &templates())
+                .map(|format| format.map(|format| format.name().to_string()))
+        };
+        let table = |name: &str| Ok(Some(name.to_string()));
+        let v13 = pair(Some("mistral_v13"), None);
+        let no_flags = Names::default();
+        fn labeled<'a>(labels: Names, flags: &'a Names) -> ModelNames<'a> {
+            ModelNames { labels, flags }
+        }
+
+        // The labels over the registry: a table they name reads a model the registry reads with
+        // another; a legacy tool-call name, or `passthrough` alone, is their way back to the
+        // legacy parsers for the one model; a reasoning name alone that a table answers to
+        // selects it over a tool-call name the flags set.
+        assert_eq!(
+            read(&labeled(v13.clone(), &no_flags), known),
+            table("mistral_v13")
+        );
+        assert_eq!(
+            read(&labeled(pair(Some("llama"), None), &v13), known),
+            Ok(None)
+        );
+        assert_eq!(
+            read(&labeled(pair(None, Some("passthrough")), &v13), known),
+            Ok(None)
+        );
+        assert_eq!(
+            read(&labeled(pair(None, Some("qwen3")), &v13), unknown),
+            table("qwen3")
+        );
+
+        // The registry over the flags, for a model it knows, whatever they name: a table, the
+        // response template (no refusal for a model without one), a legacy parser.
+        for flags in [
+            v13.clone(),
+            pair(Some(TEMPLATE_PARSER), Some(TEMPLATE_PARSER)),
+            pair(Some("mistral"), None),
+            pair(Some("passthrough"), None),
+        ] {
+            assert_eq!(
+                read(&ModelNames::flagged(&flags), known),
+                table("qwen3"),
+                "{flags:?}"
+            );
+        }
+
+        // The flags for a model the registry does not know: a table's name reads it; `hf` asks
+        // its response template, refused when it has none; a legacy name keeps the legacy
+        // parsers; a reasoning name alone that a table answers to selects it.
+        assert_eq!(
+            read(&ModelNames::flagged(&v13), unknown),
+            table("mistral_v13")
+        );
+        assert!(read(
+            &ModelNames::flagged(&pair(Some(TEMPLATE_PARSER), None)),
+            unknown
+        )
+        .is_err());
+        assert_eq!(
+            read(&ModelNames::flagged(&pair(Some("mistral"), None)), unknown),
+            Ok(None)
+        );
+        assert_eq!(
+            read(&ModelNames::flagged(&pair(None, Some("qwen3"))), unknown),
+            table("qwen3")
+        );
+
+        // Labels that select nothing (a reasoning name alone that no table answers to) leave the
+        // decision to the registry, then to the flags.
+        let reasoning_only = pair(None, Some("deepseek_r1"));
+        assert_eq!(
+            read(&labeled(reasoning_only.clone(), &v13), known),
+            table("qwen3")
+        );
+        assert_eq!(
+            read(&labeled(reasoning_only, &v13), unknown),
+            table("mistral_v13")
+        );
+
+        // Nothing named: the registry's table for a model it knows, the legacy parsers for one
+        // it does not.
+        assert_eq!(read(&ModelNames::default(), known), table("qwen3"));
+        assert_eq!(read(&ModelNames::default(), unknown), Ok(None));
+    }
+
+    /// What the gateway's flags select for a model the registry knows, set aside for a worker
+    /// that labels no parser, is spelled for the registration warning beside the registry's
+    /// table: a table, the response template, or the legacy parsers; nothing when the flags
+    /// select nothing or the registry's own table, or for a model the registry does not know.
+    #[test]
+    fn the_flags_the_registry_sets_aside_are_spelled_for_the_warning() {
+        let known = "Qwen/Qwen3-8B";
+        let spelled = |flags: Names, model: &str| {
+            set_aside_by_the_registry(&flags, model)
+                .map(|(table, flags)| (table, flags.into_owned()))
+        };
+        let qwen3 = |flags: &str| Some((Table::Qwen3, flags.to_string()));
+        assert_eq!(
+            spelled(pair(Some("mistral_v13"), None), known),
+            qwen3("the table 'mistral_v13'")
+        );
+        assert_eq!(
+            spelled(pair(None, Some("ling")), known),
+            qwen3("the table 'ling'")
+        );
+        assert_eq!(
+            spelled(pair(Some(TEMPLATE_PARSER), None), known),
+            qwen3("the model's response template")
+        );
+        assert_eq!(
+            spelled(pair(Some("mistral"), None), known),
+            qwen3("the legacy parsers")
+        );
+        assert_eq!(
+            spelled(pair(None, Some("passthrough")), known),
+            qwen3("the legacy parsers")
+        );
+        assert_eq!(spelled(pair(Some("qwen"), Some("qwen3")), known), None);
+        assert_eq!(spelled(pair(None, Some("deepseek_r1")), known), None);
+        assert_eq!(spelled(Names::default(), known), None);
+        assert_eq!(
+            spelled(
+                pair(Some("mistral_v13"), None),
+                "acme/ministral-3-14b-instruct-w4a16"
+            ),
+            None
+        );
     }
 }
