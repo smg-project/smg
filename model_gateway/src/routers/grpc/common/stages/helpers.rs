@@ -418,7 +418,9 @@ pub(crate) enum ToolConstraintStamp {
     /// The table's `auto` tag the selected worker's policy chose, shaped for
     /// where that worker's engine starts the grammar; the retry's worker gets
     /// it derived again for its own start, or no tag where the table gives
-    /// its engine none.
+    /// its engine none. Captured only where the first worker got a tag: a
+    /// plan built without one carries no stamp, so a retry's worker the table
+    /// would give one goes without it too.
     Table(Arc<dyn TagForStart>),
 }
 

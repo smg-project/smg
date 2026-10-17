@@ -656,7 +656,11 @@ pub(crate) struct WorkerConstraint {
 /// and the attempt stamp for the worker each retry takes, whose start may differ (the retry filter
 /// compares the policy, not the start: [`WorkerDecoding::decides_alike`]). It owns what
 /// [`auto_constraint`] and [`auto_constraint_messages`] read, since the request is gone from the
-/// pipeline once the plan is built.
+/// pipeline once the plan is built. It goes with the plan only when the first worker's start got a
+/// tag: where the table gives that start none, the plan carries no tag and no stamp, and a retry
+/// to a start the table would give one is not covered (no registry table gives one of two starts
+/// a retry may cross between the tag and the other none; the whole turn keeps the first token
+/// apart).
 pub(crate) enum AutoTag {
     /// A chat request's, over the tools its `tool_choice` leaves callable.
     Chat {
