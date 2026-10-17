@@ -627,12 +627,15 @@ pub struct TenantResolutionConfig {
     pub tenant_header_name: String,
 }
 
-/// Client-certificate authentication on the HTTPS listener. A verified
+/// Client-certificate authentication on the HTTPS listener (the data
+/// listener; the admin listener serves TLS without it). A verified
 /// certificate identifies the caller: the field [`TlsClientIdentity`] names
 /// becomes the tenant identity `auth:<identity>`, the one a
-/// `--tenant-api-key` for the same id resolves to, so the tenant limits and
-/// the stored-state scoping apply to it the same way; a request on such a
-/// connection needs no bearer credential.
+/// `--tenant-api-key` for the same id resolves to for a common name or a DNS
+/// name (a URI identity is addressed as `auth:<uri>` in the rate-limit
+/// configuration), so the tenant limits and the stored-state scoping apply
+/// to it the same way; a request on such a connection needs no bearer
+/// credential.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TlsClientAuth {
@@ -645,7 +648,9 @@ pub enum TlsClientAuth {
     /// keys), as without client authentication.
     Optional,
     /// A client certificate chaining to the client CA bundle is required:
-    /// the handshake fails without one.
+    /// the handshake fails without one. With no API key and no control-plane
+    /// authentication, the admin and worker-management routes are closed as
+    /// well: a tenant credential never reaches them.
     Required,
 }
 

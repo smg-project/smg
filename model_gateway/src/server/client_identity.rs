@@ -44,9 +44,9 @@ pub enum ClientCertificate {
 
 /// The identity a leaf certificate (DER) names in `field`: the first URI or
 /// DNS subject alternative name of that kind, or the subject's common name.
-/// `None` when the leaf has none, carries an empty or over-long one (the
-/// identity becomes a tenant key, bounded like a tenant header), or cannot
-/// be parsed.
+/// `None` when the leaf has none, carries an empty, padded, over-long or
+/// control-character one (the identity becomes a tenant key, bounded like a
+/// tenant header), or cannot be parsed.
 pub fn identity_of(leaf: &[u8], field: TlsClientIdentity) -> Option<String> {
     let certificate = X509::from_der(leaf).ok()?;
     let identity = match field {
@@ -63,11 +63,20 @@ pub fn identity_of(leaf: &[u8], field: TlsClientIdentity) -> Option<String> {
                 .subject_name()
                 .entries_by_nid(Nid::COMMONNAME)
                 .next()?;
-            String::from_utf8(common_name.data().as_slice().to_vec()).ok()?
+            // Through OpenSSL's conversion, so every ASN.1 string type (a
+            // BMPString common name is UTF-16) arrives as UTF-8; the raw
+            // bytes would not.
+            common_name.data().to_string().ok()?
         }
     };
-    let identity = identity.trim();
-    (!identity.is_empty() && identity.len() <= MAX_TENANT_ID_LEN).then(|| identity.to_string())
+    // The identity is embedded verbatim in the tenant key (`auth:<identity>`):
+    // a padded value or one with control characters is no identity, as a
+    // padded tenant id is no tenant key.
+    let usable = !identity.is_empty()
+        && identity.len() <= MAX_TENANT_ID_LEN
+        && identity.trim() == identity
+        && !identity.chars().any(char::is_control);
+    usable.then_some(identity)
 }
 
 /// Streams that know the peer's certificate chain: the TLS stream, once its
@@ -247,7 +256,7 @@ mod tests {
     use axum::{body::Body, routing::get, Router};
     use http::Response;
     use openssl::{
-        asn1::Asn1Time,
+        asn1::{Asn1Time, Asn1Type},
         bn::{BigNum, MsbOption},
         hash::MessageDigest,
         pkey::{PKey, Private},
@@ -286,9 +295,16 @@ mod tests {
     }
 
     fn name(cn: &str) -> openssl::x509::X509Name {
+        name_with_type(cn, Asn1Type::UTF8STRING)
+    }
+
+    /// A subject whose common name is encoded as the ASN.1 string type `ty`.
+    fn name_with_type(cn: &str, ty: Asn1Type) -> openssl::x509::X509Name {
         let mut builder = X509NameBuilder::new().unwrap();
         builder.append_entry_by_text("O", "Test").unwrap();
-        builder.append_entry_by_text("CN", cn).unwrap();
+        builder
+            .append_entry_by_text_with_type("CN", cn, ty)
+            .unwrap();
         builder.build()
     }
 
@@ -334,11 +350,21 @@ mod tests {
         /// A leaf signed by the CA with `cn` and the given SANs (URIs and
         /// DNS names), good as a server and as a client; its PEM and key.
         fn leaf(&self, cn: &str, uris: &[&str], dns: &[&str]) -> (Vec<u8>, Vec<u8>) {
+            self.leaf_named(&name(cn), uris, dns)
+        }
+
+        /// A leaf with `subject` as its subject name.
+        fn leaf_named(
+            &self,
+            subject: &openssl::x509::X509Name,
+            uris: &[&str],
+            dns: &[&str],
+        ) -> (Vec<u8>, Vec<u8>) {
             let key = key();
             let mut builder = X509Builder::new().unwrap();
             builder.set_version(2).unwrap();
             builder.set_serial_number(&serial()).unwrap();
-            builder.set_subject_name(&name(cn)).unwrap();
+            builder.set_subject_name(subject).unwrap();
             builder
                 .set_issuer_name(self.ca_cert.subject_name())
                 .unwrap();
@@ -456,6 +482,46 @@ mod tests {
         assert_eq!(
             identity_of(b"not a certificate", TlsClientIdentity::Cn),
             None
+        );
+    }
+
+    /// A common name is read whatever ASN.1 string type its issuer used (a
+    /// BMPString one is UTF-16, which the raw bytes would pass off as ASCII
+    /// with interleaved NULs); a padded identity or one with control
+    /// characters is none at all, since it is embedded verbatim in the
+    /// tenant key, as a padded tenant id is no tenant key.
+    #[test]
+    fn a_common_name_is_decoded_from_its_string_type_and_bounded_like_a_tenant_id() {
+        let pki = Pki::new();
+        // OpenSSL takes the bytes of a typed entry verbatim: the UTF-16BE
+        // spelling of the name, a NUL before each of its ASCII bytes.
+        let utf16be: String = "team-red".chars().flat_map(|c| ['\0', c]).collect();
+        let (bmp, _) = pki.leaf_named(&name_with_type(&utf16be, Asn1Type::BMPSTRING), &[], &[]);
+        assert_eq!(
+            identity_of(&der_of(&bmp), TlsClientIdentity::Cn).as_deref(),
+            Some("team-red")
+        );
+        let (padded, _) = pki.leaf(" team-red ", &[], &[]);
+        assert_eq!(
+            identity_of(&der_of(&padded), TlsClientIdentity::Cn),
+            None,
+            "a padded value is no tenant key"
+        );
+        let (control, _) = pki.leaf("team\u{7}red", &[], &[]);
+        assert_eq!(
+            identity_of(&der_of(&control), TlsClientIdentity::Cn),
+            None,
+            "a control character is no part of a tenant key"
+        );
+        let (padded_uri, _) = pki.leaf(
+            "team-red",
+            &[" spiffe://cluster.local/ns/default/sa/x"],
+            &[],
+        );
+        assert_eq!(
+            identity_of(&der_of(&padded_uri), TlsClientIdentity::SanUri),
+            None,
+            "the bound applies to every field"
         );
     }
 

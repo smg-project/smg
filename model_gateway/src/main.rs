@@ -1746,9 +1746,12 @@ struct IntegrationArgs {
     /// Client-certificate authentication on the HTTPS listener: off; optional (a certificate
     /// chaining to --tls-client-ca-path identifies the caller when presented, a connection
     /// without one is served and authenticated by the API keys as before); required (the
-    /// handshake fails without one). A verified certificate's identity is the caller's tenant,
-    /// the one a --tenant-api-key for the same id resolves to; no bearer is needed on such a
-    /// connection.
+    /// handshake fails without one; with no --api-key and no control-plane authentication the
+    /// admin and worker-management routes are closed too). A verified certificate's identity is
+    /// the caller's tenant auth:<identity>, the one a --tenant-api-key for the same id resolves
+    /// to for cn and san-dns (a URI identity is addressed as auth:<uri> in the rate-limit
+    /// configuration); no bearer is needed on such a connection. The admin listener
+    /// (--admin-port) serves TLS without client authentication.
     #[arg(
         long,
         default_value = "off",
