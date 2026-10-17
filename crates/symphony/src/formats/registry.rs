@@ -216,8 +216,10 @@ impl Table {
     /// for: a legacy name is here or is one a table answers to, never both and never neither,
     /// which the gateway's test over its registries holds; so a new legacy name cannot go
     /// unmapped, and a table that takes a name here removes its row. Under Symphony a tool-call
-    /// name here keeps the legacy parsers, and a reasoning name here alone leaves the choice to
-    /// the registry (`passthrough` excepted, which keeps the legacy parsers either way).
+    /// name here keeps the legacy parsers, and a reasoning name here alone selects nothing, so
+    /// the next source decides: after a worker's labels the registry's table for a model it
+    /// knows, else the gateway's flags, else the legacy parsers (`passthrough` excepted, which
+    /// keeps the legacy parsers either way).
     pub const UNANSWERED: [(&str, &str); 18] = [
         (
             "passthrough",
@@ -227,8 +229,8 @@ impl Table {
         (
             "base",
             "a thought between `<think>` and `</think>` and nothing of a family's: the \
-             registry's table reads a known model's thought, and an unknown model keeps the \
-             legacy parser",
+             registry's table reads a known model's thought, and an unknown model's the table \
+             the flags name, else the legacy parser",
         ),
         (
             "glm45",

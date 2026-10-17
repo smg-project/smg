@@ -212,12 +212,13 @@ reasoning parser's name whose format a table reads is a name of that table (`Tab
 `qwen` for `qwen3`; `qwen_xml`, `qwen_coder` and `nemotron` for
 `qwen3_tagged`; `glm45_moe` for `glm4`; `glm47_moe` for `glm`; `hy_v4` for `hy4`; `kimik2`,
 `kimi_thinking` and `kimi_k25` for `kimi_k2`; `deepseek_v41`
-for `deepseek_v4.1`; `minimax` for `minimax_m2`; a table's own name where the legacy parser
+for `deepseek_v4.1`; `minimax` for `minimax_m2`; `muse`, a launcher's name for a family whose table
+has no older parser, for `muse_spark`; a table's own name where the legacy parser
 carries it, `json`, `gemma4`, `qwen3`, `deepseek_v4`, `kimi_k3`, `inkling`, `minimax_m2`,
 `minimax_m3`), so a deployment's existing flags keep a working parser when the gateway's default
 parser changes. A legacy name no table answers to keeps the legacy parsers as a tool-call name and
-selects nothing as a reasoning name alone (the registry's table for a model it knows, else the
-legacy parsers); `Table::UNANSWERED` lists each with
+selects nothing as a reasoning name alone (after a worker's labels the registry's table for a model
+it knows, else the flags, else the legacy parsers); `Table::UNANSWERED` lists each with
 the reason: `passthrough` (the way back for one model), `base` (a thought of no family's), `glm45`,
 `nano_v3` and `qwen3_thinking` (a thought two tables' families share: the tool-call name
 decides), `kimi` (thought
