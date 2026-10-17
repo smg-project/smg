@@ -2607,7 +2607,8 @@ impl StreamingProcessor {
         // engine matched is reported as such, as the message says.
         let stop_reason = match symphony_stop {
             // Strictness: a natural end of turn (or a call) the table gave up on a run of is a
-            // parse failure; a truncation stays a truncation.
+            // parse failure; a truncation stays a truncation. A stop sequence that ended it stays
+            // in `stop_sequence` beside the failure, as chat keeps `matched_stop`.
             Some(messages::StopReason::EndTurn | messages::StopReason::ToolUse)
                 if original_request.parse_strict
                     && symphony
@@ -2625,7 +2626,10 @@ impl StreamingProcessor {
             None => stop_reason,
         };
 
-        let stop_sequence = if matches!(stop_reason, Some(messages::StopReason::StopSequence)) {
+        let stop_sequence = if matches!(
+            stop_reason,
+            Some(messages::StopReason::StopSequence | messages::StopReason::ParseFailure)
+        ) {
             matched_stop.and_then(|v| v.as_str().map(String::from))
         } else {
             None

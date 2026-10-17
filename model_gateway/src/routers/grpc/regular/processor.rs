@@ -477,7 +477,8 @@ impl ResponseProcessor {
         });
         let stop_reason = match output.stop_reason {
             // Strictness: a natural end of turn (or a call) the table gave up on a run of is a
-            // parse failure; a truncation stays a truncation.
+            // parse failure; a truncation stays a truncation. A stop sequence that ended it stays
+            // in `stop_sequence` beside the failure, as chat keeps `matched_stop`.
             Some(messages::StopReason::EndTurn | messages::StopReason::ToolUse)
                 if request.parse_strict && reader.has_malformed() =>
             {
@@ -488,8 +489,12 @@ impl ResponseProcessor {
             }
             stop_reason => stop_reason,
         };
-        let stop_sequence = stop_sequence
-            .filter(|_| matches!(stop_reason, Some(messages::StopReason::StopSequence)));
+        let stop_sequence = stop_sequence.filter(|_| {
+            matches!(
+                stop_reason,
+                Some(messages::StopReason::StopSequence | messages::StopReason::ParseFailure)
+            )
+        });
         let thinking_requested = request.thinking_requested;
         let reasoning_tokens = finished(&events).map_or(0, |finished| finished.reasoning_tokens);
         Ok(Message {

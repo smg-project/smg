@@ -1182,6 +1182,33 @@ async fn under_strictness_a_streamed_message_stops_with_a_parse_failure() {
 }
 
 #[tokio::test]
+async fn under_strictness_a_stop_sequence_that_ends_a_folded_call_is_reported_beside_the_failure() {
+    // The request's stop sequence ended an output the table gave up on a run of: the stop reason
+    // is the parse failure, and the sequence that matched stays in `stop_sequence`, as chat keeps
+    // `matched_stop`.
+    let mut spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    spec.parse_report = Report::OnFailure;
+    spec.parse_strict = true;
+    let (result, events) = message_events(
+        vec![
+            chunk(0, "Hi <tool_call>\nnot a call\n</tool_call> END more"),
+            complete(0, "stop"),
+        ],
+        spec,
+        Some("END"),
+    )
+    .await;
+    result.expect("the stream ends well");
+    assert_eq!(message_stop_reason(&events), "parse_failure");
+    let delta = events
+        .iter()
+        .find(|e| e["type"] == "message_delta")
+        .expect("a message_delta");
+    assert_eq!(delta["delta"]["stop_sequence"], "END");
+    assert_eq!(delta["delta"]["smg"]["parse"]["outcome"], "malformed");
+}
+
+#[tokio::test]
 async fn a_whole_answer_reports_its_malformed_runs_when_asked() {
     let report = fold_reported(
         "Hello <tool_call>\nnot a call\n</tool_call>",
