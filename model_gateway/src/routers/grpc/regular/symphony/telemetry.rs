@@ -18,7 +18,8 @@
 //! Cost: a clean output records one counter increment through a key built once per table (the
 //! `metrics` macros build a key, with a `Vec` of labels, on every call), no allocation. A
 //! malformed one adds a histogram observation, the per-reason counters, and, when the table's
-//! token bucket allows it, one `warn` line with a bounded excerpt: the only allocations.
+//! token bucket allows it, one `warn` line, with the first run's bounded excerpt on a `debug` event
+//! beside it: the only allocations. Suppressed calls are counted and write no line.
 
 use std::{
     sync::{
@@ -31,7 +32,7 @@ use std::{
 use metrics::{Key, Label, Level, Metadata};
 use parking_lot::Mutex;
 use symphony::{formats::Table, Event, MalformedReason};
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Outputs read to their end, by `table` and `outcome` (`clean`, `malformed`, `failed`).
 pub(crate) const OUTPUTS: &str = "smg_symphony_outputs_total";
@@ -206,7 +207,8 @@ impl Tally {
     }
 
     /// Records the output under `table`, read to its end: the counters, and the line when the
-    /// output is not clean and the table's bucket allows one.
+    /// output has a malformed run and the table's bucket allows one. Suppressed calls are counted
+    /// and not written: the request asked for them to be dropped.
     pub(crate) fn report(&self, table: &'static str, who: Who<'_>) {
         let series = series(table);
         let malformed = self.malformed();
@@ -229,6 +231,9 @@ impl Tally {
         }
         if self.suppressed_calls > 0 {
             increment(&series.calls_suppressed, u64::from(self.suppressed_calls));
+        }
+        if malformed == 0 {
+            return;
         }
         let Some(suppressed_lines) = series.sampler.allow() else {
             return;
@@ -257,12 +262,23 @@ impl Tally {
             why,
             at,
             bytes,
-            excerpt,
             reasons = %self.reasons_seen(),
             tool_calls = self.tool_calls,
             suppressed_calls = self.suppressed_calls,
             suppressed_lines,
             "Symphony did not read the whole output as content, reasoning and calls"
+        );
+        // The run's text is model output: a debug event beside the line, not the line itself,
+        // which the default level and the trace exporters see.
+        debug!(
+            target: "smg::symphony",
+            request_id = who.request_id,
+            choice = who.choice,
+            table,
+            reason,
+            at,
+            excerpt,
+            "the first malformed run's text"
         );
     }
 }
@@ -732,8 +748,24 @@ mod tests {
         assert!(logs_contain("table=\"plain\""));
         assert!(logs_contain("reason=\"invalid_arguments\""));
         assert!(logs_contain("at=6"));
-        assert!(logs_contain("excerpt=\"\\nnot a call\\n\""));
         assert!(logs_contain("choice=1"));
+        logs_assert(|lines: &[&str]| {
+            let line = lines
+                .iter()
+                .find(|line| line.contains("Symphony did not read the whole output"))
+                .ok_or("no warn line")?;
+            if line.contains("excerpt=") {
+                return Err("the excerpt is on the warn line".to_string());
+            }
+            let event = lines
+                .iter()
+                .find(|line| line.contains("excerpt=\"\\nnot a call\\n\""))
+                .ok_or("no excerpt event")?;
+            if !event.contains("DEBUG") {
+                return Err(format!("the excerpt is not a debug event: {event}"));
+            }
+            Ok(())
+        });
     }
 
     #[tracing_test::traced_test]
@@ -753,5 +785,25 @@ mod tests {
             );
         });
         assert!(!logs_contain("req-quiet"));
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn suppressed_calls_write_no_line() {
+        let _scrape = rendered(|| {
+            let mut tally = Tally::default();
+            tally.see(&call_start(0, "<tool_call>"), true);
+            tally.see(&call_start(1, "<tool_call>"), true);
+            tally.see(&finish(2), true);
+            tally.report(
+                "plain",
+                Who {
+                    request_id: "req-dropped",
+                    model: "the-model",
+                    choice: 0,
+                },
+            );
+        });
+        assert!(!logs_contain("req-dropped"));
     }
 }
