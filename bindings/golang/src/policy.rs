@@ -35,7 +35,7 @@ use smg::{
 use smg_grpc_client::sglang_scheduler::SglangSchedulerClient;
 
 use super::{
-    chat_stream::{prepare_chat, start_chat_stream},
+    chat_stream::{prepare_chat, start_chat_stream, weight_version_of},
     error::{set_error_message, SglErrorCode},
     runtime::RUNTIME,
     stream::SglangStreamHandle,
@@ -55,6 +55,8 @@ pub struct GrpcWorker {
     pub(crate) api_key: Option<String>,
     pub(crate) http_client: Arc<reqwest::Client>,
     pub(crate) resilience: ResolvedResilience,
+    /// The engine's weight version at creation, the chunks' `system_fingerprint`.
+    pub(crate) weight_version: Option<String>,
 }
 
 impl GrpcWorker {
@@ -83,7 +85,14 @@ impl GrpcWorker {
             api_key: None,
             http_client: Arc::new(smg::http_client::client()),
             resilience: ResolvedResilience::default(),
+            weight_version: None,
         }
+    }
+
+    /// The worker with the weight version its engine reported.
+    pub(crate) fn with_weight_version(mut self, weight_version: Option<String>) -> Self {
+        self.weight_version = weight_version;
+        self
     }
 }
 
@@ -419,7 +428,10 @@ pub unsafe extern "C" fn sgl_multi_client_create(
                     return ptr::null_mut();
                 }
             };
-        let grpc_worker = Arc::new(GrpcWorker::new(client, endpoint.to_string()));
+        let weight_version = RUNTIME.block_on(weight_version_of(&client));
+        let grpc_worker = Arc::new(
+            GrpcWorker::new(client, endpoint.to_string()).with_weight_version(weight_version),
+        );
         workers.push(Arc::clone(&grpc_worker) as Arc<dyn Worker>);
         grpc_workers.push(grpc_worker);
     }
@@ -620,7 +632,14 @@ pub unsafe extern "C" fn sgl_multi_client_chat_completion_stream(
     // gives it back on the way out.
     let load = HeldLoad::take(Arc::clone(&worker));
 
-    match start_chat_stream(&worker.client, &tokenizer, prepared, Some(load), error_out) {
+    match start_chat_stream(
+        &worker.client,
+        &tokenizer,
+        prepared,
+        Some(load),
+        worker.weight_version.as_deref(),
+        error_out,
+    ) {
         Ok(handle) => {
             *stream_handle_out = Box::into_raw(Box::new(handle));
             SglErrorCode::Success

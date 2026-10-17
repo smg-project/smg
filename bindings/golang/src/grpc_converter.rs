@@ -195,8 +195,8 @@ impl GrpcResponseConverterHandle {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            // TODO: Get actual fingerprint
-            system_fingerprint: Some("fp_placeholder".to_string()),
+            // The engine's weight version, set by the stream that knows it.
+            system_fingerprint: None,
             tools,
             tool_choice,
             history_tool_calls_count: 0,
@@ -949,6 +949,32 @@ mod tests {
                 assert!(delta.content.is_none(), "{first:?}");
                 assert!(delta.tool_calls.is_some(), "{first:?}");
             }
+        }
+    }
+
+    /// A chunk carries the fingerprint the stream set from the engine's
+    /// weight version, and none when the engine reported none.
+    #[tokio::test]
+    async fn a_chunk_carries_the_engines_weight_version_as_its_fingerprint_or_none() {
+        let tokenizer = byte_fallback_tokenizer();
+        for fingerprint in [None, Some("v7".to_string())] {
+            let mut handle = tool_test_handle(tokenizer.clone(), None);
+            handle.system_fingerprint = fingerprint.clone();
+            let chunk = proto::GenerateResponse {
+                request_id: String::new(),
+                response: Some(proto::generate_response::Response::Chunk(
+                    proto::GenerateStreamChunk {
+                        token_ids: vec![0xC3 + 1, 0xA9 + 1],
+                        completion_tokens: 2,
+                        ..Default::default()
+                    },
+                )),
+            };
+            let first = convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer)
+                .await
+                .unwrap()
+                .expect("the first chunk is sent");
+            assert_eq!(first.system_fingerprint, fingerprint, "{first:?}");
         }
     }
 
