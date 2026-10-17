@@ -28,8 +28,8 @@ use crate::{
         metrics::{metrics_labels, Metrics},
     },
     policies::{
-        policy_filters_unavailable_workers, CacheNamespace, LoadBalancingPolicy, PolicyRegistry,
-        SelectWorkerInfo, WorkerRole,
+        policy_filters_unavailable_workers, traffic_split, CacheNamespace, LoadBalancingPolicy,
+        PolicyRegistry, SelectWorkerInfo, WorkerRole,
     },
     routers::{
         common::{header_utils, overload, retry::mark_non_retryable},
@@ -1170,15 +1170,29 @@ pub(crate) fn select_pair(
     // A decode pool all over the thresholds pairs by load, as the default
     // paired it: the least-loaded of the pick's partners, counted as a veto
     // fallback and not as a selection of the decode policy. Any other keeps
-    // the veto for its policy.
+    // the veto for its policy. Either way the decode follows the prefill's
+    // traffic group, so a pair never spans two groups (see
+    // `PolicyRegistry::select_worker_for_model_following`).
+    let prefill_group = traffic_split::group_of(selected_prefill.as_ref());
     let selected_decode = if lift_decode {
-        overload::least_loaded_uniform(decode.iter(), &mut rand::rng())
-            .cloned()
-            .ok_or_else(|| fail(WorkerRole::Decode, PlacementFailure::Unavailable))?
+        overload::least_loaded_uniform(
+            decode
+                .iter()
+                .filter(|d| traffic_split::group_of(d.as_ref()) == prefill_group),
+            &mut rand::rng(),
+        )
+        .cloned()
+        .ok_or_else(|| fail(WorkerRole::Decode, PlacementFailure::Unavailable))?
     } else {
         info.role = WorkerRole::Decode;
         info.overload_lifted = false;
-        match policies.select_worker_for_model(&decode_policy, model_id, &decode, &info) {
+        match policies.select_worker_for_model_following(
+            &decode_policy,
+            model_id,
+            &decode,
+            &info,
+            Some(prefill_group),
+        ) {
             Some(decode_idx) => decode[decode_idx].clone(),
             None => return Err(declined(WorkerRole::Decode, decode_policy.name())),
         }

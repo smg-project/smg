@@ -384,13 +384,37 @@ impl PolicyRegistry {
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
+        self.select_worker_for_model_following(policy, model_id, workers, info, None)
+    }
+
+    /// [`Self::select_worker_for_model`] for a leg of a request whose earlier
+    /// leg landed in `group` (the decode leg after the prefill's): under
+    /// `--traffic-split` the choice stays in that group while it has an
+    /// available member of positive weight among `workers`, so a
+    /// prefill-decode pair never spans two groups (two engine builds, which
+    /// lenient pairing would otherwise pair). A group absent or drained among
+    /// `workers`, or no group, leaves the key or the draw to decide as for a
+    /// first leg. Every confined selection counts in
+    /// `smg_traffic_split_selections_total`, one per leg.
+    pub fn select_worker_for_model_following(
+        &self,
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        group: Option<&str>,
+    ) -> Option<usize> {
         if self.traffic_split && Self::traffic_split_applies(policy.name(), info) {
             if let Some(split) = Split::plan(workers) {
-                // The same key the sticky override would pin by keeps a
-                // session in one group; a keyless request draws at random.
-                let arm = match self.effective_sticky_key(info) {
-                    Some((key, _)) => split.arm_for_key(key),
-                    None => split.arm_at_random(&mut rand::rng()),
+                // The group an earlier leg chose is followed; otherwise the
+                // same key the sticky override would pin by keeps a session
+                // in one group, and a keyless request draws at random.
+                let arm = match group.and_then(|name| split.arm_named(name)) {
+                    Some(arm) => arm,
+                    None => match self.effective_sticky_key(info) {
+                        Some((key, _)) => split.arm_for_key(key),
+                        None => split.arm_at_random(&mut rand::rng()),
+                    },
                 };
                 Metrics::record_traffic_split_selection(model_id, arm.name);
                 let members: Vec<Arc<dyn Worker>> = arm
@@ -405,13 +429,18 @@ impl PolicyRegistry {
         self.select_within(policy, model_id, workers, info)
     }
 
-    /// Whether the traffic split may confine this selection: an explicit
-    /// `X-SMG-Target-Worker` indexes the whole pool and outranks it (as it
-    /// outranks the routing key), and `bucket` places prefill by request
-    /// size over boundaries spanning its whole fleet, which one group cannot
-    /// represent.
+    /// Whether the traffic split may confine this selection: `bucket` places
+    /// prefill by request size over boundaries spanning its whole fleet,
+    /// which one group cannot represent; and an explicit
+    /// `X-SMG-Target-Worker` under `consistent_hashing`, the policy that
+    /// reads it, indexes the whole pool and outranks the split (as it
+    /// outranks the routing key). Every other policy ignores the header, so
+    /// the split holds there: a drained group takes nothing from a request
+    /// that carries it.
     fn traffic_split_applies(policy_name: &str, info: &SelectWorkerInfo) -> bool {
-        policy_name != "bucket" && extract_target_worker(info.headers).is_none()
+        policy_name != "bucket"
+            && !(policy_name == "consistent_hashing"
+                && extract_target_worker(info.headers).is_some())
     }
 
     /// The selection proper over `workers`: the sticky override when it
@@ -3141,6 +3170,12 @@ mod tests {
             for _ in 0..10 {
                 assert_eq!(pick(&reg, &workers, &info), 1);
             }
+            // Under round robin the policy does not read the header: the
+            // drained canary stays drained.
+            let round_robin = registry(true);
+            for _ in 0..30 {
+                assert_ne!(pick(&round_robin, &workers, &info), 1);
+            }
         }
 
         #[test]
@@ -3155,7 +3190,13 @@ mod tests {
                 headers: Some(&headers),
                 ..Default::default()
             };
+            // Only consistent hashing reads the header; every other policy
+            // ignores it, and the split holds.
             assert!(!PolicyRegistry::traffic_split_applies(
+                "consistent_hashing",
+                &targeted
+            ));
+            assert!(PolicyRegistry::traffic_split_applies(
                 "round_robin",
                 &targeted
             ));
@@ -3203,6 +3244,51 @@ mod tests {
             // Only the stable arm is live: the policy runs over the pool and
             // never picks the failed canary.
             assert!(picks(&reg, &workers, 50).iter().all(|&idx| idx != 1));
+        }
+
+        /// Under a disaggregated pair the decode leg follows the prefill's
+        /// group: the pair never spans two groups while the decode pool has
+        /// that group live, and a group drained on the decode side is not
+        /// followed into.
+        #[test]
+        fn the_decode_leg_follows_the_prefills_group() {
+            use crate::policies::traffic_split::group_of;
+
+            let reg = registry(true);
+            let policy = reg.get_default_policy();
+            let prefill = fleet("50");
+            let decode = fleet("50");
+            let info = SelectWorkerInfo::default();
+            let mut canary_pairs = 0;
+            for _ in 0..400 {
+                let prefill_idx = pick(&reg, &prefill, &info);
+                let group = group_of(prefill[prefill_idx].as_ref());
+                let decode_idx = reg
+                    .select_worker_for_model_following(&policy, "m", &decode, &info, Some(group))
+                    .expect("a decode worker is selected");
+                assert_eq!(group_of(decode[decode_idx].as_ref()), group);
+                if group == "canary" {
+                    canary_pairs += 1;
+                }
+            }
+            // Weight 50 against 90: about 36 % of the pairs, a wide band.
+            assert!(
+                (80..=220).contains(&canary_pairs),
+                "{canary_pairs} canary pairs of 400"
+            );
+            let drained = fleet("0");
+            for _ in 0..50 {
+                let decode_idx = reg
+                    .select_worker_for_model_following(
+                        &policy,
+                        "m",
+                        &drained,
+                        &info,
+                        Some("canary"),
+                    )
+                    .expect("a decode worker is selected");
+                assert_ne!(decode_idx, 1, "a drained group was followed into");
+            }
         }
     }
 }

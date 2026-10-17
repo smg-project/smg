@@ -649,10 +649,10 @@ class RouterArgs:
     tokenizer_cache_l1_max_memory: int = 50 * 1024 * 1024  # 50MB
     tokenizer_path: str | None = None
     tool_call_parser: str | None = None
-    # Tenant resolution: trust an upstream tenant header (tenant_header_name names it)
     # Weighted traffic split across worker groups (traffic_group / traffic_weight
     # labels), run before the policy
     traffic_split: bool = False
+    # Tenant resolution: trust an upstream tenant header (tenant_header_name names it)
     trust_tenant_header: bool = False
     upstream_http2: bool = False
     upstream_pool_idle_timeout_secs: int = 3
@@ -1489,7 +1489,8 @@ class RouterArgs:
                 "Weighted traffic split across worker groups: a worker's"
                 " traffic_group label names its group (default for workers"
                 " without one) and its traffic_weight label the group's weight"
-                " (100 when absent). A request with two or more groups among"
+                " (the default group weighs 100 without one; a named group"
+                " weighs what its workers carry). A request with two or more groups among"
                 " its candidates picks one by weight, by its routing key when"
                 " it has one, then the policy selects inside it. Weights are"
                 " labels: a ramp is a PATCH /workers/{id}, a weight of 0"

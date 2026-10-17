@@ -69,14 +69,14 @@ fn bad_request(message: String) -> WorkerServiceError {
 /// finite cost; a KV block size and a data-parallel size of at least 1; a
 /// rank only with a size and below it; a bootstrap port that is a port). A
 /// violation is a `400 Bad Request` naming the field.
-fn validate_spec(spec: &WorkerSpec) -> Result<(), WorkerServiceError> {
+fn validate_spec(spec: &WorkerSpec, traffic_split: bool) -> Result<(), WorkerServiceError> {
     if spec.url.len() > MAX_WORKER_URL_BYTES {
         return Err(bad_request(format!(
             "url is {} bytes long; at most {MAX_WORKER_URL_BYTES} are accepted",
             spec.url.len()
         )));
     }
-    validate_labels(&spec.labels)?;
+    validate_labels(&spec.labels, traffic_split)?;
     validate_cost(spec.cost)?;
     if spec.kv_block_size == Some(0) {
         return Err(bad_request(
@@ -102,12 +102,15 @@ fn validate_spec(spec: &WorkerSpec) -> Result<(), WorkerServiceError> {
 }
 
 /// The bounds of an update: the fields it may change, under the same rules.
-fn validate_update(update: &WorkerUpdateRequest) -> Result<(), WorkerServiceError> {
+fn validate_update(
+    update: &WorkerUpdateRequest,
+    traffic_split: bool,
+) -> Result<(), WorkerServiceError> {
     if let Some(cost) = update.cost {
         validate_cost(cost)?;
     }
     if let Some(labels) = &update.labels {
-        validate_labels(labels)?;
+        validate_labels(labels, traffic_split)?;
     }
     Ok(())
 }
@@ -161,7 +164,12 @@ fn validate_merged_labels(
     Ok(())
 }
 
-fn validate_labels(labels: &HashMap<String, String>) -> Result<(), WorkerServiceError> {
+/// The label rules; `traffic_split` says whether the split's own labels are
+/// held to their shape (they are inert while the split is off).
+fn validate_labels(
+    labels: &HashMap<String, String>,
+    traffic_split: bool,
+) -> Result<(), WorkerServiceError> {
     if labels.len() > MAX_WORKER_LABELS {
         return Err(bad_request(format!(
             "{} labels; at most {MAX_WORKER_LABELS} are accepted",
@@ -212,9 +220,12 @@ fn validate_labels(labels: &HashMap<String, String>) -> Result<(), WorkerService
         }
     }
     // The traffic split's group name and weight (`traffic_group`,
-    // `traffic_weight`): a weight the split could not read would silently
-    // weigh the group as the default.
-    traffic_split::validate_labels(labels).map_err(bad_request)?;
+    // `traffic_weight`), held while the split is on: a weight it could not
+    // read would silently weigh the group as the default. Off, the labels
+    // are inert and registration is what it was before them.
+    if traffic_split {
+        traffic_split::validate_labels(labels).map_err(bad_request)?;
+    }
     Ok(())
 }
 
@@ -510,7 +521,7 @@ impl WorkerService {
         &self,
         config: WorkerSpec,
     ) -> Result<CreateWorkerResult, WorkerServiceError> {
-        validate_spec(&config)?;
+        validate_spec(&config, self.router_config.traffic_split)?;
         validate_worker_url_request(&config.url)?;
         Self::require_provider_router(&config)?;
 
@@ -601,7 +612,7 @@ impl WorkerService {
         // the change, not which labels to strip.
         refuse_discovery_owned(existing.as_ref())?;
         let url = existing.url().to_string();
-        validate_spec(&config)?;
+        validate_spec(&config, self.router_config.traffic_split)?;
         Self::require_provider_router(&config)?;
 
         // A data-parallel router expands one spec into one worker per rank,
@@ -771,7 +782,7 @@ impl WorkerService {
         if let (Some(_), Some(worker)) = (&update.labels, &worker) {
             refuse_discovery_owned(worker.as_ref())?;
         }
-        validate_update(&update)?;
+        validate_update(&update, self.router_config.traffic_split)?;
         if let (Some(labels), Some(worker)) = (&update.labels, &worker) {
             validate_merged_labels(&worker.metadata().spec.labels, labels)?;
         }
@@ -1310,7 +1321,7 @@ mod tests {
     fn a_rejected_label_key_is_shown_truncated() {
         let long = "k".repeat(1 << 20);
         let labels: HashMap<String, String> = [(long.clone(), "v".to_string())].into();
-        let err = validate_labels(&labels).expect_err("a key over the cap");
+        let err = validate_labels(&labels, true).expect_err("a key over the cap");
         let WorkerServiceError::BadRequest { message } = err else {
             panic!("expected a bad request, got {err}");
         };
@@ -1320,12 +1331,13 @@ mod tests {
             "{message}"
         );
         let short: HashMap<String, String> = [("has space".to_string(), "v".to_string())].into();
-        let err = validate_labels(&short).expect_err("a key with a space");
+        let err = validate_labels(&short, true).expect_err("a key with a space");
         assert!(err.to_string().contains("\"has space\""), "{err}");
     }
 
     /// The traffic split's labels are held to their shape at the admin
-    /// boundary, named in the refusal.
+    /// boundary while the split is on, named in the refusal; off, they are
+    /// labels like any other.
     #[test]
     fn traffic_split_labels_are_held_to_their_shape() {
         let ok: HashMap<String, String> = [
@@ -1333,17 +1345,20 @@ mod tests {
             ("traffic_weight".to_string(), "5".to_string()),
         ]
         .into();
-        assert!(validate_labels(&ok).is_ok());
+        assert!(validate_labels(&ok, true).is_ok());
 
         let bad_weight: HashMap<String, String> =
             [("traffic_weight".to_string(), "5%".to_string())].into();
-        let err = validate_labels(&bad_weight).expect_err("a weight that is not an integer");
+        let err = validate_labels(&bad_weight, true).expect_err("a weight that is not an integer");
         assert!(err.to_string().contains("traffic_weight"), "{err}");
         assert!(err.to_string().contains("\"5%\""), "{err}");
 
         let bad_group: HashMap<String, String> =
             [("traffic_group".to_string(), "two words".to_string())].into();
-        let err = validate_labels(&bad_group).expect_err("a group name with a space");
+        let err = validate_labels(&bad_group, true).expect_err("a group name with a space");
         assert!(err.to_string().contains("traffic_group"), "{err}");
+
+        assert!(validate_labels(&bad_weight, false).is_ok());
+        assert!(validate_labels(&bad_group, false).is_ok());
     }
 }

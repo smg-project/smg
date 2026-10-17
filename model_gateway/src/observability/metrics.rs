@@ -2293,7 +2293,6 @@ impl Metrics {
         gauge!("smg_manual_policy_cache_entries").set(count as f64);
     }
 
-    /// Record which source supplied the sticky routing key for a keyed request
     /// Record a selection the traffic split confined to one worker group:
     /// `group` is the arm picked for `model_id` (interned, bounded).
     pub fn record_traffic_split_selection(model_id: &str, group: &str) {
@@ -2307,6 +2306,7 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Record which source supplied the sticky routing key for a keyed request
     pub fn record_routing_key_source(source: &'static str) {
         counter!(
             "smg_routing_key_source_total",
