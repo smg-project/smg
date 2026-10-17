@@ -185,12 +185,6 @@ pub struct JwtValidator {
 }
 
 impl JwtValidator {
-    /// Create a new JWT validator with explicit JWKS URI.
-    #[expect(dead_code)]
-    pub(crate) fn new(config: JwtConfig, jwks_provider: Arc<JwksProvider>) -> Self {
-        Self::new_with_options(config, jwks_provider, false)
-    }
-
     /// Create a new JWT validator with optional JTI replay protection.
     pub(crate) fn new_with_options(
         config: JwtConfig,
@@ -503,12 +497,6 @@ impl JwtValidator {
                 "Cannot determine algorithm from key".to_string(),
             )),
         }
-    }
-
-    /// Get a reference to the JWKS provider.
-    #[expect(dead_code)]
-    pub(crate) fn jwks_provider(&self) -> &Arc<JwksProvider> {
-        &self.jwks_provider
     }
 
     /// Get a reference to the JWT config.
