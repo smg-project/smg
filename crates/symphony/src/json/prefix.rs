@@ -1,29 +1,49 @@
-//! Whether argument bytes are still a valid JSON prefix, judged as they arrive.
+//! Whether argument bytes are still a prefix of JSON a strict reader accepts, judged as they
+//! arrive.
 //!
 //! [`Prefix`] takes the bytes of one JSON value in pieces and says where, if anywhere, they stop
-//! being a prefix of a value. It accepts exactly what [`PartialJson`](super::PartialJson) consumes
-//! whole in prefix mode and stops where that parser stops, so the promise `ToolCallArguments`
-//! makes, that the fragments so far form a valid prefix as far as the prefix parser can tell, is
-//! exactly as strong as before; a test runs the two over every cut of a corpus of sound and broken
-//! values. What makes it different is cost: it keeps its place between pieces and reads each byte
-//! once, where the parser read the whole text again on every piece, which made a long arguments
-//! string cost the square of its length.
+//! being a prefix of a value a strict reader (`serde_json`, a client's JSON library, the engine's
+//! own) accepts. It stops where [`PartialJson`](super::PartialJson) stops, and earlier, at the
+//! first byte of what that parser tolerates and JSON lacks, so the promise `ToolCallArguments`
+//! makes, that the fragments so far are a prefix of JSON a strict reader accepts, holds at every
+//! byte and not only at a call's end; a test runs the judge, the parser and a strict reader over
+//! every cut of a corpus of sound and broken values. It keeps its place between pieces and reads
+//! each byte once, where the parser read the whole text again on every piece, which made a long
+//! arguments string cost the square of its length.
 //!
-//! What the prefix parser tolerates, this does too: a literal's prefix at the end (`nu`), a
-//! number cut anywhere (`-`, `1.`, `1e+`), a trailing comma before a closing bracket, a value left
-//! out before a comma or a closing brace (`[,,]`, `{"a": }`), an escape JSON lacks (`\q` is `q`),
-//! a `\u` escape with fewer than four hex digits, and any Unicode whitespace between tokens. What
-//! it refuses, where that parser stops: a word that is no literal (judged from the word's first
-//! letter, as the parser rolls back to it), a bracket closed by the wrong kind where the parent
-//! cannot take it (`{"a": [1}` is whole, the array ending at the brace that closes the object;
-//! `[1, 2}` stops at the brace), a surrogate escape without its other half, a container nested
-//! past the depth limit, and anything after the value. Inside a string the only error is a broken
-//! surrogate pair; a string cut anywhere else is a prefix.
+//! What it takes is what a strict reader takes, cut anywhere: a literal's prefix at the end
+//! (`nu`), a number cut anywhere (`-`, `1.`, `1e+`), a string cut anywhere, and the one thing JSON
+//! lacks that it lets through, a raw control character inside a string, which the fragment that
+//! carries it writes as its escape ([`Prefix::escaped`]), so that what a client assembles is JSON
+//! again. One place it is wider than `serde_json`: it reads a number's grammar, not its size, so a
+//! number out of the reader's range (`1e400`, an integer past `f64`'s range) passes, and a call
+//! that carries one closes whole while a client's reader may refuse the number; the templates' own
+//! readers differ there too (Python's reads it as infinity), so the judge leaves it to the client.
+//! What it refuses, at the first byte a strict reader refuses: a value left out before a
+//! comma or a close (`[,,]`, `{"a": }`), a trailing comma before a close (`[1, ]`), a bracket
+//! closed by the wrong kind (`{"a": [1}`), whitespace JSON lacks between tokens (a no-break
+//! space), a number or a word cut short before a delimiter (`1.}`, `nu}`), a container nested
+//! past the depth limit, and anything after the value; and from the first byte of what the
+//! readers hold until it is decided, which the strict reader refuses a byte or more later: a word
+//! that is no literal, from its first letter (as the parser rolls back to it), and an escape JSON
+//! lacks (`\q`), a `\u` escape with fewer than four hex digits and a surrogate escape without its
+//! other half, from the escape's backslash. The partial parser tolerates most of these, as the old
+//! crate did (it refuses the depth, the bytes after the value, the word that is no literal and
+//! the surrogate), which is right for a prefix that is still arriving and wrong at a call's close,
+//! where the fragments are handed over as the model's whole arguments and no strict reader takes
+//! them; where the judge refuses, the readers report the bytes from there as
+//! `Malformed { InvalidArguments }` and nothing twice.
 
 use std::borrow::Cow;
 
 /// The nesting the prefix parser allows, which is [`PartialJson::DEFAULT_MAX_DEPTH`].
 const DEEPEST: usize = 32;
+
+/// The whitespace JSON allows between tokens and around a value: these four characters and no
+/// other, where the old crate took any Unicode whitespace.
+pub(crate) fn json_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r')
+}
 
 /// A JSON prefix being judged as its bytes arrive.
 #[derive(Clone, Debug)]
@@ -63,11 +83,15 @@ enum Container {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Expect {
-    /// A value, at the top or inside a container; inside one, the container's close is also
-    /// taken (a trailing comma, or `[]`), and a comma stands for a missing value.
+    /// A value: at the top, after a colon, or after a comma in an array. A comma or a close here
+    /// is a value left out, which JSON lacks.
     Value,
-    /// An object's key, or its close.
+    /// An array's first value, or its close (`[]`).
+    ValueOrClose,
+    /// An object's key, after a comma. A close here is a trailing comma, which JSON lacks.
     Key,
+    /// An object's first key, or its close (`{}`).
+    KeyOrClose,
     /// The colon after a key.
     Colon,
     /// A comma or the container's close, after a value.
@@ -120,18 +144,31 @@ enum Str {
 
 #[derive(Clone, Copy, Debug)]
 enum Num {
-    /// After `-`: a digit must come, though the parser takes `-` alone as a number too.
+    /// After `-`: a digit must come.
     Sign,
     /// After a leading `0`: only a fraction or an exponent may follow.
     Zero,
     Integer,
-    /// After `.`.
+    /// After `.`: a digit must come.
+    Dot,
+    /// Inside the fraction's digits.
     Fraction,
-    /// After `e` or `E`.
+    /// After `e` or `E`: a sign or a digit must come.
     Exponent,
-    /// After the exponent's sign.
+    /// After the exponent's sign: a digit must come.
     ExponentSign,
     ExponentDigits,
+}
+
+impl Num {
+    /// Whether the number is whole as it stands: a strict reader takes it, and would take more
+    /// digits.
+    fn whole(self) -> bool {
+        matches!(
+            self,
+            Num::Zero | Num::Integer | Num::Fraction | Num::ExponentDigits
+        )
+    }
 }
 
 impl Default for Prefix {
@@ -153,8 +190,9 @@ impl Prefix {
     /// stopped being a prefix of a value, if they have: an offset into the whole text, never past
     /// what has been fed, but anywhere at or after the start, bytes judged sound before included,
     /// since the parser rolls back to a word's first letter when the word is no literal, to the
-    /// backslash before a surrogate's missing other half, and to the value's start when a
-    /// top-level string breaks. A caller that has already passed on the sound bytes clamps the
+    /// backslash of an escape it refuses (one JSON lacks, a `\u` escape short of its digits, a
+    /// surrogate without its other half), and to the value's start when a top-level string
+    /// breaks. A caller that has already passed on the sound bytes clamps the
     /// answer to what it passed on, as the assembler does.
     pub fn feed(&mut self, bytes: &str) -> Option<usize> {
         for (offset, c) in bytes.char_indices() {
@@ -180,11 +218,26 @@ impl Prefix {
     }
 
     /// Where the top-level value ended, once something ended it: just past its closing quote or
-    /// bracket, or before the character that ended a number or a word. Whether the bytes up to
-    /// there are whole JSON is the caller's to say: this judge also ends a value it tolerates
-    /// unfinished, such as an array a brace cut short (`[1}`) or a literal's prefix (`nu`).
+    /// bracket, or before the character that ended a number or a word. The bytes up to there are
+    /// one whole value a strict reader accepts, since the judge ends no other ([`Self::whole`]).
     pub fn ended(&self) -> Option<usize> {
         self.ended
+    }
+
+    /// Whether the bytes so far are one whole JSON value a strict reader accepts, as they stand:
+    /// the value closed, or a number or a literal whole at the end of the bytes (`12`, `null`),
+    /// which more bytes could still extend or refuse. Not where the bytes stopped being a prefix,
+    /// nor while a string, a container, a word or a number is open (`"ab`, `[1,`, `nu`, `1.`).
+    pub fn whole(&self) -> bool {
+        if self.invalid.is_some() || !self.open.is_empty() {
+            return false;
+        }
+        match self.token {
+            Token::None => self.expect == Expect::End,
+            Token::Lit { expected, len, .. } => len == expected.len(),
+            Token::Num(state) => state.whole(),
+            Token::Str { .. } => false,
+        }
     }
 
     /// Where the word under way starts, while one is: a literal being spelled (`nu`), which is a
@@ -200,15 +253,29 @@ impl Prefix {
         }
     }
 
-    /// Where the surrogate escape under way starts, while a high surrogate awaits its low half
-    /// behind a backslash: the backslash, where the judge stops when what follows it is not the
-    /// low half, one byte before the character that says so.
+    /// Where the escape under way starts, while one is: the backslash of an escape whose letter
+    /// has not come, of a `\u` escape whose four hex digits are not all in, and of the `\u` escape
+    /// after a high surrogate until it is the low half. The judge refuses at that backslash when
+    /// the escape turns out to be one JSON lacks (`\q`), a `\u` escape short of its four hex
+    /// digits, or a surrogate without its other half, so an assembler holds from there, and no
+    /// fragment ends inside an escape; a letter JSON knows, four digits that are a character, and
+    /// a high surrogate's four digits release the hold.
     pub fn escape_start(&self) -> Option<usize> {
+        if self.invalid.is_some() {
+            return None;
+        }
         match self.token {
+            Token::Str {
+                state: Str::Escape, ..
+            } => Some(self.at - 1),
+            Token::Str {
+                state: Str::Unicode { digits, .. } | Str::Low { digits, .. },
+                ..
+            } => Some(self.at - 2 - usize::from(digits)),
             Token::Str {
                 state: Str::AfterHighBackslash { at },
                 ..
-            } if self.invalid.is_none() => Some(at),
+            } => Some(at),
             _ => None,
         }
     }
@@ -301,26 +368,31 @@ impl Prefix {
 
     /// A character where no token is under way.
     fn between(&mut self, at: usize, c: char) {
-        if self.expect != Expect::End && c.is_whitespace() {
+        // Between tokens JSON allows four whitespace characters and no other: a no-break space or
+        // an ideographic space, which the partial parser skipped, is refused as a strict reader
+        // refuses it.
+        if self.expect != Expect::End && json_space(c) {
             return;
         }
         match self.expect {
-            Expect::Value => self.value(at, c),
-            Expect::Key => match c {
-                '}' => self.close(Container::Object),
+            Expect::Value | Expect::ValueOrClose => self.value(at, c),
+            Expect::Key | Expect::KeyOrClose => match c {
+                '}' if self.expect == Expect::KeyOrClose => self.close(Container::Object),
                 '"' => {
                     self.token = Token::Str {
                         state: Str::Text,
                         key: true,
                     };
                 }
-                _ => self.unwind(at, c),
+                // A close after a comma (`{"a": 1, }`) is a trailing comma, which the partial
+                // parser took and JSON lacks; anything else is no key.
+                _ => self.refuse(at),
             },
             Expect::Colon => {
                 if c == ':' {
                     self.expect = Expect::Value;
                 } else {
-                    self.unwind(at, c);
+                    self.refuse(at);
                 }
             }
             Expect::CommaOrClose => match (self.open.last(), c) {
@@ -328,7 +400,11 @@ impl Prefix {
                 (Some(Container::Array), ',') => self.expect = Expect::Value,
                 (Some(Container::Object), '}') => self.close(Container::Object),
                 (Some(Container::Array), ']') => self.close(Container::Array),
-                _ => self.unwind(at, c),
+                // A bracket of the wrong kind, or anything else the container cannot take. The
+                // partial parser returned the container to its parent as it stood and let the
+                // parent judge the character, which made `{"a": [1}` a whole object; a strict
+                // reader refuses the character, and so does the judge.
+                _ => self.refuse(at),
             },
             Expect::End => self.refuse(at),
         }
@@ -360,30 +436,12 @@ impl Prefix {
             '-' => self.token = Token::Num(Num::Sign),
             '0' => self.token = Token::Num(Num::Zero),
             '1'..='9' => self.token = Token::Num(Num::Integer),
-            // No value starts here: the parser reads a missing value as `null` and leaves the
-            // character to the container, which takes a comma or its own close.
-            ',' => match self.open.last() {
-                Some(Container::Object) => self.expect = Expect::Key,
-                Some(Container::Array) => self.expect = Expect::Value,
-                None => self.refuse(at),
-            },
-            '}' if self.open.last() == Some(&Container::Object) => self.close(Container::Object),
-            ']' if self.open.last() == Some(&Container::Array) => self.close(Container::Array),
-            _ => self.unwind(at, c),
+            ']' if self.expect == Expect::ValueOrClose => self.close(Container::Array),
+            // No value starts here. A comma or a close where a value must stand (`[,`, `[1,]`,
+            // `{"a": }`) is a value left out: the partial parser read `null` for it and left the
+            // character to the container, and JSON has no such thing.
+            _ => self.refuse(at),
         }
-    }
-
-    /// A character the innermost container cannot take. The parser returns that container to
-    /// its parent as it stands and lets the parent judge the character, and so on up; at the top
-    /// nothing takes it, and the bytes stop being a prefix there. That is how `{"a": [1}` is a
-    /// whole object to the parser: the array ends at the brace, which then closes the object.
-    fn unwind(&mut self, at: usize, c: char) {
-        if self.open.pop().is_none() {
-            self.refuse(at);
-            return;
-        }
-        self.value_done();
-        self.between(at, c);
     }
 
     fn open(&mut self, at: usize, container: Container) {
@@ -393,8 +451,8 @@ impl Prefix {
         }
         self.open.push(container);
         self.expect = match container {
-            Container::Object => Expect::Key,
-            Container::Array => Expect::Value,
+            Container::Object => Expect::KeyOrClose,
+            Container::Array => Expect::ValueOrClose,
         };
     }
 
@@ -441,13 +499,20 @@ impl Prefix {
                     digits: 0,
                     value: 0,
                 },
-                // An escape JSON lacks reads as the character itself: a backslash and a raw
-                // newline are a newline, written `\n` with the backslash that already stands.
+                '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' => Str::Text,
+                // A backslash and a raw newline read as a newline, written `\n` with the
+                // backslash that already stands.
                 c if c < ' ' => {
                     self.controls.push(Control { at, escaped: true });
                     Str::Text
                 }
-                _ => Str::Text,
+                // An escape JSON lacks (`\q`): the partial parser read the character itself; a
+                // strict reader refuses it, and the judge refuses the escape from its backslash,
+                // which the readers hold ([`Self::escape_start`]).
+                _ => {
+                    self.refuse(at - 1);
+                    return;
+                }
             },
             Str::Unicode { digits, value } => match c.to_digit(16) {
                 Some(digit) => {
@@ -460,29 +525,27 @@ impl Prefix {
                     } else if (0xD800..0xDC00).contains(&value) {
                         Str::AfterHigh
                     } else if (0xDC00..0xE000).contains(&value) {
-                        // A low surrogate alone is no character: the parser stops after its
-                        // digits.
-                        self.string_broken(at + c.len_utf8(), None);
+                        // A low surrogate alone is no character: refused at its backslash, which
+                        // the readers hold ([`Self::escape_start`]); the parser stopped after
+                        // its digits.
+                        self.string_broken(at - 2 - usize::from(digits));
                         return;
                     } else {
                         Str::Text
                     }
                 }
-                // Fewer than four hex digits: the parser takes the escape as unfinished, and
-                // reads this character as the string's text.
+                // Fewer than four hex digits (`\u12G`): the partial parser took the escape as
+                // unfinished and read this character as the string's text; a strict reader
+                // refuses it, and the judge refuses the escape from its backslash, held likewise.
                 None => {
-                    self.token = Token::Str {
-                        state: Str::Text,
-                        key,
-                    };
-                    self.in_string(Str::Text, key, at, c);
+                    self.refuse(at - 2 - usize::from(digits));
                     return;
                 }
             },
             Str::AfterHigh => match c {
                 '\\' => Str::AfterHighBackslash { at },
                 _ => {
-                    self.string_broken(at, Some(c));
+                    self.string_broken(at);
                     return;
                 }
             },
@@ -492,7 +555,7 @@ impl Prefix {
                     value: 0,
                 },
                 _ => {
-                    self.string_broken(backslash, Some('\\'));
+                    self.string_broken(backslash);
                     return;
                 }
             },
@@ -507,16 +570,13 @@ impl Prefix {
                     } else if (0xDC00..0xE000).contains(&value) {
                         Str::Text
                     } else {
-                        self.string_broken(at + c.len_utf8(), None);
+                        // Not the low half: refused at this escape's backslash, held likewise.
+                        self.string_broken(at - 2 - usize::from(digits));
                         return;
                     }
                 }
                 None => {
-                    self.token = Token::Str {
-                        state: Str::Text,
-                        key,
-                    };
-                    self.in_string(Str::Text, key, at, c);
+                    self.refuse(at - 2 - usize::from(digits));
                     return;
                 }
             },
@@ -539,6 +599,13 @@ impl Prefix {
             }
             return;
         }
+        // The word ends before this character. Whole, it is the literal; cut short (`nu}`), it is
+        // no JSON, and is refused from its first letter like a word that is no literal, which the
+        // readers hold it as until it is decided.
+        if len < expected.len() {
+            self.refuse_word(start);
+            return;
+        }
         self.value_done();
         self.step(at, c);
     }
@@ -547,11 +614,9 @@ impl Prefix {
         let next = match (state, c) {
             (Num::Sign, '0') => Some(Num::Zero),
             (Num::Sign | Num::Integer, '1'..='9') | (Num::Integer, '0') => Some(Num::Integer),
-            (Num::Zero | Num::Integer | Num::Sign, '.') => Some(Num::Fraction),
-            (Num::Fraction, '0'..='9') => Some(Num::Fraction),
-            (Num::Zero | Num::Integer | Num::Sign | Num::Fraction, 'e' | 'E') => {
-                Some(Num::Exponent)
-            }
+            (Num::Zero | Num::Integer, '.') => Some(Num::Dot),
+            (Num::Dot | Num::Fraction, '0'..='9') => Some(Num::Fraction),
+            (Num::Zero | Num::Integer | Num::Fraction, 'e' | 'E') => Some(Num::Exponent),
             (Num::Exponent, '+' | '-') => Some(Num::ExponentSign),
             (Num::Exponent | Num::ExponentSign | Num::ExponentDigits, '0'..='9') => {
                 Some(Num::ExponentDigits)
@@ -560,11 +625,14 @@ impl Prefix {
         };
         match next {
             Some(state) => self.token = Token::Num(state),
-            None => {
-                // The number ends before this character, which the container judges.
+            // The number ends before this character, which the container judges.
+            None if state.whole() => {
                 self.value_done();
                 self.step(at, c);
             }
+            // Cut short (`1.}`, `-]`, `1e+,`): the partial parser took it as a number, and no
+            // strict reader does; the character that ends it is refused.
+            None => self.refuse(at),
         }
     }
 
@@ -575,19 +643,13 @@ impl Prefix {
         }
     }
 
-    /// A string broken at `at` (a surrogate escape without its other half). The parser leaves
-    /// the string there, returns its container to the parent as it stands, and the parent judges
-    /// what follows: `next` when that is the character at `at`, else the characters to come. At
-    /// the top the error is the value's own, and nothing of the value counts.
-    fn string_broken(&mut self, at: usize, next: Option<char>) {
-        if self.open.pop().is_none() {
-            self.refuse(0);
-            return;
-        }
-        self.value_done();
-        if let Some(c) = next {
-            self.between(at, c);
-        }
+    /// A string broken at `at` (a surrogate escape without its other half: the backslash of the
+    /// escape that is not the half the other needs, or the character after a high surrogate that
+    /// is no backslash): the bytes stop being a prefix there. At the top the error is the value's
+    /// own, and nothing of the value counts; the assemblers say so where they choose it
+    /// ([`Self::held_from`]).
+    fn string_broken(&mut self, at: usize) {
+        self.refuse(if self.open.is_empty() { 0 } else { at });
     }
 
     /// A word that is no literal: refused from its first letter, as the parser rolls back to it;
@@ -616,24 +678,23 @@ mod tests {
         Prefix::default().feed(text).unwrap_or(text.len())
     }
 
-    /// The corpus: sound values, the broken ones the prefix parser has rules for, and the shapes
-    /// the assembler's tests feed.
+    /// The corpus the judge and the partial parser agree on: sound values, the broken ones both
+    /// refuse at the same byte (or from a word's first letter), and the shapes the assembler's
+    /// tests feed.
     const CORPUS: &[&str] = &[
         r#"{"city": "Paris", "days": [1, 2]}"#,
         r#"{"name": "test", "value": 42, "flags": [true, false, null], "ratio": -1.5e2}"#,
         r#"{"a": {"b": {"c": [[], {}, [{}]]}}, "d": ""}"#,
         r#""a string value""#,
         "[1, 2, 3]",
+        "[-0, 0.5, 1e5, 1E+5, 2e-3, -12.25E-1]",
         "-0.5e-3",
         "true",
-        r#"{"q": "say \"hi\"\n\t\\ done", "u": "\u00e9\u00E9"}"#,
-        r#"{"pair": "\ud83d\ude00", "lone": "\udc00"}"#,
+        r#"{"q": "say \"hi\"\n\t\\ done", "u": "\u00e9\u00E9", "s": "a\/b\b\f\r"}"#,
+        r#"{"pair": "\ud83d\ude00", "high": "\ud83d"}"#,
         r#"{"half": "\ud83dx"}"#,
         r#"{"half": "\ud83d\n"}"#,
         r#"{"half": "\ud83dA"}"#,
-        r#"{"short": "\u00"}"#,
-        r#"{"short": "\uZZZZ"}"#,
-        r#"{"odd": "\q\/"}"#,
         r#""\udc00""#,
         "[1, truex]",
         "[1, falsey, 2]",
@@ -641,30 +702,98 @@ mod tests {
         "[nu",
         "truex",
         "trueé",
-        "[1, 2, ]",
-        r#"{"a": 1, }"#,
-        "[,,]",
-        r#"{"a": }"#,
-        r#"{"a": , "b": 1}"#,
-        r#"{"a": [1}"#,
         "[1, 2}",
         r#"{"a" 1}"#,
         "{a: 1}",
         r#"{"a": 1 "b": 2}"#,
         "[1 2]",
         "[01]",
-        "[-]",
-        "[1.]",
-        "[1e+]",
         "[1.5.5]",
         "[1x]",
         "[-x]",
         r#"{"a":1} "#,
         r#"{"a":1}x"#,
-        "\u{a0}[1,\u{a0}2]\u{2003}",
         r#"{"a": [1, {"b": [2, {"c": 3}]}]}"#,
         r#"{"name": "f", "arguments": {"k": "v"}}"#,
     ];
+
+    /// What the partial parser tolerates and a strict reader refuses, with the byte the judge
+    /// refuses it at: the first byte the strict reader refuses, or the first letter of a word or
+    /// the backslash of an escape, which the readers hold. One of each kind, in the shapes the
+    /// fuzzer found at a call's close.
+    const TOLERATED: &[(&str, usize)] = &[
+        // A value left out before a comma or a close.
+        (r#"{"a": }"#, 6),
+        (r#"{"a": , "b": 1}"#, 6),
+        (r#"{"city": "Paris", "days": ,}"#, 26),
+        ("[,,]", 1),
+        ("[1,,2]", 3),
+        // A trailing comma before a close.
+        (r#"{"a": 1, }"#, 9),
+        (r#"{"a": 1,}"#, 8),
+        ("[1, 2, ]", 7),
+        ("[1,]", 3),
+        // An escape JSON lacks, and a `\u` escape with fewer than four hex digits.
+        (r#"{"odd": "\q\/"}"#, 9),
+        (r#"{"a": "it\'s"}"#, 9),
+        (r#"{"short": "\u00"}"#, 11),
+        (r#"{"short": "\uZZZZ"}"#, 11),
+        (r#"{"a": "x\u12G4"}"#, 8),
+        // A surrogate escape without its other half, a low surrogate alone and a high one whose
+        // next escape is no low surrogate: refused at that escape's backslash, which is held.
+        (r#"{"pair": "\ud83d\ude00", "lone": "\udc00"}"#, 34),
+        (r#"{"a": "\ud83d\u0041"}"#, 13),
+        // A bracket closed by the wrong kind.
+        (r#"{"a": [1}"#, 8),
+        (r#"{"a": [1, 2}"#, 11),
+        (r#"[{"a": 1]"#, 8),
+        // Whitespace JSON lacks, before the value and between tokens.
+        ("\u{a0}[1,\u{a0}2]\u{2003}", 0),
+        ("[1,\u{a0}2]", 3),
+        ("{\"a\":\u{3000}1}", 5),
+        // A number cut short before a delimiter.
+        ("[-]", 2),
+        ("[1.]", 3),
+        ("[1e]", 3),
+        ("[1e+]", 4),
+        (r#"{"a": 1.}"#, 8),
+        (r#"{"a": -}"#, 7),
+        // A word cut short before a delimiter, from its first letter.
+        ("[nu]", 1),
+        (r#"{"a": nu}"#, 6),
+        (r#"{"a": tru, "b": 1}"#, 6),
+    ];
+
+    /// The texts of both tables.
+    fn every_text() -> Vec<String> {
+        CORPUS
+            .iter()
+            .copied()
+            .chain(TOLERATED.iter().map(|(text, _)| *text))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Whether `text` is a prefix of JSON a strict reader accepts: whole, or cut where the reader
+    /// wants more bytes rather than refusing one it saw.
+    fn strict_prefix(text: &str) -> bool {
+        match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(_) => true,
+            Err(error) => error.is_eof(),
+        }
+    }
+
+    /// The byte a strict reader refuses `text` at, if it refuses one (its column is one-based and
+    /// counts bytes; the corpus has no newlines).
+    fn strict_refusal(text: &str) -> Option<usize> {
+        match serde_json::from_str::<serde_json::Value>(text) {
+            Err(error) if !error.is_eof() => {
+                assert_eq!(error.line(), 1, "{text:?}");
+                Some(error.column() - 1)
+            }
+            _ => None,
+        }
+    }
 
     fn deep(levels: usize) -> String {
         let mut text = "[".repeat(levels);
@@ -690,7 +819,81 @@ mod tests {
                 cuts += 1;
             }
         }
-        assert!(cuts > 800, "{cuts} cuts");
+        assert!(cuts > 700, "{cuts} cuts");
+    }
+
+    /// What the partial parser tolerates and JSON lacks is refused at the first byte a strict
+    /// reader refuses, or from the first letter of a word or the backslash of an escape, which
+    /// the readers hold and which come before it: the bytes before that byte are a prefix the
+    /// strict reader takes, the whole text is not, the parser read further, and every cut of the
+    /// text gives the same byte.
+    #[test]
+    fn it_refuses_what_the_partial_parser_tolerates_where_a_strict_reader_does() {
+        for &(text, at) in TOLERATED {
+            assert_eq!(prefix_says(text), at, "{text:?}");
+            assert!(
+                strict_prefix(&text[..at]),
+                "{text:?}: the bytes before {at}"
+            );
+            assert!(!strict_prefix(text), "{text:?}: whole");
+            if let Some(refused) = strict_refusal(text) {
+                assert!(
+                    at <= refused,
+                    "{text:?}: the judge at {at}, the reader at {refused}"
+                );
+            }
+            assert!(parser_says(text) > at, "{text:?}: the parser tolerated it");
+            for cut in (1..text.len()).filter(|&cut| text.is_char_boundary(cut)) {
+                let mut judge = Prefix::default();
+                let first = judge.feed(&text[..cut]);
+                assert_eq!(
+                    first.or_else(|| judge.feed(&text[cut..])),
+                    Some(at),
+                    "{text:?} cut at {cut}"
+                );
+            }
+        }
+    }
+
+    /// `whole` says what a strict reader says of the bytes as they stand: a value that closed, or a
+    /// number or a literal whole at the end, and nothing open or refused.
+    #[test]
+    fn whole_says_whether_the_bytes_are_one_value_a_strict_reader_takes() {
+        for (text, expected) in [
+            ("12", true),
+            ("-0", true),
+            ("1.5", true),
+            ("1e5", true),
+            ("1E+5", true),
+            ("null", true),
+            ("true", true),
+            (r#"{"a": 1}"#, true),
+            ("[]", true),
+            ("{}", true),
+            (r#""ab""#, true),
+            ("-", false),
+            ("1.", false),
+            ("1e", false),
+            ("1e+", false),
+            ("nu", false),
+            (r#"{"a": 1"#, false),
+            ("[1,", false),
+            (r#""ab"#, false),
+            ("", false),
+            ("  ", false),
+            ("[1}", false),
+            (r#"{"a": 1, }"#, false),
+            (r#"{"a": nu}"#, false),
+        ] {
+            let mut judge = Prefix::default();
+            judge.feed(text);
+            assert_eq!(judge.whole(), expected, "{text:?}");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(text).is_ok(),
+                expected,
+                "{text:?} by the strict reader"
+            );
+        }
     }
 
     #[test]
@@ -710,9 +913,17 @@ mod tests {
         assert_eq!(after("  1").held_from(), None);
         assert_eq!(after("null").held_from(), Some(0));
         assert_eq!(after("[null, ").held_from(), None);
-        // A surrogate escape awaiting its low half behind a backslash: the backslash.
+        // An escape being read: its backslash, until a letter JSON knows or four hex digits that
+        // are a character have decided it; a high surrogate's four digits are not held, and the
+        // `\u` escape after them is, until it is the low half.
+        assert_eq!(after(r#"{"e": "\"#).held_from(), Some(7));
+        assert_eq!(after(r#"{"e": "\u"#).held_from(), Some(7));
+        assert_eq!(after(r#"{"e": "\u12"#).held_from(), Some(7));
+        assert_eq!(after(r#"{"e": "\u1234"#).held_from(), None);
+        assert_eq!(after(r#"{"e": "\n"#).held_from(), None);
         assert_eq!(after(r#"{"e": "\ud83c\"#).held_from(), Some(13));
-        assert_eq!(after(r#"{"e": "\ud83c\u"#).held_from(), None);
+        assert_eq!(after(r#"{"e": "\ud83c\u"#).held_from(), Some(13));
+        assert_eq!(after(r#"{"e": "\ud83c\ude0"#).held_from(), Some(13));
         assert_eq!(after(r#"{"e": "\ud83c"#).held_from(), None);
         // A string streams on, at the top too; a number and a container: nothing to go back to.
         assert_eq!(after(r#""ab\ud83c"#).held_from(), None);
@@ -723,7 +934,7 @@ mod tests {
 
     #[test]
     fn feeding_a_text_in_pieces_judges_it_as_feeding_it_whole_does() {
-        let mut corpus: Vec<String> = CORPUS.iter().map(|s| s.to_string()).collect();
+        let mut corpus = every_text();
         corpus.push(deep(33));
         for text in &corpus {
             let whole = Prefix::default().feed(text);

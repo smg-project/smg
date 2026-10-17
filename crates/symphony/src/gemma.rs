@@ -33,12 +33,16 @@
 //! after it included, and the object closes whole without it, as the tagged assemblers leave such
 //! a member; a list item missing before a comma the same. A member the call's end cuts after its
 //! colon is the cut call's: the key held for the value comes back with the end's reason, nothing
-//! is made up for the value that never came, and the object closes whole without the member.
+//! is made up for the value that never came, and the object closes whole without the member. Nesting
+//! past the prefix parser's bound ([`DEEPEST`]) in what is written is reported from the bracket
+//! that passes it, with the key held for it, so that the fragments stay a prefix that parser
+//! takes, as the JSON syntax keeps them, and the object closes whole without the member.
 //!
 //! [`formats::gemma4`]: crate::formats::gemma4()
 
 use crate::{
     event::{runs, DropReason, Event, Events, MalformedReason, Text},
+    json::PartialJson,
     tagged::assembler::{push_escaped, push_quoted},
 };
 
@@ -83,6 +87,12 @@ fn header_name(head: &str) -> Result<&str, MalformedReason> {
     }
 }
 
+/// The nesting the arguments may reach, the arguments object counted: the prefix parser's bound
+/// ([`PartialJson::DEFAULT_MAX_DEPTH`]), which the JSON syntax's judge applies, so that the
+/// fragments of a call stay a prefix that parser takes, whichever syntax wrote them. It counts
+/// what is written: the containers of a member without a key, which is not written, do not count.
+const DEEPEST: usize = PartialJson::DEFAULT_MAX_DEPTH;
+
 /// The events of one call, from the bytes after `<|tool_call>`.
 #[derive(Clone, Debug)]
 pub struct Assembler {
@@ -122,6 +132,11 @@ enum Stage {
     Text,
     /// Where `,` or the container's close stands.
     AfterValue,
+    /// After a bracket that would open a container past [`DEEPEST`]: the arguments are no longer
+    /// read, every byte from the refused member's key, or from the refused list element, up to
+    /// the call's end is reported, and the containers still open are closed at the end, whole,
+    /// since the member whose value the bracket began was held and nothing of it written.
+    Refused,
     /// The arguments object closed; only the marker should follow.
     Closed,
 }
@@ -181,6 +196,7 @@ impl Assembler {
                 Stage::Value => self.value(rest, out),
                 Stage::Text => self.text(rest, out),
                 Stage::AfterValue => self.after_value(rest, out),
+                Stage::Refused => refused(rest, out),
                 Stage::Closed => after_the_object(rest, out),
             };
             if taken == 0 && self.stage == stage {
@@ -355,6 +371,21 @@ impl Assembler {
             self.push_fragment(String::new(), Text::uncounted(&rest[..key + space]), out);
             self.stage = Stage::AfterValue;
             return key + space;
+        }
+        if matches!(first, '{' | '[') && self.skipping.is_none() && self.containers.len() >= DEEPEST
+        {
+            // Nesting the prefix parser would refuse: the fragments stop here, where they are
+            // still a prefix it takes, and the bytes from here on are reported, as the JSON
+            // syntax reports the bytes from the bracket it cannot take: a member from its key,
+            // held for this value and not written, so that the object closes whole without it,
+            // as it does without a member that has no value; a list's element from the
+            // whitespace before its bracket. The members written before stay the call's; the end
+            // closes what is open. A member being skipped is not written, so its nesting is not
+            // counted: nothing of it reaches the parser, and the members after it are written as
+            // before.
+            self.key = None;
+            self.stage = Stage::Refused;
+            return refused(rest, out);
         }
         if self.key.take().is_some() {
             let mut json = self.separator();
@@ -634,6 +665,19 @@ impl Assembler {
             source,
         });
     }
+}
+
+/// Bytes from a bracket that would open a container past [`DEEPEST`], the key held for it before
+/// them, up to the call's end: reported as invalid arguments, piece by piece, which joins to the
+/// same text however the bytes are cut.
+fn refused(text: &str, out: &mut Events) -> usize {
+    if !text.is_empty() {
+        out.push(Event::Malformed {
+            text: Text::uncounted(text),
+            why: MalformedReason::InvalidArguments,
+        });
+    }
+    text.len()
 }
 
 /// Text after the arguments closed, run by run: whitespace is dropped as the template's wrapping,
@@ -1247,6 +1291,154 @@ mod tests {
                     "{output:?} cut {cut}: {events:?}"
                 );
             }
+        }
+    }
+
+    /// A container opened past the prefix parser's depth bound: the fragments stop where the
+    /// parser still takes them, the bytes from that bracket to the call's end are reported as
+    /// invalid arguments, and the end closes what is open, whole and in pieces alike. Nesting
+    /// up to the bound reads as before.
+    #[test]
+    fn nesting_past_the_prefix_parsers_bound_is_reported_from_the_bracket_that_passes_it() {
+        let deep = |levels: usize| {
+            format!(
+                "call:f{{days:{}1{}}}",
+                "[".repeat(levels),
+                "]".repeat(levels)
+            )
+        };
+        let within = deep(DEEPEST - 1);
+        for cut in [false, true] {
+            let events = run(&[&within], cut);
+            let json = arguments(&events);
+            assert!(
+                PartialJson::default().parse(&json, false).is_ok(),
+                "cut {cut}: {json}"
+            );
+            assert!(
+                !events.iter().any(|e| matches!(e, Event::Malformed { .. })),
+                "cut {cut}"
+            );
+        }
+        // The refused bracket as an object member's value: the key held for it is reported with
+        // the bytes from the bracket on, nothing of the member is written, and the objects close
+        // whole without it; the reported bytes run from the key to the object's own close.
+        let objects = |levels: usize| {
+            format!(
+                "call:f{{{}a:1{}}}",
+                "a:{".repeat(levels),
+                "}".repeat(levels)
+            )
+        };
+        let within_objects = objects(DEEPEST - 1);
+        let events = run(&[&within_objects], false);
+        assert!(PartialJson::default()
+            .parse(&arguments(&events), false)
+            .is_ok());
+        assert!(!events.iter().any(|e| matches!(e, Event::Malformed { .. })));
+        let past_objects = objects(DEEPEST);
+        for cut in [false, true] {
+            let events = run(&[&past_objects], cut);
+            let json = arguments(&events);
+            assert!(
+                PartialJson::default().parse(&json, false).is_ok(),
+                "objects cut {cut}: a prefix the parser takes: {json}"
+            );
+            assert_eq!(
+                json,
+                format!(
+                    "{{{}{}",
+                    "\"a\": {".repeat(DEEPEST - 1),
+                    "}".repeat(DEEPEST)
+                ),
+                "objects cut {cut}: the objects close whole, the refused member not written"
+            );
+            let reported: String = events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Malformed {
+                        text,
+                        why: MalformedReason::InvalidArguments,
+                    } => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                reported,
+                format!("a:{{a:1{}}}", "}".repeat(DEEPEST)),
+                "objects cut {cut}: from the refused member's key to the object's own close"
+            );
+        }
+        let past = deep(DEEPEST);
+        let per_char: Vec<&str> = past
+            .char_indices()
+            .map(|(i, c)| &past[i..i + c.len_utf8()])
+            .collect();
+        for (how, pieces) in [("whole", vec![past.as_str()]), ("per character", per_char)] {
+            for cut in [false, true] {
+                let events = run(&pieces, cut);
+                let json = arguments(&events);
+                assert!(
+                    PartialJson::default().parse(&json, false).is_ok(),
+                    "{how} cut {cut}: the fragments stay a value the prefix parser takes: {json}"
+                );
+                assert!(
+                    serde_json::from_str::<serde_json::Value>(&json).is_ok(),
+                    "{how} cut {cut}: the end closes what is open: {json}"
+                );
+                let reported: String = events
+                    .iter()
+                    .filter_map(|e| match e {
+                        Event::Malformed {
+                            text,
+                            why: MalformedReason::InvalidArguments,
+                        } => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    reported,
+                    format!("[1{}}}", "]".repeat(DEEPEST)),
+                    "{how} cut {cut}: from the bracket past the bound to the object's own close"
+                );
+                assert_eq!(
+                    bytes(&events),
+                    if cut {
+                        past.clone()
+                    } else {
+                        format!("{past}{CLOSE}")
+                    },
+                    "{how} cut {cut}"
+                );
+            }
+        }
+        // The bound counts what is written: a member without a key is reported and not written,
+        // so the containers opened inside it, however deep, refuse nothing, and the members after
+        // it are written as before.
+        let skipped = format!(
+            "call:f{{:{}1{},b:1}}",
+            "[".repeat(DEEPEST + 8),
+            "]".repeat(DEEPEST + 8)
+        );
+        for cut in [false, true] {
+            let events = run(&[&skipped], cut);
+            assert_eq!(arguments(&events), "{\"b\": 1}", "skipped cut {cut}");
+            assert!(
+                malformed(&events)
+                    .iter()
+                    .all(|(_, why)| *why == MalformedReason::EmptyKey),
+                "skipped cut {cut}: {:?}",
+                malformed(&events)
+            );
+            assert_eq!(
+                bytes(&events),
+                if cut {
+                    skipped.clone()
+                } else {
+                    format!("{skipped}{CLOSE}")
+                },
+                "skipped cut {cut}"
+            );
         }
     }
 
