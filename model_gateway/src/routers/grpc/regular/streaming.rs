@@ -246,6 +246,9 @@ impl StreamingProcessor {
 
         // Create SSE channel
         let (tx, rx) = sse_channel();
+        // Read for this client: the moment the response body is dropped, the
+        // request is aborted on the engine (see `ProtoStream::until_client_gone`).
+        let execution_result = execution_result.until_client_gone(&tx, &dispatch.request_id);
 
         // Spawn background task based on execution mode
         match execution_result {
@@ -1251,6 +1254,12 @@ impl StreamingProcessor {
                     .await;
             }
         }
+        // The read ended with the client's leaving, not with the engine's end:
+        // no terminal router metric for it, as the HTTP router has none for a
+        // disconnect (neither a completed request nor a failure).
+        if grpc_stream.client_left() {
+            return Ok(());
+        }
         // In PD mode this task only starts once the decode stream exists —
         // for sequential PD that is after prefill completes, with the first
         // decode chunk already buffered — so `start_time` would report a
@@ -1314,8 +1323,10 @@ impl StreamingProcessor {
             )
             .await;
 
-        // Mark prefill stream as completed AFTER decode completes successfully
-        // This ensures that if client disconnects during decode, BOTH streams send abort
+        // The prefill stream is marked completed after the decode's read ended
+        // well: a decode that failed leaves both streams to abort on drop; a
+        // client that left ends the read with `Ok` too, its decode stream
+        // aborting the request on drop, the prefill's own request complete.
         if result.is_ok() {
             prefill_stream.mark_completed();
         }
@@ -1341,6 +1352,9 @@ impl StreamingProcessor {
         let source = source.with_backend(self.backend_type);
         // Create SSE channel
         let (tx, rx) = sse_channel();
+        // Read for this client: the moment the response body is dropped, the
+        // request is aborted on the engine (see `ProtoStream::until_client_gone`).
+        let execution_result = execution_result.until_client_gone(&tx, &dispatch.request_id);
 
         // Build context once, clone for spawned task
         let ctx = GenerateStreamContext {
@@ -1569,6 +1583,12 @@ impl StreamingProcessor {
                 handle.close_reserved_only().await;
             }
         }
+        // The read ended with the client's leaving, not with the engine's end:
+        // no terminal router metric for it, as the HTTP router has none for a
+        // disconnect (neither a completed request nor a failure).
+        if stream.client_left() {
+            return Ok(());
+        }
         Self::record_generate_metrics(start_time, first_token_time, total_completion, None, &ctx);
 
         Ok(())
@@ -1628,8 +1648,10 @@ impl StreamingProcessor {
         )
         .await;
 
-        // Mark prefill stream as completed AFTER decode completes successfully
-        // This ensures that if client disconnects during decode, BOTH streams send abort
+        // The prefill stream is marked completed after the decode's read ended
+        // well: a decode that failed leaves both streams to abort on drop; a
+        // client that left ends the read with `Ok` too, its decode stream
+        // aborting the request on drop, the prefill's own request complete.
         if result.is_ok() {
             prefill_stream.mark_completed();
         }
@@ -1816,6 +1838,12 @@ impl StreamingProcessor {
             } else {
                 handle.close_reserved_only().await;
             }
+        }
+        // The read ended with the client's leaving, not with the engine's end:
+        // no terminal router metric for it, as the HTTP router has none for a
+        // disconnect (neither a completed request nor a failure).
+        if stream.client_left() {
+            return Ok(());
         }
         Self::record_generate_metrics(
             start_time,
@@ -2459,6 +2487,9 @@ impl StreamingProcessor {
         );
 
         let (tx, rx) = sse_channel();
+        // Read for this client: the moment the response body is dropped, the
+        // request is aborted on the engine (see `ProtoStream::until_client_gone`).
+        let execution_result = execution_result.until_client_gone(&tx, &dispatch.request_id);
 
         match execution_result {
             context::ExecutionResult::Single { stream } => {
@@ -3466,7 +3497,12 @@ impl StreamingProcessor {
             }
         }
 
-        // Record metrics
+        // The read ended with the client's leaving, not with the engine's end:
+        // no terminal router metric for it, as the HTTP router has none for a
+        // disconnect (neither a completed request nor a failure).
+        if grpc_stream.client_left() {
+            return Ok(());
+        }
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: self.backend_type,
@@ -3546,6 +3582,9 @@ impl StreamingProcessor {
     ) -> Response {
         let source = source.with_backend(self.backend_type);
         let (tx, rx) = sse_channel();
+        // Read for this client: the moment the response body is dropped, the
+        // request is aborted on the engine (see `ProtoStream::until_client_gone`).
+        let execution_result = execution_result.until_client_gone(&tx, &dispatch.request_id);
 
         let units = match Self::completion_stream_units(execution_result) {
             Ok(units) => units,
@@ -3710,6 +3749,13 @@ impl StreamingProcessor {
                         let mut sse_buffer = Vec::with_capacity(256);
                         Self::format_completion_sse_into(&mut sse_buffer, &usage_chunk);
                         let _ = tx.send(Ok(Bytes::from(sse_buffer))).await;
+                    }
+                    // The units' streams are read for this client (the sender
+                    // the watch reads): a sender closed by now says the client
+                    // left and ended the read, which is no completed
+                    // generation and gets no terminal router metric.
+                    if tx.is_closed() {
+                        return;
                     }
                     Metrics::record_streaming_metrics(StreamingMetricsParams {
                         router_type: metrics_labels::ROUTER_GRPC,
@@ -4137,8 +4183,10 @@ impl StreamingProcessor {
             )
             .await;
 
-        // Mark prefill stream as completed AFTER decode completes successfully
-        // This ensures that if client disconnects during decode, BOTH streams send abort
+        // The prefill stream is marked completed after the decode's read ended
+        // well: a decode that failed leaves both streams to abort on drop; a
+        // client that left ends the read with `Ok` too, its decode stream
+        // aborting the request on drop, the prefill's own request complete.
         if result.is_ok() {
             prefill_stream.mark_completed();
         }

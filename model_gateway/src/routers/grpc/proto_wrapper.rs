@@ -45,9 +45,12 @@ use tokio::time::error::Elapsed;
 
 use crate::{
     observability::metrics::Metrics,
-    routers::grpc::{
-        multimodal::{log_mm_timing_enabled, mm_rdma_exporter},
-        zmq_client::ZmqGenerateStream,
+    routers::{
+        common::sse::SseSender,
+        grpc::{
+            multimodal::{log_mm_timing_enabled, mm_rdma_exporter},
+            zmq_client::ZmqGenerateStream,
+        },
     },
     worker::{liveness, Worker},
 };
@@ -2899,6 +2902,11 @@ pub enum ProtoStream {
     /// Any of the above under the no-progress budget of a grammar-constrained
     /// generation (see [`BudgetedStream`]).
     Budgeted(Box<BudgetedStream>),
+    /// Any of the above, read for a client that can leave: the moment the
+    /// client's response body is dropped, the inner stream is dropped (its
+    /// abort-on-drop reaches the engine, its tickets go back to the worker)
+    /// and the reader meets the end (see [`WatchedStream`]).
+    Watched(Box<WatchedStream>),
 }
 
 /// The kinds of grammar a generation can be constrained by, as
@@ -2978,6 +2986,36 @@ impl BudgetedStream {
             tonic::metadata::MetadataValue::from_static(self.constraint),
         );
         status
+    }
+}
+
+/// A [`ProtoStream`] read on behalf of one client, whose response body is
+/// the receiving end of `client`. A reader parked on the engine (a
+/// generation that stalled mid-stream, a first token still owed) would
+/// otherwise learn that the client left only when the engine next speaks,
+/// or when the request timeout ends the attempt: its send fails then, and
+/// the stream it drops at its return sends the abort. Here every poll of the
+/// stream races the engine against the client's leaving, so the abort
+/// reaches the engine the moment the body is dropped: the inner stream goes
+/// (its abort-on-drop and its tickets with it) and the reader meets the
+/// end, the path it takes today when the engine ends a stream whose client
+/// had already left.
+pub struct WatchedStream {
+    /// `None` once the client left: the inner stream was dropped there.
+    inner: Option<ProtoStream>,
+    client: SseSender,
+    request_id: String,
+}
+
+impl WatchedStream {
+    /// The client left: drop the inner stream, which sends its abort to the
+    /// engine and gives back its tickets.
+    fn client_left(&mut self) {
+        self.inner = None;
+        tracing::debug!(
+            request_id = %self.request_id,
+            "Client left during the stream; the request was aborted on the engine"
+        );
     }
 }
 
@@ -3612,6 +3650,12 @@ impl ProtoStream {
     /// returns at once as if a response had come (the dispatch paths wrap a
     /// leg before they bound it).
     pub async fn first_response_within(&mut self, deadline: Instant) -> Result<FirstItem, Elapsed> {
+        if let Self::Watched(watched) = self {
+            return match watched.inner.as_mut() {
+                Some(inner) => Box::pin(inner.first_response_within(deadline)).await,
+                None => Ok(FirstItem::End),
+            };
+        }
         if let Self::Budgeted(budgeted) = self {
             return match budgeted.inner.as_mut() {
                 Some(inner) => Box::pin(inner.first_response_within(deadline)).await,
@@ -3638,6 +3682,7 @@ impl ProtoStream {
             Self::Tracked(tracked) => Some(&tracked.worker),
             Self::DecodeLeg(leg) => leg.inner.worker(),
             Self::Budgeted(budgeted) => budgeted.inner.as_ref().and_then(ProtoStream::worker),
+            Self::Watched(watched) => watched.inner.as_ref().and_then(ProtoStream::worker),
             _ => None,
         }
     }
@@ -3662,6 +3707,20 @@ impl ProtoStream {
         }))
     }
 
+    /// This stream read for the client at the receiving end of `client`'s
+    /// channel (see [`WatchedStream`]): the moment the client's response body
+    /// is dropped, the stream is dropped (its abort reaches the engine) and
+    /// its reader meets the end. `request_id` names the request for the log
+    /// line.
+    #[must_use]
+    pub fn until_client_gone(self, client: &SseSender, request_id: &str) -> Self {
+        Self::Watched(Box::new(WatchedStream {
+            inner: Some(self),
+            client: client.clone(),
+            request_id: request_id.to_string(),
+        }))
+    }
+
     /// This stream as a disaggregated request's decode leg: its responses
     /// carry `prefill`'s prefix-cache hit instead of their own (see
     /// [`PrefillCachedTokens`]). A prefill leg that reported nothing leaves
@@ -3677,8 +3736,53 @@ impl ProtoStream {
         }))
     }
 
+    /// Whether the end this stream's reader met was the client's leaving
+    /// (see [`Self::until_client_gone`]), not the engine's end: the
+    /// generation did not complete, and nothing accounts it as one. Read
+    /// through a decode-leg wrapper as through the watch itself (dual
+    /// dispatch wraps the watched stream once the prefill leg has drained);
+    /// `false` for a stream that is not watched.
+    pub fn client_left(&self) -> bool {
+        match self {
+            Self::Watched(watched) => watched.inner.is_none(),
+            Self::DecodeLeg(leg) => leg.inner.client_left(),
+            _ => false,
+        }
+    }
+
     /// Get next item from stream
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+        let Self::Watched(watched) = self else {
+            return self.next_unwatched().await;
+        };
+        let WatchedStream { inner, client, .. } = &mut **watched;
+        // Nothing after the client left: the inner stream went with it.
+        let stream = inner.as_mut()?;
+        // The client's leaving is looked at first, so a stream the engine
+        // keeps busy cannot outrun it; the inner stream is polled in place,
+        // without a boxed future per message. `None` here is the client's
+        // leaving, `Some(item)` the stream's own item or end.
+        let item = tokio::select! {
+            biased;
+            () = client.closed() => None,
+            item = stream.next_unwatched() => Some(item),
+        };
+        match item {
+            Some(item) => item,
+            None => {
+                watched.client_left();
+                None
+            }
+        }
+    }
+
+    /// The next item of a stream that is not [`Self::Watched`]; a watched
+    /// stream goes through [`Self::next`], which races the client's leaving.
+    async fn next_unwatched(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+        if let Self::Watched(_) = self {
+            // Reached only with one watched stream inside another.
+            return Box::pin(self.next()).await;
+        }
         if let Self::Budgeted(budgeted) = self {
             // Nothing after the cut: the inner stream went with it.
             let inner = budgeted.inner.as_mut()?;
@@ -3787,7 +3891,9 @@ impl ProtoStream {
                 .await
                 .map(|result| result.map(|r| ProtoGenerateResponse::Vllm(Box::new(r)))),
             Self::Fanout(stream) => stream.next().await,
-            Self::Tracked(_) | Self::Budgeted(_) => return Box::pin(self.next()).await,
+            Self::Tracked(_) | Self::Budgeted(_) | Self::Watched(_) => {
+                return Box::pin(self.next()).await
+            }
             // Reached only with one wrapper inside another: [`Self::next`]
             // polls a decode leg in place.
             Self::DecodeLeg(_) => return Box::pin(self.next()).await,
@@ -3809,6 +3915,11 @@ impl ProtoStream {
             Self::DecodeLeg(leg) => leg.inner.mark_completed(),
             Self::Budgeted(budgeted) => {
                 if let Some(inner) = budgeted.inner.as_mut() {
+                    inner.mark_completed();
+                }
+            }
+            Self::Watched(watched) => {
+                if let Some(inner) = watched.inner.as_mut() {
                     inner.mark_completed();
                 }
             }
@@ -3874,6 +3985,18 @@ impl ProtoStream {
                     constraint,
                     request_id,
                     responses,
+                }))
+            }
+            Self::Watched(watched) => {
+                let WatchedStream {
+                    inner,
+                    client,
+                    request_id,
+                } = *watched;
+                Self::Watched(Box::new(WatchedStream {
+                    inner: inner.map(ProtoStream::defer_abort_until_first_item),
+                    client,
+                    request_id,
                 }))
             }
         }
@@ -5116,5 +5239,150 @@ mod no_progress_tests {
             ProtoGenerateRequest::Mlx(Box::default()).grammar_constraint(),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod watched_tests {
+    use std::{sync::Arc, time::Duration};
+
+    use smg_grpc_client::vllm_proto as vllm;
+    use tokio::sync::oneshot;
+
+    use super::{PrefillCachedTokens, ProtoGenerateComplete, ProtoStream};
+    use crate::{
+        routers::{
+            common::sse::{sse_channel, SseReceiver},
+            grpc::regular::streaming::eof_tests::{chunk, complete, gated_stream},
+        },
+        worker::{BasicWorkerBuilder, Worker},
+    };
+
+    /// A stream whose `first` frames come at once and whose `rest` wait for
+    /// the returned gate, read for the client at the receiving end of the
+    /// returned receiver.
+    async fn watched(
+        first: Vec<vllm::GenerateResponse>,
+        rest: Vec<vllm::GenerateResponse>,
+    ) -> (ProtoStream, oneshot::Sender<()>, SseReceiver) {
+        let (gate_tx, gate_rx) = oneshot::channel();
+        let (stream, _server) = gated_stream(first, gate_rx, rest, "0").await;
+        let (client, rx) = sse_channel();
+        (
+            stream.until_client_gone(&client, "req-watched"),
+            gate_tx,
+            rx,
+        )
+    }
+
+    /// A client that leaves while the stream waits on the engine ends the
+    /// wait at once: the reader meets the end, not the engine's next frame,
+    /// and nothing after it.
+    #[tokio::test]
+    async fn a_client_that_leaves_while_the_stream_is_parked_ends_it_at_once() {
+        // A tracked layer under the watch: its worker and its load pile show
+        // the inner stream going with the client.
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w1:8000").build());
+        let (_gate_tx, gate_rx) = oneshot::channel();
+        let (stream, _server) =
+            gated_stream(vec![chunk(0, "a")], gate_rx, vec![complete(0, "stop")], "0").await;
+        let (client, rx) = sse_channel();
+        let mut stream = stream
+            .tracked(Arc::clone(&worker), 0, true)
+            .until_client_gone(&client, "req-watched");
+        assert!(stream.worker().is_some(), "tracked under the watch");
+        assert_eq!(worker.tracked_load(), 1);
+        assert!(
+            matches!(stream.next().await, Some(Ok(_))),
+            "the first response is read"
+        );
+        assert!(!stream.client_left());
+        let (item, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(stream.next(), async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                drop(rx);
+            })
+        })
+        .await
+        .expect("the gate never opens; the client's leaving ends the wait");
+        assert!(item.is_none(), "the client's leaving is the end");
+        assert!(stream.client_left(), "the end was the client's leaving");
+        assert!(
+            stream.next().await.is_none(),
+            "nothing after the client left"
+        );
+        assert!(
+            stream.worker().is_none(),
+            "the inner stream went with the client"
+        );
+        assert_eq!(worker.tracked_load(), 0, "its load released with it");
+    }
+
+    /// The client's leaving is seen through a decode-leg wrapper too: dual
+    /// dispatch wraps the watched stream in one once the prefill leg has
+    /// drained, and the reader asks the outer layer.
+    #[tokio::test]
+    async fn a_client_that_leaves_is_seen_through_the_decode_leg_wrapper() {
+        let (stream, _gate, rx) = watched(vec![chunk(0, "a")], vec![complete(0, "stop")]).await;
+        let mut prefill = PrefillCachedTokens::default();
+        prefill.note(&ProtoGenerateComplete::Vllm(Box::new(
+            vllm::GenerateComplete {
+                prompt_tokens: 4,
+                cached_tokens: 2,
+                ..Default::default()
+            },
+        )));
+        let mut stream = stream.decode_leg(prefill);
+        assert!(matches!(stream, ProtoStream::DecodeLeg(_)), "wrapped");
+        assert!(
+            matches!(stream.next().await, Some(Ok(_))),
+            "the first response is read through the wrapper"
+        );
+        assert!(!stream.client_left());
+        let (item, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(stream.next(), async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                drop(rx);
+            })
+        })
+        .await
+        .expect("the gate never opens; the client's leaving ends the wait");
+        assert!(item.is_none(), "the client's leaving is the end");
+        assert!(
+            stream.client_left(),
+            "the end was the client's leaving, seen through the wrapper"
+        );
+    }
+
+    /// A client that left before the stream was first polled reads nothing:
+    /// the response the engine has ready is not read for it.
+    #[tokio::test]
+    async fn a_client_that_left_before_the_first_poll_reads_nothing() {
+        let (mut stream, _gate, rx) = watched(vec![chunk(0, "a")], vec![]).await;
+        drop(rx);
+        assert!(stream.next().await.is_none());
+        assert!(stream.next().await.is_none());
+    }
+
+    /// A client that stays reads the stream as it is: every response, a gap
+    /// inside it waited out, and the end where the engine ends it.
+    #[tokio::test]
+    async fn a_client_that_stays_reads_the_stream_as_it_is() {
+        let (mut stream, gate, _rx) = watched(
+            vec![chunk(0, "a")],
+            vec![chunk(0, "b"), complete(0, "stop")],
+        )
+        .await;
+        assert!(matches!(stream.next().await, Some(Ok(_))));
+        let (second, ()) = tokio::join!(stream.next(), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = gate.send(());
+        });
+        assert!(
+            matches!(second, Some(Ok(_))),
+            "the gap inside the stream is waited out"
+        );
+        assert!(matches!(stream.next().await, Some(Ok(_))));
+        assert!(stream.next().await.is_none(), "the end is the end");
     }
 }
