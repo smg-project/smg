@@ -10,8 +10,8 @@
 //! character at a time and in pieces of about a token (`slice/<family>/{whole,chars,tokens}`, in
 //! bytes per second or tokens per second), the parts of the per-request setup (`setup/{table,
 //! validate,scanner,declared,engine}`) and the adapters over the events a slice produces
-//! (`adapt/{chat_deltas,chat_message,messages_stream}`, per event). A slice row includes one
-//! engine's setup; `setup/engine` says how much of it that is.
+//! (`adapt/{chat_deltas,chat_message,messages_stream}`, per event). A slice row is the reading
+//! alone, the engine built outside the timing; `setup/engine` states the per-request setup.
 //!
 //! `cargo bench -p smg-symphony --bench throughput`; a filter narrows it (`-- parse/whole`). The
 //! README's evidence section says how a change produces its throughput row from these.

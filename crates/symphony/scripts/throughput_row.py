@@ -4,7 +4,9 @@
 Usage: throughput_row.py --filter PREFIX LABEL=CRITERION_DIR [LABEL=CRITERION_DIR ...]
 
 Each side is a label and the criterion directory its bench binary wrote (`criterion/` under the
-build's target directory); its baselines are the ones named LABEL or LABEL-<n>, one per repeat.
+build's target directory, or the `CRITERION_HOME` the README's recipe gives both sides: one
+directory can serve several sides, each under its own label); its baselines are the ones named
+LABEL or LABEL-<n>, one per repeat.
 For every bench whose id starts with PREFIX the table has, per side, the median over the repeats
 of the bench's mean, in nanoseconds per byte, per token, per event or per iteration as the bench
 declares its throughput, with the spread of the repeats, and the change of every side after the
