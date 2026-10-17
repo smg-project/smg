@@ -8,10 +8,10 @@ abbreviations by default, which let a few chart flags through by accident;
 this check uses exact names.
 
 The chart hands the gateway its secrets (the shared API key, the history
-store's connection URL) through Secrets the launcher reads as a mounted file
-or an environment variable, never as an argument: arguments sit in the
-Deployment object, the process listing and ``/proc``. The render checks need
-the ``helm`` binary and are skipped without it.
+store's connection URL, the Oracle credentials) through Secrets the launcher
+reads as a mounted file or an environment variable, never as an argument:
+arguments sit in the Deployment object, the process listing and ``/proc``.
+The render checks need the ``helm`` binary and are skipped without it.
 """
 
 from __future__ import annotations
@@ -54,6 +54,20 @@ STORES = {
     "redis": ("--redis-url", "SMG_REDIS_URL", "redis-url", "redis://:hunter2@cache.example:6379/0"),
 }
 
+# Per Oracle credential (a value of history.oracle): the flag that used to
+# carry it, the variable the launcher reads it from, the chart's default
+# Secret key, and a value to render.
+ORACLE_CREDENTIALS = {
+    "dsn": ("--oracle-connect-descriptor", "ATP_DSN", "oracle-dsn", "tcps://db.example:1522/svc"),
+    "user": ("--oracle-username", "ATP_USER", "oracle-user", "dbadmin42"),
+    "password": ("--oracle-password", "ATP_PASSWORD", "oracle-password", "hunter2"),
+}
+ORACLE_FLAGS = {flag for flag, _, _, _ in ORACLE_CREDENTIALS.values()}
+ORACLE_VARIABLES = {variable for _, variable, _, _ in ORACLE_CREDENTIALS.values()}
+ORACLE_SETTINGS = [
+    f"history.oracle.{name}={value}" for name, (_, _, _, value) in ORACLE_CREDENTIALS.items()
+]
+
 needs_chart = pytest.mark.skipif(not HELPERS.exists(), reason="chart not present in this checkout")
 needs_helm = pytest.mark.skipif(
     shutil.which("helm") is None or not HELPERS.exists(), reason="helm or the chart not present"
@@ -82,18 +96,32 @@ def test_chart_router_flags_are_launcher_options():
 def test_chart_router_args_carry_no_secret():
     """A secret's value flag never appears in the args: the chart passes a
     file (``--api-key-file``) or sets the variable from a Secret instead."""
-    leaked = sorted(router_args_flags() & SECRET_FLAGS)
+    leaked = sorted(router_args_flags() & (SECRET_FLAGS | ORACLE_FLAGS))
     assert not leaked, f"the chart passes a secret in the pod arguments: {leaked}"
 
 
 @needs_chart
 def test_chart_secret_variables_are_launcher_names():
-    """Every ``SMG_*`` variable the chart's templates name is one the launcher reads."""
+    """Every ``SMG_*`` or ``ATP_*`` variable the chart's templates name is one
+    the launcher reads."""
     text = HELPERS.read_text() + ROUTER_TEMPLATE.read_text()
-    names = set(re.findall(r"\bSMG_[A-Z0-9_]+\b", text))
-    assert names, "no SMG_* variable found in the chart"
-    unknown = sorted(names - SECRET_VARIABLES)
+    names = set(re.findall(r"\b(?:SMG|ATP)_[A-Z0-9_]+\b", text))
+    assert names >= ORACLE_VARIABLES, "the chart does not set every Oracle variable"
+    unknown = sorted(names - SECRET_VARIABLES - ORACLE_VARIABLES)
     assert not unknown, f"the chart sets variables the launcher does not read: {unknown}"
+
+
+def test_oracle_variables_are_read_by_the_launcher(monkeypatch):
+    """The three variables the chart wires for Oracle reach the launcher's
+    Oracle settings when the flags are absent."""
+    for _, variable, _, value in ORACLE_CREDENTIALS.values():
+        monkeypatch.setenv(variable, value)
+    parser = argparse.ArgumentParser()
+    RouterArgs.add_cli_args(parser)
+    args = RouterArgs.from_cli_args(parser.parse_args(["--history-backend", "oracle"]))
+    assert (args.oracle_connect_descriptor, args.oracle_username, args.oracle_password) == tuple(
+        value for _, _, _, value in ORACLE_CREDENTIALS.values()
+    )
 
 
 def render(*settings: str) -> tuple[str, list[dict]]:
@@ -176,14 +204,16 @@ def test_store_url_from_an_existing_secret(store):
 
 @needs_helm
 @pytest.mark.parametrize(
-    "settings", [(), ("history.backend=postgres",), ("history.backend=redis",)]
+    "settings",
+    [(), ("history.backend=postgres",), ("history.backend=redis",), ("history.backend=oracle",)],
 )
 def test_store_without_a_url_gets_no_variable(settings):
     _, documents = render(*settings)
-    assert "smg-history" not in secret_names(documents)
+    assert not secret_names(documents) & {"smg-history", "smg-secrets"}
     pod = router_pod(documents)
-    assert not [name for name in router_env(pod) if name.startswith("SMG_")]
-    assert "checksum/history-secret" not in (pod["metadata"]["annotations"] or {})
+    assert not [name for name in router_env(pod) if name.startswith(("SMG_", "ATP_"))]
+    annotations = pod["metadata"]["annotations"] or {}
+    assert not [name for name in annotations if name.startswith("checksum/")]
     if settings:
         assert "--history-backend" in pod["spec"]["containers"][0]["args"]
 
@@ -202,3 +232,82 @@ def test_store_url_variable_reaches_the_mesh_statefulset():
         "name": "cache-creds",
         "key": "redis-url",
     }
+
+
+def oracle_secret(documents: list[dict]) -> dict:
+    (secret,) = [
+        d for d in documents if d["kind"] == "Secret" and d["metadata"]["name"] == "smg-secrets"
+    ]
+    return secret
+
+
+@needs_helm
+def test_oracle_credentials_render_into_a_chart_secret():
+    rendered, documents = render("history.backend=oracle", *ORACLE_SETTINGS)
+    pod = router_pod(documents)
+    args = pod["spec"]["containers"][0]["args"]
+    env = router_env(pod)
+    assert "--oracle-pool-max" in args
+    for flag, variable, key, value in ORACLE_CREDENTIALS.values():
+        assert flag not in args
+        assert value not in " ".join(args)
+        assert env[variable]["valueFrom"]["secretKeyRef"] == {"name": "smg-secrets", "key": key}
+        # The credential is in the Secret and nowhere else in the release.
+        assert rendered.count(value) == 1
+    assert oracle_secret(documents)["stringData"] == {
+        key: value for _, _, key, value in ORACLE_CREDENTIALS.values()
+    }
+    # A changed credential rolls the pods: the pod template carries the Secret's checksum.
+    checksum = pod["metadata"]["annotations"]["checksum/oracle-secret"]
+    assert re.fullmatch(r"[0-9a-f]{64}", checksum)
+    _, rotated = render(
+        "history.backend=oracle", *ORACLE_SETTINGS[:-1], "history.oracle.password=rotated"
+    )
+    assert router_pod(rotated)["metadata"]["annotations"]["checksum/oracle-secret"] != checksum
+
+
+@needs_helm
+def test_oracle_credentials_from_an_existing_secret():
+    rendered, documents = render(
+        "history.backend=oracle",
+        "history.oracle.existingSecret=db-creds",
+        "history.oracle.secretKeys.password=pw",
+        # A password left in the values is written nowhere: the existing Secret wins.
+        "history.oracle.password=hunter2",
+    )
+    assert "hunter2" not in rendered
+    assert "smg-secrets" not in secret_names(documents)
+    pod = router_pod(documents)
+    assert not ORACLE_FLAGS & set(pod["spec"]["containers"][0]["args"])
+    # All three variables are wired: the custom key for the password, the defaults for the rest.
+    env = router_env(pod)
+    assert env["ATP_DSN"]["valueFrom"]["secretKeyRef"] == {"name": "db-creds", "key": "oracle-dsn"}
+    assert env["ATP_USER"]["valueFrom"]["secretKeyRef"] == {
+        "name": "db-creds",
+        "key": "oracle-user",
+    }
+    assert env["ATP_PASSWORD"]["valueFrom"]["secretKeyRef"] == {"name": "db-creds", "key": "pw"}
+    assert "checksum/oracle-secret" not in (pod["metadata"]["annotations"] or {})
+
+
+@needs_helm
+def test_a_partial_oracle_configuration_wires_what_is_set():
+    """The connect descriptor alone (external authentication, say): the
+    Secret and the environment carry it and nothing for the user or password."""
+    dsn = ORACLE_CREDENTIALS["dsn"][3]
+    _, documents = render("history.backend=oracle", f"history.oracle.dsn={dsn}")
+    assert oracle_secret(documents)["stringData"] == {"oracle-dsn": dsn}
+    env = router_env(router_pod(documents))
+    assert env["ATP_DSN"]["valueFrom"]["secretKeyRef"] == {
+        "name": "smg-secrets",
+        "key": "oracle-dsn",
+    }
+    assert not {"ATP_USER", "ATP_PASSWORD"} & set(env)
+
+
+@needs_helm
+def test_oracle_credentials_are_ignored_for_another_backend():
+    rendered, documents = render("history.backend=postgres", *ORACLE_SETTINGS)
+    assert "smg-secrets" not in secret_names(documents)
+    assert not ORACLE_VARIABLES & set(router_env(router_pod(documents)))
+    assert "hunter2" not in rendered
