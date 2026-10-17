@@ -15,8 +15,8 @@
 //!   as one request's engine does);
 //! - well-formedness: one start and one end per call, arguments only between them and a valid
 //!   JSON prefix after every fragment, reasoning text only inside a region, one `Finish` that
-//!   counts the calls; and a call its own terminal closed has arguments that are whole JSON,
-//!   unless the engine said `Malformed` while the call was open;
+//!   counts the calls; and a call that ended, at its own terminal or at the stream's end, has
+//!   arguments that are whole JSON, unless the engine said `Malformed` while the call was open;
 //! - the adapters render any event sequence without a panic, and the Chat Completions stream,
 //!   concatenated, says what the whole message says.
 //!
@@ -64,19 +64,21 @@ pub const TARGETS: &[(&str, Option<Table>)] = &[
     ("pythonic_calls", Some(Table::Lfm2_5)),
 ];
 
+/// The breach names this run looks past: `SYMPHONY_FUZZ_ALLOW`, comma separated, read once.
+fn allowances() -> &'static [String] {
+    static ALLOWED: OnceLock<Vec<String>> = OnceLock::new();
+    ALLOWED.get_or_init(|| {
+        std::env::var("SYMPHONY_FUZZ_ALLOW")
+            .map(|list| list.split(',').map(|n| n.trim().to_string()).collect())
+            .unwrap_or_default()
+    })
+}
+
 /// Whether the breach named `name` is allowed for this run: `SYMPHONY_FUZZ_ALLOW` lists, comma
 /// separated, the names the breach messages carry, so that a class already reported does not stop
 /// the fuzzer from finding the next one. Every check honors it, through [`breach`].
 pub fn allowed(name: &str) -> bool {
-    static ALLOWED: OnceLock<Vec<String>> = OnceLock::new();
-    ALLOWED
-        .get_or_init(|| {
-            std::env::var("SYMPHONY_FUZZ_ALLOW")
-                .map(|list| list.split(',').map(|n| n.trim().to_string()).collect())
-                .unwrap_or_default()
-        })
-        .iter()
-        .any(|allowed| allowed == name)
+    allowances().iter().any(|allowed| allowed == name)
 }
 
 /// The check named `name`: a panic whose message starts with `breach <name>:` unless `holds`, or
@@ -403,10 +405,9 @@ fn quoted(entry: &str) -> String {
     out
 }
 
-/// The events of one replay and how many of them came before the end of the stream.
+/// The events of one replay.
 struct Replayed {
     events: Vec<Event>,
-    before_end: usize,
 }
 
 /// The nonce both replays of a case count their call ids from: an engine draws its own at random
@@ -463,7 +464,6 @@ fn replay(case: &Case, cuts: &[usize]) -> Replayed {
     if case.empty_between {
         feed(case, &mut engine, delta(""), &mut out, &mut events);
     }
-    let before_end = events.len();
     feed(
         case,
         &mut engine,
@@ -473,7 +473,7 @@ fn replay(case: &Case, cuts: &[usize]) -> Replayed {
         &mut out,
         &mut events,
     );
-    Replayed { events, before_end }
+    Replayed { events }
 }
 
 fn feed(
@@ -571,7 +571,11 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                     format!("{}: a second end", place())
                 });
                 ended.push(*index);
-                if at < replayed.before_end && !malformed_inside.contains(index) {
+                // The stream's end closes an open call too, and the promise holds there as at a
+                // marker's close: a call the end cut says `Malformed` before its end, or its
+                // arguments are whole. A reader that ends a cut call there without a word is a
+                // breach, whichever its syntax.
+                if !malformed_inside.contains(index) {
                     let so_far = arguments
                         .iter()
                         .find(|(i, _)| i == index)
@@ -821,6 +825,8 @@ fn check_adapters(case: &Case, whole: &[Event], pieces: &[Event]) {
 
 #[cfg(test)]
 mod tests {
+    use symphony::Text;
+
     use super::*;
 
     /// The tree `BELLWETHER_FIXTURES` names, or None with the notice a skipped test prints: the
@@ -977,6 +983,105 @@ mod tests {
         }
         fs::remove_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
         Ok(())
+    }
+
+    /// The name of the breach `check_well_formed` reports on `events`, as the stream of one
+    /// replay, or None when it holds: the checks on the shape of a stream, without a parser
+    /// behind it, so that a check is tried on the event list it is about.
+    fn breach_in(table: Table, events: Vec<Event>) -> Option<String> {
+        // An allowance would turn a breach into a hold and the assertion into a riddle.
+        assert!(
+            allowances().is_empty(),
+            "the harness's own tests run with SYMPHONY_FUZZ_ALLOW unset; it allows {:?}",
+            allowances()
+        );
+        let case = Case {
+            table,
+            prompt: String::new(),
+            output: String::new(),
+            cuts: Vec::new(),
+            empty_between: false,
+            finish: EngineFinish::Stop,
+        };
+        let replayed = Replayed { events };
+        let outcome = std::panic::catch_unwind(|| check_well_formed(&case, "synthetic", &replayed));
+        let payload = outcome.err()?;
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()));
+        match message.as_deref().and_then(|m| m.strip_prefix("breach ")) {
+            Some(rest) => rest.split(':').next().map(str::to_string),
+            // Any other panic is no answer of the checks: it is raised again, not read as a hold.
+            None => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn start(index: u32) -> Event {
+        Event::ToolCallStart {
+            index,
+            id: format!("call_{index}"),
+            name: "get_weather".to_string(),
+            source: Text::uncounted("<tool_call>"),
+        }
+    }
+
+    fn arguments(index: u32, json: &str, source: &str) -> Event {
+        Event::ToolCallArguments {
+            index,
+            json: json.to_string(),
+            source: Text::uncounted(source),
+        }
+    }
+
+    fn end(index: u32, source: &str) -> Event {
+        Event::ToolCallEnd {
+            index,
+            source: Text::uncounted(source),
+        }
+    }
+
+    fn malformed() -> Event {
+        Event::Malformed {
+            text: Text::uncounted(""),
+            why: MalformedReason::UnterminatedRegion,
+        }
+    }
+
+    fn finish(tool_calls: u32) -> Event {
+        Event::Finish {
+            reason: FinishReason::ToolCalls,
+            tool_calls,
+            reasoning_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn a_call_the_streams_end_closed_keeps_the_whole_json_promise() {
+        // The end of the stream closed a call whose arguments are a prefix: without a word it is
+        // a breach, as it is for a call a marker closed; with `Malformed` before the end it holds.
+        let cut = || {
+            vec![
+                start(0),
+                arguments(0, "{\"city\": \"Par", "{\"city\": \"Par"),
+            ]
+        };
+        let mut without_a_word = cut();
+        without_a_word.extend([end(0, ""), finish(1)]);
+        assert_eq!(
+            breach_in(Table::Qwen3Tagged, without_a_word).as_deref(),
+            Some("whole-json")
+        );
+        let mut said = cut();
+        said.extend([malformed(), end(0, ""), finish(1)]);
+        assert_eq!(breach_in(Table::Qwen3Tagged, said), None);
+        let mut whole = cut();
+        whole.extend([
+            arguments(0, "is\"}", "is</parameter>"),
+            end(0, ""),
+            finish(1),
+        ]);
+        assert_eq!(breach_in(Table::Qwen3Tagged, whole), None);
     }
 
     #[test]

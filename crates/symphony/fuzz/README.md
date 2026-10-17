@@ -6,8 +6,9 @@ asserts the crate's contract on every input; libFuzzer mutates the bytes towards
 so the shapes it composes are not limited to what a recording or a seeded scramble has shown. The
 checks are in `src/lib.rs`, whose module doc lists them: no failed `feed` and no panic;
 conservation of every byte; what the parser says not depending on the cuts; well-formed call
-streams with whole JSON arguments at a terminal's close or a `Malformed` event; and the adapters
-rendering any sequence, the Chat Completions stream agreeing with its whole message.
+streams with whole JSON arguments when a call ends (at a terminal's close or at the stream's end)
+unless a `Malformed` event came while it was open; and the adapters rendering any sequence, the
+Chat Completions stream agreeing with its whole message.
 
 This directory is its own Cargo workspace: it needs a nightly toolchain and is not a member of the
 repository's workspace, which stays on the pinned stable release.
