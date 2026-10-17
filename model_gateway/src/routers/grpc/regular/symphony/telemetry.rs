@@ -18,8 +18,9 @@
 //! Cost: a clean output records one counter increment through a key built once per table (the
 //! `metrics` macros build a key, with a `Vec` of labels, on every call), no allocation. A
 //! malformed one adds a histogram observation, the per-reason counters, and, when the table's
-//! token bucket allows it, one `warn` line, with the first run's bounded excerpt on a `debug` event
-//! beside it: the only allocations. Suppressed calls are counted and write no line.
+//! token bucket allows it, one `warn` line: the only allocations. The run's text is model output
+//! and is never logged, at any level: `at` and `bytes` locate it in the response for a reader with
+//! access to it. Suppressed calls are counted and write no line.
 
 use std::{
     borrow::Cow,
@@ -33,7 +34,7 @@ use std::{
 use metrics::{Key, Label, Level, Metadata};
 use parking_lot::Mutex;
 use symphony::{formats::Table, Event, MalformedReason};
-use tracing::{debug, warn};
+use tracing::warn;
 
 /// Outputs read to their end, by `table` and `outcome` (`clean`, `malformed`, `failed`).
 pub(crate) const OUTPUTS: &str = "smg_symphony_outputs_total";
@@ -53,8 +54,6 @@ const TEMPLATE: &str = "response_template";
 /// The `table` label of a format that is neither a registry table's nor the template's: a format
 /// built by hand.
 const OTHER_TABLE: &str = "other";
-/// How many bytes of the first malformed run the line shows.
-pub(crate) const EXCERPT_BYTES: usize = 120;
 
 /// The `reason` labels, in the order of [`Tally::reasons`].
 const REASONS: [&str; 4] = [
@@ -98,18 +97,6 @@ pub(crate) fn reason_label(why: &MalformedReason) -> &'static str {
     REASONS[reason_index(why)]
 }
 
-/// The first [`EXCERPT_BYTES`] of `text`, cut at a character boundary.
-pub(crate) fn excerpt(text: &str) -> &str {
-    if text.len() <= EXCERPT_BYTES {
-        return text;
-    }
-    let mut end = EXCERPT_BYTES;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
-}
-
 /// The bytes an event accounts for in the output.
 fn bytes_of(event: &Event) -> usize {
     match event {
@@ -141,8 +128,6 @@ pub(crate) struct FirstRun {
     pub at: usize,
     /// Its length in bytes.
     pub bytes: usize,
-    /// Its first bytes ([`EXCERPT_BYTES`]).
-    pub excerpt: String,
 }
 
 /// What the reader has seen of one output so far, counted as the events are drained.
@@ -175,7 +160,6 @@ impl Tally {
                         },
                         at: self.at,
                         bytes: text.text.len(),
-                        excerpt: excerpt(&text.text).to_string(),
                     });
                 }
             }
@@ -240,15 +224,9 @@ impl Tally {
             return;
         };
         let outcome = OUTCOMES[outcome];
-        let (reason, why, at, bytes, excerpt) = match &self.first {
-            Some(first) => (
-                first.reason,
-                first.why.as_ref(),
-                first.at,
-                first.bytes,
-                first.excerpt.as_str(),
-            ),
-            None => ("", "", 0, 0, ""),
+        let (reason, why, at, bytes) = match &self.first {
+            Some(first) => (first.reason, first.why.as_ref(), first.at, first.bytes),
+            None => ("", "", 0, 0),
         };
         warn!(
             target: "smg::symphony",
@@ -269,18 +247,8 @@ impl Tally {
             suppressed_lines,
             "Symphony did not read the whole output as content, reasoning and calls"
         );
-        // The run's text is model output: a debug event beside the line, not the line itself,
-        // which the default level sees.
-        debug!(
-            target: "smg::symphony",
-            request_id = who.request_id,
-            choice = who.choice,
-            table,
-            reason,
-            at,
-            excerpt,
-            "the first malformed run's text"
-        );
+        // The run's text is model output and may carry the user's data: it is not logged, at
+        // any level; `at` and `bytes` locate it in the response for a reader with access to it.
     }
 }
 
@@ -459,22 +427,6 @@ mod tests {
     }
 
     #[test]
-    fn the_excerpt_is_bounded_at_a_character_boundary() {
-        assert_eq!(excerpt("short"), "short");
-        let exact = "x".repeat(EXCERPT_BYTES);
-        assert_eq!(excerpt(&exact), exact);
-        // Every character is three bytes; 120 is not a multiple of three.
-        let wide = "日".repeat(60);
-        let cut = excerpt(&wide);
-        assert!(
-            cut.len() <= EXCERPT_BYTES && cut.len() > EXCERPT_BYTES - 3,
-            "{}",
-            cut.len()
-        );
-        assert!(cut.chars().all(|c| c == '日'));
-    }
-
-    #[test]
     fn a_tally_counts_the_runs_their_bytes_and_where_the_first_one_starts() {
         let mut tally = Tally::default();
         let events = [
@@ -507,7 +459,6 @@ mod tests {
                 why: "invalid_arguments".into(),
                 at: "Hello <tool_call>".len(),
                 bytes: 12,
-                excerpt: "\nnot a call\n".into(),
             })
         );
         assert_eq!(
@@ -750,23 +701,9 @@ mod tests {
         assert!(logs_contain("reason=\"invalid_arguments\""));
         assert!(logs_contain("at=6"));
         assert!(logs_contain("choice=1"));
-        logs_assert(|lines: &[&str]| {
-            let line = lines
-                .iter()
-                .find(|line| line.contains("Symphony did not read the whole output"))
-                .ok_or("no warn line")?;
-            if line.contains("excerpt=") {
-                return Err("the excerpt is on the warn line".to_string());
-            }
-            let event = lines
-                .iter()
-                .find(|line| line.contains("excerpt=\"\\nnot a call\\n\""))
-                .ok_or("no excerpt event")?;
-            if !event.contains("DEBUG") {
-                return Err(format!("the excerpt is not a debug event: {event}"));
-            }
-            Ok(())
-        });
+        // The run's text is model output: no line at any level carries it.
+        assert!(!logs_contain("not a call"));
+        assert!(!logs_contain("excerpt"));
     }
 
     #[tracing_test::traced_test]
