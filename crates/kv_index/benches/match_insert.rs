@@ -193,6 +193,28 @@ fn bench_string_tree(c: &mut Criterion) {
         });
     });
 
+    // The request routes to a tenant other than the one it matched: the insert
+    // replay attaches the routed tenant on every path node (confirming each
+    // edge first) instead of taking the skip branch that "hit" measures. Its
+    // own warm tree, so the rows after it see the tree "hit" left.
+    let (other_tree, other_tenants, other_prompts) = warm_string_tree();
+    let next_names: HashMap<&str, &str> = other_tenants
+        .iter()
+        .zip(other_tenants.iter().cycle().skip(1))
+        .map(|(tenant, next)| (tenant.as_str(), next.as_str()))
+        .collect();
+    let mut j = 0usize;
+    group.bench_function("hit_other", |b| {
+        b.iter(|| {
+            let prompt = &other_prompts[j % TENANTS];
+            j += 1;
+            let result = other_tree
+                .match_and_insert_with(prompt, |r| next_names.get(r.tenant.as_ref()).copied());
+            assert!(result.matched_char_count >= SYSTEM_CHARS);
+            result.matched_char_count
+        });
+    });
+
     let miss_tree = RefCell::new(warm_string_tree().0);
     let mut turn = 1_000_000u64;
     group.bench_function("miss", |b| {

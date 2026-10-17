@@ -299,6 +299,12 @@ impl Node {
             }
         }
     }
+
+    /// No tenant owns this node and nothing hangs below it: the shape an
+    /// eviction detaches from its parent.
+    fn is_empty(&self) -> bool {
+        self.children.is_empty() && self.tenant_last_access_time.is_empty()
+    }
 }
 
 /// True when `node`'s parent pointer currently designates `parent`. A split
@@ -502,6 +508,12 @@ impl Tree {
     /// (`tenant_last_access_time` / `tenant_char_count` entries) and, when resuming
     /// below the root, attaching `tenant_id` to the ancestor nodes on the matched
     /// path (which this method does not touch).
+    ///
+    /// [`Self::match_and_insert_with`] resumes below the root only while its
+    /// replay found every recorded edge in place; after a lost edge (an eviction
+    /// detached a path node while the caller chose the tenant) it descends again
+    /// from the root over the whole text, and this method credits only the edges
+    /// it newly attaches, so nothing is counted twice.
     fn insert_from(&self, start: NodeRef, mut remaining: &str, tenant_id: TenantId) {
         let mut prev = start;
 
@@ -839,6 +851,9 @@ impl Tree {
         // Every full-match node we descended through, in order. Each node is
         // cloned once, into `path`; `current` indexes it (`None` = root).
         let mut path: Vec<NodeRef> = Vec::with_capacity(16);
+        // The char each edge of `path` was descended by, so the replay can
+        // confirm an edge still exists before it attaches a tenant under it.
+        let mut keys: Vec<char> = Vec::with_capacity(16);
         let mut current: Option<usize> = None;
         // The child the match ended inside, when it ended on a partial match.
         let mut partial: Option<NodeRef> = None;
@@ -876,6 +891,7 @@ impl Tree {
                 consumed_chars += shared_count;
                 remaining = &remaining[shared_bytes..];
                 path.push(matched_node);
+                keys.push(first_char);
                 current = Some(path.len() - 1);
             } else {
                 // Partial match: match stops, resolving on this child node.
@@ -934,7 +950,18 @@ impl Tree {
 
         // Re-attach the inserting tenant to every full-match ancestor node, the
         // epoch-0 intermediate attach `insert_text` performs while descending.
-        for node in &path {
+        //
+        // Nothing held the path while `select` ran. An eviction that emptied a
+        // path node meanwhile has detached it from its parent, and a tenant
+        // attached to a detached node is credited chars no eviction can find
+        // again. So each attach below is made under the parent's child entry
+        // (its shard read guard), after confirming the entry still names the
+        // node: the detach takes the same shard's write lock and removes the
+        // node only while it is still empty (see `detach_if_empty`), so the
+        // two serialize. A detach that came first shows here as a lost edge;
+        // an attach that came first leaves a node the detach keeps.
+        let mut lost_edge = false;
+        for (i, node) in path.iter().enumerate() {
             // Already attached (the common hit: the request routes to the
             // worker it matched): nothing to credit, no write lock.
             if node
@@ -942,6 +969,15 @@ impl Tree {
                 .contains_key(tenant_id.as_ref())
             {
                 continue;
+            }
+            let parent = if i == 0 { &self.root } else { &path[i - 1] };
+            let edge = parent.children.get(&keys[i]);
+            if !edge
+                .as_ref()
+                .is_some_and(|edge| Arc::ptr_eq(edge.value(), node))
+            {
+                lost_edge = true;
+                break;
             }
             // Credit the live char count under the `text` read guard: a
             // concurrent split truncates the node and clones its tenant map in
@@ -953,9 +989,19 @@ impl Tree {
             if node.attach_tenant_if_absent(&tenant_id, 0) {
                 self.add_tenant_chars(&tenant_id, text_guard.char_count());
             }
+            drop(text_guard);
+            drop(edge);
         }
 
-        if remaining.is_empty() {
+        if lost_edge {
+            // A path node left the tree between the match and the replay. The
+            // nodes credited above are attached and live; descend again from
+            // the root for the whole text. `insert_from` credits only the
+            // edges it newly attaches, so nothing is counted twice, and it
+            // splices the suffix under live nodes, so the prompt is cached.
+            // One extra descent, in the rare case.
+            self.insert_from(Arc::clone(&self.root), text, tenant_id);
+        } else if remaining.is_empty() {
             // Loop-end: `current` is the final leaf; give it the real timestamp
             // (insert_text's tail). It already received the epoch-0 attach above
             // if it is on the path.
@@ -1201,12 +1247,11 @@ impl Tree {
             // Use Weak::upgrade() to get a strong reference if the parent still exists
             let parent_opt = node.parent.read().as_ref().and_then(Weak::upgrade);
 
-            // Remove empty nodes
-            if node.children.is_empty() && node.tenant_last_access_time.is_empty() {
+            // Detach the node once it is empty (`detach_if_empty` repeats the
+            // checks under the parent's shard lock).
+            if node.is_empty() {
                 if let Some(ref parent) = parent_opt {
-                    if let Some(fc) = node.text.read().first_char() {
-                        parent.children.remove(&fc);
-                    }
+                    Self::detach_if_empty(parent, &node);
                 }
             }
 
@@ -1353,14 +1398,34 @@ impl Tree {
     /// detached.
     fn detach_empty_ancestors(node: &NodeRef) {
         let mut current = Arc::clone(node);
-        while current.children.is_empty() && current.tenant_last_access_time.is_empty() {
+        while current.is_empty() {
             let Some(parent) = current.parent.read().as_ref().and_then(Weak::upgrade) else {
                 break;
             };
-            if let Some(fc) = current.text.read().first_char() {
-                parent.children.remove(&fc);
-            }
+            Self::detach_if_empty(&parent, &current);
             current = parent;
+        }
+    }
+
+    /// Remove `node` from `parent`'s children, only while the parent still holds
+    /// this exact node under its first char and the node is still empty. The
+    /// children map is concurrent: an insert can install a split's prefix node
+    /// under the same char after the caller's emptiness check, and the fused
+    /// walk's insert replay attaches a tenant to this very node under this
+    /// entry's shard read guard once it has confirmed the edge (see
+    /// `match_and_insert_dyn`). Removing the key unconditionally would drop that
+    /// live replacement, or a node whose tenant was just credited for it, with
+    /// every descendant it owns: the index silently shrinks or the credit leaks.
+    /// `remove_if` evaluates the predicate under the shard lock, so the checks
+    /// and the removal cannot be split. The first char is read before the entry
+    /// is taken: a split writes this node's text while it holds the parent's
+    /// entry, the reverse order.
+    fn detach_if_empty(parent: &NodeRef, node: &NodeRef) {
+        let first_char = node.text.read().first_char();
+        if let Some(first_char) = first_char {
+            parent.children.remove_if(&first_char, |_, child| {
+                Arc::ptr_eq(child, node) && child.is_empty()
+            });
         }
     }
 
