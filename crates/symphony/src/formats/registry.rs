@@ -187,15 +187,14 @@ impl Table {
 
     /// The other names a table answers to ([`Self::answering_to`]): the gateway's older tool and
     /// reasoning parsers that read the table's format, so that a deployment that names one
-    /// (`--tool-call-parser qwen_xml`) reads with the table (`qwen3_tagged`) when the gateway
-    /// reads with Symphony. The rule, so that a
-    /// deployment's existing flags keep a working parser when the gateway's default parser
-    /// changes: every legacy tool-call or reasoning parser's name whose format a table reads is
-    /// an alias of that table; a legacy name no table answers to keeps its own parser and is in
-    /// [`Self::UNANSWERED`] with the reason, `passthrough` among them, which leaves its channel
-    /// as written, which no table reads for. A row may also be the name a downstream launcher
-    /// passes for a model family whose table has no older parser (`muse` for `muse_spark`), so
-    /// that the launcher's flags read with the table.
+    /// (`--tool-call-parser qwen_xml`) reads with the table (`qwen3_tagged`) when the gateway reads
+    /// with Symphony. The rule, so that a deployment's existing flags keep a working parser when
+    /// the gateway's default parser changes: every legacy tool-call or reasoning parser's name
+    /// whose format a table reads is an alias of that table; a legacy name no table answers to is
+    /// in [`Self::UNANSWERED`] with the reason (what it selects then is said there), `passthrough`
+    /// among them, which leaves its channel as written, which no table reads for. A row may also be
+    /// the name a downstream launcher passes for a model family whose table has no older parser
+    /// (`muse` for `muse_spark`), so that the launcher's flags read with the table.
     pub const ALIASES: [(&str, Table); 13] = [
         ("qwen", Table::Qwen3),
         ("qwen_xml", Table::Qwen3Tagged),
