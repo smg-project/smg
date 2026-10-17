@@ -460,6 +460,10 @@ class TestMmSettings:
         parser = argparse.ArgumentParser()
         assert "--mm-turbojpeg" in mm_processor.add_mm_arguments(parser)
         assert parser.parse_args(["--mm-turbojpeg", "require"]).mm_turbojpeg == "require"
+        # argparse checks `choices` after `type`: the flag reads in any case
+        # with blanks around it, as `_validate_flag` reads the value.
+        assert parser.parse_args(["--mm-turbojpeg", " REQUIRE "]).mm_turbojpeg == "require"
+        assert parser.parse_args(["--mm-processor", "SMG"]).mm_processor == "smg"
         with pytest.raises(SystemExit):
             parser.parse_args(["--mm-turbojpeg", "required"])
 

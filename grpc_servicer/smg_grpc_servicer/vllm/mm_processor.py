@@ -869,6 +869,14 @@ _MM_FLAG_HELP: dict[str, str] = {
 }
 
 
+def _choice(value: str) -> str:
+    """A choice flag's value as `_validate_flag` reads it, before argparse
+    checks it against `choices` (which it does after `type`): any case, with
+    the blanks around it dropped, so `--mm-turbojpeg REQUIRE` is the policy
+    the help promises and not a rejected spelling."""
+    return value.strip().lower()
+
+
 def add_mm_arguments(parser: argparse.ArgumentParser) -> list[str]:
     """Define the `--mm-*` flags `MmSettings.from_args` reads on a launcher
     parser that lacks them; a flag the parser already has (a `vllm serve` that
@@ -884,8 +892,10 @@ def add_mm_arguments(parser: argparse.ArgumentParser) -> list[str]:
             "help": f"{_MM_FLAG_HELP[name]} Unset falls back to ${env_name}.",
         }
         if name == "processor":
+            kwargs["type"] = _choice
             kwargs["choices"] = list(VALID_MODES)
         elif name == "turbojpeg":
+            kwargs["type"] = _choice
             kwargs["choices"] = list(VALID_TURBOJPEG)
         elif name in _MM_INT_SETTINGS:
             kwargs["type"] = int
