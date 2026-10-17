@@ -1651,11 +1651,7 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "mistral-small-24b-instruct-2501",
         model: "mistralai/Mistral-Small-24B-Instruct-2501",
-        also: &[
-            "Mistral-Small-3.1-24B-Instruct-2503",
-            "Devstral-Small-2505",
-            "Magistral-Small-2506",
-        ],
+        also: &["Mistral-Small-3.1-24B-Instruct-2503", "Devstral-Small-2505"],
         released: "2025-01-28",
         smg: (Some("mistral"), None),
         table: Some(Table::Mistral),

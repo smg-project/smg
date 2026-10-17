@@ -713,9 +713,13 @@ impl Format {
             // xLAM's list stands alone in the turn, no marker before or after it, and its table
             // has no thought: the list is the same either way; a call alone (`json`) is forced as
             // the list, as the gateway's older `json` parser forces it. Between markers (Llama
-            // Nemotron) the list is one tag's content, and the thought takes the prefix.
+            // Nemotron) the list is one tag's content, and the thought takes the prefix; behind
+            // one marker the turn ends (the Mistral list) it is one tag that ends with nothing.
             CallSyntax::JsonList | CallSyntax::JsonAlone(_) => match markers {
-                None => (json::list_calls(&named, count), false),
+                None => match self.opened_list_markers() {
+                    Some(opened) => (json::list_tag(&opened, &named, count), true),
+                    None => (json::list_calls(&named, count), false),
+                },
                 Some(markers) => (json::list_tag(markers, &named, count), true),
             },
             CallSyntax::Json => (json::calls(markers?, &named, count), true),
@@ -1322,6 +1326,34 @@ impl Format {
             block,
             call_open: call.open,
             call_close: call.close,
+            call_exits,
+        })
+    }
+
+    /// The markers of a list a marker opens and the turn ends, the Mistral list behind
+    /// `[TOOL_CALLS]`: no row closes the arguments state, so [`Self::region`] names no region, and
+    /// the tag ends with nothing, as the v13 table's do. `None` for a list that stands alone in the
+    /// turn (xLAM's, `json`'s), which no row enters: a tag for it would write a marker the table
+    /// never reads.
+    fn opened_list_markers(&self) -> Option<CallMarkers<'_>> {
+        let arguments = self.state_emitting(Emits::Arguments)?;
+        let (_, open, _) = self
+            .transitions()
+            .find(|&(source, _, target)| target == arguments && source != arguments)?;
+        let mut call_exits: Vec<&str> = Vec::new();
+        for (_, on, _) in self
+            .transitions()
+            .filter(|&(source, _, _)| source == arguments)
+        {
+            let text = self.terminal_text(on);
+            if !call_exits.contains(&text) {
+                call_exits.push(text);
+            }
+        }
+        Some(CallMarkers {
+            block: None,
+            call_open: self.terminal_text(open),
+            call_close: "",
             call_exits,
         })
     }
@@ -2430,6 +2462,36 @@ mod tests {
                             && !excludes.contains(&"<think>".to_string())
                             && !excludes.contains(&"</think>".to_string()))
         ));
+    }
+
+    #[test]
+    fn mistral_list_derives_one_tag_behind_the_marker_with_no_end() {
+        // The Mistral list: `[TOOL_CALLS]` opens the region and the turn ends it, so the tag is
+        // the marker, xLAM's list of the tools' calls, and an empty end, as the v13 table's tags
+        // end with nothing. A bare list would be content to this table, which starts in content.
+        let tools = weather_tools();
+        let payload = formats::mistral()
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .payload();
+        let list = formats::xlam()
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .to_json();
+        assert_eq!(
+            payload,
+            value!({"format": {
+                "type": "triggered_tags",
+                "triggers": ["[TOOL_CALLS]"],
+                "tags": [{
+                    "type": "tag",
+                    "begin": "[TOOL_CALLS]",
+                    "content": list,
+                    "end": "",
+                }],
+                "at_least_one": true,
+            }})
+        );
     }
 
     #[test]
