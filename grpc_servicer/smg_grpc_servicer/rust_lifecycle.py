@@ -1015,6 +1015,8 @@ async def supervise(
     process alive is reported to a server that takes such reports
     (``note_engine_alive``), so the server's startup bound counts silence
     from a living engine rather than time since the last handshake message.
+    An engine that tracks its workers (``track``) gets one pass when the
+    server first reports it connected, its start and its spawning over.
 
     Signals drain: health flips to NOT_SERVING at once (the Router stops
     routing here), in-flight streams get ``drain_secs`` to finish with the
@@ -1023,6 +1025,7 @@ async def supervise(
     """
     loop = asyncio.get_running_loop()
     note_engine_alive = getattr(server, "note_engine_alive", None)
+    track = getattr(engine, "track", None)
     if stop_event is None:
         stop_event = asyncio.Event()
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -1036,7 +1039,8 @@ async def supervise(
                 # The engine's start is over, and with it the spawning of its
                 # workers: one pass records them all before the servicer
                 # counts as serving, whatever the interval's passes saw.
-                engine.track()
+                if track is not None:
+                    track()
                 logger.info("Engine connected; the servicer is SERVING")
             error = server.last_error
             if error or not server.running:
