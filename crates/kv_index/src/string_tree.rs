@@ -3896,4 +3896,167 @@ mod tests {
         let r = tree.match_prefix_with_counts("solo prefix chain");
         assert_eq!(r.matched_char_count, 0);
     }
+
+    /// The chars `tenant` holds on nodes the root still reaches: what an
+    /// eviction can find and subtract, and what a match can return.
+    fn reachable_chars(tree: &Tree, tenant: &str) -> usize {
+        fn walk(node: &NodeRef, tenant: &str) -> usize {
+            node.children
+                .iter()
+                .map(|child| {
+                    let child = child.value();
+                    let owned = if child.tenant_last_access_time.contains_key(tenant) {
+                        child.text.read().char_count()
+                    } else {
+                        0
+                    };
+                    owned + walk(child, tenant)
+                })
+                .sum()
+        }
+        walk(&tree.root, tenant)
+    }
+
+    /// The nodes `text` descends through on node boundaries, root excluded.
+    fn path_nodes(tree: &Tree, text: &str) -> Vec<NodeRef> {
+        let mut nodes = Vec::new();
+        let mut current = Arc::clone(&tree.root);
+        let mut remaining = text;
+        while let Some(first_char) = remaining.chars().next() {
+            let child = Arc::clone(current.children.get(&first_char).expect("edge").value());
+            let node_text = child.text.read().as_str().to_string();
+            assert!(
+                remaining.starts_with(&node_text),
+                "node {node_text:?} must cover the start of {remaining:?}"
+            );
+            remaining = &remaining[node_text.len()..];
+            nodes.push(Arc::clone(&child));
+            current = child;
+        }
+        nodes
+    }
+
+    /// An eviction between the match and the insert replay that empties a
+    /// path node also detaches it from its parent. The replay must not credit
+    /// the inserting tenant for that node or splice the suffix under it:
+    /// afterwards the tenant's char count equals the chars it holds on nodes
+    /// the root still reaches (what an eviction can subtract again), and the
+    /// prompt is cached for it.
+    #[test]
+    fn test_match_and_insert_with_detached_path_node_keeps_count_reachable() {
+        let tree = Tree::new();
+        let prefix = "shared system prompt";
+        let w1 = intern_tenant("w1");
+        tree.insert_text(prefix, "w1"); // one node; w1 is its only tenant
+        assert_eq!(path_nodes(&tree, prefix).len(), 1);
+
+        // The request matches the node in full and falls off it with more
+        // text, so the node is both a replayed path node and the fall-off
+        // node the suffix is spliced under.
+        let text = format!("{prefix}, then a user turn");
+
+        let result = tree.match_and_insert_with(&text, |matched| {
+            assert_eq!(matched.matched_char_count, prefix.chars().count());
+            assert_eq!(matched.tenant.as_ref(), "w1");
+            // Between the match and the replay: evict the whole tree down to
+            // nothing. No other tenant owns the node, so the eviction
+            // detaches it from the root.
+            tree.evict_tenant_by_size(0);
+            assert!(
+                tree.root.children.is_empty(),
+                "the eviction detaches the emptied node"
+            );
+            assert_eq!(tree.tenant_char_size(&w1), 0);
+            Some("w1")
+        });
+        assert_eq!(result.matched_char_count, prefix.chars().count());
+
+        let reachable = reachable_chars(&tree, "w1");
+        assert_eq!(
+            tree.tenant_char_size(&w1),
+            reachable,
+            "w1's count must equal the chars it holds on reachable nodes"
+        );
+        assert_eq!(tree.total_char_size(), reachable);
+        let cached = tree.match_prefix_with_counts(&text);
+        assert_eq!(
+            cached.matched_char_count,
+            text.chars().count(),
+            "the prompt must be cached for w1"
+        );
+        assert_eq!(cached.tenant.as_ref(), "w1");
+    }
+
+    /// Seeded traffic with an eviction injected between the match and the
+    /// insert replay of every request (the `select` seam): per-tenant
+    /// eviction, tree-wide eviction or a tenant purge, on prompts drawn from a
+    /// small word alphabet so paths share, split and fall empty often. After
+    /// every request each tenant's count equals the chars it holds on nodes
+    /// the root still reaches, the tree-wide total equals the sum of the
+    /// counts, and the prompt is cached for the tenant it was routed to.
+    #[test]
+    fn test_match_and_insert_with_counts_stay_reachable_under_injected_evictions() {
+        // splitmix64: the same sequence on every platform and toolchain.
+        fn next(state: &mut u64) -> u64 {
+            *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        const TENANTS: usize = 4;
+        const WORDS: [&str; 6] = ["aa", "ab", "ac", "ba", "bb", "ca"];
+        const WORD_CHARS: usize = 2;
+        const MAX_WORDS: u64 = 4;
+        const REQUESTS: usize = 2_000;
+
+        let names: Vec<String> = (0..TENANTS).map(|i| format!("w{i}")).collect();
+        let tree = Tree::new();
+        let mut rng = 0x5EED_u64;
+        for request in 0..REQUESTS {
+            let words = 1 + (next(&mut rng) % MAX_WORDS) as usize;
+            let mut prompt = String::with_capacity(words * WORD_CHARS);
+            for _ in 0..words {
+                prompt.push_str(WORDS[(next(&mut rng) % WORDS.len() as u64) as usize]);
+            }
+            let route = &names[(next(&mut rng) % TENANTS as u64) as usize];
+            let victim = intern_tenant(&names[(next(&mut rng) % TENANTS as u64) as usize]);
+            let budget = (next(&mut rng) % 5) as usize * WORD_CHARS;
+            let eviction = next(&mut rng) % 4;
+
+            tree.match_and_insert_with(&prompt, |_| {
+                match eviction {
+                    0 => tree.evict_by_tenant(&victim, budget),
+                    1 => tree.evict_tenant_by_size(budget * TENANTS),
+                    2 => tree.remove_tenant_all(&victim),
+                    _ => {}
+                }
+                Some(route.as_str())
+            });
+
+            for name in &names {
+                assert_eq!(
+                    tree.tenant_char_size(&intern_tenant(name)),
+                    reachable_chars(&tree, name),
+                    "request {request}: {name}'s count vs the chars it holds on reachable nodes"
+                );
+            }
+            assert_eq!(
+                tree.total_char_size(),
+                tree.get_tenant_char_count().values().sum::<usize>(),
+                "request {request}: total vs the per-tenant sum"
+            );
+            assert_eq!(
+                tree.match_prefix_with_counts(&prompt).matched_char_count,
+                prompt.chars().count(),
+                "request {request}: the prompt is cached"
+            );
+            for node in path_nodes(&tree, &prompt) {
+                assert!(
+                    node.tenant_last_access_time.contains_key(route.as_str()),
+                    "request {request}: {route} owns the whole prompt"
+                );
+            }
+        }
+    }
 }
