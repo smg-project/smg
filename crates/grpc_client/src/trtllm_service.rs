@@ -1,18 +1,17 @@
 use std::{future::Future, pin::Pin};
 
 use openai_protocol::{
-    chat::ChatCompletionRequest,
-    common::{ResponseFormat, StringOrArray},
-    completion::CompletionRequest,
-    generate::GenerateRequest,
-    messages::CreateMessageRequest,
-    responses::ResponsesRequest,
+    chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
+    messages::CreateMessageRequest, responses::ResponsesRequest,
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
 use tonic::{transport::Channel, Request};
 use tracing::{debug, warn};
 
-use crate::{AbortOnDropClient, BoxedTraceInjector};
+use crate::{
+    request_fields::{response_format_schema, stop_strings, PlainSampling},
+    AbortOnDropClient, BoxedTraceInjector,
+};
 
 // Include the generated protobuf code
 #[expect(clippy::allow_attributes)]
@@ -131,7 +130,7 @@ impl TrtllmServiceClient {
         // Build guided decoding params if needed
         let guided_decoding = Self::build_guided_decoding_from_chat(body, tool_call_constraint)?;
 
-        let stop = Self::extract_stop_strings(body.stop.as_ref());
+        let stop = stop_strings(body.stop.as_ref());
 
         let max_tokens = body.output_token_cap().unwrap_or(2048);
 
@@ -183,7 +182,8 @@ impl TrtllmServiceClient {
         original_text: Option<String>,
         token_ids: Vec<u32>,
     ) -> Result<proto::GenerateRequest, String> {
-        let sampling_config = Self::build_sampling_config_from_plain(body.sampling_params.as_ref());
+        let plain = PlainSampling::read(body.sampling_params.as_ref());
+        let sampling_config = Self::build_sampling_config_from_plain(&plain);
         let output_config = proto::OutputConfig {
             logprobs: if body.return_logprob.unwrap_or(false) {
                 Some(body.top_logprobs_num.unwrap_or(0))
@@ -205,14 +205,7 @@ impl TrtllmServiceClient {
             None
         };
 
-        let max_tokens = body
-            .sampling_params
-            .as_ref()
-            .and_then(|p| p.max_new_tokens)
-            .unwrap_or(2048);
-
-        let stop =
-            Self::extract_stop_strings(body.sampling_params.as_ref().and_then(|p| p.stop.as_ref()));
+        let max_tokens = plain.max_new_tokens.unwrap_or(2048);
 
         let grpc_request = proto::GenerateRequest {
             request_id,
@@ -225,13 +218,9 @@ impl TrtllmServiceClient {
             output_config: Some(output_config),
             max_tokens,
             streaming: body.stream,
-            stop,
+            stop: plain.stop,
             stop_token_ids: vec![],
-            ignore_eos: body
-                .sampling_params
-                .as_ref()
-                .and_then(|p| p.ignore_eos)
-                .unwrap_or(false),
+            ignore_eos: plain.ignore_eos,
             bad: vec![],
             bad_token_ids: vec![],
             guided_decoding,
@@ -310,15 +299,6 @@ impl TrtllmServiceClient {
         Ok(grpc_request)
     }
 
-    /// Extract stop strings from an optional StringOrArray
-    fn extract_stop_strings(stop: Option<&StringOrArray>) -> Vec<String> {
-        match stop {
-            Some(StringOrArray::String(s)) => vec![s.clone()],
-            Some(StringOrArray::Array(arr)) => arr.clone(),
-            None => vec![],
-        }
-    }
-
     /// Build SamplingConfig from ChatCompletionRequest
     ///
     /// Uses sensible defaults when values are not specified:
@@ -373,28 +353,11 @@ impl TrtllmServiceClient {
         tool_call_constraint: Option<(String, String)>,
     ) -> Result<Option<proto::GuidedDecodingParams>, String> {
         // Collect non-tool constraint (response_format, ebnf, regex)
-        let mut guided = None;
-
-        match &request.response_format {
-            Some(ResponseFormat::JsonObject) => {
-                let schema = serde_json::json!({"type": "object"});
-                let schema_str = serde_json::to_string(&schema)
-                    .map_err(|e| format!("Failed to serialize JSON schema: {e}"))?;
-                guided = Some(proto::GuidedDecodingParams {
-                    guide_type: proto::guided_decoding_params::GuideType::JsonSchema as i32,
-                    guide: schema_str,
-                });
-            }
-            Some(ResponseFormat::JsonSchema { json_schema }) => {
-                let schema_str = serde_json::to_string(&json_schema.schema)
-                    .map_err(|e| format!("Failed to serialize JSON schema: {e}"))?;
-                guided = Some(proto::GuidedDecodingParams {
-                    guide_type: proto::guided_decoding_params::GuideType::JsonSchema as i32,
-                    guide: schema_str,
-                });
-            }
-            Some(ResponseFormat::Text) | None => {}
-        }
+        let mut guided =
+            response_format_schema(request)?.map(|schema| proto::GuidedDecodingParams {
+                guide_type: proto::guided_decoding_params::GuideType::JsonSchema as i32,
+                guide: schema,
+            });
 
         if guided.is_none() {
             if let Some(ebnf) = &request.ebnf {
@@ -599,11 +562,7 @@ impl TrtllmServiceClient {
 
         let guided_decoding = Self::build_guided_decoding_from_completion(body)?;
 
-        let stop = match &body.stop {
-            Some(StringOrArray::String(s)) => vec![s.clone()],
-            Some(StringOrArray::Array(arr)) => arr.clone(),
-            None => vec![],
-        };
+        let stop = stop_strings(body.stop.as_ref());
 
         let grpc_request = proto::GenerateRequest {
             request_id,
@@ -700,63 +659,29 @@ impl TrtllmServiceClient {
         }
     }
 
-    fn build_sampling_config_from_plain(
-        params: Option<&GenerateSamplingParams>,
-    ) -> proto::SamplingConfig {
-        let mut config = proto::SamplingConfig {
+    fn build_sampling_config_from_plain(plain: &PlainSampling) -> proto::SamplingConfig {
+        proto::SamplingConfig {
             beam_width: 1,
-            num_return_sequences: 1,
-            top_k: None,
-            top_p: Some(1.0),
+            num_return_sequences: plain.n,
+            top_k: plain.top_k.map(|k| k.max(0)),
+            top_p: Some(plain.top_p),
             top_p_min: None,
             top_p_reset_ids: None,
             top_p_decay: None,
             seed: None,
-            temperature: Some(1.0),
-            min_tokens: None,
+            temperature: Some(plain.temperature),
+            min_tokens: plain.min_new_tokens,
             beam_search_diversity_rate: None,
-            repetition_penalty: Some(1.0),
-            presence_penalty: None,
-            frequency_penalty: None,
+            repetition_penalty: Some(plain.repetition_penalty),
+            presence_penalty: plain.presence_penalty,
+            frequency_penalty: plain.frequency_penalty,
             prompt_ignore_length: None,
             length_penalty: None,
             early_stopping: None,
             no_repeat_ngram_size: None,
-            min_p: None,
+            min_p: plain.min_p,
             beam_width_array: vec![],
-        };
-
-        let Some(p) = params else {
-            return config;
-        };
-
-        if let Some(val) = p.temperature {
-            config.temperature = Some(val);
         }
-        if let Some(val) = p.top_p {
-            config.top_p = Some(val);
-        }
-        if let Some(val) = p.top_k {
-            config.top_k = Some(val.max(0));
-        }
-        if let Some(val) = p.frequency_penalty {
-            config.frequency_penalty = Some(val);
-        }
-        if let Some(val) = p.presence_penalty {
-            config.presence_penalty = Some(val);
-        }
-        if let Some(val) = p.repetition_penalty {
-            config.repetition_penalty = Some(val);
-        }
-        if let Some(val) = p.min_p {
-            config.min_p = Some(val);
-        }
-        config.min_tokens = p.min_new_tokens;
-        if let Some(n) = p.n {
-            config.num_return_sequences = n;
-        }
-
-        config
     }
 
     fn build_guided_decoding_from_plain(

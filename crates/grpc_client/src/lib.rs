@@ -19,6 +19,7 @@ pub mod codec;
 pub mod engine_load;
 pub mod media_fault;
 pub mod mlx_engine;
+mod request_fields;
 pub mod sglang_scheduler;
 pub mod tokenizer_bundle;
 pub mod tokenspeed_encoder;

@@ -1,18 +1,17 @@
 use std::{future::Future, pin::Pin};
 
 use openai_protocol::{
-    chat::ChatCompletionRequest,
-    common::{ResponseFormat, StringOrArray},
-    completion::CompletionRequest,
-    generate::GenerateRequest,
-    messages::CreateMessageRequest,
-    responses::ResponsesRequest,
+    chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
+    messages::CreateMessageRequest, responses::ResponsesRequest,
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
 use tonic::{transport::Channel, Request};
 use tracing::{debug, warn};
 
-use crate::{AbortOnDropClient, BoxedTraceInjector};
+use crate::{
+    request_fields::{response_format_schema, stop_strings, PlainSampling},
+    AbortOnDropClient, BoxedTraceInjector,
+};
 
 // Include the generated protobuf code
 #[expect(clippy::allow_attributes)]
@@ -224,7 +223,7 @@ impl VllmEngineClient {
         request: &ChatCompletionRequest,
         tool_call_constraint: Option<(String, String)>,
     ) -> Result<proto::SamplingParams, String> {
-        let stop_sequences = Self::extract_stop_strings(request);
+        let stop_sequences = stop_strings(request.stop.as_ref());
 
         let max_tokens = request.output_token_cap();
 
@@ -268,15 +267,6 @@ impl VllmEngineClient {
         })
     }
 
-    /// Extract stop strings from request
-    fn extract_stop_strings(request: &ChatCompletionRequest) -> Vec<String> {
-        match &request.stop {
-            Some(StringOrArray::String(s)) => vec![s.clone()],
-            Some(StringOrArray::Array(arr)) => arr.clone(),
-            None => vec![],
-        }
-    }
-
     /// Build constraint for structured generation
     fn build_constraint_for_chat(
         request: &ChatCompletionRequest,
@@ -284,23 +274,8 @@ impl VllmEngineClient {
     ) -> Result<Option<proto::sampling_params::Constraint>, String> {
         let mut constraints = Vec::new();
 
-        // Handle response_format constraints
-        match &request.response_format {
-            Some(ResponseFormat::JsonObject) => {
-                // json_object mode - constrain to valid JSON object
-                let schema = serde_json::json!({"type": "object"});
-                let schema_str = serde_json::to_string(&schema)
-                    .map_err(|e| format!("Failed to serialize JSON schema: {e}"))?;
-                constraints.push(proto::sampling_params::Constraint::JsonSchema(schema_str));
-            }
-            Some(ResponseFormat::JsonSchema { json_schema }) => {
-                let schema_str = serde_json::to_string(&json_schema.schema)
-                    .map_err(|e| format!("Failed to serialize JSON schema: {e}"))?;
-                constraints.push(proto::sampling_params::Constraint::JsonSchema(schema_str));
-            }
-            Some(ResponseFormat::Text) | None => {
-                // No constraint for text format
-            }
+        if let Some(schema) = response_format_schema(request)? {
+            constraints.push(proto::sampling_params::Constraint::JsonSchema(schema));
         }
 
         // vLLM supports: json_schema, regex, grammar, structural_tag, json_object, choice
@@ -529,11 +504,7 @@ impl VllmEngineClient {
     fn build_grpc_sampling_params_from_completion(
         request: &CompletionRequest,
     ) -> Result<proto::SamplingParams, String> {
-        let stop_sequences = match &request.stop {
-            Some(StringOrArray::String(s)) => vec![s.clone()],
-            Some(StringOrArray::Array(arr)) => arr.clone(),
-            None => vec![],
-        };
+        let stop_sequences = stop_strings(request.stop.as_ref());
 
         let logprobs = request.logprobs.map(|v| v.min(20) as i32);
 
@@ -614,85 +585,31 @@ impl VllmEngineClient {
     fn build_sampling_params_from_plain(
         params: Option<&GenerateSamplingParams>,
     ) -> Result<proto::SamplingParams, String> {
-        let mut sampling = proto::SamplingParams {
-            temperature: Some(1.0),
-            top_p: 1.0,
-            top_k: 0, // 0 means disabled in vLLM
-            repetition_penalty: 1.0,
-            n: 1,
-            skip_special_tokens: true,
+        let plain = PlainSampling::read(params);
+        Ok(proto::SamplingParams {
+            temperature: Some(plain.temperature),
+            top_p: plain.top_p,
+            top_k: plain.top_k.map_or(0, |k| k.max(0) as u32), // 0 means disabled in vLLM
+            min_p: plain.min_p.unwrap_or(0.0),
+            frequency_penalty: plain.frequency_penalty.unwrap_or(0.0),
+            presence_penalty: plain.presence_penalty.unwrap_or(0.0),
+            repetition_penalty: plain.repetition_penalty,
+            max_tokens: plain.max_new_tokens,
+            min_tokens: plain.min_new_tokens.unwrap_or(0),
+            stop: plain.stop,
+            stop_token_ids: plain.stop_token_ids,
+            skip_special_tokens: plain.skip_special_tokens,
             spaces_between_special_tokens: true,
+            ignore_eos: plain.ignore_eos,
+            n: plain.n,
+            // no_stop_trim has no field in this proto; the plain sampling_seed is not
+            // forwarded to `seed` here (as before)
+            constraint: match params {
+                Some(p) => Self::build_single_constraint_from_plain(p)?,
+                None => None,
+            },
             ..Default::default()
-        };
-
-        let Some(p) = params else {
-            return Ok(sampling);
-        };
-
-        // Handle temperature (now optional)
-        if let Some(val) = p.temperature {
-            sampling.temperature = Some(val);
-        }
-
-        // Simple field mappings
-        if let Some(val) = p.top_p {
-            sampling.top_p = val;
-        }
-        if let Some(val) = p.top_k {
-            sampling.top_k = val.max(0) as u32; // Clamp negative values to 0 (disabled)
-        }
-        if let Some(val) = p.frequency_penalty {
-            sampling.frequency_penalty = val;
-        }
-        if let Some(val) = p.presence_penalty {
-            sampling.presence_penalty = val;
-        }
-        if let Some(val) = p.repetition_penalty {
-            sampling.repetition_penalty = val;
-        }
-        if let Some(val) = p.min_p {
-            sampling.min_p = val;
-        }
-        if let Some(val) = p.ignore_eos {
-            sampling.ignore_eos = val;
-        }
-        if let Some(val) = p.skip_special_tokens {
-            sampling.skip_special_tokens = val;
-        }
-        // Note: no_stop_trim not supported in vLLM
-
-        // Handle stop sequences
-        if let Some(stop) = &p.stop {
-            match stop {
-                StringOrArray::String(s) => sampling.stop.push(s.clone()),
-                StringOrArray::Array(arr) => sampling.stop.extend(arr.clone()),
-            }
-        }
-
-        // Handle stop token IDs
-        if let Some(stop_token_ids) = &p.stop_token_ids {
-            sampling.stop_token_ids.clone_from(stop_token_ids);
-        }
-
-        // Handle max_tokens (read from internal max_new_tokens)
-        if let Some(max_new_tokens) = p.max_new_tokens {
-            sampling.max_tokens = Some(max_new_tokens);
-        }
-
-        // Handle min_tokens (read from internal min_new_tokens)
-        if let Some(min_new_tokens) = p.min_new_tokens {
-            sampling.min_tokens = min_new_tokens;
-        }
-
-        // Handle n
-        if let Some(n) = p.n {
-            sampling.n = n;
-        }
-
-        // Handle constraints (exactly one allowed)
-        sampling.constraint = Self::build_single_constraint_from_plain(p)?;
-
-        Ok(sampling)
+        })
     }
 }
 
@@ -737,6 +654,8 @@ impl From<proto::GetLoadsResponse> for openai_protocol::worker::WorkerLoadRespon
 
 #[cfg(test)]
 mod tests {
+    use openai_protocol::common::StringOrArray;
+
     use super::*;
     use crate::channel::testing::refused_endpoint;
 
