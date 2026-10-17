@@ -4259,6 +4259,26 @@ mod tests {
         nodes
     }
 
+    /// The tokens `tenant` holds on nodes the root still reaches: what an
+    /// eviction can find and subtract, and what a match can return.
+    fn reachable_tokens(tree: &TokenTree, tenant: &str) -> usize {
+        fn walk(node: &NodeRef, tenant: &str) -> usize {
+            node.children
+                .iter()
+                .map(|child| {
+                    let child = child.value();
+                    let owned = if child.tenant_last_access_time.contains_key(tenant) {
+                        child.tokens.read().len()
+                    } else {
+                        0
+                    };
+                    owned + walk(child, tenant)
+                })
+                .sum()
+        }
+        walk(&tree.root, tenant)
+    }
+
     fn hit_counts(nodes: &[NodeRef]) -> Vec<u64> {
         nodes
             .iter()
@@ -4353,6 +4373,58 @@ mod tests {
             "replay must re-credit the path to {evicted}"
         );
         assert_eq!(counts.get(other), Some(&tokens.len()));
+    }
+
+    /// An eviction between the match and the insert replay that empties a
+    /// path node also detaches it from its parent. The replay must not credit
+    /// the inserting tenant for that node or splice the suffix under it:
+    /// afterwards the tenant's token count equals the tokens it holds on
+    /// nodes the root still reaches (what an eviction can subtract again),
+    /// and the prompt is cached for it.
+    #[test]
+    fn test_match_and_insert_with_detached_path_node_keeps_count_reachable() {
+        let tree = TokenTree::new();
+        let prefix = make_tokens(1, 2);
+        let w1 = intern_tenant("w1");
+        tree.insert_tokens(&prefix, "w1"); // one 2-page node; w1 is its only tenant
+        assert_eq!(path_nodes(&tree, &prefix).len(), 1);
+
+        // The request matches the node in full and falls off it with one more
+        // page, so the node is both a replayed path node and the fall-off
+        // node the suffix is spliced under.
+        let mut tokens = prefix.clone();
+        tokens.extend(make_tokens(9_001, 1));
+
+        let result = tree.match_and_insert_with(&tokens, |matched| {
+            assert_eq!(matched.matched_token_count, prefix.len());
+            assert_eq!(matched.tenant.as_ref(), "w1");
+            // Between the match (which stamped w1 on the node) and the
+            // replay: evict everything w1 holds. No other tenant owns the
+            // node, so the eviction detaches it from the root.
+            tree.evict_tenant(&w1, 0);
+            assert!(
+                tree.root.children.is_empty(),
+                "the eviction detaches the emptied node"
+            );
+            assert_eq!(tree.tenant_token_size(&w1), 0);
+            Some("w1")
+        });
+        assert_eq!(result.matched_token_count, prefix.len());
+
+        let reachable = reachable_tokens(&tree, "w1");
+        assert_eq!(
+            tree.tenant_token_size(&w1),
+            reachable,
+            "w1's count must equal the tokens it holds on reachable nodes"
+        );
+        assert_eq!(tree.total_token_size(), reachable);
+        let cached = tree.match_prefix_with_counts(&tokens);
+        assert_eq!(
+            cached.matched_token_count,
+            tokens.len(),
+            "the prompt must be cached for w1"
+        );
+        assert_eq!(cached.tenant.as_ref(), "w1");
     }
 
     /// `touch_any_tenant` reports only a tenant it stamped in this call. The
