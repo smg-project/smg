@@ -69,8 +69,12 @@ fn reasoning_decision(
             )
         })
     };
+    // A request that chose no parser (transcription shares this path and
+    // sets none) keeps the legacy parsers here as at the sites below, rather
+    // than inheriting the enum's default: its response is read by them, so
+    // no table's replay of the prompt decides its reasoning state.
     match symphony::reasoning_open(
-        ctx.state.parser.unwrap_or_default(),
+        ctx.state.parser.unwrap_or(ParserChoice::Legacy),
         &ctx.components.parser_resolver.names(&chat_request.model),
         &chat_request.model,
         &ctx.components.templates,

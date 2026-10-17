@@ -71,8 +71,12 @@ fn reasoning_decision(
             )
         })
     };
+    // Where a Symphony table reads the message, its replay of the
+    // prompt: a turn the prompt leaves unopened starts inside the
+    // thought whatever the switch says (`regular::symphony::reasoning_open`);
+    // a request that chose no parser keeps the legacy parsers, as the other sites do.
     match symphony::reasoning_open(
-        ctx.state.parser.unwrap_or_default(),
+        ctx.state.parser.unwrap_or(ParserChoice::Legacy),
         &ctx.components
             .parser_resolver
             .names(&messages_request.model),
