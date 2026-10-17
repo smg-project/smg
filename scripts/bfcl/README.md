@@ -64,10 +64,10 @@ Key env knobs for `launch_arm.sh`: `BFCL_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`)
 |---|---|---|---|---|
 | Qwen3.8-27B (`qwen3.8`) | `4-gpu-h100` | 2 | `qwen3_xml` / `qwen3` | `qwen_xml` / `qwen3` |
 | gpt-oss-120b (`gpt-oss`) | `4-gpu-h100` | 2 | `openai` / — | _(none — SMG auto-routes harmony)_ / — |
-| DeepSeek-V4.1-Flash (`deepseek-v4.1`) | `blackwell` | 8 (seq) | `deepseek_v41` / `deepseek_v41` (+`--tokenizer-mode deepseek_v41 --trust-remote-code`; per-commit vLLM main wheel) | `deepseek_v41` / `deepseek_v41` |
+| DeepSeek-V4.1-Flash-1017 (`deepseek-v4.1`) | `blackwell` | 8 (seq) | `deepseek_v41` / `deepseek_v41` (+`--tokenizer-mode deepseek_v41 --trust-remote-code`; per-commit vLLM main wheel) | `deepseek_v41` / `deepseek_v41` |
 | MiniMax-M3 MXFP8 (`minimax-m3`) | `blackwell` | 4 | `minimax_m3` / `minimax_m3` (+`--trust-remote-code --block-size 128 --attention_config.indexer_kv_dtype fp8`) | `minimax_m3` / `minimax_m3` |
 | GLM-5.3-Flash (`glm-5.3-flash`) | `blackwell` | 4 | `glm47` / `glm45` (+`--trust-remote-code --kv-cache-dtype fp8`; per-commit vLLM main wheel) | `glm47_moe` / `glm45` |
-| DeepSeek-V4.1-Flash (`deepseek-v4.1-amd`) | `8-gpu-mi300x` | 4 | `deepseek_v41` / `deepseek_v41` (+`--tokenizer-mode deepseek_v41 --trust-remote-code --moe-backend aiter --engram-config {"cpu_offload":true} --compilation-config {"cudagraph_mode":"FULL_DECODE_ONLY"}`; vLLM ROCm 10.0 nightly image) | `deepseek_v41` / `deepseek_v41` |
+| DeepSeek-V4.1-Flash-1017 (`deepseek-v4.1-amd`) | `8-gpu-mi300x` | 4 | `deepseek_v41` / `deepseek_v41` (+`--tokenizer-mode deepseek_v41 --trust-remote-code --moe-backend aiter --engram-config {"cpu_offload":true} --compilation-config {"cudagraph_mode":"FULL_DECODE_ONLY"}`; vLLM ROCm 10.0 nightly image) | `deepseek_v41` / `deepseek_v41` |
 
 > **gpt-oss has no SMG tool-call-parser.** SMG handles gpt-oss through its harmony
 > pipeline (`model_gateway/src/routers/grpc/harmony/`), auto-activated by

@@ -198,7 +198,7 @@ jobs:
               # is a separate change that needs a run on this leg.
               {"name": "deepseek-v4.1", "runner": "blackwell", "tp": 8,
                "gpu_a": "0,1,2,3,4,5,6,7", "gpu_b": "",  # sequential: arm B reuses GPU_A (whole node)
-               "model": "deepseek-ai/DeepSeek-V4.1-Flash", "bfcl_model": "deepseek-ai/DeepSeek-V4.1-Flash-FC",
+               "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017", "bfcl_model": "deepseek-ai/DeepSeek-V4.1-Flash-1017-FC",
                "vllm_tool": "deepseek_v41", "vllm_reason": "deepseek_v41",
                "smg_tool": "deepseek_v41", "smg_reason": "deepseek_v41",
                # No kv-cache/block-size flags: vLLM's V4.1 sparse-MLA path maps
@@ -291,7 +291,7 @@ jobs:
               # vllm-project/vllm#56503); v0.31.0 has none of this.
               {"name": "deepseek-v4.1-amd", "runner": amd_runner, "vendor": "amd", "tp": 4,
                "image": amd_nightly_rocm100_image, "gpu_a": "0,1,2,3", "gpu_b": "4,5,6,7",
-               "model": "deepseek-ai/DeepSeek-V4.1-Flash", "bfcl_model": "deepseek-ai/DeepSeek-V4.1-Flash-FC",
+               "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017", "bfcl_model": "deepseek-ai/DeepSeek-V4.1-Flash-1017-FC",
                "vllm_tool": "deepseek_v41", "vllm_reason": "deepseek_v41",
                "smg_tool": "deepseek_v41", "smg_reason": "deepseek_v41",
                "vllm_extra": '--tokenizer-mode deepseek_v41 --trust-remote-code --moe-backend aiter --engram-config {"cpu_offload":true} --compilation-config {"cudagraph_mode":"FULL_DECODE_ONLY"}',
