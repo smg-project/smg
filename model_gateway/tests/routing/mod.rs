@@ -19,5 +19,6 @@ pub mod stream_request_body_test;
 #[cfg(feature = "provider-openai")]
 pub mod test_openai_routing;
 pub mod test_pd_routing;
+pub mod traffic_split_test;
 pub mod upstream_http2_test;
 pub mod worker_management_test;

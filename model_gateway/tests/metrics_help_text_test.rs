@@ -44,6 +44,7 @@ async fn every_smg_family_has_help_text() {
     Metrics::record_upstream_send_retry("http");
     Metrics::record_response_not_stored("foreground", "record");
     Metrics::record_routing_key_source("header");
+    Metrics::record_traffic_split_selection("model-a", "canary");
     Metrics::record_worker_manual_policy_branch("vacant");
     Metrics::record_worker_consistent_hashing_policy_branch("routing_key_hit");
     Metrics::record_worker_prefix_hash_policy_branch("ring_hit");

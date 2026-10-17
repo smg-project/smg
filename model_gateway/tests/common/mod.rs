@@ -449,10 +449,11 @@ async fn build_test_app_context(
 
     // Initialize registries
     let worker_registry = Arc::new(WorkerRegistry::new());
-    let policy_registry = Arc::new(PolicyRegistry::with_override(
-        config.policy.clone(),
-        config.routing_key_override.clone(),
-    ));
+    let policy_registry = Arc::new(
+        PolicyRegistry::with_override(config.policy.clone(), config.routing_key_override.clone())
+            .with_pd_pairing_mode(config.pd_pairing_mode)
+            .with_traffic_split(config.traffic_split),
+    );
 
     // Initialize storage backends (Memory for tests, unless the caller brought
     // its own: a history store that is down, for one).

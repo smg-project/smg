@@ -1898,9 +1898,15 @@ impl WorkerSelectionStage {
             hash_ring: hash_ring.clone(),
             leg: WorkerLeg::Prefill,
         };
-        let prefill_idx = self
+        let (prefill_idx, prefill_group) = self
             .policy_registry
-            .select_worker_for_model(&prefill_policy, model_id, &available_prefill, &info)
+            .select_worker_for_model_split(
+                &prefill_policy,
+                model_id,
+                &available_prefill,
+                &info,
+                None,
+            )
             .ok_or(EpdSelectionFailure::Unavailable)?;
         if prefill_capacity
             .is_some_and(|capacity| !capacity.has_capacity(&available_prefill[prefill_idx]))
@@ -1908,9 +1914,20 @@ impl WorkerSelectionStage {
             return Err(EpdSelectionFailure::PrefillAtCapacity);
         }
         info.leg = WorkerLeg::Decode;
-        let decode_idx = self
+        // The decode follows the traffic group the prefill leg was split
+        // into, or the named group an unsplit prefill was picked from, so a
+        // pair never spans two groups; an unsplit prefill from the default
+        // group leaves it to decide for itself (see
+        // `PolicyRegistry::select_worker_for_model_split`).
+        let (decode_idx, _) = self
             .policy_registry
-            .select_worker_for_model(&decode_policy, model_id, &available_decode, &info)
+            .select_worker_for_model_split(
+                &decode_policy,
+                model_id,
+                &available_decode,
+                &info,
+                prefill_group,
+            )
             .ok_or(EpdSelectionFailure::Unavailable)?;
 
         let encode_assignments = assign_encode_workers(
