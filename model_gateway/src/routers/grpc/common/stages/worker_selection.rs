@@ -5255,6 +5255,7 @@ mod tests {
             tokenizer_autoload: true,
             tokenizer_load_failures: Arc::default(),
             parser: crate::config::ParserChoice::Legacy,
+            parse_failures: crate::config::ParseFailures::Log,
         });
         let mut ctx = RequestContext::for_generate(
             Arc::new(request),

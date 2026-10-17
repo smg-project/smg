@@ -7,7 +7,7 @@ use axum::response::Response;
 use tracing::error;
 
 use crate::{
-    config::ParserChoice,
+    config::{ParseFailures, ParserChoice},
     routers::{
         error,
         grpc::{
@@ -274,6 +274,8 @@ impl BuildStage for MessageRequestBuildingStage {
         };
         spec.reasoning_in_prefill = require_reasoning;
         spec.symphony = assignment;
+        spec.parse_report = ctx.state.parse_report;
+        spec.parse_silent = ctx.components.parse_failures == ParseFailures::Silent;
         Ok(BuildOutput {
             plan: ExecutionPlan::generate(self.plan_kind, proto_request),
             spec: ResponseSpec::Messages(spec),

@@ -34,6 +34,7 @@ pub mod rerank;
 pub mod responses;
 pub mod rl;
 pub mod sampling_params;
+pub mod smg;
 pub mod systemone;
 pub mod tokenize;
 pub mod transcription;

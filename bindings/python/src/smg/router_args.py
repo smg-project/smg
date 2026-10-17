@@ -486,6 +486,11 @@ class RouterArgs:
     otlp_traces_endpoint: str = "localhost:4317"
     overlap_decay: float = 0.0
     overload_token_usage_threshold: float = 1.0
+    # What the gateway does about an output a Symphony table did not read whole: "log" (the
+    # default: one sampled line per such output, and the report in the response when the
+    # request asks with X-SMG-Parse-Report), "surface" (the report on every such output as
+    # well) or "silent" (the counters alone)
+    parse_failures: str = "log"
     # Which parser reads a chat completion's reasoning and tool calls: the per-model parsers
     # ("legacy") or Symphony ("symphony") for the models its registry knows; a request's
     # X-SMG-Parser header overrides it
@@ -2289,6 +2294,17 @@ class RouterArgs:
             "name reads with that table, a legacy parser's keeps the legacy parsers, and no name takes "
             "Symphony's registry for the models it knows. A request's X-SMG-Parser header overrides the "
             "flag for that request.",
+        )
+        tokenizer_group.add_argument(
+            f"--{prefix}parse-failures",
+            type=str,
+            default=RouterArgs.parse_failures,
+            choices=["surface", "log", "silent"],
+            help="What the gateway does about an output a Symphony table did not read whole (a malformed "
+            "call region folded into the content, a call dropped under parallel_tool_calls: false); the "
+            "counters are always recorded. log (the default): one sampled line per such output, and the "
+            "report in the response when the request asks with X-SMG-Parse-Report: on or detail; surface: "
+            "the report on every such output as well; silent: the counters alone, the header ignored.",
         )
         tokenizer_group.add_argument(
             f"--{prefix}tokenizer-cache-enable-l0",

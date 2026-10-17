@@ -22,7 +22,8 @@ use openai_protocol::{
 };
 
 use crate::routers::grpc::regular::{
-    stages::decisions::scoring::DecisionScoring, symphony::Assignment,
+    stages::decisions::scoring::DecisionScoring,
+    symphony::{telemetry::Report, Assignment},
 };
 
 /// Response-phase contract for one request, handed on by request building.
@@ -104,6 +105,11 @@ pub(crate) struct ChatResponseSpec {
     /// Set by request building when Symphony reads the response (`regular::symphony`):
     /// the table, and the part of the rendered prompt the engine replays.
     pub symphony: Option<Assignment>,
+    /// What the response says about how its output was read (`X-SMG-Parse-Report` under the
+    /// gateway's parse-failure policy; see `regular::symphony::telemetry`).
+    pub parse_report: Report,
+    /// `--parse-failures silent`: the counters alone, no line about the output.
+    pub parse_silent: bool,
 }
 
 /// Whether the response to a chat `request` is scanned for tool calls: the
@@ -147,6 +153,8 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             unbilled_prompt_tokens: 0,
             reasoning_in_prefill: false,
             symphony: None,
+            parse_report: Report::Off,
+            parse_silent: false,
         }
     }
 }
@@ -195,6 +203,11 @@ pub(crate) struct MessagesResponseSpec {
     /// `disable_parallel_tool_use: true`: only the first tool call is
     /// returned.
     pub first_tool_call_only: bool,
+    /// What the response says about how its output was read (`X-SMG-Parse-Report` under the
+    /// gateway's parse-failure policy; see `regular::symphony::telemetry`).
+    pub parse_report: Report,
+    /// `--parse-failures silent`: the counters alone, no line about the output.
+    pub parse_silent: bool,
 }
 
 impl From<&CreateMessageRequest> for MessagesResponseSpec {
@@ -212,6 +225,8 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
             stop_sequences: request.stop_sequences.clone().map(StringOrArray::Array),
             symphony: None,
             first_tool_call_only: request.disables_parallel_tool_use(),
+            parse_report: Report::Off,
+            parse_silent: false,
         }
     }
 }

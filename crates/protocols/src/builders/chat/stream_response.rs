@@ -22,6 +22,7 @@ pub struct ChatCompletionStreamResponseBuilder {
     choices: Vec<ChatStreamChoice>,
     usage: Option<Usage>,
     system_fingerprint: Option<String>,
+    smg: Option<Box<crate::smg::SmgExtension>>,
 }
 
 impl ChatCompletionStreamResponseBuilder {
@@ -39,6 +40,7 @@ impl ChatCompletionStreamResponseBuilder {
             choices: Vec::new(),
             usage: None,
             system_fingerprint: None,
+            smg: None,
         }
     }
 
@@ -282,6 +284,12 @@ impl ChatCompletionStreamResponseBuilder {
         self
     }
 
+    /// The gateway's own members (see [`crate::smg`]), when there are any.
+    pub fn maybe_smg(mut self, smg: Option<crate::smg::SmgExtension>) -> Self {
+        self.smg = smg.map(Box::new);
+        self
+    }
+
     /// Build the ChatCompletionStreamResponse
     pub fn build(self) -> ChatCompletionStreamResponse {
         ChatCompletionStreamResponse {
@@ -292,6 +300,7 @@ impl ChatCompletionStreamResponseBuilder {
             system_fingerprint: self.system_fingerprint,
             choices: self.choices,
             usage: self.usage,
+            smg: self.smg,
         }
     }
 }

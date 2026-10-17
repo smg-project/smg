@@ -33,10 +33,10 @@ use smg::{
         bind_socket_addr, resolve_worker_auto_recovery, validate_mesh_server_name, AccessLogField,
         CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
         FileDiscoveryConfig, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig,
-        ManualAssignmentMode, MemoryConfig, MetricsConfig, OracleConfig, ParserChoice,
-        PdPairingMode, PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric, RedisConfig,
-        RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig,
-        TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+        ManualAssignmentMode, MemoryConfig, MetricsConfig, OracleConfig, ParseFailures,
+        ParserChoice, PdPairingMode, PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric,
+        RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
+        SchemaConfig, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
         DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
     },
     mesh_discovery::MeshDiscoveryConfig,
@@ -1472,6 +1472,16 @@ struct ModelArgs {
     /// overrides the flag for that request.
     #[arg(long, default_value = "legacy", value_parser = ["legacy", "symphony"], help_heading = "Parsers")]
     parser: String,
+
+    /// What the gateway does about an output a Symphony table did not read
+    /// whole (a malformed call region folded into the content, a call dropped
+    /// under parallel_tool_calls: false). The counters are always recorded.
+    /// log (the default): one sampled line per such output, and the report
+    /// in the response when the request asks with X-SMG-Parse-Report: on or
+    /// detail; surface: the report on every such output as well; silent: the
+    /// counters alone, the header ignored.
+    #[arg(long, default_value = "log", value_parser = ["surface", "log", "silent"], help_heading = "Parsers")]
+    parse_failures: String,
 
     /// Path to MCP server configuration file
     #[arg(long, help_heading = "Parsers")]
@@ -3211,6 +3221,7 @@ impl CliArgs {
             })
             .disable_tokenizer_autoload(self.model.disable_tokenizer_autoload)
             .parser(ParserChoice::parse(&self.model.parser).unwrap_or_default())
+            .parse_failures(ParseFailures::parse(&self.model.parse_failures).unwrap_or_default())
             .history_backend(history_backend)
             .memory_config(MemoryConfig {
                 max_responses: self.model.history_memory_max_responses,

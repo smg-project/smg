@@ -7,7 +7,7 @@ use axum::response::Response;
 use tracing::error;
 
 use crate::{
-    config::ParserChoice,
+    config::{ParseFailures, ParserChoice},
     routers::{
         error,
         grpc::{
@@ -334,6 +334,8 @@ impl BuildStage for ChatRequestBuildingStage {
         spec.unbilled_prompt_tokens = unbilled_prompt_tokens;
         spec.reasoning_in_prefill = reasoning_in_prefill;
         spec.symphony = assignment;
+        spec.parse_report = ctx.state.parse_report;
+        spec.parse_silent = ctx.components.parse_failures == ParseFailures::Silent;
 
         Ok(BuildOutput {
             plan,

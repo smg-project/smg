@@ -36,7 +36,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tool_parser::{ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser};
 use tracing::{debug, error, warn};
 
-use super::symphony::{engine_finish, finished, reasoning_text_tokens, telemetry::Who, Reader};
+use super::symphony::{
+    engine_finish, finished, reasoning_text_tokens, telemetry, telemetry::Who, Reader,
+};
 use crate::{
     observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
     rate_limit::{SharedReservationHandle, UsageSettlement},
@@ -1886,8 +1888,11 @@ impl StreamingProcessor {
             .symphony
             .as_ref()
             .map(|assignment| {
-                Reader::new(assignment, Arc::clone(&original_request.chat_tools))
-                    .map(|reader| reader.first_call_only(original_request.first_tool_call_only))
+                Reader::new(assignment, Arc::clone(&original_request.chat_tools)).map(|reader| {
+                    reader
+                        .first_call_only(original_request.first_tool_call_only)
+                        .reporting(original_request.parse_report, original_request.parse_silent)
+                })
             })
             .transpose()?
             .map(|reader| (reader, adapt::messages::Stream::new()));
@@ -1905,6 +1910,7 @@ impl StreamingProcessor {
             stop_details: None,
             usage: Self::initial_messages_usage(),
             container: None,
+            smg: None,
         };
         // Thinking tokens of the turn: the engine's count when it keeps one,
         // else the tokens the parser routed to thinking, chunk by chunk.
@@ -2624,6 +2630,16 @@ impl StreamingProcessor {
                     stop_sequence,
                     stop_details: None,
                     container: None,
+                    // What the response says about how the output was read, when the request
+                    // asked or the policy surfaces it.
+                    smg: match symphony.as_ref() {
+                        Some((reader, _)) => reader.parse_report(0),
+                        None => original_request
+                            .parse_report
+                            .wanted(false)
+                            .then(super::processor::legacy_parse_report),
+                    }
+                    .map(openai_protocol::smg::SmgExtension::boxed_parse),
                 },
                 usage: Self::final_messages_delta_usage(
                     completion_tokens.total(),
@@ -3832,7 +3848,8 @@ impl<'a> ChatStream<'a> {
                     Entry::Occupied(reader) => reader.into_mut(),
                     Entry::Vacant(slot) => slot.insert(
                         Reader::new(assignment, self.spec.tools.clone().unwrap_or_default())?
-                            .first_call_only(self.spec.first_tool_call_only),
+                            .first_call_only(self.spec.first_tool_call_only)
+                            .reporting(self.spec.parse_report, self.spec.parse_silent),
                     ),
                 };
                 Some(reader.read(stop_decoder, chunk.token_ids())?)
@@ -4429,11 +4446,28 @@ impl<'a> ChatStream<'a> {
             } else {
                 usage.cloned()
             };
+            // What the response says about how the choice's output was read, when the request
+            // asked or the policy surfaces it: the reader's report, or the legacy parsers'
+            // word that they read it.
+            let parse_report = match (self.readers.get(index), self.spec.symphony.as_ref()) {
+                (Some(reader), _) => reader.parse_report(*index),
+                // A table was assigned but no chunk came for this choice (an empty output, an
+                // abort before the first token): nothing was read, and nothing was wrong, which
+                // is what an empty tally reports.
+                (None, Some(assignment)) => telemetry::Tally::reporting(self.spec.parse_report)
+                    .parse_report(telemetry::table_label(assignment.format.name()), *index),
+                (None, None) => self
+                    .spec
+                    .parse_report
+                    .wanted(false)
+                    .then(super::processor::legacy_parse_report),
+            };
             let finish_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                 .created(created)
                 .add_choice_finish_reason(*index, final_finish_reason, matched_stop_value)
                 .maybe_system_fingerprint(system_fingerprint)
                 .maybe_usage(finish_usage)
+                .maybe_smg(parse_report.map(openai_protocol::smg::SmgExtension::parse))
                 .build();
 
             let sse_chunk = self
@@ -4818,6 +4852,7 @@ mod tests {
                     system_fingerprint: fingerprint.map(str::to_string),
                     choices: vec![choice.clone()],
                     usage: usage.clone(),
+                    smg: None,
                 };
                 assert_eq!(
                     event(&buffer),

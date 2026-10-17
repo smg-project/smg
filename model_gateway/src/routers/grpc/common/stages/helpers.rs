@@ -2071,6 +2071,7 @@ mod shared_pieces_tests {
             worker_registry: Arc::new(WorkerRegistry::new()),
             tool_parser_factory: Default::default(),
             reasoning_parser_factory: Default::default(),
+            parse_failures: crate::config::ParseFailures::Log,
             parser_resolver: utils::ParserResolver::disabled(),
             multimodal: None,
             tokenizer_autoload: true,
