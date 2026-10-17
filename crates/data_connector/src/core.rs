@@ -585,6 +585,14 @@ impl StoredResponse {
             && self.raw_response.get(BACKGROUND_LEASE_KEY).is_some()
     }
 
+    /// When the lease of a background record runs out (unix seconds):
+    /// `None` for a record without a lease, or with one that names no
+    /// expiry. The order of
+    /// [`ResponseStorage::list_open_background_responses`].
+    pub fn background_lease_expires_at(&self) -> Option<i64> {
+        self.raw_response[BACKGROUND_LEASE_KEY]["expires_at"].as_i64()
+    }
+
     /// Whether the stored object's status is one a response does not leave
     /// any more.
     pub fn is_closed(&self) -> bool {
@@ -1007,10 +1015,13 @@ pub trait ResponseStorage: Send + Sync {
     /// The background responses still in flight under a lease (`background:
     /// true`, a status they still leave and a lease under
     /// [`BACKGROUND_LEASE_KEY`]: [`StoredResponse::is_open_background`]),
-    /// oldest first, at most `limit` of them: the records a gateway reads to
-    /// close those whose running gateway is gone. A record without a lease is
-    /// not listed: it is left to a client's cancel, and the oldest such
-    /// records would otherwise fill every batch.
+    /// the lease that runs out first ahead (a lease without an expiry last,
+    /// the oldest record first among equals), at most `limit` of them: the
+    /// records a gateway reads to close those whose running gateway is gone,
+    /// so a batch reaches the expired leases whatever the number of open
+    /// records. A record without a lease is not listed: it is left to a
+    /// client's cancel, and the oldest such records would otherwise fill
+    /// every batch.
     ///
     /// The default answers an empty list: a backend without a way to find
     /// them leaves such records to a client's cancel.

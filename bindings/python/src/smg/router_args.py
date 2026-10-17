@@ -309,7 +309,6 @@ class RouterArgs:
     # stays valid without a renewal, in seconds; a response whose gateway
     # stopped is closed as failed by any gateway sharing the response store.
     # 0 = no lease, no reaper (1 to 5 are rejected)
-    # same reason
     background_lease_ttl_secs: int = 30
     balance_abs_threshold: int = 64
     balance_rel_threshold: float = 1.5

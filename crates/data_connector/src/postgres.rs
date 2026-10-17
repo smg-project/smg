@@ -323,7 +323,10 @@ impl PostgresStore {
     /// time: a session-level advisory lock is tried, not waited for, and a
     /// gateway that does not get it skips the build (two concurrent builds of
     /// the same index would deadlock on each other's snapshots, leaving an
-    /// INVALID index). The builder drops an INVALID leftover of an interrupted
+    /// INVALID index; so would the build and another gateway's concurrent
+    /// drop of the earlier unstored index, which takes the same lock, so a
+    /// gateway whose drop held the lock spawns its own build after it, see
+    /// `drop_legacy_unstored_index`). The builder drops an INVALID leftover of an interrupted
     /// build first (Postgres keeps it, and `IF NOT EXISTS` would honour it),
     /// lifts the statement timeout for the build on its connection and
     /// restores it, and logs a failure instead of failing the start.
@@ -357,7 +360,22 @@ impl PostgresStore {
     /// CONCURRENTLY`, which blocks no read or write on the table and waits
     /// for the transactions using it to end instead (it cannot run inside a
     /// transaction block, so this runs on `client` after the bootstrap's
-    /// commit). Nothing is sent once the index is gone.
+    /// commit). Nothing is sent once the index is gone. The drop holds the
+    /// index-DDL lock of [`build_open_background_index`] in shared mode: a
+    /// `DROP INDEX CONCURRENTLY` and a `CREATE INDEX CONCURRENTLY` on one
+    /// table deadlock on each other (each waits for the other's transaction
+    /// while holding the table lock the other wants; the server aborts one,
+    /// and a drop aborted that way failed the start), so a drop that meets a
+    /// build in progress on another gateway waits for the build to end, and
+    /// a builder that meets a drop in progress leaves the build to the
+    /// gateway doing the drop, whose start spawns one once the drop is
+    /// through; two drops share the lock, as they wait on each other's
+    /// transactions and end. The wait polls the lock between statements
+    /// rather than blocking in one (`pg_advisory_lock`): the build waits for
+    /// every statement in flight on the database before it can end, so a
+    /// blocking wait would deadlock with the build it waits for. The wait is
+    /// bounded by one build, and happens only while a database still carries
+    /// the earlier index.
     async fn drop_legacy_unstored_index(
         &self,
         client: &tokio_postgres::Client,
@@ -376,11 +394,38 @@ impl PostgresStore {
         if !present {
             return Ok(());
         }
+        let owner = folded_owner(&self.schema);
+        let mut announced = false;
+        loop {
+            let locked: bool = client
+                .query_one(
+                    INDEX_DDL_TRY_LOCK_SHARED_SQL,
+                    &[&POSTGRES_INDEX_BUILD_LOCK_CLASS, &owner, &OPEN_BACKGROUND_INDEX],
+                )
+                .await
+                .map_err(|e| {
+                    format!(
+                        "failed to try the index lock for the drop of the earlier unstored response index: {}",
+                        describe_error(&e)
+                    )
+                })?
+                .get(0);
+            if locked {
+                break;
+            }
+            if !announced {
+                tracing::info!(
+                    "another gateway is building the open-background response index; the drop of the earlier unstored response index waits for that build to end"
+                );
+                announced = true;
+            }
+            tokio::time::sleep(INDEX_DDL_POLL).await;
+        }
         tracing::info!(
             index = %index,
             "dropping the earlier unstored response index concurrently (the drop waits for the transactions using the table to end, and blocks none)"
         );
-        client
+        let dropped = client
             .batch_execute(&PostgresResponseStorage::legacy_unstored_index_drop_ddl(
                 &self.schema,
             ))
@@ -390,7 +435,9 @@ impl PostgresStore {
                     "failed to drop the earlier unstored response index: {}",
                     describe_error(&e)
                 )
-            })
+            });
+        release_index_ddl_lock(client, owner.as_deref(), true).await;
+        dropped
     }
 }
 
@@ -406,14 +453,63 @@ enum IndexBuild {
 }
 
 /// The class of the advisory lock the builder of the open-background index
-/// holds for the build (session-level, tried, never waited for); the lock's
-/// second key is the hash of the index name qualified by the schema the
-/// store writes to (`owner` folded as the server folds the unquoted DDL,
-/// else `current_schema()` on the server), so two stores sharing one
-/// database under different schemas build their own index at the same
-/// time, two spellings of one schema share the key, and one gateway per
-/// schema builds.
+/// holds for the build (session-level, exclusive, tried, never waited for)
+/// and the drop of the earlier unstored index holds in shared mode (tried
+/// again until it is free: see `PostgresStore::drop_legacy_unstored_index`);
+/// the lock's second key is
+/// the hash of the index name qualified by the schema the store writes to
+/// (`owner` folded as the server folds the unquoted DDL, else
+/// `current_schema()` on the server), so two stores sharing one database
+/// under different schemas build their own index at the same time, two
+/// spellings of one schema share the key, and one gateway per schema builds.
 const POSTGRES_INDEX_BUILD_LOCK_CLASS: i32 = 0x736D_6778;
+
+/// The statements of that lock, tried and never blocked on (a blocking
+/// `pg_advisory_lock` is a statement in flight, which the build waits for):
+/// exclusive for the builder, shared for the drop of the earlier index; `$1`
+/// the class, `$2` the folded schema owner (NULL for the server's
+/// `current_schema()`), `$3` the index name.
+const INDEX_DDL_TRY_LOCK_SQL: &str =
+    "SELECT pg_try_advisory_lock($1, hashtext(COALESCE($2, current_schema()) || '.' || $3))";
+const INDEX_DDL_TRY_LOCK_SHARED_SQL: &str =
+    "SELECT pg_try_advisory_lock_shared($1, hashtext(COALESCE($2, current_schema()) || '.' || $3))";
+const INDEX_DDL_UNLOCK_SQL: &str =
+    "SELECT pg_advisory_unlock($1, hashtext(COALESCE($2, current_schema()) || '.' || $3))";
+const INDEX_DDL_UNLOCK_SHARED_SQL: &str =
+    "SELECT pg_advisory_unlock_shared($1, hashtext(COALESCE($2, current_schema()) || '.' || $3))";
+
+/// How often a start whose drop of the earlier index meets a build in
+/// progress asks for the lock again.
+const INDEX_DDL_POLL: Duration = Duration::from_millis(200);
+
+/// Releases the index-DDL lock `client`'s session holds (`shared` as it was
+/// taken); a failure is logged (the lock goes with the session, and the
+/// pool's sessions are long-lived, so the release matters, but nothing the
+/// caller did is undone by missing it).
+async fn release_index_ddl_lock(
+    client: &tokio_postgres::Client,
+    owner: Option<&str>,
+    shared: bool,
+) {
+    let unlock = if shared {
+        INDEX_DDL_UNLOCK_SHARED_SQL
+    } else {
+        INDEX_DDL_UNLOCK_SQL
+    };
+    if let Err(e) = client
+        .execute(
+            unlock,
+            &[
+                &POSTGRES_INDEX_BUILD_LOCK_CLASS,
+                &owner,
+                &OPEN_BACKGROUND_INDEX,
+            ],
+        )
+        .await
+    {
+        tracing::warn!("could not release the index lock: {}", describe_error(&e));
+    }
+}
 
 /// The schema owner as the server stores the schema the unquoted DDL
 /// created: folded to lower case the way identifiers are folded (`A`-`Z`
@@ -441,8 +537,12 @@ async fn build_open_background_index(
     let owner = folded_owner(schema);
     let locked: bool = client
         .query_one(
-            "SELECT pg_try_advisory_lock($1, hashtext(COALESCE($2, current_schema()) || '.' || $3))",
-            &[&POSTGRES_INDEX_BUILD_LOCK_CLASS, &owner, &OPEN_BACKGROUND_INDEX],
+            INDEX_DDL_TRY_LOCK_SQL,
+            &[
+                &POSTGRES_INDEX_BUILD_LOCK_CLASS,
+                &owner,
+                &OPEN_BACKGROUND_INDEX,
+            ],
         )
         .await
         .map_err(|e| format!("failed to try the index build lock: {}", describe_error(&e)))?
@@ -471,22 +571,7 @@ async fn build_open_background_index(
         Ok(IndexBuild::Built)
     }
     .await;
-    if let Err(e) = client
-        .execute(
-            "SELECT pg_advisory_unlock($1, hashtext(COALESCE($2, current_schema()) || '.' || $3))",
-            &[
-                &POSTGRES_INDEX_BUILD_LOCK_CLASS,
-                &owner,
-                &OPEN_BACKGROUND_INDEX,
-            ],
-        )
-        .await
-    {
-        tracing::warn!(
-            "could not release the index build lock: {}",
-            describe_error(&e)
-        );
-    }
+    release_index_ddl_lock(&client, owner.as_deref(), false).await;
     built
 }
 
@@ -1731,19 +1816,24 @@ fn open_background_index_sql(schema: &SchemaConfig) -> Option<String> {
 /// The query behind [`ResponseStorage::list_open_background_responses`]:
 /// the rows whose stored object carries a status the response still leaves
 /// (the condition of [`open_background_index_sql`], so the partial index
-/// serves the query), `background: true` and a lease, oldest first, `$1` the
-/// most rows. `None` when the schema skips the column (nothing to list).
+/// serves the query), `background: true` and a lease, the lease that runs
+/// out first ahead (the expiry read as a `jsonb` value: a number orders as
+/// one, a lease without an expiry is NULL and sorts last, and no row fails
+/// the listing), then the oldest, `$1` the most rows. `None` when the
+/// schema skips the column (nothing to list).
 fn open_background_sql(schema: &SchemaConfig, select_base: &str) -> Option<String> {
     let s = &schema.responses;
     if s.is_skipped("raw_response") {
         return None;
     }
     let col_raw = s.col("raw_response");
-    let order = if s.is_skipped("created_at") {
-        String::new()
-    } else {
-        format!(" ORDER BY {} ASC", s.col("created_at"))
-    };
+    let mut order = format!(
+        " ORDER BY ({}::jsonb->'{BACKGROUND_LEASE_KEY}'->'expires_at') ASC",
+        nul_safe_json_document(col_raw)
+    );
+    if !s.is_skipped("created_at") {
+        order.push_str(&format!(", {} ASC", s.col("created_at")));
+    }
     Some(format!(
         "{select_base} WHERE {} AND {} = 'true' AND {} IS NOT NULL{order} LIMIT $1",
         open_status_condition(col_raw),
@@ -2669,7 +2759,8 @@ mod tests {
     }
 
     #[test]
-    fn open_background_sql_filters_on_the_stored_status_and_flag_oldest_first() {
+    fn open_background_sql_filters_on_the_stored_status_and_flag_and_orders_by_the_lease_s_expiry()
+    {
         let schema = SchemaConfig::default();
         let sql = open_background_sql(&schema, "SELECT id, raw_response FROM responses").unwrap();
         assert_eq!(
@@ -2679,7 +2770,8 @@ mod tests {
              IN ('queued', 'in_progress') AND \
              replace(raw_response::text, $$\\u0000$$, $$\\u0020$$)::json->>'background' = 'true' AND \
              replace(raw_response::text, $$\\u0000$$, $$\\u0020$$)::json->>'_lease' IS NOT NULL \
-             ORDER BY created_at ASC LIMIT $1"
+             ORDER BY (replace(raw_response::text, $$\\u0000$$, $$\\u0020$$)::jsonb->'_lease'->'expires_at') ASC, \
+             created_at ASC LIMIT $1"
         );
 
         let mut skipped = SchemaConfig::default();

@@ -975,19 +975,23 @@ impl RedisResponseStorage {
     /// The open set's change for a conditional write that was stored: the
     /// script's run wrote the hash, the output-item keys and the expiry, and
     /// the set follows here (the unconditional store queues the same change
-    /// in [`Self::index_writes`]).
-    async fn follow_open_set(
-        &self,
-        conn: &mut Connection,
-        response: &StoredResponse,
-    ) -> ResponseResult<()> {
+    /// in [`Self::index_writes`]). A failure is logged, never returned: the
+    /// write landed with the script's answer, and the set loses nothing to
+    /// a missed command (a queued record joined it through its first store,
+    /// every renewal joins it again, and the listing drops a member whose
+    /// record it finds closed).
+    async fn follow_open_set(&self, conn: &mut Connection, response: &StoredResponse) {
         let mut pipe = redis::pipe();
         if !self.open_set_writes(&mut pipe, response) {
-            return Ok(());
+            return;
         }
-        pipe.query_async::<()>(conn)
-            .await
-            .map_err(ResponseStorageError::from_redis)
+        if let Err(e) = pipe.query_async::<()>(conn).await {
+            tracing::debug!(
+                response_id = %response.id.0,
+                error = %e,
+                "Failed to update the set of open background responses after a stored conditional write"
+            );
+        }
     }
 
     /// One run of [`store_if_open_script`] on the hash under `key`, answered
@@ -1234,11 +1238,18 @@ impl ResponseStorage for RedisResponseStorage {
             "stored" => {
                 // The open set follows the object (the output-item keys and
                 // the expiry were written in the script's run).
-                self.follow_open_set(&mut conn, &response).await?;
+                self.follow_open_set(&mut conn, &response).await;
                 // A repeat of the entry the record's first store made (the
                 // identifier does not change between the writes of one
-                // response), so a failure here loses nothing.
-                self.index_by_identifier(&mut conn, &response).await?;
+                // response), so a failure here loses nothing and does not
+                // turn the stored write into an error.
+                if let Err(e) = self.index_by_identifier(&mut conn, &response).await {
+                    tracing::debug!(
+                        response_id = %response.id.0,
+                        error = %e,
+                        "Failed to repeat the identifier index entry after a stored conditional write"
+                    );
+                }
                 Ok(ConditionalStore::Stored)
             }
             "closed" => {
@@ -1289,7 +1300,7 @@ impl ResponseStorage for RedisResponseStorage {
                 let mut moved = StoredResponse::new(None);
                 moved.id = id.clone();
                 moved.raw_response = raw_response;
-                self.follow_open_set(&mut conn, &moved).await?;
+                self.follow_open_set(&mut conn, &moved).await;
                 Ok(ConditionalStore::Stored)
             }
             "closed" => {
@@ -1498,7 +1509,12 @@ impl ResponseStorage for RedisResponseStorage {
                 .await
                 .map_err(ResponseStorageError::from_redis)?;
         }
-        open.sort_by_key(|response| response.created_at);
+        open.sort_by_key(|response| {
+            (
+                response.background_lease_expires_at().unwrap_or(i64::MAX),
+                response.created_at,
+            )
+        });
         open.truncate(limit);
         Ok(open)
     }

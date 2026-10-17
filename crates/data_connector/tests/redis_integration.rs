@@ -557,12 +557,36 @@ async fn a_conditional_store_replaces_an_open_record_and_refuses_a_closed_or_mis
     };
     let bundle = redis_bundle(&url).await.expect("create storage");
     let storage = bundle.response_storage;
+    // The set of open background ids, read directly: the listing drops a
+    // member whose record it finds closed, so it alone cannot tell whether
+    // the conditional writes maintain the set.
+    let raw = redis::Client::open(url.as_str())
+        .expect("client")
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connection");
+    let in_open_set = |id: String| {
+        let mut raw = raw.clone();
+        async move {
+            redis::cmd("SISMEMBER")
+                .arg("background:open")
+                .arg(id)
+                .query_async::<i64>(&mut raw)
+                .await
+                .expect("SISMEMBER")
+                == 1
+        }
+    };
 
     let base = StoredResponse::new(None);
     let record = |status: &str| {
         let mut stored = base.clone();
-        stored.raw_response =
+        let mut raw =
             json!({"id": stored.id.0, "background": true, "status": status, "output": []});
+        if matches!(status, "queued" | "in_progress") {
+            raw["_lease"] = json!({"owner": "gw_test", "expires_at": 1_700_000_000});
+        }
+        stored.raw_response = raw;
         stored
     };
     // Missing: nothing is written.
@@ -580,6 +604,10 @@ async fn a_conditional_store_replaces_an_open_record_and_refuses_a_closed_or_mis
         .store_response(record("queued"))
         .await
         .expect("store");
+    assert!(
+        in_open_set(base.id.0.clone()).await,
+        "a queued leased record joins the open set"
+    );
     assert!(matches!(
         storage
             .store_response_if_open(record("in_progress"))
@@ -593,6 +621,10 @@ async fn a_conditional_store_replaces_an_open_record_and_refuses_a_closed_or_mis
         .expect("get")
         .expect("stored");
     assert_eq!(stored.raw_response["status"], "in_progress");
+    assert!(
+        in_open_set(base.id.0.clone()).await,
+        "a conditional write that keeps the record open keeps it in the set"
+    );
     assert!(matches!(
         storage
             .store_response_if_open(record("cancelled"))
@@ -600,6 +632,10 @@ async fn a_conditional_store_replaces_an_open_record_and_refuses_a_closed_or_mis
             .expect("conditional store"),
         ConditionalStore::Stored
     ));
+    assert!(
+        !in_open_set(base.id.0.clone()).await,
+        "the conditional store that closed the record took it out of the set"
+    );
 
     // Closed: refused, the record handed back as it is.
     let ConditionalStore::Closed(current) = storage
@@ -625,8 +661,37 @@ async fn a_conditional_store_replaces_an_open_record_and_refuses_a_closed_or_mis
             .all(|r| r.id != base.id),
         "a closed record is not among the open ones"
     );
-
     storage.delete_response(&base.id).await.expect("delete");
+
+    // The reaper's path: the object alone moves to a terminal status, and
+    // the set follows that write too.
+    let reaped = StoredResponse::new(None);
+    let mut open = reaped.clone();
+    open.raw_response = json!({
+        "id": reaped.id.0, "background": true, "status": "in_progress", "output": [],
+        "_lease": {"owner": "gw_lost", "expires_at": 1},
+    });
+    storage.store_response(open).await.expect("store");
+    assert!(in_open_set(reaped.id.0.clone()).await);
+    let mut failed = storage
+        .get_response(&reaped.id)
+        .await
+        .expect("get")
+        .expect("stored")
+        .raw_response;
+    failed["status"] = json!("failed");
+    assert!(matches!(
+        storage
+            .update_response_object_if_open(&reaped.id, failed)
+            .await
+            .expect("conditional update"),
+        ConditionalStore::Stored
+    ));
+    assert!(
+        !in_open_set(reaped.id.0.clone()).await,
+        "the conditional object update that closed the record took it out of the set"
+    );
+    storage.delete_response(&reaped.id).await.expect("delete");
 }
 
 /// Under a schema that skips the object column there is no status to check:
