@@ -243,6 +243,20 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("qwen-drive-1.0-4b", GenerationPrompt::OpensTheThought),
     // DeepSeek V4.1 writes DSML and opens the thought in the prompt (`<think>`, no newline).
     ("deepseek-v4.1-flash", GenerationPrompt::OpensTheThought),
+    // The Kimi K2 line reads with one table, and each template ends the generation prompt its own
+    // way: K2 Instruct and Instruct-0905 write no thought; K2 Thinking ends at the turn's opener
+    // and the model writes its own `<think>`; K2.5, K2.6 and K2.7-Code open the thought in the
+    // prompt (`<think>`, no newline: the shared tail's is prompt text inside the thought, as for
+    // Kimi K3). K2.5 and K2.6 close it at once (`<think></think>`) when the request's `thinking`
+    // is false, a switch bellwether's requests do not set (they carry `enable_thinking`), so the
+    // recorded sets start inside the thought whatever the request says. bellwether holds the six
+    // manifests and no set yet: each slug is skipped with the notice until the pin holds its sets.
+    ("kimi-k2-instruct", GenerationPrompt::Plain),
+    ("kimi-k2-instruct-0905", GenerationPrompt::Plain),
+    ("kimi-k2-thinking", GenerationPrompt::ModelDecides),
+    ("kimi-k2.5", GenerationPrompt::AlwaysOpensTheThought),
+    ("kimi-k2.6", GenerationPrompt::AlwaysOpensTheThought),
+    ("kimi-k2.7-code", GenerationPrompt::AlwaysOpensTheThought),
     // Kimi K3 writes XTML and opens the thought in the prompt, whatever the request says: its
     // recorded requests carry no switch. The shared tail adds a newline the template does not
     // write; it is prompt text inside the thought and moves nothing.
@@ -591,12 +605,14 @@ impl Recorded for Table {
             | Self::MistralV13
             | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
-            // tagged ones' (no call comes of the fence); IQuest, DSML, LFM2.5, MiniMax M2,
-            // MiniCPM5, dots3 and Llama Nemotron read `</think>` but not `<tool_call>`.
+            // tagged ones' (no call comes of the fence); IQuest, DSML, Kimi K2, LFM2.5,
+            // MiniMax M2, MiniCPM5, dots3 and Llama Nemotron read `</think>` but not
+            // `<tool_call>`.
             Self::Ling | Self::Glm | Self::Glm4 => KNOWN_TAGGED_DIFFERENCES,
             Self::IQuest
             | Self::DeepSeekV4
             | Self::DeepSeekV4_1
+            | Self::KimiK2
             | Self::Lfm2_5
             | Self::MinimaxM2
             | Self::MiniCpm5
@@ -678,9 +694,10 @@ enum GenerationPrompt {
     /// Qwen3-Coder, Qwen2.5 and the instruct variants: `<|im_start|>assistant\n` and nothing more;
     /// the template has no thought.
     Plain,
-    /// MiniMax M3: nothing, whatever the request says (the template reads `thinking_mode`, which
-    /// the requests do not set), and the template has a thought: the model writes `<mm:think>`
-    /// itself or closes an empty thought with `</mm:think>` at once.
+    /// MiniMax M3 and Kimi K2 Thinking: nothing, whatever the request says (M3's template reads
+    /// `thinking_mode`, which the requests do not set; K2 Thinking's has no switch), and the
+    /// template has a thought: the model writes `<mm:think>` or `<think>` itself, or closes an
+    /// empty thought with the closer at once.
     ModelDecides,
     /// Laguna: the thought's opener alone, with no newline, when the request turns thinking on,
     /// so the output starts inside the thought; otherwise (the default) its closer alone, which
