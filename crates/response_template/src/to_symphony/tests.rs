@@ -1,14 +1,18 @@
 //! Unit tests of the lowering: the classes it resolves, the pieces each construct lowers into,
 //! and its answers against Python's `regex` module, through symphony's matcher.
 //!
-//! symphony's `tests/fixtures/shape/` records, with `regex` 2026.9.10, the module's `\w`, `\s` and
-//! `\d` tables, and what `match` gives for every pattern a call shape runs in the public response
+//! bellwether's shape patterns record, with the `regex` module at the version bellwether pins
+//! (`classes.json` names it), the module's `\w`, `\s` and `\d` tables, and what `match` gives for
+//! every pattern a call shape runs in the public response
 //! templates (the header after a call's marker, the text before its closing marker, and a
 //! parameter's tag with the ways its value ends) at every prefix of a set of texts. These tests
-//! read those recordings: the classes the lowering resolves are the module's, and each recorded
-//! pattern, lowered here from its source, answers as the module does.
+//! read those recordings, `patterns/` of the tree `BELLWETHER_FIXTURES` names (the one
+//! `bellwether unpack` writes from the commit CI pins): the classes the lowering resolves are the
+//! module's, and each recorded pattern, lowered here from its source, answers as the module does.
+//! Without the tree, or until the pin holds the patterns, the two tests that read them print why
+//! they skip and pass.
 
-use std::{fs, path::PathBuf};
+use std::{fs, path::Path};
 
 use serde::Deserialize;
 use symphony::shape::{Atom, Class, End, Matcher, Slot, Verdict};
@@ -17,13 +21,11 @@ use super::lower::{
     anchor_literals, chars, lower, lower_tag, pattern, split_close, split_open, Branches, Captures,
     Chars, EndItems, Item, Tag,
 };
-use crate::{pyre::Regex, to_symphony::refusal::Construct};
+use crate::{pyre::Regex, test_fixtures::patterns, to_symphony::refusal::Construct};
 
-/// A file of symphony's shape recordings.
-fn shape_fixture(name: &str) -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../symphony/tests/fixtures/shape")
-        .join(name);
+/// A file of bellwether's shape recordings.
+fn shape_fixture(patterns: &Path, name: &str) -> String {
+    let path = patterns.join(name);
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
@@ -59,8 +61,14 @@ fn escape(source: &str) -> Chars {
 
 #[test]
 fn the_classes_are_the_regex_modules_own() {
-    let tables: Tables = serde_json::from_str(&shape_fixture("classes.json")).unwrap();
-    assert_eq!(tables.regex, "2026.9.10");
+    let Some(patterns) = patterns() else {
+        return;
+    };
+    let tables: Tables = serde_json::from_str(&shape_fixture(&patterns, "classes.json")).unwrap();
+    assert!(
+        !tables.regex.is_empty(),
+        "the recording names the module's version"
+    );
     for (source, table) in [
         ("\\w", &tables.word),
         ("\\s", &tables.space),
@@ -204,10 +212,13 @@ fn lowered_recording(recorded: &Recorded) -> (symphony::shape::Pattern, Vec<End>
 /// match ends, what it captures, and which of a value's ends closed it.
 #[test]
 fn lowered_call_patterns_answer_as_the_regex_module_does() {
+    let Some(patterns) = patterns() else {
+        return;
+    };
     let word = escape("\\w").class();
     let (mut lowered, mut tags) = (0, 0);
     let mut answers = 0;
-    for line in shape_fixture("regex.jsonl").lines() {
+    for line in shape_fixture(&patterns, "regex.jsonl").lines() {
         let recorded: Recorded = serde_json::from_str(line).unwrap();
         let (pattern, ends) = lowered_recording(&recorded);
         assert_eq!(pattern.check(), Ok(()), "{}", recorded.id);

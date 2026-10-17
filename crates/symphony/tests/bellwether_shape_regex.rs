@@ -1,7 +1,7 @@
 //! The shape matcher against Python's `regex` module, the dialect response templates are written
 //! in.
 //!
-//! `scripts/generate_shape_fixtures.py` records, with `regex` and `DOTALL` as transformers compiles
+//! bellwether's `bellwether patterns` records, with `regex` and `DOTALL` as transformers compiles
 //! a template's patterns, what `match` says about every pattern a call shape runs in the public
 //! response templates (the header after a call's marker, the text before its closing marker, a
 //! parameter's tag with its value's ends), and about a few patterns on abstract tags for what no
@@ -9,7 +9,9 @@
 //! `value` capture, and which end closed a value. For a written text it also records the answer for
 //! every prefix taken as the whole text. Each pattern is lowered here by hand into a
 //! [`Pattern`] and its [`End`]s, next to the source it is lowered from, which must be the source
-//! the fixture recorded.
+//! the fixture recorded. The recordings are `patterns/regex.jsonl`, `patterns/search.jsonl` and
+//! `patterns/classes.json` of the tree `BELLWETHER_FIXTURES` names, the one `bellwether unpack`
+//! writes from the commit CI pins; without them each test prints why it skips and passes.
 //!
 //! Every text is fed at every chunking (whole, cut once at every place for a short one, a
 //! character at a time, thirty seeded plans), and the matcher's answer must be the recorded one.
@@ -24,7 +26,13 @@
 //! text. [`Suffix`] must give that start at every chunking, and, fed a written text a character
 //! at a time, the start recorded for each prefix as it goes.
 
-use std::{collections::BTreeMap, fs, path::PathBuf};
+#[expect(
+    dead_code,
+    reason = "the integration tests share these helpers, and this one reads the patterns' directory only"
+)]
+mod common;
+
+use std::{collections::BTreeMap, fs, path::Path};
 
 use serde::Deserialize;
 use symphony::shape::{Atom, Class, End, Matcher, Pattern, Slot, Suffix, Verdict};
@@ -103,10 +111,8 @@ struct Classes {
     clippy::panic,
     reason = "a fixture that cannot be read ends the test with its path"
 )]
-fn fixture(name: &str) -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/shape")
-        .join(name);
+fn fixture(patterns: &Path, name: &str) -> String {
+    let path = patterns.join(name);
     fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
 }
 
@@ -114,12 +120,12 @@ fn fixture(name: &str) -> String {
     clippy::expect_used,
     reason = "tables that cannot be read end the test"
 )]
-fn tables() -> Tables {
-    let tables: Tables = serde_json::from_str(&fixture("classes.json")).expect("classes.json");
-    assert_eq!(
-        (tables.regex.as_str(), tables.python.as_str()),
-        ("2026.9.10", "3.12")
-    );
+fn tables(patterns: &Path) -> Tables {
+    let tables: Tables =
+        serde_json::from_str(&fixture(patterns, "classes.json")).expect("classes.json");
+    // The module's version is the recording's to state (bellwether pins it); the Python it ran
+    // under is the one transformers' templates are written for.
+    assert_eq!(tables.python.as_str(), "3.12");
     tables
 }
 
@@ -566,7 +572,10 @@ fn replay(
 
 #[test]
 fn every_class_holds_what_the_regex_module_says_it_holds() {
-    let tables = tables();
+    let Some(patterns) = common::patterns() else {
+        return;
+    };
+    let tables = tables(&patterns);
     let classes = Classes::new(&tables);
     let probes: Vec<char> = tables.probes.chars().collect();
     for (source, members) in &tables.members {
@@ -597,12 +606,15 @@ fn every_class_holds_what_the_regex_module_says_it_holds() {
     reason = "the count of what was checked is test diagnostic output"
 )]
 fn the_matcher_answers_as_the_regex_module_does_at_every_chunking() {
-    let tables = tables();
+    let Some(dir) = common::patterns() else {
+        return;
+    };
+    let tables = tables(&dir);
     let classes = Classes::new(&tables);
     let mut patterns = 0;
     let mut texts = 0;
     let mut replays = 0;
-    for line in fixture("regex.jsonl").lines() {
+    for line in fixture(&dir, "regex.jsonl").lines() {
         let recorded: Recorded = serde_json::from_str(line).expect("a recorded pattern");
         let id = recorded.id.as_str();
         let lowered = lower(id, &classes);
@@ -659,7 +671,10 @@ fn the_matcher_answers_as_the_regex_module_does_at_every_chunking() {
             }
         }
     }
-    println!("{patterns} patterns, {texts} texts, {replays} replays: every answer the module's");
+    println!(
+        "{patterns} patterns, {texts} texts, {replays} replays: every answer the module's (regex {})",
+        tables.regex
+    );
     assert_eq!((patterns, texts), (24, 1_790), "the fixture as recorded");
 }
 
@@ -701,12 +716,15 @@ fn search(
     reason = "the count of what was checked is test diagnostic output"
 )]
 fn the_search_finds_where_the_regex_module_closes_a_region_at_every_chunking() {
-    let tables = tables();
+    let Some(dir) = common::patterns() else {
+        return;
+    };
+    let tables = tables(&dir);
     let classes = Classes::new(&tables);
     let mut trailers = 0;
     let mut texts = 0;
     let mut asked = 0;
-    for line in fixture("search.jsonl").lines() {
+    for line in fixture(&dir, "search.jsonl").lines() {
         let recorded: Searched = serde_json::from_str(line).expect("a recorded trailer");
         let id = recorded.id.as_str();
         let lowered = lower(id, &classes);
@@ -741,6 +759,9 @@ fn the_search_finds_where_the_regex_module_closes_a_region_at_every_chunking() {
             }
         }
     }
-    println!("{trailers} trailers, {texts} texts, {asked} answers: every start the module's");
+    println!(
+        "{trailers} trailers, {texts} texts, {asked} answers: every start the module's (regex {})",
+        tables.regex
+    );
     assert_eq!(trailers, 5, "the fixture as recorded");
 }

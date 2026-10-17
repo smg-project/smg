@@ -5,29 +5,36 @@
 //! request declares them. The parse and prose rows time the reading alone: the engine is made
 //! before the timed closure and dropped after it, and the setup rows time the making and the drop.
 //!
-//! The recorded slices of `tests/fixtures/slices/` add, per table family (plain text, one call,
-//! parallel calls, a thought and a call, a malformed call), the cost of the output fed whole, one
-//! character at a time and in pieces of about a token (`slice/<family>/{whole,chars,tokens}`, in
-//! bytes per second or tokens per second), the parts of the per-request setup (`setup/{table,
-//! validate,scanner,declared,engine}`) and the adapters over the events a slice produces
+//! The recorded slices of bellwether's hand-written sets (`tests/common/slices.rs`: per table
+//! family, plain text, one call, parallel calls, a thought and a call, and a malformed call cut
+//! from the one call's) add the cost of the output fed whole, one character at a time and in
+//! pieces of about a token (`slice/<family>/{whole,chars,tokens}`, in bytes per second or tokens
+//! per second), the parts of the per-request setup (`setup/{table,validate,scanner,declared,
+//! engine}`) and the adapters over the events a slice produces
 //! (`adapt/{chat_deltas,chat_message,messages_stream}`, per event). A slice row is the reading
-//! alone, the engine built outside the timing; `setup/engine` states the per-request setup.
+//! alone, the engine built outside the timing; `setup/engine` states the per-request setup. The
+//! slices are read from the tree `BELLWETHER_FIXTURES` names (the one `bellwether unpack` writes
+//! from the commit CI pins); without it the `slice` and `adapt` groups are skipped, and the run
+//! says so once.
 //!
 //! `cargo bench -p smg-symphony --bench throughput`; a filter narrows it (`-- parse/whole`). The
 //! README's evidence section says how a change produces its throughput row from these.
 #![allow(clippy::expect_used)]
 
-use std::{hint::black_box, time::Duration};
+use std::{hint::black_box, sync::OnceLock, time::Duration};
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use openai_protocol::common::{Function, Tool};
-use serde::Deserialize;
 use serde_json::json;
+use slices::{Slice, FAMILIES};
 use symphony::{
     adapt::{chat, messages},
     formats::Table,
     Declared, Engine, EngineFinish, Event, Events, Input, Parser, Scanner,
 };
+
+#[path = "../tests/common/slices.rs"]
+mod slices;
 
 /// One table under measurement: the prompt tail that places the output, the output, and the prompt
 /// tail that leaves the model in its answer, for the prose rows.
@@ -164,66 +171,30 @@ fn prose() -> String {
     text
 }
 
-/// The families a table's slices come in, in `tests/fixtures/slices/<table>.jsonl`.
-const FAMILIES: [&str; 5] = [
-    "plain",
-    "one_call",
-    "parallel_calls",
-    "thought_call",
-    "malformed",
-];
-
-/// One recorded output slice: its family, the prompt's tail that places it, and the output.
-#[derive(Deserialize)]
-struct Slice {
-    family: String,
-    prompt: String,
-    output: String,
-}
-
-/// The slices of the eight tables that stand for the call syntaxes, as the fixtures record them.
-fn recorded() -> Vec<(Table, Slice)> {
-    const FILES: [(&str, &str); 8] = [
-        (
-            "qwen3",
-            include_str!("../tests/fixtures/slices/qwen3.jsonl"),
-        ),
-        (
-            "qwen3_tagged",
-            include_str!("../tests/fixtures/slices/qwen3_tagged.jsonl"),
-        ),
-        ("glm", include_str!("../tests/fixtures/slices/glm.jsonl")),
-        (
-            "deepseek_v4.1",
-            include_str!("../tests/fixtures/slices/deepseek_v4.1.jsonl"),
-        ),
-        (
-            "kimi_k3",
-            include_str!("../tests/fixtures/slices/kimi_k3.jsonl"),
-        ),
-        (
-            "minimax_m3",
-            include_str!("../tests/fixtures/slices/minimax_m3.jsonl"),
-        ),
-        (
-            "gemma4",
-            include_str!("../tests/fixtures/slices/gemma4.jsonl"),
-        ),
-        (
-            "lfm2.5",
-            include_str!("../tests/fixtures/slices/lfm2.5.jsonl"),
-        ),
-    ];
-    FILES
-        .iter()
-        .flat_map(|(name, text)| {
-            let table = Table::named(name).expect("a table of the fixture's name");
-            text.lines().map(move |line| {
-                let slice: Slice = serde_json::from_str(line).expect("a slice per line");
-                (table, slice)
-            })
-        })
-        .collect()
+/// The slices of the eight tables that stand for the call syntaxes, read once from the tree
+/// `BELLWETHER_FIXTURES` names; empty, with the reason printed once, without the tree, and a
+/// group the tree has not recorded is named and left out.
+#[expect(
+    clippy::print_stderr,
+    reason = "the skip notice is the bench's diagnostic output"
+)]
+fn recorded() -> &'static [(Table, Slice)] {
+    static RECORDED: OnceLock<Vec<(Table, Slice)>> = OnceLock::new();
+    RECORDED.get_or_init(|| {
+        let Some(root) = slices::root() else {
+            eprintln!(
+                "skipping the slice and adapt rows: {} is not set; point it at the tree \
+                 `bellwether unpack` writes",
+                slices::ENV
+            );
+            return Vec::new();
+        };
+        let recorded = slices::recorded(&root).expect("the recorded slices");
+        for notice in &recorded.missing {
+            eprintln!("skipping {notice}");
+        }
+        recorded.slices
+    })
 }
 
 /// The table's terminals, longest first, so that the longest matches first.
@@ -492,8 +463,11 @@ fn setup(c: &mut Criterion) {
 }
 
 fn slices(c: &mut Criterion) {
-    let declared = declared();
     let recorded = recorded();
+    if recorded.is_empty() {
+        return;
+    }
+    let declared = declared();
     for family in FAMILIES {
         let mut group = c.benchmark_group(format!("slice/{family}"));
         group.warm_up_time(Duration::from_millis(500));
@@ -543,11 +517,15 @@ fn slices(c: &mut Criterion) {
 }
 
 fn adapters(c: &mut Criterion) {
+    let recorded = recorded();
+    if recorded.is_empty() {
+        return;
+    }
     let declared = declared();
     let mut group = c.benchmark_group("adapt");
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_millis(1500));
-    for (table, slice) in recorded()
+    for (table, slice) in recorded
         .iter()
         .filter(|(_, slice)| slice.family == "thought_call")
     {

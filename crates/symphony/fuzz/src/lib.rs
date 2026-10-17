@@ -11,7 +11,8 @@
 //! - conservation: the bytes of the events, in order, are the output, with `Finish` last;
 //! - what the parser says does not depend on the cuts: the whole replay and the pieces agree on
 //!   the content, each reasoning region, the dropped and malformed text by reason, the calls with
-//!   their arguments and the finish;
+//!   their ids and arguments and the finish (both replays count their call ids from one nonce,
+//!   as one request's engine does);
 //! - well-formedness: one start and one end per call, arguments only between them and a valid
 //!   JSON prefix after every fragment, reasoning text only inside a region, one `Finish` that
 //!   counts the calls; and a call its own terminal closed has arguments that are whole JSON,
@@ -22,8 +23,9 @@
 //! Every breach message starts with `breach <name>:`, the invariant's name, so that the artifacts
 //! of a campaign group by class.
 //!
-//! The seeds `prepare` writes from the crate's recorded output slices are cases in this layout,
-//! so a seed replays as its table's own output and every mutation of it stays a case.
+//! The seeds `prepare` writes from the recorded output slices of bellwether's hand-written sets
+//! ([`slices`], read from the tree `BELLWETHER_FIXTURES` names) are cases in this layout, so a
+//! seed replays as its table's own output and every mutation of it stays a case.
 
 #![forbid(unsafe_code)]
 
@@ -32,15 +34,20 @@ use std::{fs, io::Write, path::Path, sync::OnceLock};
 /// The macro a target is written with, so that the targets and the harness share one dependency.
 pub use libfuzzer_sys::fuzz_target;
 use openai_protocol::common::{Function, Tool};
-use serde::Deserialize;
 use serde_json::{json, Value};
 use symphony::{
     adapt::{chat, messages, responses},
     formats::Table,
     json::PartialJson,
-    Declared, DropReason, Engine, EngineFinish, Event, Events, FinishReason, Input,
+    CallIds, Declared, DropReason, Engine, EngineFinish, Event, Events, FinishReason, Input,
     MalformedReason, Parser,
 };
+
+/// The recorded output slices the seeds are made from, one definition with the crate's bench.
+#[path = "../../tests/common/slices.rs"]
+pub mod slices;
+
+pub use slices::{Recorded, Slice};
 
 /// The targets and the table each fuzzes; `None` lets the input's last byte pick one of
 /// [`Table::ALL`]. `prepare` writes one dictionary per entry; a test keeps the entries and the
@@ -287,46 +294,13 @@ pub fn declared_names() -> Vec<&'static str> {
     ]
 }
 
-/// One recorded output slice of a table family, as the crate's fixtures record it.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub struct Slice {
-    pub family: String,
-    pub prompt: String,
-    pub output: String,
-}
-
-/// The slices under `dir`: one `<table>.jsonl` per table, one slice per line.
-pub fn slices(dir: &Path) -> Result<Vec<(Table, String, Slice)>, String> {
-    let mut out = Vec::new();
-    let entries = fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let mut paths: Vec<_> = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
-        .collect();
-    paths.sort();
-    for path in paths {
-        let name = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .ok_or_else(|| format!("{}: no table name", path.display()))?;
-        let table = Table::named(name)
-            .ok_or_else(|| format!("{}: no table is named {name}", path.display()))?;
-        let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        for (line, json) in text.lines().enumerate() {
-            let slice: Slice = serde_json::from_str(json)
-                .map_err(|e| format!("{}:{}: {e}", path.display(), line + 1))?;
-            out.push((table, slice.family.clone(), slice));
-        }
-    }
-    Ok(out)
-}
-
-/// What a run starts from, as [`prepare`] counts it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a run starts from, as [`prepare`] counts it, and the groups the tree had not recorded,
+/// each a notice for the caller to print.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Prepared {
     pub dictionaries: usize,
     pub seeds: usize,
+    pub missing: Vec<String>,
 }
 
 /// libFuzzer's longest dictionary word, in bytes: a longer entry it skips without a word.
@@ -335,8 +309,9 @@ pub const DICTIONARY_WORD_MAX: usize = 64;
 /// Writes what a run starts from under `out`: `dict/<target>.dict`, a dictionary per target in
 /// libFuzzer's syntax (every terminal of its table, of every table for `any_table`, the declared
 /// names and the atoms of the call syntaxes), and `seeds/<table>/<family>`, a seed per recorded
-/// slice under `fixtures`, each the case that replays the slice ([`encode`]).
-pub fn prepare(fixtures: &Path, out: &Path) -> Result<Prepared, String> {
+/// slice of the groups recorded under `root`, the tree `BELLWETHER_FIXTURES` names
+/// ([`slices::recorded`]), each the case that replays the slice ([`encode`]).
+pub fn prepare(root: &Path, out: &Path) -> Result<Prepared, String> {
     let dict = out.join("dict");
     fs::create_dir_all(&dict).map_err(|e| format!("{}: {e}", dict.display()))?;
     for (target, table) in TARGETS {
@@ -366,18 +341,20 @@ pub fn prepare(fixtures: &Path, out: &Path) -> Result<Prepared, String> {
             writeln!(file, "{}", quoted(&entry)).map_err(|e| format!("{}: {e}", path.display()))?;
         }
     }
+    let recorded = slices::recorded(root)?;
     let mut seeds = 0;
-    for (table, family, slice) in slices(fixtures)? {
+    for (table, slice) in &recorded.slices {
         let dir = out.join("seeds").join(table.name());
         fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let path = dir.join(family);
-        let seed = encode(table, &slice.prompt, &slice.output)?;
+        let path = dir.join(&slice.family);
+        let seed = encode(*table, &slice.prompt, &slice.output)?;
         fs::write(&path, seed).map_err(|e| format!("{}: {e}", path.display()))?;
         seeds += 1;
     }
     Ok(Prepared {
         dictionaries: TARGETS.len(),
         seeds,
+        missing: recorded.missing,
     })
 }
 
@@ -434,8 +411,14 @@ struct Replayed {
 
 /// `case` through a new engine, its output cut at `cuts`, the events drained after every feed as
 /// a stream's reader drains them.
+/// The nonce both replays of a case count their call ids from: an engine draws its own at random
+/// (one request, one nonce), so two engines over one output would name the same call differently
+/// and the chunking check could never compare them.
+const NONCE: &str = "0123456789abcdef00000000";
+
 fn replay(case: &Case, cuts: &[usize]) -> Replayed {
-    let mut engine = Engine::shared(case.table.shared(), declared_shared());
+    let ids = CallIds::from_nonce(NONCE).unwrap_or_else(CallIds::fresh);
+    let mut engine = Engine::with_call_ids(case.table.shared(), declared_shared(), ids);
     let mut out = Events::new();
     let mut events = Vec::new();
     let delta = |text: &'static str| Input::Delta {
@@ -836,21 +819,73 @@ fn check_adapters(case: &Case, whole: &[Event], pieces: &[Event]) {
 mod tests {
     use super::*;
 
-    fn fixtures() -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/slices")
+    /// The tree `BELLWETHER_FIXTURES` names, or None with the notice a skipped test prints: the
+    /// seeds are read from bellwether's recorded sets, which the repository does not hold.
+    fn fixtures() -> Option<std::path::PathBuf> {
+        let root = slices::root();
+        if root.is_none() {
+            eprintln!(
+                "skipping: {} is not set; point it at the tree `bellwether unpack` writes",
+                slices::ENV
+            );
+        }
+        root
+    }
+
+    /// The recorded slices under `root`, every group the tree lacks named, and every recorded
+    /// group checked to yield the families a seed set needs: plain text, one call, parallel calls
+    /// and the malformed call cut from the one call's (a thought and a call where the group's
+    /// template has a thought).
+    fn recorded_slices(root: &Path) -> Result<Recorded, String> {
+        let recorded = slices::recorded(root)?;
+        for notice in &recorded.missing {
+            eprintln!("skipping {notice}");
+        }
+        if recorded.slices.is_empty() {
+            return Err(format!(
+                "none of the eight groups is recorded under {}",
+                root.display()
+            ));
+        }
+        for group in &slices::GROUPS {
+            let families: Vec<&str> = recorded
+                .slices
+                .iter()
+                .filter(|(table, _)| table.name() == group.table)
+                .map(|(_, slice)| slice.family.as_str())
+                .collect();
+            if families.is_empty() {
+                continue;
+            }
+            println!("{}: {}", group.table, families.join(", "));
+            for family in ["plain", "one_call", "parallel_calls", "malformed"] {
+                if !families.contains(&family) {
+                    return Err(format!(
+                        "{}: no {family} slice among {families:?}",
+                        group.table
+                    ));
+                }
+            }
+        }
+        Ok(recorded)
     }
 
     #[test]
     fn every_recorded_slice_holds_the_contract() -> Result<(), String> {
-        let slices = slices(&fixtures())?;
-        assert_eq!(slices.len(), 40, "eight tables, five families each");
-        for (table, family, slice) in &slices {
+        let Some(root) = fixtures() else {
+            return Ok(());
+        };
+        for (table, slice) in &recorded_slices(&root)?.slices {
             let data = encode(*table, &slice.prompt, &slice.output)?;
             let case = decode(&data, None);
-            assert_eq!(case.table, *table, "{family}");
-            assert_eq!(case.prompt, slice.prompt, "{family}");
-            assert_eq!(case.output, slice.output, "{family}");
-            assert!(!case.cuts.is_empty(), "{family}: a seed replays in pieces");
+            assert_eq!(case.table, *table, "{}", slice.family);
+            assert_eq!(case.prompt, slice.prompt, "{}", slice.family);
+            assert_eq!(case.output, slice.output, "{}", slice.family);
+            assert!(
+                !case.cuts.is_empty(),
+                "{}: a seed replays in pieces",
+                slice.family
+            );
             check(&case);
             check(&decode(&data, Some(*table)));
         }
@@ -875,29 +910,44 @@ mod tests {
 
     #[test]
     fn the_seeds_prepare_writes_decode_as_the_slices_and_its_words_fit() -> Result<(), String> {
+        let Some(root) = fixtures() else {
+            return Ok(());
+        };
+        let recorded = recorded_slices(&root)?;
         let out =
             std::env::temp_dir().join(format!("symphony-fuzz-prepare-{}", std::process::id()));
-        let prepared = prepare(&fixtures(), &out)?;
-        assert_eq!(
-            prepared,
-            Prepared {
-                dictionaries: TARGETS.len(),
-                seeds: 40
-            }
-        );
-        for (table, family, slice) in slices(&fixtures())? {
-            let path = out.join("seeds").join(table.name()).join(&family);
+        let prepared = prepare(&root, &out)?;
+        assert_eq!(prepared.dictionaries, TARGETS.len());
+        assert_eq!(prepared.seeds, recorded.slices.len());
+        assert_eq!(prepared.missing, recorded.missing);
+        for (table, slice) in &recorded.slices {
+            let family = slice.family.as_str();
+            let path = out.join("seeds").join(table.name()).join(family);
             let data = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-            for case in [decode(&data, None), decode(&data, Some(table))] {
-                assert_eq!(case.table, table, "{family}");
+            for case in [decode(&data, None), decode(&data, Some(*table))] {
+                assert_eq!(case.table, *table, "{family}");
                 assert_eq!(case.prompt, slice.prompt, "{family}");
                 assert_eq!(case.output, slice.output, "{family}");
                 assert_eq!(case.finish, EngineFinish::Stop, "{family}");
                 assert!(!case.cuts.is_empty(), "{family}: a seed replays in pieces");
             }
         }
+        fs::remove_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+        Ok(())
+    }
+
+    #[test]
+    fn the_dictionaries_prepare_writes_fit_libfuzzers_words() -> Result<(), String> {
+        // A tree with no group recorded: the dictionaries come from the tables alone.
+        let out = std::env::temp_dir().join(format!("symphony-fuzz-dict-{}", std::process::id()));
+        let empty = out.join("empty-tree");
+        fs::create_dir_all(&empty).map_err(|e| format!("{}: {e}", empty.display()))?;
+        let prepared = prepare(&empty, &out.join("prepared"))?;
+        assert_eq!((prepared.dictionaries, prepared.seeds), (TARGETS.len(), 0));
+        assert_eq!(prepared.missing.len(), slices::GROUPS.len());
+        let out_dir = out.join("prepared");
         for (target, _) in TARGETS {
-            let path = out.join("dict").join(format!("{target}.dict"));
+            let path = out_dir.join("dict").join(format!("{target}.dict"));
             let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
             assert!(text.lines().count() > 1, "{target}: an empty dictionary");
             for line in text.lines() {

@@ -17,8 +17,8 @@
 //! The run is opt-in: `BELLWETHER_FIXTURES` points at the `fixtures/` directory of a bellwether
 //! checkout; without it the test prints a skip notice and passes. `SYMPHONY_SAMPLE_EVERY=n`
 //! replays every n-th case of each recorded set, the same slice every run, for a CI job that
-//! cannot afford a benchmark-scale set whole, and the hand-written `common` set whole; a run
-//! that leaves it unset or empty replays every case. A second parity test replays
+//! cannot afford a benchmark-scale set whole, and the hand-written sets (`common`, `turns`)
+//! whole; a run that leaves it unset or empty replays every case. A second parity test replays
 //! every Qwen checkpoint bellwether has recorded ([`MODELS`]): the Qwen3 table with the JSON call
 //! syntax, the same table with the tagged syntax (Qwen 3.5 and later, Qwen3-Coder), typed by each
 //! case's request tools, and the Qwen2.5 table, each after the prompt tail its template leaves,
@@ -109,7 +109,8 @@ const FIXTURES_ENV: &str = "BELLWETHER_FIXTURES";
 /// Replay every n-th case of each recorded set, counted from the set's first, when this is set
 /// and not empty: a deterministic slice of a benchmark-scale set, so CI can replay a set of fifty
 /// thousand cases in minutes, and a nightly run, which leaves it unset, replays them all. The
-/// hand-written [`COMMON_SET`] is replayed whole whatever the step. The run says so.
+/// hand-written sets ([`HAND_WRITTEN_SETS`]) are replayed whole whatever the step. The run says
+/// so.
 const SAMPLE_ENV: &str = "SYMPHONY_SAMPLE_EVERY";
 /// Set to anything but empty or `0`, the per-case report is printed on stdout as well.
 const VERBOSE_ENV: &str = "BELLWETHER_VERBOSE";
@@ -118,9 +119,10 @@ const REPORT_DIR_ENV: &str = "BELLWETHER_REPORT_DIR";
 /// How many differing cases of a model stdout shows, and how many failures the run's message
 /// lists; the rest are in the per-case report.
 const SHOWN: usize = 20;
-/// The hand-written set in every slug's directory: the probes (bellwether #16) and the parallel
-/// calls, a few cases that a sample must not thin.
-const COMMON_SET: &str = "common";
+/// The hand-written sets in every slug's directory, `common` (the probes, bellwether #16, and the
+/// parallel calls) and `turns` (the turn shapes a table reads): a few cases that a sample must
+/// not thin.
+const HAND_WRITTEN_SETS: &[&str] = &["common", "turns"];
 /// Up to this many bytes an output is also replayed at every two-way split, which costs as many
 /// replays as it has characters; past it the sampled plans alone keep a case's cost linear in
 /// its size (a 252 KB swebench case took 80 minutes and 13 GB under every split).
@@ -2730,14 +2732,19 @@ fn sample_note(every: usize) -> String {
     match every {
         1 => String::new(),
         every => {
-            format!(" (1 in {every} cases of each recorded set, {COMMON_SET} whole, {SAMPLE_ENV})")
+            format!(
+                " (1 in {every} cases of each recorded set, the hand-written sets whole, {SAMPLE_ENV})"
+            )
         }
     }
 }
 
-/// The step for one set's file: the hand-written [`COMMON_SET`] is never thinned.
+/// The step for one set's file: the hand-written sets ([`HAND_WRITTEN_SETS`]) are never thinned.
 fn step_for(file: &std::path::Path, every: usize) -> usize {
-    if file.file_stem().is_some_and(|stem| stem == COMMON_SET) {
+    if file
+        .file_stem()
+        .is_some_and(|stem| HAND_WRITTEN_SETS.iter().any(|set| stem == *set))
+    {
         1
     } else {
         every
@@ -2753,7 +2760,7 @@ fn kept(index: usize, every: usize) -> bool {
 /// The cases a slug's set files gave.
 struct Cases {
     /// The cases to replay, in the files' order, each recorded set sampled by [`SAMPLE_ENV`] and
-    /// the [`COMMON_SET`] whole.
+    /// the [`HAND_WRITTEN_SETS`] whole.
     fixtures: Vec<Fixture>,
     /// Every case's id, in the same order, before the sample thinned them: what the check that a
     /// listed difference is still among the cases reads, so that a sample never fails it.
@@ -3350,7 +3357,7 @@ fn a_summary_names_its_sample_and_a_whole_run_says_nothing() {
     assert_eq!(sample_note(1), "");
     assert_eq!(
         sample_note(2),
-        " (1 in 2 cases of each recorded set, common whole, SYMPHONY_SAMPLE_EVERY)"
+        " (1 in 2 cases of each recorded set, the hand-written sets whole, SYMPHONY_SAMPLE_EVERY)"
     );
 }
 

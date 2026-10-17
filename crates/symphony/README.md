@@ -125,9 +125,11 @@ where one existed, and was checked in review against the recorded calls where no
 `cargo bench -p smg-symphony --bench throughput` measures what a table costs on its own: the bytes
 per second of a turn fed whole and in eight-byte pieces, one subject per call syntax, the bytes per
 second of prose with no marker in it, and the construction of an engine, which is the parser's
-per-request setup. Over the recorded slices of `tests/fixtures/slices/` (per table, one output of
-each family: plain text, one call, parallel calls, a thought and a call, a malformed call) it
-measures the output fed whole, one character at a time and in pieces of about a token
+per-request setup. Over the recorded slices of bellwether's hand-written sets (per table, one
+output of each family: plain text, one call, parallel calls, a thought and a call, and a malformed
+call cut from the one call's; `tests/common/slices.rs` reads them from the tree
+`BELLWETHER_FIXTURES` names, and the rows are skipped with a notice without it) it measures the
+output fed whole, one character at a time and in pieces of about a token
 (`slice/<family>/{whole,chars,tokens}`, in bytes or tokens per second), the parts of the setup
 (`setup/{table,validate,scanner,declared,engine}`) and the adapters over the events a slice
 produces (`adapt/{chat_deltas,chat_message,messages_stream}`, per event). A change to the decode
@@ -142,8 +144,10 @@ three interleaved repeats on one pinned core, against `main` built the same way.
    `cargo bench -p smg-symphony --bench throughput --no-run` prints the binary's path. The two
    binaries must carry the same rows: where `main`'s bench lacks a group the change measures (the
    `slice` and `adapt` groups are this harness's), copy the change's `crates/symphony/benches/`
-   and `crates/symphony/tests/fixtures/slices/` into the `main` checkout before building there,
-   so each binary reads its own crate through one harness.
+   and `crates/symphony/tests/common/slices.rs` into the `main` checkout before building there,
+   so each binary reads its own crate through one harness. Both runs read the slices from one
+   unpacked bellwether tree, the commit `.github/versions/bellwether.ref` pins:
+   `BELLWETHER_FIXTURES=<tree>` on both commands.
 2. Run the two binaries interleaved, three repeats each, pinned to one core, saving one baseline
    per repeat, with the directory the baselines go to named outright (a bench binary run on its
    own, outside `cargo bench`, writes to `./target/criterion` of the current directory otherwise):
@@ -166,9 +170,10 @@ says so; a regression in a row is a regression, reverted before it is explained.
 `fuzz/` holds coverage-guided fuzz targets for the engine over every table (cargo-fuzz on a
 nightly toolchain, a workspace of its own): the fuzzer's bytes, cut into deltas it also chooses,
 are replayed whole and in pieces and checked against the contract on every input, with the
-recorded slices of `tests/fixtures/slices/` (one output per table and family: plain text, one
-call, parallel calls, a thought and a call, a malformed call) as the seeds. `fuzz/README.md` says
-how a target is run, what it checks and how a crash is minimized and filed; the nightly workflow
+recorded slices of bellwether's hand-written sets (one output per table and family: plain text,
+one call, parallel calls, a thought and a call, a malformed call cut from the one call's) as the
+seeds, read from the fixture tree at fuzz time. `fuzz/README.md` says how a target is run, what
+it checks, where its seeds come from and how a crash is minimized and filed; the nightly workflow
 runs every target for a bounded time.
 
 ## Models

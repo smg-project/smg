@@ -21,7 +21,7 @@
 )]
 mod common;
 
-use std::{fs, path::PathBuf};
+use std::{fs, path::Path};
 
 use common::{bytes_of, chunkings, replay_after};
 use openai_protocol::common::{Function, Tool};
@@ -47,15 +47,24 @@ struct Case {
     calls: &'static [(&'static str, &'static str)],
 }
 
-/// Python `regex`'s `\w`, as `tests/fixtures/shape/classes.json` records it: the class a
-/// template's `\w` holds, which whoever lowers a template resolves into ranges.
+/// Python `regex`'s `\w` and `\s`, as bellwether's shape patterns record them
+/// (`patterns/classes.json` of the tree `BELLWETHER_FIXTURES` names): the classes a template's
+/// `\w` and `\s` hold, which whoever lowers a template resolves into ranges. None, with the
+/// reason printed, when the tree or the patterns are not there: the tables spelled with them are
+/// not built, and their tests pass with the notice.
+fn classes() -> Option<(Class, Class)> {
+    let patterns = common::patterns()?;
+    Some((python_word(&patterns), python_space(&patterns)))
+}
+
+/// Python `regex`'s `\w`, as `classes.json` under `patterns` records it.
 #[expect(
     clippy::panic,
     clippy::expect_used,
     reason = "a fixture that cannot be read ends the test with its path"
 )]
-fn python_word() -> Class {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shape/classes.json");
+fn python_word(patterns: &Path) -> Class {
+    let path = patterns.join("classes.json");
     let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let tables: Value = serde_json::from_str(&text).expect("classes.json");
     let ranges = tables["word"]
@@ -80,8 +89,7 @@ fn python_word() -> Class {
 /// JSON value; its close, `<|call|>`, is a stop token, so the stream's stop closes it. The stop
 /// tokens are `<|return|>`, `<|endoftext|>` and `<|call|>` (the `generation_config.json` of
 /// `openai/gpt-oss-20b`).
-fn gpt_oss() -> Format {
-    let word = python_word();
+fn gpt_oss(word: &Class) -> Format {
     let shape = shape::intern(CallShape {
         header: Pattern(
             [
@@ -106,7 +114,7 @@ fn gpt_oss() -> Format {
         name: NameSource::Header,
         arguments: Arguments::Json(Dialect::default()),
         trailer: Pattern::default(),
-        word,
+        word: word.clone(),
         hold_cap: 8192,
     });
     Format::new("gpt-oss test template")
@@ -238,14 +246,14 @@ fn none_of(chars: &str) -> Class {
     Class::new(chars.chars().map(|c| (c, c)), true)
 }
 
-/// Python `regex`'s `\s`, as `tests/fixtures/shape/classes.json` records it.
+/// Python `regex`'s `\s`, as `classes.json` under `patterns` records it.
 #[expect(
     clippy::panic,
     clippy::expect_used,
     reason = "a fixture that cannot be read ends the test with its path"
 )]
-fn python_space() -> Class {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shape/classes.json");
+fn python_space(patterns: &Path) -> Class {
+    let path = patterns.join("classes.json");
     let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let tables: Value = serde_json::from_str(&text).expect("classes.json");
     let ranges = tables["space"]
@@ -272,8 +280,7 @@ fn python_space() -> Class {
 /// and as text otherwise, which the values here read the same as the crate's own reading does.
 /// `<|end_of_text|>` and `<|eot|>` are the stop tokens (its `generation_config.json`); `<|eom|>`
 /// ends a message inside the turn, and the model goes on after it.
-fn muse() -> Format {
-    let word = python_word();
+fn muse(word: &Class) -> Format {
     let any = Class::any();
     let shape = shape::intern(CallShape {
         header: Pattern(
@@ -316,7 +323,7 @@ fn muse() -> Format {
             },
         },
         trailer: Pattern::default(),
-        word,
+        word: word.clone(),
         hold_cap: 8192,
     });
     Format::new("muse glimmer template")
@@ -354,8 +361,7 @@ fn muse() -> Format {
 /// its parameters are tags read as `finditer` reads `<parameter=(?P<key>[^>\n]+)>\s*`, then the
 /// value up to `\s*</parameter>`, each value the text, typed by the request's tools.
 /// `<|im_end|>` and `<|endoftext|>` are the stop tokens.
-fn serve_qwen3_5() -> Format {
-    let space = python_space();
+fn serve_qwen3_5(word: &Class, space: &Class) -> Format {
     let name = none_of(">\n");
     let shape = shape::intern(CallShape {
         header: Pattern(
@@ -392,8 +398,14 @@ fn serve_qwen3_5() -> Format {
             .into(),
             values: ValueParser::Raw,
         },
-        trailer: Pattern([Atom::Lit("</function>".into()), run(space, 0, true, None)].into()),
-        word: python_word(),
+        trailer: Pattern(
+            [
+                Atom::Lit("</function>".into()),
+                run(space.clone(), 0, true, None),
+            ]
+            .into(),
+        ),
+        word: word.clone(),
         hold_cap: 8192,
     });
     Format::new("qwen 3.5 serve template")
@@ -966,7 +978,10 @@ fn check_declared(name: &str, format: &Format, case: &Case, declared: &Declared)
 
 #[test]
 fn gpt_oss_test_template_reads_as_hugging_face_reads_it() {
-    let format = gpt_oss();
+    let Some((word, _)) = classes() else {
+        return;
+    };
+    let format = gpt_oss(&word);
     for case in GPT_OSS {
         check("gpt-oss", &format, case);
     }
@@ -998,7 +1013,10 @@ fn inkling_test_template_reads_as_hugging_face_reads_it() {
 
 #[test]
 fn muse_glimmer_template_reads_as_hugging_face_reads_it() {
-    let format = muse();
+    let Some((word, _)) = classes() else {
+        return;
+    };
+    let format = muse(&word);
     for case in MUSE {
         check("muse", &format, case);
     }
@@ -1006,7 +1024,10 @@ fn muse_glimmer_template_reads_as_hugging_face_reads_it() {
 
 #[test]
 fn qwen3_5_serve_template_reads_as_hugging_face_reads_it() {
-    let (format, declared) = (serve_qwen3_5(), weather());
+    let Some((word, space)) = classes() else {
+        return;
+    };
+    let (format, declared) = (serve_qwen3_5(&word, &space), weather());
     for case in SERVE_QWEN3_5 {
         check_declared("qwen 3.5 serve", &format, case, &declared);
     }
@@ -1033,13 +1054,16 @@ fn a_field_written_twice_reads_as_both_stays() {
 
 #[test]
 fn every_table_here_is_valid_and_names_its_stop_tokens() {
+    let Some((word, space)) = classes() else {
+        return;
+    };
     for (format, stops) in [
-        (gpt_oss(), &[][..]),
+        (gpt_oss(&word), &[][..]),
         (gemma4(), &["<|tool_response>"][..]),
         (ernie(), &[][..]),
         (inkling(), &[][..]),
-        (muse(), &["<|eot|>"][..]),
-        (serve_qwen3_5(), &[][..]),
+        (muse(&word), &["<|eot|>"][..]),
+        (serve_qwen3_5(&word, &space), &[][..]),
     ] {
         assert_eq!(format.validate(), Ok(()), "{}", format.name());
         for stop in stops {
@@ -1048,11 +1072,11 @@ fn every_table_here_is_valid_and_names_its_stop_tokens() {
     }
     // A stop token that is not a terminal is not kept, and a terminal that ends a message inside
     // the turn is not a stop token.
-    assert!(gpt_oss().is_stop_token("<|call|>"));
-    assert!(!gpt_oss().is_stop_token("<|return|>"));
+    assert!(gpt_oss(&word).is_stop_token("<|call|>"));
+    assert!(!gpt_oss(&word).is_stop_token("<|return|>"));
     assert!(!gemma4().is_stop_token("<turn|>"));
     assert!(!inkling().is_stop_token("<|end_message|>"));
-    assert!(!muse().is_stop_token("<|eom|>"));
+    assert!(!muse(&word).is_stop_token("<|eom|>"));
 }
 
 // The structural tags of the shaped calls above, written from their chat templates' layouts.
@@ -1472,10 +1496,13 @@ fn accepts(grammar: &Grammar, text: &str) -> bool {
 
 #[test]
 fn every_layout_here_fits_its_table() {
-    assert_eq!(muse_layout().check(&muse()), Ok(()));
-    assert_eq!(serve_qwen3_5_layout().check(&serve_qwen3_5()), Ok(()));
+    let Some((word, space)) = classes() else {
+        return;
+    };
+    let (muse, qwen) = (muse(&word), serve_qwen3_5(&word, &space));
+    assert_eq!(muse_layout().check(&muse), Ok(()));
+    assert_eq!(serve_qwen3_5_layout().check(&qwen), Ok(()));
     // Recorded with the chat template, read back through the table: the probe's calls.
-    let muse = muse();
     assert_eq!(
         read_probe(&muse, MUSE_PROMPT, MUSE_CALLS),
         json!({"reasoning": null, "content": null, "calls": probe_calls(true)})
@@ -1484,7 +1511,6 @@ fn every_layout_here_fits_its_table() {
         read_probe(&muse, MUSE_PROMPT, MUSE_ONE_CALL),
         json!({"reasoning": null, "content": null, "calls": probe_calls(false)})
     );
-    let qwen = serve_qwen3_5();
     assert_eq!(
         read_probe(&qwen, QWEN3_5_PROMPT_THINKING, QWEN3_5_CALLS_THINKING),
         json!({"reasoning": null, "content": null, "calls": probe_calls(true)})
@@ -1525,7 +1551,10 @@ fn modes(format: &Format, reasoning_open: bool) -> [Grammar; 4] {
 
 #[test]
 fn muse_glimmers_tags_take_what_its_chat_template_writes() {
-    let format = muse().with_layout(muse_layout());
+    let Some((word, _)) = classes() else {
+        return;
+    };
+    let format = muse(&word).with_layout(muse_layout());
     assert!(!format.reasoning_open(MUSE_PROMPT));
     let [required, named, one, answer] = modes(&format, false);
     assert!(accepts(&required, MUSE_CALLS));
@@ -1575,7 +1604,10 @@ fn muse_glimmers_tags_take_what_its_chat_template_writes() {
 
 #[test]
 fn qwen3_5s_tags_take_what_its_chat_template_writes() {
-    let format = serve_qwen3_5().with_layout(serve_qwen3_5_layout());
+    let Some((word, space)) = classes() else {
+        return;
+    };
+    let format = serve_qwen3_5(&word, &space).with_layout(serve_qwen3_5_layout());
     // The default prompt leaves the thought open: the tag follows a prefix, never a refusal.
     assert!(format.reasoning_open(QWEN3_5_PROMPT_THINKING));
     assert!(!format.reasoning_open(QWEN3_5_PROMPT));
@@ -1637,8 +1669,11 @@ fn qwen3_5s_tag_is_the_tagged_tables_where_their_layouts_agree() {
     // differ only where the hand-written tag allows a spelling the chat template does not write:
     // a newline on either side of a value that is not text, which the template always writes, and
     // JSON's `true` beside Python's words. A string's text holds the same markers.
+    let Some((word, space)) = classes() else {
+        return;
+    };
     let tools = probe_tools();
-    let shaped = serve_qwen3_5()
+    let shaped = serve_qwen3_5(&word, &space)
         .with_layout(serve_qwen3_5_layout())
         .grammar(&tools, true, false)
         .expect("a tag")
