@@ -5,15 +5,29 @@
 //! request declares them. The parse and prose rows time the reading alone: the engine is made
 //! before the timed closure and dropped after it, and the setup rows time the making and the drop.
 //!
-//! `cargo bench -p smg-symphony --bench throughput`; a filter narrows it (`-- parse/whole`).
+//! The recorded slices of `tests/fixtures/slices/` add, per table family (plain text, one call,
+//! parallel calls, a thought and a call, a malformed call), the cost of the output fed whole, one
+//! character at a time and in pieces of about a token (`slice/<family>/{whole,chars,tokens}`, in
+//! bytes per second or tokens per second), the parts of the per-request setup (`setup/{table,
+//! validate,scanner,declared,engine}`) and the adapters over the events a slice produces
+//! (`adapt/{chat_deltas,chat_message,messages_stream}`, per event). A slice row includes one
+//! engine's setup; `setup/engine` says how much of it that is.
+//!
+//! `cargo bench -p smg-symphony --bench throughput`; a filter narrows it (`-- parse/whole`). The
+//! README's evidence section says how a change produces its throughput row from these.
 #![allow(clippy::expect_used)]
 
-use std::hint::black_box;
+use std::{hint::black_box, time::Duration};
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use openai_protocol::common::{Function, Tool};
+use serde::Deserialize;
 use serde_json::json;
-use symphony::{formats::Table, Declared, Engine, EngineFinish, Events, Input, Parser};
+use symphony::{
+    adapt::{chat, messages},
+    formats::Table,
+    Declared, Engine, EngineFinish, Event, Events, Input, Parser, Scanner,
+};
 
 /// One table under measurement: the prompt tail that places the output, the output, and the prompt
 /// tail that leaves the model in its answer, for the prose rows.
@@ -148,6 +162,140 @@ fn prose() -> String {
         text.push_str(sentence);
     }
     text
+}
+
+/// The families a table's slices come in, in `tests/fixtures/slices/<table>.jsonl`.
+const FAMILIES: [&str; 5] = [
+    "plain",
+    "one_call",
+    "parallel_calls",
+    "thought_call",
+    "malformed",
+];
+
+/// One recorded output slice: its family, the prompt's tail that places it, and the output.
+#[derive(Deserialize)]
+struct Slice {
+    family: String,
+    prompt: String,
+    output: String,
+}
+
+/// The slices of the eight tables that stand for the call syntaxes, as the fixtures record them.
+fn recorded() -> Vec<(Table, Slice)> {
+    const FILES: [(&str, &str); 8] = [
+        (
+            "qwen3",
+            include_str!("../tests/fixtures/slices/qwen3.jsonl"),
+        ),
+        (
+            "qwen3_tagged",
+            include_str!("../tests/fixtures/slices/qwen3_tagged.jsonl"),
+        ),
+        ("glm", include_str!("../tests/fixtures/slices/glm.jsonl")),
+        (
+            "deepseek_v4.1",
+            include_str!("../tests/fixtures/slices/deepseek_v4.1.jsonl"),
+        ),
+        (
+            "kimi_k3",
+            include_str!("../tests/fixtures/slices/kimi_k3.jsonl"),
+        ),
+        (
+            "minimax_m3",
+            include_str!("../tests/fixtures/slices/minimax_m3.jsonl"),
+        ),
+        (
+            "gemma4",
+            include_str!("../tests/fixtures/slices/gemma4.jsonl"),
+        ),
+        (
+            "lfm2.5",
+            include_str!("../tests/fixtures/slices/lfm2.5.jsonl"),
+        ),
+    ];
+    FILES
+        .iter()
+        .flat_map(|(name, text)| {
+            let table = Table::named(name).expect("a table of the fixture's name");
+            text.lines().map(move |line| {
+                let slice: Slice = serde_json::from_str(line).expect("a slice per line");
+                (table, slice)
+            })
+        })
+        .collect()
+}
+
+/// The table's terminals, longest first, so that the longest matches first.
+fn terminals(table: Table) -> Vec<String> {
+    let format = table.format();
+    let mut terminals: Vec<String> = format.terminal_texts().map(str::to_owned).collect();
+    terminals.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    terminals.dedup();
+    terminals
+}
+
+/// `text` cut as a tokenizer would, near enough for a cost per token: a terminal of the table is
+/// one piece, and the text between is cut into pieces of up to four characters that end before a
+/// space, a newline or a terminal.
+fn tokens<'a>(text: &'a str, terminals: &[String]) -> Vec<&'a str> {
+    let terminal_at = |at: usize| {
+        terminals
+            .iter()
+            .find(|terminal| text[at..].starts_with(terminal.as_str()))
+    };
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        if let Some(terminal) = terminal_at(start) {
+            out.push(&text[start..start + terminal.len()]);
+            start += terminal.len();
+            continue;
+        }
+        let mut end = start;
+        for (count, (offset, ch)) in text[start..].char_indices().enumerate() {
+            let at = start + offset;
+            if count > 0 && (count == 4 || ch == ' ' || ch == '\n' || terminal_at(at).is_some()) {
+                break;
+            }
+            end = at + ch.len_utf8();
+        }
+        out.push(&text[start..end]);
+        start = end;
+    }
+    out
+}
+
+/// The events `slice` produces through `table` read in token pieces: the stream an adapter
+/// renders.
+fn events_of(table: Table, slice: &Slice, declared: &Declared) -> Vec<Event> {
+    let terminals = terminals(table);
+    let mut engine = engine(table, &slice.prompt, declared);
+    let mut out = Events::new();
+    let mut events = Vec::new();
+    for piece in tokens(&slice.output, &terminals) {
+        engine
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: piece,
+                    spans: &[],
+                },
+                &mut out,
+            )
+            .expect("delta");
+        events.extend(out.drain());
+    }
+    engine
+        .feed(
+            Input::End {
+                finish: EngineFinish::Stop,
+            },
+            &mut out,
+        )
+        .expect("end");
+    events.extend(out.drain());
+    events
 }
 
 /// The request's tools: a string and an integer, a string and an object.
@@ -309,19 +457,113 @@ fn prose_only(c: &mut Criterion) {
 }
 
 fn setup(c: &mut Criterion) {
-    let declared = declared();
+    let tools = declared();
     let mut group = c.benchmark_group("setup");
     for subject in SUBJECTS {
         let name = subject.table.name();
         group.bench_with_input(BenchmarkId::new("table", name), subject, |b, subject| {
             b.iter(|| black_box(subject.table.format()));
         });
-        group.bench_with_input(BenchmarkId::new("engine", name), subject, |b, subject| {
-            b.iter(|| black_box(engine(subject.table, subject.prompt, &declared)));
+        group.bench_with_input(BenchmarkId::new("validate", name), subject, |b, subject| {
+            let format = subject.table.format();
+            b.iter(|| black_box(format.validate()));
         });
+        group.bench_with_input(BenchmarkId::new("scanner", name), subject, |b, subject| {
+            let format = subject.table.format();
+            b.iter(|| black_box(Scanner::new(format.terminal_texts())));
+        });
+        group.bench_with_input(BenchmarkId::new("engine", name), subject, |b, subject| {
+            b.iter(|| black_box(engine(subject.table, subject.prompt, &tools)));
+        });
+    }
+    group.bench_function("declared", |b| b.iter(|| black_box(declared())));
+    group.finish();
+}
+
+fn slices(c: &mut Criterion) {
+    let declared = declared();
+    let recorded = recorded();
+    for family in FAMILIES {
+        let mut group = c.benchmark_group(format!("slice/{family}"));
+        group.warm_up_time(Duration::from_millis(500));
+        group.measurement_time(Duration::from_millis(1500));
+        for (table, slice) in recorded.iter().filter(|(_, slice)| slice.family == family) {
+            let name = table.name();
+            let terminals = terminals(*table);
+            let by_token = tokens(&slice.output, &terminals);
+            let by_char = pieces(&slice.output, 1);
+            group.throughput(Throughput::Bytes(slice.output.len() as u64));
+            group.bench_with_input(BenchmarkId::new("whole", name), slice, |b, slice| {
+                b.iter(|| {
+                    let mut engine = engine(*table, &slice.prompt, &declared);
+                    let mut out = Events::new();
+                    read(&mut engine, &[slice.output.as_str()], &mut out);
+                });
+            });
+            group.bench_with_input(BenchmarkId::new("chars", name), slice, |b, slice| {
+                b.iter(|| {
+                    let mut engine = engine(*table, &slice.prompt, &declared);
+                    let mut out = Events::new();
+                    read(&mut engine, &by_char, &mut out);
+                });
+            });
+            group.throughput(Throughput::Elements(by_token.len() as u64));
+            group.bench_with_input(BenchmarkId::new("tokens", name), slice, |b, slice| {
+                b.iter(|| {
+                    let mut engine = engine(*table, &slice.prompt, &declared);
+                    let mut out = Events::new();
+                    read(&mut engine, &by_token, &mut out);
+                });
+            });
+        }
+        group.finish();
+    }
+}
+
+fn adapters(c: &mut Criterion) {
+    let declared = declared();
+    let mut group = c.benchmark_group("adapt");
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_millis(1500));
+    for (table, slice) in recorded()
+        .iter()
+        .filter(|(_, slice)| slice.family == "thought_call")
+    {
+        let name = table.name();
+        let events = events_of(*table, slice, &declared);
+        group.throughput(Throughput::Elements(events.len() as u64));
+        group.bench_with_input(
+            BenchmarkId::new("chat_deltas", name),
+            &events,
+            |b, events| {
+                b.iter(|| black_box(chat::deltas(0, events)));
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("chat_message", name),
+            &events,
+            |b, events| {
+                b.iter(|| black_box(chat::message(0, events)));
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("messages_stream", name),
+            &events,
+            |b, events| {
+                b.iter(|| {
+                    let mut stream = messages::Stream::new();
+                    let mut out = Vec::new();
+                    for event in events {
+                        black_box(stream.feed(event, &mut out));
+                    }
+                    stream.close(&mut out);
+                    black_box(out)
+                });
+            },
+        );
     }
     group.finish();
 }
 
-criterion_group!(benches, parse, prose_only, setup);
+criterion_group!(benches, parse, prose_only, setup, slices, adapters);
 criterion_main!(benches);
