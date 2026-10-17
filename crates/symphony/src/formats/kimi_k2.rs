@@ -17,7 +17,10 @@
 //! ([`CallSyntax::Shaped`]): its header after `<|tool_call_begin|>` is the id, `functions.`
 //! (which the gateway's older parser lets a model leave out), the name, `:`, the index and
 //! `<|tool_call_argument_begin|>`, with the whitespace the vendor's reader allows around the id;
-//! an id the header does not match opens no call. The arguments are one JSON value, closed by
+//! an id the header does not match opens no call. The call carries the id as the model wrote it
+//! ([`CallId::Header`]): the line's templates render a turn's ids back into the prompt
+//! (`<|tool_call_begin|>ID…` and `## Return of ID`), so a call keeps the id the model will see
+//! again and a tool result pairs with it; the gateway numbers no K2 call. The arguments are one JSON value, closed by
 //! `<|tool_call_end|>` right after it, so a closing marker inside a string argument ends the call
 //! there, as the engine reads every table (bellwether #16), and the block's close ends a call
 //! still open with what arrived; a second `<|tool_call_begin|>` inside an open call is the
@@ -34,7 +37,7 @@
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
 use crate::{
-    format::{CallSyntax, Emits, Format},
+    format::{CallId, CallSyntax, Emits, Format},
     shape::{self, Arguments, Atom, CallShape, Class, Dialect, NameSource, Pattern, Slot},
 };
 
@@ -63,6 +66,7 @@ pub fn kimi_k2() -> Format {
         .transition("call", "calls_close", "content")
         .transition("calls", "calls_close", "content")
         .calls(CallSyntax::Shaped(shape::intern(call_shape())))
+        .call_id(CallId::Header)
         .opens_turn("<|im_assistant|>assistant<|im_middle|>")
 }
 
@@ -221,6 +225,17 @@ mod tests {
             }
         }
         calls
+    }
+
+    /// The calls' ids, in order.
+    fn ids(events: &[Event]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallStart { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     fn starts(events: &[Event]) -> Vec<(u32, &str, &str)> {
@@ -409,6 +424,48 @@ mod tests {
             assert_eq!(malformed(&events), "", "cut at {at}");
             assert_eq!(finish(&events), finish(&whole), "cut at {at}");
         }
+    }
+
+    /// The tail of the generation prompt after a tool result, as the templates render it: the
+    /// result names the call it answers by the id the model gave.
+    const PROMPT_AFTER_RESULT: &str = concat!(
+        "<|im_system|>tool<|im_middle|>## Return of functions.get_weather:0\n{\"temperature\": 18}",
+        "<|im_end|><|im_assistant|>assistant<|im_middle|>"
+    );
+
+    #[test]
+    fn a_call_carries_the_id_the_model_wrote() {
+        // One call and two: each start carries the id of its header, not one minted for it.
+        assert_eq!(ids(&run(PROMPT, &[CALL])), ["functions.get_weather:0"]);
+        assert_eq!(
+            ids(&run(PROMPT_THOUGHT_OPEN, &[TURN])),
+            ["functions.get_weather:0", "functions.get_weather:1"]
+        );
+        // The turn after a tool result: the model numbers on from the call the result answered,
+        // and the id it writes is the one carried, whole and character by character.
+        let output = concat!(
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:1",
+            "<|tool_call_argument_begin|>{\"city\": \"Rome\"}<|tool_call_end|><|tool_calls_section_end|>"
+        );
+        let pieces: Vec<String> = output.chars().map(String::from).collect();
+        let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
+        for events in [
+            run(PROMPT_AFTER_RESULT, &[output]),
+            run(PROMPT_AFTER_RESULT, &pieces),
+        ] {
+            assert_eq!(ids(&events), ["functions.get_weather:1"]);
+            assert_eq!(
+                calls(&events),
+                [(
+                    "get_weather".to_string(),
+                    "{\"city\": \"Rome\"}".to_string()
+                )]
+            );
+            assert_eq!(finish(&events), (FinishReason::Stop, 1));
+        }
+        // The older parser's spelling without `functions.` is carried as written too.
+        let bare = "<|tool_calls_section_begin|><|tool_call_begin|>get_weather:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>";
+        assert_eq!(ids(&run(PROMPT, &[bare])), ["get_weather:0"]);
     }
 
     #[test]

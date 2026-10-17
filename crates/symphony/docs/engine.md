@@ -64,8 +64,10 @@ What the engine decides for every format, and what it leaves open:
   values by one) and the output's call `index` is the nonce `index` steps on: an id repeats in
   no other request, since a client pairs its tool results with its calls by id across a
   conversation, and is the same for one output however its stream is cut.
-  `Engine::with_call_ids` names the nonce for a replay that wants the ids reproducible. No table
-  or assembler chooses an id (`ids.rs`).
+  `Engine::with_call_ids` names the nonce for a replay that wants the ids reproducible. No
+  assembler chooses an id (`ids.rs`); a table whose call header writes the id and whose
+  templates render it back into the prompt (Kimi K2) carries the model's own id on the call
+  instead (`Format::call_id(CallId::Header)`: the header's text without its ending literal).
 - Every text event says how many tokens it carries, counted by the `Ledger` from the deltas'
   spans: a token in the event that carries its first byte, a byte-less span (a held half of a
   character, or a hidden special token) into the run that carries the next byte, and the tokens

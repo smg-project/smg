@@ -51,13 +51,26 @@
 use super::params::Params;
 use crate::{
     event::{runs, DropReason, Event, Events, MalformedReason, Text},
+    format::CallId,
     json::{self, arguments::Strings},
     shape::{
-        Arguments, CallShape, Match, Matcher, NameSource, Schema, Slot, Suffix, ValueParser,
-        Values, Verdict,
+        Arguments, Atom, CallShape, Match, Matcher, NameSource, Pattern, Schema, Slot, Suffix,
+        ValueParser, Values, Verdict,
     },
     tagged::Declared,
 };
+
+/// The call's id as `header` wrote it: the header's text without the literal that ends
+/// `pattern` (when a literal does) and without the whitespace around it; `None` when nothing is
+/// left.
+fn header_id(header: &str, pattern: &Pattern) -> Option<String> {
+    let written = match pattern.0.last() {
+        Some(Atom::Lit(lit)) => header.strip_suffix(&**lit).unwrap_or(header),
+        _ => header,
+    };
+    let id = written.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
 
 /// What a call's header says, once the bytes fed after the terminal decide it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +89,8 @@ pub enum Header {
 pub struct Assembler {
     index: u32,
     id: String,
+    /// Where the call's id comes from: the one minted for it, or its header as written.
+    call_id: CallId,
     shape: &'static CallShape,
     /// How the call's values read.
     values: Values,
@@ -183,11 +198,19 @@ impl Assembler {
         Self {
             index,
             id: id.into(),
+            call_id: CallId::Minted,
             shape,
             values,
             before,
             stage: Stage::Header(Box::new(matcher)),
         }
+    }
+
+    /// Where the call's id comes from; the minted one unless the table says otherwise.
+    #[must_use]
+    pub(crate) fn with_call_id(mut self, source: CallId) -> Self {
+        self.call_id = source;
+        self
     }
 
     /// Read the next bytes after the terminal into the header, and say what they decide. Once
@@ -280,9 +303,15 @@ impl Assembler {
                 .map(|span| held[span].to_string())
                 .unwrap_or_default(),
         };
+        // The call's id: the one minted for it, or the header's as the model wrote it, which a
+        // header that leaves nothing after its literal falls back from.
+        let id = match self.call_id {
+            CallId::Minted => self.id.clone(),
+            CallId::Header => header_id(header, &shape.header).unwrap_or_else(|| self.id.clone()),
+        };
         out.push(Event::ToolCallStart {
             index: self.index,
-            id: self.id.clone(),
+            id,
             name: name.clone(),
             source: Text::uncounted(header),
         });

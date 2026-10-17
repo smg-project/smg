@@ -442,8 +442,10 @@ wrapper state for the block, an arguments state per call):
 - **The id is a call given as data.** `<|tool_call_begin|>` opens a call only where
   `functions.NAME:N<|tool_call_argument_begin|>` follows it (the shaped header: `functions.`,
   which the gateway's older `kimik2` parser also reads without, the name, `:`, the index, and
-  the whitespace the vendor's reader allows around the id); the name is read from the id, the
-  index is not kept (the gateway numbers the calls itself). An id the header does not match
+  the whitespace the vendor's reader allows around the id); the name is read from the id, and
+  the call carries the id as the model wrote it (`Format::call_id(CallId::Header)`: the line's
+  templates render a turn's ids back into the prompt and a tool result names its call by that
+  id, so the gateway numbers no K2 call). An id the header does not match
   opens no call: the opener and the id are the block's text (`Malformed`, since the block is a
   wrapper state). The arguments are one JSON value, closed by `<|tool_call_end|>` with nothing
   between, so a closing marker inside a string argument ends the call there (bellwether #16; the

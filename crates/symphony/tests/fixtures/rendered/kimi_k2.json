@@ -173,6 +173,7 @@
    "content": "",
    "calls": [
     {
+     "id": "functions.get_weather:0",
      "name": "get_weather",
      "arguments": {
       "city": "Paris"
@@ -222,12 +223,14 @@
    "content": "",
    "calls": [
     {
+     "id": "functions.get_weather:0",
      "name": "get_weather",
      "arguments": {
       "city": "Paris"
      }
     },
     {
+     "id": "functions.get_weather:1",
      "name": "get_weather",
      "arguments": {
       "city": "Rome",
@@ -268,6 +271,7 @@
    "content": "Let me check.",
    "calls": [
     {
+     "id": "functions.get_weather:0",
      "name": "get_weather",
      "arguments": {
       "city": "Paris"
@@ -304,6 +308,7 @@
    "content": "",
    "calls": [
     {
+     "id": "functions.get_stock_price:0",
      "name": "get_stock_price",
      "arguments": {}
     }
@@ -355,6 +360,7 @@
    "content": "",
    "calls": [
     {
+     "id": "functions.save_note:0",
      "name": "save_note",
      "arguments": {
       "title": "計画 🌍",
@@ -409,6 +415,7 @@
    "content": "",
    "calls": [
     {
+     "id": "functions.save_note:0",
      "name": "save_note",
      "arguments": {
       "title": "Braces",
@@ -468,6 +475,7 @@
    "content": "",
    "calls": [
     {
+     "id": "functions.get_weather:0",
      "name": "get_weather",
      "arguments": {
       "city": "Rome"
@@ -524,6 +532,7 @@
    "content": "",
    "calls": [
     {
+     "id": "functions.get_weather:0",
      "name": "get_weather",
      "arguments": {
       "city": "Paris"
@@ -572,12 +581,14 @@
    "content": "",
    "calls": [
     {
+     "id": "functions.get_weather:0",
      "name": "get_weather",
      "arguments": {
       "city": "Paris"
      }
     },
     {
+     "id": "functions.get_weather:1",
      "name": "get_weather",
      "arguments": {
       "city": "Rome",
@@ -617,6 +628,7 @@
    "content": "Let me check.",
    "calls": [
     {
+     "id": "functions.get_weather:0",
      "name": "get_weather",
      "arguments": {
       "city": "Paris"
@@ -652,6 +664,7 @@
    "content": "",
    "calls": [
     {
+     "id": "functions.get_stock_price:0",
      "name": "get_stock_price",
      "arguments": {}
     }
@@ -702,6 +715,7 @@
    "content": "",
    "calls": [
     {
+     "id": "functions.save_note:0",
      "name": "save_note",
      "arguments": {
       "title": "計画 🌍",
@@ -755,6 +769,7 @@
    "content": "",
    "calls": [
     {
+     "id": "functions.save_note:0",
      "name": "save_note",
      "arguments": {
       "title": "Braces",
@@ -812,6 +827,7 @@
    "content": "",
    "calls": [
     {
+     "id": "functions.get_weather:0",
      "name": "get_weather",
      "arguments": {
       "city": "Rome"
@@ -850,6 +866,7 @@
    "content": "",
    "calls": [
     {
+     "id": "functions.get_weather:0",
      "name": "get_weather",
      "arguments": {
       "city": "Paris"
@@ -900,12 +917,14 @@
    "content": "Checking both.",
    "calls": [
     {
+     "id": "functions.get_weather:0",
      "name": "get_weather",
      "arguments": {
       "city": "Paris"
      }
     },
     {
+     "id": "functions.get_weather:1",
      "name": "get_weather",
      "arguments": {
       "city": "Rome",
@@ -945,6 +964,7 @@
    "content": "",
    "calls": [
     {
+     "id": "functions.get_weather:0",
      "name": "get_weather",
      "arguments": {
       "city": "Rome"
@@ -1005,6 +1025,7 @@
    "content": "",
    "calls": [
     {
+     "id": "functions.get_weather:0",
      "name": "get_weather",
      "arguments": {
       "city": "Paris"
@@ -1055,12 +1076,14 @@
    "content": "",
    "calls": [
     {
+     "id": "functions.get_weather:0",
      "name": "get_weather",
      "arguments": {
       "city": "Paris"
      }
     },
     {
+     "id": "functions.get_weather:1",
      "name": "get_weather",
      "arguments": {
       "city": "Rome",
@@ -1102,6 +1125,7 @@
    "content": "Let me check.",
    "calls": [
     {
+     "id": "functions.get_weather:0",
      "name": "get_weather",
      "arguments": {
       "city": "Paris"
@@ -1139,6 +1163,7 @@
    "content": "",
    "calls": [
     {
+     "id": "functions.get_stock_price:0",
      "name": "get_stock_price",
      "arguments": {}
     }
@@ -1191,6 +1216,7 @@
    "content": "",
    "calls": [
     {
+     "id": "functions.save_note:0",
      "name": "save_note",
      "arguments": {
       "title": "計画 🌍",
@@ -1246,6 +1272,7 @@
    "content": "",
    "calls": [
     {
+     "id": "functions.save_note:0",
      "name": "save_note",
      "arguments": {
       "title": "Braces",
@@ -1307,6 +1334,7 @@
    "content": "",
    "calls": [
     {
+     "id": "functions.get_weather:0",
      "name": "get_weather",
      "arguments": {
       "city": "Rome"
@@ -1347,6 +1375,7 @@
    "content": "",
    "calls": [
     {
+     "id": "functions.get_weather:0",
      "name": "get_weather",
      "arguments": {
       "city": "Paris"
@@ -1399,12 +1428,14 @@
    "content": "Checking both.",
    "calls": [
     {
+     "id": "functions.get_weather:0",
      "name": "get_weather",
      "arguments": {
       "city": "Paris"
      }
     },
     {
+     "id": "functions.get_weather:1",
      "name": "get_weather",
      "arguments": {
       "city": "Rome",
@@ -1446,6 +1477,7 @@
    "content": "",
    "calls": [
     {
+     "id": "functions.get_weather:0",
      "name": "get_weather",
      "arguments": {
       "city": "Rome"
@@ -1508,6 +1540,7 @@
    "content": "",
    "calls": [
     {
+     "id": "functions.get_weather:0",
      "name": "get_weather",
      "arguments": {
       "city": "Paris"

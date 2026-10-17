@@ -297,7 +297,7 @@ def render_case(template, slug, kind, kwargs, name, messages):
     turn = messages[start]
     reasoning = turn.get("reasoning_content", "")
     calls = [
-        {"name": c["function"]["name"], "arguments": c["function"]["arguments"]}
+        {"id": c["id"], "name": c["function"]["name"], "arguments": c["function"]["arguments"]}
         for c in turn.get("tool_calls", [])
     ]
     tail = prompt[max(prompt.rfind(USER_OPENER), prompt.rfind(TOOL_OPENER)) :]

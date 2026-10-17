@@ -51,6 +51,9 @@ struct Turn {
 
 #[derive(Deserialize)]
 struct Call {
+    /// The call's id as the template rendered it, for a table that carries the model's id.
+    #[serde(default)]
+    id: Option<String>,
     name: String,
     arguments: Value,
 }
@@ -60,7 +63,8 @@ struct Call {
 struct Reading {
     reasoning: String,
     content: String,
-    calls: Vec<(String, Value)>,
+    /// Each call's id, name and arguments.
+    calls: Vec<(String, String, Value)>,
     malformed: Vec<String>,
     finish: Option<(FinishReason, u32)>,
 }
@@ -82,9 +86,11 @@ fn reading(events: &[Event], place: &dyn Fn() -> String) -> Reading {
         match event {
             Event::Reasoning(text) => reading.reasoning.push_str(&text.text),
             Event::Content(text) => reading.content.push_str(&text.text),
-            Event::ToolCallStart { index, name, .. } => {
+            Event::ToolCallStart {
+                index, id, name, ..
+            } => {
                 assert_eq!(*index as usize, arguments.len(), "{}", place());
-                reading.calls.push((name.clone(), Value::Null));
+                reading.calls.push((id.clone(), name.clone(), Value::Null));
                 arguments.push(String::new());
             }
             Event::ToolCallArguments { index, json, .. } => {
@@ -98,8 +104,8 @@ fn reading(events: &[Event], place: &dyn Fn() -> String) -> Reading {
         }
     }
     for (call, text) in reading.calls.iter_mut().zip(arguments) {
-        call.1 = serde_json::from_str(&text)
-            .unwrap_or_else(|e| panic!("{}: {}: arguments {text:?}: {e}", place(), call.0));
+        call.2 = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("{}: {}: arguments {text:?}: {e}", place(), call.1));
     }
     reading
 }
@@ -169,10 +175,16 @@ fn every_rendered_turn_reads_back_as_the_message_it_stands_for() {
         let table = Table::named(&fixture.table).expect("a registry table");
         let declared = Declared::of(&fixture.tools);
         for turn in &fixture.turns {
-            let expected_calls: Vec<(String, Value)> = turn
+            let expected_calls: Vec<(Option<&str>, String, Value)> = turn
                 .calls
                 .iter()
-                .map(|call| (call.name.clone(), call.arguments.clone()))
+                .map(|call| {
+                    (
+                        call.id.as_deref(),
+                        call.name.clone(),
+                        call.arguments.clone(),
+                    )
+                })
                 .collect();
             let count = u32::try_from(turn.calls.len()).expect("a few calls");
             for (plan, cuts) in chunkings(&turn.output, usize::MAX) {
@@ -197,7 +209,22 @@ fn every_rendered_turn_reads_back_as_the_message_it_stands_for() {
                 let read = reading(&events, &place);
                 assert_eq!(read.reasoning, turn.reasoning, "{}", place());
                 assert_eq!(read.content, turn.content, "{}", place());
-                assert_eq!(read.calls, expected_calls, "{}", place());
+                // The name and the arguments of every call, and its id where the fixture
+                // renders one (a table that carries the model's id).
+                let read_calls: Vec<(Option<&str>, String, Value)> = read
+                    .calls
+                    .iter()
+                    .zip(&expected_calls)
+                    .map(|((id, name, arguments), (want_id, _, _))| {
+                        (
+                            want_id.map(|_| id.as_str()),
+                            name.clone(),
+                            arguments.clone(),
+                        )
+                    })
+                    .collect();
+                assert_eq!(read.calls.len(), expected_calls.len(), "{}", place());
+                assert_eq!(read_calls, expected_calls, "{}", place());
                 assert_eq!(read.malformed, Vec::<String>::new(), "{}", place());
                 assert_eq!(
                     read.finish,

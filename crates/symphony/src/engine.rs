@@ -19,7 +19,7 @@ use std::{collections::VecDeque, sync::Arc};
 
 use crate::{
     event::{runs, DropReason, Event, Events, FinishReason, MalformedReason, Text},
-    format::{CallSyntax, Emits, Format, Replay},
+    format::{CallId, CallSyntax, Emits, Format, Replay},
     gemma,
     ids::CallIds,
     input::{EngineFinish, Input},
@@ -265,7 +265,8 @@ fn assembler(
         // enters the call's state with that assembler (`Engine::open_shaped`); a table that
         // validates enters the state no other way.
         Some(CallSyntax::Shaped(shape)) => Box::new(ShapedCall {
-            call: shape::Assembler::new(index, id, shape, values, None),
+            call: shape::Assembler::new(index, id, shape, values, None)
+                .with_call_id(CallId::Minted),
             declared: declared.clone(),
         }),
     }
@@ -502,7 +503,8 @@ impl Engine {
         let id = self.ids.id(self.calls);
         let values = self.format.value_reader();
         let call =
-            shape::Assembler::new(self.calls, id, shape, values, terminal.chars().next_back());
+            shape::Assembler::new(self.calls, id, shape, values, terminal.chars().next_back())
+                .with_call_id(self.format.call_id_source());
         Some(Pending {
             terminal: index,
             from,
