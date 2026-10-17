@@ -98,74 +98,91 @@ pub enum Table {
     Plain,
 }
 
+/// A table's row in the registry: the table, its name and the function that builds it. The rows
+/// stand at the tables' discriminants, so that a table reads its own by `self as usize`.
+struct Row {
+    table: Table,
+    name: &'static str,
+    build: fn() -> Format,
+}
+
+/// A row ([`ROWS`]).
+const fn row(table: Table, name: &'static str, build: fn() -> Format) -> Row {
+    Row { table, name, build }
+}
+
+/// Every table's row, in the enum's order: the one place a table is spelled after its variant.
+/// [`Table::ALL`], [`Table::name`], [`Table::format`] and the lookups by name read it. The rows
+/// end with `plain`, the table that reads nothing, so that a table added without its row, or a
+/// row out of its table's place, does not build (the checks below): a new table goes before it.
+const ROWS: [Row; 29] = [
+    row(Table::Qwen3, "qwen3", || qwen3(CallSyntax::Json)),
+    row(Table::Qwen3Tagged, "qwen3_tagged", || {
+        qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine))
+    }),
+    row(Table::Qwen3TaggedDirect, "qwen3_tagged_direct", || {
+        qwen3(CallSyntax::Tagged(Spelling::Json, Placement::Direct))
+    }),
+    row(Table::Qwen2_5, "qwen2.5", qwen2_5),
+    row(Table::DeepSeekV4, "deepseek_v4", deepseek_v4),
+    row(Table::DeepSeekV4_1, "deepseek_v4.1", deepseek_v4_1),
+    row(Table::SeedOss, "seed_oss", seed_oss),
+    row(Table::Hy4, "hy4", hy4),
+    row(Table::Ling, "ling", ling),
+    row(Table::IQuest, "iquest", iquest),
+    row(Table::Olmo3, "olmo3", olmo3),
+    row(Table::Lfm2_5, "lfm2.5", lfm2_5),
+    row(Table::Xlam, "xlam", xlam),
+    row(Table::Json, "json", json),
+    row(Table::MinimaxM2, "minimax_m2", minimax_m2),
+    row(Table::MinimaxM3, "minimax_m3", minimax_m3),
+    row(Table::MistralV13, "mistral_v13", mistral_v13),
+    row(Table::LlamaNemotron, "llama_nemotron", llama_nemotron),
+    row(Table::KimiK3, "kimi_k3", kimi_k3),
+    row(Table::Inkling, "inkling", inkling),
+    row(Table::MiniCpm5, "minicpm5", minicpm5),
+    row(Table::Dots3, "dots3", dots3),
+    row(Table::Gemma4, "gemma4", gemma4),
+    row(Table::FunctionGemma, "function_gemma", function_gemma),
+    row(Table::Glm, "glm", glm),
+    row(Table::Glm4, "glm4", glm4),
+    row(Table::K2Horizon, "k2_horizon", k2_horizon),
+    row(Table::MuseSpark, "muse_spark", muse_spark),
+    row(Table::Plain, "plain", plain),
+];
+
+// Every row stands at its table's discriminant, and the last table has the last row.
+const _: () = {
+    let mut i = 0;
+    while i < ROWS.len() {
+        assert!(
+            ROWS[i].table as usize == i,
+            "a table's row is not at its discriminant"
+        );
+        i += 1;
+    }
+    assert!(
+        Table::Plain as usize + 1 == ROWS.len(),
+        "a table has no row: a new table and its row go before `Plain`"
+    );
+};
+
 impl Table {
-    /// Every table, in this order.
-    pub const ALL: [Table; 29] = [
-        Self::Qwen3,
-        Self::Qwen3Tagged,
-        Self::Qwen3TaggedDirect,
-        Self::Qwen2_5,
-        Self::DeepSeekV4,
-        Self::DeepSeekV4_1,
-        Self::SeedOss,
-        Self::Hy4,
-        Self::Ling,
-        Self::IQuest,
-        Self::Olmo3,
-        Self::Lfm2_5,
-        Self::Xlam,
-        Self::Json,
-        Self::MinimaxM2,
-        Self::MinimaxM3,
-        Self::MistralV13,
-        Self::LlamaNemotron,
-        Self::KimiK3,
-        Self::Inkling,
-        Self::MiniCpm5,
-        Self::Dots3,
-        Self::Gemma4,
-        Self::FunctionGemma,
-        Self::Glm,
-        Self::Glm4,
-        Self::K2Horizon,
-        Self::MuseSpark,
-        Self::Plain,
-    ];
+    /// Every table, in the rows' order, which is the enum's.
+    pub const ALL: [Table; ROWS.len()] = {
+        let mut all = [Table::Plain; ROWS.len()];
+        let mut i = 0;
+        while i < all.len() {
+            all[i] = ROWS[i].table;
+            i += 1;
+        }
+        all
+    };
 
     /// The table's name, as an operator spells it: its format's name, with the call syntax after
     /// it where the function takes one (`qwen3`, `qwen3_tagged`, `qwen3_tagged_direct`).
     pub const fn name(self) -> &'static str {
-        match self {
-            Self::Qwen3 => "qwen3",
-            Self::Qwen3Tagged => "qwen3_tagged",
-            Self::Qwen3TaggedDirect => "qwen3_tagged_direct",
-            Self::Qwen2_5 => "qwen2.5",
-            Self::DeepSeekV4 => "deepseek_v4",
-            Self::DeepSeekV4_1 => "deepseek_v4.1",
-            Self::SeedOss => "seed_oss",
-            Self::Hy4 => "hy4",
-            Self::Ling => "ling",
-            Self::IQuest => "iquest",
-            Self::Olmo3 => "olmo3",
-            Self::Lfm2_5 => "lfm2.5",
-            Self::Xlam => "xlam",
-            Self::Json => "json",
-            Self::MinimaxM2 => "minimax_m2",
-            Self::MinimaxM3 => "minimax_m3",
-            Self::MistralV13 => "mistral_v13",
-            Self::LlamaNemotron => "llama_nemotron",
-            Self::KimiK3 => "kimi_k3",
-            Self::Inkling => "inkling",
-            Self::MiniCpm5 => "minicpm5",
-            Self::Dots3 => "dots3",
-            Self::Gemma4 => "gemma4",
-            Self::FunctionGemma => "function_gemma",
-            Self::Glm => "glm",
-            Self::Glm4 => "glm4",
-            Self::K2Horizon => "k2_horizon",
-            Self::MuseSpark => "muse_spark",
-            Self::Plain => "plain",
-        }
+        ROWS[self as usize].name
     }
 
     /// The table named `name`, a table's own name ([`Self::name`]) in any case; `None` for any
@@ -178,9 +195,9 @@ impl Table {
     /// constant function, so that a group can name its table where the groups are evaluated.
     const fn exactly_named(name: &str) -> Option<Self> {
         let mut i = 0;
-        while i < Self::ALL.len() {
-            if same(Self::ALL[i].name(), name) {
-                return Some(Self::ALL[i]);
+        while i < ROWS.len() {
+            if same(ROWS[i].name, name) {
+                return Some(ROWS[i].table);
             }
             i += 1;
         }
@@ -220,37 +237,7 @@ impl Table {
 
     /// The table, built.
     pub fn format(self) -> Format {
-        match self {
-            Self::Qwen3 => qwen3(CallSyntax::Json),
-            Self::Qwen3Tagged => qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
-            Self::Qwen3TaggedDirect => qwen3(CallSyntax::Tagged(Spelling::Json, Placement::Direct)),
-            Self::Qwen2_5 => qwen2_5(),
-            Self::DeepSeekV4 => deepseek_v4(),
-            Self::DeepSeekV4_1 => deepseek_v4_1(),
-            Self::SeedOss => seed_oss(),
-            Self::Hy4 => hy4(),
-            Self::Ling => ling(),
-            Self::IQuest => iquest(),
-            Self::Olmo3 => olmo3(),
-            Self::Lfm2_5 => lfm2_5(),
-            Self::Xlam => xlam(),
-            Self::Json => json(),
-            Self::MinimaxM2 => minimax_m2(),
-            Self::MinimaxM3 => minimax_m3(),
-            Self::MistralV13 => mistral_v13(),
-            Self::LlamaNemotron => llama_nemotron(),
-            Self::KimiK3 => kimi_k3(),
-            Self::Inkling => inkling(),
-            Self::MiniCpm5 => minicpm5(),
-            Self::Dots3 => dots3(),
-            Self::Gemma4 => gemma4(),
-            Self::FunctionGemma => function_gemma(),
-            Self::Glm => glm(),
-            Self::Glm4 => glm4(),
-            Self::K2Horizon => k2_horizon(),
-            Self::MuseSpark => muse_spark(),
-            Self::Plain => plain(),
-        }
+        (ROWS[self as usize].build)()
     }
 }
 
