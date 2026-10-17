@@ -210,7 +210,7 @@ or renamed checkpoint is not listed: the flags, or its workers' labels, name its
 group names it, else it keeps the older parsers).
 
 <!-- models: begin -->
-210 groups, 360 checkpoints, newest first.
+210 groups, 359 checkpoints, newest first.
 12 ready, 139 replaying a recorded set, 4 on main awaiting fixtures, 55 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
@@ -414,7 +414,7 @@ group names it, else it keeps the older parsers).
 | 2025-02-17 | [cogalign-internvl2-5-mpo-4b](https://github.com/smg-project/bellwether/tree/main/fixtures/cogalign-internvl2-5-mpo-4b) | Salesforce/cogalign-internvl2_5-mpo-4b | cogalign-internvl2_5-mpo-1b | `qwen2.5` | 576,772 | replaying the set | none |
 | 2025-02-17 | [cogalign-llava-ov-0-5b](https://github.com/smg-project/bellwether/tree/main/fixtures/cogalign-llava-ov-0-5b) | Salesforce/cogalign-llava-ov-0_5b |  | — | 328,662 | pending | none |
 | 2025-02-17 | [granite-vision-3.2-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/granite-vision-3.2-2b) | ibm-granite/granite-vision-3.2-2b |  | — | 328,662 | pending | none |
-| 2025-01-28 | [mistral-small-24b-instruct-2501](https://github.com/smg-project/bellwether/tree/main/fixtures/mistral-small-24b-instruct-2501) | mistralai/Mistral-Small-24B-Instruct-2501 | Mistral-Small-3.1-24B-Instruct-2503, Devstral-Small-2505, Magistral-Small-2506 | `mistral` | 184,972 | replaying the set | `mistral`, none |
+| 2025-01-28 | [mistral-small-24b-instruct-2501](https://github.com/smg-project/bellwether/tree/main/fixtures/mistral-small-24b-instruct-2501) | mistralai/Mistral-Small-24B-Instruct-2501 | Mistral-Small-3.1-24B-Instruct-2503, Devstral-Small-2505 | `mistral` | 184,972 | replaying the set | `mistral`, none |
 | 2025-01-27 | [granite-vision-3.1-2b-preview](https://github.com/smg-project/bellwether/tree/main/fixtures/granite-vision-3.1-2b-preview) | ibm-granite/granite-vision-3.1-2b-preview |  | — | 328,662 | pending | none |
 | 2025-01-26 | [qwen2.5-vl-7b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen2.5-vl-7b-instruct) | Qwen/Qwen2.5-VL-7B-Instruct | allenai/olmOCR-7B-0725, allenai/olmOCR-7B-0825, Qwen2.5-VL-3B-Instruct, Qwen2.5-VL-72B-Instruct | `qwen2.5` | 328,662 | replaying the set | `qwen`, `qwen3` |
 | 2025-01-23 | [qwen2.5-7b-instruct-1m](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen2.5-7b-instruct-1m) | Qwen/Qwen2.5-7B-Instruct-1M | Qwen2.5-14B-Instruct-1M | `qwen2.5` | 576,772 | replaying the set | `qwen`, `qwen3` |

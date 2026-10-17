@@ -8,9 +8,10 @@
 //! ```
 //!
 //! The spelling of the Mistral tokenizers before v11, the gateway's older `mistral` parser's:
-//! Mistral 7B v0.3 writes it through its template, and Mistral Small 3 (2501), Small 3.1,
-//! Devstral Small 2505 and Magistral Small 2506 through their own tokenizer, since their templates
-//! render no tool call. The v11 and v13 tokenizers write a call's name and `[ARGS]` instead, which
+//! Mistral 7B v0.3 writes it through its template, and Mistral Small 3 (2501), Small 3.1 and
+//! Devstral Small 2505 through their own tokenizer, since their templates render no tool call
+//! (Magistral Small 2506 writes its thought as plain `<think>` text, which this table has no rows
+//! for: it stays out until a table reads it). The v11 and v13 tokenizers write a call's name and `[ARGS]` instead, which
 //! the [`mistral_v13`](super::mistral_v13()) table reads; the two names keep the two spellings
 //! apart. The list reads framed, as Llama Nemotron's does: text in place of it is malformed. The
 //! generation prompt ends at `[/INST]`, whatever the request says, so the prompt's replay starts

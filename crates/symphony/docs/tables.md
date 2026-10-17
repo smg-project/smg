@@ -232,8 +232,8 @@ calls as one JSON list after `[TOOL_CALLS]`, `[TOOL_CALLS] [{"name": "get_weathe
 {"city": "Paris"}, "id": "call00000"}]`, the content before it; no thought. Mistral 7B v0.3's
 template writes it (a space after the marker, an `id` member of nine characters after each call's
 arguments); Mistral Small 3 (2501) and the checkpoints that keep its tokenizer (Small 3.1,
-Devstral Small 2505, Magistral Small 2506) write the same list through their own tokenizer, since
-their chat templates render no tool call at all. What the table says beyond the others:
+Devstral Small 2505) write the same list through their own tokenizer, since their chat templates
+render no tool call at all. What the table says beyond the others:
 
 - **One marker, the list behind it.** `[TOOL_CALLS]` enters the arguments state, and the list
   assembler reads the region framed (`json::list::Assembler::framed`), as Llama Nemotron's does:
@@ -256,10 +256,16 @@ their chat templates render no tool call at all. What the table says beyond the 
   none before `[TOOL_CALLS]`; the table reads the space as the model's bytes, as the v13 table
   reads what its template writes around the content, and the rendered turns expect it. Whether
   the family's own tokenizer shows that space to a client is for the live reading to say.
+- **A forced call is the list behind the marker, with no end.** `Format::grammar` writes one tag:
+  `[TOOL_CALLS]`, the list of the tools' calls as Llama Nemotron's tag holds it, and nothing after
+  it, as the template writes nothing and the turn ends the region (the v13 table's tags end the
+  same way). A list with no marker is content to this table, so the tag never writes one; the
+  `id` the template writes after each call's arguments is left to the model.
 
-What the table leaves open: a forced call's tag (`Format::grammar` writes the list between the
-marker and the turn's end, as Llama Nemotron's does, with the `id` the template writes left to the
-model); the live reading on an engine (owed with the family's weights); and the v11 tokenizer's
+What the table leaves open: the live reading on an engine (owed with the family's weights);
+Magistral Small 2506, whose recommended system prompt has the model write its thought as plain
+`<think>…</think>` text, which this table has no rows for, and which stays out of the group until
+a table reads it (the gateway's older parsers serve it meanwhile); and the v11 tokenizer's
 checkpoints (Mistral Small 3.2, Devstral Small 2507, Magistral Small 2509), whose templates write
 `[TOOL_CALLS]name[ARGS]{…}`, the v13 table's spelling without `[CALL_ID]`, and are not in the
 registry until a set records them.
