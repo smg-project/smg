@@ -475,11 +475,11 @@ impl ConfigValidator {
     fn validate_tenant_usage_accounting(config: &RouterConfig) -> ConfigResult<()> {
         if config.tenant_usage_accounting_enabled && config.tenant_usage_accounting_max_tenants == 0
         {
-            return Err(ConfigError::InvalidValue {
-                field: "tenant_usage_accounting_max_tenants".to_string(),
-                value: "0".to_string(),
-                reason: "must be at least 1 when tenant usage accounting is enabled".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "tenant_usage_accounting_max_tenants",
+                0,
+                "must be at least 1 when tenant usage accounting is enabled",
+            ));
         }
         Ok(())
     }
