@@ -12,12 +12,7 @@ use std::{collections::HashMap, future::Future, sync::Arc};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
-use axum::{
-    body::Body,
-    extract::Request,
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
-};
+use axum::{body::Body, extract::Request, http::HeaderMap, response::Response};
 use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
@@ -114,11 +109,11 @@ pub struct Gateway {
     enable_igw: bool,
 }
 
-/// The answer when no router serves a request.
-const NO_ROUTER: (StatusCode, &str) = (
-    StatusCode::NOT_FOUND,
-    "No router available for this request",
-);
+/// The answer when no router serves a request: the JSON error object, a 404
+/// under `no_router`, as the endpoint-specific misses answer.
+fn no_router() -> Response {
+    route_error::not_found("no_router", "No router available for this request")
+}
 
 impl Gateway {
     pub fn new(worker_registry: Arc<WorkerRegistry>) -> Self {
@@ -459,11 +454,13 @@ impl Gateway {
         })
     }
 
-    /// Hand a request to the router that serves `model`, or answer `miss`.
+    /// Hand a request to the router that serves `model`, or answer with the
+    /// refusal `miss` builds (built on a miss alone: a request a router takes
+    /// pays nothing for it).
     async fn dispatch<F, Fut>(
         &self,
         model: Option<&str>,
-        miss: impl IntoResponse,
+        miss: impl FnOnce() -> Response,
         run: F,
     ) -> Response
     where
@@ -472,7 +469,7 @@ impl Gateway {
     {
         match self.select_router_for_request(model) {
             Some(router) => run(router).await,
-            None => miss.into_response(),
+            None => miss(),
         }
     }
 }
@@ -493,10 +490,12 @@ impl RouterTrait for Gateway {
     }
 
     async fn health_generate(&self, req: Request<Body>) -> Response {
-        let miss = route_error::service_unavailable(
-            "no_routers",
-            "No routers with healthy workers available",
-        );
+        let miss = || {
+            route_error::service_unavailable(
+                "no_routers",
+                "No routers with healthy workers available",
+            )
+        };
         self.dispatch(None, miss, |router| async move {
             router.health_generate(req).await
         })
@@ -504,7 +503,7 @@ impl RouterTrait for Gateway {
     }
 
     async fn get_server_info(&self, req: Request<Body>) -> Response {
-        let miss = route_error::service_unavailable("no_routers", "No routers available");
+        let miss = || route_error::service_unavailable("no_routers", "No routers available");
         self.dispatch(None, miss, |router| async move {
             router.get_server_info(req).await
         })
@@ -537,7 +536,7 @@ impl RouterTrait for Gateway {
                 "/generate requests must include a model when IGW routing is enabled",
             );
         }
-        self.dispatch(Some(model_id), NO_ROUTER, |router| async move {
+        self.dispatch(Some(model_id), no_router, |router| async move {
             router
                 .route_generate(headers, tenant_meta, body, model_id)
                 .await
@@ -552,7 +551,7 @@ impl RouterTrait for Gateway {
         body: ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.dispatch(Some(model_id), NO_ROUTER, |router| async move {
+        self.dispatch(Some(model_id), no_router, |router| async move {
             router
                 .route_chat(headers, tenant_meta, body, model_id)
                 .await
@@ -567,7 +566,7 @@ impl RouterTrait for Gateway {
         body: CompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.dispatch(Some(model_id), NO_ROUTER, |router| async move {
+        self.dispatch(Some(model_id), no_router, |router| async move {
             router
                 .route_completion(headers, tenant_meta, body, model_id)
                 .await
@@ -593,7 +592,7 @@ impl RouterTrait for Gateway {
                     .route_messages(headers, tenant_meta, body, model_id)
                     .await
             }
-            None => NO_ROUTER.into_response(),
+            None => no_router(),
         }
     }
 
@@ -634,7 +633,7 @@ impl RouterTrait for Gateway {
                     .route_messages_count_tokens(headers, tenant_meta, body, model_id)
                     .await
             }
-            None => NO_ROUTER.into_response(),
+            None => no_router(),
         }
     }
 
@@ -645,10 +644,12 @@ impl RouterTrait for Gateway {
         body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
-        let miss = route_error::not_found(
-            "no_router",
-            "No router available to handle responses request",
-        );
+        let miss = || {
+            route_error::not_found(
+                "no_router",
+                "No router available to handle responses request",
+            )
+        };
         self.dispatch(Some(model_id), miss, |router| async move {
             router
                 .route_responses(headers, tenant_meta, body, model_id)
@@ -664,10 +665,12 @@ impl RouterTrait for Gateway {
         body: InteractionsRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let miss = route_error::not_found(
-            "no_router",
-            "No router available to handle interactions request",
-        );
+        let miss = || {
+            route_error::not_found(
+                "no_router",
+                "No router available to handle interactions request",
+            )
+        };
         self.dispatch(model_id, miss, |router| async move {
             router
                 .route_interactions(headers, tenant_meta, body, model_id)
@@ -682,10 +685,12 @@ impl RouterTrait for Gateway {
         tenant_meta: &TenantRequestMeta,
         response_id: &str,
     ) -> Response {
-        let miss = route_error::not_found(
-            "no_router",
-            format!("No router available to cancel response '{response_id}'"),
-        );
+        let miss = || {
+            route_error::not_found(
+                "no_router",
+                format!("No router available to cancel response '{response_id}'"),
+            )
+        };
         self.dispatch(None, miss, |router| async move {
             router
                 .cancel_response(headers, tenant_meta, response_id)
@@ -701,7 +706,7 @@ impl RouterTrait for Gateway {
         body: EmbeddingRequest,
         model_id: &str,
     ) -> Response {
-        self.dispatch(Some(model_id), NO_ROUTER, |router| async move {
+        self.dispatch(Some(model_id), no_router, |router| async move {
             router
                 .route_embeddings(headers, tenant_meta, body, model_id)
                 .await
@@ -716,7 +721,7 @@ impl RouterTrait for Gateway {
         body: ClassifyRequest,
         model_id: &str,
     ) -> Response {
-        self.dispatch(Some(model_id), NO_ROUTER, |router| async move {
+        self.dispatch(Some(model_id), no_router, |router| async move {
             router
                 .route_classify(headers, tenant_meta, body, model_id)
                 .await
@@ -832,7 +837,7 @@ impl RouterTrait for Gateway {
         audio: AudioFile,
         model_id: &str,
     ) -> Response {
-        self.dispatch(Some(model_id), NO_ROUTER, |router| async move {
+        self.dispatch(Some(model_id), no_router, |router| async move {
             router
                 .route_audio_transcriptions(headers, tenant_meta, body, audio, model_id)
                 .await
@@ -847,7 +852,7 @@ impl RouterTrait for Gateway {
         body: RerankRequest,
         model_id: &str,
     ) -> Response {
-        let miss = route_error::not_found("no_router", "No router available for rerank request");
+        let miss = || route_error::not_found("no_router", "No router available for rerank request");
         self.dispatch(Some(model_id), miss, |router| async move {
             router
                 .route_rerank(headers, tenant_meta, body, model_id)
@@ -861,10 +866,12 @@ impl RouterTrait for Gateway {
         headers: Option<&HeaderMap>,
         body: &RealtimeSessionCreateRequest,
     ) -> Response {
-        let miss = route_error::not_found(
-            "no_router",
-            "No router available for realtime session request",
-        );
+        let miss = || {
+            route_error::not_found(
+                "no_router",
+                "No router available for realtime session request",
+            )
+        };
         let model = body.model.as_deref();
         self.dispatch(model, miss, |router| async move {
             router.route_realtime_session(headers, body).await
@@ -877,10 +884,12 @@ impl RouterTrait for Gateway {
         headers: Option<&HeaderMap>,
         body: &RealtimeClientSecretCreateRequest,
     ) -> Response {
-        let miss = route_error::not_found(
-            "no_router",
-            "No router available for realtime client secret request",
-        );
+        let miss = || {
+            route_error::not_found(
+                "no_router",
+                "No router available for realtime client secret request",
+            )
+        };
         let model = body.session.model.as_deref();
         self.dispatch(model, miss, |router| async move {
             router.route_realtime_client_secret(headers, body).await
@@ -893,10 +902,12 @@ impl RouterTrait for Gateway {
         headers: Option<&HeaderMap>,
         body: &RealtimeTranscriptionSessionCreateRequest,
     ) -> Response {
-        let miss = route_error::not_found(
-            "no_router",
-            "No router available for realtime transcription request",
-        );
+        let miss = || {
+            route_error::not_found(
+                "no_router",
+                "No router available for realtime transcription request",
+            )
+        };
         let model = body.model.as_deref();
         self.dispatch(model, miss, |router| async move {
             router
@@ -907,10 +918,12 @@ impl RouterTrait for Gateway {
     }
 
     async fn route_realtime_ws(&self, req: Request<Body>, model: &str) -> Response {
-        let miss = route_error::not_found(
-            "no_router",
-            "No router available for realtime WebSocket request",
-        );
+        let miss = || {
+            route_error::not_found(
+                "no_router",
+                "No router available for realtime WebSocket request",
+            )
+        };
         self.dispatch(Some(model), miss, |router| async move {
             router.route_realtime_ws(req, model).await
         })
@@ -918,10 +931,12 @@ impl RouterTrait for Gateway {
     }
 
     async fn route_realtime_webrtc(&self, req: Request<Body>, model: &str) -> Response {
-        let miss = route_error::not_found(
-            "no_router",
-            "No router available for realtime WebRTC request",
-        );
+        let miss = || {
+            route_error::not_found(
+                "no_router",
+                "No router available for realtime WebRTC request",
+            )
+        };
         self.dispatch(Some(model), miss, |router| async move {
             router.route_realtime_webrtc(req, model).await
         })
@@ -948,6 +963,7 @@ mod tests {
     use std::collections::HashMap;
 
     use async_trait::async_trait;
+    use axum::{http::StatusCode, response::IntoResponse};
     use openai_protocol::model_card::ModelCard;
 
     use super::*;
@@ -1136,7 +1152,8 @@ mod tests {
 
     /// With no router registered, each answer the gateway gives on its own is
     /// the JSON error object: a 503 `no_routers` where it has no router to
-    /// ask, a 404 `no_router` where no router serves the request's model.
+    /// ask, a 404 `no_router` where no router serves the request's model,
+    /// with the endpoint's own message or the shared one.
     #[tokio::test]
     async fn a_gateway_without_routers_answers_the_json_error_object() {
         use serde_json::json;
@@ -1227,6 +1244,75 @@ mod tests {
             (
                 gateway.route_realtime_webrtc(empty(), "m").await,
                 "No router available for realtime WebRTC request",
+            ),
+            (
+                gateway
+                    .route_chat(
+                        None,
+                        &meta,
+                        body(
+                            json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}),
+                        ),
+                        "m",
+                    )
+                    .await,
+                "No router available for this request",
+            ),
+            (
+                gateway
+                    .route_completion(
+                        None,
+                        &meta,
+                        body(json!({"model": "m", "prompt": "hi"})),
+                        "m",
+                    )
+                    .await,
+                "No router available for this request",
+            ),
+            (
+                gateway
+                    .route_generate(None, &meta, body(json!({"model": "m", "text": "hi"})), "m")
+                    .await,
+                "No router available for this request",
+            ),
+            (
+                gateway
+                    .route_embeddings(None, &meta, body(json!({"model": "m", "input": "hi"})), "m")
+                    .await,
+                "No router available for this request",
+            ),
+            (
+                gateway
+                    .route_classify(None, &meta, body(json!({"model": "m", "input": "hi"})), "m")
+                    .await,
+                "No router available for this request",
+            ),
+            (
+                gateway
+                    .route_messages(
+                        None,
+                        &meta,
+                        body(json!({
+                            "model": "m", "max_tokens": 16,
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })),
+                        "m",
+                    )
+                    .await,
+                "No router available for this request",
+            ),
+            (
+                gateway
+                    .route_messages_count_tokens(
+                        None,
+                        &meta,
+                        body(
+                            json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}),
+                        ),
+                        "m",
+                    )
+                    .await,
+                "No router available for this request",
             ),
         ];
         for (answer, message) in not_found {

@@ -1288,8 +1288,6 @@ mod pd_tests {
         }
     }
 
-    /// Minimal `AppContext` for constructing a disaggregated gRPC router. PD
-    /// serves /v1/responses, so the MCP orchestrator must be initialized.
     /// A mode that does not serve an endpoint refuses it with the JSON error
     /// object under the endpoint's code, as the router trait's default does.
     #[tokio::test]
@@ -1352,6 +1350,8 @@ mod pd_tests {
         }
     }
 
+    /// Minimal `AppContext` for constructing a disaggregated gRPC router. PD
+    /// serves /v1/responses, so the MCP orchestrator must be initialized.
     async fn grpc_ctx(mode: RoutingMode) -> Arc<AppContext> {
         let config = RouterConfig::builder()
             .mode(mode)

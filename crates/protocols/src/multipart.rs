@@ -9,7 +9,7 @@
 use axum::{
     extract::{multipart::MultipartError, FromRequest, Multipart, Request},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::Response,
 };
 
 #[cfg(feature = "axum")]
@@ -34,7 +34,7 @@ impl<S: Send + Sync> FromRequest<S> for AudioTranscriptionMultipart {
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         let mut multipart = Multipart::from_request(req, state)
             .await
-            .map_err(IntoResponse::into_response)?;
+            .map_err(|e| bad_request("invalid_multipart", None, e.body_text()))?;
 
         let mut file_bytes: Option<bytes::Bytes> = None;
         let mut file_name: Option<String> = None;
@@ -219,6 +219,11 @@ mod tests {
             .header("content-type", "multipart/form-data; boundary=cut")
             .body(Body::from(form.replace('\n', "\r\n")))
             .expect("a request");
+        refusal_of(request).await
+    }
+
+    /// The parser's refusal of `request`: its status and JSON body.
+    async fn refusal_of(request: Request) -> (StatusCode, serde_json::Value) {
         let response = match AudioTranscriptionMultipart::from_request(request, &()).await {
             Ok(_) => panic!("the form was taken"),
             Err(refusal) => refusal,
@@ -231,6 +236,25 @@ mod tests {
             status,
             serde_json::from_slice(&body).expect("json error body"),
         )
+    }
+
+    /// A request that is no multipart form at all (a JSON body here) is
+    /// refused by the extractor before any part is read, with the same JSON
+    /// error object and code as a part the parser cannot read.
+    #[tokio::test]
+    async fn a_request_that_is_not_a_form_is_refused_with_the_json_error_object() {
+        let request = Request::builder()
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model": "whisper"}"#))
+            .expect("a request");
+        let (status, body) = refusal_of(request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+        assert_eq!(body["error"]["code"], "invalid_multipart", "{body}");
+        assert!(body["error"]["param"].is_null(), "{body}");
+        let message = body["error"]["message"].as_str().expect("a message");
+        assert!(message.contains("boundary"), "{body}");
     }
 
     #[tokio::test]
