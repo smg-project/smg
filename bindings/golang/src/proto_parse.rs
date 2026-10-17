@@ -6,11 +6,7 @@ use smg_grpc_client::sglang_proto as proto;
 /// Parse a JSON value into a proto::GenerateResponse
 pub fn parse_proto_response(json_value: &Value) -> Result<proto::GenerateResponse, &'static str> {
     let mut proto_response = proto::GenerateResponse {
-        request_id: json_value
-            .get("request_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
+        request_id: string_at(json_value, "request_id"),
         response: None,
     };
 
@@ -34,22 +30,32 @@ pub fn is_terminal_response(json_value: &Value) -> bool {
     json_value.get("complete").is_some()
 }
 
-/// A `u32` count at `key`: 0 when the field is absent or not a number.
+/// The string at `key`; empty when absent or not a string.
+fn string_at(json: &Value, key: &str) -> String {
+    json.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The count at `key`; zero when absent or not a non-negative integer (a
+/// negative number and a float read as absent). The cast keeps the low 32
+/// bits of a value beyond `u32`.
 fn u32_at(json: &Value, key: &str) -> u32 {
     json.get(key)
-        .and_then(|v| v.as_u64())
+        .and_then(Value::as_u64)
         .map(|n| n as u32)
         .unwrap_or(0)
 }
 
-/// The token ids at `key`: empty when the field is absent; entries that are
-/// not numbers are skipped.
+/// The token ids at `key`; empty when absent or not an array, a member that
+/// is not a non-negative integer skipped.
 fn ids_at(json: &Value, key: &str) -> Vec<u32> {
     json.get(key)
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_u64().map(|n| n as u32))
+        .and_then(Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(|id| id.as_u64().map(|n| n as u32))
                 .collect()
         })
         .unwrap_or_default()
@@ -72,11 +78,7 @@ fn parse_chunk(json: &Value) -> proto::GenerateStreamChunk {
 fn parse_complete(json: &Value) -> proto::GenerateComplete {
     proto::GenerateComplete {
         output_ids: ids_at(json, "output_ids"),
-        finish_reason: json
-            .get("finish_reason")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
+        finish_reason: string_at(json, "finish_reason"),
         prompt_tokens: u32_at(json, "prompt_tokens"),
         completion_tokens: u32_at(json, "completion_tokens"),
         cached_tokens: u32_at(json, "cached_tokens"),
@@ -197,5 +199,20 @@ mod tests {
             ),
             (0, 0, 0, 6)
         );
+    }
+
+    #[test]
+    fn a_string_of_the_wrong_type_reads_as_empty() {
+        let response = parse_proto_response(&json!({
+            "request_id": 7,
+            "complete": {"finish_reason": 5},
+        }))
+        .unwrap();
+
+        assert_eq!(response.request_id, "");
+        let Some(Response::Complete(complete)) = response.response else {
+            panic!("a completion response");
+        };
+        assert_eq!(complete.finish_reason, "");
     }
 }
