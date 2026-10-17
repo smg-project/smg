@@ -200,8 +200,9 @@ mod tests {
     /// The turns the template renders for the shapes a tool-calling conversation takes: one call,
     /// three calls in one block (a newline before each call after the first), a call after
     /// content, a call with no arguments, nested and non-ASCII values, and content alone; then a
-    /// call and content after a thought the prompt opens (the original R1 and its distills), and
-    /// after a thought the model opens itself, the prompt ending at the opener (R1-0528).
+    /// call and content after a thought the prompt opens (R1, R1-Zero and the distills, whose
+    /// template ends the prompt with the opener), and after a thought the model opens itself, the
+    /// prompt ending at the header (R1-0528, R1-0528-Qwen3-8B and the bf16 mirror).
     const RENDERED_TURNS: &[RenderedTurn] = &[
         RenderedTurn {
             tail: PROMPT,
@@ -467,54 +468,6 @@ mod tests {
                       <｜end▁of▁sentence｜><｜User｜>Thanks.<｜Assistant｜>";
         let events = run(quoted, &["You are welcome."]);
         assert_eq!(content(&events), "You are welcome.");
-    }
-
-    #[test]
-    fn the_r1_line_reads_its_thought_whether_the_prompt_or_the_model_opens_it() {
-        // R1, R1-Zero and the distills: the prompt ends `<think>\n`, the model closes the thought
-        // and answers; the replay of the tail puts the output in the thought from its first byte.
-        let output = "The user greets me.\n</think>\n\nHello!";
-        let events = run(THINKING, &[output]);
-        assert_eq!(bytes(&events), output);
-        assert_eq!(reasoning(&events), "The user greets me.\n");
-        assert_eq!(content(&events), "\n\nHello!");
-        assert!(calls(&events).is_empty());
-        // R1-0528, R1-0528-Qwen3-8B and the bf16 mirror: the prompt ends at the header and the
-        // model opens the thought itself; the same table reads it from the content state.
-        let output = "<think>The user greets me.</think>Hello!";
-        let events = run(PROMPT, &[output]);
-        assert_eq!(bytes(&events), output);
-        assert_eq!(reasoning(&events), "The user greets me.");
-        assert_eq!(content(&events), "Hello!");
-        // Either way, a call after the thought is V3's block, which R1's templates render.
-        let call = "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Paris\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>";
-        let openings = [
-            (
-                THINKING,
-                "I need the weather.\n</think>\n\n",
-                "I need the weather.\n",
-            ),
-            (
-                PROMPT,
-                "<think>I need the weather.</think>",
-                "I need the weather.",
-            ),
-        ];
-        for (prompt, thought, expected) in openings {
-            let output = format!("{thought}{call}");
-            let events = run(prompt, &[&output]);
-            assert_eq!(bytes(&events), output, "{prompt}");
-            assert_eq!(reasoning(&events), expected, "{prompt}");
-            assert_eq!(
-                calls(&events),
-                [(
-                    "get_weather".to_string(),
-                    "{\"city\": \"Paris\"}".to_string()
-                )],
-                "{prompt}"
-            );
-            assert_eq!(content(&events).trim(), "", "{prompt}");
-        }
     }
 
     #[test]
