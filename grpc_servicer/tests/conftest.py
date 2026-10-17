@@ -6,8 +6,9 @@
 ``smg_grpc_proto`` stubs (``scripts/gen_proto_stubs.py``), so the tests see
 this checkout's proto instead of the released package.
 
-Every test starts with no servicer implementation selected by the environment
-and leaves none selected (:func:`no_servicer_impl_selected`).
+Every test runs with no servicer implementation selected by the environment,
+and its teardown puts back what the shell exported, if anything
+(:func:`no_servicer_impl_selected`).
 """
 
 import importlib.util
@@ -29,8 +30,8 @@ if _PROTO_PATH and _PROTO_PATH not in sys.path:
 
 @pytest.fixture(autouse=True)
 def no_servicer_impl_selected():
-    """No servicer implementation is selected by the environment when a test
-    starts, and none is left selected when it ends.
+    """No servicer implementation is selected by the environment while a test
+    runs; at its end the shell's own selection, if any, is put back.
 
     The ``SMG_<ENGINE>_SERVICER_IMPL`` variables select the implementation a
     launcher serves, and the switch writes a flag's decision back to them
