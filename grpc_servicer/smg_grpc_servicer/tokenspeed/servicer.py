@@ -443,12 +443,19 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         tic = time.time()
 
         async def _drive_probe() -> bool:
+            # Held so the finally can close it, as Generate holds its own: the
+            # return at the first output leaves the engine's iterator suspended
+            # at that yield, and the close runs the engine's exit now, in the
+            # probe's own task, not in asyncio's generator finalizer later.
+            engine_outputs = self.async_llm.generate_request(probe)
             try:
-                async for _ in self.async_llm.generate_request(probe):
+                async for _ in engine_outputs:
                     return True
             except Exception as e:  # noqa: BLE001 — the probe is best-effort.
                 logger.warning("Health probe failed: %s", e)
                 return False
+            finally:
+                await engine_outputs.aclose()
             return False
 
         task = asyncio.create_task(_drive_probe())

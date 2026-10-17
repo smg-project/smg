@@ -12,6 +12,7 @@ import logging
 import os
 import time
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -378,12 +379,16 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         # Submit health check request
         async def run_health_check():
             try:
-                async for _ in self.request_manager.generate_request(
-                    obj=health_req,
-                    request_id=rid,
-                ):
-                    # Got at least one response, server is healthy
-                    return True
+                # The probe leaves the stream at its first output. Closing the
+                # stream on the way out releases the probe's request state
+                # here, in the probe's own task, rather than whenever the
+                # garbage collector finalizes the abandoned stream.
+                async with aclosing(
+                    self.request_manager.generate_request(obj=health_req, request_id=rid)
+                ) as outputs:
+                    async for _ in outputs:
+                        # Got at least one response, server is healthy
+                        return True
             except Exception as e:
                 logger.warning(f"Health check failed: {e}")
                 return False

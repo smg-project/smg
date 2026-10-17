@@ -191,6 +191,32 @@ def test_client_cancel_mid_stream_ends_the_root_span(manager):
     )
 
 
+def test_the_consumers_close_after_an_output_ends_the_root_span_at_once(manager):
+    """A consumer that leaves the stream after an output (the health probe
+    does, at its first) closes it; the close reaches the handler through the
+    stream, so the request's exit runs before the close returns, not in a
+    generator finalizer whose turn the garbage collector decides."""
+
+    async def scenario():
+        stream = manager.generate_request(
+            SimpleNamespace(stream=True, sampling_params=SimpleNamespace(n=1)), "r-close", None
+        )
+
+        async def first():
+            return await anext(stream)
+
+        task = asyncio.create_task(first())
+        await _settle()
+        manager.rid_to_state["r-close"].out_queue.put_nowait({"token_ids": [1], "finished": False})
+        assert (await task)["token_ids"] == [1]
+        await stream.aclose()
+        assert "r-close" not in manager.rid_to_state, "released before the close returned"
+        assert manager.exporter.names() == [" Req"], "the root span is ended by then"
+
+    asyncio.run(scenario())
+    assert manager.exporter.spans[0].ended == 1
+
+
 def test_scheduler_abort_ends_the_root_span(manager):
     async def scenario():
         task, got = await _handle(manager, "r-abort")
