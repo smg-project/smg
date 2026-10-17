@@ -891,9 +891,21 @@ impl ConfigValidator {
                 cache_boundaries,
                 selection_policy,
                 selection_accounting_ttl_ms: _,
-                balance_cost_gate: _,
+                balance_cost_gate,
             } => {
                 Self::validate_cache_boundaries(cache_boundaries)?;
+
+                // The cost gate ranks every candidate on its expected wait;
+                // the group a sampling temperature draws would be ignored.
+                if *balance_cost_gate && *selection_temperature > 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "balance_cost_gate".to_string(),
+                        value: "true".to_string(),
+                        reason: format!(
+                            "ranks every candidate on its expected wait, so the group selection_temperature ({selection_temperature}) samples would be ignored; set one or the other"
+                        ),
+                    });
+                }
 
                 // Build the selection policy once here so a bad name or
                 // parameter fails configuration instead of routing.
@@ -3425,6 +3437,23 @@ mod tests {
         // Off (defaults) and positive values are valid.
         assert!(ConfigValidator::validate(&make(0.0, 0.0)).is_ok());
         assert!(ConfigValidator::validate(&make(4.0, 0.7)).is_ok());
+        // The cost gate ranks every candidate itself: a sampling temperature
+        // next to it would be ignored, so the pair is refused.
+        let with_cost_gate = |selection_temperature: f32| {
+            let mut config = make(0.0, selection_temperature);
+            if let PolicyConfig::CacheAware {
+                balance_cost_gate, ..
+            } = &mut config.policy
+            {
+                *balance_cost_gate = true;
+            }
+            config
+        };
+        assert!(ConfigValidator::validate(&with_cost_gate(0.0)).is_ok());
+        assert!(matches!(
+            ConfigValidator::validate(&with_cost_gate(0.7)),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "balance_cost_gate"
+        ));
         // Negative or non-finite values are rejected for both knobs.
         assert!(ConfigValidator::validate(&make(-0.1, 0.0)).is_err());
         assert!(ConfigValidator::validate(&make(0.0, -1.0)).is_err());

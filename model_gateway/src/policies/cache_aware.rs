@@ -1871,11 +1871,15 @@ impl CacheAwarePolicy {
     /// The cost form of the spill decision (`balance_cost_gate`): every row
     /// the decision read is a candidate at its expected wait plus the
     /// prefill the request still needs there, its uncached share of the
-    /// prompt (see [`LeastLoadPolicy::select_min_total_wait`]). The holders
-    /// of the prefix are left for a colder worker exactly when their wait
+    /// prompt (see [`LeastLoadPolicy::select_min_total_wait`]), read as the
+    /// tokens of the blocks it holds over the prompt's tokens, so a prompt
+    /// that ends inside a block is not read as cached whole. The holders of
+    /// the prefix are left for a colder worker exactly when their wait
     /// exceeds its by more than the time the prefix saves; a shallower
     /// holder keeps the credit of its own overlap; the in-flight count
-    /// margins do not apply. Selection and credit stay one atomic step.
+    /// margins do not apply, nor do the group a selection policy formed or
+    /// `overlap_decay`: the cost ranks every row on its blocks. Selection
+    /// and credit stay one atomic step.
     fn select_final_by_cost(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -1883,11 +1887,14 @@ impl CacheAwarePolicy {
         request: &RequestInputs<'_>,
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
-        let request_blocks = request.request_blocks.max(1) as f64;
+        let prompt_tokens = request.prompt_tokens.max(1) as f64;
+        let block_size = request.block_size as f64;
         let rows: Vec<usize> = inputs.iter().map(|candidate| candidate.idx).collect();
         let shares: Vec<f64> = inputs
             .iter()
-            .map(|candidate| (candidate.device_blocks / request_blocks).clamp(0.0, 1.0))
+            .map(|candidate| {
+                (candidate.device_blocks.max(0.0) * block_size / prompt_tokens).clamp(0.0, 1.0)
+            })
             .collect();
         let selected =
             self.load_scorer
@@ -3425,6 +3432,16 @@ impl CacheAwarePolicy {
 impl Default for CacheAwarePolicy {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+impl CacheAwarePolicy {
+    /// The policy with `load_scorer` in place of the default one, so a test
+    /// can size the mean prefill the credit floors at.
+    fn with_load_scorer(mut self, load_scorer: LeastLoadPolicy) -> Self {
+        self.load_scorer = load_scorer;
+        self
     }
 }
 

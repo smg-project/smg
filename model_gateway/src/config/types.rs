@@ -1199,8 +1199,11 @@ pub enum PolicyConfig {
         /// ranked on its expected wait plus the prefill the request still
         /// needs there, at the fleet's nominal drain rate), instead of when
         /// its in-flight count clears `balance_abs_threshold` and
-        /// `balance_rel_threshold`. Needs backend load reports to be more
-        /// than a count comparison.
+        /// `balance_rel_threshold`. The cost ranks the candidates on the
+        /// blocks they hold: `overlap_decay` does not shape it, a selection
+        /// policy's group is re-ranked (its final pick stands), and a
+        /// `selection_temperature` above 0 is refused with it. Needs backend
+        /// load reports to be more than a count comparison.
         #[serde(default)]
         balance_cost_gate: bool,
         eviction_interval_secs: u64,

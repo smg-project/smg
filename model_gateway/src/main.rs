@@ -489,8 +489,12 @@ struct RoutingArgs {
     /// still needs there (a holder's uncached share of the prompt, a cold
     /// worker's whole prompt, at the fleet's nominal drain rate), so a deep
     /// prefix is kept through a bigger wait gap than a shallow one and the
-    /// chosen worker is credited with the work it must do. Needs backend load
-    /// reports to be more than a count comparison. Off by default
+    /// chosen worker is credited with the work it must do, never under the
+    /// mean prefill. The cost ranks the candidates on the blocks they hold:
+    /// --overlap-decay does not shape it, a selection policy's group is
+    /// re-ranked (its final pick stands), and a --selection-temperature
+    /// above 0 is refused with it. Needs backend load reports to be more
+    /// than a count comparison. Off by default
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     balance_cost_gate: bool,
 

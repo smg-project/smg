@@ -548,7 +548,9 @@ impl LeastLoadPolicy {
 
     /// The shared body of the two selections above: `cached_share`, when
     /// given, adds each candidate's own uncached work to its score and sets
-    /// the winner's credit to that work.
+    /// the winner's credit to that work, never under the mean prefill (the
+    /// price a report puts on a running request), so a run of cached hits
+    /// within one poll interval still moves the home's score.
     fn select_min_wait(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -716,9 +718,16 @@ impl LeastLoadPolicy {
         }
 
         // In-flight correction: credit the chosen worker with this request's
-        // token-work (the part it must still prefill, when the shares are
-        // known) until its next poll refreshes the snapshot.
-        let credited_tokens = own_tokens(best_pos);
+        // token-work until its next poll refreshes the snapshot: the part it
+        // must still prefill, when the shares are known, and never less than
+        // the mean prefill, the price a report puts on a running request. A
+        // hit cached whole would otherwise credit nothing, and every arrival
+        // of one poll interval would land on the home before its next
+        // report, the incast this correction exists to prevent.
+        let credited_tokens = match &shares {
+            Some(_) => own_tokens(best_pos).max(u64::from(self.mean_prefill_tokens)),
+            None => own_tokens(best_pos),
+        };
         inflight
             .entry(workers[best].url().to_string())
             .or_default()
@@ -1523,8 +1532,10 @@ mod tests {
     fn total_wait_ranks_the_queue_plus_the_work_each_worker_still_has_to_do() {
         // Three workers at 100 tokens/s and equal KV; the prompt is 64
         // tokens: a holds none of it, b half, c all. Totals in seconds:
-        // queue / 100 plus the uncached tokens / 100.
-        let policy = LeastLoadPolicy::new();
+        // queue / 100 plus the uncached tokens / 100. The winner is
+        // credited its uncached work, never under the mean prefill (4 here).
+        let policy =
+            LeastLoadPolicy::with_params(DEFAULT_KV_PRESSURE_WEIGHT, 4, DEFAULT_THROUGHPUT, 0);
         let feed = TestFeed::attached_to(&policy);
         let workers = vec![
             mk("http://a:8000"),
@@ -1539,8 +1550,9 @@ mod tests {
         let shares = [0.0, 0.5, 1.0];
         // (queued tokens per worker) -> the pick and the tokens it is credited.
         for (queued, pick, credited) in [
-            // a 0.64, b 0.30 + 0.32, c 0.50: c.
-            ([0, 30, 50], 2, 0),
+            // a 0.64, b 0.30 + 0.32, c 0.50: c, with nothing to prefill,
+            // credited the mean-prefill floor.
+            ([0, 30, 50], 2, 4),
             // c at 0.70: b.
             ([0, 30, 70], 1, 32),
             // b at 0.60 + 0.32: a, with the whole prompt to do.
@@ -1567,7 +1579,7 @@ mod tests {
     fn equal_total_waits_go_to_the_warmer_worker() {
         // a: a 32-token queue and the 32-token prompt cached whole; b: an
         // empty queue and none of it. Both total 0.32 s: a keeps the
-        // request every time, no draw.
+        // request, no draw.
         let policy = LeastLoadPolicy::new();
         let feed = TestFeed::attached_to(&policy);
         let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
@@ -1580,16 +1592,60 @@ mod tests {
             tokens: Some(&tokens),
             ..Default::default()
         };
-        for _ in 0..20 {
-            // A hit adds no work to a, so the tie holds across repeats.
-            assert_eq!(
-                policy.select_min_total_wait(&workers, &[0, 1], &[1.0, 0.0], &info, "test"),
-                Some(0)
-            );
-        }
+        assert_eq!(
+            policy.select_min_total_wait(&workers, &[0, 1], &[1.0, 0.0], &info, "test"),
+            Some(0)
+        );
         // The plain selection, which gives no credit for the cache, would
         // have found a's queue the deeper.
         assert_eq!(policy.select_worker(&workers, &info), Some(1));
+    }
+
+    #[test]
+    fn a_run_of_full_hits_leaves_the_home_before_the_next_report() {
+        // a holds the 32-token prompt whole, b none of it, both queues
+        // empty, no report between the picks. Each hit costs a nothing to
+        // prefill, but is credited the mean prefill (16 here) like any
+        // dispatch, so a's score climbs and the gate opens within the poll
+        // interval: b is left with the prompt to prefill once a's lead
+        // passes the 32 tokens the prefix saves, then a is preferred again.
+        let policy =
+            LeastLoadPolicy::with_params(DEFAULT_KV_PRESSURE_WEIGHT, 16, DEFAULT_THROUGHPUT, 0);
+        let feed = TestFeed::attached_to(&policy);
+        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        feed.publish(&HashMap::from([
+            (workers[0].url().to_string(), make_load(0, 0.2, 100.0)),
+            (workers[1].url().to_string(), make_load(0, 0.2, 100.0)),
+        ]));
+        let tokens: Vec<u32> = (0..32).collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        let picks: Vec<usize> = (0..20)
+            .map(|_| {
+                let pick = policy
+                    .select_min_total_wait(&workers, &[0, 1], &[1.0, 0.0], &info, "test")
+                    .expect("two candidates");
+                workers[pick].increment_load();
+                pick
+            })
+            .collect();
+        assert_eq!(picks[0], 0, "the home takes the first hit");
+        assert_eq!(
+            picks[..3],
+            [0, 0, 0],
+            "a credit of 16 per hit opens the gate only past the 32 tokens saved"
+        );
+        assert!(
+            picks.contains(&1),
+            "the home is left before the next report"
+        );
+        let to_home = picks.iter().filter(|&&pick| pick == 0).count();
+        assert!(
+            to_home > picks.len() - to_home,
+            "and still takes most of the run"
+        );
     }
 
     #[test]

@@ -7,7 +7,10 @@ use tokio::sync::watch;
 use tracing_test::traced_test;
 
 use super::*;
-use crate::worker::load_state::TestFeed;
+use crate::worker::{
+    expected_wait::{DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_THROUGHPUT},
+    load_state::TestFeed,
+};
 
 #[test]
 fn text_is_wanted_only_without_token_ids() {
@@ -1502,13 +1505,17 @@ fn cost_gate() -> CacheAwareConfig {
 /// One selection of a 32-token request on a two-worker pool where `w1`
 /// holds the request's first `held` tokens, with `queued` uncached
 /// tokens reported per worker at 100 tokens/s and no request in flight
-/// on either worker. Returns the policy and workers for credit checks.
+/// on either worker. The scorer's mean prefill is 4 tokens, so the
+/// credit floor stays under the work the table reads. Returns the
+/// policy and workers for credit checks.
 fn cost_pick(
     config: CacheAwareConfig,
     held: usize,
     queued: [i32; 2],
 ) -> (CacheAwarePolicy, Vec<Arc<dyn Worker>>, usize) {
-    let policy = CacheAwarePolicy::with_config(config);
+    let policy = CacheAwarePolicy::with_config(config).with_load_scorer(
+        LeastLoadPolicy::with_params(DEFAULT_KV_PRESSURE_WEIGHT, 4, DEFAULT_THROUGHPUT, 0),
+    );
     let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
     let tokens: Vec<u32> = (0..32).collect();
     seed_token_tenants(&policy, &workers, &tokens[..held], &["http://w1:8000"]);
@@ -1550,8 +1557,9 @@ fn the_cost_gate_leaves_the_home_once_its_wait_exceeds_the_prefill_it_saves() {
 fn the_cost_gate_prices_a_partial_prefix_at_its_uncached_share() {
     // 24 of the 32 tokens are held: 8 remain to prefill on the home
     // against 32 on a cold worker, so the gap that opens the gate is 24
-    // tokens, and the home is credited the 8 it must compute where the
-    // count gate credits the whole prompt.
+    // tokens, and the home is credited the 8 it must compute (over the
+    // scorer's 4-token floor) where the count gate credits the whole
+    // prompt.
     let (policy, workers, idx) = cost_pick(cost_gate(), 24, [24, 0]);
     assert_eq!(idx, 0);
     assert_only_final_worker_credited(&policy, &workers, 0, 8);

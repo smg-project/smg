@@ -1018,7 +1018,10 @@ class RouterArgs:
                 " expected wait exceeds the other's by more than the time the matched prefix"
                 " saves (every eligible worker ranked on its expected wait plus the prefill"
                 " the request still needs there), instead of when its in-flight count clears"
-                " the absolute and relative thresholds. Needs backend load reports to be more"
+                " the absolute and relative thresholds. The cost ranks the candidates on the"
+                " blocks they hold: overlap decay does not shape it, a selection policy's"
+                " group is re-ranked (its final pick stands), and a selection temperature"
+                " above 0 is refused with it. Needs backend load reports to be more"
                 " than a count comparison. Off by default."
             ),
         )
