@@ -279,9 +279,9 @@ impl CircuitBreaker {
     /// The bookkeeping of a state the circuit has just entered, whichever
     /// path moved it: the change's timestamp, the counters the new state
     /// starts with (an open circuit keeps its failure streak, a closed one
-    /// and a trial start clean), the transition log line (with `cause` when
-    /// something other than the counters moved the circuit), the transition
-    /// counter, and the gauges.
+    /// and a trial start clean), the transition log line (with a `cause`
+    /// field only when something other than the counters moved the
+    /// circuit), the transition counter, and the gauges.
     fn entered(&self, from: CircuitState, to: CircuitState, cause: Option<&'static str>) {
         self.last_state_change_ms.store(now_ms(), Ordering::Release);
         match to {
@@ -295,21 +295,14 @@ impl CircuitBreaker {
         }
 
         let (from, to) = (from.as_str(), to.as_str());
-        match cause {
-            Some(cause) => info!(
-                worker_url = %self.metric_label,
-                from,
-                to,
-                cause,
-                "Circuit breaker state transition: {from} -> {to}"
-            ),
-            None => info!(
-                worker_url = %self.metric_label,
-                from,
-                to,
-                "Circuit breaker state transition: {from} -> {to}"
-            ),
-        }
+        // An absent `cause` records no field: the line reads as before.
+        info!(
+            worker_url = %self.metric_label,
+            from,
+            to,
+            cause,
+            "Circuit breaker state transition: {from} -> {to}"
+        );
         Metrics::record_worker_cb_transition(&self.metric_label, from, to);
         self.publish_state_gauge();
         self.publish_gauge_metrics();
@@ -553,6 +546,27 @@ mod tests {
                 Some(line) => Err(format!("breaker line without the worker: {line}")),
                 None => Ok(()),
             }
+        });
+        // The cause is a field of the line only when something other than
+        // the counters moved the circuit: the timeout's trial carries it, a
+        // trip by the counters does not.
+        logs_assert(|lines: &[&str]| {
+            let line_of = |from: &str, to: &str| {
+                lines
+                    .iter()
+                    .find(|line| line.contains(&format!(r#"from="{from}" to="{to}""#)))
+                    .copied()
+                    .ok_or_else(|| format!("no {from} -> {to} line"))
+            };
+            let trial = line_of("open", "half_open")?;
+            if !trial.contains(r#"cause="timeout""#) {
+                return Err(format!("the trial's line names no cause: {trial}"));
+            }
+            let trip = line_of("closed", "open")?;
+            if trip.contains("cause=") {
+                return Err(format!("a trip by the counters names a cause: {trip}"));
+            }
+            Ok(())
         });
     }
 
