@@ -200,7 +200,11 @@ the dropped wrapping) at the top level of a chat completion, on the finish chunk
 choice, and on the `message` and `message_delta` of the Messages API. The gateway's
 `--parse-failures` policy sets what a client can get: `log` (the default) writes the line and
 reports on request, `surface` reports every output that is not clean as well, `silent` keeps
-the counters alone and ignores the header.
+the counters alone and ignores the header. A client that cannot tolerate a folded call asks for
+strictness with `X-SMG-Parse-Strict: on`: an output that is not clean then finishes with
+`finish_reason: "parse_failure"` (the Messages API's `stop_reason` likewise), its report attached
+whatever the report mode and its bytes still in the content; status stays 200, a clean output
+keeps its finish reason, and `silent` ignores this header too.
 
 ## Models
 

@@ -382,6 +382,7 @@ fn messages_spec(thinking: bool) -> MessagesResponseSpec {
         first_tool_call_only: false,
         parse_report: Report::Off,
         parse_silent: false,
+        parse_strict: false,
     }
 }
 

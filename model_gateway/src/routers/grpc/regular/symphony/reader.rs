@@ -261,6 +261,13 @@ impl Reader {
         self.tally.parse_report(self.table, choice)
     }
 
+    /// Whether the table gave up on a run of the output read so far: what strictness turns into
+    /// a `parse_failure` finish. A call suppressed under `parallel_tool_calls: false` is not
+    /// that: the table read it whole and the request asked for it to be dropped.
+    pub(crate) fn has_malformed(&self) -> bool {
+        self.tally.has_malformed()
+    }
+
     /// Reads `token_ids` through `decoder` as one delta: the text the decoder releases, with each
     /// token's span in it, zero-width for a token whose bytes it holds back, into `delta`, and
     /// the events into `out`, where they borrow the text. Says whether the decoder matched a
