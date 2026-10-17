@@ -18,7 +18,9 @@
 //!   counts the calls; a fragment of the arguments that closes a string, writes a member under an
 //!   empty key or writes an empty string carries the output bytes that wrote it (a reader makes
 //!   no byte up); and a call that ended, at its own terminal or at the stream's end, has
-//!   arguments that are whole JSON, unless the engine said `Malformed` while the call was open;
+//!   arguments that are whole JSON, unless the engine said `Malformed` while the call was open
+//!   (three names for the breach: `empty-arguments`, `tolerated-json`, `whole-json`, so that a
+//!   run allows a class already reported and still catches the others);
 //! - the adapters render any event sequence without a panic, and the Chat Completions stream,
 //!   concatenated, says what the whole message says.
 //!
@@ -597,6 +599,45 @@ fn whole_json(text: &str) -> bool {
     serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok()
 }
 
+/// Whether `text` has the shape of one whole JSON value, whatever JSON says of its tokens: an
+/// object or a list opened at the front and closed at the end, every bracket outside a string's
+/// contents matched; or one scalar token, a string that is closed, a number or a word. The shape
+/// the prefix judge took as whole when the call ended; whether JSON takes the tokens inside is
+/// [`whole_json`]'s question, and the two apart name the breach.
+fn closed_structure(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() || (text.starts_with(['{', '[']) && !text.ends_with(['}', ']'])) {
+        return false;
+    }
+    let mut open: Vec<char> = Vec::new();
+    let mut inside = false;
+    let mut escaped = false;
+    for c in text.chars() {
+        if inside {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                inside = false;
+            }
+        } else {
+            match c {
+                '"' => inside = true,
+                '{' | '[' => open.push(c),
+                '}' | ']' => {
+                    let opener = if c == '}' { '{' } else { '[' };
+                    if open.pop() != Some(opener) {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    open.is_empty() && !inside
+}
+
 /// Whether `text` is a JSON prefix the prefix parser takes whole.
 fn valid_json_prefix(text: &str) -> bool {
     matches!(PartialJson::default().parse(text, true), Ok((_, consumed)) if consumed == text.len())
@@ -707,12 +748,34 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                         .find(|(i, _)| i == index)
                         .map(|(_, so_far)| so_far.as_str())
                         .unwrap_or_default();
-                    breach("whole-json", whole_json(so_far), || {
-                        format!(
-                            "{}: the call closed with arguments that are no whole JSON: {so_far:?}",
-                            place()
-                        )
-                    });
+                    // Three names for one promise, so that a run allows a class already
+                    // reported and still catches the others: a call that ended with no fragment
+                    // at all; a value whose shape closed but whose tokens JSON refuses (what the
+                    // prefix judge tolerates: a value left out, a trailing comma, an escape JSON
+                    // lacks, a short `\u`, whitespace outside JSON's, a number or a word cut
+                    // short); and the rest, the committed prefix of a value that never closed.
+                    if so_far.is_empty() {
+                        breach("empty-arguments", false, || {
+                            format!(
+                                "{}: the call ended with no arguments fragment at all",
+                                place()
+                            )
+                        });
+                    } else if closed_structure(so_far) {
+                        breach("tolerated-json", whole_json(so_far), || {
+                            format!(
+                                "{}: the call ended with arguments whose shape closed but which JSON refuses: {so_far:?}",
+                                place()
+                            )
+                        });
+                    } else {
+                        breach("whole-json", whole_json(so_far), || {
+                            format!(
+                                "{}: the call ended with arguments that are the prefix of a value that never closed: {so_far:?}",
+                                place()
+                            )
+                        });
+                    }
                 }
             }
             Event::Malformed { .. } => {
@@ -1427,6 +1490,51 @@ mod tests {
         let data = encode(Table::Qwen3, "", output)?;
         check(&decode(&data, Some(Table::Qwen3)));
         Ok(())
+    }
+
+    #[test]
+    fn the_whole_json_promise_names_its_three_breaches() {
+        // The same stream, three arguments: no fragment at all; a shape that closed with a
+        // value left out, or one scalar token cut short; and a prefix that never closed.
+        let ended_with = |json: &str| {
+            let mut events = vec![start(0)];
+            if !json.is_empty() {
+                events.push(arguments(0, json, json));
+            }
+            events.extend([end(0, "</tool_call>"), finish(1)]);
+            breach_in(Table::Qwen3, events)
+        };
+        assert_eq!(ended_with("").as_deref(), Some("empty-arguments"));
+        for tolerated in [
+            "{\"city\": \"Paris\", \"days\": ,}",
+            "{\"a\": 1,}",
+            "0e",
+            "n",
+            "\"\\h\"",
+        ] {
+            assert_eq!(
+                ended_with(tolerated).as_deref(),
+                Some("tolerated-json"),
+                "{tolerated:?}"
+            );
+        }
+        for prefix in [
+            "{\"city\": \"Par",
+            "{\"city\": \"Paris\"",
+            "[1, [2",
+            "\"Par",
+        ] {
+            assert_eq!(
+                ended_with(prefix).as_deref(),
+                Some("whole-json"),
+                "{prefix:?}"
+            );
+        }
+        for whole in ["{\"city\": \"Paris\"}", "{}", "[]", "1", "\"x\""] {
+            assert_eq!(ended_with(whole), None, "{whole:?}");
+        }
+        assert!(closed_structure("{\"a\": \"}\"}") && !closed_structure("{\"a\": \"}\""));
+        assert!(!closed_structure("}") && !closed_structure("{]") && !closed_structure("  "));
     }
 
     #[test]

@@ -6,9 +6,12 @@ name: symphony fuzz campaign
 # parser's robustness does not depend on someone remembering to run them; a crash fails the
 # job and its artifact is uploaded for the report crates/symphony/fuzz/README.md describes.
 # Budget: nine targets, three at a time, ten minutes each on a hosted runner. The run looks past
-# the whole-json class (SYMPHONY_FUZZ_ALLOW) until the parser fixes the first campaign found
-# land, and past made-up-empty-string until the pythonic reader reports a value left out instead
-# of writing an empty string for it, so that a night's red is a new class; drop each name then.
+# the classes reported and not yet fixed, by the name of their shape (SYMPHONY_FUZZ_ALLOW); a
+# name covers that shape from any reader, on every target: tolerated-json, the JSON syntax
+# passing on what its prefix judge tolerates, empty-arguments, the pythonic reader's call cut
+# at the stream's end, and made-up-empty-string, its empty string for a value left out, today.
+# A night's red is then a shape not yet reported; a name leaves the list with its fix, and a
+# new breach of an allowed shape surfaces then.
 
 on:
   schedule:
@@ -23,7 +26,7 @@ on:
         default: ""
       allow:
         description: "Breach names the run looks past (comma separated; empty for none)"
-        default: "whole-json,made-up-empty-string"
+        default: "tolerated-json,empty-arguments,made-up-empty-string"
 
 concurrency:
   group: symphony-fuzz
@@ -87,7 +90,7 @@ jobs:
         run: |
           # A dispatch's allowance is its own, an empty one included (an expression's `||` would
           # put the default back); a scheduled run looks past the classes reported and not yet fixed.
-          if [ "$EVENT" = workflow_dispatch ]; then ALLOW=$ALLOW_INPUT; else ALLOW=whole-json,made-up-empty-string; fi
+          if [ "$EVENT" = workflow_dispatch ]; then ALLOW=$ALLOW_INPUT; else ALLOW=tolerated-json,empty-arguments,made-up-empty-string; fi
           # shellcheck disable=SC2086
           crates/symphony/fuzz/run.sh --minutes "$MINUTES" --jobs 3 ${ALLOW:+--allow "$ALLOW"} $TARGETS
       - name: Upload crashes and logs
