@@ -54,15 +54,17 @@ def test_a_symlinked_segment_is_refused_through_the_servicer(
 
 
 def test_a_plain_segment_reaches_the_tensor_decode(tokenspeed_servicer_mod, segment, monkeypatch):
-    """The shared reader hands the bytes on: the decode after it is the
-    engine's (stubbed here), so the read is observed by what it was given."""
+    """The shared reader hands the segment's bytes on: the decode after it is
+    the engine's (stubbed here), so the read is observed through a spy that
+    calls the real reader."""
     monkeypatch.setattr(mm_shm, "UNLINK_MM_SHM_AFTER_READ", False)
     (SHM / segment).write_bytes(bytes(range(8)))
     seen = []
+    real_reader = mm_shm.tensor_payload_bytes
     monkeypatch.setattr(
         tokenspeed_servicer_mod.mm_shm,
         "tensor_payload_bytes",
-        lambda tensor_data: seen.append(tensor_data.shm.name) or bytes(range(8)),
+        lambda tensor_data: seen.append(real_reader(tensor_data)) or seen[-1],
     )
     tensor = tokenspeed_scheduler_pb2.TensorData(
         shm=common_pb2.ShmHandle(name=segment, offset=0, nbytes=8),
@@ -75,7 +77,7 @@ def test_a_plain_segment_reaches_the_tensor_decode(tokenspeed_servicer_mod, segm
         servicer._tensor_from_proto(tensor)
     except (AttributeError, TypeError):
         pass  # the stubbed engine has no tensor constructor; the read already happened
-    assert seen == [segment]
+    assert seen == [bytes(range(8))]
 
 
 def test_the_servicer_keeps_no_reader_of_its_own(tokenspeed_servicer_mod):
