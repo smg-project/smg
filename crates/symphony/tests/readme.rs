@@ -680,6 +680,16 @@ const GROUPS: &[Group] = &[
         status: Status::Pending,
     },
     Group {
+        slug: "deepseek-v3.2",
+        model: "deepseek-ai/DeepSeek-V3.2",
+        also: &["DeepSeek-V3.2-Speciale"],
+        released: "2025-12-01",
+        smg: (Some("deepseek32"), None),
+        table: Some(Table::DeepSeekV3_2),
+        set: None,
+        status: Status::AwaitingFixtures,
+    },
+    Group {
         slug: "deepseek-v3.2-exp",
         model: "deepseek-ai/DeepSeek-V3.2-Exp",
         also: &["DeepSeek-V3.2-Exp-Base"],
