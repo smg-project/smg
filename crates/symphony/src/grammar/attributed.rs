@@ -21,7 +21,10 @@ use openai_protocol::common::Tool;
 use serde_json::Value;
 
 use super::{calls, CallMarkers, Count, Grammar, Tag};
-use crate::tagged::attributed::{Tags, Typing};
+use crate::{
+    format::Whitespace,
+    tagged::attributed::{Tags, Typing},
+};
 
 /// The calls for `tools`, in the family's spelling: in the table's one block, in a block each, or
 /// with no block at all, as many as `count` lets the model write. `None` for a syntax that
@@ -116,6 +119,7 @@ fn string_attribute_calls(
                         schema: Value::Bool(true),
                         style: None,
                         excludes: Vec::new(),
+                        whitespace: Whitespace::Free,
                     },
                 ]),
             ]),

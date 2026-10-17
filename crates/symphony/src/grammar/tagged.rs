@@ -29,7 +29,10 @@ use super::{
     schema::{self, shape, Definitions},
     CallMarkers, Count, Grammar, WayIn,
 };
-use crate::tagged::{assembler::TAGS, Spelling};
+use crate::{
+    format::Whitespace,
+    tagged::{assembler::TAGS, Spelling},
+};
 
 const FUNCTION_OPEN: &str = TAGS[0];
 const PARAMETER_OPEN: &str = TAGS[1];
@@ -117,6 +120,7 @@ fn words<const N: usize>(schema: Value, python: [&str; N]) -> Grammar {
         schema,
         style: None,
         excludes: Vec::new(),
+        whitespace: Whitespace::Free,
     }];
     options.extend(
         python

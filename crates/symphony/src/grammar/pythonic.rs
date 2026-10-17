@@ -22,7 +22,10 @@ use super::{
     schema::{joined, keyword, shape, Definitions},
     CallMarkers, Count, Grammar, Tag,
 };
-use crate::pythonic::{Dialect, Framing, Values};
+use crate::{
+    format::Whitespace,
+    pythonic::{Dialect, Framing, Values},
+};
 
 /// The calls for `tools` in the region the table's markers frame: one tag, opened by the region's
 /// opener (and the list's `[`), holding one call or more in the dialect's framing (one, when
@@ -183,6 +186,7 @@ fn json_string() -> Grammar {
         schema: json!({"type": "string"}),
         style: None,
         excludes: Vec::new(),
+        whitespace: Whitespace::Free,
     }
 }
 

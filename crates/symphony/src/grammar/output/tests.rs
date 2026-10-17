@@ -603,12 +603,24 @@ fn the_length_is_the_written_tags_without_building_it() {
         ),
     ];
     for next_key_closes in [true, false] {
-        let spelling = table(next_key_closes).output_spelling().unwrap();
-        for asked in &cases {
-            let grammar = spelling.grammar(asked).unwrap();
-            let text = grammar.payload_text();
-            assert_eq!(spelling.payload_len(asked), Some(text.len()), "{asked:?}");
-            assert_eq!(text, grammar.payload().to_string());
+        // The table as it is, and bounding the answer's whitespace: the bound's key is counted.
+        for bound in [None, Some(12)] {
+            let mut table = table(next_key_closes);
+            if let Some(run) = bound {
+                table = table.bounds_answer_whitespace(run);
+            }
+            let spelling = table.output_spelling().unwrap();
+            for asked in &cases {
+                let grammar = spelling.grammar(asked).unwrap();
+                let text = grammar.payload_text();
+                assert_eq!(spelling.payload_len(asked), Some(text.len()), "{asked:?}");
+                assert_eq!(text, grammar.payload().to_string());
+                assert_eq!(
+                    text.contains("\"max_whitespace_cnt\":12"),
+                    bound.is_some() && asked.answer.is_some(),
+                    "{asked:?}: {text}"
+                );
+            }
         }
     }
 }

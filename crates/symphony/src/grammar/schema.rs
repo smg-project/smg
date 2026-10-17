@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use serde_json::{json, Value};
 
 use super::Grammar;
+use crate::format::Whitespace;
 
 /// The arguments a tool's schema asks for, as a syntax writes them: `each` property in the
 /// schema's order, each optional unless the schema requires it; `none` for a schema without
@@ -187,6 +188,7 @@ pub(super) fn shape(
         schema,
         style: None,
         excludes: Vec::new(),
+        whitespace: Whitespace::Free,
     };
     let grammar = match kind {
         "string" => match string_enum(schema, target) {

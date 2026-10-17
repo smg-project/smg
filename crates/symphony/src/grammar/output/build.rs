@@ -9,7 +9,10 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use serde_json::{json, Map, Value};
 
 use super::values::{self, Kind, Root};
-use crate::grammar::{json_len, schema::without_annotations, Bound, Grammar, Tag};
+use crate::{
+    format::Whitespace,
+    grammar::{json_len, schema::without_annotations, Bound, Grammar, Tag},
+};
 
 /// The two groups of definitions a tool's schema may carry, which each JSON value of it takes
 /// along so its `$ref`s resolve.
@@ -48,8 +51,9 @@ pub(super) trait Build {
     fn optional(&self, content: Self::Node) -> Self::Node;
     fn star(&self, content: Self::Node) -> Self::Node;
     fn tag(&self, begin: String, content: Self::Node, end: Bound) -> Self::Node;
-    /// JSON of `schema`, the request's answer format.
-    fn schema(&self, schema: &Value) -> Self::Node;
+    /// JSON of `schema`, the request's answer format, its `whitespace` between tokens as the
+    /// table has it.
+    fn schema(&self, schema: &Value, whitespace: Whitespace) -> Self::Node;
     /// JSON of one value of a call, which carries the definitions of `root`, the tool's schema,
     /// so its `$ref`s resolve, without the patterns xgrammar does not compile, its strings
     /// holding none of `excludes`.
@@ -353,11 +357,12 @@ impl Build for Tree {
         Grammar::Tag(Tag::bounded(begin, content, end))
     }
 
-    fn schema(&self, schema: &Value) -> Grammar {
+    fn schema(&self, schema: &Value, whitespace: Whitespace) -> Grammar {
         Grammar::JsonSchema {
             schema: schema.clone(),
             style: None,
             excludes: Vec::new(),
+            whitespace,
         }
     }
 
@@ -368,6 +373,7 @@ impl Build for Tree {
             schema: Document::of(&own, &definitions).schema(),
             style: None,
             excludes: excludes.to_vec(),
+            whitespace: Whitespace::Free,
         }
     }
 }
@@ -389,6 +395,8 @@ struct Pieces {
     tag: usize,
     json_schema: usize,
     excludes: usize,
+    /// The whitespace bound's key around its number.
+    whitespace: usize,
 }
 
 impl Length {
@@ -400,6 +408,13 @@ impl Length {
             schema: Value::Null,
             style: None,
             excludes,
+            whitespace: Whitespace::Free,
+        };
+        let bounded = Grammar::JsonSchema {
+            schema: Value::Null,
+            style: None,
+            excludes: Vec::new(),
+            whitespace: Whitespace::Bounded(0),
         };
         let word = vec![String::new()];
         let pieces = Pieces {
@@ -412,6 +427,7 @@ impl Length {
             excludes: json_len(&json_schema(word.clone()))
                 - json_len(&json_schema(Vec::new()))
                 - json_len(&word),
+            whitespace: json_len(&bounded) - json_len(&json_schema(Vec::new())) - json_len(&0_u32),
         };
         Self {
             pieces,
@@ -476,8 +492,13 @@ impl Build for Length {
             .saturating_add(json_len(&end))
     }
 
-    fn schema(&self, schema: &Value) -> usize {
+    fn schema(&self, schema: &Value, whitespace: Whitespace) -> usize {
+        let bound = match whitespace {
+            Whitespace::Free => 0,
+            Whitespace::Bounded(run) => self.pieces.whitespace.saturating_add(json_len(&run)),
+        };
         self.json_schema(json_len(schema), &[])
+            .saturating_add(bound)
     }
 
     fn value(&self, json: Json<'_>, root: Root<'_>, excludes: &[String]) -> usize {

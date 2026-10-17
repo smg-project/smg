@@ -93,7 +93,12 @@ nothing after the call.
 `response_format` of a request, from the same table: the rows into the state the answer is written
 in, the schema, and the answer's close with the end of the turn. Where the output starts in
 content, as in ChatML's tables, it is the schema alone, after the prefix when the prompt left the
-model inside its thought.
+model inside its thought. A table may bound the runs of whitespace the answer's JSON holds between
+its tokens (`Format::bounds_answer_whitespace`, written as xgrammar's `max_whitespace_cnt` on the
+answer's schema node; an xgrammar before 0.2.7 ignores the key): a model held to its answer's JSON
+after a long thought, by an engine that starts the grammar at the first token, may drift into tabs
+and newlines the schema's grammar otherwise admits without end. LFM2.5's table bounds them to
+sixteen; the calls' values are never bounded.
 
 Whether a thought comes before the call or the answer is the table's, not the syntax's: a table
 whose template writes the thought before every call and answer (`Format::thinks_first`) gets it

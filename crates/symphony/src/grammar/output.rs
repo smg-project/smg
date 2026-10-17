@@ -77,7 +77,7 @@ use self::{
 };
 use super::{json_len, Bound, Grammar};
 use crate::{
-    format::{CallSyntax, Emits, Format},
+    format::{CallSyntax, Emits, Format, Whitespace},
     markers::{Piece, Scanner},
     shape::{Arguments, Atom, CallShape, Class, End, NameSource, Slot, ValueParser},
 };
@@ -127,6 +127,9 @@ struct Answer {
     /// shorter one, but the stop a call ends on, where the engine stops wherever it is written.
     closes: Vec<String>,
     end: Option<String>,
+    /// How much whitespace the answer's JSON may hold between its tokens
+    /// ([`Format::bounds_answer_whitespace`]).
+    whitespace: Whitespace,
 }
 
 /// Where the prompt leaves the model's turn.
@@ -505,7 +508,12 @@ impl Format {
                 .iter()
                 .find(|text| self.is_stop_token(text) && !call_stops.contains(text))
                 .map(|text| text.to_string());
-            Some(Answer { open, closes, end })
+            Some(Answer {
+                open,
+                closes,
+                end,
+                whitespace: self.answer_whitespace(),
+            })
         });
 
         let tokens = self.marker_token_texts();
@@ -940,7 +948,7 @@ impl OutputSpelling {
             None => b.leaf(Grammar::AnyText {
                 excludes: answer.closes.clone(),
             }),
-            Some(OutputAnswer::Json(schema)) => b.schema(schema),
+            Some(OutputAnswer::Json(schema)) => b.schema(schema, answer.whitespace),
             Some(OutputAnswer::Regex(pattern)) => b.leaf(Grammar::Regex(pattern.to_string())),
             Some(OutputAnswer::Ebnf(grammar)) => b.leaf(Grammar::Ebnf(grammar.to_string())),
         };

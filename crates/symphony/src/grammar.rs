@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 
 pub use self::output::{Output, OutputAnswer, OutputChoice, OutputPosition, OutputSpelling, Turn};
 use crate::{
-    format::{CallSyntax, Emits, Format},
+    format::{CallSyntax, Emits, Format, Whitespace},
     shape::{Layout, Message},
     tagged::{attributed::Typing, keyed::Tags as KeyedTags},
 };
@@ -50,11 +50,13 @@ pub enum Grammar {
     /// A JSON value the schema accepts, written in the engine's `style` when one is named
     /// (`glm_xml` writes it as `<arg_key>`/`<arg_value>` pairs). Its strings and keys hold none of
     /// `excludes`, a list xgrammar enforces from 0.2.8 on and an older xgrammar ignores; an empty
-    /// list is not written.
+    /// list is not written. Its `whitespace` between tokens is free, as JSON has it, or bounded to
+    /// runs of so many characters ([`Whitespace`]); only a bound is written.
     JsonSchema {
         schema: Value,
         style: Option<String>,
         excludes: Vec<String>,
+        whitespace: Whitespace,
     },
     /// Text an EBNF grammar in xgrammar's own syntax (`root ::= ...`) accepts.
     Ebnf(String),
@@ -205,9 +207,10 @@ struct Payload<'a> {
 }
 
 /// The engine's keys of each node, in the order it writes them; `excludes` of a JSON schema only
-/// when there are words to leave out, `style` only when one is named, and `stop_after_first` only
-/// when the tags stop after the first (the engines' default otherwise, so a tag that asks for any
-/// number of calls is written as it was before the key existed).
+/// when there are words to leave out, `style` only when one is named, `max_whitespace_cnt` only
+/// when the whitespace is bounded, and `stop_after_first` only when the tags stop after the first
+/// (the engines' default otherwise, so a tag that asks for any number of calls is written as it
+/// was before the key existed).
 impl Serialize for Grammar {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
@@ -228,6 +231,7 @@ impl Serialize for Grammar {
                 schema,
                 style,
                 excludes,
+                whitespace,
             } => {
                 map.serialize_entry("type", "json_schema")?;
                 map.serialize_entry("json_schema", schema)?;
@@ -236,6 +240,9 @@ impl Serialize for Grammar {
                 }
                 if !excludes.is_empty() {
                     map.serialize_entry("excludes", excludes)?;
+                }
+                if let Whitespace::Bounded(run) = whitespace {
+                    map.serialize_entry("max_whitespace_cnt", run)?;
                 }
             }
             Self::Ebnf(grammar) => {
@@ -743,6 +750,7 @@ impl Format {
             schema: schema.clone(),
             style: None,
             excludes: Vec::new(),
+            whitespace: self.answer_whitespace(),
         };
         let content = self.answer_state()?;
         let (before, after) = self.around(|layout| layout.answer.as_ref());
@@ -1053,6 +1061,7 @@ impl Format {
                         schema: tool.function.parameters.clone(),
                         style: None,
                         excludes: Vec::new(),
+                        whitespace: Whitespace::Free,
                     },
                     format!("}}\n{}", markers.call_close),
                 )
@@ -1090,6 +1099,7 @@ impl Format {
                         schema: tool.function.parameters.clone(),
                         style: None,
                         excludes: Vec::new(),
+                        whitespace: Whitespace::Free,
                     },
                     format!("}}{close}"),
                 )
@@ -1123,6 +1133,7 @@ impl Format {
                         schema: tool.function.parameters.clone(),
                         style: None,
                         excludes: Vec::new(),
+                        whitespace: Whitespace::Free,
                     },
                     "",
                 )
@@ -1155,6 +1166,7 @@ impl Format {
                             schema: tool.function.parameters.clone(),
                             style: None,
                             excludes: Vec::new(),
+                            whitespace: Whitespace::Free,
                         },
                         Grammar::ConstString("}".to_string()),
                     ])
@@ -1220,6 +1232,7 @@ impl Format {
                         schema: tool.function.parameters.clone(),
                         style: Some("glm_xml".to_string()),
                         excludes: Vec::new(),
+                        whitespace: Whitespace::Free,
                     },
                     markers.call_close,
                 )
@@ -4077,11 +4090,13 @@ mod tests {
     #[test]
     fn an_end_list_json_excludes_and_ebnf_write_the_engines_keys() {
         // A tag that ends at whichever of several texts comes first, JSON whose strings leave
-        // words out (written only when there are words to leave out), and an EBNF grammar.
+        // words out (written only when there are words to leave out), JSON whose whitespace is
+        // bounded (written only when it is), and an EBNF grammar.
         let excluding = |excludes: &[&str]| Grammar::JsonSchema {
             schema: value!({"type": "string"}),
             style: None,
             excludes: excludes.iter().map(|word| word.to_string()).collect(),
+            whitespace: Whitespace::Free,
         };
         let grammar = Grammar::Sequence(vec![
             Grammar::Tag(Tag {
@@ -4090,6 +4105,12 @@ mod tests {
                 end: Bound::Texts(vec!["</a>".to_string(), "</b>".to_string()]),
             }),
             excluding(&[]),
+            Grammar::JsonSchema {
+                schema: value!({"type": "object"}),
+                style: None,
+                excludes: Vec::new(),
+                whitespace: Whitespace::Bounded(16),
+            },
             Grammar::Ebnf("root ::= \"yes\"".to_string()),
         ]);
         assert_eq!(
@@ -4100,9 +4121,73 @@ mod tests {
                              "excludes": ["</a>"]},
                  "end": ["</a>", "</b>"]},
                 {"type": "json_schema", "json_schema": {"type": "string"}},
+                {"type": "json_schema", "json_schema": {"type": "object"},
+                 "max_whitespace_cnt": 16},
                 {"type": "grammar", "grammar": "root ::= \"yes\""},
             ]})
         );
+    }
+
+    /// The JSON schema node of a tag, wherever it stands: the answer's, under the thought or the
+    /// rows that lead to it.
+    fn json_schema_node(format: &Value) -> Option<&Value> {
+        if format["type"] == "json_schema" {
+            return Some(format);
+        }
+        ["elements", "tags"]
+            .iter()
+            .filter_map(|key| format[*key].as_array())
+            .flatten()
+            .chain(format.get("content"))
+            .find_map(json_schema_node)
+    }
+
+    #[test]
+    fn a_table_that_bounds_the_answers_whitespace_writes_the_bound_on_its_schema_alone() {
+        // LFM2.5's table bounds the runs of whitespace in a JSON answer; the bound is written on
+        // the answer's schema node, for every start and whether or not the prompt left the thought
+        // open, for a schema and for `json_object`'s bare object alike, and nowhere else: the
+        // calls' values are the schema's, and a table that does not bound keeps the node as it was.
+        let lfm = formats::lfm2_5();
+        let schema = value!({"type": "object", "properties": {"city": {"type": "string"}}});
+        for reasoning_open in [false, true] {
+            for start in [
+                GrammarStart::Unknown,
+                GrammarStart::AfterReasoning,
+                GrammarStart::FirstToken,
+            ] {
+                for schema in [&schema, &value!({"type": "object"})] {
+                    let answer = lfm
+                        .answer_grammar_for(schema, reasoning_open, start)
+                        .expect("an answer")
+                        .payload();
+                    let node = json_schema_node(&answer["format"]).expect("the schema node");
+                    assert_eq!(node["json_schema"], *schema, "{answer}");
+                    assert_eq!(
+                        node["max_whitespace_cnt"], 16,
+                        "reasoning_open={reasoning_open} {start:?}: {answer}"
+                    );
+                }
+            }
+            let calls = lfm
+                .grammar_for(
+                    &weather_tools(),
+                    Options {
+                        at_least_one: true,
+                        reasoning_open,
+                        one_call: false,
+                        start: GrammarStart::Unknown,
+                    },
+                )
+                .expect("a tag")
+                .payload_text();
+            assert!(!calls.contains("max_whitespace_cnt"), "{calls}");
+        }
+        let qwen = formats::qwen3(CallSyntax::Json)
+            .answer_grammar_for(&schema, false, GrammarStart::Unknown)
+            .expect("an answer")
+            .payload_text();
+        assert!(!qwen.contains("max_whitespace_cnt"), "{qwen}");
     }
 
     #[test]
@@ -4147,6 +4232,7 @@ mod tests {
                 schema: value!({"z": [1, 2.5, null], "a": {"b": "\t"}}),
                 style: Some("glm_xml".to_string()),
                 excludes: vec!["<|e|>".to_string()],
+                whitespace: Whitespace::Bounded(8),
             },
             Grammar::Ebnf("root ::= \"yes\"".to_string()),
             Grammar::Or(vec![

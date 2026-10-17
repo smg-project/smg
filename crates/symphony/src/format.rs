@@ -237,6 +237,17 @@ pub enum Emits {
     Wrapper,
 }
 
+/// How much whitespace a JSON answer may hold between its tokens.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Whitespace {
+    /// As much as JSON allows, which is without end.
+    #[default]
+    Free,
+    /// Runs of at most so many characters: xgrammar's `max_whitespace_cnt` on the answer's schema
+    /// node, which it enforces from 0.2.7 on and an older xgrammar ignores.
+    Bounded(u32),
+}
+
 /// One format's table. Built with [`Format::new`] and the methods that add a row each; the
 /// first state added is the initial one.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -260,6 +271,8 @@ pub struct Format {
     marker_tokens: Vec<String>,
     /// How the model's chat template writes a turn, where the table holds one.
     layout: Option<Box<Layout>>,
+    /// How much whitespace the answer's JSON may hold between its tokens.
+    answer_whitespace: Whitespace,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -345,6 +358,7 @@ impl Format {
             thinks_first: false,
             marker_tokens: Vec::new(),
             layout: None,
+            answer_whitespace: Whitespace::Free,
         }
     }
 
@@ -567,6 +581,24 @@ impl Format {
     /// Whether the template writes the thought before every call and answer.
     pub(crate) fn writes_thought_first(&self) -> bool {
         self.thinks_first
+    }
+
+    /// The answer's JSON holds runs of whitespace of at most `run` characters between its tokens
+    /// ([`Whitespace::Bounded`]): the structural tags write the bound into the answer's schema
+    /// node ([`Format::answer_grammar`], the whole turn's grammar), where JSON otherwise admits
+    /// whitespace without end. For a model that, held to its answer's JSON after a long thought by
+    /// an engine starting the grammar at the first token, drifts into runs of tabs and newlines
+    /// until the budget ends; its arrays and strings stay the schema's, and the calls' values are
+    /// not bounded. Parsing does not change.
+    #[must_use]
+    pub fn bounds_answer_whitespace(mut self, run: u32) -> Self {
+        self.answer_whitespace = Whitespace::Bounded(run);
+        self
+    }
+
+    /// How much whitespace the answer's JSON may hold between its tokens.
+    pub(crate) fn answer_whitespace(&self) -> Whitespace {
+        self.answer_whitespace
     }
 
     /// The texts among `tokens` (the model's vocabulary's added tokens, by their text) that the
