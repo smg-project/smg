@@ -130,14 +130,14 @@ An older gateway image does not know `--api-key-file`; a chart of this version w
 The connection URL of the history store (`history.postgres.url`, `history.redis.url`) carries the database password, so the chart writes it into a chart-managed Secret and the router pod gets it as the environment variable the gateway reads (`SMG_POSTGRES_DB_URL`, `SMG_REDIS_URL`); the URL is never in the pod's arguments, so it is not in the Deployment object, the process listing or `/proc`. A URL managed outside the chart's values comes from an existing Secret the same way:
 
 ```bash
-kubectl create secret generic smg-history --from-literal=postgres-url='postgresql://smg:<password>@postgres:5432/smg'
+kubectl create secret generic smg-db-credentials --from-literal=postgres-url='postgresql://smg:<password>@postgres:5432/smg'
 helm install smg deploy/helm/smg \
   --set history.backend=postgres \
-  --set history.postgres.existingSecret=smg-history \
+  --set history.postgres.existingSecret=smg-db-credentials \
   --set history.postgres.secretKey=postgres-url   # the default (redis: redis-url)
 ```
 
-A changed `url` rolls the router pods: the pod template carries a checksum of the chart-managed Secret. A rotated existing Secret does not, as the gateway reads the URL once at start-up; restart the router pods after rotating it (`kubectl rollout restart` of the router Deployment, or of the StatefulSet in mesh mode). With neither `url` nor `existingSecret` the chart passes no URL, and the gateway refuses to start a store backend without one, unless `router.extraEnv` provides the variable.
+A changed `url` rolls the router pods: the pod template carries a checksum of the chart-managed Secret. The checksum is a hash of the Secret's rendered contents, in which the URL is the only unknown, so a URL set in the values should carry a high-entropy password (anyone who can read the Deployment can test guesses against the hash); an existing Secret exposes no hash. The existing Secret's name must differ from the chart-managed one (`<fullname>-history`, so `smg-history` for a release named `smg`), or a later switch to `url` fails the upgrade because the chart cannot take over a Secret it did not create. A rotated existing Secret does not roll the pods, as the gateway reads the URL once at start-up; restart the router pods after rotating it (`kubectl rollout restart` of the router Deployment, or of the StatefulSet in mesh mode). With neither `url` nor `existingSecret` the chart passes no URL, and the gateway refuses to start a store backend without one, unless `router.extraEnv` provides the variable.
 
 An older gateway image does not read `SMG_POSTGRES_DB_URL` / `SMG_REDIS_URL`; a chart of this version with such an image refuses to start the store backend rather than starting it without the URL.
 
