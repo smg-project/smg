@@ -497,7 +497,7 @@ impl Assembler {
                 }
                 out.push(Event::Malformed {
                     text: Text::default(),
-                    why: MalformedReason::Other(VALUE_CUT_SHORT.into()),
+                    why: MalformedReason::ValueCutShort,
                 });
             }
             _ if !held.is_empty() => out.push(Event::Dropped {
@@ -841,7 +841,7 @@ mod tests {
             assert_eq!(arguments(&closed), expected, "{output:?}");
             assert_eq!(
                 malformed(&closed),
-                vec![(String::new(), VALUE_CUT_SHORT.to_string())],
+                vec![(String::new(), MalformedReason::ValueCutShort)],
                 "{output:?}"
             );
             assert!(
@@ -871,7 +871,7 @@ mod tests {
         assert_eq!(arguments(&held), r#"{"city": "Par<|"#);
         assert_eq!(
             malformed(&held),
-            vec![(String::new(), VALUE_CUT_SHORT.to_string())]
+            vec![(String::new(), MalformedReason::ValueCutShort)]
         );
         let held = run(&["call:f{city:<|\"|>Par<|"], true);
         assert_eq!(arguments(&held), r#"{"city": "Par"#);

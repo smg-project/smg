@@ -747,7 +747,10 @@ mod tests {
         assert_eq!(ends(&events), [""]);
         // The arguments are no whole value: one `Malformed` event says so before the end, of no
         // bytes since nothing was held at the cut.
-        assert_eq!(malformed(&events), [("", "unterminated")]);
+        assert_eq!(
+            malformed(&events),
+            [("", MalformedReason::UnterminatedRegion)]
+        );
         assert!(matches!(
             &events[events.len() - 2..],
             [Event::Malformed { .. }, Event::ToolCallEnd { .. }]
@@ -758,7 +761,10 @@ mod tests {
         assert_eq!(fragments(&events), Vec::<&str>::new());
         assert_eq!(
             malformed(&events),
-            [("<arg_key>n</arg_key><arg_value>12", MalformedReason::UnterminatedRegion)]
+            [(
+                "<arg_key>n</arg_key><arg_value>12",
+                MalformedReason::UnterminatedRegion
+            )]
         );
         assert_eq!(ends(&events), [""]);
         // A block with no name at all, cut: its bytes are unterminated, and no call started.
@@ -775,7 +781,10 @@ mod tests {
     fn the_calls_end_inside_a_streamed_string_leaves_it_open_and_says_so() {
         let events = run(&["f<arg_key>s</arg_key><arg_value>a <"], false);
         assert_eq!(fragments(&events), [r#"{"s": ""#, "a "]);
-        assert_eq!(malformed(&events), [("<", MalformedReason::UnterminatedRegion)]);
+        assert_eq!(
+            malformed(&events),
+            [("<", MalformedReason::UnterminatedRegion)]
+        );
         assert!(matches!(
             &events[events.len() - 2..],
             [Event::Malformed { .. }, Event::ToolCallEnd { .. }]
@@ -788,7 +797,10 @@ mod tests {
         // Nothing held: the one event has no bytes.
         let events = run(&["f<arg_key>s</arg_key><arg_value>Par"], false);
         assert_eq!(fragments(&events), [r#"{"s": ""#, "Par"]);
-        assert_eq!(malformed(&events), [("", "unterminated")]);
+        assert_eq!(
+            malformed(&events),
+            [("", MalformedReason::UnterminatedRegion)]
+        );
         assert_eq!(ends(&events), [CLOSE]);
         assert_eq!(
             bytes(&events),

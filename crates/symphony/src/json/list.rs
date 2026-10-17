@@ -600,13 +600,19 @@ mod tests {
         let prose = " \nA baseball game can be described as exciting.";
         let whole = run_alone(&[output]);
         assert_eq!(bytes(&whole), output);
-        assert_eq!(malformed(&whole, MalformedReason::TextAfterTheArguments), prose);
+        assert_eq!(
+            malformed(&whole, MalformedReason::TextAfterTheArguments),
+            prose
+        );
         assert!(dropped(&whole).is_empty(), "{whole:?}");
         let pieces: Vec<String> = output.chars().map(String::from).collect();
         let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
         let cut = run_alone(&refs);
         assert_eq!(bytes(&cut), output);
-        assert_eq!(malformed(&cut, MalformedReason::TextAfterTheArguments), prose);
+        assert_eq!(
+            malformed(&cut, MalformedReason::TextAfterTheArguments),
+            prose
+        );
         assert!(dropped(&cut).is_empty(), "{cut:?}");
         // After a call too, and after a list's `]`.
         let output = "{\"name\": \"f\", \"arguments\": {}}\n\nDone, see above.";
@@ -629,7 +635,10 @@ mod tests {
             run(&[output]),
             run(&["[{\"name\": \"f\", \"arguments\": {}}]", " ", "and so on"]),
         ] {
-            assert_eq!(malformed(&events, MalformedReason::TextAfterTheList), " and so on");
+            assert_eq!(
+                malformed(&events, MalformedReason::TextAfterTheList),
+                " and so on"
+            );
             assert_eq!(dropped(&events), ["[", "]"]);
         }
         // Whitespace alone after the object or the list stays the template's wrapping.

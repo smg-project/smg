@@ -580,7 +580,7 @@ mod tests {
             assert!(
                 matches!(
                     &events[ended - 1],
-                    Event::Malformed { text, why: MalformedReason::Other(_) } if text.text == held
+                    Event::Malformed { text, why: MalformedReason::BlockWithoutACompleteCall } if text.text == held
                 ),
                 "{output:?}: {events:#?}"
             );

@@ -50,14 +50,13 @@ impl Header {
         Some(Found { framing, at, after })
     }
 
-    /// The region ended before the marker came: the held bytes come back as `Malformed` with the
-    /// reason `why` makes; nothing was held, nothing is pushed and `why` is not asked (a reason
-    /// with a text of its own costs an allocation a message with an empty header never pays).
-    pub(super) fn ended(self, why: impl FnOnce() -> MalformedReason, out: &mut Events) {
+    /// The region ended before the marker came: the held bytes come back as `Malformed` for `why`;
+    /// nothing was held, nothing is pushed.
+    pub(super) fn ended(self, why: MalformedReason, out: &mut Events) {
         if !self.text.is_empty() {
             out.push(Event::Malformed {
                 text: Text::uncounted(self.text),
-                why: why(),
+                why,
             });
         }
     }
@@ -132,7 +131,7 @@ mod tests {
         let mut header = Header::new("[ARGS]");
         assert_eq!(header.push("name"), None);
         let mut out = Events::new();
-        header.ended(|| MalformedReason::UnterminatedRegion, &mut out);
+        header.ended(MalformedReason::UnterminatedRegion, &mut out);
         assert_eq!(
             out.as_slice(),
             &[Event::Malformed {
@@ -141,15 +140,7 @@ mod tests {
             }]
         );
         let mut out = Events::new();
-        let mut asked = false;
-        Header::new("[ARGS]").ended(
-            || {
-                asked = true;
-                MalformedReason::UnterminatedRegion
-            },
-            &mut out,
-        );
+        Header::new("[ARGS]").ended(MalformedReason::UnterminatedRegion, &mut out);
         assert!(out.is_empty());
-        assert!(!asked, "an empty header asks for no reason");
     }
 }

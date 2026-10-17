@@ -102,7 +102,7 @@ impl Assembler {
             Some(arguments) => arguments.finish(out),
             None => self
                 .header
-                .ended(|| MalformedReason::NameWithoutArguments, out),
+                .ended(MalformedReason::NameWithoutArguments, out),
         }
     }
 
@@ -111,9 +111,7 @@ impl Assembler {
     pub fn finish(self, out: &mut Events) {
         match self.arguments {
             Some(arguments) => arguments.finish(out),
-            None => self
-                .header
-                .ended(|| MalformedReason::UnterminatedRegion, out),
+            None => self.header.ended(MalformedReason::UnterminatedRegion, out),
         }
     }
 }
