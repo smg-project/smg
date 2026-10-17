@@ -195,24 +195,37 @@ fn bench_string_tree(c: &mut Criterion) {
 
     // The request routes to a tenant other than the one it matched: the insert
     // replay attaches the routed tenant on every path node (confirming each
-    // edge first) instead of taking the skip branch that "hit" measures. Its
-    // own warm tree, so the rows after it see the tree "hit" left.
-    let (other_tree, other_tenants, other_prompts) = warm_string_tree();
-    let next_names: HashMap<&str, &str> = other_tenants
+    // edge first) instead of taking the skip branch that "hit" measures. The
+    // attachment happens once per tenant per tree, so the tree is rebuilt in
+    // the untimed setup every TENANTS iterations: each timed call replays onto
+    // a path the routed tenant is not yet attached to. Its own tree, so the
+    // rows after it see the tree "hit" left.
+    let other_tree = RefCell::new(warm_string_tree().0);
+    let next_names: HashMap<&str, &str> = tenants
         .iter()
-        .zip(other_tenants.iter().cycle().skip(1))
+        .zip(tenants.iter().cycle().skip(1))
         .map(|(tenant, next)| (tenant.as_str(), next.as_str()))
         .collect();
-    let mut j = 0usize;
+    let mut j = 0u64;
     group.bench_function("hit_other", |b| {
-        b.iter(|| {
-            let prompt = &other_prompts[j % TENANTS];
-            j += 1;
-            let result = other_tree
-                .match_and_insert_with(prompt, |r| next_names.get(r.tenant.as_ref()).copied());
-            assert!(result.matched_char_count >= SYSTEM_CHARS);
-            result.matched_char_count
-        });
+        b.iter_batched(
+            || {
+                if j.is_multiple_of(TENANTS as u64) {
+                    *other_tree.borrow_mut() = warm_string_tree().0;
+                }
+                let k = (j % TENANTS as u64) as usize;
+                j += 1;
+                k
+            },
+            |k| {
+                let result = other_tree.borrow().match_and_insert_with(&prompts[k], |r| {
+                    next_names.get(r.tenant.as_ref()).copied()
+                });
+                assert!(result.matched_char_count >= SYSTEM_CHARS);
+                result.matched_char_count
+            },
+            BatchSize::SmallInput,
+        );
     });
 
     let miss_tree = RefCell::new(warm_string_tree().0);
