@@ -96,9 +96,10 @@ use serde::Deserialize;
 use symphony::{
     adapt,
     formats::{
-        deepseek_v4_1, dots3, for_model, function_gemma, gemma4, glm, glm4, groups, hy4, inkling,
-        iquest, json, k2_horizon, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2,
-        minimax_m3, mistral_v13, muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+        deepseek_v3, deepseek_v3_1, deepseek_v4_1, dots3, for_model, function_gemma, gemma4, glm,
+        glm4, groups, hy4, inkling, iquest, json, k2_horizon, kimi_k3, lfm2_5, ling,
+        llama_nemotron, minicpm5, minimax_m2, minimax_m3, mistral_v13, muse_spark, olmo3, plain,
+        qwen2_5, qwen3, seed_oss, xlam,
     },
     tagged::{Placement, Spelling},
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
@@ -403,6 +404,32 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         "deepseek-v4.1-flash",
         Family::DeepSeekV4_1,
         GenerationPrompt::OpensTheThought,
+    ),
+    // DeepSeek V3.1 and V3.2-Exp close the thought in the prompt (`</think>` right after the
+    // opener) unless the request's `thinking` kwarg opens it; the recorded requests carry
+    // `enable_thinking`, which these templates do not read, so every recorded prompt closes it
+    // and the output starts in content. DeepSeek V3 has no thought. Their sets hold content
+    // alone: the templates take a call's arguments as a string, and the recorder refused every
+    // call case of the corpus, whose arguments are objects.
+    (
+        "deepseek-v3.1",
+        Family::DeepSeekV3_1,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "deepseek-v3.2-exp",
+        Family::DeepSeekV3_1,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "deepseek-v3-0324",
+        Family::DeepSeekV3,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "deepseek-v3-0324-bf16",
+        Family::DeepSeekV3,
+        GenerationPrompt::Plain,
     ),
     // Kimi K3 writes XTML and opens the thought in the prompt, whatever the request says: its
     // recorded requests carry no switch. The shared tail adds a newline the template does not
@@ -1036,6 +1063,12 @@ enum Family {
     MiMo,
     /// [`qwen2_5`].
     Qwen2_5,
+    /// [`deepseek_v3`]: the name after `function<｜tool▁sep｜>` and the arguments in a `json` fence,
+    /// no thought.
+    DeepSeekV3,
+    /// [`deepseek_v3_1`]: the name, `<｜tool▁sep｜>` and the arguments object between the call's
+    /// markers.
+    DeepSeekV3_1,
     /// [`deepseek_v4_1`]: DSML, whose parameter tags type their own values.
     DeepSeekV4_1,
     /// [`seed_oss`]: the tagged syntax under Seed-OSS's markers, typed by the request tools.
@@ -1128,6 +1161,8 @@ impl Family {
             Self::Qwen3Tagged => qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
             Self::MiMo => qwen3(CallSyntax::Tagged(Spelling::Json, Placement::Direct)),
             Self::Qwen2_5 => qwen2_5(),
+            Self::DeepSeekV3 => deepseek_v3(),
+            Self::DeepSeekV3_1 => deepseek_v3_1(),
             Self::DeepSeekV4_1 => deepseek_v4_1(),
             Self::SeedOss => seed_oss(),
             Self::Hy4 => hy4(),
@@ -1178,12 +1213,14 @@ impl Family {
             | Self::Gemma4
             | Self::FunctionGemma
             | Self::MistralV13
+            | Self::DeepSeekV3
             | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
             // tagged ones' (no call comes of the fence); IQuest, DSML, LFM2.5, MiniMax M2,
             // MiniCPM5, dots3 and Llama Nemotron read `</think>` but not `<tool_call>`.
             Self::Ling | Self::Glm | Self::Glm4 => KNOWN_TAGGED_DIFFERENCES,
             Self::IQuest
+            | Self::DeepSeekV3_1
             | Self::DeepSeekV4_1
             | Self::Lfm2_5
             | Self::MinimaxM2
