@@ -2784,18 +2784,24 @@ fn markers_of(format: &symphony::Format) -> Vec<String> {
     pieces
 }
 
-/// `text` with one to three seeded corruptions, each on character boundaries: a span deleted, a
-/// span doubled, a piece inserted, the tail cut, or a span swapped for one character. Every
-/// corruption changes the text: one that drew an empty span (or a cut at the end) is drawn again,
-/// and an empty text takes an insertion, so a counted output is never the recorded one.
-fn corrupted(random: &mut Scramble, text: &str, pieces: &[String]) -> String {
-    let mut text = text.to_string();
+/// `recorded` with one to three seeded corruptions, each on character boundaries: a span deleted,
+/// a span doubled, a piece inserted, the tail cut, or a span swapped for one character. Every
+/// corruption changes the text it is given and none gives the recorded text back (a draw that
+/// would, an empty span, a cut at the end, a round that undoes the one before, is drawn again,
+/// and an empty text takes an insertion), so a counted output is never the recorded one.
+fn corrupted(random: &mut Scramble, recorded: &str, pieces: &[String]) -> String {
+    let mut text = recorded.to_string();
     for _ in 0..1 + random.below(3) {
         let before = std::mem::take(&mut text);
         text = (0..8)
             .map(|_| corrupted_once(random, &before, pieces))
-            .find(|after| *after != before)
+            .find(|after| *after != before && after != recorded)
             .unwrap_or_else(|| inserted(random, &before, 0, pieces));
+    }
+    if text == recorded {
+        // The fallback insertion undid the round before it: one more
+        // insertion (a piece is never empty) leaves the recorded text for good.
+        text = inserted(random, &text, 0, pieces);
     }
     text
 }
