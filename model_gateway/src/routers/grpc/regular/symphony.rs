@@ -1723,6 +1723,17 @@ mod tests {
             named_table(&pair(Some("kimi_k3"), Some("kimi_k3"))),
             Some(Table::KimiK3)
         );
+        // The Kimi K2 line's older parsers: the tool-call name, and its thought parsers alone;
+        // the `kimi` thought parser reads another family's markers and selects none.
+        assert_eq!(
+            named_table(&pair(Some("kimik2"), Some("kimi_thinking"))),
+            Some(Table::KimiK2)
+        );
+        assert_eq!(
+            named_table(&pair(None, Some("kimi_k25"))),
+            Some(Table::KimiK2)
+        );
+        assert_eq!(named_table(&pair(None, Some("kimi"))), None);
         assert_eq!(named_table(&pair(None, Some("Ling"))), Some(Table::Ling));
         assert_eq!(
             named_table(&pair(Some("qwen3_tagged"), None)),

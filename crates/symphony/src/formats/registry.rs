@@ -24,8 +24,8 @@ use std::sync::{Arc, LazyLock, OnceLock};
 
 use super::{
     deepseek_v4, deepseek_v4_1, dots3, function_gemma, gemma4, glm, glm4, hy4, inkling, iquest,
-    json, k2_horizon, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2, minimax_m3,
-    mistral_v13, muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+    json, k2_horizon, kimi_k2, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2,
+    minimax_m3, mistral_v13, muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
 };
 use crate::{
     format::{CallSyntax, Format},
@@ -121,6 +121,8 @@ tables! {
     MuseSpark => "muse_spark", muse_spark;
     /// [`plain()`].
     Plain => "plain", plain;
+    /// [`kimi_k2()`].
+    KimiK2 => "kimi_k2", kimi_k2;
 }
 
 /// A table's row in the registry: the table, its name and the function that builds it. The rows
@@ -191,7 +193,7 @@ impl Table {
     /// reads for. A row may also be the name a downstream launcher passes for a model family
     /// whose table has no older parser (`muse` for `muse_spark`), so that the launcher's flags
     /// read with the table.
-    pub const ALIASES: [(&str, Table); 10] = [
+    pub const ALIASES: [(&str, Table); 13] = [
         ("qwen", Table::Qwen3),
         ("qwen_xml", Table::Qwen3Tagged),
         ("qwen_coder", Table::Qwen3Tagged),
@@ -202,6 +204,9 @@ impl Table {
         ("deepseek_v41", Table::DeepSeekV4_1),
         ("minimax", Table::MinimaxM2),
         ("muse", Table::MuseSpark),
+        ("kimik2", Table::KimiK2),
+        ("kimi_thinking", Table::KimiK2),
+        ("kimi_k25", Table::KimiK2),
     ];
 
     /// The table, built once and shared: the engines that run it, and whoever asks the table

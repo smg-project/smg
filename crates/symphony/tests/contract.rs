@@ -311,6 +311,10 @@ fn muse_spark() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::MuseSpark.format(), Declared::default()))
 }
 
+fn kimi_k2() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::KimiK2.format(), Declared::default()))
+}
+
 fn mistral_v13() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::MistralV13.format(), Declared::default()))
 }
@@ -878,6 +882,12 @@ const FORMATS: &[Subject] = &[
         table: Some(Table::MuseSpark),
     },
     Subject {
+        name: "kimi k2",
+        new: kimi_k2,
+        outputs: KIMI_K2_OUTPUTS,
+        table: Some(Table::KimiK2),
+    },
+    Subject {
         name: "plain",
         new: plain,
         outputs: PLAIN_OUTPUTS,
@@ -1177,6 +1187,31 @@ const MUSE_SPARK_OUTPUTS: &[&str] = &[
     "<atem:invoke id=\"1\">text</atem:invoke> to=user<|message|>Hi",
     " to=self<|message|>A thought cut<|eom|><|start|>assistant to=us",
     "unframed text",
+];
+
+/// The Kimi K2 table: a thought and a call; two calls; content and a call with no arguments; a
+/// thought and an answer; an answer alone; the closing marker inside a string argument; a call
+/// cut short; the id without `functions.`; an id without its index, which opens no call;
+/// arguments that are not JSON; text after the object; text in the block between the calls; the
+/// block closed with a call open; a thought the end cuts; and nothing. The contract feeds no
+/// prompt, so each entry with a thought opens it itself, as K2 Thinking's template has the model
+/// do.
+const KIMI_K2_OUTPUTS: &[&str] = &[
+    "<think>Need the weather.</think><|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_calls_section_end|>",
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_call_begin|>functions.get_weather:1<|tool_call_argument_begin|>{\"city\": \"Rome\", \"days\": 3}<|tool_call_end|><|tool_calls_section_end|>",
+    "Let me check.<|tool_calls_section_begin|><|tool_call_begin|>functions.get_stock_price:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>",
+    "<think>Plan.</think>It is sunny.",
+    "Hello!",
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.save_note:0<|tool_call_argument_begin|>{\"body\": \"a <|tool_call_end|> b\"}<|tool_call_end|><|tool_calls_section_end|>",
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Par",
+    "<|tool_calls_section_begin|><|tool_call_begin|>get_weather:0<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_calls_section_end|>",
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_calls_section_end|>",
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>not json<|tool_call_end|><|tool_calls_section_end|>",
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>{} trailing<|tool_call_end|><|tool_calls_section_end|>",
+    "<|tool_calls_section_begin|>stray<|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>",
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>{}<|tool_calls_section_end|>",
+    "<think>unfinished",
+    "",
 ];
 
 /// Kimi K3's syntax: the recorded shape, a thought with text, every value type, calls ended every
