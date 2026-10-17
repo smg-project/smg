@@ -71,14 +71,7 @@ pub(in crate::openai) async fn route_responses(
     {
         Ok(w) => w,
         Err(response) => {
-            Metrics::record_router_error(
-                metrics_labels::ROUTER_OPENAI,
-                metrics_labels::BACKEND_EXTERNAL,
-                metrics_labels::CONNECTION_HTTP,
-                model,
-                metrics_labels::ENDPOINT_RESPONSES,
-                metrics_labels::ERROR_NO_WORKERS,
-            );
+            super::record_error(model, metrics_labels::ERROR_NO_WORKERS);
             return response;
         }
     };
@@ -93,14 +86,7 @@ pub(in crate::openai) async fn route_responses(
         .as_ref()
         .is_some_and(|s| !s.is_empty());
     if conversation.is_some() && has_previous_response {
-        Metrics::record_router_error(
-            metrics_labels::ROUTER_OPENAI,
-            metrics_labels::BACKEND_EXTERNAL,
-            metrics_labels::CONNECTION_HTTP,
-            model,
-            metrics_labels::ENDPOINT_RESPONSES,
-            metrics_labels::ERROR_VALIDATION,
-        );
+        super::record_error(model, metrics_labels::ERROR_VALIDATION);
         return error::bad_request(
             "invalid_request",
             "Cannot specify both 'conversation' and 'previous_response_id'".to_string(),
@@ -134,14 +120,7 @@ pub(in crate::openai) async fn route_responses(
     let mut payload = match to_value_exact(&request_body) {
         Ok(v) => v,
         Err(e) => {
-            Metrics::record_router_error(
-                metrics_labels::ROUTER_OPENAI,
-                metrics_labels::BACKEND_EXTERNAL,
-                metrics_labels::CONNECTION_HTTP,
-                model,
-                metrics_labels::ENDPOINT_RESPONSES,
-                metrics_labels::ERROR_VALIDATION,
-            );
+            super::record_error(model, metrics_labels::ERROR_VALIDATION);
             return error::bad_request(
                 "invalid_request",
                 format!("Failed to serialize request: {e}"),
@@ -151,14 +130,7 @@ pub(in crate::openai) async fn route_responses(
 
     let provider = resolve_provider(deps.provider_registry, worker.as_ref(), model);
     if let Err(e) = provider.transform_request(&mut payload, Endpoint::Responses) {
-        Metrics::record_router_error(
-            metrics_labels::ROUTER_OPENAI,
-            metrics_labels::BACKEND_EXTERNAL,
-            metrics_labels::CONNECTION_HTTP,
-            model,
-            metrics_labels::ENDPOINT_RESPONSES,
-            metrics_labels::ERROR_VALIDATION,
-        );
+        super::record_error(model, metrics_labels::ERROR_VALIDATION);
         return error::bad_request("invalid_request", format!("Provider transform error: {e}"));
     }
 

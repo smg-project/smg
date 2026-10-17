@@ -18,11 +18,7 @@ use smg_data_connector::{
 use tracing::warn;
 
 use super::super::context::ResponsesComponents;
-use crate::{
-    error,
-    metrics::{metrics_labels, Metrics},
-    persistence_utils::split_stored_message_content,
-};
+use crate::{error, metrics::metrics_labels, persistence_utils::split_stored_message_content};
 
 const MAX_CONVERSATION_HISTORY_ITEMS: usize = 100;
 
@@ -94,14 +90,7 @@ pub(crate) async fn load_input_history(
                 chain_items = Some(items);
             }
             Ok(_) | Err(ResponseStorageError::ResponseNotFound(_)) => {
-                Metrics::record_router_error(
-                    metrics_labels::ROUTER_OPENAI,
-                    metrics_labels::BACKEND_EXTERNAL,
-                    metrics_labels::CONNECTION_HTTP,
-                    model,
-                    metrics_labels::ENDPOINT_RESPONSES,
-                    metrics_labels::ERROR_VALIDATION,
-                );
+                super::record_error(model, metrics_labels::ERROR_VALIDATION);
                 return Err(error::bad_request(
                     "previous_response_not_found",
                     format!("Previous response with id '{prev_id_str}' not found."),
@@ -112,14 +101,7 @@ pub(crate) async fn load_input_history(
                     "Failed to load previous response chain for {}: {}",
                     prev_id_str, e
                 );
-                Metrics::record_router_error(
-                    metrics_labels::ROUTER_OPENAI,
-                    metrics_labels::BACKEND_EXTERNAL,
-                    metrics_labels::CONNECTION_HTTP,
-                    model,
-                    metrics_labels::ENDPOINT_RESPONSES,
-                    metrics_labels::ERROR_INTERNAL,
-                );
+                super::record_error(model, metrics_labels::ERROR_INTERNAL);
                 return Err(error::storage_failure(
                     "load_previous_response_chain_failed",
                     format!("Failed to load previous response chain for {prev_id_str}"),
@@ -141,14 +123,7 @@ pub(crate) async fn load_input_history(
         {
             Ok(Some(conversation)) if conversation.is_visible_to(tenant) => {}
             Ok(_) => {
-                Metrics::record_router_error(
-                    metrics_labels::ROUTER_OPENAI,
-                    metrics_labels::BACKEND_EXTERNAL,
-                    metrics_labels::CONNECTION_HTTP,
-                    model,
-                    metrics_labels::ENDPOINT_RESPONSES,
-                    metrics_labels::ERROR_VALIDATION,
-                );
+                super::record_error(model, metrics_labels::ERROR_VALIDATION);
                 return Err(error::not_found(
                     "not_found",
                     format!("No conversation found with id '{}'", conv_id.0),
@@ -156,14 +131,7 @@ pub(crate) async fn load_input_history(
             }
             Err(e) => {
                 warn!("Failed to check conversation {}: {}", conv_id.0, e);
-                Metrics::record_router_error(
-                    metrics_labels::ROUTER_OPENAI,
-                    metrics_labels::BACKEND_EXTERNAL,
-                    metrics_labels::CONNECTION_HTTP,
-                    model,
-                    metrics_labels::ENDPOINT_RESPONSES,
-                    metrics_labels::ERROR_INTERNAL,
-                );
+                super::record_error(model, metrics_labels::ERROR_INTERNAL);
                 return Err(error::storage_failure(
                     "check_conversation_failed",
                     format!("Failed to check conversation {}", conv_id.0),
@@ -252,14 +220,7 @@ pub(crate) async fn load_input_history(
             }
             Err(e) => {
                 warn!("Failed to load conversation history: {}", e);
-                Metrics::record_router_error(
-                    metrics_labels::ROUTER_OPENAI,
-                    metrics_labels::BACKEND_EXTERNAL,
-                    metrics_labels::CONNECTION_HTTP,
-                    model,
-                    metrics_labels::ENDPOINT_RESPONSES,
-                    metrics_labels::ERROR_INTERNAL,
-                );
+                super::record_error(model, metrics_labels::ERROR_INTERNAL);
                 return Err(error::storage_failure(
                     "load_conversation_history_failed",
                     "Failed to load conversation history",
