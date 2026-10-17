@@ -506,7 +506,14 @@ impl TokenTree {
     ///
     /// [`Self::match_and_insert_with`] reuses this to splice only the *unmatched
     /// suffix* at the fall-off node (after re-attaching the tenant to the matched
-    /// ancestor nodes), so the already-matched prefix is never re-walked.
+    /// ancestor nodes), so the already-matched prefix is never re-walked; except
+    /// when its replay finds an edge gone (an eviction detached a path node while
+    /// the caller chose the tenant): then it descends again from the root over the
+    /// whole aligned sequence, so that the suffix lands under live nodes. The
+    /// credit stays exact, since a node the replay already attached is a full
+    /// match here and adds nothing, though such a node is touched a second time
+    /// (under LFU its hit count rises twice for the one request), on that rare
+    /// path alone.
     fn insert_from(
         mut current: NodeRef,
         mut remaining: &[TokenId],
