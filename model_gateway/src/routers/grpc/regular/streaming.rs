@@ -423,6 +423,10 @@ impl StreamingProcessor {
         stream.read_engine(&mut grpc_stream).await?;
         let usage = stream.usage_snapshot();
         stream.flush_parsers(usage.as_ref()).await?;
+        // Every Complete settled the guard as it came; the flush above may
+        // have counted held tokens since, so the completion count is settled
+        // once more before the finish and usage chunks.
+        stream.settle_usage_so_far();
         let final_usage = stream.final_usage();
         stream
             .send_finish_chunks(final_usage.as_ref(), usage.as_ref())
@@ -701,6 +705,12 @@ impl StreamingProcessor {
                     cached_tokens = cached_tokens.max(complete.cached_tokens());
                     reasoning_tokens_map.insert(index, complete.reasoning_tokens());
                     completed_indices.insert(index);
+                    // The engine's counts are in: a client that stops reading
+                    // at the finish chunk is booked with them.
+                    ctx.usage.settle(
+                        Some(u64::from(prompt_tokens)),
+                        completion_tokens_map.values().map(|&n| u64::from(n)).sum(),
+                    );
 
                     // Send final chunk with finish_reason
                     let finish_response = serde_json::json!({
@@ -754,7 +764,7 @@ impl StreamingProcessor {
         Self::record_generate_metrics(
             start_time,
             first_token_time,
-            prompt_tokens,
+            (!completed_indices.is_empty()).then_some(prompt_tokens),
             total_completion,
             None,
             ctx,
@@ -958,6 +968,12 @@ impl StreamingProcessor {
                     cached_tokens = cached_tokens.max(complete.cached_tokens());
                     reasoning_tokens_map.insert(index, complete.reasoning_tokens());
                     completed_indices.insert(index);
+                    // The engine's counts are in: a client that stops reading
+                    // at the finish chunk is booked with them.
+                    ctx.usage.settle(
+                        Some(u64::from(prompt_tokens)),
+                        completion_tokens_map.values().map(|&n| u64::from(n)).sum(),
+                    );
 
                     // Parse finish_reason
                     let finish_reason = utils::parse_finish_reason(
@@ -1019,7 +1035,7 @@ impl StreamingProcessor {
         Self::record_generate_metrics(
             start_time,
             first_token_time,
-            prompt_tokens,
+            (!completed_indices.is_empty()).then_some(prompt_tokens),
             total_completion,
             pd_timing.as_ref(),
             ctx,
@@ -1033,13 +1049,14 @@ impl StreamingProcessor {
     // ========================================================================
 
     /// Record streaming metrics for generate endpoint, and finish the
-    /// stream's usage guard with them. `prompt_tokens` is the count the
-    /// `Complete` message carried (0 when the stream ended without one), the
-    /// same count the client reads in `meta_info.prompt_tokens`.
+    /// stream's usage guard with them. `prompt_tokens` is the engine's count
+    /// when a `Complete` arrived (the one the client reads in
+    /// `meta_info.prompt_tokens`); without one the row keeps the count made
+    /// at dispatch and the token series records no input.
     fn record_generate_metrics(
         start_time: Instant,
         first_token_time: Option<Instant>,
-        prompt_tokens: u32,
+        prompt_tokens: Option<u32>,
         total_completion: u32,
         pd_timing: Option<&context::PdTiming>,
         ctx: GenerateStreamContext,
@@ -1058,8 +1075,9 @@ impl StreamingProcessor {
             endpoint: metrics_labels::ENDPOINT_GENERATE,
             ttft: first_token_time.map(|t| t.duration_since(stream_base)),
             generation_duration: stream_base.elapsed(),
-            input_tokens: Some(u64::from(prompt_tokens)),
+            input_tokens: prompt_tokens.map(u64::from),
             output_tokens: total_completion as u64,
+            unbilled_prompt_tokens: 0,
             usage: ctx.usage,
         });
     }
@@ -1845,6 +1863,7 @@ impl StreamingProcessor {
         stream.read_engine(&mut grpc_stream).await?;
         stream.flush_parsers().await?;
         stream.close_open_blocks().await?;
+        stream.settle_usage_so_far();
         stream.send_message_delta().await?;
         stream.send_message_stop().await?;
 
@@ -2059,6 +2078,13 @@ impl StreamingProcessor {
                         };
                     }
 
+                    // The units' counts are in: a client that stops reading at
+                    // the usage chunk is booked with them from here.
+                    stream_usage.settle(
+                        all_saw_complete.then_some(u64::from(total_prompt)),
+                        u64::from(total_completion),
+                    );
+
                     // All units succeeded (fail-fast `try_join_all` above), so
                     // this is the one settle point for every mode (Single/PD/Batch).
                     // But a unit that never saw a `Complete` message has no
@@ -2114,6 +2140,7 @@ impl StreamingProcessor {
                         generation_duration: start_time.elapsed(),
                         input_tokens: Some(total_prompt as u64),
                         output_tokens: total_completion as u64,
+                        unbilled_prompt_tokens: 0,
                         usage: stream_usage,
                     });
                 }
@@ -2889,6 +2916,21 @@ impl<'a> ChatStream<'a> {
         self.prompt_tokens.insert(index, complete.prompt_tokens());
 
         self.completion_tokens.record_complete(&complete);
+        // The engine's counts are in: a client that stops reading from here
+        // on (this choice's text, the finish or usage chunk) is booked with
+        // them, the stub the rendering added left out as the usage block
+        // leaves it out.
+        self.usage.settle(
+            Some(u64::from(
+                self.prompt_tokens
+                    .values()
+                    .copied()
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_sub(self.spec.unbilled_prompt_tokens),
+            )),
+            u64::from(self.completion_tokens.total()),
+        );
         if let Some(usage) = &mut self.continuous_usage {
             usage.record_complete(&complete);
         }
@@ -3343,6 +3385,12 @@ impl<'a> ChatStream<'a> {
         Ok(())
     }
 
+    /// Settle the stream's usage guard with the completion count as it
+    /// stands (the prompt count stays what the last Complete set).
+    fn settle_usage_so_far(&self) {
+        self.usage.settle(None, u64::from(self.counts().completion));
+    }
+
     /// The counters once, for the usage chunk, the settlement and the
     /// metrics: every choice shares one prompt, so prompt/cache counts take
     /// max; completion and reasoning counts sum across choices.
@@ -3492,6 +3540,7 @@ impl<'a> ChatStream<'a> {
             generation_duration: stream_base.elapsed(),
             input_tokens: Some(total_prompt as u64),
             output_tokens: total_completion as u64,
+            unbilled_prompt_tokens: self.spec.unbilled_prompt_tokens,
             usage: self.usage,
         });
     }
@@ -4046,6 +4095,12 @@ impl<'a> MessagesStream<'a> {
 
         self.prompt_tokens = complete.prompt_tokens();
         self.saw_complete = true;
+        // The engine's counts are in: a client that stops reading from here on is
+        // booked with them.
+        self.usage.settle(
+            Some(u64::from(self.prompt_tokens)),
+            u64::from(self.completion_tokens.total()),
+        );
         self.completion_tokens.record_complete(&complete);
         self.engine_thinking_tokens = complete.reasoning_tokens();
         self.cached_tokens = complete.cached_tokens();
@@ -4415,6 +4470,15 @@ impl<'a> MessagesStream<'a> {
         Ok(())
     }
 
+    /// The engine's counts are in: a client that stops reading at the
+    /// message_delta or message_stop event is booked with them from here.
+    fn settle_usage_so_far(&self) {
+        self.usage.settle(
+            self.saw_complete.then_some(u64::from(self.prompt_tokens)),
+            u64::from(self.completion_tokens.total()),
+        );
+    }
+
     /// Phase 4: the `message_delta` with the stop reason and the usage. A
     /// truncation stays max_tokens after a tool call started, as Chat keeps
     /// `length`: the call may be cut short.
@@ -4515,6 +4579,7 @@ impl<'a> MessagesStream<'a> {
             generation_duration: self.start_time.elapsed(),
             input_tokens: Some(u64::from(self.prompt_tokens)),
             output_tokens: u64::from(self.completion_tokens.total()),
+            unbilled_prompt_tokens: 0,
             usage: self.usage,
         });
     }

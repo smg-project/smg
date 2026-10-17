@@ -1373,6 +1373,11 @@ pub struct StreamingMetricsParams<'a> {
     pub input_tokens: Option<u64>,
     /// Output token count
     pub output_tokens: u64,
+    /// Prompt tokens the caller is not billed for (a stub the gateway's
+    /// template rendering added): the usage row takes `input_tokens` without
+    /// them, as the usage block the client reads does; the token series keeps
+    /// the engine's count.
+    pub unbilled_prompt_tokens: u32,
     /// The stream's usage guard (`DispatchMetadata::begin_usage`), finished
     /// here with the end's numbers: a stream end records its metrics and
     /// books its tenant's usage row in the one call, once.
@@ -1752,6 +1757,7 @@ impl Metrics {
             generation_duration,
             input_tokens,
             output_tokens,
+            unbilled_prompt_tokens,
             usage,
         } = params;
 
@@ -1759,7 +1765,11 @@ impl Metrics {
         // the prompt as tokenized at dispatch when the end has no count;
         // before the metrics handles, so a stream is booked whether the
         // handles are kept or not.
-        usage.finish(input_tokens, output_tokens, generation_duration);
+        usage.finish(
+            input_tokens.map(|count| count.saturating_sub(u64::from(unbilled_prompt_tokens))),
+            output_tokens,
+            generation_duration,
+        );
 
         // TPOT is only meaningful past the first token.
         let tpot = ttft.and_then(|ttft| {
@@ -3868,6 +3878,7 @@ mod tests {
                     generation_duration: Duration::from_millis(50),
                     input_tokens,
                     output_tokens,
+                    unbilled_prompt_tokens: 0,
                     usage: StreamUsage::begin_on(None, tenant_usage::UNRESOLVED_TENANT, "m1", 0),
                 });
             }
@@ -3880,6 +3891,7 @@ mod tests {
                 generation_duration: Duration::from_millis(20),
                 input_tokens: None,
                 output_tokens: 1,
+                unbilled_prompt_tokens: 0,
                 usage: StreamUsage::begin_on(None, tenant_usage::UNRESOLVED_TENANT, "m2", 0),
             });
         };
@@ -4046,6 +4058,7 @@ mod tests {
                 generation_duration: Duration::from_secs(1),
                 input_tokens: Some(128),
                 output_tokens: 128,
+                unbilled_prompt_tokens: 0,
                 usage: StreamUsage::begin_on(None, tenant_usage::UNRESOLVED_TENANT, MODEL, 0),
             });
             duration();
