@@ -44,7 +44,7 @@ sglang_latest=$("${CURL[@]}" https://pypi.org/pypi/sglang/json | jq -r .info.ver
 require "sglang latest" "$sglang_latest"
 emit sglang "$sglang_current" "$sglang_latest"
 
-vllm_current=$(sed -n "s/.*default: 'vllm\/vllm-openai:v\([0-9.]*\)'.*/\1/p" .github/workflows/release-vllm-docker.yml | head -1)
+vllm_current=$(sed -n 's/.*"vllm": \["vllm\/vllm-openai:v\([0-9.]*\)".*/\1/p' .github/workflows/release-engine-docker.yml | head -1)
 require "vllm pin" "$vllm_current"
 vllm_latest=$("${CURL[@]}" https://pypi.org/pypi/vllm/json | jq -r .info.version)
 require "vllm latest" "$vllm_latest"
