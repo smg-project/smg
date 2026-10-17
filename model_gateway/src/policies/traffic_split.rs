@@ -267,31 +267,36 @@ impl<'a> Split<'a> {
     }
 }
 
-/// Whether every available worker of `workers` is in a group that weighs 0
-/// over them, so nothing in the slice may take a request: the case
-/// [`Split::plan`] declines to split (one group, or every group drained) in
-/// which the policy must not run over the slice either. A member of a named
-/// group counts only an explicit weight (as [`Arm::weight`] has it); one of
-/// the default group without a label weighs the default, so an unlabelled
-/// slice is never drained, and neither is an empty or all-unavailable one
-/// (the policy answers those). Returns at the first member that weighs
-/// anything, so the usual slice costs one worker's labels.
+/// Whether every group among the available workers of `workers` weighs 0,
+/// so nothing in the slice may take a request: the case [`Split::plan`]
+/// declines to split (one group, or every group drained) in which the policy
+/// must not run over the slice either. A group weighs what [`Arm::weight`]
+/// says: the highest explicit weight among its available members, else 0
+/// for a named group and [`DEFAULT_WEIGHT`] for the default one (a default
+/// member without a label lifts nothing while another carries a weight). An
+/// empty or all-unavailable slice is not drained (the policy answers those).
+/// Returns at the first positive weight, so a weighted slice costs one
+/// worker's labels; an unlabelled one is read whole, as [`Split::plan`]
+/// reads it.
 pub fn drained(workers: &[Arc<dyn Worker>]) -> bool {
     let mut any = false;
+    let (mut default_weighted, mut default_unweighted) = (false, false);
     for worker in workers.iter().filter(|worker| worker.is_available()) {
         any = true;
-        let labels = &worker.metadata().spec.labels;
-        match labels
+        let default = group_of(worker.as_ref()) == DEFAULT_GROUP;
+        match worker
+            .metadata()
+            .spec
+            .labels
             .get(WEIGHT_LABEL)
             .and_then(|value| parse_weight(value).ok())
         {
-            Some(0) => {}
+            Some(0) => default_weighted |= default,
             Some(_) => return false,
-            None if group_of(worker.as_ref()) == DEFAULT_GROUP => return false,
-            None => {}
+            None => default_unweighted |= default,
         }
     }
-    any
+    any && !(default_unweighted && !default_weighted)
 }
 
 /// The group a worker is in: its `traffic_group` label, else [`DEFAULT_GROUP`].

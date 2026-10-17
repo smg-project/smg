@@ -3223,6 +3223,34 @@ mod tests {
                 .is_some());
         }
 
+        /// The drained verdict weighs the default group as the split does:
+        /// one default member carrying a weight of 0 next to an unlabelled
+        /// one weighs the group 0 (the highest explicit weight wins, the
+        /// default applies only when no member carries one), so a slice of
+        /// such a default group and a drained canary serves nothing; and
+        /// with the canary lifted, the split runs and gives it everything.
+        #[test]
+        fn a_default_member_with_a_weight_of_zero_drains_the_default_group() {
+            let reg = registry(true);
+            let policy = reg.get_default_policy();
+            let info = SelectWorkerInfo::default();
+            let drained = vec![
+                grouped("http://d1:8000", None, Some("0")),
+                grouped("http://d2:8000", None, None),
+                grouped("http://c1:8000", Some("canary"), Some("0")),
+            ];
+            assert_eq!(
+                reg.select_worker_for_model_split(&policy, "m", &drained, &info, None),
+                None
+            );
+            let lifted = vec![
+                grouped("http://d1:8000", None, Some("0")),
+                grouped("http://d2:8000", None, None),
+                grouped("http://c1:8000", Some("canary"), Some("10")),
+            ];
+            assert!(picks(&reg, &lifted, 20).iter().all(|&idx| idx == 2));
+        }
+
         #[test]
         fn the_selected_index_is_into_the_callers_slice() {
             let reg = registry(true);

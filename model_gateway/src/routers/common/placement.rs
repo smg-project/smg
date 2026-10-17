@@ -280,9 +280,12 @@ pub(crate) fn select_from(
     };
     // The engines this request already tried step aside for its retry while
     // another available candidate remains; otherwise the pool is used whole.
-    // An explicit target under consistent hashing indexes this slice and
-    // stays strict (as `admission_prefilters` keeps it), so it is never
-    // narrowed: the retry goes back to the targeted worker.
+    // Under the traffic split, untried candidates that are all in drained
+    // groups count as none left: the retry goes back to the tried workers
+    // rather than to the drained build or to a miss. An explicit target
+    // under consistent hashing indexes this slice and stays strict (as
+    // `admission_prefilters` keeps it), so it is never narrowed: the retry
+    // goes back to the targeted worker.
     let strict_target = policy.name() == "consistent_hashing"
         && header_utils::extract_target_worker(inputs.headers).is_some();
     let untried;
@@ -300,7 +303,9 @@ pub(crate) fn select_from(
             })
             .cloned()
             .collect::<Vec<_>>();
-        if untried.is_empty() {
+        if untried.is_empty()
+            || (policies.traffic_split_enabled() && traffic_split::drained(&untried))
+        {
             available
         } else {
             &untried
@@ -2045,6 +2050,57 @@ mod tests {
             inputs,
         )
         .expect("a worker is selectable")
+    }
+
+    /// Under the traffic split, a retry whose untried candidates are all in
+    /// a drained group goes back to the tried workers, as it does with
+    /// nothing untried left: never to the drained build, and not to a miss
+    /// while a healthy tried worker stands.
+    #[test]
+    fn a_retry_with_only_a_drained_group_untried_goes_back_to_the_tried_workers() {
+        let registry = WorkerRegistry::new();
+        for (url, group, weight) in [
+            ("http://s:1", "stable", "90"),
+            ("http://c:1", "canary", "0"),
+        ] {
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new(MODEL))
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Http)
+                        .runtime_type(RuntimeType::Sglang)
+                        .label("traffic_group", group)
+                        .label("traffic_weight", weight)
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .build(),
+                ))
+                .expect("worker registers");
+        }
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin).with_traffic_split(true);
+        let first = pick(&registry, &policies, PlacementInputs::default());
+        assert_eq!(
+            first.base_url(),
+            "http://s:1",
+            "the drained canary takes nothing"
+        );
+        let tried = vec![first.base_url().to_string()];
+        let retried = pick(
+            &registry,
+            &policies,
+            PlacementInputs {
+                tried: &tried,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            retried.base_url(),
+            "http://s:1",
+            "the retry goes back to the tried stable worker, not to the drained canary"
+        );
     }
 
     /// A routing key pins consistent hashing to one worker; once that worker
