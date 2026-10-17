@@ -1938,14 +1938,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     llm_multimodal::init_log_video_decode_timing(mm_settings.log_mm_timing.value);
     let turbojpeg = mm_settings.turbojpeg.value;
     init_mm_settings(mm_settings);
-    // The TurboJPEG policy is enforced here, once, in every routing mode and
-    // before anything binds: under `require` a host without the library stops
-    // the process now, where a refusal at router creation would be turned
-    // into a warning by the gateway's try-register (--enable-igw) and the
-    // process would start with no gRPC router behind its routes.
-    report_jpeg_decoder();
-    enforce_jpeg_decoder_policy(turbojpeg)
-        .map_err(|error| format!("TurboJPEG policy: {error:#}"))?;
 
     // The metrics recorder is installed now so start-up records land in it;
     // its listener binds further down, once every configuration read that
@@ -1957,6 +1949,19 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         metrics::init_startup_series();
         handle
     });
+
+    // The JPEG decoder report and the TurboJPEG policy come after the
+    // recorder: the report sets its gauges (`smg_mm_turbojpeg_available`,
+    // `smg_mm_webp_available`) once per process, and they must land in the
+    // recorder /metrics serves, not in the no-op one before it. The policy is
+    // still enforced once, in every routing mode and before anything binds:
+    // under `require` a host without the library stops the process here,
+    // where a refusal at router creation would be turned into a warning by
+    // the gateway's try-register (--enable-igw) and the process would start
+    // with no gRPC router behind its routes.
+    report_jpeg_decoder();
+    enforce_jpeg_decoder_policy(turbojpeg)
+        .map_err(|error| format!("TurboJPEG policy: {error:#}"))?;
 
     // Build the mesh server if configured. Starting gossip is deferred until
     // MeshAdapters has registered the `worker:`/`rl:` CRDT namespaces below —
