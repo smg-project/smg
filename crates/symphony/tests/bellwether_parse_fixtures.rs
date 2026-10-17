@@ -460,6 +460,25 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::MiMo,
         GenerationPrompt::ModelWritesTheThought,
     ),
+    // The V2.6 line writes the same tags with no newline between them; the generation prompt
+    // leaves the model to write `<think>`, as V2.5's does, and thinking off closes it in the prompt
+    // as `<think></think>` (no newlines, where the shared tail writes them: the state after the
+    // replay is content either way).
+    (
+        "mimo-v2.6-flash-rl",
+        Family::MiMo,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "mimo-v2.6-pro-rl",
+        Family::MiMo,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "mimo-v2.6-distill-qwen-9b",
+        Family::MiMo,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
     (
         "nvidia-nemotron-3-nano-30b-a3b-bf16",
         Family::Qwen3Tagged,

@@ -453,6 +453,15 @@ mod tests {
             table_for("thinkingmachines/Inkling-NVFP4"),
             Some(Table::Inkling)
         );
+        for mimo in [
+            "XiaomiMiMo/MiMo-V2.6-Flash-RL",
+            "XiaomiMiMo/MiMo-V2.6-Pro-RL",
+            "XiaomiMiMo/MiMo-V2.6-Flash-MOPD",
+            "XiaomiMiMo/MiMo-V2.6-Pro-MOPD",
+            "XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B",
+        ] {
+            assert_eq!(table_for(mimo), Some(Table::Qwen3TaggedDirect), "{mimo}");
+        }
     }
 
     #[test]

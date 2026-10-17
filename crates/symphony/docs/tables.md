@@ -15,6 +15,13 @@ The definition is the table below; the `Engine` runs it, and decides everything 
 - No row leaves reasoning on a call marker: Qwen3 closes its thought with `</think>` before a
   call, so a `<tool_call>` inside the thought is reasoning text.
 - The turn opener is ChatML's `<|im_start|>assistant`.
+- Under the tagged syntax with the value between the tags directly (`qwen3_tagged_direct`), MiMo
+  V2.5's template writes a newline after `<tool_call>` and after `<function=…>` and the V2.6 line
+  (Flash-RL, Pro-RL, Flash-MOPD, Pro-MOPD, Distill-Qwen-9B) writes none; the newline is the tags'
+  framing either way, and a value's own bytes stay as written. Both lines' templates write the
+  thought alike: every earlier turn opens with `<think>`, closed at once when it has no thought,
+  and the generation prompt leaves the model to write `<think>` (`<think></think>` with thinking
+  off): the same rows read both, as the recorded sets of the four groups show.
 
 The tests here are the engine's as much as this format's: they were written against the hand-written
 parser this table replaced, and hold the table to the same events.
