@@ -137,7 +137,11 @@ pub(crate) fn send_round<S: StreamSink>(
             match sink.try_send(wrap_stream_batch(batch, next_sequence(), self_name)) {
                 Ok(()) => {}
                 Err(SinkError::Full) => {
-                    log::debug!(peer = ?peer, "stream batch dropped on backpressure");
+                    log::debug!(
+                        peer = peer.unwrap_or_default(),
+                        "stream batch dropped on backpressure"
+                    );
+                    // TODO(metrics): bump stream_dropped_on_backpressure
                     break;
                 }
                 Err(SinkError::Closed) => return RoundOutcome::Closed,
@@ -159,7 +163,10 @@ pub(crate) fn send_round<S: StreamSink>(
         match sink.try_send(wrap_crdt_batch(crdt_batch, next_sequence(), self_name)) {
             Ok(()) => {}
             Err(SinkError::Full) => {
-                log::debug!(peer = ?peer, "crdt batch dropped on backpressure");
+                log::debug!(
+                    peer = peer.unwrap_or_default(),
+                    "crdt batch dropped on backpressure"
+                );
                 break;
             }
             Err(SinkError::Closed) => return RoundOutcome::Closed,
@@ -284,9 +291,9 @@ pub(crate) async fn handle_frame<S: StreamSink>(
     }
 }
 
-/// Outcome of one tick of the inbound sender task.
+/// Outcome of one tick of either end's sender.
 ///
-/// The task only marks a `RoundBatch` consumed (advances
+/// [`send_round`] only marks a `RoundBatch` consumed (advances
 /// `last_stream_batch`) when [`SenderTick::Emit`] is returned. The two
 /// skip variants preserve `last_stream_batch` so the same `Arc` is
 /// retried on the next tick — important because before peer identity
@@ -294,8 +301,9 @@ pub(crate) async fn handle_frame<S: StreamSink>(
 /// the batch anyway would silently drop its targeted entries.
 #[derive(Debug)]
 enum SenderTick {
-    /// Peer identity not yet known. Wait until the inbound handler
-    /// records the dialer's `peer_id` from the first frame.
+    /// Peer identity not yet known: on the acceptor, the inbound handler
+    /// has not recorded the dialer's `peer_id` from the first frame yet;
+    /// on the dialer, only an empty peer name gets here.
     SkipPeerUnknown,
     /// Round batch unchanged since the last successful emit.
     SkipBatchUnchanged,
@@ -303,13 +311,13 @@ enum SenderTick {
     Emit(Vec<StreamBatch>),
 }
 
-/// Decide what one tick of the inbound sender should do.
+/// Decide what one tick of either end's sender should do.
 ///
-/// Splitting this from the async task body makes the per-tick decision
+/// Splitting this from [`send_round`] makes the per-tick decision
 /// pinnable in unit tests without standing up an interval timer, a
-/// real mpsc, or a tokio runtime. The async loop is responsible for
-/// freshness-watermark advancement and channel I/O; this function is
-/// responsible only for the "what should we do this tick" decision.
+/// real mpsc, or a tokio runtime. `send_round` advances the freshness
+/// watermark and does the channel I/O; this function is responsible only
+/// for the "what should we do this tick" decision.
 fn plan_sender_tick(
     last_stream_batch: Option<&Arc<RoundBatch>>,
     current_stream_batch: &Arc<RoundBatch>,
@@ -461,6 +469,11 @@ mod sender_tick_tests {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
     use bytes::Bytes;
     use tokio::sync::mpsc::error::TryRecvError;
 
@@ -624,22 +637,41 @@ mod tests {
         assert_eq!(outcome, RoundOutcome::Closed);
     }
 
+    /// A sink with room for everything but stream batches, which it refuses as
+    /// full after the first: the shape of a channel that fills mid-round.
+    struct FullForStreamBatches {
+        inner: mpsc::Sender<StreamMessage>,
+        stream_batches_taken: AtomicUsize,
+    }
+
+    impl StreamSink for FullForStreamBatches {
+        fn try_send(&self, msg: StreamMessage) -> Result<(), SinkError> {
+            if msg.message_type() == StreamMessageType::StreamBatch
+                && self.stream_batches_taken.fetch_add(1, Ordering::Relaxed) >= 1
+            {
+                return Err(SinkError::Full);
+            }
+            StreamSink::try_send(&self.inner, msg)
+        }
+
+        async fn send(&self, msg: StreamMessage) -> bool {
+            StreamSink::send(&self.inner, msg).await
+        }
+    }
+
     #[test]
-    fn a_full_sink_drops_the_rest_of_the_round_without_blocking() {
-        let (tx, mut rx) = mpsc::channel::<StreamMessage>(1);
+    fn a_full_sink_drops_the_rest_of_the_stream_batches_and_the_ops_still_go_out() {
+        let (tx, mut rx) = mpsc::channel::<StreamMessage>(16);
+        let sink = FullForStreamBatches {
+            inner: tx,
+            stream_batches_taken: AtomicUsize::new(0),
+        };
         let acked = RwLock::new(CrdtWatermark::new());
         let mut state = SenderState::default();
         // Six drain entries make two stream batches (five chunks per batch).
-        let drain: Vec<(&str, &[u8])> = (0..6)
-            .map(|i| match i {
-                0 => ("td:0", b"d".as_slice()),
-                1 => ("td:1", b"d".as_slice()),
-                2 => ("td:2", b"d".as_slice()),
-                3 => ("td:3", b"d".as_slice()),
-                4 => ("td:4", b"d".as_slice()),
-                _ => ("td:5", b"d".as_slice()),
-            })
-            .collect();
+        let keys: Vec<String> = (0..6).map(|i| format!("td:{i}")).collect();
+        let drain: Vec<(&str, &[u8])> =
+            keys.iter().map(|k| (k.as_str(), b"d".as_slice())).collect();
         let batch = round(&drain, &[], vec![op("worker:a", 1)]);
 
         let outcome = send_round(
@@ -649,13 +681,17 @@ mod tests {
             &acked,
             "me",
             &mut counter(),
-            &tx,
+            &sink,
         );
-        assert_eq!(outcome, RoundOutcome::Sent);
+        assert_eq!(
+            outcome,
+            RoundOutcome::Sent,
+            "a full channel is not a closed one"
+        );
         assert_eq!(
             kinds(&mut rx),
-            [StreamMessageType::StreamBatch],
-            "one frame fit"
+            [StreamMessageType::StreamBatch, StreamMessageType::CrdtBatch],
+            "the first stream batch and, in the same round, the ops"
         );
 
         // The round counted as consumed (at-most-once): the same Arc is not re-sent.
@@ -666,7 +702,7 @@ mod tests {
             &acked,
             "me",
             &mut counter(),
-            &tx,
+            &sink,
         );
         assert_eq!(kinds(&mut rx), [StreamMessageType::CrdtBatch]);
     }
@@ -823,6 +859,47 @@ mod tests {
         assert!(
             ops.operations().iter().all(|op| !watermark.allows(op)),
             "the ack covers every op of the batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_crdt_batch_on_a_full_sink_is_merged_and_its_ack_dropped_without_blocking() {
+        let sender = MeshKV::new("sender".to_owned());
+        let s_ns = sender.configure_crdt_prefix("worker:", MergeStrategy::LastWriterWins);
+        s_ns.put("worker:a", b"v1".to_vec());
+        let ops = sender.collect_round_batch().crdt_ops;
+        let mut batches = build_crdt_batches(ops.operations(), MAX_STREAM_CHUNK_BYTES);
+        let msg = wrap_crdt_batch(batches.remove(0), 7, "peer");
+
+        let receiver = MeshKV::new("receiver".to_owned());
+        let r_ns = receiver.configure_crdt_prefix("worker:", MergeStrategy::LastWriterWins);
+        let (tx, mut rx) = mpsc::channel::<StreamMessage>(1);
+        tx.try_send(build_heartbeat(1, "me"))
+            .expect("the one slot is taken");
+        let acked = RwLock::new(CrdtWatermark::new());
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(500),
+            handle_frame(msg, "peer", "me", Some(&receiver), &acked, &mut || 8, &tx),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            Ok(Frame::Continue),
+            "a full sink drops the ack, it does not block the inbound loop"
+        );
+        assert_eq!(
+            r_ns.get("worker:a"),
+            Some(b"v1".to_vec()),
+            "and the merge still happened"
+        );
+        let only = rx
+            .try_recv()
+            .expect("the slot still holds the frame that filled it");
+        assert_eq!(only.message_type(), StreamMessageType::Heartbeat);
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "no ack was queued"
         );
     }
 
