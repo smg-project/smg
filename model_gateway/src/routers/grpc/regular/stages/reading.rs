@@ -185,8 +185,12 @@ pub(crate) fn reasoning_decision(
         ctx.tokenizer_arc()
             .is_some_and(|tokenizer| switch(tokenizer.as_ref()))
     };
+    // A request that chose no parser (transcription shares this path and
+    // sets none) keeps the legacy parsers here as at the other sites, rather
+    // than inheriting the enum's default: its response is read by them, so
+    // no table's replay of the prompt decides its reasoning state.
     match symphony::reasoning_open(
-        ctx.state.parser.unwrap_or_default(),
+        ctx.state.parser.unwrap_or(ParserChoice::Legacy),
         &ctx.components.parser_resolver.names(model),
         model,
         &ctx.components.templates,
