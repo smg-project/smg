@@ -188,7 +188,10 @@ impl std::fmt::Display for MmRefsError {
             Self::RouterSpecMissing => f.write_str(
                 "the router has no media spec for this model's family and cannot process its \
                  media itself; a vLLM worker with --mm-processor inprocess|redis processes it \
-                 under --mm-processing worker (or auto, when every worker of the model does)",
+                 under --mm-processing worker (or auto, when every worker of the model does and \
+                 none is an encode worker: media references never travel on the \
+                 encode-prefill-decode pipeline, so that pipeline serves no media the router \
+                 cannot process)",
             ),
             Self::NoCapableWorker { model, workers } => write!(
                 f,
