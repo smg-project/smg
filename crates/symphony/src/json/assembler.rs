@@ -19,7 +19,6 @@ use crate::{
     event::{Event, Events, MalformedReason, Text},
     json::{
         fragments::Fragments,
-        is_complete,
         outline::{Scanner, Span},
     },
 };
@@ -204,6 +203,18 @@ impl Assembler {
         if let Some(close) = close {
             self.send_held(arguments.as_ref(), out);
             self.no_arguments(arguments.as_ref(), out);
+            // The object closed, and the arguments value with it. A value the judge refused said
+            // so with the bytes from the first one a strict reader refuses; one the outline ended
+            // whole for the partial parser and cut short for a strict reader (a number or a word
+            // the object's brace stops, `12.`, `nu`) is said to be none by a `Malformed` event of
+            // no bytes, as at the stream's end, so that a client is told rather than handed
+            // arguments its own reader refuses.
+            if !self.fragments.refused() && !self.arguments_whole(arguments.as_ref()) {
+                out.push(Event::Malformed {
+                    text: Text::default(),
+                    why: MalformedReason::InvalidArguments,
+                });
+            }
             let tail_start = arguments
                 .as_ref()
                 .and_then(|span| span.end)
@@ -289,11 +300,12 @@ impl Assembler {
         }
     }
 
-    /// Whether the arguments the call has said are one whole JSON value: the value's bytes are
-    /// one, or none came and `{}` stands for them ([`Self::no_arguments`]).
+    /// Whether the arguments the call has said are one whole JSON value a strict reader takes:
+    /// the value's bytes are one by the judge's account ([`Prefix::whole`]), or none came and `{}`
+    /// stands for them ([`Self::no_arguments`]).
     fn arguments_whole(&self, arguments: Option<&Span>) -> bool {
         match arguments {
-            Some(span) => is_complete(&self.fragments.escaped(0, span.text(&self.text))),
+            Some(_) => self.fragments.whole(),
             None => !self.scanner.found().arguments_named,
         }
     }
@@ -415,8 +427,9 @@ mod tests {
     fn a_top_level_string_a_surrogate_breaks_is_the_one_shape_the_pieces_say_more_of() {
         // A string-valued arguments streams as written (a stringified call object is one), and
         // the parser refuses the whole value when a surrogate escape breaks inside it: the pieces
-        // have said the string's bytes before the break where the whole says nothing. Every
-        // byte is accounted for either way, and nothing a piece said is taken back.
+        // have said the string's bytes before the escape (which is held from its backslash until
+        // it is decided) where the whole says nothing. Every byte is accounted for either way,
+        // and nothing a piece said is taken back.
         let object = r#"{"name": "f", "arguments": "ab\udc00"}"#;
         let whole = run(&[object]);
         assert_eq!(arguments(&whole), "");
@@ -426,8 +439,8 @@ mod tests {
             .map(|(i, c)| &object[i..i + c.len_utf8()])
             .collect();
         let streamed = run(&per_char);
-        assert_eq!(arguments(&streamed), r#""ab\udc0"#);
-        assert_eq!(malformed(&streamed), r#"0""#);
+        assert_eq!(arguments(&streamed), r#""ab"#);
+        assert_eq!(malformed(&streamed), r#"\udc00""#);
         for events in [&whole, &streamed] {
             assert_eq!(sources(events), object);
         }
@@ -829,6 +842,142 @@ mod tests {
         );
     }
 
+    /// What the partial parser tolerates and a strict reader refuses (a value left out, a trailing
+    /// comma after a value and after a member, list items left out, an escape JSON lacks, a `\u`
+    /// escape short of four hex digits, a bracket of the wrong kind, whitespace JSON lacks, a
+    /// number and a word cut short before a close) closed a call as whole with arguments no JSON
+    /// reader takes. The fragments stop at the first byte a strict reader refuses, the rest of the
+    /// value is malformed with `InvalidArguments`, the object's brace ends the call, and the cut
+    /// changes nothing of it.
+    #[test]
+    fn arguments_a_strict_reader_refuses_are_malformed_from_the_first_such_byte() {
+        let strict_prefix = |text: &str| match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(_) => true,
+            Err(error) => error.is_eof(),
+        };
+        for (text, expected_arguments, expected_malformed) in [
+            (
+                r#"{"name": "get_weather", "arguments": {"city": "Paris", "days": ,}}"#,
+                r#"{"city": "Paris", "days": "#,
+                ",}",
+            ),
+            (
+                r#"{"name": "f", "arguments": {"city": "Paris", "days": 3, }}"#,
+                r#"{"city": "Paris", "days": 3, "#,
+                "}",
+            ),
+            (
+                r#"{"name": "f", "arguments": {"city": "Paris",}}"#,
+                r#"{"city": "Paris","#,
+                "}",
+            ),
+            (
+                r#"{"name": "f", "arguments": {"tags": [,,]}}"#,
+                r#"{"tags": ["#,
+                ",,]}",
+            ),
+            // An escape is held from its backslash until it is decided, so the fragments end
+            // before the one the reader refuses.
+            (
+                r#"{"name": "f", "arguments": {"city": "Pa\yris"}}"#,
+                r#"{"city": "Pa"#,
+                "\\yris\"}",
+            ),
+            (
+                r#"{"name": "f", "arguments": {"city": "\u12G4"}}"#,
+                r#"{"city": ""#,
+                "\\u12G4\"}",
+            ),
+            // The outline counts a closing bracket of either kind, so the arguments run to the
+            // second brace and the third closes the object.
+            (
+                r#"{"name": "f", "arguments": {"a": [1}}}"#,
+                r#"{"a": [1"#,
+                "}}",
+            ),
+            (
+                "{\"name\": \"f\", \"arguments\": {\"a\":\u{a0}1}}",
+                "{\"a\":",
+                "\u{a0}1}",
+            ),
+            (
+                r#"{"name": "f", "arguments": {"n": 1.}}"#,
+                r#"{"n": 1."#,
+                "}",
+            ),
+            (
+                r#"{"name": "f", "arguments": {"flag": nu}}"#,
+                r#"{"flag": "#,
+                "nu}",
+            ),
+        ] {
+            let whole = run(&[text]);
+            let pieces: Vec<&str> = text
+                .char_indices()
+                .map(|(i, c)| &text[i..i + c.len_utf8()])
+                .collect();
+            let by_char = run(&pieces);
+            for (events, how) in [(&whole, "whole"), (&by_char, "by the character")] {
+                assert_eq!(arguments(events), expected_arguments, "{text:?} {how}");
+                assert!(
+                    strict_prefix(expected_arguments),
+                    "{text:?}: the arguments are a prefix a strict reader takes"
+                );
+                assert_eq!(malformed(events), expected_malformed, "{text:?} {how}");
+                assert!(
+                    events.iter().all(|event| !matches!(
+                        event,
+                        Event::Malformed { why, .. } if *why != MalformedReason::InvalidArguments
+                    )),
+                    "{text:?} {how}: {events:#?}"
+                );
+                assert_eq!(
+                    events.last(),
+                    Some(&Event::ToolCallEnd {
+                        index: 0,
+                        source: Text::uncounted("}"),
+                    }),
+                    "{text:?} {how}"
+                );
+                assert_eq!(
+                    sources(events),
+                    text,
+                    "{text:?} {how}: every byte accounted for"
+                );
+            }
+        }
+    }
+
+    /// A value the object's own brace cuts short of whole for a strict reader (a number, a word)
+    /// is said to be none before the end, by a `Malformed` event of no bytes, where the brace
+    /// closed the call without a word before.
+    #[test]
+    fn a_value_the_objects_brace_cuts_short_is_said_to_be_none_before_the_end() {
+        for (text, expected_arguments) in [
+            (r#"{"name": "f", "arguments": 1.}"#, "1."),
+            (r#"{"name": "f", "arguments": -}"#, "-"),
+            (r#"{"name": "f", "arguments": nu}"#, "nu"),
+        ] {
+            let events = run(&[text]);
+            assert_eq!(arguments(&events), expected_arguments, "{text:?}");
+            assert_eq!(
+                &events[events.len() - 2..],
+                &[
+                    Event::Malformed {
+                        text: Text::default(),
+                        why: MalformedReason::InvalidArguments,
+                    },
+                    Event::ToolCallEnd {
+                        index: 0,
+                        source: Text::uncounted("}"),
+                    },
+                ],
+                "{text:?}: {events:#?}"
+            );
+            assert_eq!(sources(&events), text, "{text:?}");
+        }
+    }
+
     #[test]
     fn feed_says_how_many_bytes_the_object_took_and_takes_none_after_the_close() {
         let mut assembler = Assembler::new(0, "call_0");
@@ -936,7 +1085,9 @@ mod tests {
         };
         for (text, expected_arguments, expected_back) in [
             (r#"{"name": "f", "arguments": nosuch</f>"#, "", "nosuch</f>"),
-            (r#"{"name": "f", "arguments": nul</f>"#, "nul", "</f>"),
+            // A word the trailer cuts short of a literal is no JSON to a strict reader: held, it
+            // is handed back whole, as a word that is no literal is.
+            (r#"{"name": "f", "arguments": nul</f>"#, "", "nul</f>"),
             (r#"{"name": "f", "arguments": null</f>"#, "null", "</f>"),
             (
                 r#"{"name": "f", "arguments": {"a": nosuch}</f>"#,

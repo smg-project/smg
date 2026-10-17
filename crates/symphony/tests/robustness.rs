@@ -44,8 +44,8 @@ use common::bytes_of;
 use openai_protocol::common::{Function, Tool};
 use serde_json::json as value;
 use symphony::{
-    adapt, formats::Table, json::PartialJson, Declared, DropReason, Engine, EngineFinish, Event,
-    Events, FinishReason, Format, Input, MalformedReason, ParseError, Parser, TokenSpan,
+    adapt, formats::Table, Declared, DropReason, Engine, EngineFinish, Event, Events, FinishReason,
+    Format, Input, MalformedReason, ParseError, Parser, TokenSpan,
 };
 
 const CASES_ENV: &str = "SYMPHONY_SCRAMBLE_CASES";
@@ -535,8 +535,13 @@ fn joined_by<R: Clone + PartialEq>(list: &mut Vec<(R, String)>, why: &R, text: &
     }
 }
 
-fn valid_json_prefix(text: &str) -> bool {
-    matches!(PartialJson::default().parse(text, true), Ok((_, consumed)) if consumed == text.len())
+/// Whether `text` is a prefix of JSON a strict reader accepts: whole, or cut where the reader asks
+/// for more bytes rather than refusing one it saw (the contract test's oracle too).
+fn strict_json_prefix(text: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(_) => true,
+        Err(error) => error.is_eof(),
+    }
 }
 
 /// The contract one replay keeps: conservation, `Finish` last and alone, and a well-formed
@@ -576,9 +581,9 @@ fn check_contract(text: &str, events: &[Event]) -> Result<(), String> {
                 }
                 if let Some((_, so_far)) = arguments.iter_mut().find(|(i, _)| i == index) {
                     so_far.push_str(json);
-                    if !valid_json_prefix(so_far) {
+                    if !strict_json_prefix(so_far) {
                         return Err(place(&format!(
-                            "the arguments so far, {so_far:?}, are no valid JSON prefix"
+                            "the arguments so far, {so_far:?}, are no prefix of JSON a strict reader accepts"
                         )));
                     }
                 }

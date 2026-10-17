@@ -226,7 +226,9 @@ pub enum Event {
         source: Text,
     },
     /// A fragment of the call's arguments. Concatenated fragments for one index are always a
-    /// valid JSON prefix and equal the final arguments when the call ends.
+    /// prefix of JSON a strict reader accepts, and equal the final arguments when the call ends;
+    /// a call whose arguments are no whole JSON then says so by a `Malformed` event before its
+    /// end.
     ToolCallArguments {
         /// Which call the fragment belongs to.
         index: u32,

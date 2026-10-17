@@ -9,8 +9,6 @@
 //! ([`Assembler`](super::Assembler), [`named_arguments`](super::named_arguments)) keep their
 //! accounting here, so that the two say the same of the same bytes.
 
-use std::borrow::Cow;
-
 use crate::{
     event::{Event, Events, MalformedReason, Text},
     json::prefix::Prefix,
@@ -35,16 +33,15 @@ impl Fragments {
         self.invalid_from.is_some()
     }
 
-    /// `fragment`, the judged bytes from offset `from` on, with every raw control character the
-    /// judge met inside a string written as its JSON escape ([`Prefix::escaped`]): the bytes as a
-    /// client assembles them, which is what a reader checks for a whole value.
-    pub(super) fn escaped<'a>(&self, from: usize, fragment: &'a str) -> Cow<'a, str> {
-        self.prefix.escaped(from, fragment)
+    /// Whether the bytes judged so far are one whole JSON value a strict reader takes
+    /// ([`Prefix::whole`]).
+    pub(super) fn whole(&self) -> bool {
+        self.prefix.whole()
     }
 
     /// The bytes of `value` that arrived since the last call, judged, and the part that keeps the
     /// value a valid JSON prefix sent as a fragment of the call at `index`. Bytes the judge may
-    /// still go back to (a word being spelled, `nu`; a surrogate escape awaiting its low half; the
+    /// still go back to (a word being spelled, `nu`; an escape being read, from its backslash; the
     /// whitespace before a value at the top) are held while the value is `open`: a fragment
     /// passed on cannot be taken back, so the pieces would say `n` where the whole says nothing.
     /// They go once the next bytes settle them, with the value's end, or when no more bytes can
@@ -191,7 +188,6 @@ mod tests {
         let value = "{\"a\": \"x\ny\"}";
         assert_eq!(fragments.send(value, false, 0, &mut out), Some(value.len()));
         assert_eq!(said(&out.drain()), ["fragment {\"a\": \"x\\ny\"}"]);
-        assert_eq!(fragments.escaped(0, value), "{\"a\": \"x\\ny\"}");
-        assert!(!fragments.refused());
+        assert!(fragments.whole() && !fragments.refused());
     }
 }
