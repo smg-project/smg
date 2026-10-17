@@ -177,20 +177,56 @@ def test_chat_stream_core_flags_a_role_repeated_on_every_chunk():
     assert detail["smg_core"][0] == "delta.role.repeated"
     assert compat_diff.chat_core_name("delta.role+") == "delta.role.repeated"
     assert compat_diff.chat_core_name("delta.role+tool_calls+") == "delta.role.repeated"
-    # a multi-choice stream sends one role chunk per choice index, back to back
-    # or not; the request's n tells the two apart
-    per_index = [
-        "delta.role",
+    # a multi-choice stream sends one role chunk per choice index: the vendor
+    # interleaves the indexes' chunks (its n=2 recording), a gateway may open
+    # both indexes back to back (the first output of index 0 decoded to no
+    # text); the request's n tells a multi-choice stream from a single-choice
+    # one, and in one the chunks carrying role are counted instead
+    vendor_n2 = [
         "delta.role",
         "delta.content",
-        "delta.empty.finish:stop+",
+        "delta.role",
+        "delta.content",
+        "delta.content",
+        "delta.empty.finish:stop",
+        "delta.empty.finish:stop",
         "usage",
         "[DONE]",
     ]
-    one_choice = ["delta.role", "delta.empty.finish:stop", "usage", "[DONE]"]
-    assert compat_diff.compare_events(per_index, one_choice, "openai-chat")[0]
-    multi = compat_diff.compare_events(per_index, one_choice, "openai-chat", multi_choice=True)
+    back_to_back = [
+        "delta.role",
+        "delta.role",
+        "delta.content",
+        "delta.content",
+        "delta.empty.finish:stop",
+        "delta.empty.finish:stop",
+        "usage",
+        "[DONE]",
+    ]
+    assert compat_diff.compare_events(vendor_n2, back_to_back, "openai-chat")[0]
+    multi = compat_diff.compare_events(vendor_n2, back_to_back, "openai-chat", multi_choice=True)
     assert not multi[0], multi[1]
+    assert compat_diff.role_chunks(vendor_n2) == 2
+    assert (
+        compat_diff.role_chunks(["delta.role+content", "delta.content", "delta.role+tool_calls"])
+        == 2
+    )
+    # a role on every chunk of an n=2 stream is still drift: five chunks carry
+    # role where the vendor's two do
+    on_every = ["delta.role+content"] * 5 + [
+        "delta.empty.finish:stop",
+        "delta.empty.finish:stop",
+        "usage",
+        "[DONE]",
+    ]
+    repeated_n2 = compat_diff.compare_events(vendor_n2, on_every, "openai-chat", multi_choice=True)
+    assert repeated_n2[0], repeated_n2[1]
+    assert repeated_n2[1]["role_chunks"] == {"vendor": 2, "smg": 5}
+    # one role chunk for two choices is one index short, not a pass
+    one_choice = ["delta.role", "delta.content", "delta.empty.finish:stop", "usage", "[DONE]"]
+    short = compat_diff.compare_events(vendor_n2, one_choice, "openai-chat", multi_choice=True)
+    assert short[0], short[1]
+    assert short[1]["role_chunks"] == {"vendor": 2, "smg": 1}
     assert compat_diff.request_choices({"request": {"body": {"n": 2}}}) == 2
     assert compat_diff.request_choices({"request": {"body": {"n": 1}}}) == 1
     assert compat_diff.request_choices({"request": {"body": None}}) == 1
@@ -203,15 +239,19 @@ def test_chat_stream_core_flags_a_role_repeated_on_every_chunk():
             "sse_events": [{"event": n, "data": "", "parsed": {}} for n in names],
         }
 
-    vrec = {"probe_id": "t.stream", "response": sse(per_index)}
+    vrec = {"probe_id": "t.stream", "response": sse(vendor_n2)}
     srec = {
         "probe_id": "t.stream",
         "recorded": True,
         "request": {"body": {"n": 2}},
-        "response": sse(one_choice),
+        "response": sse(back_to_back),
     }
     assert (
         compat_diff.classify("t.stream", vrec, srec, "openai-chat", frozenset())["severity"] != "S3"
+    )
+    srec["response"] = sse(on_every)
+    assert (
+        compat_diff.classify("t.stream", vrec, srec, "openai-chat", frozenset())["severity"] == "S3"
     )
     srec["request"]["body"]["n"] = 1
     assert (
