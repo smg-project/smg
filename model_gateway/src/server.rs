@@ -1957,6 +1957,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         mesh_adapters,
         probe_state,
     });
+    // For the shutdown task below: the mesh is told of the stop before the
+    // listeners drain (`app_state` moves into the route groups first).
+    let mesh_handler = app_state.mesh_handler.clone();
     // Worker discovery and mesh-router discovery are independent lifetimes:
     // either may run without the other. Each is supervised for unexpected exit
     // and its abort handle held so shutdown cancels it.
@@ -2208,14 +2211,52 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             in_flight = inflight_tracker.len(),
             "Beginning graceful shutdown: readiness draining"
         );
+        // Everything below shares the grace: the drain takes what the settle
+        // window and the leave of the mesh leave of it.
+        let deadline = tokio::time::Instant::now() + grace;
         inflight_tracker.begin_drain();
-        if !settle.is_zero() {
+        // The mesh hears of the stop first: `Leaving` goes to the live
+        // members during the settle window (the broadcast is bounded by 3 s,
+        // then a second for propagation, then the gossip loop stops), so
+        // they know as soon as this member stops serving, instead of finding
+        // out from failed probes once it is gone. The leave gets the window
+        // and no more (with no window, what the grace allows); cut short, its
+        // broadcast tasks run on and the gossip loop is stopped below.
+        let leave_mesh = async {
+            if let Some(mesh) = &mesh_handler {
+                if let Err(e) = mesh.graceful_shutdown().await {
+                    warn!("Leaving the mesh failed: {e:#}");
+                }
+            }
+        };
+        let left_in_time = if settle.is_zero() {
+            tokio::time::timeout(grace, leave_mesh).await.is_ok()
+        } else {
             info!(
                 settle_secs = settle.as_secs(),
                 "Keeping listener open during load-balancer propagation window"
             );
-            tokio::time::sleep(settle).await;
+            let (left, ()) = tokio::join!(
+                tokio::time::timeout(settle, leave_mesh),
+                tokio::time::sleep(settle)
+            );
+            left.is_ok()
+        };
+        if !left_in_time {
+            // The leave's own stop of the gossip loop did not run: stop it
+            // here, as a finished leave would have, so both paths end the
+            // same way; the broadcast tasks the leave spawned run on.
+            if let Some(mesh) = &mesh_handler {
+                mesh.shutdown();
+            }
+            if !grace.is_zero() {
+                info!(
+                    "Leaving the mesh was cut short by the settle window; its broadcast runs on \
+                     and the gossip loop is stopped now"
+                );
+            }
         }
+        let drain_timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
         handle_clone.graceful_shutdown(Some(drain_timeout));
         admin_handle_clone.graceful_shutdown(Some(drain_timeout));
 

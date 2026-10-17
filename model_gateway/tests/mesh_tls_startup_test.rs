@@ -37,6 +37,19 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
 const MESH_TIMEOUT: Duration = Duration::from_secs(30);
 /// How many port picks a pair of gateways gets (`spawn_pair`).
 const SPAWN_ATTEMPTS: usize = 3;
+/// How long a peer gets to show a stopping gateway as `Leaving`: the
+/// broadcast's own bound is 3 s, and the peer logs its view once a second.
+const LEAVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How a gateway's mesh runs: with mutual TLS, or in the clear.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mesh {
+    /// The TLS flags on: the listener serves TLS and requires a peer
+    /// certificate; the start-up waits for a TLS handshake with it.
+    Mtls,
+    /// No TLS flags; the start-up waits for the listener to accept.
+    Plain,
+}
 
 /// A gateway process; killed when dropped, so a failed assertion leaves none.
 struct Gateway {
@@ -70,15 +83,17 @@ impl Gateway {
     }
 
     /// Waits for `/health`, then for the mesh listener's verdict: a TLS
-    /// handshake with `probe` (its "ready"; nothing is logged for a bound
-    /// listener) or `Mesh server failed`, which the mesh server logs about a
-    /// second after its listener's task started, so possibly after `/health`
-    /// answers. The reason when the start-up ended otherwise; a lost port
-    /// ends the wait too and is the caller's to handle.
+    /// handshake with `probe` under mTLS, an accepted connection in the clear
+    /// (its "ready"; nothing is logged for a bound listener), or `Mesh server
+    /// failed`, which the mesh server logs about a second after its
+    /// listener's task started, so possibly after `/health` answers. The
+    /// reason when the start-up ended otherwise; a lost port ends the wait
+    /// too and is the caller's to handle.
     fn start_up(
         &mut self,
         certs: &TestCertificates,
         probe: &(PathBuf, PathBuf),
+        mesh: Mesh,
     ) -> Option<&'static str> {
         wait_until(STARTUP_TIMEOUT, || {
             healthy(self) || self.lost_a_port() || self.exited()
@@ -93,10 +108,14 @@ impl Gateway {
             };
         }
         wait_until(MESH_TIMEOUT, || {
-            matches!(
-                mesh_handshake(self.mesh_port, certs, Some(probe)),
-                Ok(Handshake::Accepted(_))
-            ) || self.log().contains("Mesh server failed")
+            let ready = match mesh {
+                Mesh::Mtls => matches!(
+                    mesh_handshake(self.mesh_port, certs, Some(probe)),
+                    Ok(Handshake::Accepted(_))
+                ),
+                Mesh::Plain => connect(self.mesh_port).is_ok(),
+            };
+            ready || self.log().contains("Mesh server failed")
         });
         None
     }
@@ -109,14 +128,15 @@ impl Drop for Gateway {
     }
 }
 
-/// A gateway with the mesh on and this node's identity, on `ports` (HTTP,
-/// mesh, metrics), dialing `peer_mesh_port` when given; its output goes to
-/// `<name>.log` next to the certificates.
+/// A gateway with the mesh on, with this node's identity under mTLS, on
+/// `ports` (HTTP, mesh, metrics), dialing `peer_mesh_port` when given; its
+/// output goes to `<name>.log` next to the certificates.
 fn spawn_gateway(
     name: &'static str,
     certs: &TestCertificates,
     ports: [u16; 3],
     peer_mesh_port: Option<u16>,
+    mesh: Mesh,
 ) -> Gateway {
     let (cert, key) = certs.node_identity(name).expect("node identity");
     let [http_port, mesh_port, metrics_port] = ports;
@@ -130,15 +150,18 @@ fn spawn_gateway(
         .args(["--prometheus-port", &metrics_port.to_string()])
         .args(["--enable-mesh", "--mesh-server-name", name])
         .args(["--mesh-host", &ip, "--mesh-port", &mesh_port.to_string()])
-        .args(["--mesh-tls-ca-cert", certs.ca_cert_str()])
-        .arg("--mesh-tls-cert")
-        .arg(&cert)
-        .arg("--mesh-tls-key")
-        .arg(&key)
         .args(["--log-level", "info"])
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone().expect("log handle")))
         .stderr(Stdio::from(log));
+    if mesh == Mesh::Mtls {
+        command
+            .args(["--mesh-tls-ca-cert", certs.ca_cert_str()])
+            .arg("--mesh-tls-cert")
+            .arg(&cert)
+            .arg("--mesh-tls-key")
+            .arg(&key);
+    }
     if let Some(port) = peer_mesh_port {
         command.args(["--mesh-peer-urls", &format!("{IP}:{port}")]);
     }
@@ -157,14 +180,27 @@ fn spawn_gateway(
 /// A's mesh port. The pair is respawned on fresh ports when a gateway lost
 /// one of its ports between the pick and its bind, at most `SPAWN_ATTEMPTS`
 /// times.
-fn spawn_pair(certs: &TestCertificates, probe: &(PathBuf, PathBuf)) -> (Gateway, Gateway) {
+fn spawn_pair(
+    certs: &TestCertificates,
+    probe: &(PathBuf, PathBuf),
+    mesh: Mesh,
+) -> (Gateway, Gateway) {
     let mut attempts = 0;
     loop {
         attempts += 1;
         let [http_a, mesh_a, metrics_a, http_b, mesh_b, metrics_b] = free_ports::<6>();
-        let mut a = spawn_gateway("nodea", certs, [http_a, mesh_a, metrics_a], None);
-        let mut b = spawn_gateway("nodeb", certs, [http_b, mesh_b, metrics_b], Some(mesh_a));
-        let failures = [a.start_up(certs, probe), b.start_up(certs, probe)];
+        let mut a = spawn_gateway("nodea", certs, [http_a, mesh_a, metrics_a], None, mesh);
+        let mut b = spawn_gateway(
+            "nodeb",
+            certs,
+            [http_b, mesh_b, metrics_b],
+            Some(mesh_a),
+            mesh,
+        );
+        let failures = [
+            a.start_up(certs, probe, mesh),
+            b.start_up(certs, probe, mesh),
+        ];
         if a.lost_a_port() || b.lost_a_port() {
             assert!(
                 attempts < SPAWN_ATTEMPTS,
@@ -241,6 +277,33 @@ fn nameless_peer_series(gateway: &Gateway) -> Option<Vec<String>> {
             .map(str::to_owned)
             .collect(),
     )
+}
+
+/// `member`'s status in `gateway`'s latest view of the membership (its last
+/// `Round <n> Status` log line), such as `Alive` or `Leaving`; `None` while
+/// no round line names the member.
+fn status_on(gateway: &Gateway, member: &str) -> Option<String> {
+    let log = gateway.log();
+    let round = log.lines().rev().find(|line| {
+        line.contains("Status:{") && line.contains(&format!("\"{member}\": NodeState"))
+    })?;
+    let entry = &round[round.find(&format!("\"{member}\": NodeState"))?..];
+    let status = &entry[entry.find("status: ")? + "status: ".len()..];
+    Some(
+        status
+            .chars()
+            .take_while(char::is_ascii_alphabetic)
+            .collect(),
+    )
+}
+
+/// SIGTERM to `gateway`, the way an orchestrator stops it.
+fn terminate(gateway: &Gateway) {
+    let status = Command::new("kill")
+        .args(["-TERM", &gateway.child.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(status.success(), "kill -TERM failed: {status}");
 }
 
 /// What the mesh listener made of a handshake.
@@ -353,7 +416,7 @@ fn logs(gateways: &[&Gateway]) -> String {
 fn mesh_with_mtls_forms_between_two_gateway_processes() {
     let certs = TestCertificates::generate().expect("test certificates");
     let probe = certs.node_identity("probe").expect("probe identity");
-    let (a, b) = spawn_pair(&certs, &probe);
+    let (a, b) = spawn_pair(&certs, &probe, Mesh::Mtls);
 
     // The mesh listener serves TLS to a peer that presents a certificate
     // from the CA.
@@ -426,6 +489,52 @@ fn mesh_with_mtls_forms_between_two_gateway_processes() {
             logs(&[&a, &b])
         );
     }
+}
+
+/// A gateway that is told to stop leaves the mesh before it drains: its peer
+/// sees it as `Leaving` within a few seconds of the signal, where it used to
+/// see it `Alive` until a probe failed, then `Suspected` and `Down`. In the
+/// clear: the mesh's status broadcasts do not yet dial with the node's TLS
+/// identity (a change of its own), so under mTLS a `Leaving` would not reach
+/// the peer's listener.
+#[test]
+fn a_stopping_gateway_leaves_the_mesh() {
+    let certs = TestCertificates::generate().expect("test certificates");
+    let probe = certs.node_identity("probe").expect("probe identity");
+    let (a, mut b) = spawn_pair(&certs, &probe, Mesh::Plain);
+    assert!(
+        wait_until(MESH_TIMEOUT, || peer_connected(&a, "nodeb")
+            || peer_connected(&b, "nodea")),
+        "the two gateways did not form a mesh\n{}",
+        logs(&[&a, &b])
+    );
+    assert!(
+        wait_until(MESH_TIMEOUT, || status_on(&a, "nodeb").as_deref()
+            == Some("Alive")),
+        "{} never saw {} alive: {:?}\n{}",
+        a.name,
+        b.name,
+        status_on(&a, "nodeb"),
+        logs(&[&a, &b])
+    );
+
+    terminate(&b);
+
+    assert!(
+        wait_until(LEAVE_TIMEOUT, || status_on(&a, "nodeb").as_deref()
+            == Some("Leaving")),
+        "{} did not see {} leave after its SIGTERM; its status there: {:?}\n{}",
+        a.name,
+        b.name,
+        status_on(&a, "nodeb"),
+        logs(&[&a, &b])
+    );
+    assert!(
+        wait_until(EXIT_TIMEOUT, || b.exited()),
+        "{} did not exit after its SIGTERM\n{}",
+        b.name,
+        logs(&[&a, &b])
+    );
 }
 
 /// Mesh TLS material the gateway can read but not use is refused before the
