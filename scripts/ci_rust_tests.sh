@@ -30,6 +30,9 @@
 # unify them): the protocol crate's axum surface, the provider routers, the
 # storage hooks of the WASM crate, the mock engine of the ZMQ client.
 set -euo pipefail
+# Command substitutions keep -e, so a failure inside $(...) (a cargo metadata
+# call) fails the caller's assignment instead of shrinking a shard silently.
+shopt -s inherit_errexit
 
 GATEWAY_SHARDS=3
 
