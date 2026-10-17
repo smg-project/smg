@@ -77,7 +77,12 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         let mut labels = merge_labels(&context.data.discovered_labels, &config.labels);
 
         validate_constrained_decoding_label(&labels, &config.url, "create_worker")?;
-        validate_traffic_split_labels(&labels, &config.url, "create_worker")?;
+        validate_traffic_split_labels(
+            app_context.router_config.traffic_split,
+            &labels,
+            &config.url,
+            "create_worker",
+        )?;
         let (kv_connector, kv_role, kv_engine_id) = take_kv_transfer_metadata(config, &mut labels);
 
         let model_id = resolve_model_id(config, &labels);
@@ -443,12 +448,18 @@ pub(super) fn validate_constrained_decoding_label(
 /// registration and update, must have the shape the split reads; a group
 /// whose weight would silently read as the default fails the `step` instead.
 /// Discovered workers reach here without the admin check, so the rule is
-/// held where the labels are merged.
+/// held where the labels are merged. It is held while the split is on
+/// (`enabled`): off, the labels are inert and registration is what it was
+/// before them.
 pub(super) fn validate_traffic_split_labels(
+    enabled: bool,
     labels: &HashMap<String, String>,
     url: &str,
     step: &str,
 ) -> WorkflowResult<()> {
+    if !enabled {
+        return Ok(());
+    }
     traffic_split::validate_labels(labels).map_err(|why| WorkflowError::StepFailed {
         step_id: StepId::new(step),
         message: format!("Worker {url}: {why}"),

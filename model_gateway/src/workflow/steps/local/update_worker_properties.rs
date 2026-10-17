@@ -144,6 +144,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                         "update_worker_properties",
                     )?;
                     super::create_worker::validate_traffic_split_labels(
+                        app_context.router_config.traffic_split,
                         &updated_labels,
                         worker.url(),
                         "update_worker_properties",

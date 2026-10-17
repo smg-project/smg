@@ -600,7 +600,8 @@ struct RoutingArgs {
 
     /// Weighted traffic split across worker groups: a worker's traffic_group
     /// label names its group (default for workers without one) and its
-    /// traffic_weight label the group's weight (100 when absent). A request
+    /// traffic_weight label the group's weight (the default group weighs 100
+    /// without one; a named group weighs what its workers carry). A request
     /// with two or more groups among its candidates picks one by weight, by
     /// its routing key when it has one so a session stays in one group,
     /// then the policy selects inside it. Weights are labels: a ramp is a

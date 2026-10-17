@@ -18,7 +18,10 @@ use crate::observability::log_throttle::KeyedLogThrottle;
 use crate::{
     middleware::{tenant_resolution::AcceptedAt, SHED_RETRY_AFTER_SECS},
     observability::metrics::{metrics_labels, Metrics},
-    policies::{CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerRole},
+    policies::{
+        traffic_split, CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo,
+        WorkerRole,
+    },
     routers::{
         common::{
             placement::{
@@ -1985,9 +1988,19 @@ impl WorkerSelectionStage {
             return Err(EpdSelectionFailure::PrefillAtCapacity);
         }
         info.role = WorkerRole::Decode;
+        // The decode follows the prefill's traffic group, so a pair never
+        // spans two groups (see `PolicyRegistry::select_worker_for_model_following`).
         let decode_idx = self
             .policy_registry
-            .select_worker_for_model(&decode_policy, model_id, &available_decode, &info)
+            .select_worker_for_model_following(
+                &decode_policy,
+                model_id,
+                &available_decode,
+                &info,
+                Some(traffic_split::group_of(
+                    available_prefill[prefill_idx].as_ref(),
+                )),
+            )
             .ok_or(EpdSelectionFailure::Unavailable)?;
 
         let encode_assignments = assign_encode_workers(

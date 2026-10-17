@@ -77,7 +77,8 @@ mod handles {
     #[cfg(test)]
     pub(super) use smg_external_router::metrics::handles::force_on_this_thread;
     pub(super) use smg_external_router::metrics::handles::{
-        keep_handles, nested, recorder_installed, with_handle, with_model_handle, ByLabels,
+        is_sentinel, keep_handles, nested, recorder_installed, with_handle, with_model_handle,
+        ByLabels,
     };
 
     /// Handles by the matched path (the only label a request computes).
@@ -181,6 +182,25 @@ mod handles {
     /// the interner gave it.
     pub(super) type WorkerRequests = ByWorker<HashMap<Arc<str>, Counter>>;
 
+    /// `smg_traffic_split_selections_total` under one model: the model label
+    /// as the interner gave it, and the counters by group label, each built
+    /// on its group's first sight. The map sits in a cell because the kept
+    /// handle of a model is reached through a shared reference; the group
+    /// interner bounds it.
+    pub(super) struct SplitSelections {
+        pub(super) model: Arc<str>,
+        pub(super) by_group: RefCell<HashMap<Arc<str>, Counter>>,
+    }
+
+    impl SplitSelections {
+        pub(super) fn new(model: Arc<str>) -> Self {
+            Self {
+                model,
+                by_group: RefCell::new(HashMap::new()),
+            }
+        }
+    }
+
     /// `smg_worker_cb_outcomes_total`: by worker URL, then the outcome.
     pub(super) type WorkerOutcomes = ByWorker<HashMap<&'static str, Counter>>;
 
@@ -246,6 +266,8 @@ mod handles {
         pub(super) static WORKER_CB_OUTCOMES: RefCell<WorkerOutcomes> = RefCell::new(WorkerOutcomes::default());
         /// `smg_worker_selection_total` by its static labels, then the model.
         pub(super) static WORKER_SELECTIONS: RefCell<ByLabels<SelectionLabels, Counter>> = RefCell::new(HashMap::new());
+        /// `smg_traffic_split_selections_total` by model, then group.
+        pub(super) static TRAFFIC_SPLIT_SELECTIONS: RefCell<HashMap<Arc<str>, SplitSelections>> = RefCell::new(HashMap::new());
         /// `smg_cache_aware_policy_branch_total` by branch.
         pub(super) static CACHE_AWARE_BRANCHES: RefCell<HashMap<&'static str, Counter>> = RefCell::new(HashMap::new());
         /// `smg_cache_aware_match_ratio`: one series.
@@ -277,6 +299,7 @@ mod handles {
         WORKER_CB_SUCCESSES.with_borrow_mut(|kept| *kept = WorkerGauges::default());
         WORKER_CB_OUTCOMES.with_borrow_mut(|kept| *kept = WorkerOutcomes::default());
         WORKER_SELECTIONS.with_borrow_mut(HashMap::clear);
+        TRAFFIC_SPLIT_SELECTIONS.with_borrow_mut(HashMap::clear);
         CACHE_AWARE_BRANCHES.with_borrow_mut(HashMap::clear);
         CACHE_AWARE_MATCH_RATIO.set(None);
         ROUTING_KEY_SOURCES.with_borrow_mut(HashMap::clear);
@@ -289,6 +312,25 @@ mod handles {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// A split selection's counter is kept once per model and group on
+        /// the thread, and found again by the model's and the group's names,
+        /// so a repeat builds no key and interns nothing.
+        #[test]
+        fn a_split_selection_keeps_one_counter_per_model_and_group() {
+            reset();
+            force_on_this_thread(Some(true));
+            for (model, group) in [("m", "a"), ("m", "a"), ("m", "b"), ("n", "a")] {
+                super::super::Metrics::record_traffic_split_selection(model, group);
+            }
+            TRAFFIC_SPLIT_SELECTIONS.with_borrow(|by_model| {
+                assert_eq!(by_model.len(), 2);
+                assert_eq!(by_model["m"].by_group.borrow().len(), 2);
+                assert_eq!(by_model["n"].by_group.borrow().len(), 1);
+            });
+            reset();
+            TRAFFIC_SPLIT_SELECTIONS.with_borrow(|by_model| assert!(by_model.is_empty()));
+        }
 
         #[test]
         fn kept_worker_counters_go_when_the_worker_set_changes() {
@@ -2610,20 +2652,42 @@ impl Metrics {
         gauge!("smg_manual_policy_cache_entries").set(count as f64);
     }
 
-    /// Record which source supplied the sticky routing key for a keyed request
     /// Record a selection the traffic split confined to one worker group:
-    /// `group` is the arm picked for `model_id` (interned, bounded).
+    /// `group` is the arm picked for `model_id` (interned, bounded). The
+    /// counter is this thread's kept one by model, then group, as the worker
+    /// selection's is, found again by the names alone: the group is interned
+    /// on its first sight only. A key is built per call while handles are
+    /// not kept, or for a model past the kept cap.
     pub fn record_traffic_split_selection(model_id: &str, group: &str) {
-        let model = intern_model_label(model_id);
-        let group = intern_group_label(group);
-        counter!(
-            "smg_traffic_split_selections_total",
-            "model" => model,
-            "group" => group
-        )
-        .increment(1);
+        let build = |model: Arc<str>, group: Arc<str>| {
+            counter!(
+                "smg_traffic_split_selections_total",
+                "model" => model,
+                "group" => group
+            )
+        };
+        if !handles::keep_handles() {
+            build(intern_model_label(model_id), intern_group_label(group)).increment(1);
+            return;
+        }
+        handles::TRAFFIC_SPLIT_SELECTIONS.with_borrow_mut(|by_model| {
+            handles::with_model_handle(by_model, model_id, handles::SplitSelections::new, |arms| {
+                let mut by_group = arms.by_group.borrow_mut();
+                if let Some(count) = by_group.get(group) {
+                    count.increment(1);
+                    return;
+                }
+                let label = intern_group_label(group);
+                let count = build(Arc::clone(&arms.model), Arc::clone(&label));
+                count.increment(1);
+                if !handles::is_sentinel(&label) {
+                    by_group.insert(label, count);
+                }
+            });
+        });
     }
 
+    /// Record which source supplied the sticky routing key for a keyed request
     pub fn record_routing_key_source(source: &'static str) {
         handles::with_static(
             &handles::ROUTING_KEY_SOURCES,

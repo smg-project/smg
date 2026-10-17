@@ -2,16 +2,26 @@
 //!
 //! A worker names its group with the `traffic_group` label and the group's
 //! weight with `traffic_weight`; a worker without a group is in the group
-//! [`DEFAULT_GROUP`], a group none of whose workers carries a weight weighs
-//! [`DEFAULT_WEIGHT`]. The split runs before the routing policy: with two or
-//! more groups among a request's available candidates, one group is picked
-//! by weight and the configured policy (and the sticky override) then selects
-//! inside it. A request with a routing key lands in the same group every time
-//! (the key's fixed fraction of the total, hashed, so every gateway replica
-//! agrees); a request without one draws at random.
+//! [`DEFAULT_GROUP`], which weighs [`DEFAULT_WEIGHT`] when none of its
+//! workers carries a weight. A named group weighs the highest weight among
+//! its available workers and nothing without one, so label every worker of
+//! a named group: its weight never silently becomes the default when the
+//! worker carrying it is down. The split runs before the routing policy:
+//! with two or more groups among a request's available candidates, one
+//! group is picked by weight and the configured policy (and the sticky
+//! override) then selects inside it. A request with a routing key lands in
+//! the same group every time (the key's fixed fraction of the total, hashed,
+//! so every gateway replica agrees); a request without one draws at random.
 //!
 //! Weights are labels, so a canary ramp is a `PATCH /workers/{id}` with new
 //! labels, and a weight of 0 drains a group while it stays registered.
+//!
+//! The split confines the regular selection and the prefill and decode legs
+//! of a disaggregated pair, whose decode follows the prefill's group (see
+//! `PolicyRegistry::select_worker_for_model_following`). The encode leg of
+//! an encode-prefill-decode deployment keys every media item by its content
+//! hash over all encode workers and is not confined: a weight of 0 does not
+//! drain an encode worker.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -25,8 +35,10 @@ pub const GROUP_LABEL: &str = "traffic_group";
 pub const WEIGHT_LABEL: &str = "traffic_weight";
 /// The group of a worker without a `traffic_group` label.
 pub const DEFAULT_GROUP: &str = "default";
-/// The weight of a group none of whose candidates carries one: a canary
-/// labelled `traffic_weight=5` next to an unlabelled fleet takes about 5 %.
+/// The weight of the default group when none of its workers carries one: a
+/// canary labelled `traffic_weight=5` next to an unlabelled fleet takes
+/// about 5 %. A named group has no default: it weighs what its available
+/// workers carry, and nothing without one.
 pub const DEFAULT_WEIGHT: u32 = 100;
 /// The largest weight accepted.
 pub const MAX_WEIGHT: u32 = 1_000_000;
@@ -73,15 +85,24 @@ pub fn validate_labels(labels: &HashMap<String, String>) -> Result<(), String> {
 pub struct Arm<'a> {
     pub name: &'a str,
     /// The largest `traffic_weight` among the members, `None` when no member
-    /// carries one (the arm then weighs [`DEFAULT_WEIGHT`]).
+    /// carries one (the default group then weighs [`DEFAULT_WEIGHT`], a named
+    /// group 0).
     pub explicit_weight: Option<u32>,
     pub members: Vec<usize>,
 }
 
 impl Arm<'_> {
-    /// The weight the arm enters the draw with.
+    /// The weight the arm enters the draw with: the highest its available
+    /// members carry; without one, [`DEFAULT_WEIGHT`] for the default group
+    /// and 0 for a named one, so a group whose labelled worker is down takes
+    /// nothing rather than the default share.
     pub fn weight(&self) -> u32 {
-        self.explicit_weight.unwrap_or(DEFAULT_WEIGHT)
+        self.explicit_weight
+            .unwrap_or(if self.name == DEFAULT_GROUP {
+                DEFAULT_WEIGHT
+            } else {
+                0
+            })
     }
 }
 
@@ -170,9 +191,13 @@ impl<'a> Split<'a> {
     /// two-arm split only moves keys into it (a ramp never bounces a session
     /// out and back).
     pub fn arm_for_key(&self, key: &str) -> &Arm<'a> {
-        let hash = blake3::hash(key.as_bytes());
+        // Domain-separated from the hash ring's position of the same key
+        // (`blake3::hash`), so the arm a key lands in and its position on the
+        // ring inside the arm are independent: otherwise a 10 % arm would
+        // reach only the first 10 % of its workers' ring points.
+        let hash = blake3::derive_key("smg traffic_split arm v1", key.as_bytes());
         let mut head = [0u8; 8];
-        head.copy_from_slice(&hash.as_bytes()[..8]);
+        head.copy_from_slice(&hash[..8]);
         let fraction = u64::from_le_bytes(head);
         // In `0..total`: the top 64 bits of the 128-bit product.
         let point = ((u128::from(fraction) * u128::from(self.total)) >> 64) as u64;
@@ -182,6 +207,14 @@ impl<'a> Split<'a> {
     /// The arm a random draw lands in.
     pub fn arm_at_random<R: RngExt + ?Sized>(&self, rng: &mut R) -> &Arm<'a> {
         self.arm_at(rng.random_range(0..self.total))
+    }
+
+    /// The arm named `name` while it is in the draw (an available member
+    /// and a positive weight): the one a later leg of a request follows.
+    pub fn arm_named(&self, name: &str) -> Option<&Arm<'a>> {
+        self.arms
+            .iter()
+            .find(|arm| arm.name == name && arm.weight() > 0)
     }
 
     /// The arm owning `point` in `0..total`: each arm owns the next `weight`
@@ -340,17 +373,51 @@ mod tests {
     }
 
     #[test]
-    fn a_group_weighs_the_most_any_member_carries_and_defaults_without_one() {
+    fn a_group_weighs_the_most_any_member_carries_and_the_default_one_defaults() {
         let workers = vec![
             worker("http://c1", Some("canary"), Some("5"), true),
             worker("http://c2", Some("canary"), Some("20"), true),
             worker("http://c3", Some("canary"), None, true),
-            worker("http://s1", Some("stable"), None, true),
+            worker("http://d1", None, None, true),
         ];
         let split = Split::plan(&workers).unwrap();
+        assert_eq!(names(&split), vec!["canary", DEFAULT_GROUP]);
         assert_eq!(split.arms()[0].weight(), 20);
         assert_eq!(split.arms()[1].weight(), DEFAULT_WEIGHT);
         assert_eq!(split.total(), 120);
+    }
+
+    /// A named group's weight comes from its own labels alone: with the one
+    /// worker carrying it down, the group takes nothing rather than the
+    /// default share (a 5 % canary never jumps to 100 on a failure, and a
+    /// drained one stays drained).
+    #[test]
+    fn a_named_group_takes_nothing_while_no_available_member_carries_a_weight() {
+        let workers = vec![
+            worker("http://s1", Some("stable"), Some("90"), true),
+            worker("http://c1", Some("canary"), Some("5"), false),
+            worker("http://c2", Some("canary"), None, true),
+        ];
+        let split = Split::plan(&workers).unwrap();
+        assert_eq!(names(&split), vec!["canary", "stable"]);
+        assert_eq!(split.arms()[0].weight(), 0);
+        assert_eq!(split.total(), 90);
+        assert!(split.arm_named("canary").is_none());
+        let mut rng = StdRng::seed_from_u64(11);
+        for _ in 0..1_000 {
+            assert_eq!(split.arm_at_random(&mut rng).name, "stable");
+        }
+        assert_eq!(split.arm_for_key("conv-1").name, "stable");
+
+        // With the labelled worker back, the canary weighs its 5 again.
+        let workers = vec![
+            worker("http://s1", Some("stable"), Some("90"), true),
+            worker("http://c1", Some("canary"), Some("5"), true),
+            worker("http://c2", Some("canary"), None, true),
+        ];
+        let split = Split::plan(&workers).unwrap();
+        assert_eq!(split.arms()[0].weight(), 5);
+        assert_eq!(split.arm_named("canary").map(|arm| arm.weight()), Some(5));
     }
 
     #[test]

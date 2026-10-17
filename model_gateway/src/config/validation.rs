@@ -576,7 +576,6 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// The memory history backend's bounds: at least one record of each kind.
     /// The traffic split confines each selection to one worker group;
     /// `bucket` places prefill by request size over boundaries that span its
     /// whole fleet, so the two cannot run together (the runtime skips the
@@ -597,6 +596,7 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// The memory history backend's bounds: at least one record of each kind.
     fn validate_memory_history(config: &RouterConfig) -> ConfigResult<()> {
         if let Some(memory) = &config.memory {
             memory
