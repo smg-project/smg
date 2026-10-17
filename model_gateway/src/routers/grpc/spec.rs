@@ -110,6 +110,8 @@ pub(crate) struct ChatResponseSpec {
     pub parse_report: Report,
     /// `--parse-failures silent`: the counters alone, no line about the output.
     pub parse_silent: bool,
+    /// Whether an output that is not clean finishes with `parse_failure` (`X-SMG-Parse-Strict`).
+    pub parse_strict: bool,
 }
 
 /// Whether the response to a chat `request` is scanned for tool calls: the
@@ -155,6 +157,7 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             symphony: None,
             parse_report: Report::Off,
             parse_silent: false,
+            parse_strict: false,
         }
     }
 }
@@ -208,6 +211,8 @@ pub(crate) struct MessagesResponseSpec {
     pub parse_report: Report,
     /// `--parse-failures silent`: the counters alone, no line about the output.
     pub parse_silent: bool,
+    /// Whether an output that is not clean finishes with `parse_failure` (`X-SMG-Parse-Strict`).
+    pub parse_strict: bool,
 }
 
 impl From<&CreateMessageRequest> for MessagesResponseSpec {
@@ -227,6 +232,7 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
             first_tool_call_only: request.disables_parallel_tool_use(),
             parse_report: Report::Off,
             parse_silent: false,
+            parse_strict: false,
         }
     }
 }

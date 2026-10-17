@@ -276,6 +276,7 @@ impl BuildStage for MessageRequestBuildingStage {
         spec.symphony = assignment;
         spec.parse_report = ctx.state.parse_report;
         spec.parse_silent = ctx.components.parse_failures == ParseFailures::Silent;
+        spec.parse_strict = ctx.state.parse_strict;
         Ok(BuildOutput {
             plan: ExecutionPlan::generate(self.plan_kind, proto_request),
             spec: ResponseSpec::Messages(spec),

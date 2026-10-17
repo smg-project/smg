@@ -73,6 +73,16 @@ impl ChatPreparationStage {
             ctx.input.headers.as_ref(),
         )
         .map_err(|why| error::bad_request("invalid_parse_report_header", why))?;
+        // Strictness (X-SMG-Parse-Strict): an output that is not clean finishes with
+        // `parse_failure` and is reported whatever the report mode.
+        ctx.state.parse_strict = symphony::telemetry::strict_mode(
+            ctx.components.parse_failures,
+            ctx.input.headers.as_ref(),
+        )
+        .map_err(|why| error::bad_request("invalid_parse_strict_header", why))?;
+        if ctx.state.parse_strict {
+            ctx.state.parse_report = ctx.state.parse_report.at_least_on_failure();
+        }
         let (token_ids, processed_messages, tool_constraints) =
             prepare_chat_like(ctx, request, self.wire_pools).await?;
         ctx.state.preparation = Some(PreparationOutput::Chat {

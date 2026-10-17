@@ -631,6 +631,7 @@ async fn byte_fallback_messages_eof_emits_exact_text_before_block_stop() {
     let spec = MessagesResponseSpec {
         parse_report: Report::Off,
         parse_silent: false,
+        parse_strict: false,
         thinking_requested: false,
         thinking_text_returned: true,
         reasoning_in_prefill: false,
@@ -730,6 +731,7 @@ fn byte_fallback_messages_spec(thinking: bool) -> MessagesResponseSpec {
     MessagesResponseSpec {
         parse_report: Report::Off,
         parse_silent: false,
+        parse_strict: false,
         thinking_requested: thinking,
         thinking_text_returned: true,
         reasoning_in_prefill: false,
@@ -1902,6 +1904,7 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
         let spec = MessagesResponseSpec {
             parse_report: Report::Off,
             parse_silent: false,
+            parse_strict: false,
             thinking_requested: true,
             thinking_text_returned: true,
             reasoning_in_prefill: false,
@@ -1990,6 +1993,7 @@ async fn messages_stream_stop_reason_follows_what_the_engine_matched() {
         let spec = MessagesResponseSpec {
             parse_report: Report::Off,
             parse_silent: false,
+            parse_strict: false,
             thinking_requested: false,
             thinking_text_returned: true,
             reasoning_in_prefill: false,
@@ -2367,6 +2371,7 @@ async fn messages_blocks_and_inputs(
     let spec = MessagesResponseSpec {
         parse_report: Report::Off,
         parse_silent: false,
+        parse_strict: false,
         thinking_requested: true,
         thinking_text_returned: true,
         reasoning_in_prefill: false,
