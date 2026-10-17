@@ -3952,8 +3952,8 @@ mod tests {
         );
     }
 
-    /// Three files for a set of TLS flags (their content is not read here:
-    /// the validator checks that the paths are given, nothing parses the PEM).
+    /// Three non-empty files for a set of TLS flags (the worker flags' files are
+    /// read into the config and must not be empty; nothing parses the PEM).
     fn tls_files(kind: &str, names: [&str; 3], tag: &str) -> [String; 3] {
         let dir = std::env::temp_dir().join(format!("smg-{kind}-tls-{}-{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
