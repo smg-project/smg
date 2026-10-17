@@ -121,20 +121,21 @@ for target in "${targets[@]}"; do
   log="$logs/$target.log"
   # The last status line carries the executions (`#N`, cumulative in fork mode too), the rate
   # (`exec/s`, over the time the target ran: less than its budget when it stopped at a crash) and
-  # the edges (`cov:`). No execution count means the target never ran (a flag or a dictionary
-  # libFuzzer refused, a missing binary): that fails the run as a crash does.
+  # the edges (`cov:`). No execution count and no crash means the target never ran (a flag or a
+  # dictionary libFuzzer refused, a missing binary): that fails the run as a crash does. A crash
+  # while the corpus loads comes before the first status line, so the crashes are read first.
   executions=$(grep -oE '^#[0-9]+' "$log" | tail -1 | tr -d '#' || true)
   per_second=$(grep -oE 'exec/s:? *[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
   edges=$(grep -o 'cov: [0-9]*' "$log" | tail -1 | awk '{print $2}' || true)
   units=$(find "corpus/$target" -type f | wc -l | tr -d ' ')
   crashes=$(find "$artifacts/$target" -type f | wc -l | tr -d ' ')
   classes=none
-  if [ -z "$executions" ]; then
-    failed=1
-    classes="never ran"
-  elif [ "$crashes" -gt 0 ]; then
+  if [ "$crashes" -gt 0 ]; then
     failed=1
     classes=$(classes_of "$target")
+  elif [ -z "$executions" ]; then
+    failed=1
+    classes="never ran"
   fi
   echo "| $target | $minutes | ${executions:-?} | ${per_second:-?} | ${edges:-?} | $units | $crashes | $classes |"
 done

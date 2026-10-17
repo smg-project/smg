@@ -490,12 +490,14 @@ fn feed(
     events: &mut Vec<Event>,
 ) {
     let step = input.clone();
-    if let Err(why) = engine.feed(input, out) {
-        panic!(
-            "breach feed-failed: {}: feed of {step:?} failed: {why}",
-            describe(case)
-        );
-    }
+    let fed = engine.feed(input, out);
+    breach("feed-failed", fed.is_ok(), || {
+        let why = fed
+            .as_ref()
+            .err()
+            .map_or_else(String::new, ToString::to_string);
+        format!("{}: feed of {step:?} failed: {why}", describe(case))
+    });
     events.extend(out.drain());
 }
 

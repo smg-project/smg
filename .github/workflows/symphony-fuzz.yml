@@ -56,8 +56,12 @@ jobs:
         env:
           MINUTES: ${{ github.event.inputs.minutes || '10' }}
           TARGETS: ${{ github.event.inputs.targets || '' }}
-          ALLOW: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.allow || 'whole-json' }}
+          EVENT: ${{ github.event_name }}
+          ALLOW_INPUT: ${{ github.event.inputs.allow }}
         run: |
+          # A dispatch's allowance is its own, an empty one included (an expression's `||` would
+          # put the default back); a scheduled run looks past whole-json until the parser fixes land.
+          if [ "$EVENT" = workflow_dispatch ]; then ALLOW=$ALLOW_INPUT; else ALLOW=whole-json; fi
           # shellcheck disable=SC2086
           crates/symphony/fuzz/run.sh --minutes "$MINUTES" --jobs 3 ${ALLOW:+--allow "$ALLOW"} $TARGETS
       - name: Upload crashes and logs
