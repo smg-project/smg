@@ -225,6 +225,34 @@ fn assistant() -> ChatMessageDelta {
     }
 }
 
+/// The byte ranges of the output that are the message's content, from the events' sources in
+/// order (every byte of the output lands in one event), adjacent runs joined. Malformed text is
+/// content, as [`message`] writes it; a logprobs filter keeps the tokens in these ranges. The
+/// events must be the parser's own, whole: a filter that removes events, as the one-call-only
+/// rule does today, takes their bytes out of the count and shifts every range after them.
+pub fn content_spans(events: &[Event]) -> Vec<(usize, usize)> {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0;
+    for event in events {
+        let (bytes, content) = match event {
+            Event::Content(text) | Event::Malformed { text, .. } => (text.text.len(), true),
+            Event::Reasoning(text) | Event::Dropped { text, .. } => (text.text.len(), false),
+            Event::ToolCallStart { source, .. }
+            | Event::ToolCallArguments { source, .. }
+            | Event::ToolCallEnd { source, .. } => (source.text.len(), false),
+            Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => (0, false),
+        };
+        if content && bytes > 0 {
+            match spans.last_mut() {
+                Some((_, end)) if *end == at => *end = at + bytes,
+                _ => spans.push((at, at + bytes)),
+            }
+        }
+        at += bytes;
+    }
+    spans
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
@@ -239,6 +267,32 @@ mod tests {
 
     fn wire(choice: Option<ChatStreamChoice>) -> Value {
         serde_json::to_value(choice.expect("a choice")).expect("serializable")
+    }
+
+    #[test]
+    fn content_spans_join_content_and_malformed_runs_and_skip_the_rest() {
+        let events = [
+            Event::Content(Text::uncounted("Sure. ")),
+            Event::Malformed {
+                text: Text::uncounted("{bad"),
+                why: MalformedReason::InvalidArguments,
+            },
+            Event::Reasoning(Text::uncounted("think")),
+            Event::ToolCallStart {
+                index: 0,
+                id: "call_0".to_string(),
+                name: "f".to_string(),
+                source: Text::uncounted("<call>"),
+            },
+            Event::Content(Text::uncounted("done")),
+            Event::Finish {
+                reason: FinishReason::Stop,
+                tool_calls: 1,
+                reasoning_tokens: 0,
+            },
+        ];
+        assert_eq!(content_spans(&events), [(0, 10), (21, 25)]);
+        assert!(content_spans(&[]).is_empty());
     }
 
     /// One event of every kind, with text where the kind carries it.

@@ -359,9 +359,101 @@ impl IntoIterator for Events {
     }
 }
 
+/// The engine tokens the reasoning text among `events` cost.
+pub fn reasoning_text_tokens(events: &[Event]) -> u32 {
+    events
+        .iter()
+        .map(|event| match event {
+            Event::Reasoning(text) => text.tokens.unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// One call only (`parallel_tool_calls: false`, `disable_parallel_tool_use`): the events of
+/// every call after the first are dropped and the finish counts at most one. A table's grammar
+/// limits a forced call; this limits a free one.
+pub fn first_call_only(events: &mut Vec<Event>) {
+    events.retain(|event| {
+        !matches!(
+            event,
+            Event::ToolCallStart { index, .. }
+                | Event::ToolCallArguments { index, .. }
+                | Event::ToolCallEnd { index, .. }
+                if *index > 0
+        )
+    });
+    for event in events {
+        if let Event::Finish { tool_calls, .. } = event {
+            *tool_calls = (*tool_calls).min(1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_text_tokens_sum_the_reasoning_texts_alone() {
+        let events = vec![
+            Event::Content(Text::new("a", 3)),
+            Event::Reasoning(Text::new("b", 2)),
+            Event::Reasoning(Text::uncounted("c")),
+            Event::Reasoning(Text::new("d", 5)),
+        ];
+        assert_eq!(reasoning_text_tokens(&events), 7);
+        assert_eq!(reasoning_text_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn first_call_only_keeps_the_first_call_and_caps_the_finish() {
+        let call = |index: u32| {
+            [
+                Event::ToolCallStart {
+                    index,
+                    id: format!("call_{index}"),
+                    name: "f".to_string(),
+                    source: Text::uncounted("<"),
+                },
+                Event::ToolCallArguments {
+                    index,
+                    json: "{}".to_string(),
+                    source: Text::uncounted("{}"),
+                },
+                Event::ToolCallEnd {
+                    index,
+                    source: Text::uncounted(">"),
+                },
+            ]
+        };
+        let mut events = vec![Event::Content(Text::uncounted("x"))];
+        events.extend(call(0));
+        events.extend(call(1));
+        events.push(Event::Finish {
+            reason: FinishReason::ToolCalls,
+            tool_calls: 2,
+            reasoning_tokens: 0,
+        });
+
+        first_call_only(&mut events);
+
+        let indices: Vec<u32> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallStart { index, .. }
+                | Event::ToolCallArguments { index, .. }
+                | Event::ToolCallEnd { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(indices, [0, 0, 0]);
+        assert!(matches!(events.first(), Some(Event::Content(_))));
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 1, .. })
+        ));
+    }
 
     #[test]
     fn adjacent_content_merges_and_counts_tokens() {

@@ -61,6 +61,7 @@ use openai_protocol::{
     worker::ConstrainedDecoding,
 };
 use serde_json::{json, Value};
+pub(crate) use symphony::{adapt::chat::content_spans, event::reasoning_text_tokens};
 use symphony::{
     formats::{for_model_shared, table_for, Table},
     grammar::{GrammarStart, Options},
@@ -1193,44 +1194,6 @@ pub(crate) fn finished(events: &[Event]) -> Option<Finished> {
     })
 }
 
-/// The byte ranges of the output that are the message's content, from the events' sources in
-/// order (every byte of the output lands in one event), adjacent runs joined: what the logprobs
-/// filter keeps, as the older path keeps the tokens of `message.content` alone. Malformed text
-/// is content, as `adapt::chat::message` writes it.
-pub(crate) fn content_spans(events: &[Event]) -> Vec<(usize, usize)> {
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    let mut at = 0;
-    for event in events {
-        let (bytes, content) = match event {
-            Event::Content(text) | Event::Malformed { text, .. } => (text.text.len(), true),
-            Event::Reasoning(text) | Event::Dropped { text, .. } => (text.text.len(), false),
-            Event::ToolCallStart { source, .. }
-            | Event::ToolCallArguments { source, .. }
-            | Event::ToolCallEnd { source, .. } => (source.text.len(), false),
-            Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => (0, false),
-        };
-        if content && bytes > 0 {
-            match spans.last_mut() {
-                Some((_, end)) if *end == at => *end = at + bytes,
-                _ => spans.push((at, at + bytes)),
-            }
-        }
-        at += bytes;
-    }
-    spans
-}
-
-/// The engine tokens the reasoning text among `events` cost.
-pub(crate) fn reasoning_text_tokens(events: &[Event]) -> u32 {
-    events
-        .iter()
-        .map(|event| match event {
-            Event::Reasoning(text) => text.tokens.unwrap_or(0),
-            _ => 0,
-        })
-        .sum()
-}
-
 /// One choice's reader: the engine over the choice's output, fed what the stop decoder releases
 /// with the span of every token in it.
 pub(crate) struct Reader {
@@ -1287,20 +1250,7 @@ impl Reader {
     fn drained(&mut self) -> Vec<Event> {
         let mut events = self.events.drain();
         if self.first_call_only {
-            events.retain(|event| {
-                !matches!(
-                    event,
-                    Event::ToolCallStart { index, .. }
-                        | Event::ToolCallArguments { index, .. }
-                        | Event::ToolCallEnd { index, .. }
-                        if *index > 0
-                )
-            });
-            for event in &mut events {
-                if let Event::Finish { tool_calls, .. } = event {
-                    *tool_calls = (*tool_calls).min(1);
-                }
-            }
+            symphony::event::first_call_only(&mut events);
         }
         events
     }
