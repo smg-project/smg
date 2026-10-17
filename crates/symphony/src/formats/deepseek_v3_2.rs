@@ -26,9 +26,9 @@
 //! DeepSeek-V3.2-Speciale ships the identical encoder; DeepSeek-V3.2-Exp, before
 //! it, writes the V3.1 spelling. The gateway's older `deepseek32` parser reads this format, and
 //! the alias takes a deployment that names it to this table. bellwether has no recorded group for
-//! the family: the table stands on the turns the encoder renders, each read as the encoder's own
-//! parser reads it (`tests/fixtures/rendered/deepseek_v3_2.json`, replayed at every cut by
-//! `tests/rendered_fixtures.rs`), and on the probes below.
+//! the family yet: the table stands on the turns the encoder renders, each read as the encoder's
+//! own parser reads it in the tests below, and on the probes; the recorded set replays from the
+//! fixture pin once bellwether has it.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 //!

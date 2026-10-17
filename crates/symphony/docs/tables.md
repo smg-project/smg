@@ -127,11 +127,12 @@ Beyond that:
   terminals, byte for byte otherwise.
 
 The table is pinned against the turns the encoder renders for a tool-calling conversation, each
-read as the encoder's own parser reads it (`tests/fixtures/rendered/deepseek_v3_2.json`, written by
-`scripts/render_deepseek_v3_2_turns.py`, replayed at every cut by `tests/rendered_fixtures.rs`):
-an answer, a thought and an answer, one call, two, a call after content, a call with no
-parameters, every kind of value, non-ASCII text, and the turn after a tool result, in thinking and
-in chat mode; bellwether has not recorded the group's set. What the table leaves open: the
+read as the encoder's own parser reads it, in the module's tests: an answer, a thought and an
+answer, one call, two, a call after content, a call with no parameters, every kind of value,
+non-ASCII text, and the turn after a tool result, in thinking and in chat mode. Those shapes are
+hand-written cases of bellwether's sets, which its recorder renders through the encoder once the
+group has a manifest there; the corpus harness replays the recorded set from the fixture pin, and
+the README row says awaiting fixtures until the pin holds it. What the table leaves open: the
 recorded set, and the live reading against the engine's own server.
 
 ## GLM 4.5 and 4.6 (`glm4`)
