@@ -183,7 +183,6 @@ http-body-util = "0.1"
 portpicker = "0.1"
 lazy_static = "1.5"
 wasm-encoder = "0.261"
-npyz = { version = "0.9", features = ["npz"] }
 opentelemetry-proto = { version = "0.33", features = ["gen-tonic"] }
 serial_test = "3.5"
 rsa = { version = "0.9", features = ["sha2"] }
@@ -197,7 +196,7 @@ toml = "1.1"
 wasmtime-wasi = { workspace = true }
 lru = { workspace = true }
 wat = "1.252"
-zip = "8.6"
+zip = "9.0"
 # The KV-index exactness tests and the decision bench run the mock engine's
 # streams through the relay's decoder and normalizer into the gateway's index.
 engine-servicer.workspace = true

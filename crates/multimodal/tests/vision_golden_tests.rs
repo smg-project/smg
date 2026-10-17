@@ -28,7 +28,11 @@
     reason = "integration test helpers: assertion-like panics"
 )]
 
-use std::{fs::File, io::Read, path::Path};
+use std::{
+    fs::File,
+    io::{Cursor, Read},
+    path::Path,
+};
 
 use llm_multimodal::vision::{
     Llama4VisionProcessor, LlavaProcessor, ModelSpecificValue, Phi3VisionProcessor,
@@ -37,16 +41,22 @@ use llm_multimodal::vision::{
 };
 use ndarray::{Array4, Array5};
 
+/// Open array `name` of the `.npz` archive at `path`: the archive is a zip whose members are the
+/// arrays as `.npy` files, read here in full and parsed as one.
+fn npz_member(path: &Path, name: &str) -> npyz::NpyFile<Cursor<Vec<u8>>> {
+    let file = File::open(path).expect("Failed to open golden file");
+    let mut archive = zip::ZipArchive::new(file).expect("Failed to parse npz");
+    let mut member = archive
+        .by_name(&npyz::npz::file_name_from_array_name(name))
+        .unwrap_or_else(|e| panic!("No {name}: {e}"));
+    let mut bytes = Vec::new();
+    member.read_to_end(&mut bytes).expect("Failed to read npz");
+    npyz::NpyFile::new(Cursor::new(bytes)).expect("Failed to parse npy")
+}
+
 /// Load a numpy .npz file and extract pixel_values
 fn load_golden_npz(path: &Path) -> Array4<f32> {
-    let file = File::open(path).expect("Failed to open golden file");
-    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
-
-    // Read pixel_values array (npz stores arrays without .npy extension in the lookup)
-    let reader = npz
-        .by_name("pixel_values")
-        .expect("Failed to read npz")
-        .expect("No pixel_values");
+    let reader = npz_member(path, "pixel_values");
 
     // Get shape from npy header
     let shape = reader.shape().to_vec();
@@ -92,13 +102,7 @@ fn max_diff(a: &Array4<f32>, b: &ndarray::ArrayD<f32>) -> f32 {
 
 /// Load image_grid_thw from npz file
 fn load_golden_grid_thw(path: &Path) -> Vec<i64> {
-    let file = File::open(path).expect("Failed to open golden file");
-    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
-
-    let reader = npz
-        .by_name("image_grid_thw")
-        .expect("Failed to read npz")
-        .expect("No image_grid_thw");
+    let reader = npz_member(path, "image_grid_thw");
 
     // Shape not needed, data is flat
     let _shape = reader.shape();
@@ -109,13 +113,7 @@ fn load_golden_grid_thw(path: &Path) -> Vec<i64> {
 
 /// Load num_tokens from npz file
 fn load_golden_num_tokens(path: &Path) -> usize {
-    let file = File::open(path).expect("Failed to open golden file");
-    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
-
-    let reader = npz
-        .by_name("num_tokens")
-        .expect("Failed to read npz")
-        .expect("No num_tokens");
+    let reader = npz_member(path, "num_tokens");
 
     // Read single value as i64
     let data: Vec<i64> = reader.into_vec().expect("Failed to read array");
@@ -304,13 +302,7 @@ fn test_llava_token_count() {
 /// Load flattened pixel values from Qwen2-VL npz file.
 /// Returns (data, shape) where shape is (num_patches, patch_features).
 fn load_golden_qwen2_vl_pixels(path: &Path) -> (Vec<f32>, (usize, usize)) {
-    let file = File::open(path).expect("Failed to open golden file");
-    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
-
-    let reader = npz
-        .by_name("pixel_values")
-        .expect("Failed to read npz")
-        .expect("No pixel_values");
+    let reader = npz_member(path, "pixel_values");
 
     let shape = reader.shape().to_vec();
     assert_eq!(shape.len(), 2, "Expected 2D tensor for Qwen2-VL patches");
@@ -617,13 +609,7 @@ fn test_qwen3_vl_golden_grayscale() {
 
 /// Load a 5D numpy .npz file for Phi3-Vision (batch, num_crops+1, C, H, W)
 fn load_golden_npz_5d(path: &Path) -> Array5<f32> {
-    let file = File::open(path).expect("Failed to open golden file");
-    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
-
-    let reader = npz
-        .by_name("pixel_values")
-        .expect("Failed to read npz")
-        .expect("No pixel_values");
+    let reader = npz_member(path, "pixel_values");
 
     let shape = reader.shape().to_vec();
     assert_eq!(shape.len(), 5, "Expected 5D tensor [B, N, C, H, W]");
@@ -645,13 +631,7 @@ fn load_golden_npz_5d(path: &Path) -> Array5<f32> {
 
 /// Load image_sizes from Phi3-Vision npz file (2D tensor [batch, 2])
 fn load_phi3_image_sizes(path: &Path) -> Vec<(i64, i64)> {
-    let file = File::open(path).expect("Failed to open golden file");
-    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
-
-    let reader = npz
-        .by_name("image_sizes")
-        .expect("Failed to read npz")
-        .expect("No image_sizes");
+    let reader = npz_member(path, "image_sizes");
 
     let shape = reader.shape().to_vec();
     let data: Vec<i64> = reader.into_vec().expect("Failed to read array");
@@ -665,13 +645,7 @@ fn load_phi3_image_sizes(path: &Path) -> Vec<(i64, i64)> {
 
 /// Load num_img_tokens from Phi3-Vision npz file
 fn load_phi3_num_img_tokens(path: &Path) -> Vec<usize> {
-    let file = File::open(path).expect("Failed to open golden file");
-    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
-
-    let reader = npz
-        .by_name("num_img_tokens")
-        .expect("Failed to read npz")
-        .expect("No num_img_tokens");
+    let reader = npz_member(path, "num_img_tokens");
 
     let data: Vec<i64> = reader.into_vec().expect("Failed to read array");
     data.into_iter().map(|v| v as usize).collect()
@@ -898,13 +872,7 @@ fn test_phi3_vision_golden_grayscale() {
 
 /// Load num_img_tokens from Phi4-Vision npz file
 fn load_phi4_num_img_tokens(path: &Path) -> Vec<usize> {
-    let file = File::open(path).expect("Failed to open golden file");
-    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
-
-    let reader = npz
-        .by_name("num_img_tokens")
-        .expect("Failed to read npz")
-        .expect("No num_img_tokens");
+    let reader = npz_member(path, "num_img_tokens");
 
     let data: Vec<i64> = reader.into_vec().expect("Failed to read array");
     data.into_iter().map(|v| v as usize).collect()
@@ -912,13 +880,7 @@ fn load_phi4_num_img_tokens(path: &Path) -> Vec<usize> {
 
 /// Load image_sizes from Phi4-Vision npz file (2D tensor [batch, 2])
 fn load_phi4_image_sizes(path: &Path) -> Vec<(i64, i64)> {
-    let file = File::open(path).expect("Failed to open golden file");
-    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
-
-    let reader = npz
-        .by_name("image_sizes")
-        .expect("Failed to read npz")
-        .expect("No image_sizes");
+    let reader = npz_member(path, "image_sizes");
 
     let shape = reader.shape().to_vec();
     let data: Vec<i64> = reader.into_vec().expect("Failed to read array");
@@ -1100,13 +1062,7 @@ fn test_phi4_vision_golden_grayscale() {
 
 /// Load aspect_ratios from npz file for LLaMA 4
 fn load_llama4_aspect_ratios(path: &Path) -> Vec<(i64, i64)> {
-    let file = File::open(path).expect("Failed to open golden file");
-    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
-
-    let reader = npz
-        .by_name("aspect_ratios")
-        .expect("Failed to read npz")
-        .expect("No aspect_ratios");
+    let reader = npz_member(path, "aspect_ratios");
 
     let shape = reader.shape().to_vec();
 
@@ -1122,13 +1078,7 @@ fn load_llama4_aspect_ratios(path: &Path) -> Vec<(i64, i64)> {
 
 /// Load pixel_values for LLaMA 4 Vision (3D: [num_tiles, C, H, W])
 fn load_llama4_pixels(path: &Path) -> (Vec<f32>, Vec<usize>) {
-    let file = File::open(path).expect("Failed to open golden file");
-    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
-
-    let reader = npz
-        .by_name("pixel_values")
-        .expect("Failed to read npz")
-        .expect("No pixel_values");
+    let reader = npz_member(path, "pixel_values");
 
     let shape: Vec<usize> = reader.shape().iter().map(|&s| s as usize).collect();
     let data: Vec<f32> = reader.into_vec().expect("Failed to read array");
@@ -1301,13 +1251,7 @@ fn test_llama4_vision_golden_grayscale() {
 
 /// Load image_sizes from npz file for Pixtral
 fn load_pixtral_image_sizes(path: &Path) -> Vec<(usize, usize)> {
-    let file = File::open(path).expect("Failed to open golden file");
-    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
-
-    let reader = npz
-        .by_name("image_sizes")
-        .expect("Failed to read npz")
-        .expect("No image_sizes");
+    let reader = npz_member(path, "image_sizes");
 
     let shape = reader.shape().to_vec();
 
