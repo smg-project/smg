@@ -14,8 +14,12 @@
 //! The spelling is the gateway's older `deepseek` parser's; DeepSeek V3.1 drops the type and the
 //! fence ([`deepseek_v3_1`]). V3's template writes no thought; the table reads one between
 //! `<think>` and `</think>` all the same, since the checkpoints that share the call spelling and
-//! write a thought (DeepSeek R1-0528, which the gateway's older pairing `deepseek` + `deepseek_r1`
-//! served) read with it under the `deepseek` alias, and a thought must never land in the content.
+//! write a thought read with it: the DeepSeek R1 line (R1, R1-Zero, the bf16 mirror, the six
+//! distills, R1-0528 and R1-0528-Qwen3-8B, by id, and the gateway's older pairing `deepseek` +
+//! `deepseek_r1` under the `deepseek` alias), whose templates render V3's block from the history
+//! and either open the thought in the prompt (`<think>` after the assistant header: R1, R1-Zero,
+//! the distills) or leave the model to open it (R1-0528, R1-0528-Qwen3-8B, the bf16 mirror); a
+//! thought must never land in the content.
 //! Recorded as `deepseek-v3-0324`, whose parse sets hold content alone: the template takes a
 //! call's arguments as a string, so the recorder, whose corpus holds them as an object, refused
 //! every call case; the calls stand on the turns the template renders, held in the tests below.
@@ -68,8 +72,10 @@ mod tests {
 
     /// The generation prompt's tail: the turn's opener and nothing more.
     const PROMPT: &str = "<｜Assistant｜>";
-    /// The tail of a checkpoint whose template opens the thought in the prompt (the original R1
-    /// and its distills). R1-0528 ends its prompt at the opener and writes `<think>` itself.
+    /// The tail of a checkpoint whose template opens the thought in the prompt: DeepSeek R1's,
+    /// R1-Zero's and the R1 distills' write `<think>` and a newline after the assistant header.
+    /// R1-0528's, R1-0528-Qwen3-8B's and the bf16 mirror's end at the header, and the model writes
+    /// `<think>` itself.
     const THINKING: &str = "<｜Assistant｜><think>\n";
 
     fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
@@ -194,8 +200,9 @@ mod tests {
     /// The turns the template renders for the shapes a tool-calling conversation takes: one call,
     /// three calls in one block (a newline before each call after the first), a call after
     /// content, a call with no arguments, nested and non-ASCII values, and content alone; then a
-    /// call and content after a thought the prompt opens (the original R1 and its distills), and
-    /// after a thought the model opens itself, the prompt ending at the opener (R1-0528).
+    /// call and content after a thought the prompt opens (R1, R1-Zero and the distills, whose
+    /// template ends the prompt with the opener), and after a thought the model opens itself, the
+    /// prompt ending at the header (R1-0528, R1-0528-Qwen3-8B and the bf16 mirror).
     const RENDERED_TURNS: &[RenderedTurn] = &[
         RenderedTurn {
             tail: PROMPT,
