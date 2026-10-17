@@ -373,6 +373,18 @@ impl AppContextBuilder {
         self
     }
 
+    /// Apply the configuration's liveness budgets (the stall, wedge and stale
+    /// thresholds and the warm-up slice) to this process. The server's
+    /// start-up applies them in its worker-monitor step; a context built by
+    /// hand from the public setters (the test harness) calls this so the
+    /// budgets its configuration carries are the ones in force. They are
+    /// process-wide and the first call wins, so the first context built in a
+    /// process sets them.
+    pub fn liveness_budgets(self, config: &RouterConfig) -> Self {
+        liveness::configure_from(config);
+        self
+    }
+
     pub fn worker_monitor(mut self, worker_monitor: Option<Arc<WorkerMonitor>>) -> Self {
         self.worker_monitor = worker_monitor;
         self
@@ -849,19 +861,8 @@ impl AppContextBuilder {
         if let Some(registry) = self.worker_registry.as_ref() {
             registry.set_overload_shed(config.worker_overload_shed);
         }
-        // Progress-based liveness thresholds (see `worker::liveness`).
-        liveness::configure(
-            Duration::from_secs(config.worker_stall_secs),
-            Duration::from_secs(config.worker_wedge_secs),
-            Duration::from_secs(config.worker_stale_secs),
-        );
-        liveness::configure_warmup(liveness::Warmup {
-            secs: Duration::from_secs(config.worker_warmup_secs),
-            share: config.worker_warmup_share,
-            blocks: config.worker_warmup_blocks,
-            thin_ratio: config.worker_warmup_thin_ratio,
-            divert_every: config.worker_warmup_divert_every,
-        });
+        // Progress-based liveness budgets (see `worker::liveness`).
+        liveness::configure_from(config);
         // PD dispatch waits here, not in the decode engine's queue, when the
         // pair's running window is full.
         pd_admission::set_pd_admission_wait_secs(config.pd_admission_wait_secs);

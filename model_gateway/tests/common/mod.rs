@@ -483,6 +483,10 @@ async fn build_test_app_context(
 
     let app_context = Arc::new(
         AppContext::builder()
+            // The configuration's liveness budgets, as the start-up applies
+            // them: process-wide, so the first context a test binary builds
+            // sets them for the process.
+            .liveness_budgets(&config)
             .router_config(config.clone())
             .client(client)
             .rate_limiter(rate_limiter)

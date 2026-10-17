@@ -113,7 +113,7 @@ use openai_protocol::worker::WorkerStatus;
 use tracing::{info, warn};
 
 use super::{worker::StallReason, Worker};
-use crate::observability::metrics::Metrics;
+use crate::{config::RouterConfig, observability::metrics::Metrics};
 
 const DEFAULT_STALL: Duration = Duration::from_secs(2);
 const DEFAULT_WEDGE: Duration = Duration::from_secs(3);
@@ -365,11 +365,69 @@ pub(crate) fn configure(stall: Duration, wedge: Duration, stale: Duration) {
     let _ = THRESHOLDS.set((stall, wedge, stale));
 }
 
+/// Apply every liveness budget the configuration carries: the stall, wedge
+/// and stale thresholds and the warm-up slice. The one place the budgets
+/// are read from a configuration, for the server's start-up and for a
+/// context built by hand (the test harness); the first call in a process
+/// wins, as for [`configure`].
+pub(crate) fn configure_from(config: &RouterConfig) {
+    configure(
+        Duration::from_secs(config.worker_stall_secs),
+        Duration::from_secs(config.worker_wedge_secs),
+        Duration::from_secs(config.worker_stale_secs),
+    );
+    configure_warmup(Warmup {
+        secs: Duration::from_secs(config.worker_warmup_secs),
+        share: config.worker_warmup_share,
+        blocks: config.worker_warmup_blocks,
+        thin_ratio: config.worker_warmup_thin_ratio,
+        divert_every: config.worker_warmup_divert_every,
+    });
+}
+
 fn thresholds() -> (Duration, Duration, Duration) {
     THRESHOLDS
         .get()
         .copied()
         .unwrap_or((DEFAULT_STALL, DEFAULT_WEDGE, DEFAULT_STALE))
+}
+
+/// The liveness budgets in force in this process: what a configuration set
+/// through [`configure_from`], or the defaults.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Budgets {
+    /// A worker that has not answered a contact for this long is stalled.
+    pub stall: Duration,
+    /// A worker whose engine is silent on its requests this long is vetoed.
+    pub wedge: Duration,
+    /// A load report older than this is stale.
+    pub stale: Duration,
+    /// The warm-up slice's age bound.
+    pub warmup_secs: Duration,
+    /// The share of cache misses the warm-up slice diverts.
+    pub warmup_share: f32,
+    /// The index size that ends a young worker's warm-up.
+    pub warmup_blocks: usize,
+    /// The index ratio below which a worker is thin against the fleet.
+    pub warmup_thin_ratio: f32,
+    /// One hit in this many goes to a thin worker.
+    pub warmup_divert_every: u64,
+}
+
+/// The liveness budgets in force in this process.
+pub fn budgets() -> Budgets {
+    let (stall, wedge, stale) = thresholds();
+    let warmup = warmup();
+    Budgets {
+        stall,
+        wedge,
+        stale,
+        warmup_secs: warmup.secs,
+        warmup_share: warmup.share,
+        warmup_blocks: warmup.blocks,
+        warmup_thin_ratio: warmup.thin_ratio,
+        warmup_divert_every: warmup.divert_every,
+    }
 }
 
 /// Milliseconds since the gateway started: the clock behind the workers'

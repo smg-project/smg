@@ -2,8 +2,9 @@
 //! has not run. A realistic mock engine behind a gRPC router pushes its load
 //! records, the engine's silence on its in-flight requests among them, over
 //! the KV-event stream; the wedge budget is the default three seconds (the
-//! test context is built by hand, without the configuration's liveness
-//! step). The first prompt longer than any the worker has answered holds
+//! harness applies the configuration's liveness budgets and this test's
+//! configuration leaves them). The first prompt longer than any the worker
+//! has answered holds
 //! the engine for several budgets with nothing produced (the mock's
 //! cold-shape hook; a minute on a real engine): the gateway must not veto
 //! the worker, and the request completes on it. An engine frozen on a shape
