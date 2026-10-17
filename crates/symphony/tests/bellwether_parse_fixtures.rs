@@ -276,6 +276,17 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("deepseek-v3.2-exp", GenerationPrompt::Plain),
     ("deepseek-v3-0324", GenerationPrompt::Plain),
     ("deepseek-v3-0324-bf16", GenerationPrompt::Plain),
+    // The R1 line writes V3's call spelling from its history and a thought of its own. The
+    // recorder rendered each reference through the template, which keeps an assistant message
+    // from its `</think>` on and takes a call's arguments as a string, so the sets hold content
+    // alone and the replay starts in content; the prompt's own tail (`<think>` after the
+    // assistant header in R1's, R1-Zero's and the distills' templates, nothing in R1-0528's,
+    // R1-0528-Qwen3-8B's and the bf16 mirror's) is held by the table's module tests.
+    ("deepseek-r1-0528", GenerationPrompt::Plain),
+    ("deepseek-r1-0528-qwen3-8b", GenerationPrompt::Plain),
+    ("deepseek-r1-bf16", GenerationPrompt::Plain),
+    ("deepseek-r1-distill-llama-8b", GenerationPrompt::Plain),
+    ("deepseek-r1-distill-qwen-1.5b", GenerationPrompt::Plain),
     // Kimi K3 writes XTML and opens the thought in the prompt, whatever the request says: its
     // recorded requests carry no switch. The shared tail adds a newline the template does not
     // write; it is prompt text inside the thought and moves nothing.
