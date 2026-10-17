@@ -1201,6 +1201,13 @@ impl Reader {
         self.tally.parse_report(self.table, choice)
     }
 
+    /// Whether the table gave up on a run of the output read so far: what strictness turns into
+    /// a `parse_failure` finish. A call suppressed under `parallel_tool_calls: false` is not
+    /// that: the table read it whole and the request asked for it to be dropped.
+    pub(crate) fn has_malformed(&self) -> bool {
+        self.tally.has_malformed()
+    }
+
     fn drained(&mut self) -> Vec<Event> {
         let mut events = self.events.drain();
         for event in &events {

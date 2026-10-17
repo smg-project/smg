@@ -41,6 +41,40 @@ use crate::config::ParseFailures;
 
 /// The request header that asks for the report: `on`, `off` or `detail`.
 pub(crate) const REPORT_HEADER: &str = "x-smg-parse-report";
+/// The request header that asks for strictness: `on` or `off`. An output the table gave up on a
+/// run of then finishes with [`PARSE_FAILURE`] in place of a natural stop, a matched stop sequence
+/// included (a truncation and every other engine finish keep their reason), and carries its
+/// report whatever the report mode.
+pub(crate) const STRICT_HEADER: &str = "x-smg-parse-strict";
+/// The finish reason (and the Messages stop reason) of an output the table gave up on a run of,
+/// under strictness, where a natural stop would have been; a stop sequence that ended it stays
+/// reported beside it (`matched_stop`, Messages `stop_sequence`).
+pub(crate) const PARSE_FAILURE: &str = "parse_failure";
+
+/// Whether the request asks for strictness: its `X-SMG-Parse-Strict` header says `on`, and the
+/// policy is not `silent` (which ignores the header). The error names a header value that is
+/// neither `on` nor `off`, for the 400 response.
+pub(crate) fn strict_mode(
+    policy: ParseFailures,
+    headers: Option<&HeaderMap>,
+) -> Result<bool, String> {
+    if policy == ParseFailures::Silent {
+        return Ok(false);
+    }
+    match headers.and_then(|headers| headers.get(STRICT_HEADER)) {
+        None => Ok(false),
+        Some(value) => {
+            let spelled = String::from_utf8_lossy(value.as_bytes());
+            match spelled.trim().to_ascii_lowercase().as_str() {
+                "on" => Ok(true),
+                "off" => Ok(false),
+                _ => Err(format!(
+                    "{STRICT_HEADER} must be on or off, not {spelled:?}"
+                )),
+            }
+        }
+    }
+}
 
 /// What a response says about how its output was read: the `smg.parse` object next to its
 /// usage (on a streamed choice's finish chunk; on a Messages answer's `message` and
@@ -66,6 +100,15 @@ impl Report {
             Self::Off => false,
             Self::OnFailure => not_clean,
             Self::Always | Self::Detail => true,
+        }
+    }
+
+    /// The mode under strictness: an output that is not clean is reported whatever the request
+    /// asked, so `Off` becomes `OnFailure`; the others stay.
+    pub(crate) fn at_least_on_failure(self) -> Self {
+        match self {
+            Self::Off => Self::OnFailure,
+            other => other,
         }
     }
 
@@ -315,6 +358,11 @@ impl Tally {
             _ => {}
         }
         self.at += bytes_of(event);
+    }
+
+    /// Whether the table gave up on a run of the output.
+    pub(crate) fn has_malformed(&self) -> bool {
+        self.malformed() > 0
     }
 
     /// Whether the output was not clean: a malformed run or a suppressed call.
@@ -926,6 +974,41 @@ mod tests {
         );
         // The header value is not read under `silent`, so a bad one is not an error there.
         assert_eq!(mode(Silent, Some("yes")), Report::Off);
+    }
+
+    fn strict_headers(value: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(value) = value {
+            headers.insert(STRICT_HEADER, value.parse().expect("a header value"));
+        }
+        headers
+    }
+
+    #[test]
+    fn strictness_follows_the_header_unless_the_policy_is_silent() {
+        use ParseFailures::{Log, Silent, Surface};
+        let strict = |policy, header| {
+            strict_mode(policy, Some(&strict_headers(header))).expect("a decision")
+        };
+        assert!(!strict(Log, None));
+        assert!(strict(Log, Some("on")));
+        assert!(strict(Log, Some(" ON ")));
+        assert!(!strict(Log, Some("off")));
+        assert!(strict(Surface, Some("on")));
+        assert!(!strict(Silent, Some("on")));
+        assert!(!strict_mode(Log, None).expect("a decision"));
+        let why = strict_mode(Log, Some(&strict_headers(Some("yes")))).expect_err("refused");
+        assert_eq!(why, "x-smg-parse-strict must be on or off, not \"yes\"");
+        // Not read under `silent`, so a bad value is not an error there.
+        assert!(!strict(Silent, Some("yes")));
+    }
+
+    #[test]
+    fn strictness_reports_a_failure_whatever_the_mode_asked() {
+        assert_eq!(Report::Off.at_least_on_failure(), Report::OnFailure);
+        assert_eq!(Report::OnFailure.at_least_on_failure(), Report::OnFailure);
+        assert_eq!(Report::Always.at_least_on_failure(), Report::Always);
+        assert_eq!(Report::Detail.at_least_on_failure(), Report::Detail);
     }
 
     #[test]
