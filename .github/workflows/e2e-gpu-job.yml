@@ -104,9 +104,15 @@ on:
         required: false
         type: string
         default: ""
+      enabled:
+        description: "Run the job; false skips it before it takes a runner, so a caller can gate single matrix rows (the tiers of smg-lab#127)"
+        required: false
+        type: boolean
+        default: true
 
 jobs:
   run:
+    if: ${{ inputs.enabled }}
     runs-on: ${{ inputs.runner }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     timeout-minutes: ${{ inputs.timeout }}
