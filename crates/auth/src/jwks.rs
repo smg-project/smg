@@ -197,6 +197,12 @@ pub(crate) fn validate_url(url_str: &str) -> Result<Url, JwksError> {
 #[derive(Debug, serde::Deserialize)]
 struct OidcDiscovery {
     jwks_uri: String,
+    /// Required of the document (OIDC Discovery 1.0 lists it as such), so a
+    /// document without it is refused at the parse as before; its value is
+    /// read nowhere yet. Checking it against the configured issuer is a
+    /// separate change.
+    #[serde(rename = "issuer")]
+    _issuer: String,
 }
 
 /// Cached JWKS with expiration tracking.
