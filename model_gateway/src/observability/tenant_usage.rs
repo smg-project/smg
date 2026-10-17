@@ -113,8 +113,18 @@ pub struct RequestUsage {
 /// with an error, a prefill leg failed before the first token. The guard's
 /// `Drop` books those with what it has: the prompt as the gateway tokenized
 /// it at dispatch, the completion tokens streamed so far, the time since the
-/// stream began. One booking per stream either way: `finish` takes the guard,
-/// and a guard that was finished has nothing left to book when it drops.
+/// stream began; once the stream has the engine's own counts (its `Complete`
+/// messages) it hands them to the guard through [`settle`](Self::settle), so
+/// a client that stops reading at the finish or usage chunk is booked with
+/// them. One booking per stream either way: `finish` takes the guard, and a
+/// guard that was finished has nothing left to book when it drops.
+///
+/// Every dispatched stream is booked, a stream whose first engine message is
+/// an error included: it books one request of the prompt alone. The gateway
+/// cannot tell a rejection from an engine that failed after the prefill, and
+/// the row counts the work a tenant sent the engine; a buffered request that
+/// fails has no stream and books nothing, which is the one place the two
+/// modes differ.
 ///
 /// With accounting off (no table installed) the guard is inert: `begin`
 /// clones nothing and every method is one branch.
@@ -129,11 +139,12 @@ struct Booking {
     table: &'static TenantUsage,
     tenant: Box<str>,
     model: Box<str>,
-    /// The prompt's length as tokenized at dispatch.
-    prompt_tokens: u64,
-    /// Completion tokens streamed so far. Atomic so the fan-out of a batched
-    /// request can count into one guard by shared reference; one relaxed add
-    /// per chunk.
+    /// The prompt's length as tokenized at dispatch, then the engine's count
+    /// once the stream settled it.
+    prompt_tokens: AtomicU64,
+    /// Completion tokens streamed so far (the engine's count once settled).
+    /// Atomic so the fan-out of a batched request can count into one guard by
+    /// shared reference; one relaxed add per chunk.
     completion_tokens: AtomicU64,
     start: Instant,
 }
@@ -165,7 +176,7 @@ impl StreamUsage {
                 table,
                 tenant: tenant.into(),
                 model: model.into(),
-                prompt_tokens,
+                prompt_tokens: AtomicU64::new(prompt_tokens),
                 completion_tokens: AtomicU64::new(0),
                 start: Instant::now(),
             }),
@@ -182,13 +193,33 @@ impl StreamUsage {
         }
     }
 
+    /// Take the engine's own counts once the stream has them (its `Complete`
+    /// messages, before the finish or usage chunk the client may no longer
+    /// read): what a drop books from here on. `None` keeps the prompt count
+    /// the dispatch made.
+    #[inline]
+    pub fn settle(&self, prompt_tokens: Option<u64>, completion_tokens: u64) {
+        if let Some(booking) = &self.booking {
+            if let Some(prompt_tokens) = prompt_tokens {
+                booking
+                    .prompt_tokens
+                    .store(prompt_tokens, Ordering::Relaxed);
+            }
+            booking
+                .completion_tokens
+                .store(completion_tokens, Ordering::Relaxed);
+        }
+    }
+
     /// Book the stream's normal end: `completion_tokens`, the prompt count
-    /// the end knows (else the one counted at dispatch), and `elapsed`, the
-    /// stream's duration as the metrics measure it.
+    /// the end knows (else the settled one, else the one counted at
+    /// dispatch), and `elapsed`, the stream's duration as the metrics
+    /// measure it.
     pub fn finish(mut self, prompt_tokens: Option<u64>, completion_tokens: u64, elapsed: Duration) {
         if let Some(booking) = self.booking.take() {
             booking.book(RequestUsage {
-                prompt_tokens: prompt_tokens.unwrap_or(booking.prompt_tokens),
+                prompt_tokens: prompt_tokens
+                    .unwrap_or_else(|| booking.prompt_tokens.load(Ordering::Relaxed)),
                 completion_tokens,
                 elapsed,
             });
@@ -203,11 +234,12 @@ impl Booking {
 }
 
 impl Drop for StreamUsage {
-    /// A stream that ended without its normal end: what was counted so far.
+    /// A stream that ended without its normal end: what was counted so far,
+    /// or the engine's counts once settled.
     fn drop(&mut self) {
         if let Some(booking) = self.booking.take() {
             booking.book(RequestUsage {
-                prompt_tokens: booking.prompt_tokens,
+                prompt_tokens: booking.prompt_tokens.load(Ordering::Relaxed),
                 completion_tokens: booking.completion_tokens.load(Ordering::Relaxed),
                 elapsed: booking.start.elapsed(),
             });
@@ -812,6 +844,32 @@ mod tests {
             "{}",
             row.totals.request_seconds
         );
+    }
+
+    #[test]
+    fn a_dropped_stream_books_the_counts_it_settled() {
+        let table = leaked_table(4);
+        let stream = StreamUsage::begin_on(Some(table), "auth:a", "m", 100);
+        stream.add_completion_tokens(3);
+        // The engine's Complete arrived: its counts replace the estimates ...
+        stream.settle(Some(120), 9);
+        drop(stream);
+        let snapshot = table.snapshot();
+        let row = tenant(&snapshot, "auth:a");
+        assert_eq!(row.totals.requests, 1);
+        assert_eq!(row.totals.prompt_tokens, 120, "the engine's prompt count");
+        assert_eq!(
+            row.totals.completion_tokens, 9,
+            "the engine's completion count"
+        );
+
+        // ... and a settle without a prompt count keeps the dispatch count.
+        let stream = StreamUsage::begin_on(Some(table), "auth:b", "m", 100);
+        stream.settle(None, 2);
+        drop(stream);
+        let snapshot = table.snapshot();
+        assert_eq!(tenant(&snapshot, "auth:b").totals.prompt_tokens, 100);
+        assert_eq!(tenant(&snapshot, "auth:b").totals.completion_tokens, 2);
     }
 
     #[test]

@@ -455,6 +455,14 @@ impl HarmonyStreamingProcessor {
                     prompt_tokens
                         .entry(index)
                         .or_insert_with(|| complete_wrapper.prompt_tokens());
+                    // The engine's counts are in: a client that stops reading
+                    // from here on is booked with them.
+                    stream_usage.settle(
+                        Some(u64::from(
+                            prompt_tokens.values().copied().max().unwrap_or(0),
+                        )),
+                        u64::from(completion_tokens.total()),
+                    );
                     completion_tokens.record_complete(&complete_wrapper);
                     cached_tokens
                         .entry(index)
@@ -569,6 +577,9 @@ impl HarmonyStreamingProcessor {
             spec_accepted: spec_accepted.values().sum(),
             spec_drafted: spec_drafted.values().sum(),
         };
+        // The engine's counts are in: a client that stops reading at the
+        // usage chunk is booked with them from here.
+        stream_usage.settle(Some(u64::from(counts.prompt)), u64::from(counts.completion));
 
         if let Some(handle) = reservation {
             // A clean decode EOF with fewer decode `Complete` messages than
@@ -609,6 +620,7 @@ impl HarmonyStreamingProcessor {
             generation_duration: start_time.elapsed(),
             input_tokens: Some(counts.prompt as u64),
             output_tokens: counts.completion as u64,
+            unbilled_prompt_tokens: 0,
             usage: stream_usage,
         });
 

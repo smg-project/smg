@@ -87,11 +87,19 @@ fn character_tokenizer() -> Arc<dyn Tokenizer> {
 }
 
 async fn chat_response(stream: ProtoStream, dispatch: context::DispatchMetadata) -> Response {
+    chat_response_of(stream, dispatch, chat_spec(false)).await
+}
+
+async fn chat_response_of(
+    stream: ProtoStream,
+    dispatch: context::DispatchMetadata,
+    spec: ChatResponseSpec,
+) -> Response {
     let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_CHAT);
     Arc::new(processor(false))
         .process_streaming_response(
             context::ExecutionResult::Single { stream },
-            chat_spec(false),
+            spec,
             dispatch,
             character_tokenizer(),
             false,
@@ -172,6 +180,72 @@ async fn a_stream_the_client_abandons_books_the_dispatch_prompt_and_the_tokens_s
          arrived); every token the engine delivered before the send failed"
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn a_stream_the_client_leaves_after_the_engines_count_books_that_count_once() {
+    let tenant = "auth:usage-row-client-gone-after-complete";
+    let (gate, held) = oneshot::channel();
+    let (stream, server) = gated_stream(
+        vec![chunk(0, "Hel"), chunk(0, "lo")],
+        held,
+        vec![complete_with_prompt(0, "stop", 7)],
+        "0",
+    )
+    .await;
+    let mut body = chat_response(stream, dispatch(tenant)).await.into_body();
+
+    // The client reads the whole text ...
+    assert!(first_frame(&mut body).await.contains("Hel"));
+    assert!(first_frame(&mut body).await.contains("lo"));
+    // ... and leaves. The engine's Complete arrives, the finish chunk cannot
+    // be sent: the row takes the engine's counts, not the dispatch estimate.
+    drop(body);
+    let _ = gate.send(());
+
+    assert_eq!(
+        counts(&booked(tenant).await),
+        (1, 7, 5),
+        "one request; the engine's prompt count (its Complete arrived before the          client left); the tokens it confirmed"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_stream_whose_first_message_is_the_engines_error_books_the_prompt_alone_once() {
+    let tenant = "auth:usage-row-error-first";
+    let (stream, server) =
+        cut_stream(vec![], tonic::Status::unavailable("engine overloaded")).await;
+    let text = read_to_end(chat_response(stream, dispatch(tenant)).await).await;
+    assert!(text.contains("stream_error"), "{text}");
+    server.abort();
+
+    assert_eq!(
+        counts(&booked(tenant).await),
+        (1, u64::from(PROMPT_AT_DISPATCH), 0),
+        "one request of the prompt as dispatched: the gateway cannot tell a rejection          from an engine that failed after the prefill"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_books_the_prompt_without_the_unbilled_stub() {
+    let tenant = "auth:usage-row-unbilled-stub";
+    let mut spec = chat_spec(false);
+    spec.unbilled_prompt_tokens = 2;
+    let (stream, server) = scripted_stream(
+        vec![chunk(0, "Hel"), complete_with_prompt(0, "stop", 7)],
+        "0",
+    )
+    .await;
+    let text = read_to_end(chat_response_of(stream, dispatch(tenant), spec).await).await;
+    assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+    server.abort();
+
+    assert_eq!(
+        counts(&booked(tenant).await),
+        (1, 5, 3),
+        "the engine's 7 less the 2-token stub the client is not billed for, as its          usage block shows"
+    );
 }
 
 #[tokio::test]
