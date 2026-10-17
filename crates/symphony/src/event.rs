@@ -92,7 +92,7 @@ pub enum MalformedReason {
     /// A tag of the syntax where it has no place: a value's close with no value open, a
     /// parameter tag before the function's.
     TagOutOfPlace,
-    /// A tag another tag cut short before it closed.
+    /// A tag another tag, or the call's end, cut short before it closed.
     TagCutShort,
     /// Text between a tag's name and its close, where the syntax has none.
     TagTail,
@@ -151,7 +151,7 @@ impl MalformedReason {
             Self::UnknownTool => "a call to a function the request did not declare",
             Self::TextBetweenTags => "text between a call's tags",
             Self::TagOutOfPlace => "a tag where the call's syntax has none",
-            Self::TagCutShort => "a tag that another tag cut short",
+            Self::TagCutShort => "a tag that another tag or the call's end cut short",
             Self::TagTail => "text after a tag's name",
             Self::EmptyName => "a tag without a name",
             Self::CallWithoutName => "a call without a name",

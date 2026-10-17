@@ -215,6 +215,8 @@ impl Assembler {
                 Stage::ParameterName { .. } => MalformedReason::KeyCutShort,
                 Stage::Value(_) => MalformedReason::ValueCutShort,
                 Stage::FunctionName { .. } => MalformedReason::ClosedBeforeTheName,
+                // Not reached once the call started (`Between` took the branch above, `Opening`
+                // is never re-entered); the match stays exhaustive.
                 Stage::Opening | Stage::Between => MalformedReason::TagCutShort,
             };
             self.carried.push_str(&held);
@@ -1235,7 +1237,7 @@ mod tests {
                 MalformedReason::ValueCutShort
             )]
         );
-        // Inside a key, and a tag the scanner held between parameters: the same.
+        // Inside a key, the key the end cut short; a tag the scanner held between parameters, the tag.
         let events = closed(&["<function=f>\n<parameter=ci"]);
         assert_eq!(arguments(&events), "{}");
         assert_eq!(
