@@ -87,7 +87,10 @@ pub(crate) struct MultimodalSettings {
     /// Whether the images of a request whose workers all read one wire dtype
     /// are preprocessed straight into it, in one pass; off, every request
     /// takes the two passes (the patch layout, then the write in the
-    /// worker's dtype at assembly). The bytes are the same either way.
+    /// worker's dtype at assembly). The bytes are the same either way. With
+    /// a pixel cache, the one pass caches the wire bytes, twice the neutral
+    /// patches at the half widths and four times at float32, against the
+    /// same budget: the same `--mm-pixel-cache-mb` holds fewer images.
     pub one_pass_wire: Setting<bool>,
 }
 
@@ -198,14 +201,21 @@ impl MultimodalSettings {
                 None,
             ),
             // No flag and no deprecation line: a switch that is on by
-            // default, read both ways.
+            // default, read both ways, and a spelling it does not know is
+            // said (here a typo would be an ignored rollback).
             one_pass_wire: resolve(
                 None,
                 env_nonempty(ENV_ONE_PASS_WIRE),
                 ENV_ONE_PASS_WIRE,
                 None,
                 defaults.one_pass_wire,
-                two_way_switch,
+                |raw| {
+                    two_way_switch_or_warn(
+                        raw,
+                        ENV_ONE_PASS_WIRE,
+                        "the one-pass wire write stays on",
+                    )
+                },
             ),
         })
     }
@@ -278,6 +288,18 @@ fn two_way_switch(raw: &str) -> Option<bool> {
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+/// [`two_way_switch`] for a switch that is on by default, where a spelling
+/// it does not know is not a typo to pass over in silence but a rollback
+/// that did not happen: it is logged with its consequence, and the default
+/// stands as it does for the other switches.
+fn two_way_switch_or_warn(raw: &str, env_name: &str, consequence: &str) -> Option<bool> {
+    let parsed = two_way_switch(raw);
+    if parsed.is_none() {
+        warn!(value = %raw, "{env_name} is not an on/off spelling; {consequence}");
+    }
+    parsed
 }
 
 /// A numeric env value; one that is not a number is logged with its
