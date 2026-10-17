@@ -94,6 +94,10 @@ impl Dialect {
     };
 }
 
+/// The most bytes a list held after content may grow to before it is given back as content: a
+/// real list of calls is short, and content with a `[name(` of its own must not stop the stream.
+const HOLD_CAP_BYTES: usize = 8192;
+
 /// The events of the pythonic calls in one region, each call with its own index from `first` and
 /// its id from the engine's [`CallIds`].
 #[derive(Clone, Debug)]
@@ -432,6 +436,12 @@ impl Assembler {
             Stage::Holding(extent) => {
                 self.carried.push(c);
                 match extent.read(c) {
+                    // A real list of calls is short: a hold that outgrows the cap is content
+                    // (`[f(` of the content's own with a lone quote after it would otherwise
+                    // hold the rest of the turn), and the stream goes on.
+                    ListEnd::Open if self.carried.len() > HOLD_CAP_BYTES => {
+                        self.stage = Stage::Prose;
+                    }
                     ListEnd::Open => {}
                     ListEnd::Closed => self.read_held_list(declared, out),
                     ListEnd::Mismatched => self.stage = Stage::Prose,
@@ -1117,6 +1127,33 @@ mod tests {
         }
         assembler.close(&mut out);
         out.drain()
+    }
+
+    /// Content with a `[f(` of its own and a lone quote after it: the hold would never close, so
+    /// it is given back as content once it passes the cap, before the region ends, and the turn
+    /// streams on.
+    #[test]
+    fn a_hold_after_content_is_given_back_once_it_passes_the_cap() {
+        let text = format!(
+            "The product rule gives [f(x)g'(x) + {}",
+            "z".repeat(HOLD_CAP_BYTES)
+        );
+        let mut assembler = Assembler::bare(0, ids(), Dialect::LLAMA4);
+        let mut out = Events::new();
+        assembler.feed(&text, &tools(), &mut out);
+        let while_open = out.drain();
+        assert!(
+            content(&while_open).len() > HOLD_CAP_BYTES,
+            "given back before the region ends: {} bytes of content",
+            content(&while_open).len()
+        );
+        assembler.finish(&mut out);
+        let mut events = while_open;
+        events.extend(out.drain());
+        assert_eq!(bytes(&events), text);
+        assert_eq!(content(&events), text);
+        assert!(calls(&events).is_empty());
+        assert_eq!(malformed(&events), "");
     }
 
     fn run_bare(declared: &Declared, pieces: &[&str]) -> Vec<Event> {

@@ -45,6 +45,7 @@ pub const ALIASES: [(&str, Table); 19] = [
     ("deepseek32", Table::DeepSeekV3_2),
     ("deepseek_v41", Table::DeepSeekV4_1),
     ("pythonic", Table::Llama4),
+    ("llama4_pythonic", Table::Llama4),
     ("minimax", Table::MinimaxM2),
     ("muse", Table::MuseSpark),
     ("kimik2", Table::KimiK2),
