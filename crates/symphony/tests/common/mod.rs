@@ -109,6 +109,19 @@ pub fn replay_after(
     finish: &EngineFinish,
     empty_between: bool,
 ) -> Result<Vec<Event>, ParseError> {
+    replay_marked(parser, prompt_text, text, cuts, finish, empty_between).map(|(events, _)| events)
+}
+
+/// [`replay_after`] with the index of the first event the end of the stream produced, so that a
+/// check can tell a call its own terminal closed from one the end cut.
+pub fn replay_marked(
+    parser: &mut dyn Parser,
+    prompt_text: &str,
+    text: &str,
+    cuts: &[usize],
+    finish: &EngineFinish,
+    empty_between: bool,
+) -> Result<(Vec<Event>, usize), ParseError> {
     let mut out = Events::new();
     parser.feed(
         Input::Prompt {
@@ -130,11 +143,12 @@ pub fn replay_after(
     if empty_between {
         parser.feed(delta(""), &mut out)?;
     }
+    let before_end = out.len();
     parser.feed(
         Input::End {
             finish: finish.clone(),
         },
         &mut out,
     )?;
-    Ok(out.drain())
+    Ok((out.drain(), before_end))
 }

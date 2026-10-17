@@ -16,6 +16,7 @@
 use crate::{
     event::{Event, Events, MalformedReason, Text},
     json::{
+        is_complete,
         outline::{Scanner, Span},
         prefix::Prefix,
     },
@@ -187,6 +188,15 @@ impl Assembler {
             // (`refused_tail`).
             self.send_held(arguments.as_ref(), out);
             self.no_arguments(arguments.as_ref(), out);
+            // An object that ended where its arguments broke handed the bytes from the break
+            // back, so nothing of its own says that the arguments are no whole value: a
+            // `Malformed` event of no bytes does, before the end.
+            if !self.arguments_whole(arguments.as_ref()) {
+                out.push(Event::Malformed {
+                    text: Text::default(),
+                    why: MalformedReason::InvalidArguments,
+                });
+            }
             let tail_start = arguments
                 .as_ref()
                 .and_then(|span| span.end)
@@ -231,8 +241,10 @@ impl Assembler {
     }
 
     /// No more bytes will come, and the object never closed. A call that started is closed with
-    /// what arrived, the bytes after its arguments value returned as `Malformed`; an object that
-    /// never named its call comes back as `Malformed` whole. Either way no byte is lost.
+    /// what arrived, the bytes after its arguments value returned as `Malformed`; an arguments
+    /// value the close cut short is said to be one, by a `Malformed` event of no bytes before the
+    /// end; an object that never named its call comes back as `Malformed` whole. Either way no
+    /// byte is lost.
     pub fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
@@ -245,6 +257,18 @@ impl Assembler {
             // region: a comma cut short, a complete member, or bytes that are no member at all. A
             // closed object's tail is the source of its `ToolCallEnd` instead.
             self.send_held(found.arguments.as_ref(), out);
+            // The arguments value itself may be what the close cut: a string or a container left
+            // open, a word or a number the bytes end on. The fragments sent are not revised and
+            // no value is made up for one the model never finished: the call ends as it stands,
+            // and a `Malformed` event of no bytes, before its end, says that its arguments are no
+            // whole value, where a client would otherwise take them for one. The engine names the
+            // reason for a region a marker closed.
+            if self.invalid_from.is_none() && !self.arguments_whole(found.arguments.as_ref()) {
+                out.push(Event::Malformed {
+                    text: Text::default(),
+                    why: MalformedReason::UnterminatedRegion,
+                });
+            }
             let tail_start = found
                 .arguments
                 .as_ref()
@@ -269,6 +293,15 @@ impl Assembler {
                 text: Text::uncounted(self.text),
                 why: MalformedReason::UnterminatedRegion,
             });
+        }
+    }
+
+    /// Whether the arguments the call has said are one whole JSON value: the value's bytes are
+    /// one, or none came and `{}` stands for them ([`Self::no_arguments`]).
+    fn arguments_whole(&self, arguments: Option<&Span>) -> bool {
+        match arguments {
+            Some(span) => is_complete(span.text(&self.text)),
+            None => !self.scanner.found().arguments_named,
         }
     }
 
@@ -712,11 +745,18 @@ mod tests {
         let events = run(&[r#"{"name": "f", "arguments": {"a": 1"#]);
         assert_eq!(arguments(&events), r#"{"a": 1"#);
         assert_eq!(
-            events.last(),
-            Some(&Event::ToolCallEnd {
-                index: 0,
-                source: Text::default(),
-            })
+            &events[events.len() - 2..],
+            [
+                Event::Malformed {
+                    text: Text::default(),
+                    why: MalformedReason::UnterminatedRegion,
+                },
+                Event::ToolCallEnd {
+                    index: 0,
+                    source: Text::default(),
+                },
+            ],
+            "the value was cut: the call says so before its end"
         );
         let events = run(&[r#"{"name": "f", "arguments": {},"#]);
         assert_eq!(arguments(&events), "{}");
@@ -732,6 +772,67 @@ mod tests {
                     source: Text::default(),
                 },
             ]
+        );
+    }
+
+    /// A call cut inside its arguments value, by the next call's opener, the region's closing
+    /// marker or the end of the stream: the fragments sent stand, nothing is made up, and a
+    /// `Malformed` event of no bytes before the end says that the arguments are no whole value,
+    /// whole and in pieces alike. A value that is whole when the object's brace is left off
+    /// needs no word.
+    #[test]
+    fn a_call_cut_inside_its_arguments_says_so_before_its_end() {
+        let said_cut = |events: &[Event]| {
+            matches!(
+                &events[events.len() - 2..],
+                [
+                    Event::Malformed { text, why: MalformedReason::UnterminatedRegion },
+                    Event::ToolCallEnd { .. }
+                ] if text.text.is_empty()
+            )
+        };
+        let cases = [
+            (
+                "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Par\n",
+                "{\"city\": \"Par\n",
+            ),
+            ("{\"name\": \"ch\", \"arguments\":\"dname\n", "\"dname\n"),
+            (
+                r#"{"name": "f", "arguments": {"a": [1, 2"#,
+                r#"{"a": [1, 2"#,
+            ),
+            (r#"{"name": "f", "arguments": {"a": nul"#, r#"{"a": nul"#),
+            (r#"{"name": "f", "arguments": {"a": 1.5e"#, r#"{"a": 1.5e"#),
+        ];
+        for (object, expected) in cases {
+            let whole = run(&[object]);
+            assert_eq!(arguments(&whole), expected, "{object:?}");
+            assert!(said_cut(&whole), "{object:?}: {whole:?}");
+            let per_char: Vec<&str> = object
+                .char_indices()
+                .map(|(i, c)| &object[i..i + c.len_utf8()])
+                .collect();
+            let streamed = run(&per_char);
+            assert_eq!(arguments(&streamed), expected, "{object:?} per character");
+            assert!(said_cut(&streamed), "{object:?} per character");
+            assert_eq!(sources(&streamed), object);
+        }
+        // The arguments are whole, the object's brace is missing: a call, with no word.
+        let whole = run(&[r#"{"name": "f", "arguments": {"a": 1}"#]);
+        assert_eq!(arguments(&whole), r#"{"a": 1}"#);
+        assert!(!whole
+            .iter()
+            .any(|event| matches!(event, Event::Malformed { .. })));
+        // Arguments that broke have said so already, from the byte that broke them.
+        let broken = run(&[r#"{"name": "f", "arguments": {"a": 12abc"#]);
+        assert_eq!(arguments(&broken), r#"{"a": 12"#);
+        assert_eq!(malformed(&broken), "abc");
+        assert_eq!(
+            broken
+                .iter()
+                .filter(|event| matches!(event, Event::Malformed { .. }))
+                .count(),
+            1
         );
     }
 
@@ -955,12 +1056,20 @@ mod tests {
         assert_eq!(tail, Some(("</f>".to_string(), Some('"'))));
 
         // An arguments member whose value never began is not a call with none: its key came, so
-        // no `{}` is made up for it; the call ends with what arrived and the bytes from the stop
-        // on are the caller's, as before.
+        // no `{}` is made up for it; the call ends with what arrived, a `Malformed` event of no
+        // bytes saying that it has no whole arguments, and the bytes from the stop on are the
+        // caller's, as before.
         let (events, tail) = feed(r#"{"name": "f", "arguments": }</f>"#, false);
         assert_eq!(
             events,
-            vec![start(r#"{"name": "f", "arguments": "#), end("")],
+            vec![
+                start(r#"{"name": "f", "arguments": "#),
+                Event::Malformed {
+                    text: Text::default(),
+                    why: MalformedReason::InvalidArguments,
+                },
+                end("")
+            ],
             "an arguments member without a value is not a call with `{{}}`"
         );
         assert_eq!(tail, Some(("}</f>".to_string(), Some(' '))));

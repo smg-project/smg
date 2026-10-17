@@ -11,8 +11,10 @@
 //!   them;
 //! - well-formedness: arguments and an end only for a call that has started and not ended, one
 //!   start per index, reasoning text only inside an open region, exactly one `Finish`, counting the
-//!   calls that started, and after every fragment each call's arguments so far a valid JSON prefix,
-//!   which is what prefix stability promises a client;
+//!   calls that started, after every fragment each call's arguments so far a valid JSON prefix,
+//!   which is what prefix stability promises a client, and a call its own terminal closed has
+//!   arguments that are whole JSON unless a `Malformed` event came while it was open, so that a
+//!   client is never handed a cut call as a whole one without a word;
 //! - order: calls are numbered from zero as they start, with ids that follow the index;
 //! - the lifecycle: one `Prompt`, deltas, one `End`, and an input out of order is a `Lifecycle`
 //!   error that emits nothing.
@@ -1588,6 +1590,12 @@ const QWEN3_OUTPUTS: &[&str] = &[
     "<think>I could write </think> here but it is text.\n</think>\n\nParis is sunny.",
     "<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n x\n</tool_call>",
     "<tool_call>{\"name\": \"f\", \"arguments\": {}}x y</tool_call>",
+    // A call cut by the next call's opener, by its own closing marker and by the end, inside a
+    // string value, a string-valued arguments and an array: no whole value without a word.
+    "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Par\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"days\": 3}}\n</tool_call>",
+    "<tool_call>\n{\"name\": \"ch\", \"arguments\":\"dname\n<tool_call>",
+    "<tool_call>{\"name\": \"f\", \"arguments\": {\"a\": \"x</tool_call>",
+    "<tool_call>{\"name\": \"f\", \"arguments\": {\"a\": [1, 2</tool_call>done",
 ];
 
 /// The outputs bellwether's common set records for MiMo-V2.5 (Qwen 3.5's tags, the value between
@@ -1691,6 +1699,11 @@ const GEMMA4_OUTPUTS: &[&str] = &[
     "<|channel>thought\n97 is not divisible by 2, 3, 5 or 7.\n<channel|>Yes, 97 is prime.",
     "Hello!",
     "<|tool_call>call:get_weather{city:<|\"|>Par",
+    // A member cut between its colon and its value, by the closing marker and by the end.
+    "<|tool_call>call:get_weather{city:<tool_call|>",
+    "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days:<tool_call|>",
+    "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days:",
+    "<|tool_call>call:get_weather{tags:[<tool_call|>",
 ];
 
 /// The outputs bellwether's common set records for Inkling, and one cut short.
@@ -1810,11 +1823,13 @@ fn valid_json_prefix(text: &str) -> bool {
     matches!(PartialJson::default().parse(text, true), Ok((_, consumed)) if consumed == text.len())
 }
 
-/// What a client relies on in the shape of the stream, checked event by event.
-fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event]) {
+/// What a client relies on in the shape of the stream, checked event by event; `before_end` is
+/// where the events of the stream's end begin.
+fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event], before_end: usize) {
     let mut started: Vec<u32> = Vec::new();
     let mut ended: Vec<u32> = Vec::new();
     let mut arguments: Vec<(u32, String)> = Vec::new();
+    let mut malformed_inside: Vec<u32> = Vec::new();
     let mut reasoning_open = false;
     let mut finished = false;
     for (at, event) in events.iter().enumerate() {
@@ -1850,6 +1865,26 @@ fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event]) {
                 );
                 assert!(!ended.contains(index), "{}: a second end", place());
                 ended.push(*index);
+                // A call its own terminal closed is whole, or the parser said it is not: a client
+                // that reads the arguments as JSON relies on one or the other.
+                if at < before_end && !malformed_inside.contains(index) {
+                    let so_far = arguments
+                        .iter()
+                        .find(|(i, _)| i == index)
+                        .map_or("", |(_, so_far)| so_far.as_str());
+                    assert!(
+                        serde_json::from_str::<serde_json::Value>(so_far).is_ok(),
+                        "{}: the call closed with arguments that are no whole JSON, {so_far:?}, and no Malformed event",
+                        place()
+                    );
+                }
+            }
+            Event::Malformed { .. } => {
+                for index in &started {
+                    if !ended.contains(index) && !malformed_inside.contains(index) {
+                        malformed_inside.push(*index);
+                    }
+                }
             }
             Event::ReasoningStart => {
                 assert!(!reasoning_open, "{}: reasoning already open", place());
@@ -1871,7 +1906,7 @@ fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event]) {
                 );
                 finished = true;
             }
-            Event::Content(_) | Event::Dropped { .. } | Event::Malformed { .. } => {}
+            Event::Content(_) | Event::Dropped { .. } => {}
         }
     }
     let place = format!("{name}: {text:?} cut at {cuts:?}");
@@ -1954,9 +1989,16 @@ fn empty_deltas_between_the_pieces_change_nothing() {
 fn the_event_stream_is_well_formed_under_every_chunking() {
     for (subject, text) in corpus() {
         for (_, cuts) in chunkings(text, usize::MAX) {
-            let events = replay(subject, text, &cuts, false)
-                .unwrap_or_else(|e| panic!("{}: {text:?}: {e}", subject.name));
-            check_well_formed(subject.name, text, &cuts, &events);
+            let (events, before_end) = common::replay_marked(
+                &mut *(subject.new)(),
+                "",
+                text,
+                &cuts,
+                &EngineFinish::Stop,
+                false,
+            )
+            .unwrap_or_else(|e| panic!("{}: {text:?}: {e}", subject.name));
+            check_well_formed(subject.name, text, &cuts, &events, before_end);
         }
     }
 }

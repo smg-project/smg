@@ -31,7 +31,16 @@ string fed by the character took 800 s against 0.03 s whole.
 
 A started call whose object never closes is closed at `finish` with what arrived, and the bytes
 after its arguments value (a comma cut short, a complete member, or bytes that are no member) come
-back as `Malformed` with `UnterminatedRegion`.
+back as `Malformed` with `UnterminatedRegion`. An arguments value the close itself cut (a string or
+a container left open, a word or a number the bytes end on; the next call's opener, the region's
+closing marker and the end of the stream all cut this way) is said to be none: the fragments sent
+stand, since a fragment passed on cannot be taken back, nothing is made up for a value the model
+never finished, and a `Malformed` event of no bytes comes before the call's end, so that a client
+that reads the arguments as JSON is told rather than left to find out; the engine names the reason
+for a region a marker closed. The value reader (`json::arguments`) and the Mistral object reader
+(`json::named_arguments`) say the same at their end, and the Gemma assembler for a member cut
+between its colon and its value. Whole arguments that only the object's brace is missing after are
+a call with no word.
 
 `feed` takes one piece and returns how many of its bytes the object took: all of them before the
 close, and up to the closing brace in the piece that carries it, so the format routes whatever

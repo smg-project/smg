@@ -28,7 +28,7 @@
 
 use crate::{
     event::{Event, Events, MalformedReason, Text},
-    json::{outline::Scanner, prefix::Prefix},
+    json::{is_complete, outline::Scanner, prefix::Prefix},
 };
 
 const NAME_WITHOUT_ARGUMENTS: &str = "a call that names a tool and writes no arguments";
@@ -188,7 +188,9 @@ impl Arguments {
 
     /// No more bytes will come: a closed object has said everything; one that never closed ends
     /// with what arrived, every byte of it already a fragment or malformed text but for a word it
-    /// still held, which goes first, as the prefix it is.
+    /// still held, which goes first, as the prefix it is, and a `Malformed` event of no bytes
+    /// before the end says that the arguments are no whole value, unless the bytes happen to be
+    /// one (a value that is no object, which the template never writes).
     fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
@@ -201,6 +203,12 @@ impl Arguments {
                 source: Text::uncounted(held),
             });
             self.emitted = self.text.len();
+        }
+        if self.invalid_from.is_none() && !is_complete(&self.text) {
+            out.push(Event::Malformed {
+                text: Text::default(),
+                why: MalformedReason::UnterminatedRegion,
+            });
         }
         out.push(Event::ToolCallEnd {
             index: self.index,

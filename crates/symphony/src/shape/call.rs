@@ -1103,9 +1103,14 @@ mod tests {
     /// A value the JSON reader refuses is over where it was refused: what follows is the
     /// trailer's to read, so the closing terminal the trailer ends before closes the call, and the
     /// text after it is content. Without this, the refused value took every byte to the stream's
-    /// stop and the close came back as the call's text (#3145's unresolved finding).
+    /// stop and the close came back as the call's text (#3145's unresolved finding). The value
+    /// the trailer cut is no whole one, which a `Malformed` event of no bytes says before the end.
     #[test]
     fn a_refused_value_hands_what_follows_to_the_trailer() {
+        let no_whole_value = || Event::Malformed {
+            text: Text::default(),
+            why: MalformedReason::InvalidArguments,
+        };
         let format = table(named(closing_f()));
         assert_eq!(
             run(&format, "<c><n=f>{\"a\": 1</f>\n</c>Done."),
@@ -1113,6 +1118,7 @@ mod tests {
                 wrapper("<c>"),
                 start("f", "<n=f>"),
                 arguments("{\"a\": 1"),
+                no_whole_value(),
                 end("</f>\n</c>"),
                 content("Done."),
                 finish(1),
@@ -1127,6 +1133,7 @@ mod tests {
             [
                 wrapper("<c>"),
                 start("f", "<n=f>"),
+                no_whole_value(),
                 end("END</c>"),
                 content("Done."),
                 finish(1),
@@ -1141,6 +1148,7 @@ mod tests {
                     text: Text::uncounted(" "),
                     why: DropReason::Whitespace,
                 },
+                no_whole_value(),
                 end("END</c>"),
                 content("Done."),
                 finish(1),
@@ -1180,10 +1188,22 @@ mod tests {
             .position(|event| matches!(event, Event::Content(_)))
             .expect("the text after the call is content");
         assert!(ended < content_at, "{events:#?}");
+        // The arguments the trailer cut are no whole value: said once, before the end.
+        let said: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(at, event)| match event {
+                Event::Malformed { .. } => Some(at),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(said.len(), 1, "{events:#?}");
+        assert!(said[0] < ended, "{events:#?}");
         assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, Event::Malformed { .. })),
+            matches!(
+                &events[said[0]],
+                Event::Malformed { text, why: MalformedReason::InvalidArguments } if text.text.is_empty()
+            ),
             "{events:#?}"
         );
         let shown: String = events

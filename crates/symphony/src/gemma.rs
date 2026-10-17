@@ -23,7 +23,9 @@
 //! piece's end, so a trailing start of it is held until the next bytes say. Every byte lands in one
 //! event: the `call:NAME{` header is the start's source, each fragment's bytes its own, the closing
 //! marker the end's. Text after the object closed and before the marker, which the template never
-//! writes, is reported; a header that is not `call:NAME{` is reported and no call starts.
+//! writes, is reported; a header that is not `call:NAME{` is reported and no call starts. A member
+//! the call's end cuts between its colon and its value is reported too, since the object closed for
+//! the client has no value where one must stand and nothing is made up for it.
 //!
 //! [`formats::gemma4`]: crate::formats::gemma4()
 
@@ -178,12 +180,14 @@ impl Assembler {
 
     /// The stream was cut: what was held comes back as `Malformed { UnterminatedRegion }`, an
     /// object still open is closed for the client, and a call that started still ends, with no
-    /// bytes of its own, as every assembler ends one.
+    /// bytes of its own, as every assembler ends one. A member cut between its colon and its value
+    /// leaves the object no JSON when it is closed, and a `Malformed` event of no bytes says so.
     pub fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
         }
-        if !self.carried.is_empty() {
+        let value_missing = self.carried.is_empty() && self.value_missing();
+        if !self.carried.is_empty() || value_missing {
             out.push(Event::Malformed {
                 text: Text::uncounted(std::mem::take(&mut self.carried)),
                 why: MalformedReason::UnterminatedRegion,
@@ -422,6 +426,13 @@ impl Assembler {
         self.containers.last().is_some_and(|c| c.list)
     }
 
+    /// Whether the call stands where an object member's value must come and none has: its key
+    /// and colon are written, so the object cannot close as JSON. In a list the same place is
+    /// where a value may come, and the list closes without one.
+    fn value_missing(&self) -> bool {
+        self.started && self.stage == Stage::Value && !self.in_list()
+    }
+
     /// `", "` before every member of a container but its first, and the member counted.
     fn separator(&mut self) -> String {
         match self.containers.last_mut() {
@@ -439,6 +450,9 @@ impl Assembler {
 
     /// The call's end before its marker: a key or a value cut short is reported, a string left
     /// open gets its quote, and every open container is closed, so the arguments are an object.
+    /// A member cut between its colon and its value is reported too, with whatever was held
+    /// there, since the object closed below has no value where one must stand and is no JSON:
+    /// nothing is made up for a value the model never wrote.
     fn end(&mut self, out: &mut Events) {
         let held = std::mem::take(&mut self.carried);
         match self.stage {
@@ -446,15 +460,14 @@ impl Assembler {
                 text: Text::uncounted(held),
                 why: MalformedReason::Other(NOT_A_CALL.to_string()),
             }),
-            Stage::Key | Stage::Value if !held.trim().is_empty() => {
-                let why = if self.stage == Stage::Key {
-                    KEY_CUT_SHORT
-                } else {
-                    VALUE_CUT_SHORT
-                };
+            Stage::Key if !held.trim().is_empty() => out.push(Event::Malformed {
+                text: Text::uncounted(held),
+                why: MalformedReason::Other(KEY_CUT_SHORT.to_string()),
+            }),
+            Stage::Value if !held.trim().is_empty() || self.value_missing() => {
                 out.push(Event::Malformed {
                     text: Text::uncounted(held),
-                    why: MalformedReason::Other(why.to_string()),
+                    why: MalformedReason::Other(VALUE_CUT_SHORT.to_string()),
                 });
             }
             Stage::Text => {
@@ -797,6 +810,55 @@ mod tests {
         let cut_in_key = run(&["call:f{ci"], true);
         assert_eq!(arguments(&cut_in_key), "{}");
         assert_eq!(bytes(&cut_in_key), "call:f{ci");
+    }
+
+    /// A member the call's end cuts between its colon and its value: the object closed for the
+    /// client has no value where one must stand, nothing is made up for it, and the call says
+    /// so, at the closing marker with the key's reason and at the end of the stream as the cut
+    /// region it is. A list closed where a value may come is an empty list, and an object closed
+    /// after a comma is whole: no word for those.
+    #[test]
+    fn a_member_cut_before_its_value_is_reported_and_nothing_is_made_up() {
+        let closed = run(&["call:get_weather{city:"], false);
+        assert_eq!(arguments(&closed), r#"{"city": }"#);
+        assert_eq!(
+            malformed(&closed),
+            vec![(String::new(), VALUE_CUT_SHORT.to_string())]
+        );
+        assert_eq!(bytes(&closed), format!("call:get_weather{{city:{CLOSE}"));
+        let second = run(&["call:get_weather{city:<|\"|>Paris<|\"|>,days:"], false);
+        assert_eq!(arguments(&second), r#"{"city": "Paris", "days": }"#);
+        assert_eq!(
+            malformed(&second),
+            vec![(String::new(), VALUE_CUT_SHORT.to_string())]
+        );
+        let spaced = run(&["call:get_weather{city: "], false);
+        assert_eq!(
+            malformed(&spaced),
+            vec![(" ".to_string(), VALUE_CUT_SHORT.to_string())]
+        );
+        let cut = run(&["call:get_weather{city:"], true);
+        assert_eq!(arguments(&cut), r#"{"city": }"#);
+        assert!(cut.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, why: MalformedReason::UnterminatedRegion } if text.text.is_empty()
+        )));
+        for (output, expected) in [
+            ("call:f{tags:[", r#"{"tags": []}"#),
+            ("call:f{a:1,", r#"{"a": 1}"#),
+            ("call:f{", "{}"),
+        ] {
+            for cut in [false, true] {
+                let events = run(&[output], cut);
+                assert_eq!(arguments(&events), expected, "{output:?} cut {cut}");
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, Event::Malformed { .. })),
+                    "{output:?} cut {cut}: {events:?}"
+                );
+            }
+        }
     }
 
     #[test]
