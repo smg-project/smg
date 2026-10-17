@@ -1251,15 +1251,17 @@ impl ChatDecode {
         prompt_tokens
             .entry(index)
             .or_insert_with(|| complete.prompt_tokens());
-        // The engine's counts are in: a client that stops reading
-        // from here on is booked with them.
+        self.completion_tokens.record_complete(complete);
+        // The engine's counts are in (the completion count only
+        // once the tracker took the `Complete`: on a cumulative
+        // engine the chunks wrote none): a client that stops
+        // reading from here on is booked with them.
         self.usage.settle(
             Some(u64::from(
                 prompt_tokens.values().copied().max().unwrap_or(0),
             )),
             u64::from(self.completion_tokens.total()),
         );
-        self.completion_tokens.record_complete(complete);
         cached_tokens
             .entry(index)
             .or_insert_with(|| complete.cached_tokens());
@@ -1384,9 +1386,13 @@ impl ChatDecode {
             spec_drafted: self.spec_drafted.values().sum(),
         };
         // The engine's counts are in: a client that stops reading at the
-        // usage chunk is booked with them from here.
-        self.usage
-            .settle(Some(u64::from(counts.prompt)), u64::from(counts.completion));
+        // usage chunk is booked with them from here. `prompt_tokens` holds
+        // only what `Complete` messages carried: with none, the dispatch count
+        // stands.
+        self.usage.settle(
+            (!prompt_tokens.is_empty()).then_some(u64::from(counts.prompt)),
+            u64::from(counts.completion),
+        );
 
         if let Some(handle) = reservation {
             // A clean decode EOF with fewer decode `Complete` messages than this request's `n>1`
@@ -1430,7 +1436,7 @@ impl ChatDecode {
                 .first_token_time
                 .map(|t| t.duration_since(self.start_time)),
             generation_duration: self.start_time.elapsed(),
-            input_tokens: Some(counts.prompt as u64),
+            input_tokens: (!prompt_tokens.is_empty()).then_some(counts.prompt as u64),
             output_tokens: counts.completion as u64,
             unbilled_prompt_tokens: 0,
             usage: self.usage,
