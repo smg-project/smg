@@ -824,7 +824,7 @@ pub(crate) fn on_token_progress(worker: &Arc<dyn Worker>) {
 }
 
 /// A request completed on the worker (the engine's own last message for it,
-/// not an error): progress, and the proof the wedge drain waits for, from
+/// not an error or an abort): progress, and the proof the wedge drain waits for, from
 /// any of its states. The probe that completes ends the drain; so does an
 /// in-flight request that finishes while the worker drains.
 pub(crate) fn on_completion(worker: &Arc<dyn Worker>) {
