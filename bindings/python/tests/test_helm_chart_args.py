@@ -30,7 +30,6 @@ from smg.router_args import RouterArgs
 CHART = Path(__file__).resolve().parents[3] / "deploy" / "helm" / "smg"
 HELPERS = CHART / "templates" / "_helpers.tpl"
 ROUTER_TEMPLATE = CHART / "templates" / "deployment-router.yaml"
-HELM = shutil.which("helm")
 
 # The launcher's secrets: the flag that takes the value itself, and the
 # environment variables that carry it or name a file holding it.
@@ -57,7 +56,7 @@ STORES = {
 
 needs_chart = pytest.mark.skipif(not HELPERS.exists(), reason="chart not present in this checkout")
 needs_helm = pytest.mark.skipif(
-    HELM is None or not HELPERS.exists(), reason="helm or the chart not present"
+    shutil.which("helm") is None or not HELPERS.exists(), reason="helm or the chart not present"
 )
 
 
@@ -99,7 +98,7 @@ def test_chart_secret_variables_are_launcher_names():
 
 def render(*settings: str) -> tuple[str, list[dict]]:
     """Renders the chart with ``--set`` pairs: the text and its documents."""
-    command = [HELM, "template", "smg", str(CHART)]
+    command = ["helm", "template", "smg", str(CHART)]
     for setting in settings:
         command += ["--set", setting]
     completed = subprocess.run(command, capture_output=True, text=True)
