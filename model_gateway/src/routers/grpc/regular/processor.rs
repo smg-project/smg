@@ -28,7 +28,9 @@ use crate::routers::{
         common::{response_collection, response_formatting},
         context::{DispatchMetadata, ExecutionResult},
         proto_wrapper::ProtoGenerateComplete,
-        regular::symphony::{content_spans, engine_finish, finished, Assignment, Reader},
+        regular::symphony::{
+            content_spans, engine_finish, finished, telemetry::Who, Assignment, Reader,
+        },
         spec::{ChatResponseSpec, CompletionResponseSpec, MessagesResponseSpec},
         utils,
     },
@@ -87,6 +89,7 @@ impl ResponseProcessor {
                 complete,
                 index,
                 original_request,
+                model,
                 tokenizer,
                 stop_decoder,
             );
@@ -332,12 +335,14 @@ impl ResponseProcessor {
     /// The matched stop is set as on the older path, and the logprobs cover the
     /// tokens of `message.content` only, as the older path's do: the content's
     /// bytes come from the events, each token's from the reader.
+    #[expect(clippy::too_many_arguments)]
     fn read_with_symphony(
         request_id: &str,
         assignment: &Assignment,
         complete: &ProtoGenerateComplete,
         index: usize,
         original_request: &ChatResponseSpec,
+        model: &str,
         tokenizer: &Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<(ChatChoice, u32), String> {
@@ -363,7 +368,12 @@ impl ResponseProcessor {
         } else {
             complete.finish_reason()
         };
-        events.extend(reader.end(engine_finish(reason))?);
+        let who = Who {
+            request_id,
+            model,
+            choice: index as u32,
+        };
+        events.extend(reader.end(engine_finish(reason), who)?);
         let reasoning_tokens = finished(&events).map_or(0, |finished| finished.reasoning_tokens);
         let mut choice = adapt::chat::message(index as u32, &events);
         choice.matched_stop = stop_decoder
@@ -432,7 +442,12 @@ impl ResponseProcessor {
         } else {
             complete.finish_reason()
         };
-        events.extend(reader.end(engine_finish(reason))?);
+        let who = Who {
+            request_id: &dispatch.request_id,
+            model: &dispatch.model,
+            choice: 0,
+        };
+        events.extend(reader.end(engine_finish(reason), who)?);
         let mut output = adapt::messages::output(&events);
         if !request.thinking_text_returned {
             utils::message_utils::omit_thinking_text(&mut output.content);

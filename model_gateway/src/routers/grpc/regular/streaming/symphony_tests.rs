@@ -757,3 +757,113 @@ async fn a_conversation_that_ends_with_a_system_turn_keeps_the_thought_out_of_th
     assert_eq!(chat_text(&events, 0, "content").trim(), "");
     assert!(!tool_call_deltas(&events).is_empty(), "{events:#?}");
 }
+
+/// The scrape of a recorder of this test's own after `read` ran on this thread (the test
+/// runtime is single-threaded, so the local recorder sees every record of the future).
+async fn scraped<F: std::future::Future>(read: F) -> (F::Output, String) {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let guard = metrics::set_default_local_recorder(&recorder);
+    let output = read.await;
+    drop(guard);
+    (output, handle.render())
+}
+
+/// The line of `scrape` for the series `name` with every label in `labels`.
+fn series_line<'a>(scrape: &'a str, name: &str, labels: &[&str]) -> Option<&'a str> {
+    scrape
+        .lines()
+        .find(|line| line.starts_with(name) && labels.iter().all(|label| line.contains(label)))
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_malformed_region_in_a_whole_output_is_counted_and_written_once() {
+    // A call region that never forms a call: the content keeps its bytes, the counters say
+    // which table gave up and why, and one line names the request, the choice and the model.
+    let ((choice, _), scrape) = scraped(fold("Hello <tool_call>\nnot a call\n</tool_call>")).await;
+    let content = choice.message.content.expect("content");
+    assert!(content.contains("not a call"), "{content}");
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"qwen3\"", "outcome=\"malformed\""],
+    )
+    .expect("the outputs counter");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    assert!(
+        series_line(
+            &scrape,
+            "smg_symphony_malformed_total",
+            &["table=\"qwen3\""]
+        )
+        .is_some(),
+        "{scrape}"
+    );
+    assert!(
+        series_line(
+            &scrape,
+            "smg_symphony_malformed_bytes_count",
+            &["table=\"qwen3\""]
+        )
+        .is_some_and(|line| line.ends_with(" 1")),
+        "{scrape}"
+    );
+    assert!(logs_contain(
+        "Symphony did not read the whole output as content, reasoning and calls"
+    ));
+    assert!(logs_contain("request_id=\"test-request\""));
+    assert!(logs_contain("model=\"Qwen/Qwen3-8B\""));
+    assert!(logs_contain("table=\"qwen3\""));
+    assert!(logs_contain("choice=0"));
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_clean_whole_output_is_counted_and_writes_nothing() {
+    let ((choice, _), scrape) = scraped(fold("Hello there")).await;
+    assert_eq!(choice.message.content.as_deref(), Some("Hello there"));
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"qwen3\"", "outcome=\"clean\""],
+    )
+    .expect("the outputs counter");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    assert!(!scrape.contains("smg_symphony_malformed"), "{scrape}");
+    assert!(!logs_contain("Symphony did not read the whole output"));
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_malformed_region_in_a_stream_is_counted_and_written_once() {
+    let spec = assigned(
+        chat_spec(true),
+        qwen3(CallSyntax::Json),
+        "<|im_start|>assistant\n",
+    );
+    let ((result, events), scrape) = scraped(stream_events(
+        vec![
+            chunk(0, "Hi <tool_call>\nnot a call\n"),
+            chunk(0, "</tool_call>"),
+            complete(0, "stop"),
+        ],
+        true,
+        spec,
+    ))
+    .await;
+    result.expect("the stream ends well");
+    assert!(chat_text(&events, 0, "content").contains("not a call"));
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"qwen3\"", "outcome=\"malformed\""],
+    )
+    .expect("the outputs counter");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    assert!(logs_contain(
+        "Symphony did not read the whole output as content, reasoning and calls"
+    ));
+    assert!(logs_contain("table=\"qwen3\""));
+    assert!(logs_contain("choice=0"));
+}

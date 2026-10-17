@@ -39,6 +39,7 @@
 //! over the stop decoder's output and render its events with `symphony::adapt::chat` or
 //! `symphony::adapt::messages`, so the client sees the deltas and the message it saw before.
 
+pub(crate) mod telemetry;
 pub(crate) mod template;
 
 use std::{borrow::Cow, fmt, sync::Arc};
@@ -64,7 +65,10 @@ use symphony::{
 use tool_parser::{GrammarStart as WorkerGrammarStart, ToolConstraint};
 use tracing::debug;
 
-use self::template::Templates;
+use self::{
+    telemetry::{Tally, Who},
+    template::Templates,
+};
 use crate::{
     config::{ParserChoice, TEMPLATE_PARSER},
     routers::grpc::{
@@ -1125,10 +1129,15 @@ pub(crate) fn reasoning_text_tokens(events: &[Event]) -> u32 {
 }
 
 /// One choice's reader: the engine over the choice's output, fed what the stop decoder releases
-/// with the span of every token in it.
+/// with the span of every token in it. What it reads is counted as it goes ([`telemetry`]) and
+/// recorded when the output ends.
 pub(crate) struct Reader {
     engine: Engine,
     events: Events,
+    /// The `table` label of the format, for the counters and the line.
+    table: &'static str,
+    /// What the output said so far that was not content, reasoning or a call.
+    tally: Tally,
     /// The last token the decoder saw: text it releases later belongs to it.
     last_token: Option<u32>,
     /// Where each token's text ends in the output read so far, in order; the text the decoder
@@ -1151,8 +1160,10 @@ impl Reader {
     /// as its response spec holds them: every choice's reader shares them, none copies a schema.
     pub(crate) fn new(assignment: &Assignment, tools: Arc<[Tool]>) -> Result<Self, String> {
         let mut reader = Self {
+            table: telemetry::table_label(assignment.format.name()),
             engine: Engine::shared(Arc::clone(&assignment.format), Declared::shared(tools)),
             events: Events::new(),
+            tally: Tally::default(),
             last_token: None,
             ends: Vec::new(),
             read: 0,
@@ -1179,6 +1190,9 @@ impl Reader {
 
     fn drained(&mut self) -> Vec<Event> {
         let mut events = self.events.drain();
+        for event in &events {
+            self.tally.see(event, self.first_call_only);
+        }
         if self.first_call_only {
             events.retain(|event| {
                 !matches!(
@@ -1241,6 +1255,7 @@ impl Reader {
         feed_engine(
             &mut self.engine,
             &mut self.events,
+            self.table,
             Input::Delta {
                 token_ids: &self.tokens,
                 text: &self.text,
@@ -1285,14 +1300,17 @@ impl Reader {
     }
 
     /// Ends the output with the engine's finish, once: the events, the last of them the
-    /// `Finish`, or nothing when the output already ended.
-    pub(crate) fn end(&mut self, finish: EngineFinish) -> Result<Vec<Event>, String> {
+    /// `Finish`, or nothing when the output already ended. The output is recorded here, under
+    /// `who`: its counters, and the line when it was not clean ([`Tally::report`]).
+    pub(crate) fn end(&mut self, finish: EngineFinish, who: Who<'_>) -> Result<Vec<Event>, String> {
         if self.ended {
             return Ok(Vec::new());
         }
         self.ended = true;
         self.feed(Input::End { finish })?;
-        Ok(self.drained())
+        let events = self.drained();
+        self.tally.report(self.table, who);
+        Ok(events)
     }
 
     /// Whether the output ended.
@@ -1301,16 +1319,23 @@ impl Reader {
     }
 
     fn feed(&mut self, input: Input<'_>) -> Result<(), String> {
-        feed_engine(&mut self.engine, &mut self.events, input)
+        feed_engine(&mut self.engine, &mut self.events, self.table, input)
     }
 }
 
 /// Feeds `input` to `engine`, its events into `events`: the reader's one way in, over the fields
-/// rather than the reader, so a delta read from the reader's own buffers can be fed too.
-fn feed_engine(engine: &mut Engine, events: &mut Events, input: Input<'_>) -> Result<(), String> {
-    engine
-        .feed(input, events)
-        .map_err(|e| format!("Symphony failed to read the output: {e}"))
+/// rather than the reader, so a delta read from the reader's own buffers can be fed too. An
+/// output the engine refuses is recorded as failed for `table`, which the error names.
+fn feed_engine(
+    engine: &mut Engine,
+    events: &mut Events,
+    table: &'static str,
+    input: Input<'_>,
+) -> Result<(), String> {
+    engine.feed(input, events).map_err(|e| {
+        telemetry::record_failed(table);
+        format!("Symphony failed to read the output with the {table} table: {e}")
+    })
 }
 
 #[cfg(test)]
@@ -1340,6 +1365,15 @@ mod tests {
             }
         }]))
         .expect("tools")
+    }
+
+    /// The request the tests' readers report under.
+    fn who() -> Who<'static> {
+        Who {
+            request_id: "test-request",
+            model: "Qwen/Qwen3-8B",
+            choice: 0,
+        }
     }
 
     const PROMPT: &str = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n";
@@ -2767,10 +2801,13 @@ mod tests {
         };
         let mut reader = Reader::new(&assignment, Arc::default()).expect("a reader");
         assert!(!reader.ended());
-        let events = reader.end(EngineFinish::Stop).expect("ended");
+        let events = reader.end(EngineFinish::Stop, who()).expect("ended");
         assert!(finished(&events).is_some());
         assert!(reader.ended());
-        assert!(reader.end(EngineFinish::Stop).expect("ended").is_empty());
+        assert!(reader
+            .end(EngineFinish::Stop, who())
+            .expect("ended")
+            .is_empty());
     }
 
     fn message_request(extra: Value) -> CreateMessageRequest {
@@ -3070,7 +3107,7 @@ mod tests {
         };
         let mut reader = Reader::new(&assignment, tools().into()).expect("a reader");
         let mut events = reader.tail(QWEN3_OUTPUT).expect("read");
-        events.extend(reader.end(EngineFinish::Stop).expect("ended"));
+        events.extend(reader.end(EngineFinish::Stop, who()).expect("ended"));
         events
     }
 
@@ -3089,7 +3126,7 @@ mod tests {
                 .expect("a reader")
                 .first_call_only(first_only);
             let mut events = reader.tail(TWO_CALLS).expect("read");
-            events.extend(reader.end(EngineFinish::Stop).expect("ended"));
+            events.extend(reader.end(EngineFinish::Stop, who()).expect("ended"));
             let starts = events
                 .iter()
                 .filter(|event| matches!(event, Event::ToolCallStart { .. }))
@@ -3122,7 +3159,7 @@ mod tests {
         let mut reader = Reader::new(&assignment, Arc::default()).expect("a reader");
         let answer = "{\"answer\": 42}";
         let mut events = reader.tail(answer).expect("read");
-        events.extend(reader.end(EngineFinish::Stop).expect("ended"));
+        events.extend(reader.end(EngineFinish::Stop, who()).expect("ended"));
         let text: String = events
             .iter()
             .filter_map(|event| match event {

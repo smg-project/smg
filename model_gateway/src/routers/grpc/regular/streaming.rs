@@ -36,7 +36,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tool_parser::{ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser};
 use tracing::{debug, error, warn};
 
-use super::symphony::{engine_finish, finished, reasoning_text_tokens, Reader};
+use super::symphony::{engine_finish, finished, reasoning_text_tokens, telemetry::Who, Reader};
 use crate::{
     observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
     rate_limit::{SharedReservationHandle, UsageSettlement},
@@ -1436,13 +1436,16 @@ impl StreamingProcessor {
 
     /// Ends Symphony's reading of the message: `flushed`, the text the decoder released last,
     /// then the engine's `finish`; the events go through the machine ([`Self::send_symphony_blocks`],
-    /// `thinking_text` as there) and the reasoning tokens they cost are added to `thinking_tokens`.
+    /// `thinking_text` as there) and the reasoning tokens they cost are added to `thinking_tokens`,
+    /// under `who` for the telemetry of the output's end.
+    #[expect(clippy::too_many_arguments)]
     async fn end_symphony_message(
         tx: &SseSender,
         buffer: &mut Vec<u8>,
         (reader, machine): (&mut Reader, &mut adapt::messages::Stream),
         flushed: Option<&str>,
         finish: EngineFinish,
+        who: Who<'_>,
         thinking_text: bool,
         thinking_tokens: &mut u32,
     ) -> Result<Option<messages::StopReason>, utils::StreamFailure> {
@@ -1450,7 +1453,7 @@ impl StreamingProcessor {
             Some(text) => reader.tail(text)?,
             None => Vec::new(),
         };
-        events.extend(reader.end(finish)?);
+        events.extend(reader.end(finish, who)?);
         *thinking_tokens += reasoning_text_tokens(&events);
         Self::send_symphony_blocks(tx, buffer, machine, &events, thinking_text).await
     }
@@ -2042,6 +2045,11 @@ impl StreamingProcessor {
                             (reader, machine),
                             flushed.as_deref(),
                             engine_finish(&finish_reason_str),
+                            Who {
+                                request_id,
+                                model,
+                                choice: 0,
+                            },
                             thinking_text_returned,
                             &mut parsed_thinking_tokens,
                         )
@@ -2092,6 +2100,11 @@ impl StreamingProcessor {
                             (reader, machine),
                             flushed.as_deref(),
                             finish,
+                            Who {
+                                request_id,
+                                model,
+                                choice: 0,
+                            },
                             thinking_text_returned,
                             &mut parsed_thinking_tokens,
                         )
@@ -3972,7 +3985,12 @@ impl<'a> ChatStream<'a> {
                 Some(text) => reader.tail(text)?,
                 None => Vec::new(),
             };
-            events.extend(reader.end(engine_finish(reason))?);
+            let who = Who {
+                request_id,
+                model: &self.dispatch.model,
+                choice: index,
+            };
+            events.extend(reader.end(engine_finish(reason), who)?);
             if let Some(finished) = finished(&events) {
                 self.has_tool_calls.insert(index, finished.tool_calls > 0);
                 self.parsed_reasoning_tokens
@@ -4046,7 +4064,12 @@ impl<'a> ChatStream<'a> {
                     events.extend(reader.tail(&text)?);
                 }
             }
-            events.extend(reader.end(EngineFinish::Abort)?);
+            let who = Who {
+                request_id,
+                model: &self.dispatch.model,
+                choice: index,
+            };
+            events.extend(reader.end(EngineFinish::Abort, who)?);
             // The `Finish` event says what the Complete frame would have:
             // the calls made, for the finish reason, and the reasoning
             // tokens, for the usage.
