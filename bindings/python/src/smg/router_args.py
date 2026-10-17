@@ -2840,9 +2840,11 @@ class RouterArgs:
             type=_positive_int,
             default=RouterArgs.runtime_worker_threads,
             help=(
-                "Explicit async runtime worker-thread count, at least 1. Leave unset to"
-                " use the runtime's default (the available parallelism, which honors the"
-                " cgroup CPU quota and is therefore container-aware)"
+                "Async runtime worker-thread count, from 1 to 4096 (the router refuses a"
+                " count above the ceiling). Unset: TOKIO_WORKER_THREADS when it is set (under"
+                " the same ceiling), else the available parallelism (the container's CPU"
+                " quota) capped at 8, the gateway's own budget. Set it to size the runtime"
+                " for a heavier deployment"
             ),
         )
 

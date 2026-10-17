@@ -994,10 +994,12 @@ pub const DEFAULT_RUNTIME_WORKER_THREADS_CAP: usize = 8;
 pub const TOKIO_WORKER_THREADS: &str = "TOKIO_WORKER_THREADS";
 
 /// The async runtime's worker-thread count, in this order: the explicit
-/// setting when there is one (the validator refuses 0), then
-/// `TOKIO_WORKER_THREADS` as tokio reads it (a positive integer; anything
-/// else is a configuration error naming the variable, where tokio would
-/// refuse to start), then the gateway's budget: the available parallelism
+/// setting when there is one (the validator refuses 0 and a count above
+/// [`RUNTIME_WORKER_THREADS_CEILING`](crate::config::RUNTIME_WORKER_THREADS_CEILING)),
+/// then `TOKIO_WORKER_THREADS` as tokio reads it (a positive integer, held to
+/// the same ceiling; anything else is a configuration error naming the
+/// variable, where tokio would refuse to start or build a runtime the
+/// validator refuses by flag), then the gateway's budget: the available parallelism
 /// (the container's CPU quota on Rust 1.95+) capped at
 /// [`DEFAULT_RUNTIME_WORKER_THREADS_CAP`], never below 1, and the cap when
 /// the parallelism cannot be read.
@@ -1024,11 +1026,19 @@ fn runtime_worker_threads_from(
         return Ok(count);
     }
     if let Some(value) = env_setting {
+        let ceiling = crate::config::RUNTIME_WORKER_THREADS_CEILING;
         return match value.to_str().and_then(|text| text.parse::<usize>().ok()) {
-            Some(count) if count >= 1 => Ok(count),
-            _ => Err(format!(
+            None | Some(0) => Err(format!(
                 "{TOKIO_WORKER_THREADS}={value:?} is not a positive integer"
             )),
+            // The flag's ceiling holds for the variable too: a count this
+            // size builds its threads for a long time and holds their stacks
+            // before the first bind, whichever way it was set.
+            Some(count) if count > ceiling => Err(format!(
+                "{TOKIO_WORKER_THREADS}={count} is above {ceiling}, the ceiling on the \
+                 runtime's worker threads (the same as --runtime-worker-threads's)"
+            )),
+            Some(count) => Ok(count),
         };
     }
     Ok(parallelism
@@ -1661,22 +1671,23 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // logged here, where the line reaches the log. `pinned` is the
     // configuration's say; the CLI's `main` and the Python binding size
     // theirs by `runtime_worker_threads`.
+    let worker_threads = tokio::runtime::Handle::current().metrics().num_workers();
     info!(
-        worker_threads = tokio::runtime::Handle::current().metrics().num_workers(),
+        worker_threads,
         pinned = config.runtime_worker_threads.is_some(),
         tokio_worker_threads_env = std::env::var_os(TOKIO_WORKER_THREADS).is_some(),
         "Tokio runtime sized"
     );
-    // A pinned count well above the CPUs available to the process is the
-    // operator's choice, served with a warning: a worker thread beyond the
-    // CPUs only waits for one. The ceiling on the count is the validator's,
-    // and reads nothing of the host.
-    if let Some(warning) = config.runtime_worker_threads.and_then(|threads| {
-        crate::config::runtime_worker_threads_oversubscription(
-            threads,
-            crate::config::available_cpus(),
-        )
-    }) {
+    // A count well above the CPUs available to the process, by the flag or
+    // by the variable, is the operator's choice, served with a warning: a
+    // worker thread beyond the CPUs only waits for one. The runtime's own
+    // count is checked, so the warning covers every way it was set (the
+    // budget never exceeds the parallelism, so it never warns). The ceiling
+    // on the count is the validator's, and reads nothing of the host.
+    if let Some(warning) = crate::config::runtime_worker_threads_oversubscription(
+        worker_threads,
+        crate::config::available_cpus(),
+    ) {
         tracing::warn!("{warning}");
     }
 
@@ -2683,9 +2694,10 @@ mod tests {
     /// unset and without `TOKIO_WORKER_THREADS`, the worker count is the
     /// available parallelism capped at `DEFAULT_RUNTIME_WORKER_THREADS_CAP`,
     /// never below 1, and the cap when the parallelism cannot be read; the
-    /// variable, as tokio reads it, comes before the budget; an explicit
-    /// `--runtime-worker-threads` comes first, above the cap included, and
-    /// the variable, well-formed or not, is not read under it.
+    /// variable, as tokio reads it and held to the flag's ceiling, comes
+    /// before the budget; an explicit `--runtime-worker-threads` comes first,
+    /// above the cap included, and the variable, well-formed or not, is not
+    /// read under it.
     #[test]
     fn the_runtime_size_follows_the_gateway_budget_unless_pinned() {
         let cap = DEFAULT_RUNTIME_WORKER_THREADS_CAP;
@@ -2720,6 +2732,29 @@ mod tests {
             );
             assert_eq!(
                 runtime_worker_threads_from(Some(3), var(bad), cores(16)),
+                Ok(3)
+            );
+        }
+        // The flag's ceiling holds for the variable: the ceiling itself is
+        // taken, one above it is refused by name with the ceiling's value,
+        // and an explicit count is not refused by a variable above it.
+        let ceiling = crate::config::RUNTIME_WORKER_THREADS_CEILING;
+        let at = ceiling.to_string();
+        let above = [(ceiling + 1).to_string(), "100000".to_string()];
+        assert_eq!(
+            runtime_worker_threads_from(None, Some(std::ffi::OsStr::new(&at)), cores(16)),
+            Ok(ceiling)
+        );
+        for value in &above {
+            let err =
+                runtime_worker_threads_from(None, Some(std::ffi::OsStr::new(value)), cores(16))
+                    .unwrap_err();
+            assert!(
+                err.contains(TOKIO_WORKER_THREADS) && err.contains(value) && err.contains(&at),
+                "{value}: {err}"
+            );
+            assert_eq!(
+                runtime_worker_threads_from(Some(3), Some(std::ffi::OsStr::new(value)), cores(16)),
                 Ok(3)
             );
         }

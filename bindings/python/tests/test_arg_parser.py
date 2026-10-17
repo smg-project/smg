@@ -2293,12 +2293,22 @@ class TestPdPairingMode:
 
 class TestRuntimeWorkerThreads:
     """--runtime-worker-threads is a launcher option, unset by default as on the Rust
-    CLI (the runtime's own size), and reaches the Rust router; a negative count is
-    refused at parse time, zero by the router's validation as on the CLI."""
+    CLI (TOKIO_WORKER_THREADS when set, else the available parallelism capped at the
+    gateway's budget of 8), and reaches the Rust router; a negative count is refused
+    at parse time, zero by the router's validation as on the CLI."""
 
     def test_unset_by_default(self):
         assert RouterArgs().runtime_worker_threads is None
         assert parse_router_args([]).runtime_worker_threads is None
+
+    def test_the_help_names_the_default_cap(self):
+        """The help documents the default the Rust CLI's help documents: the cap is
+        spelled in both, and this pins the Python side as the Rust help test pins its own."""
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        help_text = parser.format_help()
+        assert "TOKIO_WORKER_THREADS" in help_text
+        assert "capped at 8" in help_text
 
     def test_value_lands_on_the_dataclass(self):
         assert parse_router_args(["--runtime-worker-threads", "4"]).runtime_worker_threads == 4
