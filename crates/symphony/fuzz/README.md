@@ -56,7 +56,9 @@ Once a class is reported, `--allow <names>` (the environment variable `SYMPHONY_
 separated) makes the harness look past it, so that the next class surfaces: for the whole-JSON
 check it is `--allow whole-json`. Every check honors it. An allowance is for a run, never for the
 default; the names are the ones the breach messages carry. The nightly workflow allows
-`whole-json` until the parser fixes the first campaign found land, and no more than that.
+`whole-json` until the parser fixes the first campaign found land, and `made-up-empty-string`
+until the pythonic reader reports a value left out instead of writing an empty string for it, and
+no more than that.
 
 One target by hand, with libFuzzer's own options after `--`:
 

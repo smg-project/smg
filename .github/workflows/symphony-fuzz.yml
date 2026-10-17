@@ -7,7 +7,8 @@ name: symphony fuzz campaign
 # job and its artifact is uploaded for the report crates/symphony/fuzz/README.md describes.
 # Budget: nine targets, three at a time, ten minutes each on a hosted runner. The run looks past
 # the whole-json class (SYMPHONY_FUZZ_ALLOW) until the parser fixes the first campaign found
-# land, so that a night's red is a new class; drop the default then.
+# land, and past made-up-empty-string until the pythonic reader reports a value left out instead
+# of writing an empty string for it, so that a night's red is a new class; drop each name then.
 
 on:
   schedule:
@@ -22,7 +23,7 @@ on:
         default: ""
       allow:
         description: "Breach names the run looks past (comma separated; empty for none)"
-        default: "whole-json"
+        default: "whole-json,made-up-empty-string"
 
 concurrency:
   group: symphony-fuzz
@@ -85,8 +86,8 @@ jobs:
           ALLOW_INPUT: ${{ github.event.inputs.allow }}
         run: |
           # A dispatch's allowance is its own, an empty one included (an expression's `||` would
-          # put the default back); a scheduled run looks past whole-json until the parser fixes land.
-          if [ "$EVENT" = workflow_dispatch ]; then ALLOW=$ALLOW_INPUT; else ALLOW=whole-json; fi
+          # put the default back); a scheduled run looks past the classes reported and not yet fixed.
+          if [ "$EVENT" = workflow_dispatch ]; then ALLOW=$ALLOW_INPUT; else ALLOW=whole-json,made-up-empty-string; fi
           # shellcheck disable=SC2086
           crates/symphony/fuzz/run.sh --minutes "$MINUTES" --jobs 3 ${ALLOW:+--allow "$ALLOW"} $TARGETS
       - name: Upload crashes and logs

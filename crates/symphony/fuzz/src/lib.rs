@@ -15,7 +15,9 @@
 //!   as one request's engine does);
 //! - well-formedness: one start and one end per call, arguments only between them and a valid
 //!   JSON prefix after every fragment, reasoning text only inside a region, one `Finish` that
-//!   counts the calls; and a call that ended, at its own terminal or at the stream's end, has
+//!   counts the calls; a fragment of the arguments that closes a string, writes a member under an
+//!   empty key or writes an empty string carries the output bytes that wrote it (a reader makes
+//!   no byte up); and a call that ended, at its own terminal or at the stream's end, has
 //!   arguments that are whole JSON, unless the engine said `Malformed` while the call was open;
 //! - the adapters render any event sequence without a panic, and the Chat Completions stream,
 //!   concatenated, says what the whole message says.
@@ -520,6 +522,65 @@ fn bytes_of(event: &Event) -> &str {
     }
 }
 
+/// Whether `fragment`, appended to the arguments `so_far`, closes a JSON string `so_far` left
+/// open: the quote that ends a value the reader was streaming.
+fn closes_an_open_string(so_far: &str, fragment: &str) -> bool {
+    let mut inside = false;
+    let mut escaped = false;
+    for c in so_far.chars() {
+        if !inside {
+            inside = c == '"';
+        } else if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            inside = false;
+        }
+    }
+    if !inside {
+        return false;
+    }
+    for c in fragment.chars() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `json`, a fragment of the arguments, writes an empty string for a value the model left
+/// out: the fragment alone (`""`, `, ""`, `[""`) with no byte of the output behind it (none, or
+/// whitespace), or a whole member (`{"city": ""`, `, "city": ""`) whose source holds nothing of a
+/// value once the key's own text is taken out: whitespace and the separators `=`, `:` and `,`
+/// alone (`city=`). The model's own empty value leaves its quotes or its tags in the source
+/// (`city=""`, `<parameter=city></parameter>`), and the JSON syntaxes' source is the member itself.
+fn made_up_empty_string(json: &str, source: &str) -> bool {
+    if !json.ends_with("\"\"") {
+        return false;
+    }
+    let member = json
+        .strip_prefix('{')
+        .or_else(|| json.strip_prefix(", "))
+        .unwrap_or(json);
+    let key = member
+        .strip_prefix('"')
+        .and_then(|rest| rest.split_once("\": "))
+        .map(|(key, _)| key)
+        .filter(|key| !key.is_empty());
+    match key {
+        Some(key) => source
+            .replacen(key, "", 1)
+            .chars()
+            .all(|c| c.is_whitespace() || matches!(c, '=' | ':' | ',')),
+        None => source.trim().is_empty(),
+    }
+}
+
 /// Whether `text` is a JSON prefix the prefix parser takes whole.
 fn valid_json_prefix(text: &str) -> bool {
     matches!(PartialJson::default().parse(text, true), Ok((_, consumed)) if consumed == text.len())
@@ -546,7 +607,11 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                 started.push(*index);
                 arguments.push((*index, String::new()));
             }
-            Event::ToolCallArguments { index, json, .. } => {
+            Event::ToolCallArguments {
+                index,
+                json,
+                source,
+            } => {
                 breach("arguments-before-start", started.contains(index), || {
                     format!("{}: arguments before the call's start", place())
                 });
@@ -554,6 +619,51 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                     format!("{}: arguments after the call's end", place())
                 });
                 if let Some((_, so_far)) = arguments.iter_mut().find(|(i, _)| i == index) {
+                    // A fragment that closes a string the arguments so far left open carries the
+                    // bytes that closed it, the model's quote, closing tag or token: a closing
+                    // quote with no byte of the output behind it (none, or whitespace alone) is
+                    // one the reader made up for a value the model never closed.
+                    breach(
+                        "made-up-quote",
+                        !closes_an_open_string(so_far, json) || !source.text.trim().is_empty(),
+                        || {
+                            format!(
+                                "{}: the fragment {json:?} closes a string with no byte of the output behind it",
+                                place()
+                            )
+                        },
+                    );
+                    // A member under an empty key is the model's to write (`{"": 1}` in a JSON
+                    // syntax: the source carries the key's quotes); a reader that spells one for
+                    // a key the model left out made the key up, whether it writes the key as a
+                    // fragment of its own or opens the member with it (`{"": "`, `, "": 1`).
+                    let member = json
+                        .strip_prefix('{')
+                        .or_else(|| json.strip_prefix(", "))
+                        .unwrap_or(json);
+                    breach(
+                        "empty-key-member",
+                        !(member.starts_with("\"\": ") && !source.text.contains("\"\"")),
+                        || {
+                            format!(
+                                "{}: the fragment {json:?} writes a member under an empty key the output did not write",
+                                place()
+                            )
+                        },
+                    );
+                    // An empty string no byte of the output wrote: the reader quoted an empty bare
+                    // value where the model left one out before a comma or a close, as a
+                    // fragment of its own or at the end of a whole member (`, "city": ""`).
+                    breach(
+                        "made-up-empty-string",
+                        !made_up_empty_string(json, &source.text),
+                        || {
+                            format!(
+                                "{}: the fragment {json:?} writes an empty string with no byte of the output behind it",
+                                place()
+                            )
+                        },
+                    );
                     so_far.push_str(json);
                     breach("json-prefix", valid_json_prefix(so_far), || {
                         format!(
@@ -1082,6 +1192,178 @@ mod tests {
             finish(1),
         ]);
         assert_eq!(breach_in(Table::Qwen3Tagged, whole), None);
+    }
+
+    #[test]
+    fn a_quote_that_closes_a_value_carries_a_byte_of_the_output() {
+        // The arguments so far leave a string open; a closing quote with no source behind it is
+        // the reader's, one with the closing tag behind it is the model's.
+        let open = || {
+            vec![
+                start(0),
+                arguments(0, "{\"city\": \"Par", "{\"city\": \"Par"),
+            ]
+        };
+        for source in ["", "\n"] {
+            let mut made_up = open();
+            made_up.extend([arguments(0, "\"}", source), end(0, ""), finish(1)]);
+            assert_eq!(
+                breach_in(Table::Qwen3Tagged, made_up).as_deref(),
+                Some("made-up-quote"),
+                "source {source:?}"
+            );
+        }
+        let mut closed = open();
+        closed.extend([
+            arguments(0, "\"}", "</parameter>\n</function>"),
+            end(0, "</tool_call>"),
+            finish(1),
+        ]);
+        assert_eq!(breach_in(Table::Qwen3Tagged, closed), None);
+        assert!(closes_an_open_string("{\"a\": \"x", "\""));
+        assert!(closes_an_open_string("{\"a\": \"x\\\"", "y\""));
+        assert!(!closes_an_open_string("{\"a\": \"x\"", "}"));
+        assert!(!closes_an_open_string("{\"a\": \"x", "\\\""));
+    }
+
+    #[test]
+    fn a_member_under_an_empty_key_is_the_models_or_a_breach() {
+        // The JSON syntaxes' own `{"": "Paris"}`: the fragment's source carries the key's quotes.
+        let models = vec![
+            start(0),
+            arguments(0, "{", "{"),
+            arguments(0, "\"\": ", "\"\": "),
+            arguments(0, "\"Paris\"}", "\"Paris\"}"),
+            end(0, "</tool_call>"),
+            finish(1),
+        ];
+        assert_eq!(breach_in(Table::Qwen3, models), None);
+        let whole = vec![
+            start(0),
+            arguments(0, "{\"\": \"Paris\"}", "{\"\": \"Paris\"}"),
+            end(0, "</tool_call>"),
+            finish(1),
+        ];
+        assert_eq!(breach_in(Table::Qwen3, whole), None);
+        // A reader that spells the member for a key-less value: the source has no quotes,
+        // whether the key comes as a fragment of its own or opens the member.
+        for (json, source) in [
+            ("\"\": ", ":"),
+            ("\"\": ", "<parameter=>"),
+            ("\"\": ", ""),
+            ("{\"\": \"", "<parameter=>"),
+            (", \"\": 1", "<arg_key></arg_key><arg_value>1</arg_value>"),
+        ] {
+            let readers = vec![
+                start(0),
+                arguments(0, "{\"a\": 1", "{\"a\": 1"),
+                arguments(0, json, source),
+                arguments(0, "}", "}"),
+                end(0, ""),
+                finish(1),
+            ];
+            assert_eq!(
+                breach_in(Table::Gemma4, readers).as_deref(),
+                Some("empty-key-member"),
+                "fragment {json:?} with source {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_string_carries_a_byte_of_the_output() {
+        // A value the model left out: the lone fragment with nothing behind it, a list's first
+        // item alike, or a whole member whose source holds the key and its separator alone (the
+        // pythonic reader's `city=`); the model's own empty value leaves its quotes or its tags.
+        let first = || {
+            vec![
+                start(0),
+                arguments(0, "{\"city\": \"Paris\"", "city='Paris'"),
+            ]
+        };
+        for (json, source) in [
+            (", \"days\": \"\"", ", days="),
+            (", \"days\": \"\"", "days:"),
+            (", \"days\": \"\"", "\n"),
+        ] {
+            let mut made_up = first();
+            made_up.extend([
+                arguments(0, json, source),
+                arguments(0, "}", ""),
+                end(0, ")"),
+                finish(1),
+            ]);
+            assert_eq!(
+                breach_in(Table::Lfm2_5, made_up).as_deref(),
+                Some("made-up-empty-string"),
+                "fragment {json:?} with source {source:?}"
+            );
+        }
+        for (json, source) in [
+            (", \"days\": \"\"", ", days=\"\""),
+            (", \"days\": \"\"", ", days=''"),
+            (", \"days\": \"\"", "\n<parameter=days>\n</parameter>"),
+            (
+                ", \"days\": \"\"",
+                "<arg_key>days</arg_key><arg_value></arg_value>",
+            ),
+            (", \"days\": \"\"", ", \"days\": \"\""),
+        ] {
+            let mut written = first();
+            written.extend([
+                arguments(0, json, source),
+                arguments(0, "}", ")"),
+                end(0, "]"),
+                finish(1),
+            ]);
+            assert_eq!(
+                breach_in(Table::Lfm2_5, written),
+                None,
+                "fragment {json:?} with source {source:?}"
+            );
+        }
+        for (before, json, source, close) in [
+            ("{\"city\": ", "\"\"", "", "}"),
+            ("{\"city\": ", "\"\"", " ", "}"),
+            ("{\"tags\": ", "[\"\"", "", "]}"),
+        ] {
+            let lone = vec![
+                start(0),
+                arguments(0, before, before),
+                arguments(0, json, source),
+                arguments(0, close, close),
+                end(0, ""),
+                finish(1),
+            ];
+            assert_eq!(
+                breach_in(Table::Gemma4, lone).as_deref(),
+                Some("made-up-empty-string"),
+                "fragment {json:?} with source {source:?}"
+            );
+        }
+        let written = vec![
+            start(0),
+            arguments(0, "{\"city\": ", "{\"city\": "),
+            arguments(0, "\"\"", "</parameter>"),
+            arguments(0, "}", "</function>"),
+            end(0, "</tool_call>"),
+            finish(1),
+        ];
+        assert_eq!(breach_in(Table::Qwen3Tagged, written), None);
+        assert!(made_up_empty_string("{\"city\": \"\"", "city="));
+        assert!(!made_up_empty_string("{\"city\": \"\"", "city=\"\""));
+        assert!(!made_up_empty_string("{\"city\": \"x\"", ""));
+    }
+
+    #[test]
+    fn the_json_syntaxes_own_empty_key_holds_in_pieces() -> Result<(), String> {
+        // The seed a first draft of the empty-key check flagged: the model's own member.
+        let output = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"\": \"Paris\"}}\n</tool_call>";
+        let data = encode(Table::Qwen3, "", output)?;
+        let case = decode(&data, Some(Table::Qwen3));
+        assert!(!case.cuts.is_empty());
+        check(&case);
+        Ok(())
     }
 
     #[test]
