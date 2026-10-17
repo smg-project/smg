@@ -9,7 +9,7 @@ use std::collections::HashSet;
 
 use crate::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent, ThinkingType},
-    common::Tool,
+    common::{invalid, Tool},
     ext::kimi::DeclaredTools,
 };
 
@@ -133,14 +133,14 @@ fn validate_message_tools(req: &ChatCompletionRequest) -> Result<(), validator::
         for (j, tool) in tools.iter().enumerate() {
             let at = || format!("messages[{i}].tools[{j}]");
             if tool.tool_type != "function" {
-                return Err(error(
+                return Err(invalid(
                     "tool_type_unsupported",
                     format!("{}: tool type must be 'function'", at()),
                 ));
             }
             let name = tool.function.name.as_str();
             if !is_valid_tool_name(name) {
-                return Err(error(
+                return Err(invalid(
                     "tool_name_invalid",
                     format!(
                         "{}: tool name must match [A-Za-z_][A-Za-z0-9_]* and be at most {MAX_TOOL_NAME_LEN} characters",
@@ -149,7 +149,7 @@ fn validate_message_tools(req: &ChatCompletionRequest) -> Result<(), validator::
                 ));
             }
             if !seen.insert(name) {
-                return Err(error(
+                return Err(invalid(
                     "tool_name_duplicate",
                     format!("{}: duplicate tool name '{name}'", at()),
                 ));
@@ -177,16 +177,10 @@ fn is_valid_tool_name(name: &str) -> bool {
 }
 
 fn on_role(code: &'static str, role: &str, rule: &str) -> validator::ValidationError {
-    error(
+    invalid(
         code,
         format!("'tools' on a message with role '{role}' {rule}"),
     )
-}
-
-fn error(code: &'static str, message: String) -> validator::ValidationError {
-    let mut e = validator::ValidationError::new(code);
-    e.message = Some(message.into());
-    e
 }
 
 /// Whether a model id names Kimi K3, the only Kimi model with pinned sampling and thinking rules.
@@ -263,7 +257,8 @@ fn approx_eq(a: f32, b: f32) -> bool {
 }
 
 fn pinned(code: &'static str, field: &str, allowed: &str) -> validator::ValidationError {
-    let mut e = validator::ValidationError::new(code);
-    e.message = Some(format!("invalid {field}: only {allowed} is allowed for this model").into());
-    e
+    invalid(
+        code,
+        format!("invalid {field}: only {allowed} is allowed for this model"),
+    )
 }

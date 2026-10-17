@@ -8,7 +8,7 @@ use super::{
     common::*,
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
-use crate::validated::Normalizable;
+use crate::{common::invalid, validated::Normalizable};
 
 // ============================================================================
 // Completions API (v1/completions) - DEPRECATED but still supported
@@ -157,9 +157,7 @@ fn validate_completion_prompt(prompt: &StringOrArray) -> Result<(), validator::V
         StringOrArray::String(_) => {}
         StringOrArray::Array(arr) => {
             if arr.is_empty() {
-                let mut error = validator::ValidationError::new("prompt_empty");
-                error.message = Some("prompt array cannot be empty".into());
-                return Err(error);
+                return Err(invalid("prompt_empty", "prompt array cannot be empty"));
             }
         }
     }
@@ -171,43 +169,44 @@ fn validate_completion_cross_parameters(
     req: &CompletionRequest,
 ) -> Result<(), validator::ValidationError> {
     if req.stream_options.is_some() && !req.stream {
-        let mut error = validator::ValidationError::new("stream_options_requires_stream");
-        error.message =
-            Some("The 'stream_options' parameter is only allowed when 'stream' is enabled".into());
-        return Err(error);
+        return Err(invalid(
+            "stream_options_requires_stream",
+            "The 'stream_options' parameter is only allowed when 'stream' is enabled",
+        ));
     }
 
     if let (Some(min), Some(max)) = (req.min_tokens, req.max_tokens) {
         if min > max {
-            let mut error = validator::ValidationError::new("min_tokens_exceeds_max");
-            error.message = Some("min_tokens cannot exceed max_tokens".into());
-            return Err(error);
+            return Err(invalid(
+                "min_tokens_exceeds_max",
+                "min_tokens cannot exceed max_tokens",
+            ));
         }
     }
 
     let constraint_count =
         req.regex.is_some() as u8 + req.ebnf.is_some() as u8 + req.json_schema.is_some() as u8;
     if constraint_count > 1 {
-        let mut error = validator::ValidationError::new("multiple_constraints");
-        error.message = Some(
-            "only one structured output constraint (regex, ebnf, or json_schema) can be active at a time"
-                .into(),
-        );
-        return Err(error);
+        return Err(invalid(
+            "multiple_constraints",
+            "only one structured output constraint (regex, ebnf, or json_schema) can be active at a time",
+        ));
     }
 
     if let (Some(best_of), Some(n)) = (req.best_of, req.n) {
         if best_of <= n {
-            let mut error = validator::ValidationError::new("best_of_less_than_n");
-            error.message = Some("best_of must be greater than n".into());
-            return Err(error);
+            return Err(invalid(
+                "best_of_less_than_n",
+                "best_of must be greater than n",
+            ));
         }
     }
 
     if req.stream && req.best_of.is_some() {
-        let mut error = validator::ValidationError::new("best_of_not_supported_with_stream");
-        error.message = Some("best_of is not supported when stream is enabled".into());
-        return Err(error);
+        return Err(invalid(
+            "best_of_not_supported_with_stream",
+            "best_of is not supported when stream is enabled",
+        ));
     }
 
     Ok(())

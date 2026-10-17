@@ -27,7 +27,7 @@ use std::{
 
 use crate::{
     chat::{thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessage},
-    common::Tool,
+    common::{invalid, Tool},
     ext::retain_if,
 };
 
@@ -417,9 +417,7 @@ fn reject_root(req: &ChatCompletionRequest) -> Result<(), validator::ValidationE
         .iter()
         .any(|m| matches!(m, ChatMessage::Root { .. }))
     {
-        let mut e = validator::ValidationError::new("invalid_role");
-        e.message = Some("invalid role: root".into());
-        return Err(e);
+        return Err(invalid("invalid_role", "invalid role: root"));
     }
     Ok(())
 }

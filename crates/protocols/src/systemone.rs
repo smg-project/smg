@@ -9,9 +9,12 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use validator::{Validate, ValidationError, ValidationErrors};
+use validator::{Validate, ValidationErrors};
 
-use crate::{common::GenerationRequest, validated::Normalizable};
+use crate::{
+    common::{invalid, GenerationRequest},
+    validated::Normalizable,
+};
 
 /// Text or structured JSON used as state, instructions, or a criterion.
 ///
@@ -137,18 +140,21 @@ impl Validate for SystemOneRequest {
     fn validate(&self) -> Result<(), ValidationErrors> {
         let mut errors = ValidationErrors::new();
         if self.questions.is_empty() {
-            let mut error = ValidationError::new("length");
-            error.message = Some("at least one question is required".into());
-            errors.add("questions", error);
+            errors.add(
+                "questions",
+                invalid("length", "at least one question is required"),
+            );
         }
         for (name, question) in &self.questions {
             if let SystemOneQuestion::Score { criteria, .. } = question {
                 if criteria.is_empty() {
-                    let mut error = ValidationError::new("length");
-                    error.message = Some(
-                        format!("question {name:?} requires at least one score criterion").into(),
+                    errors.add(
+                        "questions",
+                        invalid(
+                            "length",
+                            format!("question {name:?} requires at least one score criterion"),
+                        ),
                     );
-                    errors.add("questions", error);
                 }
             }
         }

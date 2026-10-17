@@ -587,25 +587,27 @@ fn validate_chat_cross_parameters(
 ) -> Result<(), validator::ValidationError> {
     // 1. Validate logprobs dependency
     if req.top_logprobs.is_some() && !req.logprobs {
-        let mut e = validator::ValidationError::new("top_logprobs_requires_logprobs");
-        e.message = Some("top_logprobs is only allowed when logprobs is enabled".into());
-        return Err(e);
+        return Err(invalid(
+            "top_logprobs_requires_logprobs",
+            "top_logprobs is only allowed when logprobs is enabled",
+        ));
     }
 
     // 2. Validate stream_options dependency
     if req.stream_options.is_some() && !req.stream {
-        let mut e = validator::ValidationError::new("stream_options_requires_stream");
-        e.message =
-            Some("The 'stream_options' parameter is only allowed when 'stream' is enabled".into());
-        return Err(e);
+        return Err(invalid(
+            "stream_options_requires_stream",
+            "The 'stream_options' parameter is only allowed when 'stream' is enabled",
+        ));
     }
 
     // 3. Validate token limits - min <= max
     if let (Some(min), Some(max)) = (req.min_tokens, req.output_token_cap()) {
         if min > max {
-            let mut e = validator::ValidationError::new("min_tokens_exceeds_max");
-            e.message = Some("min_tokens cannot exceed max_tokens/max_completion_tokens".into());
-            return Err(e);
+            return Err(invalid(
+                "min_tokens_exceeds_max",
+                "min_tokens cannot exceed max_tokens/max_completion_tokens",
+            ));
         }
     }
 
@@ -616,15 +618,17 @@ fn validate_chat_cross_parameters(
     );
 
     if has_json_format && req.regex.is_some() {
-        let mut e = validator::ValidationError::new("regex_conflicts_with_json");
-        e.message = Some("cannot use regex constraint with JSON response format".into());
-        return Err(e);
+        return Err(invalid(
+            "regex_conflicts_with_json",
+            "cannot use regex constraint with JSON response format",
+        ));
     }
 
     if has_json_format && req.ebnf.is_some() {
-        let mut e = validator::ValidationError::new("ebnf_conflicts_with_json");
-        e.message = Some("cannot use EBNF constraint with JSON response format".into());
-        return Err(e);
+        return Err(invalid(
+            "ebnf_conflicts_with_json",
+            "cannot use EBNF constraint with JSON response format",
+        ));
     }
 
     // 5. Validate mutually exclusive structured output constraints
@@ -638,9 +642,10 @@ fn validate_chat_cross_parameters(
     .count();
 
     if constraint_count > 1 {
-        let mut e = validator::ValidationError::new("multiple_constraints");
-        e.message = Some("only one structured output constraint (regex, ebnf, or json_schema) can be active at a time".into());
-        return Err(e);
+        return Err(invalid(
+            "multiple_constraints",
+            "only one structured output constraint (regex, ebnf, or json_schema) can be active at a time",
+        ));
     }
 
     // 6. Validate response format JSON schema name and shape
@@ -648,105 +653,9 @@ fn validate_chat_cross_parameters(
         validate_json_schema_shape(&json_schema.name, &json_schema.schema)?;
     }
 
-    // 7. Validate tool_choice requires tools — except "none" and "auto", which are valid without tools
-    if let Some(ref tool_choice) = req.tool_choice {
-        // The effective tool set: request-level tools plus the dynamic tools
-        // declared on system and developer messages (Kimi K3). Both the
-        // "are there tools" decision and the named-choice checks below use
-        // it, so a name is resolved against everything the model will see.
-        // Lazy on purpose: most tool traffic only needs the emptiness check.
-        let effective_tools = || req.effective_tools();
-        let has_tools = effective_tools().next().is_some();
-
-        let requires_tools = !matches!(
-            tool_choice,
-            ToolChoice::Value(ToolChoiceValue::None) | ToolChoice::Value(ToolChoiceValue::Auto)
-        );
-
-        if requires_tools && !has_tools {
-            let mut e = validator::ValidationError::new("tool_choice_requires_tools");
-            e.message = Some("Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.".into());
-            return Err(e);
-        }
-
-        // Additional validation when tools are present
-        if has_tools {
-            match tool_choice {
-                ToolChoice::Function { function, .. } => {
-                    // Validate that the specified function name exists in tools
-                    let function_exists = effective_tools().any(|tool| {
-                        tool.tool_type == "function" && tool.function.name == function.name
-                    });
-
-                    if !function_exists {
-                        let mut e =
-                            validator::ValidationError::new("tool_choice_function_not_found");
-                        e.message = Some(
-                            format!(
-                            "Invalid value for 'tool_choice': function '{}' not found in 'tools'.",
-                            function.name
-                        )
-                            .into(),
-                        );
-                        return Err(e);
-                    }
-                }
-                ToolChoice::AllowedTools {
-                    mode,
-                    tools: allowed_tools,
-                    ..
-                } => {
-                    // Validate mode is "auto" or "required"
-                    if mode != "auto" && mode != "required" {
-                        let mut e = validator::ValidationError::new("tool_choice_invalid_mode");
-                        e.message = Some(format!(
-                            "Invalid value for 'tool_choice.mode': must be 'auto' or 'required', got '{mode}'."
-                        ).into());
-                        return Err(e);
-                    }
-
-                    // Validate that all ToolReferences are Function type (Chat API only supports function tools)
-                    for tool_ref in allowed_tools {
-                        match tool_ref {
-                            ToolReference::Function { name } => {
-                                // Validate that the function exists in tools array
-                                let tool_exists = effective_tools().any(|tool| {
-                                    tool.tool_type == "function" && tool.function.name == *name
-                                });
-
-                                if !tool_exists {
-                                    let mut e = validator::ValidationError::new(
-                                        "tool_choice_tool_not_found",
-                                    );
-                                    e.message = Some(
-                                        format!(
-                                            "Invalid value for 'tool_choice.tools': tool '{name}' not found in 'tools'."
-                                        )
-                                        .into(),
-                                    );
-                                    return Err(e);
-                                }
-                            }
-                            _ => {
-                                // Chat Completion API only supports function tools in tool_choice
-                                let mut e = validator::ValidationError::new(
-                                    "tool_choice_invalid_tool_type",
-                                );
-                                e.message = Some(
-                                    format!(
-                                        "Invalid value for 'tool_choice.tools': Chat Completion API only supports function tools, got '{}'.",
-                                        tool_ref.identifier()
-                                    )
-                                    .into(),
-                                );
-                                return Err(e);
-                            }
-                        }
-                    }
-                }
-                ToolChoice::Value(_) => {}
-            }
-        }
+    // 7. A tool_choice against the tools the model will see
+    if let Some(tool_choice) = &req.tool_choice {
+        validate_tool_choice(req, tool_choice)?;
     }
 
     // 8. A function's `parameters` is a JSON Schema object (null was already
@@ -789,6 +698,69 @@ fn validate_chat_cross_parameters(
     ProviderProfile::for_model(&req.model).validate_chat(req)?;
 
     Ok(())
+}
+
+/// A `tool_choice` against the tools the model will see: the request's tools
+/// plus the dynamic tools its system and developer messages declare. Only
+/// `none` and `auto` are allowed without tools; a named function must be
+/// declared; an allowed-tools choice names a mode and function tools only,
+/// each declared.
+fn validate_tool_choice(
+    req: &ChatCompletionRequest,
+    tool_choice: &ToolChoice,
+) -> Result<(), validator::ValidationError> {
+    // Lazy on purpose: most tool traffic only needs the emptiness check.
+    let effective_tools = || req.effective_tools();
+    let has_tools = effective_tools().next().is_some();
+    let requires_tools = !matches!(
+        tool_choice,
+        ToolChoice::Value(ToolChoiceValue::None | ToolChoiceValue::Auto)
+    );
+    if requires_tools && !has_tools {
+        return Err(invalid(
+            "tool_choice_requires_tools",
+            "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.",
+        ));
+    }
+    if !has_tools {
+        return Ok(());
+    }
+    let declared = |name: &str| {
+        effective_tools().any(|tool| tool.tool_type == "function" && tool.function.name == name)
+    };
+    match tool_choice {
+        ToolChoice::Function { function, .. } if !declared(&function.name) => Err(invalid(
+            "tool_choice_function_not_found",
+            format!(
+                "Invalid value for 'tool_choice': function '{}' not found in 'tools'.",
+                function.name
+            ),
+        )),
+        ToolChoice::AllowedTools { mode, .. } if mode != "auto" && mode != "required" => {
+            Err(invalid(
+                "tool_choice_invalid_mode",
+                format!(
+                    "Invalid value for 'tool_choice.mode': must be 'auto' or 'required', got '{mode}'."
+                ),
+            ))
+        }
+        // The Chat Completions API takes function tools only in an allowed-tools choice.
+        ToolChoice::AllowedTools { tools, .. } => tools.iter().try_for_each(|tool_ref| match tool_ref {
+            ToolReference::Function { name } if !declared(name) => Err(invalid(
+                "tool_choice_tool_not_found",
+                format!("Invalid value for 'tool_choice.tools': tool '{name}' not found in 'tools'."),
+            )),
+            ToolReference::Function { .. } => Ok(()),
+            _ => Err(invalid(
+                "tool_choice_invalid_tool_type",
+                format!(
+                    "Invalid value for 'tool_choice.tools': Chat Completion API only supports function tools, got '{}'.",
+                    tool_ref.identifier()
+                ),
+            )),
+        }),
+        ToolChoice::Function { .. } | ToolChoice::Value(_) => Ok(()),
+    }
 }
 
 /// The JSON type of a value, for error messages (`a string`, `an array`, ...).
@@ -1746,5 +1718,97 @@ mod request_contract_tests {
         let legacy = request(json!({"max_tokens": 32, "max_completion_tokens": null}));
         assert_eq!(rejection(&legacy), None);
         assert_eq!(legacy.output_token_cap(), Some(32));
+    }
+}
+
+#[cfg(test)]
+mod tool_choice_tests {
+    use serde_json::{json, Value};
+
+    use super::{validate_tool_choice, ChatCompletionRequest};
+
+    fn request(tools: Value, tool_choice: Value) -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools,
+            "tool_choice": tool_choice,
+        }))
+        .expect("a chat request")
+    }
+
+    /// The code the choice is refused with, or `None` when it passes.
+    fn verdict(tools: Value, tool_choice: Value) -> Option<String> {
+        let req = request(tools, tool_choice);
+        let choice = req.tool_choice.as_ref().expect("a tool choice");
+        validate_tool_choice(&req, choice)
+            .err()
+            .map(|e| e.code.into_owned())
+    }
+
+    fn weather_tool() -> Value {
+        json!([{
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}},
+        }])
+    }
+
+    #[test]
+    fn without_tools_only_none_and_auto_pass() {
+        assert_eq!(verdict(json!([]), json!("none")), None);
+        assert_eq!(verdict(json!([]), json!("auto")), None);
+        assert_eq!(
+            verdict(json!([]), json!("required")),
+            Some("tool_choice_requires_tools".to_string())
+        );
+        assert_eq!(
+            verdict(
+                json!([]),
+                json!({"type": "function", "function": {"name": "get_weather"}})
+            ),
+            Some("tool_choice_requires_tools".to_string())
+        );
+    }
+
+    #[test]
+    fn each_kind_of_choice_is_judged_against_the_declared_tools() {
+        let cases = [
+            (json!("required"), None),
+            (
+                json!({"type": "function", "function": {"name": "get_weather"}}),
+                None,
+            ),
+            (
+                json!({"type": "function", "function": {"name": "get_time"}}),
+                Some("tool_choice_function_not_found"),
+            ),
+            (
+                json!({"type": "allowed_tools", "mode": "auto",
+                       "tools": [{"type": "function", "name": "get_weather"}]}),
+                None,
+            ),
+            (
+                json!({"type": "allowed_tools", "mode": "sometimes",
+                       "tools": [{"type": "function", "name": "get_weather"}]}),
+                Some("tool_choice_invalid_mode"),
+            ),
+            (
+                json!({"type": "allowed_tools", "mode": "required",
+                       "tools": [{"type": "function", "name": "get_time"}]}),
+                Some("tool_choice_tool_not_found"),
+            ),
+            (
+                json!({"type": "allowed_tools", "mode": "required",
+                       "tools": [{"type": "mcp", "server_label": "docs"}]}),
+                Some("tool_choice_invalid_tool_type"),
+            ),
+        ];
+        for (tool_choice, code) in cases {
+            assert_eq!(
+                verdict(weather_tool(), tool_choice.clone()),
+                code.map(str::to_string),
+                "{tool_choice}"
+            );
+        }
     }
 }

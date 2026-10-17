@@ -18,7 +18,8 @@ use super::{
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
 use crate::{
-    builders::ResponsesResponseBuilder, profile::is_openai_vendor_model, validated::Normalizable,
+    builders::ResponsesResponseBuilder, common::invalid, profile::is_openai_vendor_model,
+    validated::Normalizable,
 };
 
 // ============================================================================
@@ -3467,11 +3468,12 @@ impl GenerationRequest for ResponsesRequest {
 pub fn validate_conversation_id(conv: &ConversationRef) -> Result<(), ValidationError> {
     let conv_id = conv.as_id();
     if !conv_id.starts_with("conv_") {
-        let mut error = ValidationError::new("invalid_conversation_id");
-        error.message = Some(std::borrow::Cow::Owned(format!(
-            "Invalid 'conversation': '{conv_id}'. Expected an ID that begins with 'conv_'."
-        )));
-        return Err(error);
+        return Err(invalid(
+            "invalid_conversation_id",
+            format!(
+                "Invalid 'conversation': '{conv_id}'. Expected an ID that begins with 'conv_'."
+            ),
+        ));
     }
 
     // Check if the conversation ID contains only valid characters
@@ -3480,11 +3482,12 @@ pub fn validate_conversation_id(conv: &ConversationRef) -> Result<(), Validation
         .all(|c| c.is_alphanumeric() || c == '_' || c == '-');
 
     if !is_valid {
-        let mut error = ValidationError::new("invalid_conversation_id");
-        error.message = Some(std::borrow::Cow::Owned(format!(
-            "Invalid 'conversation': '{conv_id}'. Expected an ID that contains letters, numbers, underscores, or dashes, but this value contained additional characters."
-        )));
-        return Err(error);
+        return Err(invalid(
+            "invalid_conversation_id",
+            format!(
+                "Invalid 'conversation': '{conv_id}'. Expected an ID that contains letters, numbers, underscores, or dashes, but this value contained additional characters."
+            ),
+        ));
     }
     Ok(())
 }
@@ -3503,9 +3506,10 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
 
     // Check if tool_choice requires tools but none are provided
     if is_some_choice && !has_tools {
-        let mut e = ValidationError::new("tool_choice_requires_tools");
-        e.message = Some("Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.".into());
-        return Err(e);
+        return Err(invalid(
+            "tool_choice_requires_tools",
+            "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.",
+        ));
     }
 
     // Validate tool references exist when tools are present
@@ -3543,14 +3547,12 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
                     _ => false,
                 });
                 if !found {
-                    let mut e = ValidationError::new("tool_choice_function_not_found");
-                    e.message = Some(
+                    return Err(invalid(
+                        "tool_choice_function_not_found",
                         format!(
-                            "Invalid value for 'tool_choice': function '{name}' not found in 'tools'.",
-                        )
-                        .into(),
-                    );
-                    return Err(e);
+                            "Invalid value for 'tool_choice': function '{name}' not found in 'tools'."
+                        ),
+                    ));
                 }
             }
         }
@@ -3561,28 +3563,24 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
         } => {
             // Validate mode is "auto" or "required"
             if mode != "auto" && mode != "required" {
-                let mut e = ValidationError::new("tool_choice_invalid_mode");
-                e.message = Some(
+                return Err(invalid(
+                    "tool_choice_invalid_mode",
                     format!(
                         "Invalid value for 'tool_choice.mode': must be 'auto' or 'required', got '{mode}'."
-                    )
-                    .into(),
-                );
-                return Err(e);
+                    ),
+                ));
             }
 
             // Validate that all function tool references exist
             for tool_ref in allowed_tools {
                 if let ToolReference::Function { name } = tool_ref {
                     if !function_tool_names.contains(&name.as_str()) {
-                        let mut e = ValidationError::new("tool_choice_tool_not_found");
-                        e.message = Some(
+                        return Err(invalid(
+                            "tool_choice_tool_not_found",
                             format!(
                                 "Invalid value for 'tool_choice.tools': tool '{name}' not found in 'tools'."
-                            )
-                            .into(),
-                        );
-                        return Err(e);
+                            ),
+                        ));
                     }
                 }
                 // Note: MCP and hosted tools don't need existence validation here
@@ -3614,9 +3612,10 @@ fn validate_responses_cross_parameters(request: &ResponsesRequest) -> Result<(),
 
     // 3. Validate conversation and previous_response_id are mutually exclusive
     if request.conversation.is_some() && request.previous_response_id.is_some() {
-        let mut e = ValidationError::new("mutually_exclusive_parameters");
-        e.message = Some("Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.".into());
-        return Err(e);
+        return Err(invalid(
+            "mutually_exclusive_parameters",
+            "Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.",
+        ));
     }
 
     // 4. The public OpenAI API's rules on request content beyond the schema
@@ -3651,15 +3650,13 @@ fn validate_openai_structured_output_rules(
         let function = &function_tool.function;
         if function.strict == Some(true) {
             if let Some(path) = strict_schema_missing_additional_properties(&function.parameters) {
-                let mut e = ValidationError::new("invalid_function_parameters");
-                e.message = Some(
+                return Err(invalid(
+                    "invalid_function_parameters",
                     format!(
                         "Invalid schema for function '{}': In context={path}, 'additionalProperties' is required to be supplied and to be false.",
                         function.name
-                    )
-                    .into(),
-                );
-                return Err(e);
+                    ),
+                ));
             }
         }
     }
@@ -3672,23 +3669,19 @@ fn validate_openai_structured_output_rules(
             ..
         }) => {
             if let Some(path) = strict_schema_missing_additional_properties(schema) {
-                let mut e = ValidationError::new("invalid_json_schema");
-                e.message = Some(
+                return Err(invalid(
+                    "invalid_json_schema",
                     format!(
                         "Invalid schema for response_format '{name}': In context={path}, 'additionalProperties' is required to be supplied and to be false."
-                    )
-                    .into(),
-                );
-                return Err(e);
+                    ),
+                ));
             }
         }
         Some(TextFormat::JsonObject) if !request_mentions_json(request) => {
-            let mut e = ValidationError::new("json_object_requires_json_in_input");
-            e.message = Some(
-                "Response input messages must contain the word 'json' in some form to use 'text.format' of type 'json_object'."
-                    .into(),
-            );
-            return Err(e);
+            return Err(invalid(
+                "json_object_requires_json_in_input",
+                "Response input messages must contain the word 'json' in some form to use 'text.format' of type 'json_object'.",
+            ));
         }
         _ => {}
     }
@@ -3727,39 +3720,33 @@ const MAX_METADATA_VALUE_CHARS: usize = 512;
 
 fn validate_metadata(metadata: &HashMap<String, Value>) -> Result<(), ValidationError> {
     if metadata.len() > MAX_METADATA_PAIRS {
-        let mut e = ValidationError::new("object_above_max_properties");
-        e.message = Some(
+        return Err(invalid(
+            "object_above_max_properties",
             format!(
                 "Invalid 'metadata': too many properties. The object has {} properties, but the maximum is {MAX_METADATA_PAIRS}.",
                 metadata.len()
-            )
-            .into(),
-        );
-        return Err(e);
+            ),
+        ));
     }
     for (key, value) in metadata {
         if key.chars().count() > MAX_METADATA_KEY_CHARS {
-            let mut e = ValidationError::new("string_above_max_length");
-            e.message = Some(
+            return Err(invalid(
+                "string_above_max_length",
                 format!(
                     "Invalid 'metadata': a key is too long. Expected a key with a maximum length of {MAX_METADATA_KEY_CHARS}, but got one of {} characters instead.",
                     key.chars().count()
-                )
-                .into(),
-            );
-            return Err(e);
+                ),
+            ));
         }
         if let Some(text) = value.as_str() {
             if text.chars().count() > MAX_METADATA_VALUE_CHARS {
-                let mut e = ValidationError::new("string_above_max_length");
-                e.message = Some(
+                return Err(invalid(
+                    "string_above_max_length",
                     format!(
                         "Invalid 'metadata.{key}': string too long. Expected a string with maximum length {MAX_METADATA_VALUE_CHARS}, but got a string with length {} instead.",
                         text.chars().count()
-                    )
-                    .into(),
-                );
-                return Err(e);
+                    ),
+                ));
             }
         }
     }
@@ -3773,14 +3760,12 @@ fn validate_input_message_role(role: &str) -> Result<(), ValidationError> {
     if INPUT_MESSAGE_ROLES.contains(&role) {
         return Ok(());
     }
-    let mut e = ValidationError::new("invalid_value");
-    e.message = Some(
+    Err(invalid(
+        "invalid_value",
         format!(
             "Invalid value: '{role}'. Supported values are: 'assistant', 'system', 'developer', and 'user'."
-        )
-        .into(),
-    );
-    Err(e)
+        ),
+    ))
 }
 
 // ============================================================================
@@ -3792,16 +3777,12 @@ fn validate_response_input(input: &ResponseInput) -> Result<(), ValidationError>
     match input {
         ResponseInput::Text(text) => {
             if text.is_empty() {
-                let mut e = ValidationError::new("input_text_empty");
-                e.message = Some("Input text cannot be empty".into());
-                return Err(e);
+                return Err(invalid("input_text_empty", "Input text cannot be empty"));
             }
         }
         ResponseInput::Items(items) => {
             if items.is_empty() {
-                let mut e = ValidationError::new("input_items_empty");
-                e.message = Some("Input items cannot be empty".into());
-                return Err(e);
+                return Err(invalid("input_items_empty", "Input items cannot be empty"));
             }
             // Validate each item has valid content
             for item in items {
@@ -3818,23 +3799,26 @@ fn validate_input_item(item: &ResponseInputOutputItem) -> Result<(), ValidationE
         ResponseInputOutputItem::Message { content, role, .. } => {
             validate_input_message_role(role)?;
             if content.is_empty() {
-                let mut e = ValidationError::new("message_content_empty");
-                e.message = Some("Message content cannot be empty".into());
-                return Err(e);
+                return Err(invalid(
+                    "message_content_empty",
+                    "Message content cannot be empty",
+                ));
             }
         }
         ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
             validate_input_message_role(role)?;
             match content {
                 StringOrContentParts::String(s) if s.is_empty() => {
-                    let mut e = ValidationError::new("message_content_empty");
-                    e.message = Some("Message content cannot be empty".into());
-                    return Err(e);
+                    return Err(invalid(
+                        "message_content_empty",
+                        "Message content cannot be empty",
+                    ));
                 }
                 StringOrContentParts::Array(parts) if parts.is_empty() => {
-                    let mut e = ValidationError::new("message_content_empty");
-                    e.message = Some("Message content parts cannot be empty".into());
-                    return Err(e);
+                    return Err(invalid(
+                        "message_content_empty",
+                        "Message content parts cannot be empty",
+                    ));
                 }
                 _ => {}
             }
@@ -3857,14 +3841,16 @@ fn validate_input_item(item: &ResponseInputOutputItem) -> Result<(), ValidationE
         ResponseInputOutputItem::CustomToolCall { .. } => {}
         ResponseInputOutputItem::CustomToolCallOutput { output, .. } => match output {
             CustomToolCallOutputContent::Text(s) if s.is_empty() => {
-                let mut e = ValidationError::new("custom_tool_call_output_empty");
-                e.message = Some("Custom tool call output cannot be empty".into());
-                return Err(e);
+                return Err(invalid(
+                    "custom_tool_call_output_empty",
+                    "Custom tool call output cannot be empty",
+                ));
             }
             CustomToolCallOutputContent::Parts(parts) if parts.is_empty() => {
-                let mut e = ValidationError::new("custom_tool_call_output_empty");
-                e.message = Some("Custom tool call output parts cannot be empty".into());
-                return Err(e);
+                return Err(invalid(
+                    "custom_tool_call_output_empty",
+                    "Custom tool call output parts cannot be empty",
+                ));
             }
             _ => {}
         },
@@ -3922,37 +3908,32 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
             ResponseTool::Function(function_tool) => {
                 let function = &function_tool.function;
                 if !function.parameters.is_object() {
-                    let mut e = ValidationError::new("invalid_type");
-                    e.message = Some(
+                    return Err(invalid(
+                        "invalid_type",
                         format!(
                             "Invalid type for 'tools[{idx}].parameters': expected an object, but got {} instead.",
                             json_type_name(&function.parameters)
-                        )
-                        .into(),
-                    );
-                    return Err(e);
+                        ),
+                    ));
                 }
             }
             // The hosted local_shell tool is not served by the gateway, and the
             // public API no longer accepts it either.
             ResponseTool::LocalShell => {
-                let mut e = ValidationError::new("tool_not_supported");
-                e.message = Some(
-                    format!("Invalid 'tools[{idx}]': the local_shell tool is not supported.")
-                        .into(),
-                );
-                return Err(e);
+                return Err(invalid(
+                    "tool_not_supported",
+                    format!("Invalid 'tools[{idx}]': the local_shell tool is not supported."),
+                ));
             }
             _ => {}
         }
         if let ResponseTool::Mcp(mcp) = tool {
             let raw_label = mcp.server_label.as_str();
             if raw_label.is_empty() {
-                let mut e = ValidationError::new("missing_required_parameter");
-                e.message = Some(
-                    format!("Missing required parameter: 'tools[{idx}].server_label'.").into(),
-                );
-                return Err(e);
+                return Err(invalid(
+                    "missing_required_parameter",
+                    format!("Missing required parameter: 'tools[{idx}].server_label'."),
+                ));
             }
 
             // OpenAI spec-compatible validation: require a non-empty label that starts with a
@@ -3962,38 +3943,32 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
             if !valid {
-                let mut e = ValidationError::new("invalid_server_label");
-                e.message = Some(
+                return Err(invalid(
+                    "invalid_server_label",
                     format!(
                         "Invalid input {raw_label}: 'server_label' must start with a letter and consist of only letters, digits, '-' and '_'"
-                    )
-                    .into(),
-                );
-                return Err(e);
+                    ),
+                ));
             }
 
             let normalized = raw_label.to_lowercase();
             if !seen_mcp_labels.insert(normalized) {
-                let mut e = ValidationError::new("mcp_tool_duplicate_server_label");
-                e.message = Some(
-                    format!("Duplicate MCP server_label '{raw_label}' found in 'tools' parameter.")
-                        .into(),
-                );
-                return Err(e);
+                return Err(invalid(
+                    "mcp_tool_duplicate_server_label",
+                    format!("Duplicate MCP server_label '{raw_label}' found in 'tools' parameter."),
+                ));
             }
 
             // One of `server_url` or `connector_id` is required, and the two
             // are mutually exclusive. Reject payloads that set both so
             // downstream target resolution is unambiguous.
             if mcp.server_url.is_some() && mcp.connector_id.is_some() {
-                let mut e = ValidationError::new("mcp_tool_conflicting_targets");
-                e.message = Some(
+                return Err(invalid(
+                    "mcp_tool_conflicting_targets",
                     format!(
                         "MCP tool with server_label '{raw_label}' sets both 'server_url' and 'connector_id'; exactly one is required."
-                    )
-                    .into(),
-                );
-                return Err(e);
+                    ),
+                ));
             }
         }
     }
