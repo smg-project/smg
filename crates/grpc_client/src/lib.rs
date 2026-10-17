@@ -20,6 +20,7 @@ pub mod engine_load;
 pub mod media_fault;
 pub mod mlx_engine;
 pub mod sglang_scheduler;
+pub mod tap;
 pub mod tokenizer_bundle;
 pub mod tokenspeed_encoder;
 pub mod tokenspeed_scheduler;
@@ -42,6 +43,7 @@ pub use mlx_engine::{proto as mlx_proto, MlxEngineClient};
 pub use sglang_scheduler::{
     proto as sglang_proto, SglangGenerateRequestOptions, SglangSchedulerClient,
 };
+pub use tap::{set_call_tap, CallEnd, CallRecord, CallStart, CallTap, TapChannel};
 pub use tokenspeed_encoder::{tokenspeed_encoder_proto, TokenSpeedEncoderClient};
 pub use tokenspeed_scheduler::{tokenspeed_proto, TokenSpeedSchedulerClient};
 use tonic::metadata::MetadataMap;
@@ -311,8 +313,8 @@ macro_rules! impl_engine_client_basics {
                 $display_name,
                 endpoint
             );
-            let channel = $crate::channel::connect_channel(endpoint).await?;
-            let client = <$proto_client>::new(channel);
+            let (channel, origin) = $crate::tap::TapChannel::connect(endpoint).await?;
+            let client = <$proto_client>::with_origin(channel, origin);
             Ok(Self {
                 client,
                 trace_injector,

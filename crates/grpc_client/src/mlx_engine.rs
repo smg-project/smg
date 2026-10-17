@@ -5,10 +5,10 @@ use openai_protocol::{
     messages::CreateMessageRequest, responses::ResponsesRequest,
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
-use tonic::{transport::Channel, Request};
+use tonic::Request;
 use tracing::{debug, warn};
 
-use crate::{AbortOnDropClient, BoxedTraceInjector};
+use crate::{AbortOnDropClient, BoxedTraceInjector, TapChannel};
 
 // Include the generated protobuf code
 #[expect(clippy::allow_attributes)]
@@ -24,7 +24,7 @@ pub type AbortOnDropStream = crate::AbortOnDropStream<proto::GenerateResponse, M
 /// gRPC client for MLX engine
 #[derive(Clone)]
 pub struct MlxEngineClient {
-    client: proto::mlx_engine_client::MlxEngineClient<Channel>,
+    client: proto::mlx_engine_client::MlxEngineClient<TapChannel>,
     trace_injector: BoxedTraceInjector,
 }
 
@@ -41,7 +41,7 @@ impl AbortOnDropClient for MlxEngineClient {
 }
 
 impl MlxEngineClient {
-    crate::impl_engine_client_basics!(proto::mlx_engine_client::MlxEngineClient<Channel>, "MLX");
+    crate::impl_engine_client_basics!(proto::mlx_engine_client::MlxEngineClient<TapChannel>, "MLX");
 
     /// Submit a generation request (returns auto-aborting streaming response)
     pub async fn generate(

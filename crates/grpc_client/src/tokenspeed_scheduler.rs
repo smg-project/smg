@@ -18,10 +18,10 @@ use openai_protocol::{
     responses::ResponsesRequest,
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
-use tonic::{transport::Channel, Request};
+use tonic::Request;
 use tracing::{debug, warn};
 
-use crate::{AbortOnDropClient, BoxedTraceInjector, NoopTraceInjector};
+use crate::{AbortOnDropClient, BoxedTraceInjector, NoopTraceInjector, TapChannel};
 
 #[expect(clippy::allow_attributes)]
 pub mod tokenspeed_proto {
@@ -42,7 +42,7 @@ pub type AbortOnDropStream =
 /// gRPC client for the TokenSpeed scheduler.
 #[derive(Clone)]
 pub struct TokenSpeedSchedulerClient {
-    client: tokenspeed_proto::token_speed_scheduler_client::TokenSpeedSchedulerClient<Channel>,
+    client: tokenspeed_proto::token_speed_scheduler_client::TokenSpeedSchedulerClient<TapChannel>,
     trace_injector: BoxedTraceInjector,
 }
 
@@ -68,9 +68,11 @@ impl TokenSpeedSchedulerClient {
         trace_injector: BoxedTraceInjector,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Connecting to TokenSpeed scheduler at {}", endpoint);
-        let channel = crate::channel::connect_channel(endpoint).await?;
+        let (channel, origin) = TapChannel::connect(endpoint).await?;
         let client =
-            tokenspeed_proto::token_speed_scheduler_client::TokenSpeedSchedulerClient::new(channel);
+            tokenspeed_proto::token_speed_scheduler_client::TokenSpeedSchedulerClient::with_origin(
+                channel, origin,
+            );
 
         Ok(Self {
             client,

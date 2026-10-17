@@ -32,6 +32,13 @@ prost-types.workspace = true
 # Async/concurrency
 futures.workspace = true
 
+# The call tap (`tap`): wraps tonic's channel as a tower service and tees the
+# HTTP/2 bodies of the calls it observes.
+bytes.workspace = true
+http.workspace = true
+http-body = "1.0"
+tower-service = "0.3"
+
 # The HTTP/2 layer under tonic: the type of the transport fault a
 # `tonic::Status` made of one carries in its source chain
 # (`channel::is_transport_failure`); also the raw peer of the channel tests.

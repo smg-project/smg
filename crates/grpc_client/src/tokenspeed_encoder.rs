@@ -14,10 +14,14 @@ use std::{
     },
 };
 
-use tonic::{transport::Channel, Request};
+use http::Uri;
+use tonic::Request;
 use tracing::{debug, warn};
 
-use crate::{BoxedTraceInjector, NoopTraceInjector};
+use crate::{BoxedTraceInjector, NoopTraceInjector, TapChannel};
+
+/// One pooled connection: the channel and the origin to build a client with.
+type Connection = (TapChannel, Uri);
 
 /// Process-global cache of connected channels, keyed by encode-worker endpoint.
 ///
@@ -31,8 +35,8 @@ use crate::{BoxedTraceInjector, NoopTraceInjector};
 /// head-of-line-block on one HTTP/2 connection's write buffer + flow-control
 /// credit. So hold a small POOL of independent connections per endpoint and
 /// round-robin RPCs across them (independent sockets = independent windows).
-fn channel_cache() -> &'static Mutex<HashMap<String, Vec<Channel>>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Vec<Channel>>>> = OnceLock::new();
+fn channel_cache() -> &'static Mutex<HashMap<String, Vec<Connection>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Vec<Connection>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -51,7 +55,8 @@ pub mod tokenspeed_encoder_proto {
 /// gRPC client for the TokenSpeed encode worker.
 #[derive(Clone)]
 pub struct TokenSpeedEncoderClient {
-    client: tokenspeed_encoder_proto::token_speed_encoder_client::TokenSpeedEncoderClient<Channel>,
+    client:
+        tokenspeed_encoder_proto::token_speed_encoder_client::TokenSpeedEncoderClient<TapChannel>,
     trace_injector: BoxedTraceInjector,
 }
 
@@ -85,7 +90,7 @@ impl TokenSpeedEncoderClient {
         );
         let mut built = Vec::with_capacity(ENCODE_CONNS_PER_ENDPOINT);
         for _ in 0..ENCODE_CONNS_PER_ENDPOINT {
-            built.push(crate::channel::connect_channel(endpoint).await?);
+            built.push(TapChannel::connect(endpoint).await?);
         }
         {
             let mut cache = channel_cache()
@@ -99,11 +104,11 @@ impl TokenSpeedEncoderClient {
         }
     }
 
-    fn from_channel(channel: Channel) -> Self {
+    fn from_channel((channel, origin): Connection) -> Self {
         Self {
             client:
-                tokenspeed_encoder_proto::token_speed_encoder_client::TokenSpeedEncoderClient::new(
-                    channel,
+                tokenspeed_encoder_proto::token_speed_encoder_client::TokenSpeedEncoderClient::with_origin(
+                    channel, origin,
                 ),
             trace_injector: Arc::new(NoopTraceInjector),
         }

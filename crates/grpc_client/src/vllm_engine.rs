@@ -9,10 +9,10 @@ use openai_protocol::{
     responses::ResponsesRequest,
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
-use tonic::{transport::Channel, Request};
+use tonic::Request;
 use tracing::{debug, warn};
 
-use crate::{AbortOnDropClient, BoxedTraceInjector};
+use crate::{AbortOnDropClient, BoxedTraceInjector, TapChannel};
 
 // Include the generated protobuf code
 #[expect(clippy::allow_attributes)]
@@ -28,7 +28,7 @@ pub type AbortOnDropStream = crate::AbortOnDropStream<proto::GenerateResponse, V
 /// gRPC client for vLLM scheduler
 #[derive(Clone)]
 pub struct VllmEngineClient {
-    client: proto::vllm_engine_client::VllmEngineClient<Channel>,
+    client: proto::vllm_engine_client::VllmEngineClient<TapChannel>,
     trace_injector: BoxedTraceInjector,
 }
 
@@ -45,7 +45,10 @@ impl AbortOnDropClient for VllmEngineClient {
 }
 
 impl VllmEngineClient {
-    crate::impl_engine_client_basics!(proto::vllm_engine_client::VllmEngineClient<Channel>, "vLLM");
+    crate::impl_engine_client_basics!(
+        proto::vllm_engine_client::VllmEngineClient<TapChannel>,
+        "vLLM"
+    );
 
     /// Submit a generation request (returns auto-aborting streaming response)
     ///

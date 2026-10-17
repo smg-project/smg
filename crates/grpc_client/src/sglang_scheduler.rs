@@ -9,10 +9,10 @@ use openai_protocol::{
     responses::ResponsesRequest,
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
-use tonic::{transport::Channel, Request};
+use tonic::Request;
 use tracing::{debug, warn};
 
-use crate::{AbortOnDropClient, BoxedTraceInjector};
+use crate::{AbortOnDropClient, BoxedTraceInjector, TapChannel};
 
 // Include the generated protobuf code
 #[expect(clippy::allow_attributes)]
@@ -29,7 +29,7 @@ pub type AbortOnDropStream =
 /// gRPC client for SGLang scheduler
 #[derive(Clone)]
 pub struct SglangSchedulerClient {
-    client: proto::sglang_scheduler_client::SglangSchedulerClient<Channel>,
+    client: proto::sglang_scheduler_client::SglangSchedulerClient<TapChannel>,
     trace_injector: BoxedTraceInjector,
 }
 
@@ -55,7 +55,7 @@ impl AbortOnDropClient for SglangSchedulerClient {
 
 impl SglangSchedulerClient {
     crate::impl_engine_client_basics!(
-        proto::sglang_scheduler_client::SglangSchedulerClient<Channel>,
+        proto::sglang_scheduler_client::SglangSchedulerClient<TapChannel>,
         "SGLang scheduler"
     );
 

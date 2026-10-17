@@ -9,10 +9,10 @@ use openai_protocol::{
     responses::ResponsesRequest,
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
-use tonic::{transport::Channel, Request};
+use tonic::Request;
 use tracing::{debug, warn};
 
-use crate::{AbortOnDropClient, BoxedTraceInjector};
+use crate::{AbortOnDropClient, BoxedTraceInjector, TapChannel};
 
 // Include the generated protobuf code
 #[expect(clippy::allow_attributes)]
@@ -33,7 +33,7 @@ pub type AbortOnDropStream = crate::AbortOnDropStream<proto::GenerateResponse, T
 /// gRPC client for TensorRT-LLM service
 #[derive(Clone)]
 pub struct TrtllmServiceClient {
-    client: proto::trtllm_service_client::TrtllmServiceClient<Channel>,
+    client: proto::trtllm_service_client::TrtllmServiceClient<TapChannel>,
     trace_injector: BoxedTraceInjector,
 }
 
@@ -52,7 +52,7 @@ impl AbortOnDropClient for TrtllmServiceClient {
 
 impl TrtllmServiceClient {
     crate::impl_engine_client_basics!(
-        proto::trtllm_service_client::TrtllmServiceClient<Channel>,
+        proto::trtllm_service_client::TrtllmServiceClient<TapChannel>,
         "TensorRT-LLM"
     );
 
