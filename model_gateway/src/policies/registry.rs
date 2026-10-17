@@ -135,6 +135,21 @@ fn strip_suffix_tag(s: &str, tag: char) -> &str {
     }
 }
 
+/// Append `candidate` to `out` unless the same instance is there already: a
+/// policy shared by several roles is visited once.
+fn push_distinct(
+    out: &mut Vec<Arc<dyn LoadBalancingPolicy>>,
+    candidate: Arc<dyn LoadBalancingPolicy>,
+) {
+    let ptr = Arc::as_ptr(&candidate) as *const ();
+    if !out
+        .iter()
+        .any(|existing| Arc::as_ptr(existing) as *const () == ptr)
+    {
+        out.push(candidate);
+    }
+}
+
 impl PolicyRegistry {
     /// Create a new PolicyRegistry with a default policy (no routing-key override).
     pub fn new(default_policy_config: PolicyConfig) -> Self {
@@ -686,27 +701,18 @@ impl PolicyRegistry {
     /// deployments, and inbound deltas never resolve.
     pub(crate) fn policies_for_model(&self, model_id: &str) -> Vec<Arc<dyn LoadBalancingPolicy>> {
         let mut out: Vec<Arc<dyn LoadBalancingPolicy>> = Vec::new();
-        let mut push = |candidate: Arc<dyn LoadBalancingPolicy>| {
-            let ptr = Arc::as_ptr(&candidate) as *const ();
-            if !out
-                .iter()
-                .any(|existing| Arc::as_ptr(existing) as *const () == ptr)
-            {
-                out.push(candidate);
-            }
-        };
         if let Some(policy) = self.get_policy(model_id) {
-            push(policy);
+            push_distinct(&mut out, policy);
         }
-        push(Arc::clone(&self.default_policy));
-        if let Some(p) = self.prefill_policy.get() {
-            push(Arc::clone(p));
-        }
-        if let Some(p) = self.decode_policy.get() {
-            push(Arc::clone(p));
-        }
-        if let Some(p) = self.encode_policy.get() {
-            push(Arc::clone(p));
+        push_distinct(&mut out, Arc::clone(&self.default_policy));
+        for leg in [
+            &self.prefill_policy,
+            &self.decode_policy,
+            &self.encode_policy,
+        ] {
+            if let Some(policy) = leg.get() {
+                push_distinct(&mut out, Arc::clone(policy));
+            }
         }
         out
     }
@@ -2673,7 +2679,7 @@ mod tests {
             Arc::clone(&per_model) as Arc<dyn LoadBalancingPolicy>,
         );
 
-        registry.remove_worker_from_load_aware("http://w2:8000");
+        registry.remove_worker_from_policies("http://w2:8000");
 
         assert_eq!(
             shared.removed.lock().unwrap().as_slice(),
@@ -2703,7 +2709,7 @@ mod tests {
         ];
         registry.init_pd_bucket_policies(&prefill);
 
-        registry.remove_worker_from_load_aware("http://prefill-2:8000");
+        registry.remove_worker_from_policies("http://prefill-2:8000");
 
         let remaining = [Arc::clone(&prefill[0]), Arc::clone(&prefill[2])];
         let policy = registry.get_prefill_policy();

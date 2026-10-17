@@ -183,6 +183,27 @@ impl LoadBalancingPolicy for BucketPolicy {
         workers.iter().position(|w| w.url() == prefill_url)
     }
 
+    /// A worker that left the fleet leaves every bucket that listed it; a
+    /// neighbour takes its size range over (see
+    /// [`Bucket::remove_prefill_worker_url`]). A URL names one worker across
+    /// models, so every bucket is asked.
+    fn remove_worker(&self, url: &str) {
+        let buckets: Vec<(String, Arc<RwLock<Bucket>>)> = self
+            .buckets
+            .iter()
+            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+            .collect();
+        for (model_key, bucket) in buckets {
+            let mut bucket = bucket.write();
+            if bucket.remove_prefill_worker_url(url) {
+                info!(
+                    "Removed worker {} from bucket for model {} (remaining workers: {})",
+                    url, model_key, bucket.bucket_cnt
+                );
+            }
+        }
+    }
+
     fn name(&self) -> &'static str {
         "bucket"
     }
@@ -352,6 +373,31 @@ impl Bucket {
         });
 
         self.load_total = self.load_total.saturating_add(char_cnt);
+    }
+
+    /// Forget `url`: its place among the workers, its load counter and its
+    /// range, which the previous neighbour takes over (the next one when it
+    /// was first). The partition stays contiguous until the next adjustment
+    /// rebuilds it from the request sizes seen. Whether the bucket held it.
+    pub fn remove_prefill_worker_url(&mut self, url: &str) -> bool {
+        let listed = {
+            let mut urls = self.prefill_worker_urls.lock();
+            let before = urls.len();
+            urls.retain(|u| u != url);
+            self.bucket_cnt = urls.len();
+            urls.len() != before
+        };
+        let counted = self.chars_per_url.lock().remove(url).is_some();
+        let Some(i) = self.boundary.iter().position(|b| b.url == url) else {
+            return listed || counted;
+        };
+        let gone = self.boundary.remove(i);
+        if let Some(previous) = i.checked_sub(1) {
+            self.boundary[previous].range[1] = gone.range[1];
+        } else if let Some(next) = self.boundary.first_mut() {
+            next.range[0] = gone.range[0];
+        }
+        true
     }
 
     pub fn find_boundary(&self, char_count: usize) -> Option<String> {
