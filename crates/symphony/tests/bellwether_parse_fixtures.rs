@@ -1024,6 +1024,14 @@ const OPENERS: &[(&str, &str)] = &[
         "bytedance-seed-oss-36b-alternate-tokenizer",
         "<|start_header_id|>assistant<|end_header_id|>",
     ),
+    (
+        "llama-3.2-1b-instruct",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "llama-3.2-11b-vision-instruct",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
     ("exaone-4.5-33b", "<|assistant|>"),
     (
         "llama-3-1-nemotron-ultra-253b-cpt-v1",

@@ -242,9 +242,12 @@ What the table says beyond the others:
 - **`<|python_tag|>` is wrapping wherever it stands.** Llama 3.2's template writes the call object
   alone, and the model writes the tag before it as often as not (the family's prompt format gives
   the tag to its built-in tools); the gateway's older `llama` parser strips it, and the engines'
-  readers for the family start the object after it. The table ignores the terminal, so the object
-  after it reads as the call and prose around it as content; the replay sees the same bytes with
-  or without it.
+  readers for the family start the object after it. The table ignores the terminal, so an object
+  the tag opens the output with reads as the call, and prose around the tag as content; the
+  replay sees the same bytes with or without it. An object after prose is content with the prose,
+  tag or no tag, as the rule above says: where the older `llama` parser splits the output at the
+  tag and reads the object after prose as the call, this table does not, and a model that writes
+  prose before a tagged call is read as content (pinned by the table's tests).
 - **A forced call is the list.** `Format::grammar` writes the `xlam` list, as the older parser's
   forced calls were written.
 
