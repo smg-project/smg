@@ -207,6 +207,20 @@ class ShardTableTests(unittest.TestCase):
         self.assertFalse(filter_matches(filters["rust-multimodal"], "crates/tokenizer/src/lib.rs"))
         self.assertFalse(filter_matches(filters["rust-gateway"], "docs/README.md"))
 
+    def test_the_gateway_filter_covers_the_sources_its_integration_tests_read(self):
+        # The metrics catalogue test walks these roots for recorder and family
+        # names, and the dashboard test reads the chart: a change there can
+        # change their result, so it runs the gateway shards.
+        filters = path_filters()
+        for path in (
+            "bindings/python/src/lib.rs",
+            "bindings/golang/src/lib.rs",
+            "clients/rust/src/lib.rs",
+            "examples/wasm/wasm-guest-storage-hook-passthrough/src/lib.rs",
+            "deploy/helm/smg/templates/grafana-dashboard.yaml",
+        ):
+            self.assertTrue(filter_matches(filters["rust-gateway"], path), path)
+
     def test_every_shard_has_a_filter_and_setup_flags_the_workflow_knows(self):
         filters = path_filters()
         workflow = WORKFLOW.read_text()
