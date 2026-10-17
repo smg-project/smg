@@ -23,7 +23,6 @@
 //! access to it. Suppressed calls are counted and write no line.
 
 use std::{
-    borrow::Cow,
     sync::{
         atomic::{AtomicU32, Ordering},
         OnceLock,
@@ -55,7 +54,10 @@ const TEMPLATE: &str = "response_template";
 /// built by hand.
 const OTHER_TABLE: &str = "other";
 
-/// The `reason` labels, in the order of [`Tally::reasons`].
+/// The `reason` labels, in the order of [`Tally::reasons`]: the three reasons that say what the
+/// model got wrong, and `other` for the crate's syntax-level reasons (text where the call's syntax
+/// has none, a tag out of place, a key without a value, ...), each spelled by the crate's sentence
+/// on the sampled line.
 const REASONS: [&str; 4] = [
     "unterminated_region",
     "invalid_arguments",
@@ -83,17 +85,17 @@ pub(crate) fn table_label(name: &str) -> &'static str {
 }
 
 /// The `reason` label of a malformed run, and its place in [`REASONS`].
-fn reason_index(why: &MalformedReason) -> usize {
+fn reason_index(why: MalformedReason) -> usize {
     match why {
         MalformedReason::UnterminatedRegion => 0,
         MalformedReason::InvalidArguments => 1,
         MalformedReason::UnknownTool => 2,
-        MalformedReason::Other(_) => 3,
+        _ => 3,
     }
 }
 
 /// The `reason` label of a malformed run.
-pub(crate) fn reason_label(why: &MalformedReason) -> &'static str {
+pub(crate) fn reason_label(why: MalformedReason) -> &'static str {
     REASONS[reason_index(why)]
 }
 
@@ -122,8 +124,8 @@ pub(crate) struct Who<'a> {
 pub(crate) struct FirstRun {
     /// Its `reason` label.
     pub reason: &'static str,
-    /// The crate's reason: the label, or the text of `Other`.
-    pub why: Cow<'static, str>,
+    /// The crate's sentence for the reason (`MalformedReason::sentence`).
+    pub why: &'static str,
     /// Where it starts in the output, in bytes.
     pub at: usize,
     /// Its length in bytes.
@@ -149,15 +151,12 @@ impl Tally {
     pub(crate) fn see(&mut self, event: &Event, first_call_only: bool) {
         match event {
             Event::Malformed { text, why } => {
-                self.reasons[reason_index(why)] += 1;
+                self.reasons[reason_index(*why)] += 1;
                 self.malformed_bytes += text.text.len() as u64;
                 if self.first.is_none() {
                     self.first = Some(FirstRun {
-                        reason: reason_label(why),
-                        why: match why {
-                            MalformedReason::Other(text) => text.clone(),
-                            typed => Cow::Borrowed(reason_label(typed)),
-                        },
+                        reason: reason_label(*why),
+                        why: why.sentence(),
                         at: self.at,
                         bytes: text.text.len(),
                     });
@@ -225,7 +224,7 @@ impl Tally {
         };
         let outcome = OUTCOMES[outcome];
         let (reason, why, at, bytes) = match &self.first {
-            Some(first) => (first.reason, first.why.as_ref(), first.at, first.bytes),
+            Some(first) => (first.reason, first.why, first.at, first.bytes),
             None => ("", "", 0, 0),
         };
         warn!(
@@ -441,10 +440,7 @@ mod tests {
                 why: DropReason::Wrapper,
             },
             malformed("<tool_call>{", MalformedReason::UnterminatedRegion),
-            malformed(
-                "x",
-                MalformedReason::Other("a tool call without a name".into()),
-            ),
+            malformed("x", MalformedReason::CallWithoutName),
             finish(0),
         ];
         for event in &events {
@@ -456,7 +452,7 @@ mod tests {
             tally.first,
             Some(FirstRun {
                 reason: "invalid_arguments",
-                why: "invalid_arguments".into(),
+                why: "arguments that did not parse under the call's syntax",
                 at: "Hello <tool_call>".len(),
                 bytes: 12,
             })
@@ -469,13 +465,10 @@ mod tests {
     }
 
     #[test]
-    fn the_first_run_of_another_reason_carries_its_text() {
+    fn the_first_run_of_another_reason_carries_its_sentence() {
         let mut tally = Tally::default();
         tally.see(
-            &malformed(
-                "<|end|>",
-                MalformedReason::Other("a name without a call".into()),
-            ),
+            &malformed("<|end|>", MalformedReason::NameWithoutACall),
             false,
         );
         let first = tally.first.as_ref().expect("a first run");
