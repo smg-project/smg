@@ -218,6 +218,15 @@ def get_parser() -> str | None:
     return value
 
 
+def effective_parser() -> str:
+    """The parser the gateway reads with in this lane: ``get_parser()`` when ``E2E_PARSER``
+    is set, else the gateway's own default, ``symphony``. A test that branches on the parser
+    reads this, so it need not know the default; the command line still omits ``--parser``
+    when the variable is blank (``Gateway._build_base_cmd``).
+    """
+    return get_parser() or "symphony"
+
+
 def get_vllm_mm_processor() -> str:
     """The processor the worker lane launches vLLM gRPC workers with
     (``SMG_VLLM_MM_PROCESSOR``): ``inprocess`` (vLLM's own, the default) or
