@@ -1,11 +1,11 @@
 {
-  "baseline_bytes": 167558,
-  "clusters": 44,
+  "baseline_bytes": 198719,
+  "clusters": 46,
   "date": "2026-10-09",
   "exemplar_kinds": {
-    "body": 30,
-    "skeleton": 5,
-    "sse": 9
+    "body": 34,
+    "skeleton": 4,
+    "sse": 8
   },
   "max_exemplar_bytes": 8192,
   "models": {
@@ -21,21 +21,21 @@
       "gpt-nope"
     ]
   },
-  "probe_set_git_sha": "93e3b3e5",
+  "probe_set_git_sha": "0829a0bf",
   "probes_distilled": 209,
   "probes_total": 225,
   "provider": "openai",
   "recording": {
-    "estimated_cost_usd": 0.0113,
+    "estimated_cost_usd": 0.0112,
     "expected_error_recorded": 59,
-    "fingerprint_clusters_total": 44,
+    "fingerprint_clusters_total": 46,
     "recorded": 209,
     "skipped": 16,
     "tokens": {
-      "input": 110705,
-      "output": 14290
+      "input": 110667,
+      "output": 14274
     },
     "transport_failures": 0
   },
-  "recording_run_id": "38001344395"
+  "recording_run_id": "38004101229"
 }
