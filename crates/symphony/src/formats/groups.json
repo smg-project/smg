@@ -77,6 +77,8 @@
   {"model": "nvidia/Llama-3.1-Nemotron-Nano-8B-v1", "also": [], "table": "llama_nemotron", "opener": null},
   {"model": "nvidia/Llama-3.1-Nemotron-Safety-Guard-8B-v3", "also": [], "table": "json", "opener": "<|start_header_id|>assistant<|end_header_id|>"},
   {"model": "nvidia/Llama-3.3-Nemotron-70B-Reward-Principle", "also": ["Llama-3.3-Nemotron-70B-Edit", "Llama-3.3-Nemotron-70B-Feedback"], "table": "json", "opener": "<|start_header_id|>assistant<|end_header_id|>"},
+  {"model": "meta-llama/Llama-4-Maverick-17B-128E-Instruct", "also": ["Llama-4-Maverick-17B-128E-Instruct-FP8"], "table": "llama4", "opener": null},
+  {"model": "meta-llama/Llama-4-Scout-17B-16E-Instruct", "also": [], "table": "llama4", "opener": null},
   {"model": "Salesforce/Llama-xLAM-2-8b-fc-r", "also": [], "table": "xlam", "opener": null},
   {"model": "XiaomiMiMo/MiMo-V2.5", "also": ["MiMo-V2.5-Base"], "table": "qwen3_tagged_direct", "opener": null},
   {"model": "XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B", "also": [], "table": "qwen3_tagged_direct", "opener": null},

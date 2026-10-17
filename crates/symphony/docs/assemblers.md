@@ -310,6 +310,22 @@ What the syntax says, and what the assembler does with it:
 - **Python's whitespace is allowed** between a name and its `(`, around the `=`, and around a
   value, as the old parser's regular expression allowed it; a name or a key is the text less
   that whitespace.
+- **A list bare in the turn** (`Assembler::bare`, which the engine picks for a table no row of
+  which enters the arguments state, as it picks the bare JSON list): a `[` is held with the name
+  after it until a `(` says it opens a list, or anything else gives it back as content. At the
+  turn's start, after whitespace alone, the list then reads as between markers, as it arrives.
+  After content, the list is held until the `]` that closes it (strings and nested brackets
+  scanned) and read whole by an assembler of its own: when every byte is a call's or the list's
+  wrapping and every call names a tool the request declares, its events are the turn's; when any
+  byte is malformed (a positional argument, an operator, prose between calls) or a name is no
+  tool's, the whole is content, since code holds `[name(` of its own. After the
+  list's `]` whitespace is wrapping and anything else malformed, as after xLAM's list. A stream
+  cut while a `[` or a list is held gives it back as content, since no call began.
+- **A dialect whose quotes carry no type** (`Values::Quoted`, Llama 4's template writing `"%s"`
+  of every value): the text between a value's double quotes, as written and with no escape
+  decoded, is typed by the kind the request's tool declares for the parameter, through the value
+  module's `json`, or by its text where none is declared; a bare value, a single-quoted Python
+  string included, reads as under the other dialects.
 
 Ported in spirit from the old crate's pythonic parser, which compiled a regular expression per call
 and read the arguments with a Python-literal evaluator at the end; here the arguments are read as
