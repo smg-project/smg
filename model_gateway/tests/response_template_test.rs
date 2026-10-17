@@ -166,18 +166,24 @@ impl Gateway {
     }
 }
 
-/// The prompt the Qwen3.5-9B chat template renders for [`chat_request`]'s messages with the
-/// request's `chat_template_kwargs`: where the template leaves the model.
+/// The prompt the Qwen3.5-9B chat template renders for the request [`chat_request`] builds from
+/// `extra`, its messages with its `chat_template_kwargs`: where the template leaves the model. A
+/// precondition of a case, rendered by the fixture's template as the gateway renders it; the
+/// engine's request is not read back (it carries token ids).
 #[expect(clippy::expect_used, reason = "test helper")]
-fn rendered(kwargs: Option<&HashMap<String, Value>>) -> String {
+fn rendered(extra: &Value) -> String {
+    let request = chat_request(extra.clone());
+    let messages: Vec<Value> =
+        serde_json::from_value(serde_json::to_value(&request.messages).expect("the messages"))
+            .expect("the messages as a list");
     ScriptedTokenizer::from_chunks(Vec::new())
         .with_chat_template(&qwen3_5_chat_template())
         .expect("the chat template")
         .apply_chat_template(
-            &[json!({"role": "user", "content": "weather?"})],
+            &messages,
             ChatTemplateParams {
                 add_generation_prompt: true,
-                template_kwargs: kwargs,
+                template_kwargs: request.chat_template_kwargs.as_ref(),
                 ..Default::default()
             },
         )
@@ -667,7 +673,7 @@ async fn a_registry_tables_json_answer_follows_the_thought_the_prompt_leaves_ope
     };
     // The template's default leaves the thought open: the thought's free text, then the JSON,
     // for an engine that does not say where it starts the grammar.
-    let prompt = rendered(None);
+    let prompt = rendered(&answer);
     assert!(prompt.ends_with(THINKING), "{prompt:?}");
     let gateway = serve(registry(Vec::new())).await;
     chat(&gateway, answer.clone()).await;
@@ -681,10 +687,10 @@ async fn a_registry_tables_json_answer_follows_the_thought_the_prompt_leaves_ope
     // Thinking off closes the thought in the prompt: the tag would be the schema alone, and the
     // engine's own constraint is sent, as before.
     let off = HashMap::from([("enable_thinking".to_string(), json!(false))]);
-    let prompt = rendered(Some(&off));
-    assert!(prompt.ends_with("</think>\n\n"), "{prompt:?}");
     let mut request = answer.clone();
     request["chat_template_kwargs"] = json!(off);
+    let prompt = rendered(&request);
+    assert!(prompt.ends_with("</think>\n\n"), "{prompt:?}");
     chat(&gateway, request).await;
     let (kind, _) = gateway.last_constraint().expect("the schema constraint");
     assert_eq!(kind, "json_schema");
