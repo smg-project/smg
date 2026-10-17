@@ -253,6 +253,9 @@ impl LoadBalancingPolicy for BucketPolicy {
 
 #[derive(Debug, Clone)]
 pub struct Bucket {
+    /// The declared span of request sizes a listing of the workers splits
+    /// evenly among them; the last range is open-ended regardless. Fixed:
+    /// the adjustment learns the real sizes from the requests seen.
     l_max: usize,
     bucket_cnt: usize,
     pub prefill_worker_urls: Arc<Mutex<Vec<String>>>,
@@ -317,31 +320,47 @@ impl Bucket {
         }
     }
 
+    /// List the prefill workers the bucket partitions the sizes over, as the
+    /// registration step does whenever a worker joins (it hands the bucket
+    /// every prefill worker again). The same set again, in any order, is a
+    /// no-op: the partition and the load counters stay. A changed set keeps
+    /// the counters of the workers that stay, starts the newcomers at zero
+    /// and splits the declared span `l_max` evenly among all of them with
+    /// the last range open-ended, exactly as the first split does; `l_max`
+    /// never changes, so no later split divides the open end. The even split
+    /// is provisional: the next adjustment rebuilds it from the sizes seen
+    /// without waiting for the per-worker load to double
+    /// ([`Self::adjust_boundary`]).
     pub fn init_prefill_worker_urls(&mut self, prefill_worker_urls: Vec<String>) {
-        let bucket_cnt = prefill_worker_urls.len();
-        self.bucket_cnt = bucket_cnt;
-        let mut urls_lock = self.prefill_worker_urls.lock();
-        urls_lock.clone_from(&prefill_worker_urls);
-
-        let mut chars_lock = self.chars_per_url.lock();
-        chars_lock.clear();
-
-        for url in &prefill_worker_urls {
-            chars_lock.insert(url.clone(), 0);
+        {
+            let mut urls = self.prefill_worker_urls.lock();
+            let listed: HashSet<&str> = urls.iter().map(String::as_str).collect();
+            let incoming: HashSet<&str> = prefill_worker_urls.iter().map(String::as_str).collect();
+            if listed == incoming {
+                return;
+            }
+            urls.clone_from(&prefill_worker_urls);
         }
-
-        let worker_cnt = bucket_cnt;
-        let boundary = match self.l_max.checked_div(worker_cnt) {
+        {
+            let mut chars = self.chars_per_url.lock();
+            chars.retain(|url, _| prefill_worker_urls.contains(url));
+            for url in &prefill_worker_urls {
+                chars.entry(url.clone()).or_insert(0);
+            }
+        }
+        let worker_cnt = prefill_worker_urls.len();
+        self.bucket_cnt = worker_cnt;
+        self.boundary = match self.l_max.checked_div(worker_cnt) {
             None => Vec::new(),
             Some(gap) => {
-                self.l_max = usize::MAX;
+                let gap = gap.max(1);
                 prefill_worker_urls
                     .iter()
                     .enumerate()
                     .map(|(i, url)| {
                         let min = i * gap;
                         let max = if i == worker_cnt - 1 {
-                            self.l_max
+                            usize::MAX
                         } else {
                             (i + 1) * gap - 1
                         };
@@ -350,8 +369,7 @@ impl Bucket {
                     .collect()
             }
         };
-
-        self.boundary = boundary;
+        self.bucket_load = 0;
         info!("Init boundary:{:?}", self.boundary);
     }
 
