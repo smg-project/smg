@@ -1449,9 +1449,11 @@ struct ModelArgs {
     /// symphony, a worker's labels decide for its model, else Symphony's
     /// registry for a model it knows, and this flag for the models the
     /// registry does not know: a Symphony table's name here (and in
-    /// --tool-call-parser, or there alone) reads them with that table; `hf`
-    /// reads each with the table its tokenizer's response_template compiles
-    /// into; a legacy parser's name keeps the legacy parsers for them.
+    /// --tool-call-parser, or there alone) reads them with that table, and
+    /// so does a legacy parser's name whose format a table reads (the
+    /// table's aliases); `hf` reads each with the table its tokenizer's
+    /// response_template compiles into; any other legacy parser's name keeps
+    /// the legacy parsers for them.
     #[arg(long, help_heading = "Parsers")]
     reasoning_parser: Option<String>,
 
@@ -1459,9 +1461,11 @@ struct ModelArgs {
     /// symphony, a worker's labels decide for its model, else Symphony's
     /// registry for a model it knows, and this flag for the models the
     /// registry does not know: a Symphony table's name here (and in
-    /// --reasoning-parser, or here alone) reads them with that table; `hf`
-    /// reads each with the table its tokenizer's response_template compiles
-    /// into; a legacy parser's name keeps the legacy parsers for them.
+    /// --reasoning-parser, or here alone) reads them with that table, and
+    /// so does a legacy parser's name whose format a table reads (the
+    /// table's aliases); `hf` reads each with the table its tokenizer's
+    /// response_template compiles into; any other legacy parser's name keeps
+    /// the legacy parsers for them.
     #[arg(long, help_heading = "Parsers")]
     tool_call_parser: Option<String>,
 
