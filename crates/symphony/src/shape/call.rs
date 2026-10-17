@@ -51,7 +51,7 @@
 use super::params::Params;
 use crate::{
     engine::TEXT_AFTER_THE_OBJECT,
-    event::{DropReason, Event, Events, MalformedReason, Text},
+    event::{runs, DropReason, Event, Events, MalformedReason, Text},
     json::{self, arguments::Strings},
     shape::{
         Arguments, CallShape, Match, Matcher, NameSource, Schema, Slot, Suffix, ValueParser,
@@ -567,14 +567,8 @@ impl Value {
 /// wrapping, each run of anything else `Malformed` for `why`. Classifying run by run keeps the
 /// result the same wherever the chunks were cut.
 fn wrapping(text: &str, why: &MalformedReason, out: &mut Events) {
-    let mut rest = text;
-    while let Some(first) = rest.chars().next() {
-        let space = first.is_whitespace();
-        let length = rest
-            .char_indices()
-            .find(|(_, c)| c.is_whitespace() != space)
-            .map_or(rest.len(), |(at, _)| at);
-        let run = Text::uncounted(&rest[..length]);
+    for (run, space) in runs(text) {
+        let run = Text::uncounted(run);
         out.push(if space {
             Event::Dropped {
                 text: run,
@@ -586,7 +580,6 @@ fn wrapping(text: &str, why: &MalformedReason, out: &mut Events) {
                 why: why.clone(),
             }
         });
-        rest = &rest[length..];
     }
 }
 
