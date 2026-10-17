@@ -115,31 +115,16 @@ def workspace() -> dict[str, dict]:
         by_dir[(REPO / member).resolve()] = manifest["package"]["name"]
     for name, info in members.items():
         deps = set()
-        tables = [
-            info["manifest"].get(k, {})
-            for k in ("dependencies", "dev-dependencies", "build-dependencies")
-        ]
-        for target in info["manifest"].get("target", {}).values():
-            tables += [
-                target.get(k, {})
-                for k in ("dependencies", "dev-dependencies", "build-dependencies")
-            ]
-        for table in tables:
-            for spec in table.values():
-                if isinstance(spec, dict) and "path" in spec:
-                    deps.add(by_dir[(REPO / info["dir"] / spec["path"]).resolve()])
-                elif isinstance(spec, dict) and spec.get("workspace"):
-                    # A `workspace = true` dependency on a member goes through [workspace.dependencies].
-                    pass
         for dep_name, spec in table_items(info["manifest"]):
-            ws = root["workspace"]["dependencies"].get(dep_name)
-            if (
-                isinstance(spec, dict)
-                and spec.get("workspace")
-                and isinstance(ws, dict)
-                and "path" in ws
-            ):
-                deps.add(by_dir[(REPO / ws["path"]).resolve()])
+            if not isinstance(spec, dict):
+                continue
+            if "path" in spec:
+                deps.add(by_dir[(REPO / info["dir"] / spec["path"]).resolve()])
+            elif spec.get("workspace"):
+                # A `workspace = true` dependency on a member goes through [workspace.dependencies].
+                ws = root["workspace"]["dependencies"].get(dep_name)
+                if isinstance(ws, dict) and "path" in ws:
+                    deps.add(by_dir[(REPO / ws["path"]).resolve()])
         info["deps"] = deps - {name}
     return members
 
