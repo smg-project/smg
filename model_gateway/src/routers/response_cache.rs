@@ -141,10 +141,14 @@ impl Cacheable for ChatCompletionRequest {
         if self.n.is_some_and(|n| n > 1) {
             return Some("choices");
         }
+        // A tool offered anywhere: the request-level list (an empty one
+        // offers none and stays cacheable), the legacy function fields, or a
+        // tool a message declares under the model's provider profile.
         if self.tools.as_ref().is_some_and(|tools| !tools.is_empty())
             || self.tool_choice.is_some()
             || self.functions.is_some()
             || self.function_call.is_some()
+            || self.dynamic_tools().next().is_some()
         {
             return Some("tools");
         }
@@ -822,6 +826,34 @@ mod tests {
         plain["n"] = json!(1);
         plain["tools"] = json!([]);
         assert_eq!(chat(plain).bypass_reason(), None);
+    }
+
+    /// A tool declared on a message (a provider profile's dynamic tools) is
+    /// a tool the model sees: the request bypasses like one with a
+    /// request-level list, so a stored answer's calls are never replayed.
+    #[test]
+    fn a_tool_declared_on_a_message_bypasses_like_a_request_level_one() {
+        let declared = chat(json!({
+            "model": "kimi-k3",
+            "messages": [
+                {"role": "system", "content": "", "tools": [
+                    {"type": "function", "function": {"name": "get_time"}}
+                ]},
+                {"role": "user", "content": "hi"}
+            ],
+            "temperature": 0
+        }));
+        assert!(declared.dynamic_tools().next().is_some());
+        assert_eq!(declared.bypass_reason(), Some("tools"));
+        let plain = chat(json!({
+            "model": "kimi-k3",
+            "messages": [
+                {"role": "system", "content": ""},
+                {"role": "user", "content": "hi"}
+            ],
+            "temperature": 0
+        }));
+        assert_eq!(plain.bypass_reason(), None);
     }
 
     #[test]
