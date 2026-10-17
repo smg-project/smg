@@ -391,6 +391,13 @@ fn deepseek_v4() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::DeepSeekV4.format(), Declared::default()))
 }
 
+fn deepseek_v3_2() -> Box<dyn Parser> {
+    Box::new(Engine::new(
+        Table::DeepSeekV3_2.format(),
+        Declared::default(),
+    ))
+}
+
 fn json() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::Json.format(), Declared::default()))
 }
@@ -893,6 +900,12 @@ const FORMATS: &[Subject] = &[
         new: deepseek_v4,
         outputs: DEEPSEEK_V4_OUTPUTS,
         table: Some(Table::DeepSeekV4),
+    },
+    Subject {
+        name: "deepseek v3.2",
+        new: deepseek_v3_2,
+        outputs: DEEPSEEK_V3_2_OUTPUTS,
+        table: Some(Table::DeepSeekV3_2),
     },
     Subject {
         name: "json",
@@ -1650,6 +1663,20 @@ const DEEPSEEK_V4_OUTPUTS: &[&str] = &[
     "Hello!",
     "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Par",
     "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Par</｜DSML｜tool_calls>",
+];
+
+/// DeepSeek V3.2's DSML as its reference encoder renders it (the thought the prompt opens written
+/// here, since the replay starts from an empty prompt): a call after a thought, a call with a
+/// number and a boolean, two calls after content, an invoke with no parameters, a thought cut
+/// short, content alone, and one cut short.
+const DEEPSEEK_V3_2_OUTPUTS: &[&str] = &[
+    "<think>The user asks.</think>\n\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Beijing</｜DSML｜parameter>\n<｜DSML｜parameter name=\"unit\" string=\"true\">celsius</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
+    "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"add_integers\">\n<｜DSML｜parameter name=\"a\" string=\"false\">17</｜DSML｜parameter>\n<｜DSML｜parameter name=\"b\" string=\"false\">true</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
+    "Sure.\n\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Rome</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
+    "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"noop\">\n\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
+    "<think>still thinking",
+    "Hello!",
+    "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Par",
 ];
 
 /// Llama 3.1's bare call object, a list of them, content, and one cut short.
