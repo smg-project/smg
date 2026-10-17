@@ -3738,10 +3738,16 @@ impl ProtoStream {
 
     /// Whether the end this stream's reader met was the client's leaving
     /// (see [`Self::until_client_gone`]), not the engine's end: the
-    /// generation did not complete, and nothing accounts it as one. `false`
-    /// for a stream that is not watched.
+    /// generation did not complete, and nothing accounts it as one. Read
+    /// through a decode-leg wrapper as through the watch itself (dual
+    /// dispatch wraps the watched stream once the prefill leg has drained);
+    /// `false` for a stream that is not watched.
     pub fn client_left(&self) -> bool {
-        matches!(self, Self::Watched(watched) if watched.inner.is_none())
+        match self {
+            Self::Watched(watched) => watched.inner.is_none(),
+            Self::DecodeLeg(leg) => leg.inner.client_left(),
+            _ => false,
+        }
     }
 
     /// Get next item from stream
@@ -5243,7 +5249,7 @@ mod watched_tests {
     use smg_grpc_client::vllm_proto as vllm;
     use tokio::sync::oneshot;
 
-    use super::ProtoStream;
+    use super::{PrefillCachedTokens, ProtoGenerateComplete, ProtoStream};
     use crate::{
         routers::{
             common::sse::{sse_channel, SseReceiver},
@@ -5310,6 +5316,42 @@ mod watched_tests {
             "the inner stream went with the client"
         );
         assert_eq!(worker.tracked_load(), 0, "its load released with it");
+    }
+
+    /// The client's leaving is seen through a decode-leg wrapper too: dual
+    /// dispatch wraps the watched stream in one once the prefill leg has
+    /// drained, and the reader asks the outer layer.
+    #[tokio::test]
+    async fn a_client_that_leaves_is_seen_through_the_decode_leg_wrapper() {
+        let (stream, _gate, rx) = watched(vec![chunk(0, "a")], vec![complete(0, "stop")]).await;
+        let mut prefill = PrefillCachedTokens::default();
+        prefill.note(&ProtoGenerateComplete::Vllm(Box::new(
+            vllm::GenerateComplete {
+                prompt_tokens: 4,
+                cached_tokens: 2,
+                ..Default::default()
+            },
+        )));
+        let mut stream = stream.decode_leg(prefill);
+        assert!(matches!(stream, ProtoStream::DecodeLeg(_)), "wrapped");
+        assert!(
+            matches!(stream.next().await, Some(Ok(_))),
+            "the first response is read through the wrapper"
+        );
+        assert!(!stream.client_left());
+        let (item, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(stream.next(), async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                drop(rx);
+            })
+        })
+        .await
+        .expect("the gate never opens; the client's leaving ends the wait");
+        assert!(item.is_none(), "the client's leaving is the end");
+        assert!(
+            stream.client_left(),
+            "the end was the client's leaving, seen through the wrapper"
+        );
     }
 
     /// A client that left before the stream was first polled reads nothing:

@@ -1254,17 +1254,17 @@ impl StreamingProcessor {
                     .await;
             }
         }
-        // In PD mode this task only starts once the decode stream exists —
-        // for sequential PD that is after prefill completes, with the first
-        // decode chunk already buffered — so `start_time` would report a
-        // near-zero TTFT. Anchor at the prefill dispatch instant instead;
-        // generation duration must share the base or TPOT underflows.
         // The read ended with the client's leaving, not with the engine's end:
         // no terminal router metric for it, as the HTTP router has none for a
         // disconnect (neither a completed request nor a failure).
         if grpc_stream.client_left() {
             return Ok(());
         }
+        // In PD mode this task only starts once the decode stream exists —
+        // for sequential PD that is after prefill completes, with the first
+        // decode chunk already buffered — so `start_time` would report a
+        // near-zero TTFT. Anchor at the prefill dispatch instant instead;
+        // generation duration must share the base or TPOT underflows.
         let stream_base = pd_timing
             .as_ref()
             .map(|timing| timing.prefill_start)
