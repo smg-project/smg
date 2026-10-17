@@ -16,13 +16,39 @@ with nothing in it, on every path that reads the fragments (a client of the stre
 server call made from the arguments). A member whose key came and whose value never began is not
 one: the call ends with what arrived, and nothing is made up for a value the model botched.
 
-The assembler keeps the promise `ToolCallArguments` makes, that the fragments so far always form a
-valid JSON prefix, as far as the prefix parser can tell: each new run of argument bytes is judged by
-`Prefix`, which accepts what `PartialJson` accepts in prefix mode, before it is emitted, and from
-the first byte it cannot take, the argument bytes come back as `Malformed` with `InvalidArguments`
-instead, nothing already emitted being revised. The prefix parser tolerates what the old crate
-tolerated (a literal's prefix, a bracket closed by the wrong kind where the parent can take it), so
-the promise is exactly as strong as that parser.
+The assembler keeps the promise `ToolCallArguments` makes, that the fragments so far are always a
+prefix of JSON a strict reader accepts: each new run of argument bytes is judged by `Prefix` before
+it is emitted, and from the first byte a strict reader refuses, the argument bytes come back as
+`Malformed` with `InvalidArguments` instead, nothing already emitted being revised. The oracle is
+the template reference and the JSON grammar: the template writes a JSON object that the engine's
+own server hands to a strict reader (`json.loads`, `serde_json`, a client's library), so a call its
+terminal closed is whole only if such a reader takes its arguments. The judge therefore refuses what
+the partial parser (`PartialJson`, the old crate's reader) tolerated and JSON lacks, each at its
+first byte, whole and in pieces alike:
+
+- a value left out before a comma or a close (`{"days": ,}`, `[,,]`) and a trailing comma before a
+  close (`{"days": 3, }`): refused at the comma or the close that stands where a value or a key
+  must;
+- an escape JSON lacks (`"Pa\yris"`), a `\u` escape with fewer than four hex digits
+  (`"\u12G4"`) and a surrogate escape without its other half: refused from the escape's
+  backslash, which is held until the escape is decided (a letter JSON knows, four hex digits that
+  are a character or a pair), so no fragment ends inside an escape and the fragments end before
+  the one the reader refuses, whichever byte of it the reader names;
+- a bracket closed by the wrong kind (`{"a": [1}`) and whitespace JSON lacks between tokens (a
+  no-break space, an ideographic space): refused at the character;
+- a number or a word cut short before a delimiter (`1.}`, `-]`, `nu}`): refused at the delimiter,
+  or from the word's first letter, which the readers hold until the word is decided.
+
+A raw control character inside a string is the one thing JSON lacks that is let through, escaped
+rather than refused (the next paragraph), since the engines' own servers re-serialize what their
+partial reader took and hand out the escape; nothing else is normalized, since no engine's reader
+takes it. A value the outline ended and a strict reader does not take whole (a number or a word the
+object's brace stops, `"arguments": 12.}`) is said to be none by a `Malformed` event of no bytes
+before the call's end, as at the stream's end. The value reader (`json::arguments`) and the Mistral
+object reader (`json::named_arguments`) judge and say the same. The contract tests
+(`tests/contract.rs`) check both halves of the promise under every chunking: a fragment never takes
+a call's arguments past a prefix a strict reader accepts, and a call that closed without a
+`Malformed` event has arguments a strict reader parses whole.
 
 A raw control character inside a string (U+0000..U+001F: a newline in a multi-line value, a tab
 in code), which JSON forbids there and no strict reader accepts, is written in the fragment as its

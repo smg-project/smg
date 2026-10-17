@@ -19,7 +19,10 @@
 
 use crate::{
     event::{Event, Events, MalformedReason, Text},
-    json::arguments::{json_space, Arguments, AsWritten},
+    json::{
+        arguments::{Arguments, AsWritten},
+        prefix::json_space,
+    },
     Declared,
 };
 

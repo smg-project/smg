@@ -16,7 +16,7 @@
 
 use crate::{
     event::{Event, Events, MalformedReason, Text},
-    json::{fragments::Fragments, is_complete, outline::Scanner},
+    json::{fragments::Fragments, outline::Scanner},
 };
 
 /// The arguments object as it arrives.
@@ -63,6 +63,15 @@ impl Object {
         };
         self.emit_new_bytes(close.is_none(), out);
         if close.is_some() {
+            // The object closed. A value the judge refused said so with the bytes; one the
+            // outline ended whole for the partial parser and cut short for a strict reader is
+            // said to be none by a `Malformed` event of no bytes, as the JSON assembler says it.
+            if !self.fragments.refused() && !self.fragments.whole() {
+                out.push(Event::Malformed {
+                    text: Text::default(),
+                    why: MalformedReason::InvalidArguments,
+                });
+            }
             out.push(Event::ToolCallEnd {
                 index: self.index,
                 source: Text::default(),
@@ -82,7 +91,7 @@ impl Object {
             return;
         }
         self.fragments.send_held(&self.text, self.index, out);
-        if !self.fragments.refused() && !is_complete(&self.fragments.escaped(0, &self.text)) {
+        if !self.fragments.refused() && !self.fragments.whole() {
             out.push(Event::Malformed {
                 text: Text::default(),
                 why: MalformedReason::UnterminatedRegion,
@@ -237,10 +246,49 @@ mod tests {
         assert!(matches!(events.last(), Some(Event::ToolCallEnd { .. })));
     }
 
+    /// What the partial parser tolerates and a strict reader refuses (a value left out, a trailing
+    /// comma) closed the call as whole with arguments no JSON reader takes: the fragments stop at
+    /// the first byte a strict reader refuses, the rest is malformed with `InvalidArguments`, and
+    /// the object's brace ends the call, whole and in pieces alike.
+    #[test]
+    fn arguments_a_strict_reader_refuses_are_malformed_from_the_first_such_byte() {
+        for (text, expected_arguments, expected_malformed) in [
+            (
+                "{\"city\": \"Paris\", \"days\": ,}",
+                "{\"city\": \"Paris\", \"days\": ",
+                ",}",
+            ),
+            ("{\"city\": \"Paris\", }", "{\"city\": \"Paris\", ", "}"),
+        ] {
+            let (whole, _) = run(&[text]);
+            let pieces: Vec<&str> = text
+                .char_indices()
+                .map(|(i, c)| &text[i..i + c.len_utf8()])
+                .collect();
+            let (by_char, _) = run(&pieces);
+            for (events, how) in [(&whole, "whole"), (&by_char, "by the character")] {
+                assert_eq!(bytes(events), text, "{text:?} {how}");
+                assert_eq!(arguments(events), expected_arguments, "{text:?} {how}");
+                assert_eq!(malformed(events), expected_malformed, "{text:?} {how}");
+                assert!(
+                    events.iter().all(|event| !matches!(
+                        event,
+                        Event::Malformed { why, .. } if *why != MalformedReason::InvalidArguments
+                    )),
+                    "{text:?} {how}: {events:#?}"
+                );
+                assert!(
+                    matches!(events.last(), Some(Event::ToolCallEnd { .. })),
+                    "{text:?} {how}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn bytes_that_break_the_json_prefix_are_malformed_from_there_whatever_the_cut() {
-        // `@` is no JSON value's first byte, so the boundary does not depend on the cut (junk that
-        // begins like a literal does, as the prefix judge is as lenient as the old crate's).
+        // `@` is no JSON value's first byte, so the boundary does not depend on the cut (a word
+        // that begins like a literal is held until it is decided, so neither does its boundary).
         let text = "{\"city\": @}";
         let (whole, _) = run(&[text]);
         assert_eq!(bytes(&whole), text);

@@ -27,6 +27,5 @@ pub(crate) mod prefix;
 
 pub(crate) use arguments::Arguments;
 pub(crate) use assembler::Assembler;
-pub(crate) use partial::is_complete;
 pub use partial::{PartialJson, PartialJsonError};
 pub(crate) use prefix::Prefix;

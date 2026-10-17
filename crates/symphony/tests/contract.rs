@@ -11,8 +11,8 @@
 //!   them;
 //! - well-formedness: arguments and an end only for a call that has started and not ended, one
 //!   start per index, reasoning text only inside an open region, exactly one `Finish`, counting the
-//!   calls that started, after every fragment each call's arguments so far a valid JSON prefix,
-//!   which is what prefix stability promises a client, and a call that ended, by its own
+//!   calls that started, after every fragment each call's arguments so far a prefix of JSON a
+//!   strict reader accepts, which is what prefix stability promises a client, and a call that ended, by its own
 //!   terminal, the region's or the end of the stream, has arguments that are whole JSON unless a
 //!   `Malformed` event came while it was open, so that a client is never handed a cut call as a
 //!   whole one without a word, and a fragment that closes a string the arguments left open
@@ -42,7 +42,6 @@ use serde_json::json as value;
 use symphony::{
     format::CallId,
     formats::{self, Table},
-    json::PartialJson,
     shape::{
         self, Arguments, Atom, CallShape, Class, Dialect, End, NameSource, Path, Pattern, Slot,
         ValueParser,
@@ -1094,6 +1093,7 @@ const GPT_OSS_OUTPUTS: &[&str] = &[
     "<|channel|>commentary to=functions.f<|message|>not json",
     "<|channel|>commentary to=functions.f<|message|>{} trailing",
     "",
+    "<|channel|>commentary to=functions.get_weather<|message|>{\"city\": \"Paris\", \"days\": ,}",
 ];
 
 /// Calls on abstract tags: a call its trailer closes, terminals whose header does not match (in
@@ -1333,6 +1333,7 @@ const XLAM_OUTPUTS: &[&str] = &[
     "Hello, [not a list].",
     "",
     "[{\"name\": \"get_weather\"}]",
+    "[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\",}}]",
 ];
 
 /// Python calls as Olmo 3 writes them: bare, one per line.
@@ -1371,6 +1372,9 @@ const MISTRAL_OUTPUTS: &[&str] = &[
     "[THINK]Only a thought.[/THINK]",
     "Hello!",
     "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Pa\nris\"}",
+    // A trailing comma and a value left out, at a call its object's brace closes.
+    "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\", }",
+    "[TOOL_CALLS]get_weather[ARGS]{\"city\": ,}[TOOL_CALLS]get_stock_price[ARGS]{}",
 ];
 
 /// Llama Nemotron's calls: one JSON list between `<TOOLCALL>` and `</TOOLCALL>`, content before
@@ -1426,6 +1430,11 @@ const FORCED_OUTPUTS: &[&str] = &[
     "   ",
     "[1, 2]",
     "{\"city\": \"Pa\nris\"}",
+    // A trailing comma, a value left out and an escape JSON lacks, at a value the stream's end
+    // closes.
+    "{\"city\": \"Paris\", }",
+    "{\"city\": \"Paris\", \"days\": ,}",
+    "{\"city\": \"Pa\\yris\"}",
 ];
 
 /// Seed-OSS: the tagged syntax under its own markers, a value as Python's repr, and Qwen's
@@ -1684,6 +1693,24 @@ const QWEN3_OUTPUTS: &[&str] = &[
     // stays.
     "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Pa\nris\", \"days\": 3}}\n</tool_call>",
     "<tool_call>{\"name\": \"f\", \"arguments\": {\"k\u{12}\": \"\\\n\u{1}\",\n\"t\": \"a\tb\"}}</tool_call>",
+    // What the partial parser tolerates and a strict reader refuses, at a call its own marker
+    // closes: a value left out, a trailing comma after a value and after a member, list items left
+    // out, an escape JSON lacks, a `\u` escape short of four hex digits, a bracket of the wrong
+    // kind, whitespace JSON lacks, a number and a word cut short before the close, and a number
+    // and a word the object's own brace cuts short. The fragments stop at the first byte the
+    // reader refuses; the rest, or nothing, is said to be malformed before the end.
+    "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"days\": ,}}\n</tool_call>",
+    "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"days\": 3, }}\n</tool_call>",
+    "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\",}}\n</tool_call>",
+    "<tool_call>{\"name\": \"f\", \"arguments\": {\"tags\": [,,]}}</tool_call>",
+    "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Pa\\yris\"}}</tool_call>",
+    "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"\\u12G4\"}}</tool_call>",
+    "<tool_call>{\"name\": \"f\", \"arguments\": {\"a\": [1}}</tool_call>",
+    "<tool_call>{\"name\": \"f\", \"arguments\": {\"a\":\u{a0}1}}</tool_call>",
+    "<tool_call>{\"name\": \"f\", \"arguments\": {\"n\": 1.}}</tool_call>",
+    "<tool_call>{\"name\": \"f\", \"arguments\": {\"flag\": nu}}</tool_call>",
+    "<tool_call>{\"name\": \"f\", \"arguments\": 1.}</tool_call>",
+    "<tool_call>{\"name\": \"f\", \"arguments\": nu}</tool_call>",
 ];
 
 /// The outputs bellwether's common set records for MiMo-V2.5 (Qwen 3.5's tags, the value between
@@ -1722,6 +1749,7 @@ const JSON_OUTPUTS: &[&str] = &[
     "{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Par",
     "{\"name\": \"f\", \"arguments\": {}} and then some",
     "{\"name\": \"get_weather\"}",
+    "{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\", }}",
 ];
 
 /// The outputs bellwether's common set records for MiniMax M2 (the thought the prompt opens
@@ -1931,9 +1959,15 @@ fn replay(
     )
 }
 
-/// Whether `text` is a JSON prefix the prefix parser takes whole.
-fn valid_json_prefix(text: &str) -> bool {
-    matches!(PartialJson::default().parse(text, true), Ok((_, consumed)) if consumed == text.len())
+/// Whether `text` is a prefix of JSON a strict reader accepts: whole, or cut where the reader asks
+/// for more bytes rather than refusing one it saw. The crate's partial parser is no oracle here: its
+/// prefix mode tolerates what JSON lacks (a trailing comma, a value left out, an escape JSON lacks),
+/// which is what a client's reader refuses once the call ends.
+fn strict_json_prefix(text: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(_) => true,
+        Err(error) => error.is_eof(),
+    }
 }
 
 /// Whether `fragment`, appended to the arguments `so_far`, closes a JSON string `so_far` left
@@ -2016,8 +2050,8 @@ fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event]) {
                     );
                     so_far.push_str(json);
                     assert!(
-                        valid_json_prefix(so_far),
-                        "{}: the arguments so far, {so_far:?}, are no valid JSON prefix",
+                        strict_json_prefix(so_far),
+                        "{}: the arguments so far, {so_far:?}, are no prefix of JSON a strict reader accepts",
                         place()
                     );
                 }

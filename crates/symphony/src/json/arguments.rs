@@ -31,7 +31,7 @@
 
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
-    json::{is_complete, Prefix},
+    json::{prefix::json_space, Prefix},
 };
 
 /// What the reader does with a member of the value's top-level object whose value is a string:
@@ -58,11 +58,6 @@ impl Strings for AsWritten {
     fn typed(&self, _key: &str, _raw: &str) -> Option<String> {
         None
     }
-}
-
-/// The whitespace JSON allows before a value.
-pub(crate) fn json_space(c: char) -> bool {
-    matches!(c, ' ' | '\t' | '\n' | '\r')
 }
 
 /// The argument events of one call, from the bytes of its arguments value.
@@ -294,12 +289,10 @@ impl Arguments {
         let before = self.value.len();
         self.value.push_str(rest);
         let refused = self.prefix.feed(rest);
-        if let Some(end) = self.prefix.ended() {
-            if self.invalid_from.is_none()
-                && is_complete(&self.prefix.escaped(0, &self.value[..end]))
-            {
-                self.whole = Some(end);
-            }
+        // The judge ends none but a value a strict reader takes whole, so the value is whole where
+        // it ended.
+        if self.invalid_from.is_none() {
+            self.whole = self.prefix.ended();
         }
         let end = self.whole.unwrap_or(self.value.len());
         if self.invalid_from.is_none() {
@@ -315,7 +308,7 @@ impl Arguments {
         }
         let mut upto = end;
         if self.invalid_from.is_none() && self.whole.is_none() {
-            // A word being spelled and a surrogate escape awaiting its low half are held; a
+            // A word being spelled and an escape being read (from its backslash) are held; a
             // string streams on, as a string parameter would otherwise wait for its closing
             // quote, and a surrogate that breaks inside it is the one case where the pieces say
             // more of the value than the whole, which refuses it (`Prefix::held_from`).
@@ -342,7 +335,7 @@ impl Arguments {
         if self.whole.is_none()
             && self.started
             && self.invalid_from.is_none()
-            && is_complete(&self.prefix.escaped(0, &self.value))
+            && self.prefix.whole()
         {
             self.whole = Some(self.value.len());
         }
@@ -592,6 +585,64 @@ mod tests {
         );
         assert!(arguments.whole());
         assert_eq!(fragments(&out.drain()), "{\"s\": \"a\\nb\"}");
+    }
+
+    /// What the partial parser tolerates and a strict reader refuses is refused from the first
+    /// such byte: the fragments before it stand, the rest of the value is malformed with
+    /// `InvalidArguments`, the value is never whole, and the cut changes nothing of it.
+    #[test]
+    fn what_a_strict_reader_refuses_is_malformed_from_the_first_such_byte() {
+        for (text, expected_fragments) in [
+            (
+                "{\"city\": \"Paris\", \"days\": ,}",
+                "{\"city\": \"Paris\", \"days\": ",
+            ),
+            (
+                "{\"city\": \"Paris\", \"days\": 3, }",
+                "{\"city\": \"Paris\", \"days\": 3, ",
+            ),
+            ("{\"tags\": [,,]}", "{\"tags\": ["),
+            ("{\"city\": \"Pa\\yris\"}", "{\"city\": \"Pa"),
+            ("{\"city\": \"\\u12G4\"}", "{\"city\": \""),
+            ("{\"a\": [1}", "{\"a\": [1"),
+            ("{\"n\": 1.}", "{\"n\": 1."),
+            ("{\"a\":\u{a0}1}", "{\"a\":"),
+            ("{\"flag\": nu}", "{\"flag\": "),
+        ] {
+            let whole = run(&[text]);
+            let pieces: Vec<&str> = text
+                .char_indices()
+                .map(|(i, c)| &text[i..i + c.len_utf8()])
+                .collect();
+            let by_char = run(&pieces);
+            for ((events, taken, fed, finished), how) in
+                [(whole, "whole"), (by_char, "by the character")]
+            {
+                assert_eq!(fragments(&events), expected_fragments, "{text:?} {how}");
+                assert_eq!(sources(&events), text, "{text:?} {how}");
+                assert_eq!(
+                    taken.iter().sum::<usize>(),
+                    text.len(),
+                    "{text:?} {how}: a broken value takes every byte"
+                );
+                assert!(!fed && !finished, "{text:?} {how}");
+                let malformed: String = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        Event::Malformed { text, why } => {
+                            assert_eq!(*why, MalformedReason::InvalidArguments, "{text:?} {how}");
+                            Some(text.text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    malformed,
+                    &text[expected_fragments.len()..],
+                    "{text:?} {how}"
+                );
+            }
+        }
     }
 
     #[test]
