@@ -1061,7 +1061,7 @@ mod tests {
         for flags in [
             v13.clone(),
             pair(Some(TEMPLATE_PARSER), Some(TEMPLATE_PARSER)),
-            pair(Some("mistral"), None),
+            pair(Some("cohere"), None),
             pair(Some("passthrough"), None),
         ] {
             assert_eq!(
@@ -1084,7 +1084,7 @@ mod tests {
         )
         .is_err());
         assert_eq!(
-            read(&ModelNames::flagged(&pair(Some("mistral"), None)), unknown),
+            read(&ModelNames::flagged(&pair(Some("cohere"), None)), unknown),
             Ok(None)
         );
         assert_eq!(
@@ -1135,7 +1135,7 @@ mod tests {
             qwen3("the model's response template")
         );
         assert_eq!(
-            spelled(pair(Some("mistral"), None), known),
+            spelled(pair(Some("cohere"), None), known),
             qwen3("the legacy parsers")
         );
         assert_eq!(
