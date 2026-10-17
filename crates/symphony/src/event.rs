@@ -70,6 +70,8 @@ pub enum DropReason {
     Wrapper,
     /// Whitespace the format treats as structural.
     Whitespace,
+    /// A call after the first, where the request takes one call only ([`first_call_only`]).
+    LaterCall,
 }
 
 /// Why a region could not be parsed. Its text is returned, never lost.
@@ -371,21 +373,25 @@ pub fn reasoning_text_tokens(events: &[Event]) -> u32 {
 }
 
 /// One call only (`parallel_tool_calls: false`, `disable_parallel_tool_use`): the events of
-/// every call after the first are dropped and the finish counts at most one. A table's grammar
-/// limits a forced call; this limits a free one.
-pub fn first_call_only(events: &mut Vec<Event>) {
-    events.retain(|event| {
-        !matches!(
-            event,
-            Event::ToolCallStart { index, .. }
-                | Event::ToolCallArguments { index, .. }
-                | Event::ToolCallEnd { index, .. }
-                if *index > 0
-        )
-    });
+/// every call after the first become its dropped text, so every byte of the output still lands
+/// in one event and the content ranges after the call hold
+/// ([`content_spans`](crate::adapt::chat::content_spans)); the finish counts at most one. A
+/// table's grammar limits a forced call; this limits a free one.
+pub fn first_call_only(events: &mut [Event]) {
     for event in events {
-        if let Event::Finish { tool_calls, .. } = event {
-            *tool_calls = (*tool_calls).min(1);
+        match event {
+            Event::ToolCallStart { index, source, .. }
+            | Event::ToolCallArguments { index, source, .. }
+            | Event::ToolCallEnd { index, source, .. }
+                if *index > 0 =>
+            {
+                *event = Event::Dropped {
+                    text: std::mem::take(source),
+                    why: DropReason::LaterCall,
+                };
+            }
+            Event::Finish { tool_calls, .. } => *tool_calls = (*tool_calls).min(1),
+            _ => {}
         }
     }
 }
@@ -449,6 +455,22 @@ mod tests {
             .collect();
         assert_eq!(indices, [0, 0, 0]);
         assert!(matches!(events.first(), Some(Event::Content(_))));
+        let dropped: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped {
+                    text,
+                    why: DropReason::LaterCall,
+                } => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dropped,
+            ["<", "{}", ">"],
+            "the second call's bytes stay, in place"
+        );
+        assert_eq!(events.len(), 8);
         assert!(matches!(
             events.last(),
             Some(Event::Finish { tool_calls: 1, .. })
