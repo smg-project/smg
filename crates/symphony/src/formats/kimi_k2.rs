@@ -26,7 +26,10 @@
 //! the turns the six templates render (`tests/fixtures/rendered/kimi_k2.json`, written by
 //! `scripts/render_kimi_k2_turns.py`, replayed at every cut by `tests/rendered_fixtures.rs`) and on
 //! the tests below. The gateway's older `kimik2` parser reads the same spelling, with the
-//! `kimi_thinking` and `kimi_k25` thought parsers.
+//! `kimi_thinking` and `kimi_k25` thought parsers; one departure from `kimi_thinking`, which read
+//! everything before `</think>` as the thought whether or not `<think>` came first: this table
+//! starts K2 Thinking in content, so an output that closes a thought it never opened is content
+//! as written, the marker included (the templates always write the opener; the tests pin it).
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
@@ -362,6 +365,13 @@ mod tests {
         let events = run(PROMPT, &["<think>Plan.</think>It is sunny."]);
         assert_eq!(reasoning(&events), "Plan.");
         assert_eq!(content(&events), "It is sunny.");
+        // K2 Thinking closing a thought it never opened: the output starts in content, where
+        // the table has no row for `</think>`, so the turn is content as written, the marker
+        // included. The older `kimi_thinking` parser read everything before the marker as the
+        // thought; the table departs from it there, and this pins the departure.
+        let events = run(PROMPT, &["Plan.</think>It is sunny."]);
+        assert_eq!(reasoning(&events), "");
+        assert_eq!(content(&events), "Plan.</think>It is sunny.");
         // K2 Instruct: no thought at all.
         let events = run(PROMPT, &["It is sunny."]);
         assert_eq!(reasoning(&events), "");

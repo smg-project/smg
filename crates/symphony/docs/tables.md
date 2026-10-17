@@ -434,7 +434,11 @@ wrapper state for the block, an arguments state per call):
   turns thinking off; K2.7-Code's end with `<think>`, with no switch. The prompt's replay puts
   the output inside the thought or in content accordingly. Under K2 Instruct a `<think>` the
   model never writes would be read as a thought, the choice the DeepSeek V3 table made for the
-  same reason: one table serves the deployments that name the line's older parsers.
+  same reason: one table serves the deployments that name the line's older parsers. One
+  departure from the older `kimi_thinking` parser, which read everything before `</think>` as
+  the thought whether or not `<think>` came first: K2 Thinking starts in content here, so an
+  output that closes a thought it never opened is content as written, the marker included (the
+  template always writes the opener; the module tests pin the reading).
 - **The id is a call given as data.** `<|tool_call_begin|>` opens a call only where
   `functions.NAME:N<|tool_call_argument_begin|>` follows it (the shaped header: `functions.`,
   which the gateway's older `kimik2` parser also reads without, the name, `:`, the index, and
