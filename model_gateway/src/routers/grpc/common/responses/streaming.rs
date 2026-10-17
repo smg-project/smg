@@ -101,7 +101,7 @@ struct ToolCallStreamItem {
 /// reported a failed generation (also the case when the finish reason alone
 /// says so and no error object was built). Anything else counts as `other`
 /// so a client-visible code can never widen the label set.
-pub(crate) fn failure_reason(error: Option<&serde_json::Value>) -> &'static str {
+fn failure_reason(error: Option<&serde_json::Value>) -> &'static str {
     match error.and_then(|e| e.get("code")).and_then(|c| c.as_str()) {
         Some("stream_error") => "stream_error",
         Some("server_error") | None => "server_error",
@@ -533,6 +533,29 @@ impl ResponseStreamEventEmitter {
             Metrics::record_responses_stream_failure(&self.model, failure_reason(error));
         }
         Ok(())
+    }
+
+    /// The terminal of a run whose items the stream processor has already
+    /// closed: `response.completed` with the usage, or `response.failed` when
+    /// the record could not be stored. Sent best-effort, since nothing follows;
+    /// the failure is counted only once the terminal reached the client, as
+    /// [`emit_terminal`](Self::emit_terminal) counts. Unlike `emit_terminal`
+    /// it closes no item, so an item left open stays as the processor left it.
+    pub async fn finish_stream(
+        &mut self,
+        usage: &Usage,
+        not_stored: Option<&serde_json::Value>,
+        tx: &SseSender,
+    ) {
+        let usage_json = json!(ResponseUsage::from(usage));
+        let event = match not_stored {
+            Some(error) => self.emit_failed(Some(&usage_json), error),
+            None => self.emit_completed(Some(&usage_json)),
+        };
+        let delivered = self.send_event_best_effort(&event, tx).await;
+        if delivered && not_stored.is_some() {
+            Metrics::record_responses_stream_failure(&self.model, failure_reason(not_stored));
+        }
     }
 
     /// Convert tool entries to JSON values using the shared bridge builder.
