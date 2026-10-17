@@ -647,19 +647,12 @@ jobs:
       # pull request, a change confined to the Symphony crate.
       docs-only: ${{ steps.lanes.outputs.docs-only }}
       symphony-only: ${{ steps.lanes.outputs.symphony-only }}
-      common: ${{ steps.filter.outputs.common }}
-      chat-completions: ${{ steps.filter.outputs.chat-completions }}
-      completions: ${{ steps.filter.outputs.completions }}
-      agentic: ${{ steps.filter.outputs.agentic }}
-      embeddings: ${{ steps.filter.outputs.embeddings }}
-      realtime: ${{ steps.filter.outputs.realtime }}
-      go-bindings: ${{ steps.filter.outputs.go-bindings }}
       rust-ci: ${{ steps.filter.outputs.rust-ci }}
       # The rust-tests matrix: the shards of scripts/ci_rust_tests.sh a pull
       # request can affect (every shard on a push or a dispatch); '[]' skips the job.
       rust-shards: ${{ steps.rust-shards.outputs.rust-shards }}
       dependencies: ${{ steps.filter.outputs.dependencies }}
-      # The GPU e2e lanes' decisions, one per area (the same step).
+      # The GPU e2e lanes' decisions, one per area, from the tier table (the same step).
       skip-chat-completions: ${{ steps.lanes.outputs.skip-chat-completions }}
       skip-chat-symphony: ${{ steps.lanes.outputs.skip-chat-symphony }}
       skip-completions: ${{ steps.lanes.outputs.skip-completions }}
@@ -704,6 +697,9 @@ jobs:
           # Lets a filter exclude paths with `!` patterns. Filters without them
           # behave exactly as before: any changed file matching any pattern.
           predicate-quantifier: 'some-with-excludes'
+          # Lists each filter's files (`<filter>_files`, one JSON line): the tier
+          # table of the "Decide the e2e lanes" step reads `all_files`.
+          list-files: json
           filters: |
             docs:
               - '**/*.md'
@@ -714,84 +710,9 @@ jobs:
               - 'e2e_test/**'
               - '**/tests/**'
               - '**/fixtures/**'
-            common:
-              - 'model_gateway/**'
-              - 'crates/protocols/**'
-              - 'bindings/**'
-              - 'e2e_test/conftest.py'
-              - 'e2e_test/infra/**'
-              - 'e2e_test/fixtures/**'
-              - 'Cargo.lock'
-              - '.github/actions/**'
-              - '.github/workflows/pr-test-rust.yml'
-              - '.github/workflows/e2e-gpu-job.yml'
-              - 'scripts/ci_setup_python_venv.sh'
-              - 'scripts/ci_retry.sh'
-              - 'scripts/ci_apt_mirror.sh'
-              - 'scripts/ci_ensure_python_headers.sh'
-              - 'scripts/ci_install_sglang.sh'
-              - 'scripts/ci_install_vllm.sh'
-              - 'scripts/ci_install_tokenspeed.sh'
-              - 'scripts/ci_tokenspeed_scheduler_pin.py'
-              - 'scripts/ci_install_flashinfer.py'
-              - '.github/versions/tokenspeed.ref'
-              - '.github/versions/tokenspeed-nightly.txt'
-              - 'scripts/ci_install_e2e_deps.sh'
-              - 'scripts/ci_killall_sglang.sh'
-              - 'scripts/ci_build_wheel.sh'
-              - 'crates/tokenizer/**'
-              - 'crates/tool_parser/**'
-              # Router-embedded crates: changes here alter gateway behavior
-              # across every API surface, so they must trigger the e2e lanes.
-              - 'crates/auth/**'
-              - 'crates/kv_index/**'
-              - 'crates/mesh/**'
-              - 'crates/mm_rdma/**'
-              - 'crates/rl/**'
-              - 'crates/wasm/**'
-              - 'crates/workflow/**'
-            chat-completions:
-              - 'crates/reasoning_parser/**'
-              - 'crates/response_template/**'
-              - 'crates/multimodal/**'
-              - 'crates/grpc_client/**'
-              # The ZMQ wire crates drive the e2e-*-chat-zmq* lanes and the
-              # Rust-servicer lane, which gate on this filter.
-              - 'crates/engine_zmq_client/**'
-              - 'crates/engine_zmq_adapter/**'
-              - 'crates/engine_servicer/**'
-              - 'crates/mock_worker/**'
-              - 'grpc_servicer/**'
-              - 'e2e_test/chat_completions/**'
-              - 'e2e_test/router/**'
-              - 'scripts/ci_install_vllm.sh'
-              - 'scripts/ci_install_trtllm.sh'
-              - 'scripts/ci_apt_mirror.sh'
-              - 'scripts/ci_install_tokenspeed.sh'
-              - 'scripts/ci_tokenspeed_scheduler_pin.py'
-              - 'scripts/ci_install_flashinfer.py'
-              - 'scripts/ci_tokenspeed_image_tag.sh'
-              - 'scripts/ci_fetch_tokenspeed_prebuilt.sh'
-              - '.github/versions/tokenspeed.ref'
-              - '.github/versions/tokenspeed-nightly.txt'
-            agentic:
-              - 'crates/mcp/**'
-              - 'crates/data_connector/**'
-              - 'e2e_test/responses/**'
-              - 'e2e_test/messages/**'
-              - 'scripts/ci_agentic_svc_deps.sh'
-              - 'scripts/ci_apt_mirror.sh'
-              - 'scripts/oracle_flyway/**'
-            completions:
-              - 'crates/grpc_client/**'
-              - 'grpc_servicer/**'
-              - 'e2e_test/completions/**'
-            embeddings:
-              - 'e2e_test/embeddings/**'
-            realtime:
-              - 'e2e_test/realtime/**'
-            go-bindings:
-              - 'e2e_test/bindings_go/**'
+            # Every changed file, for the tier table.
+            all:
+              - '**'
             symphony:
               - 'crates/symphony/**'
             # Everything that is not Symphony's crate or the lock file. A PR is Symphony-only
@@ -927,60 +848,317 @@ jobs:
               - 'scripts/ci_cargo_audit.sh'
               - '.github/workflows/pr-test-rust.yml'
 
-      # The two shortcuts and whether each GPU e2e lane skips, decided here once.
-      # A lane's `if:` reads its `skip-<area>` output and adds only what is its
+      # The two shortcuts and whether each GPU e2e lane skips, decided here once:
+      # the tier table below maps a changed path to the lanes it can reach. A
+      # lane's `if:` reads its `skip-<area>` output and adds only what is its
       # own: `always() && !cancelled()`, its prerequisite's result and, on a pull
-      # request, this job's success. The step runs when the filter failed too: its
-      # outputs then skip nothing, so a push still runs every lane, and a pull
-      # request runs none through the lanes' own condition on this job's result.
+      # request, this job's success. The step runs when the filter failed too:
+      # its outputs then skip nothing, so a push still runs every lane, and a
+      # pull request runs none through the lanes' own condition on this job's
+      # result.
       - name: Decide the e2e lanes
         id: lanes
         if: always()
         env:
           PULL_REQUEST: ${{ github.event_name == 'pull_request' }}
-          CHANGED: ${{ toJSON(steps.filter.outputs) }}
+          # The label `ci:full` runs every lane whatever the paths say. It is read
+          # from the event, so a pull request labelled after its last push takes
+          # it on the next push (or on a close and reopen).
+          FORCE_FULL: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+          CHANGED_FILES: ${{ steps.filter.outputs.all_files }}
+          DOCS: ${{ steps.filter.outputs.docs }}
+          NON_DOCS: ${{ steps.filter.outputs.non-docs }}
+          TESTS: ${{ steps.filter.outputs.tests }}
+          SYMPHONY: ${{ steps.filter.outputs.symphony }}
+          OUTSIDE_SYMPHONY: ${{ steps.filter.outputs.outside-symphony }}
         run: |
           python3 - <<'EOF'
-          import json, os
+          import json, os, re, sys
 
-          pull_request = os.environ["PULL_REQUEST"] == "true"
-          changed = json.loads(os.environ["CHANGED"])
+          env = os.environ
+          pull_request = env.get("PULL_REQUEST") == "true"
+          # The label: every lane, and neither shortcut.
+          force_full = pull_request and env.get("FORCE_FULL") == "true"
 
           # Only pull requests take the docs-only shortcut; a push keeps its coverage.
           docs_only = (
               pull_request
-              and changed.get("docs") == "true"
-              and changed.get("non-docs") == "false"
-              and changed.get("tests") == "false"
+              and not force_full
+              and env.get("DOCS") == "true"
+              and env.get("NON_DOCS") == "false"
+              and env.get("TESTS") == "false"
           )
           # Symphony is not wired into the gateway yet: a change confined to its crate and
           # the lock file runs the CPU checks and the Symphony chat lane only.
           symphony_only = (
-              changed.get("symphony") == "true" and changed.get("outside-symphony") == "false"
+              not force_full
+              and env.get("SYMPHONY") == "true"
+              and env.get("OUTSIDE_SYMPHONY") == "false"
           )
 
-          def pull_request_without(*areas):
-              """A pull request that touched neither the common paths nor one of `areas`."""
-              return pull_request and not any(changed.get(a) == "true" for a in ("common", *areas))
+          # The areas, one per skip-<area> output, each the gate of a group of lanes:
+          #   chat-completions  the chat and router suites on every engine: the chat,
+          #                     Rust-servicer, worker-side multimodal, ZMQ, gateway, PD,
+          #                     EPD and 4-GPU lanes
+          #   chat-symphony     the chat suite read through Symphony
+          #   completions, embeddings, realtime, go-bindings   that suite's lane
+          #   agentic           the Responses suite on an engine
+          #   vendor            the Responses, Messages and realtime suites on the cloud
+          #                     providers (CPU)
+          AREAS = ("chat-completions", "chat-symphony", "completions", "embeddings",
+                   "realtime", "agentic", "vendor", "go-bindings")
+          FULL = " ".join(AREAS)
+          NONE = ""
+          # A gateway module no suite targets: the chat, Symphony and Responses suites
+          # and the vendor rows read every response through it and witness a
+          # regression; the completions, embeddings, realtime and Go suites drive
+          # paths of their own, named below where a change reaches them.
+          CORE = "chat-completions chat-symphony agentic vendor"
+          # One engine's own files reach the lanes with a row for that engine.
+          SGLANG = "chat-completions chat-symphony completions embeddings agentic go-bindings"
+          VLLM = "chat-completions chat-symphony completions embeddings realtime"
+          TRTLLM = "chat-completions"
+          TOKENSPEED = "chat-completions"
 
-          # No lane for a docs-only or a Symphony-only change; a push and a manual run
-          # take every lane; a pull request takes the lanes whose area or the common
-          # paths changed.
-          skip = {
-              area: docs_only or symphony_only or pull_request_without(area)
-              for area in ("chat-completions", "completions", "embeddings", "realtime", "agentic", "go-bindings")
-          }
+          # The tier table: the lanes a changed path can reach. The first row a path
+          # matches decides; a path no row matches reaches every lane, so a new path
+          # runs the whole matrix until a row places it. `**` spans directories, `*`
+          # one segment of a path. A pull request runs the union over its files; a
+          # push and a manual run keep every lane.
+          TIERS = [
+              # documentation, licences, assets, lint and format configuration
+              ("**/*.md",                                        NONE),
+              ("**/LICENSE",                                     NONE),
+              ("docs/**",                                        NONE),
+              ("assets/**",                                      NONE),
+              (".gitignore",                                     NONE),
+              (".dockerignore",                                  NONE),
+              (".pre-commit-config.yaml",                        NONE),
+              ("clippy.toml",                                    NONE),
+              ("rustfmt.toml",                                   NONE),
+              ("ruff.toml",                                      NONE),
+              ("mypy.ini",                                       NONE),
+              ("Makefile",                                       NONE),
+              # deployment, images and examples no lane builds; the two WASM guests
+              # built with the wheel for the Responses suite's storage-hook cases
+              ("deploy/**",                                      NONE),
+              ("docker/**",                                      NONE),
+              ("examples/wasm/wasm-guest-storage-hook/**",       "agentic vendor"),
+              ("examples/wasm/wasm-guest-storage-hook-passthrough/**", "agentic vendor"),
+              ("examples/**",                                    NONE),
+              # the workspace: the manifest, the lock file and the toolchain shape every binary
+              ("Cargo.toml",                                     FULL),
+              ("Cargo.lock",                                     FULL),
+              ("rust-toolchain.toml",                            FULL),
+              (".cargo/audit.toml",                              NONE),
+              (".cargo/**",                                      FULL),
+              # this workflow, the GPU job and the actions the lanes run; an engine's
+              # setup action its rows; other workflows and the repository's automation none
+              (".github/workflows/pr-test-rust.yml",             FULL),
+              (".github/workflows/e2e-gpu-job.yml",              FULL),
+              (".github/workflows/**",                           NONE),
+              (".github/actions/setup-sglang/**",                SGLANG),
+              (".github/actions/setup-vllm/**",                  VLLM),
+              (".github/actions/setup-trtllm/**",                TRTLLM),
+              (".github/actions/setup-tokenspeed/**",            TOKENSPEED),
+              (".github/actions/setup-gh/**",                    NONE),
+              (".github/actions/export-pod-api-key/**",          NONE),
+              (".github/actions/publish-crate/**",               NONE),
+              (".github/actions/**",                             FULL),
+              (".github/versions/tokenspeed.ref",                TOKENSPEED),
+              (".github/versions/tokenspeed-nightly.txt",        TOKENSPEED),
+              (".github/**",                                     NONE),
+              # the CI scripts: an engine's installers its rows; the agentic services the
+              # Responses, Messages and vendor lanes; the scripts of other workflows none;
+              # the scripts every lane runs (the venv, the wheel, the models, the logs) all
+              ("scripts/ci_install_sglang.sh",                   SGLANG),
+              ("scripts/ci_install_vllm.sh",                     VLLM),
+              ("scripts/ci_install_flashinfer_jit_cache.sh",     VLLM),
+              ("scripts/ci_install_trtllm.sh",                   TRTLLM),
+              ("scripts/ci_install_tokenspeed.sh",               TOKENSPEED),
+              ("scripts/ci_fetch_tokenspeed_prebuilt.sh",        TOKENSPEED),
+              ("scripts/ci_tokenspeed_image_tag.sh",             TOKENSPEED),
+              ("scripts/ci_tokenspeed_scheduler_pin.py",         TOKENSPEED),
+              ("scripts/ci_install_flashinfer.py",               TOKENSPEED),
+              ("scripts/ci_agentic_svc_deps.sh",                 "agentic vendor"),
+              ("scripts/oracle_flyway/**",                       "agentic vendor"),
+              ("scripts/ci_cargo_audit.sh",                      NONE),
+              ("scripts/ci_gpu_runner_image.py",                 NONE),
+              ("scripts/ci_node_health.py",                      NONE),
+              ("scripts/ci_prune_tokenspeed_images.sh",          NONE),
+              ("scripts/ci_setup_sglang_rocm_image.sh",          NONE),
+              ("scripts/ci_setup_vllm_rocm_image.sh",            NONE),
+              ("scripts/ci_*",                                   FULL),
+              ("scripts/**",                                     NONE),
+              # the servicers: an engine's package its rows; the MLX servicer has its own
+              # workflow; the tests and their stub generator two rows run against a real
+              # engine; the shared modules and the package every lane
+              ("grpc_servicer/smg_grpc_servicer/sglang/**",      SGLANG),
+              ("grpc_servicer/smg_grpc_servicer/vllm/**",        VLLM),
+              ("grpc_servicer/smg_grpc_servicer/tokenspeed/**",  TOKENSPEED),
+              ("grpc_servicer/smg_grpc_servicer/mlx/**",         NONE),
+              ("grpc_servicer/tests/**",                         "chat-completions"),
+              ("grpc_servicer/scripts/**",                       "chat-completions"),
+              ("grpc_servicer/**",                               FULL),
+              # the e2e suites: a suite its lane; the suites of other workflows and the
+              # advisory benchmarks none; the harness, its fixtures and the client every lane
+              ("e2e_test/chat_completions/**",                   "chat-completions chat-symphony"),
+              ("e2e_test/router/**",                             "chat-completions"),
+              ("e2e_test/completions/**",                        "completions"),
+              ("e2e_test/embeddings/**",                         "embeddings"),
+              ("e2e_test/realtime/**",                           "realtime vendor"),
+              ("e2e_test/responses/**",                          "agentic vendor"),
+              ("e2e_test/messages/**",                           "agentic vendor"),
+              ("e2e_test/bindings_go/**",                        "go-bindings"),
+              ("e2e_test/benchmarks/**",                         NONE),
+              ("e2e_test/file_discovery/**",                     NONE),
+              ("e2e_test/kind_discovery/**",                     NONE),
+              ("e2e_test/mlx/**",                                NONE),
+              ("e2e_test/**",                                    FULL),
+              ("pytest.ini",                                     FULL),
+              ("clients/python/smg_client/api/completions.py",   "completions"),
+              ("clients/python/smg_client/api/embeddings.py",    "embeddings"),
+              ("clients/python/smg_client/api/responses.py",     "agentic vendor"),
+              ("clients/python/smg_client/api/messages.py",      "agentic vendor"),
+              ("clients/python/tests/**",                        NONE),
+              ("clients/python/**",                              FULL),
+              ("clients/openapi-gen/**",                         FULL),
+              ("clients/**",                                     NONE),
+              # the bindings: the wheel every lane installs; the Go library its lane
+              ("bindings/python/tests/**",                       NONE),
+              ("bindings/python/.coveragerc",                    NONE),
+              ("bindings/python/**",                             FULL),
+              ("bindings/golang/**",                             "go-bindings"),
+              # the gateway: its test trees none; the Responses and conversations
+              # endpoints their lanes; the modules no suite targets the core; the
+              # routers (the Symphony seam among them: it chooses the parser of every
+              # request), the workers, the configuration, the registration workflow,
+              # the server and the entry points every lane
+              ("model_gateway/tests/**",                         NONE),
+              ("model_gateway/benches/**",                       NONE),
+              ("model_gateway/src/endpoints/responses/**",       "agentic vendor"),
+              ("model_gateway/src/endpoints/conversations/**",   "agentic vendor"),
+              ("model_gateway/src/endpoints/**",                 CORE),
+              ("model_gateway/src/middleware/**",                CORE),
+              ("model_gateway/src/observability/**",             CORE),
+              ("model_gateway/src/rate_limit/**",                CORE),
+              ("model_gateway/src/policies/**",                  CORE),
+              ("model_gateway/src/mesh/**",                      CORE),
+              ("model_gateway/src/mesh_discovery/**",            CORE),
+              ("model_gateway/src/service_discovery/**",         CORE),
+              ("model_gateway/src/wasm/**",                      CORE),
+              ("model_gateway/src/tls.rs",                       CORE),
+              ("model_gateway/src/version.rs",                   CORE),
+              ("model_gateway/src/posture.rs",                   CORE),
+              ("model_gateway/src/tenant.rs",                    CORE),
+              ("model_gateway/src/rl_adapter.rs",                CORE),
+              ("model_gateway/**",                               FULL),
+              # the crates: test trees, benches, fuzzers, examples and tooling none (the
+              # WASM fixtures directory builds the storage-hook guests); crates no lane's
+              # binary links none; the tokenizer none, its oracle being the fixture
+              # parity gate (the render and encode of every registered model against
+              # the reference fixtures, in its own workflow on every pull request that
+              # touches the crate) and the crate's tests
+              ("crates/wasm/tests/fixtures/**",                  "agentic vendor"),
+              ("crates/*/tests/**",                              NONE),
+              ("crates/*/benches/**",                            NONE),
+              ("crates/*/fuzz/**",                               NONE),
+              ("crates/*/examples/**",                           NONE),
+              ("crates/*/docs/**",                               NONE),
+              ("crates/*/scripts/**",                            NONE),
+              ("crates/*/tools/**",                              NONE),
+              ("crates/grpc_client/go/**",                       NONE),
+              ("crates/mock_worker/**",                          NONE),
+              ("crates/radix_tree/**",                           NONE),
+              ("crates/tokenizer/**",                            NONE),
+              # Symphony and the response templates it compiles: read behind
+              # --parser symphony, the Symphony lane's flag
+              ("crates/symphony/**",                             "chat-symphony"),
+              ("crates/response_template/**",                    "chat-symphony"),
+              # the Rust servicer and the ZMQ wire: lanes of the chat family
+              ("crates/engine_servicer/**",                      "chat-completions"),
+              ("crates/engine_zmq_client/**",                    "chat-completions"),
+              ("crates/engine_zmq_adapter/**",                   "chat-completions"),
+              # the Responses tools and the provider routers
+              ("crates/mcp/**",                                  "agentic vendor"),
+              ("crates/external_router/**",                      "agentic vendor"),
+              # crates the gateway alone links, on every suite's path: the core (the
+              # Go library links the tool parser too)
+              ("crates/tool_parser/**",                          CORE + " go-bindings"),
+              ("crates/reasoning_parser/**",                     CORE),
+              ("crates/multimodal/**",                           CORE),
+              ("crates/kv_index/**",                             CORE),
+              ("crates/data_connector/**",                       CORE),
+              ("crates/auth/**",                                 CORE),
+              ("crates/mesh/**",                                 CORE),
+              ("crates/mm_rdma/**",                              CORE),
+              ("crates/rl/**",                                   CORE),
+              ("crates/wasm/**",                                 CORE),
+              # the protocol types, the gRPC client with its proto package and the
+              # workflow engine of the worker registration: every lane
+              ("crates/protocols/**",                            FULL),
+              ("crates/grpc_client/**",                          FULL),
+              ("crates/workflow/**",                             FULL),
+              ("crates/**",                                      FULL),
+          ]
+
+          def pattern_regex(pattern):
+              out, i = "", 0
+              while i < len(pattern):
+                  if pattern.startswith("**/", i):
+                      out, i = out + "(?:.*/)?", i + 3
+                  elif pattern.startswith("**", i):
+                      out, i = out + ".*", i + 2
+                  elif pattern[i] == "*":
+                      out, i = out + "[^/]*", i + 1
+                  else:
+                      out, i = out + re.escape(pattern[i]), i + 1
+              return re.compile(out + r"\Z")
+
+          rows = [(pattern, pattern_regex(pattern), set(areas.split())) for pattern, areas in TIERS]
+          unknown = sorted({area for _, _, areas in rows for area in areas} - set(AREAS))
+          if unknown:
+              sys.exit(f"tier table: no lane area is named {unknown}; the areas are {list(AREAS)}")
+
+          def reach_of(path):
+              """The row that places a path and the areas it reaches: every area when no row does."""
+              for pattern, regex, areas in rows:
+                  if regex.match(path):
+                      return pattern, areas
+              return None, set(AREAS)
+
+          def named(areas):
+              return " ".join(area for area in AREAS if area in areas) or "none"
+
+          files = json.loads(env["CHANGED_FILES"]) if env.get("CHANGED_FILES") else None
+          if not pull_request:
+              reached, why = set(AREAS), "not a pull request"
+          elif force_full:
+              reached, why = set(AREAS), "the label ci:full"
+          elif files is None:
+              # The filter failed: its failure gates the pull request's lanes.
+              reached, why = set(AREAS), "no list of the changed files"
+          else:
+              reached = set()
+              for path in files:
+                  pattern, areas = reach_of(path)
+                  print(f"{path}: {pattern or 'no row'} -> {named(areas)}")
+                  reached |= areas
+              why = f"{len(files)} changed files"
+          print(f"{why}: lanes reached: {named(reached)}")
+
+          # No lane for a docs-only or a Symphony-only change; otherwise the lanes
+          # of the areas the changed paths reach.
+          skip = {area: docs_only or symphony_only or area not in reached for area in AREAS}
           # The Symphony chat lane runs for a Symphony-only change too: it is the one
           # lane that exercises a table against a real engine.
-          skip["chat-symphony"] = docs_only or (
-              pull_request_without("chat-completions") and not symphony_only
-          )
+          skip["chat-symphony"] = docs_only or ("chat-symphony" not in reached and not symphony_only)
           # The vendor lanes have no docs-only shortcut.
-          skip["vendor"] = symphony_only or pull_request_without("agentic")
+          skip["vendor"] = symphony_only or "vendor" not in reached
 
           decided = {"docs-only": docs_only, "symphony-only": symphony_only}
           decided.update((f"skip-{area}", skipped) for area, skipped in skip.items())
-          with open(os.environ["GITHUB_OUTPUT"], "a") as outputs:
+          with open(env["GITHUB_OUTPUT"], "a") as outputs:
               for name, value in decided.items():
                   line = f"{name}={str(value).lower()}"
                   print(line)
