@@ -833,7 +833,12 @@ def test_the_default_publisher_port_is_a_free_one_not_the_engines_fixed_default(
     from below the OS's ephemeral range and probed free, so a held default is
     never chosen, and the ports after it, which a data-parallel engine's other
     ranks publish on, are free too."""
+    # The bound the draw stays below: the host's, or Linux's default when the
+    # host's leaves no room above the floor (a host tuned for many outbound
+    # connections, whose range starts at or below the floor).
     low = rust_lifecycle._ephemeral_low()
+    if low - 4 < rust_lifecycle.KV_EVENTS_PORT_FLOOR:
+        low = rust_lifecycle.DEFAULT_EPHEMERAL_LOW
     with _listener(5557):
         assert not rust_lifecycle._bindable(5557)
         port = _port_of(rust_lifecycle.free_kv_events_endpoint())
