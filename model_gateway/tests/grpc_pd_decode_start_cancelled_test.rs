@@ -22,7 +22,6 @@ use std::{
     time::Duration,
 };
 
-use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use proto::generate_response::Response as GenResp;
@@ -254,19 +253,7 @@ async fn build_pd_router(legs: &[(u16, WorkerType)]) -> Box<dyn RouterTrait> {
         .max_payload_size(1024 * 1024)
         .build_unchecked();
     config.health_check.disable_health_check = true;
-    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-    let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
-    tokenizer_registry
-        .load(
-            "tokenizer-id",
-            MODEL,
-            "test",
-            || async move { Ok(tokenizer) },
-        )
-        .await
-        .unwrap();
-    let app_context =
-        common::create_test_context_with_tokenizer_registry(config, tokenizer_registry).await;
+    let app_context = common::create_test_context_with_mock_tokenizer(config, MODEL).await;
     for (port, worker_type) in legs {
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))

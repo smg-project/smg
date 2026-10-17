@@ -22,7 +22,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-use llm_tokenizer::registry::TokenizerRegistry;
+use llm_tokenizer::{mock::MockTokenizer, registry::TokenizerRegistry, traits::Tokenizer};
 use mock_worker::{MockWorker, MockWorkerConfig};
 use openai_protocol::common::{Function, Tool};
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
@@ -612,6 +612,34 @@ pub fn create_test_context_with_tokenizer_registry(
             None,
         )
         .await
+    })
+}
+
+/// `create_test_context_with_tokenizer_registry` over a registry holding the
+/// mock tokenizer for `model` (loaded as `tokenizer-id`, source `test`): the
+/// context the gRPC worker tests run their routers in.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+pub fn create_test_context_with_mock_tokenizer(
+    config: RouterConfig,
+    model: &str,
+) -> Pin<Box<dyn Future<Output = Arc<AppContext>> + Send>> {
+    let model = model.to_string();
+    Box::pin(async move {
+        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
+        let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
+        tokenizer_registry
+            .load(
+                "tokenizer-id",
+                &model,
+                "test",
+                || async move { Ok(tokenizer) },
+            )
+            .await
+            .expect("the mock tokenizer loads");
+        create_test_context_with_tokenizer_registry(config, tokenizer_registry).await
     })
 }
 

@@ -12,7 +12,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer, TokenizerRegistry};
 use openai_protocol::worker::{ConnectionMode, HealthCheckConfig, RuntimeType, WorkerType};
 use smg::{
     config::RouterConfig,
@@ -88,19 +87,7 @@ async fn eight_workers_loads_reach_the_gateway_through_the_event_streams() {
         .port(0)
         .build_unchecked();
     config.health_check.disable_health_check = true;
-    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-    let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
-    tokenizer_registry
-        .load(
-            "tokenizer-id",
-            MODEL,
-            "test",
-            || async move { Ok(tokenizer) },
-        )
-        .await
-        .unwrap();
-    let app_context =
-        common::create_test_context_with_tokenizer_registry(config, tokenizer_registry).await;
+    let app_context = common::create_test_context_with_mock_tokenizer(config, MODEL).await;
     let worker_monitor = app_context
         .worker_monitor
         .clone()

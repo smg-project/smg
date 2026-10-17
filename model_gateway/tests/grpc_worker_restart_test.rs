@@ -11,7 +11,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
 use openai_protocol::{
     completion::CompletionRequest,
     model_card::ModelCard,
@@ -177,19 +176,7 @@ async fn build_router(port: u16) -> (Box<dyn RouterTrait>, Arc<dyn Worker>, Work
         .build_unchecked();
     config.health_check.disable_health_check = false;
 
-    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-    let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
-    tokenizer_registry
-        .load(
-            "tokenizer-id",
-            MODEL,
-            "test",
-            || async move { Ok(tokenizer) },
-        )
-        .await
-        .expect("mock tokenizer");
-    let app_context =
-        common::create_test_context_with_tokenizer_registry(config, tokenizer_registry).await;
+    let app_context = common::create_test_context_with_mock_tokenizer(config, MODEL).await;
 
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))

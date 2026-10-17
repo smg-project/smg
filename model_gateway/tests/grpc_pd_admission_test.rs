@@ -14,7 +14,6 @@ mod common;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
 use openai_protocol::{
     completion::CompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
 };
@@ -103,19 +102,7 @@ async fn build_pd_router(
         .build_unchecked();
     config.health_check.disable_health_check = true;
 
-    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-    let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
-    tokenizer_registry
-        .load(
-            "tokenizer-id",
-            MODEL,
-            "test",
-            || async move { Ok(tokenizer) },
-        )
-        .await
-        .unwrap();
-    let app_context =
-        common::create_test_context_with_tokenizer_registry(config, tokenizer_registry).await;
+    let app_context = common::create_test_context_with_mock_tokenizer(config, MODEL).await;
     for (port, worker_type, labels) in [
         (prefill_port, WorkerType::Prefill, HashMap::new()),
         (decode_port, WorkerType::Decode, decode_labels),

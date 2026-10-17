@@ -9,7 +9,6 @@ mod common;
 
 use std::{sync::Arc, time::Duration};
 
-use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
 use openai_protocol::{
     completion::CompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
 };
@@ -107,19 +106,7 @@ async fn build_bed(prefill_ports: &[u16], decode_port: u16) -> Bed {
         .build_unchecked();
     config.health_check.disable_health_check = true;
 
-    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-    let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
-    tokenizer_registry
-        .load(
-            "tokenizer-id",
-            MODEL,
-            "test",
-            || async move { Ok(tokenizer) },
-        )
-        .await
-        .unwrap();
-    let app_context =
-        common::create_test_context_with_tokenizer_registry(config, tokenizer_registry).await;
+    let app_context = common::create_test_context_with_mock_tokenizer(config, MODEL).await;
 
     let mut prefill_workers: Vec<Arc<dyn Worker>> = Vec::new();
     let roles = prefill_ports
