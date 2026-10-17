@@ -31,7 +31,7 @@ use crate::{
         grpc::{
             multimodal::MultimodalConfigRegistry,
             regular::symphony::{check_names, named_table},
-            utils::Names,
+            utils::{Names, ALIASES},
         },
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
@@ -463,10 +463,7 @@ impl AppContextBuilder {
             // The other names a table answers to: the legacy names that read a table's format,
             // and a launcher's name for a family whose table has no older parser, which is in
             // no other list.
-            let symphony_aliases: Vec<&str> = symphony::formats::Table::ALIASES
-                .iter()
-                .map(|(alias, _)| *alias)
-                .collect();
+            let symphony_aliases: Vec<&str> = ALIASES.iter().map(|(alias, _)| *alias).collect();
             tracing::error!(
                 tool_call_parser = ?names.tool,
                 reasoning_parser = ?names.reasoning,

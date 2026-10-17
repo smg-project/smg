@@ -10,7 +10,7 @@
 //! registry's table for a model it knows (`symphony::formats::for_model`); else the flags, for a
 //! model the registry does not know, so that a fleet-wide name never reads a family the registry
 //! has a table for; else the legacy parsers with their own detection. Names select a table when
-//! it answers to them (`symphony::formats::Table::answering_to`: its own name, a legacy parser's
+//! it answers to them (`utils::answering_to`: its own name, a legacy parser's
 //! that reads its format, `qwen` for `qwen3`, `qwen_xml` for `qwen3_tagged`, or a launcher's name
 //! for a family whose table has no older parser, `muse` for `muse_spark`), the tool-call name
 //! deciding, and the table then reads every request for the model; [`TEMPLATE_PARSER`] selects
@@ -21,7 +21,7 @@
 //! only names they read: a table's name or [`TEMPLATE_PARSER`] there is nothing to them,
 //! `ParserResolver::new`), the rule being that every legacy name whose format a table reads is
 //! the table's alias, so that a deployment's existing flags keep a working parser, and
-//! `Table::UNANSWERED` lists each name no table answers to with the reason (the test over both
+//! `utils::UNANSWERED` lists each name no table answers to with the reason (the test over both
 //! legacy registries below holds every name to one of the two); no name at all, or a reasoning
 //! name alone that no table answers to, other than `passthrough`, selects nothing. The names are
 //! checked at startup and at a worker's registration ([`check_names`]), which also says, once per
@@ -84,7 +84,7 @@ use crate::{
     routers::grpc::{
         common::stages::helpers::TagForStart,
         spec::scans_for_tool_calls,
-        utils::{ModelNames, Names, StreamFailure, WorkerDecoding},
+        utils::{answering_to, ModelNames, Names, StreamFailure, WorkerDecoding},
     },
     worker::{Worker, WorkerType},
 };
@@ -167,7 +167,7 @@ fn names_template(names: &Names) -> bool {
 
 /// The table the parser names set for a model select, when they do: the tool-call name's, else
 /// the reasoning name's when no tool-call name is set. A name is one a table answers to
-/// ([`Table::answering_to`]): its own, a legacy parser's that reads its format, or a launcher's
+/// ([`answering_to`]): its own, a legacy parser's that reads its format, or a launcher's
 /// for a family whose table has no older parser; any other name selects none, `passthrough` and
 /// [`TEMPLATE_PARSER`] among them, and so do no names at all.
 pub(crate) fn named_table(names: &Names) -> Option<Table> {
@@ -175,7 +175,7 @@ pub(crate) fn named_table(names: &Names) -> Option<Table> {
         .tool
         .as_deref()
         .or(names.reasoning.as_deref())
-        .and_then(Table::answering_to)
+        .and_then(answering_to)
 }
 
 /// What one source's parser names select: the response template's table ([`TEMPLATE_PARSER`] in
@@ -351,7 +351,7 @@ fn checked_names(
         Table::named(name).or_else(|| {
             let spelled = name.trim().to_ascii_lowercase();
             (!legacy_tool(&spelled) && !legacy_reasoning(&spelled))
-                .then(|| Table::answering_to(name))
+                .then(|| answering_to(name))
                 .flatten()
         })
     };
@@ -1456,7 +1456,10 @@ mod tests {
     use tool_parser::GrammarStart;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, WorkerType};
+    use crate::{
+        routers::grpc::utils::{ALIASES, UNANSWERED},
+        worker::{BasicWorkerBuilder, WorkerType},
+    };
 
     fn request(extra: Value) -> ChatCompletionRequest {
         let mut request = json!({"model": "Qwen/Qwen3-8B", "messages": [], "stream": true});
@@ -1850,7 +1853,7 @@ mod tests {
         let reasoning = reasoning_parser::ParserFactory::new();
         let symphony = ParserChoice::Symphony;
         let mut launchers = Vec::new();
-        for (alias, table) in Table::ALIASES {
+        for (alias, table) in ALIASES {
             if tools.has_parser(alias) || reasoning.registry().has_parser(alias) {
                 // A legacy parser's name is checked as the legacy name it is
                 // (`names_are_checked_against_both_registries_by_the_parser_in_force`).
@@ -1889,7 +1892,7 @@ mod tests {
 
     /// Every name of the two legacy registries answers to the table the flip maps it to (its
     /// own, or the one whose format it reads), so that a deployment's existing flags keep a
-    /// working parser under Symphony, or is in `Table::UNANSWERED` with its reason; never both,
+    /// working parser under Symphony, or is in `UNANSWERED` with its reason; never both,
     /// never neither, so a new legacy parser's name cannot appear unmapped, and a table that
     /// takes a listed name removes its row. In its own kind every legacy name passes the startup
     /// check under Symphony; a tool-call name decides beside any reasoning name, and a reasoning
@@ -1944,8 +1947,8 @@ mod tests {
                 .iter()
                 .find(|(own, _)| own == name)
                 .map(|(_, table)| *table);
-            let listed = Table::UNANSWERED.iter().find(|(own, _)| own == name);
-            match (Table::answering_to(name), listed) {
+            let listed = UNANSWERED.iter().find(|(own, _)| own == name);
+            match (answering_to(name), listed) {
                 (Some(table), None) => {
                     assert_eq!(
                         Some(table.name()),
@@ -1965,12 +1968,12 @@ mod tests {
                 }
                 (Some(table), Some(_)) => panic!(
                     "{kind} parser {name} answers to {} and is listed as unanswered: remove \
-                     its row from Table::UNANSWERED",
+                     its row from UNANSWERED",
                     table.name()
                 ),
                 (None, None) => panic!(
                     "{kind} parser {name} answers to no table and is not listed: add it to \
-                     Table::ALIASES or to Table::UNANSWERED with the reason"
+                     ALIASES or to UNANSWERED with the reason"
                 ),
             }
         }
@@ -1979,7 +1982,7 @@ mod tests {
         for (name, _) in mapped {
             assert!(is_legacy(name), "{name} is no legacy parser's name");
         }
-        for (name, _) in Table::UNANSWERED {
+        for (name, _) in UNANSWERED {
             assert!(
                 is_legacy(name),
                 "{name} is no legacy parser's name: remove its row"

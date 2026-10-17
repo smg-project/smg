@@ -2089,7 +2089,7 @@ fn get_available_tool_call_parsers() -> Vec<String> {
 /// The choices of one parser flag: the names `legacy` picks from the two legacy registries (the
 /// flag's own kind), Symphony's tables' (`symphony::formats::Table::name`), which `--parser
 /// symphony` reads with when both flags name one, the names a table answers to that no legacy
-/// parser of either kind has (`symphony::formats::Table::ALIASES`: a launcher's name for a model
+/// parser of either kind has (the gateway's `utils::ALIASES`: a launcher's name for a model
 /// family whose table has no older parser, which the gateway takes in either flag), and `hf`,
 /// the table a model's response template compiles into, sorted, each once.
 fn parser_choices(
@@ -2104,7 +2104,7 @@ fn parser_choices(
             .map(|table| table.name().to_string()),
     );
     names.extend(
-        symphony::formats::Table::ALIASES
+        routers::grpc::utils::ALIASES
             .iter()
             .map(|(alias, _)| *alias)
             .filter(|alias| !tools.has_parser(alias) && !reasoning.registry().has_parser(alias))

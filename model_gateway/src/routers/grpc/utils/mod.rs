@@ -1,5 +1,6 @@
 //! Shared utilities for gRPC routers.
 
+mod aliases;
 mod chat_utils;
 mod logprobs;
 pub(crate) mod message_utils;
@@ -10,6 +11,7 @@ pub(crate) mod stream_failure;
 pub(crate) mod tonic_ext;
 
 // Re-export all public items so consumer imports stay unchanged.
+pub use aliases::{answering_to, ALIASES, UNANSWERED};
 pub use chat_utils::{
     create_stop_decoder, process_chat_messages, process_chat_messages_with_encoding,
     request_as_rendered,
