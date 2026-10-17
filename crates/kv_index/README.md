@@ -197,7 +197,8 @@ The servicer relays the engine's publisher into `SubscribeKvEvents` through one 
   the `smg_worker_wedge_drain{worker,state}` gauge and the `smg_worker_wedge_drains_total`
   counter; `PATCH /workers/{id}` with `{"readmit": true}` ends a veto and a drain by hand. The
   pile is the streaming gRPC generations in flight, as for the veto, and the completion that
-  counts is the engine's own last message for a request (a `Complete` that is not an error).
+  counts is the engine's own last message for a request (a `Complete` that is neither an error nor
+  an abort).
 - **Warm-up slice.** A worker that just became routable, or whose index is thin against the
   fleet's (`--worker-warmup-thin-ratio`), receives a share of cache-miss traffic until its index has
   grown, so an empty index does not starve it while every prompt has a holder elsewhere.
