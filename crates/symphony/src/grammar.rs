@@ -1312,21 +1312,11 @@ impl Format {
             }
             None => None,
         };
-        let mut call_exits: Vec<&str> = Vec::new();
-        for (_, on, _) in self
-            .transitions()
-            .filter(|&(source, _, _)| source == arguments)
-        {
-            let text = self.terminal_text(on);
-            if !call_exits.contains(&text) {
-                call_exits.push(text);
-            }
-        }
         Some(CallMarkers {
             block,
             call_open: call.open,
             call_close: call.close,
-            call_exits,
+            call_exits: self.call_exits(arguments),
         })
     }
 
@@ -1340,22 +1330,29 @@ impl Format {
         let (_, open, _) = self
             .transitions()
             .find(|&(source, _, target)| target == arguments && source != arguments)?;
-        let mut call_exits: Vec<&str> = Vec::new();
+        Some(CallMarkers {
+            block: None,
+            call_open: self.terminal_text(open),
+            call_close: "",
+            call_exits: self.call_exits(arguments),
+        })
+    }
+
+    /// The terminals the table has a row for out of the arguments state `arguments`, in the order
+    /// of the rows, each once: what the engine takes wherever it stands inside a call, a value
+    /// included.
+    fn call_exits(&self, arguments: usize) -> Vec<&str> {
+        let mut exits: Vec<&str> = Vec::new();
         for (_, on, _) in self
             .transitions()
             .filter(|&(source, _, _)| source == arguments)
         {
             let text = self.terminal_text(on);
-            if !call_exits.contains(&text) {
-                call_exits.push(text);
+            if !exits.contains(&text) {
+                exits.push(text);
             }
         }
-        Some(CallMarkers {
-            block: None,
-            call_open: self.terminal_text(open),
-            call_close: "",
-            call_exits,
-        })
+        exits
     }
 
     /// The ways into the block the calls sit in, or none when they sit in no block.
