@@ -792,6 +792,22 @@ fn every_measured_opener_is_the_registrys() {
             "{slug}: the registry's opener"
         );
     }
+    // The other recorded models render their own table's opener: the registry gives them none.
+    for (slug, _) in MODELS {
+        if MEASURED_OPENERS
+            .iter()
+            .any(|(measured, _)| measured == slug)
+        {
+            continue;
+        }
+        let model = model_of(slug);
+        let table = table_for(&model).unwrap_or_else(|| panic!("{slug}: not in the registry"));
+        assert_eq!(
+            for_model(&model),
+            Some(table.format()),
+            "{slug}: an opener the template does not write"
+        );
+    }
 }
 
 /// The id the registry knows `slug` by. Bellwether's slug is the repository name in lower case
