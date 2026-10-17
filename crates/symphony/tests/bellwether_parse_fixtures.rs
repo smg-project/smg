@@ -264,6 +264,16 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("kimi-k2.5", GenerationPrompt::AlwaysOpensTheThought),
     ("kimi-k2.6", GenerationPrompt::AlwaysOpensTheThought),
     ("kimi-k2.7-code", GenerationPrompt::AlwaysOpensTheThought),
+    // DeepSeek V3.1 and V3.2-Exp close the thought in the prompt (`</think>` right after the
+    // opener) unless the request's `thinking` kwarg opens it; the recorded requests carry
+    // `enable_thinking`, which these templates do not read, so every recorded prompt closes it
+    // and the output starts in content. DeepSeek V3 has no thought. Their sets hold content
+    // alone: the templates take a call's arguments as a string, and the recorder refused every
+    // call case of the corpus, whose arguments are objects.
+    ("deepseek-v3.1", GenerationPrompt::Plain),
+    ("deepseek-v3.2-exp", GenerationPrompt::Plain),
+    ("deepseek-v3-0324", GenerationPrompt::Plain),
+    ("deepseek-v3-0324-bf16", GenerationPrompt::Plain),
     // Kimi K3 writes XTML and opens the thought in the prompt, whatever the request says: its
     // recorded requests carry no switch. The shared tail adds a newline the template does not
     // write; it is prompt text inside the thought and moves nothing.
@@ -618,6 +628,8 @@ impl Recorded for Table {
             Self::Ling | Self::Glm | Self::Glm4 => KNOWN_TAGGED_DIFFERENCES,
             Self::IQuest
             | Self::DeepSeekV3_2
+            | Self::DeepSeekV3
+            | Self::DeepSeekV3_1
             | Self::DeepSeekV4
             | Self::DeepSeekV4_1
             | Self::KimiK2

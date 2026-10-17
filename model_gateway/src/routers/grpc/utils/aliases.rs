@@ -31,7 +31,7 @@ pub fn answering_to(name: &str) -> Option<Table> {
 /// among them, which leaves its channel as written, which no table reads for. A row may also be
 /// the name a downstream launcher passes for a model family whose table has no older parser
 /// (`muse` for `muse_spark`), so that the launcher's flags read with the table.
-pub const ALIASES: [(&str, Table); 15] = [
+pub const ALIASES: [(&str, Table); 17] = [
     ("qwen", Table::Qwen3),
     ("qwen_xml", Table::Qwen3Tagged),
     ("qwen_coder", Table::Qwen3Tagged),
@@ -39,6 +39,8 @@ pub const ALIASES: [(&str, Table); 15] = [
     ("glm47_moe", Table::Glm),
     ("glm45_moe", Table::Glm4),
     ("hy_v4", Table::Hy4),
+    ("deepseek31", Table::DeepSeekV3_1),
+    ("deepseek", Table::DeepSeekV3),
     ("deepseek32", Table::DeepSeekV3_2),
     ("deepseek_v41", Table::DeepSeekV4_1),
     ("minimax", Table::MinimaxM2),
@@ -63,7 +65,7 @@ pub const ALIASES: [(&str, Table); 15] = [
 /// the next source decides: after a worker's labels the registry's table for a model it
 /// knows, else the gateway's flags, else the legacy parsers (`passthrough` excepted, which
 /// keeps the legacy parsers either way).
-pub const UNANSWERED: [(&str, &str); 16] = [
+pub const UNANSWERED: [(&str, &str); 14] = [
     (
         "passthrough",
         "leaves its channel as written, which no table reads for: the way back to the \
@@ -90,16 +92,6 @@ pub const UNANSWERED: [(&str, &str); 16] = [
         "a thought two tables' families share, qwen3 (the Qwen3-2507 thinking line) and \
          qwen3_tagged (Qwen 3.5 and later): the tool-call name, qwen or qwen_xml, or the \
          registry decides",
-    ),
-    (
-        "deepseek",
-        "DeepSeek V3's call spelling, which no table reads yet; the table that does takes \
-         the name",
-    ),
-    (
-        "deepseek31",
-        "DeepSeek V3.1's call spelling, which no table reads yet; the table that does takes \
-         the name",
     ),
     (
         "deepseek_v31",

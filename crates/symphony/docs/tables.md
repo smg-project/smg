@@ -136,6 +136,52 @@ which its recorder renders through the encoder once the group has a manifest the
 harness replays them from the fixture pin, and until then nothing in this repository checks what
 they parse to; the README row says awaiting fixtures until the pin holds it. What the table
 leaves open: the recorded set, and the live reading against the engine's own server.
+## DeepSeek V3.1 (`deepseek_v3.1`)
+
+What the table says beyond the DSML ones:
+
+- **The same four rows around the block, another call syntax.** `calls` is the template's wrapping
+  between `<｜tool▁call▁end｜>` and the next `<｜tool▁call▁begin｜>` (the template writes nothing
+  there; whitespace dropped, anything else malformed), and `call` is one call read by the named
+  arguments assembler (`json::named_arguments`): the tool's name up to `<｜tool▁sep｜>`, taken as
+  written, then the arguments object alone. The call's close is its own terminal, so the object's
+  bytes end at the object and `<｜tool▁call▁end｜>` is wrapping; a new `<｜tool▁call▁begin｜>` before
+  the close ends the call that was open and starts the next, and the block's close ends a call
+  still open, as the DSML tables have it.
+- **A calls block ends the thought** (`reasoning + calls_open = calls`), as the V4 table reads it;
+  the template closes the thought before the block.
+- **The prompt opens or closes the thought.** The template ends the generation prompt with
+  `<｜Assistant｜><think>` when the request thinks and `<｜Assistant｜></think>` when it does not,
+  and writes no generation prompt after a tool result: the output then starts where the previous
+  turn's `<｜Assistant｜>` leads, which is content once its block has closed. The turn opener is
+  `<｜Assistant｜>`, so a marker quoted in an earlier turn moves nothing.
+- **The recorded set holds no call.** The template concatenates a call's arguments as a string,
+  and bellwether's corpus holds them as an object, so the recorder refused every call case of
+  `deepseek-v3.1` (and of `deepseek-v3.2-exp`, the same spelling): the content sets replay; the
+  calls stand on the turns the template renders with string arguments, held in the module's tests
+  at every cut, as the V4 table stands on its encoder's turns.
+
+What the table leaves open: a forced call's tag (`Format::grammar` writes none for the named
+arguments syntax beyond what the Mistral table gets), and the live reading on an engine, owed with
+the family's weights.
+
+## DeepSeek V3 (`deepseek_v3`)
+
+The spelling before V3.1's, the gateway's older `deepseek` parser's: no thought, the call's opener
+is `<｜tool▁call▁begin｜>function<｜tool▁sep｜>` (the call's type before the separator, which the
+template writes from the message and every message writes as `function`), the name runs to the
+`json` fence the template opens on the next line, and the fence's close with `<｜tool▁call▁end｜>`
+is the terminal that leaves the call. Beyond that:
+
+- **The newline before the fence's close is wrapping**, dropped as whitespace after the object, and
+  so is the newline the template writes before every call after the first. A fence closed without
+  `<｜tool▁call▁end｜>` right after it is not a terminal: the bytes stay in the call as malformed
+  text until the next opener or the block's close, as the older parser's pattern would not have
+  read them either.
+- **No thought.** The template has no thinking switch, so `<think>` and `</think>` are content, as
+  the reference says.
+- **The recorded set holds no call**, for the reason given under V3.1; the calls stand on the turns
+  the template renders, held in the module's tests at every cut.
 
 ## GLM 4.5 and 4.6 (`glm4`)
 

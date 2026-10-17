@@ -410,6 +410,17 @@ fn deepseek_v3_2() -> Box<dyn Parser> {
     ))
 }
 
+fn deepseek_v3_1() -> Box<dyn Parser> {
+    Box::new(Engine::new(
+        Table::DeepSeekV3_1.format(),
+        Declared::default(),
+    ))
+}
+
+fn deepseek_v3() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::DeepSeekV3.format(), Declared::default()))
+}
+
 fn json() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::Json.format(), Declared::default()))
 }
@@ -932,6 +943,18 @@ const FORMATS: &[Subject] = &[
         new: deepseek_v3_2,
         outputs: DEEPSEEK_V3_2_OUTPUTS,
         table: Some(Table::DeepSeekV3_2),
+    },
+    Subject {
+        name: "deepseek v3.1",
+        new: deepseek_v3_1,
+        outputs: DEEPSEEK_V3_1_OUTPUTS,
+        table: Some(Table::DeepSeekV3_1),
+    },
+    Subject {
+        name: "deepseek v3",
+        new: deepseek_v3,
+        outputs: DEEPSEEK_V3_OUTPUTS,
+        table: Some(Table::DeepSeekV3),
     },
     Subject {
         name: "json",
@@ -1798,6 +1821,34 @@ const DEEPSEEK_V3_2_OUTPUTS: &[&str] = &[
     "<think>still thinking",
     "Hello!",
     "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Par",
+];
+
+/// DeepSeek V3.1's calls as its chat template renders them (the thought the prompt opens written
+/// here, since the replay starts from an empty prompt): one call after a thought, three calls in
+/// one block, a call after content, no arguments, nested values, content with a thought, content
+/// alone, and one cut short.
+const DEEPSEEK_V3_1_OUTPUTS: &[&str] = &[
+    "<think>The user asks about Paris.</think><｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{\"city\": \"Paris\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+    "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{\"city\": \"Paris\"}<｜tool▁call▁end｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{\"city\": \"Rome\"}<｜tool▁call▁end｜><｜tool▁call▁begin｜>get_stock_price<｜tool▁sep｜>{\"ticker\": \"MSFT\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+    "Let me check.<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{\"city\": \"Paris\", \"unit\": \"celsius\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+    "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_stock_price<｜tool▁sep｜>{}<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+    "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>save_note<｜tool▁sep｜>{\"title\": \"計画 🌍\", \"body\": \"a \\\"q\\\" \\\\ b\\nc\", \"tags\": [\"a\", \"b\"], \"meta\": {\"nested\": {\"deep\": [1, 2.5, true, null]}}}<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+    "<think>97 is not divisible by 2, 3, 5 or 7.</think>Yes, 97 is prime.",
+    "Hello!",
+    "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{\"city\": \"Par",
+];
+
+/// DeepSeek V3's calls as its chat template renders them: one call, three calls in one block (a
+/// newline before each after the first), a call after content, no arguments, nested values,
+/// content alone, and one cut short inside the fence.
+const DEEPSEEK_V3_OUTPUTS: &[&str] = &[
+    "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Paris\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+    "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Paris\"}\n```<｜tool▁call▁end｜>\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Rome\"}\n```<｜tool▁call▁end｜>\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_stock_price\n```json\n{\"ticker\": \"MSFT\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+    "Let me check.<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Paris\", \"unit\": \"celsius\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+    "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_stock_price\n```json\n{}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+    "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>save_note\n```json\n{\"title\": \"計画 🌍\", \"body\": \"a \\\"q\\\" \\\\ b\\nc\", \"tags\": [\"a\", \"b\"], \"meta\": {\"nested\": {\"deep\": [1, 2.5, true, null]}}}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+    "Hello!",
+    "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Par",
 ];
 
 /// Llama 3.1's bare call object, a list of them, content, and one cut short.

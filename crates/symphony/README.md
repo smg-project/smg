@@ -231,7 +231,7 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 
 <!-- models: begin -->
 212 groups, 358 checkpoints, newest first.
-12 ready, 134 replaying a recorded set, 10 on main awaiting fixtures, 56 pending.
+12 ready, 138 replaying a recorded set, 10 on main awaiting fixtures, 52 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
@@ -360,7 +360,7 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2025-10-01 | [llama-3.1-nemotron-nano-vl-8b-v1-fp4-qad](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.1-nemotron-nano-vl-8b-v1-fp4-qad) | nvidia/Llama-3.1-Nemotron-Nano-VL-8B-V1-FP4-QAD |  | — | 328,662 | pending | `json`, `nano_v3` |
 | 2025-09-30 | [qwen3-4b-saferl](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-4b-saferl) | Qwen/Qwen3-4B-SafeRL |  | `qwen3` | 54,418 | ready | `qwen`, `qwen3` |
 | 2025-09-30 | [qwen3-vl-30b-a3b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-vl-30b-a3b-instruct) | Qwen/Qwen3-VL-30B-A3B-Instruct | Qwen3-VL-235B-A22B-Instruct | `qwen3` | 576,772 | replaying the set | `qwen`, `qwen3` |
-| 2025-09-29 | [deepseek-v3.2-exp](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v3.2-exp) | deepseek-ai/DeepSeek-V3.2-Exp | DeepSeek-V3.2-Exp-Base | — | 184,972 | pending | `deepseek31`, none |
+| 2025-09-29 | [deepseek-v3.2-exp](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v3.2-exp) | deepseek-ai/DeepSeek-V3.2-Exp | DeepSeek-V3.2-Exp-Base | `deepseek_v3.1` | 184,972 | replaying the set | `deepseek31`, none |
 | 2025-09-29 | [glm-4.6](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-4.6) | zai-org/GLM-4.6 | GLM-4.5, GLM-4.5-Air | `glm4` | 492,389 | replaying the set | `glm45_moe`, none |
 | 2025-09-25 | [caprl-eval-3b](https://github.com/smg-project/bellwether/tree/main/fixtures/caprl-eval-3b) | internlm/CapRL-Eval-3B |  | `qwen2.5` | 576,772 | replaying the set | none |
 | 2025-09-24 | [caprl-3b](https://github.com/smg-project/bellwether/tree/main/fixtures/caprl-3b) | internlm/CapRL-3B |  | `qwen2.5` | 576,772 | replaying the set | none |
@@ -375,7 +375,7 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2025-09-03 | [kimi-k2-instruct-0905](https://github.com/smg-project/bellwether/tree/main/fixtures/kimi-k2-instruct-0905) | moonshotai/Kimi-K2-Instruct-0905 |  | `kimi_k2` | — | awaiting fixtures | `kimik2`, `kimi` |
 | 2025-09-01 | [apertus-70b-instruct-2509](https://github.com/smg-project/bellwether/tree/main/fixtures/apertus-70b-instruct-2509) | swiss-ai/Apertus-70B-Instruct-2509 |  | — | 137,178 | pending | none |
 | 2025-08-30 | [hermes-4-14b](https://github.com/smg-project/bellwether/tree/main/fixtures/hermes-4-14b) | NousResearch/Hermes-4-14B |  | `qwen2.5` | 576,772 | replaying the set | none |
-| 2025-08-21 | [deepseek-v3.1](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v3.1) | deepseek-ai/DeepSeek-V3.1 | DeepSeek-V3.1-Base, tencent/DeepSeek-V3.1-Terminus-W4AFP8 | — | 19,299 | pending | `deepseek31`, `deepseek_v31` |
+| 2025-08-21 | [deepseek-v3.1](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v3.1) | deepseek-ai/DeepSeek-V3.1 | DeepSeek-V3.1-Base, tencent/DeepSeek-V3.1-Terminus-W4AFP8 | `deepseek_v3.1` | 19,299 | replaying the set | `deepseek31`, `deepseek_v31` |
 | 2025-08-20 | [llama-3.1-nemotron-safety-guard-8b-v3](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.1-nemotron-safety-guard-8b-v3) | nvidia/Llama-3.1-Nemotron-Safety-Guard-8B-v3 |  | `json` | 458,185 | replaying the set | `json`, none |
 | 2025-08-20 | [seed-oss-36b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/seed-oss-36b-instruct) | ByteDance-Seed/Seed-OSS-36B-Instruct | Seed-OSS-36B-Base-woSyn | `seed_oss` | 495,977 | replaying the set | none |
 | 2025-08-13 | [apertus-8b-instruct-2509](https://github.com/smg-project/bellwether/tree/main/fixtures/apertus-8b-instruct-2509) | swiss-ai/Apertus-8B-Instruct-2509 |  | — | 137,178 | pending | none |
@@ -421,8 +421,8 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2025-04-07 | [llama-3-1-nemotron-ultra-253b-v1](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3-1-nemotron-ultra-253b-v1) | nvidia/Llama-3_1-Nemotron-Ultra-253B-v1 |  | `llama_nemotron` | 328,643 | replaying the set | `json`, none |
 | 2025-03-27 | [llama-xlam-2-8b-fc-r](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-xlam-2-8b-fc-r) | Salesforce/Llama-xLAM-2-8b-fc-r |  | `xlam` | 483,062 | replaying the set | `json`, none |
 | 2025-03-26 | [granite-speech-3.2-8b](https://github.com/smg-project/bellwether/tree/main/fixtures/granite-speech-3.2-8b) | ibm-granite/granite-speech-3.2-8b |  | — | 328,662 | pending | none |
-| 2025-03-24 | [deepseek-v3-0324](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v3-0324) | deepseek-ai/DeepSeek-V3-0324 | DeepSeek-Prover-V2-671B | — | 19,299 | pending | `deepseek`, none |
-| 2025-03-24 | [deepseek-v3-0324-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v3-0324-bf16) | arcee-ai/DeepSeek-V3-0324-bf16 |  | — | 3,110 | pending | `deepseek`, none |
+| 2025-03-24 | [deepseek-v3-0324](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v3-0324) | deepseek-ai/DeepSeek-V3-0324 | DeepSeek-Prover-V2-671B | `deepseek_v3` | 19,299 | replaying the set | `deepseek`, none |
+| 2025-03-24 | [deepseek-v3-0324-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v3-0324-bf16) | arcee-ai/DeepSeek-V3-0324-bf16 |  | `deepseek_v3` | 3,110 | replaying the set | `deepseek`, none |
 | 2025-03-22 | [qwen2.5-omni-7b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen2.5-omni-7b) | Qwen/Qwen2.5-Omni-7B | Qwen2.5-Omni-3B | `qwen2.5` | 328,662 | replaying the set | `qwen`, `qwen3` |
 | 2025-03-21 | [qwen2.5-vl-32b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen2.5-vl-32b-instruct) | Qwen/Qwen2.5-VL-32B-Instruct |  | `qwen2.5` | 328,662 | replaying the set | `qwen`, `qwen3` |
 | 2025-03-16 | [llama-3-3-nemotron-super-49b-v1](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3-3-nemotron-super-49b-v1) | nvidia/Llama-3_3-Nemotron-Super-49B-v1 |  | `llama_nemotron` | — | awaiting fixtures | `json`, `nano_v3` |
