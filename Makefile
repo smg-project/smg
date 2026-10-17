@@ -226,4 +226,4 @@ bump-version: ## Bump version across all files (usage: make bump-version VERSION
 	@echo "Verify with: make show-version"
 
 check-versions: ## Check workspace crate versions against latest tag (usage: make check-versions [TAG=v1.0.0] [VERSION_OVERRIDE=1.3.1])
-	@VERSION_OVERRIDE="$(VERSION_OVERRIDE)" ./scripts/check_release_versions.sh $(TAG)
+	@VERSION_OVERRIDE="$(VERSION_OVERRIDE)" python3 scripts/check_release_versions.py $(TAG)
