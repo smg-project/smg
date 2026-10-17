@@ -265,16 +265,29 @@ pub(crate) struct PrecomputedMultimodalIntermediate {
     pub encoder_input_key: Option<String>,
 }
 
+/// Sets the decoder availability gauges (`smg_mm_turbojpeg_available`,
+/// `smg_mm_webp_available`) on the recorder in force and returns what they
+/// read: the one call [`report_jpeg_decoder`] makes once per process, kept
+/// apart so a test can run it against a recorder of its own. The gateway
+/// installs its Prometheus recorder before the report (`server.rs`): a gauge
+/// set before that lands in the no-op recorder and never reaches /metrics.
+pub(crate) fn record_decoder_availability() -> (bool, bool) {
+    use crate::observability::metrics::Metrics;
+    let available = llm_multimodal::jpeg_turbo::turbojpeg_available();
+    Metrics::set_mm_turbojpeg_available(available);
+    let webp = llm_multimodal::webp_native::webp_available();
+    Metrics::set_mm_webp_available(webp);
+    (available, webp)
+}
+
 /// Say once which JPEG and WebP decoders this process has, and publish them:
 /// without libjpeg-turbo the pure-Rust decoder's pixels differ from PIL's by a
 /// few levels, an embedding shift against an engine that decodes with PIL;
 /// without libwebp the WebP fallback is correct but several times slower.
 pub(crate) fn report_jpeg_decoder() {
-    use crate::observability::metrics::Metrics;
     static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     ONCE.get_or_init(|| {
-        let available = llm_multimodal::jpeg_turbo::turbojpeg_available();
-        Metrics::set_mm_turbojpeg_available(available);
+        let (available, _webp) = record_decoder_availability();
         if available {
             tracing::info!("JPEG decode uses libjpeg-turbo with PIL's defaults");
         } else {
@@ -285,8 +298,6 @@ pub(crate) fn report_jpeg_decoder() {
                  refuse to serve without it"
             );
         }
-        let webp = llm_multimodal::webp_native::webp_available();
-        Metrics::set_mm_webp_available(webp);
         match llm_multimodal::webp_native::webp_version() {
             Some(version) => tracing::info!(%version, "WebP decode uses libwebp"),
             None => tracing::info!(
@@ -327,7 +338,7 @@ mod tests {
 
     use llm_multimodal::{MediaConnectorError, MultiModalError};
 
-    use super::processing_failed_message;
+    use super::{processing_failed_message, record_decoder_availability};
 
     /// A fetch that ran out of its budget is reported with its URL and the
     /// budget, not as the bare "failed to finalize" context around it.
@@ -343,5 +354,28 @@ mod tests {
             "Multimodal processing failed: Failed to finalize multimodal tracker: media fetch of \
              https://media.example/clip.mp4 timed out after 30s"
         );
+    }
+
+    /// The decoder availability gauges land in the recorder in force when the
+    /// report runs: the gateway installs its recorder first (`server.rs`),
+    /// so `smg_mm_turbojpeg_available` and `smg_mm_webp_available` are on
+    /// /metrics under every policy; a report made before the recorder would
+    /// set them on the no-op one, once, and they would never appear.
+    #[test]
+    fn the_decoder_availability_gauges_land_in_the_installed_recorder() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let (available, webp) =
+            ::metrics::with_local_recorder(&recorder, record_decoder_availability);
+        let rendered = handle.render();
+        let reads = |name: &str, value: bool| {
+            rendered.lines().any(|line| {
+                line.starts_with(name) && line.ends_with(if value { " 1" } else { " 0" })
+            })
+        };
+        assert!(reads("smg_mm_turbojpeg_available", available), "{rendered}");
+        assert!(reads("smg_mm_webp_available", webp), "{rendered}");
     }
 }
