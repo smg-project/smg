@@ -1171,8 +1171,9 @@ pub(crate) fn select_pair(
     // paired it: the least-loaded of the pick's partners, counted as a veto
     // fallback and not as a selection of the decode policy. Any other keeps
     // the veto for its policy. Either way the decode follows the traffic
-    // group the prefill leg was split into, so a pair never spans two groups;
-    // an unsplit prefill leaves it to decide for itself (see
+    // group the prefill leg was split into, or the named group an unsplit
+    // prefill was picked from, so a pair never spans two groups; an unsplit
+    // prefill from the default group leaves it to decide for itself (see
     // `PolicyRegistry::select_worker_for_model_split`).
     let selected_decode = if lift_decode {
         overload::least_loaded_uniform(

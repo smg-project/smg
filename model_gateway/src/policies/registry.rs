@@ -21,7 +21,7 @@ use super::{
     get_healthy_worker_indices,
     manual::{ExecutionBranch, PinState},
     normalize_model_key,
-    traffic_split::Split,
+    traffic_split::{self, Split},
     BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig,
     ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerRole,
 };
@@ -389,17 +389,21 @@ impl PolicyRegistry {
     }
 
     /// [`Self::select_worker_for_model`] for one leg of a request, reporting
-    /// the group the split confined it to (`None` when the split did not
-    /// run: off, exempt, or one group among `workers`). `follow` is the group
-    /// an earlier leg reported (the decode leg after the prefill's): under
-    /// `--traffic-split` the choice stays in it while it has an available
-    /// member of positive weight among `workers`, so a prefill-decode pair
-    /// never spans two groups (two engine builds, which lenient pairing would
-    /// otherwise pair). A first leg that was not split reports `None`, and
-    /// the later leg then decides for itself, so a canary only the decode
-    /// pool carries keeps its share; a followed group absent or drained among
-    /// `workers` leaves the key or the draw to decide as for a first leg.
-    /// Every confined selection counts in
+    /// the group the pick is in: the one the split confined it to, or, when
+    /// the split did not run (exempt, or one group among `workers`), the
+    /// pick's own group if it is a named one; `None` for the default group,
+    /// and whenever the split is off. `follow` is the group an earlier leg
+    /// reported (the decode leg after the prefill's): under `--traffic-split`
+    /// the choice stays in it while it has an available member of positive
+    /// weight among `workers`, so a prefill-decode pair never spans two
+    /// groups (two engine builds, which lenient pairing would otherwise
+    /// pair). A first leg picked unsplit from the default group reports
+    /// `None`, and the later leg then decides for itself, so a canary only
+    /// the decode pool carries keeps its share; one picked unsplit from a
+    /// named group (its slice shrunk to that group, the others unavailable
+    /// or at capacity) still pins the later leg to it; a followed group
+    /// absent or drained among `workers` leaves the key or the draw to decide
+    /// as for a first leg. Every confined selection counts in
     /// `smg_traffic_split_selections_total`, one per leg.
     pub fn select_worker_for_model_split<'w>(
         &self,
@@ -432,8 +436,16 @@ impl PolicyRegistry {
                 return Some((arm.members[picked], Some(arm.name)));
             }
         }
-        self.select_within(policy, model_id, workers, info)
-            .map(|selected| (selected, None))
+        let selected = self.select_within(policy, model_id, workers, info)?;
+        // Not split: a pick in a named group still reports it, so a later
+        // leg stays in that group when the slice shrank to it; a pick in the
+        // default group reports nothing and leaves the later leg to decide
+        // for itself. Off, the labels are inert and nothing is reported.
+        let group = self
+            .traffic_split
+            .then(|| traffic_split::group_of(workers[selected].as_ref()))
+            .filter(|group| *group != traffic_split::DEFAULT_GROUP);
+        Some((selected, group))
     }
 
     /// Whether the traffic split may confine this selection: `bucket` places
@@ -3237,9 +3249,46 @@ mod tests {
             }
         }
 
-        /// A prefill pool of one group is not split and reports no group, so
-        /// the decode leg decides for itself: a canary only the decode pool
-        /// carries keeps its share next to an unlabelled fleet.
+        /// A prefill slice that has shrunk to one named group (its other
+        /// groups unavailable or at capacity) is not split, yet still pins
+        /// the decode leg to that group: a canary prefill keeps a canary
+        /// decode rather than pairing across two builds. Off, no group is
+        /// reported.
+        #[test]
+        fn a_prefill_slice_of_one_named_group_still_pins_the_decode_leg() {
+            let reg = registry(true);
+            let policy = reg.get_default_policy();
+            let prefill = vec![grouped("http://c1:8000", Some("canary"), Some("10"))];
+            let decode = fleet("10");
+            let info = SelectWorkerInfo::default();
+            for _ in 0..100 {
+                let (prefill_idx, group) = reg
+                    .select_worker_for_model_split(&policy, "m", &prefill, &info, None)
+                    .expect("a prefill worker is selected");
+                assert_eq!(prefill_idx, 0);
+                assert_eq!(group, Some("canary"), "an unsplit named group is reported");
+                let (decode_idx, followed) = reg
+                    .select_worker_for_model_split(&policy, "m", &decode, &info, group)
+                    .expect("a decode worker is selected");
+                assert_eq!(decode_idx, 1, "the decode leg left the canary");
+                assert_eq!(followed, Some("canary"));
+            }
+            let off = registry(false);
+            let (_, group) = off
+                .select_worker_for_model_split(
+                    &off.get_default_policy(),
+                    "m",
+                    &prefill,
+                    &info,
+                    None,
+                )
+                .expect("a prefill worker is selected");
+            assert_eq!(group, None, "off, the labels are inert");
+        }
+
+        /// A prefill pool of the default group alone is not split and reports
+        /// no group, so the decode leg decides for itself: a canary only the
+        /// decode pool carries keeps its share next to an unlabelled fleet.
         #[test]
         fn a_decode_only_canary_keeps_its_share_next_to_an_unsplit_prefill_pool() {
             let reg = registry(true);
