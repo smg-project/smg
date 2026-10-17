@@ -15,6 +15,7 @@ import json
 import logging
 
 import pytest
+from infra.streams import collect_streamed_chat
 
 logger = logging.getLogger(__name__)
 
@@ -222,36 +223,14 @@ class TestGoOAIServerFunctionCalling:
         )
 
         # Structural: the stream itself must be well-formed (unconditional).
-        chunks = list(response_stream)
-        assert len(chunks) > 0
+        streamed = collect_streamed_chat(response_stream)
+        assert len(streamed.chunks) > 0
 
-        # Reconstruct tool calls (and content) from streaming chunks
-        tool_calls_by_index = {}
-        content_parts = []
-        for chunk in chunks:
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            if delta.content:
-                content_parts.append(delta.content)
-            if delta.tool_calls:
-                for tc in delta.tool_calls:
-                    idx = tc.index
-                    if idx not in tool_calls_by_index:
-                        tool_calls_by_index[idx] = {
-                            "name": "",
-                            "arguments": "",
-                        }
-                    if tc.function.name:
-                        tool_calls_by_index[idx]["name"] = tc.function.name
-                    if tc.function.arguments:
-                        tool_calls_by_index[idx]["arguments"] += tc.function.arguments
-
-        if not tool_calls_by_index:
+        if not streamed.tool_calls:
             # The regression this suite guards against streams neither
             # tool_call deltas nor content deltas, which is exactly the shape
             # that would otherwise xfail silently here.
-            assert "".join(content_parts).strip(), (
+            assert streamed.content.strip(), (
                 "streamed no tool call AND no content - the completion was swallowed"
             )
             pytest.xfail(
@@ -261,13 +240,12 @@ class TestGoOAIServerFunctionCalling:
             )
 
         # Structural: index math and argument accumulation (unconditional).
-        assert 0 in tool_calls_by_index, (
-            f"Streamed tool call indices must start at 0, got {sorted(tool_calls_by_index)}"
-        )
-        first_tc = tool_calls_by_index[0]
-        assert first_tc["name"] == "get_weather"
+        indices = [tool_call.index for tool_call in streamed.tool_calls]
+        assert 0 in indices, f"Streamed tool call indices must start at 0, got {indices}"
+        first_tc = streamed.tool_calls[0]
+        assert first_tc.name == "get_weather"
 
-        args = json.loads(first_tc["arguments"])
+        args = json.loads(first_tc.arguments)
         assert isinstance(args, dict)
 
         # Model-dependent: argument quality.
@@ -276,7 +254,7 @@ class TestGoOAIServerFunctionCalling:
                 f"Llama-3.2-1B-Instruct produced schema-incomplete arguments {args} "
                 "(known model limitation)"
             )
-        logger.info(f"Streamed tool call: {first_tc['name']}({args})")
+        logger.info(f"Streamed tool call: {first_tc.name}({args})")
 
     def test_function_calling_tool_choice_none(self, go_openai_client, go_oai_server):
         """Test that tool_choice='none' yields a text response.

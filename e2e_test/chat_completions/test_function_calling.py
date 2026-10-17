@@ -17,6 +17,7 @@ import openai
 import pytest
 import smg_client
 from infra.constants import get_parser
+from infra.streams import collect_streamed_chat
 
 logger = logging.getLogger(__name__)
 
@@ -219,24 +220,15 @@ class TestOpenAIServerFunctionCalling:
             tools=tools,
         )
 
-        chunks = list(response_stream)
+        streamed = collect_streamed_chat(response_stream)
+        chunks = streamed.chunks
         assert len(chunks) > 0, "Streaming should return at least one chunk"
 
-        found_function_name = False
-        for chunk in chunks:
-            choice = chunk.choices[0]
-            # Check whether the current chunk contains tool_calls
-            if choice.delta.tool_calls:
-                tool_call = choice.delta.tool_calls[0]
-                if tool_call.function.name:
-                    assert tool_call.function.name == "get_current_weather", (
-                        "Function name should be 'get_current_weather'"
-                    )
-                    found_function_name = True
-                    break
-
-        assert found_function_name, (
+        assert streamed.tool_calls, (
             "Target function name 'get_current_weather' was not found in the streaming chunks"
+        )
+        assert streamed.tool_calls[0].name == "get_current_weather", (
+            "Function name should be 'get_current_weather'"
         )
 
         finish_reason = chunks[-1].choices[0].finish_reason
@@ -294,21 +286,12 @@ class TestOpenAIServerFunctionCalling:
             tools=tools,
         )
 
-        argument_fragments = []
-        chunks = list(response_stream)
-        function_name = None
-        for chunk in chunks:
-            choice = chunk.choices[0]
-            if choice.delta.tool_calls:
-                tool_call = choice.delta.tool_calls[0]
-                # Record the function name on first occurrence
-                function_name = tool_call.function.name or function_name
-                # In case of multiple chunks, JSON fragments may need to be concatenated
-                if tool_call.function.arguments is not None:
-                    argument_fragments.append(tool_call.function.arguments)
+        streamed = collect_streamed_chat(response_stream)
+        chunks = streamed.chunks
+        function_name = streamed.tool_calls[0].name if streamed.tool_calls else None
 
         assert function_name == "add", "Function name should be 'add'"
-        joined_args = "".join(argument_fragments)
+        joined_args = streamed.tool_calls[0].arguments
         assert len(joined_args) > 0, "No parameter fragments were returned in the function call"
 
         finish_reason = chunks[-1].choices[0].finish_reason
@@ -1160,9 +1143,8 @@ class _TestToolChoiceBase:
     def test_tool_choice_auto_streaming(self, model, api_client):
         """Test tool_choice='auto' semantics in streaming mode.
 
-        Same contract as the non-streaming variant, verified over accumulated
-        stream deltas (chunk collection mirrors
-        test_required_streaming_arguments_chunks_json).
+        Same contract as the non-streaming variant, verified over the
+        accumulated stream deltas.
         """
 
         tools = self._auto_decision_tools()
@@ -1178,35 +1160,17 @@ class _TestToolChoiceBase:
                 tool_choice="auto",
                 stream=True,
             )
-            content_parts = []
-            tool_calls_by_index = {}
-            finish_reason = None
-            for chunk in response:
-                choice = chunk.choices[0]
-                if choice.finish_reason:
-                    finish_reason = choice.finish_reason
-                if choice.delta.content:
-                    content_parts.append(choice.delta.content)
-                if choice.delta.tool_calls:
-                    for tc_delta in choice.delta.tool_calls:
-                        tool_call = tool_calls_by_index.setdefault(
-                            tc_delta.index, {"name": "", "arguments": ""}
-                        )
-                        if tc_delta.function:
-                            if tc_delta.function.name:
-                                tool_call["name"] = tc_delta.function.name
-                            if tc_delta.function.arguments:
-                                tool_call["arguments"] += tc_delta.function.arguments
-            return "".join(content_parts), list(tool_calls_by_index.values()), finish_reason
+            streamed = collect_streamed_chat(response)
+            return streamed.content, streamed.tool_calls, streamed.finish_reason
 
         def assert_streamed_calls_valid(tool_calls):
             # Name provenance is not asserted - see _assert_auto_tool_calls_valid.
             for tool_call in tool_calls:
-                assert tool_call["arguments"], (
-                    f"streamed tool call {tool_call['name']!r} produced no argument "
+                assert tool_call.arguments, (
+                    f"streamed tool call {tool_call.name!r} produced no argument "
                     "deltas - the call is unusable by the client"
                 )
-                args = json.loads(tool_call["arguments"])
+                args = json.loads(tool_call.arguments)
                 assert isinstance(args, dict)
 
         # --- Scenario 1: prompt that needs the weather tool ---
@@ -1215,7 +1179,7 @@ class _TestToolChoiceBase:
         )
         if tool_calls:
             assert_streamed_calls_valid(tool_calls)
-            assert flaky or any("tokyo" in tc["arguments"].lower() for tc in tool_calls), (
+            assert flaky or any("tokyo" in tc.arguments.lower() for tc in tool_calls), (
                 f"Expected the location (Tokyo) in streamed tool call args, got: {tool_calls}"
             )
             assert finish_reason == "tool_calls", (
@@ -1285,12 +1249,7 @@ class _TestToolChoiceBase:
             stream=True,
         )
 
-        # Collect streaming response
-        tool_call_chunks = []
-
-        for chunk in response:
-            if chunk.choices[0].delta.tool_calls:
-                tool_call_chunks.extend(chunk.choices[0].delta.tool_calls)
+        tool_call_chunks = collect_streamed_chat(response).tool_call_deltas
 
         # With required, we should get tool call chunks
         assert len(tool_call_chunks) > 0
@@ -1337,23 +1296,12 @@ class _TestToolChoiceBase:
             stream=True,
         )
 
-        # Collect streaming response
-        tool_call_chunks = []
-
-        for chunk in response:
-            if chunk.choices[0].delta.tool_calls:
-                tool_call_chunks.extend(chunk.choices[0].delta.tool_calls)
+        streamed = collect_streamed_chat(response)
 
         # Should get tool call chunks for the specific function
-        assert len(tool_call_chunks) > 0
+        assert len(streamed.tool_call_deltas) > 0
 
-        # Find function name in chunks
-        found_name = None
-        for chunk in tool_call_chunks:
-            if chunk.function and chunk.function.name:
-                found_name = chunk.function.name
-                break
-
+        found_name = streamed.tool_calls[0].name
         assert found_name == "get_weather"
 
     def test_required_streaming_arguments_chunks_json(self, model, api_client):
@@ -1374,47 +1322,21 @@ class _TestToolChoiceBase:
             stream=True,
         )
 
-        # Collect all tool call chunks and reconstruct complete tool calls
-        tool_calls_by_index = {}
-        for chunk in response:
-            if chunk.choices[0].delta.tool_calls:
-                for tool_call_delta in chunk.choices[0].delta.tool_calls:
-                    tool_index = tool_call_delta.index
+        tool_calls = collect_streamed_chat(response).tool_calls
 
-                    # Initialize tool call if not seen before
-                    tool_call = tool_calls_by_index.setdefault(
-                        tool_index,
-                        {
-                            "id": None,
-                            "type": "function",
-                            "function": {"name": "", "arguments": ""},
-                        },
-                    )
-
-                    # Update fields from the delta
-                    if tool_call_delta.id is not None:
-                        tool_call["id"] = tool_call_delta.id
-                    if tool_call_delta.function:
-                        if tool_call_delta.function.name:
-                            tool_call["function"]["name"] = tool_call_delta.function.name
-                        if tool_call_delta.function.arguments:
-                            tool_call["function"]["arguments"] += tool_call_delta.function.arguments
-
-        assert len(tool_calls_by_index) > 0
+        assert len(tool_calls) > 0
 
         # Validate that complete tool calls have valid JSON arguments
-        for tool_call in tool_calls_by_index.values():
-            assert tool_call["function"]["name"] is not None
-            assert tool_call["function"]["arguments"] is not None
+        for tool_call in tool_calls:
+            assert tool_call.name is not None
+            assert tool_call.arguments is not None
 
             # The complete arguments should be valid JSON
             try:
-                args = json.loads(tool_call["function"]["arguments"])
+                args = json.loads(tool_call.arguments)
                 assert isinstance(args, dict)
             except json.JSONDecodeError:
-                pytest.fail(
-                    f"Invalid JSON in complete tool call arguments: {tool_call['function']['arguments']}"
-                )
+                pytest.fail(f"Invalid JSON in complete tool call arguments: {tool_call.arguments}")
 
     def test_complex_parameters_required_non_streaming(self, model, api_client):
         """Validate complex nested parameter schemas in non-streaming required mode."""
