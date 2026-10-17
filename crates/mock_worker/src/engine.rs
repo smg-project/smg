@@ -3493,6 +3493,87 @@ mod tests {
         assert!(next_event(&mut rx, &mut held, &mut hang, 3).await.is_none());
     }
 
+    /// The hold starts the moment the armed count is out, not when the
+    /// engine's next event arrives: with nothing in the channel the hold is
+    /// counted at once, and the stream resumes with the token the engine
+    /// produces during it, when the hold ends and not one step later.
+    #[tokio::test]
+    async fn the_hold_starts_at_the_armed_count_before_the_next_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let hung = Arc::new(AtomicU64::new(0));
+        let mut hang = Some(Hang {
+            after_tokens: 1,
+            hold: Duration::from_millis(200),
+            hung_total: Arc::clone(&hung),
+        });
+        let mut held = VecDeque::new();
+        let started = Instant::now();
+        let (item, ()) = tokio::join!(next_event(&mut rx, &mut held, &mut hang, 1), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(
+                hung.load(Ordering::Relaxed),
+                1,
+                "the hold is counted before the engine's next event"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            tx.send(token()).unwrap();
+        });
+        assert!(
+            item.is_some(),
+            "the token produced during the hold follows it"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "the hold ran its course: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "the hold did not wait for a further event: {elapsed:?}"
+        );
+    }
+
+    /// An output exactly as long as the armed count: the hold starts once
+    /// the count is out, and the engine's end (its `Done`, then the sender
+    /// dropped) ends it early, the end delivered then; the silence is the
+    /// hold's or the engine's, whichever is shorter.
+    #[tokio::test]
+    async fn an_output_exactly_as_long_as_the_armed_count_holds_its_end() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let hung = Arc::new(AtomicU64::new(0));
+        let mut hang = Some(Hang {
+            after_tokens: 1,
+            hold: Duration::from_secs(30),
+            hung_total: Arc::clone(&hung),
+        });
+        let mut held = VecDeque::new();
+        let started = Instant::now();
+        let (item, ()) = tokio::join!(next_event(&mut rx, &mut held, &mut hang, 1), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tx.send(GenEvent::Done {
+                finish_reason: "stop",
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                cached_tokens: 0,
+            })
+            .unwrap();
+            drop(tx);
+        });
+        assert!(
+            matches!(item, Some(GenEvent::Done { .. })),
+            "the end is delivered once the engine let go: {item:?}"
+        );
+        assert_eq!(
+            hung.load(Ordering::Relaxed),
+            1,
+            "the hold began at the count"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the hold ended with the engine, not at 30 s"
+        );
+    }
+
     /// An engine that ends the request during the hold (the gateway's abort)
     /// ends the hold: the stream delivers what the engine produced and ends,
     /// long before the hold would have.
