@@ -93,9 +93,11 @@ impl Dialect {
     };
 }
 
-/// The most bytes a list held after content may grow to before it is given back as content: a
-/// real list of calls is short, and content with a `[name(` of its own must not stop the stream.
-const HOLD_CAP_BYTES: usize = 8192;
+/// The most bytes a list held after content may grow to before it is given back as content. A
+/// hold whose first name no tool declares is given back at its `(` already, so this is the
+/// backstop for a declared name followed by a stray quote, and it sits far above any real call's
+/// arguments: a call that writes a whole file stays a call.
+const HOLD_CAP_BYTES: usize = 256 * 1024;
 
 /// The events of the pythonic calls in one region, each call with its own index from `first` and
 /// its id from the engine's [`CallIds`].
@@ -415,8 +417,15 @@ impl Assembler {
                     _ => false,
                 };
                 if opens && self.begun {
-                    // A list after content: held until it is whole, then read if well formed.
-                    self.stage = Stage::Holding(ListExtent::opened());
+                    // A list after content: held until it is whole, then read if well formed. A
+                    // first name no tool declares can only end as content (`[f(x)g'(x) + ...]`,
+                    // `[Authorize(`), so it is content from its `(`, and the stream goes on.
+                    let name = self.carried[1..].trim();
+                    self.stage = if declared.declares(name) {
+                        Stage::Holding(ListExtent::opened())
+                    } else {
+                        Stage::Prose
+                    };
                 } else if opens {
                     // The turn's list: the bytes held read as the list's, wrapping and name, and
                     // the `(` starts the call.
@@ -768,13 +777,35 @@ mod tests {
         out.drain()
     }
 
-    /// Content with a `[f(` of its own and a lone quote after it: the hold would never close, so
+    /// Content with a `[name(` of its own: a name no tool declares is given back as content at its
+    /// `(`, before the region ends, and the turn streams on.
+    #[test]
+    fn a_hold_after_content_whose_name_no_tool_declares_is_content_at_once() {
+        let text = "The product rule gives [f(x)g'(x) + ";
+        let mut assembler = Assembler::bare(0, ids(), Dialect::LLAMA4);
+        let mut out = Events::new();
+        assembler.feed(text, &tools(), &mut out);
+        let while_open = out.drain();
+        assert_eq!(
+            content(&while_open),
+            text,
+            "given back before the region ends"
+        );
+        assembler.finish(&mut out);
+        let mut events = while_open;
+        events.extend(out.drain());
+        assert_eq!(bytes(&events), text);
+        assert!(calls(&events).is_empty());
+        assert_eq!(malformed(&events), "");
+    }
+
+    /// A declared name after content with a lone quote after it: the hold would never close, so
     /// it is given back as content once it passes the cap, before the region ends, and the turn
     /// streams on.
     #[test]
     fn a_hold_after_content_is_given_back_once_it_passes_the_cap() {
         let text = format!(
-            "The product rule gives [f(x)g'(x) + {}",
+            "Checking.[get_weather(city='Paris{}",
             "z".repeat(HOLD_CAP_BYTES)
         );
         let mut assembler = Assembler::bare(0, ids(), Dialect::LLAMA4);

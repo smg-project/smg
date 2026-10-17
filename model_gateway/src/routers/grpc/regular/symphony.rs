@@ -1802,8 +1802,9 @@ mod tests {
                 // (`names_are_checked_against_both_registries_by_the_parser_in_force`).
                 continue;
             }
-            // A launcher's name for a family whose table has no older parser passes under
-            // Symphony in both flags, in either alone, and beside the table's own name.
+            // A name no legacy registry has (a launcher's for a family whose table has no older
+            // parser, an engine's exact name for a table) passes under Symphony in both flags, in
+            // either alone, and beside the table's own name.
             launchers.push(alias);
             let doubled = names(Some(alias), Some(alias));
             assert_eq!(named_table(&doubled.labels), Some(table), "{alias}");
@@ -1830,7 +1831,7 @@ mod tests {
                 "{alias}"
             );
         }
-        assert_eq!(launchers, ["muse"]);
+        assert_eq!(launchers, ["llama4_pythonic", "muse"]);
     }
 
     #[test]
