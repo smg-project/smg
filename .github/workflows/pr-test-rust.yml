@@ -57,7 +57,7 @@ jobs:
 
       - name: Run pre-commit checks
         env:
-          SKIP: rustfmt,clippy,no-commit-to-branch,branch-name-check,dco-check,no-ai-co-author
+          SKIP: rustfmt,rustfmt-symphony-fuzz,clippy,no-commit-to-branch,branch-name-check,dco-check,no-ai-co-author
         run: pre-commit run --all-files --show-diff-on-failure
 
   python-lint:
@@ -348,6 +348,8 @@ jobs:
           rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
           rustup toolchain install nightly --profile minimal
           cargo +nightly fmt -- --check
+          # The Symphony fuzz crate is a workspace of its own; the root's fmt does not reach it.
+          cargo +nightly fmt --manifest-path crates/symphony/fuzz/Cargo.toml --all -- --check
 
       # --strict makes a fixture that fails to generate fail this step (the Rust
       # golden tests skip a missing fixture directory, so a silent skip here
