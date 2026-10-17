@@ -1145,7 +1145,7 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "inkling",
         model: "thinkingmachines/Inkling",
-        also: &["Inkling-Small"],
+        also: &["Inkling-Small", "Inkling-NVFP4"],
         released: "2026-07-14",
         smg: (Some("inkling"), Some("inkling")),
         table: Some(Table::Inkling),

@@ -59,7 +59,7 @@
   {"model": "NousResearch/Hermes-4-14B", "also": [], "table": "qwen2.5", "opener": null},
   {"model": "FreedomIntelligence/HuatuoGPT-3-27B", "also": [], "table": "qwen3_tagged", "opener": null},
   {"model": "tencent/Hy4-preview", "also": [], "table": "hy4", "opener": null},
-  {"model": "thinkingmachines/Inkling", "also": ["Inkling-Small"], "table": "inkling", "opener": null},
+  {"model": "thinkingmachines/Inkling", "also": ["Inkling-Small", "Inkling-NVFP4"], "table": "inkling", "opener": null},
   {"model": "IQuestLab/IQuest-Q1", "also": [], "table": "iquest", "opener": null},
   {"model": "LGAI-EXAONE/K-EXAONE-236B-A23B", "also": [], "table": "qwen3", "opener": "<|assistant|>"},
   {"model": "IFM/K2-Horizon-36B", "also": ["K2-Horizon-32B", "K2-Horizon-375B-A23B"], "table": "k2_horizon", "opener": null},

@@ -493,6 +493,10 @@ mod tests {
             table_for("nvidia/Llama-3_1-Nemotron-Ultra-253B-CPT-v1"),
             Some(Table::Json)
         );
+        assert_eq!(
+            table_for("thinkingmachines/Inkling-NVFP4"),
+            Some(Table::Inkling)
+        );
     }
 
     #[test]

@@ -164,7 +164,7 @@ with Symphony (a quantized or renamed checkpoint is not listed, and keeps the ol
 its group names it); whether the flags stay as aliases is an open question of the design.
 
 <!-- models: begin -->
-202 groups, 343 checkpoints, newest first.
+202 groups, 344 checkpoints, newest first.
 12 ready, 131 replaying a recorded set, 3 on main awaiting fixtures, 56 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
@@ -196,7 +196,7 @@ its group names it); whether the flags stay as aliases is an open question of th
 | 2026-07-23 | [arex-turbo](https://github.com/smg-project/bellwether/tree/main/fixtures/arex-turbo) | BAAI/AREX-Turbo |  | `qwen3`, tagged calls | 474,543 | replaying the set | none |
 | 2026-07-21 | [nanbeige4.2-3b](https://github.com/smg-project/bellwether/tree/main/fixtures/nanbeige4.2-3b) | Nanbeige/Nanbeige4.2-3B |  | `qwen3`, tagged calls | 589,298 | replaying the set | none |
 | 2026-07-17 | [fara1.5-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/fara1.5-27b) | microsoft/Fara1.5-27B |  | `qwen3`, tagged calls | 474,543 | replaying the set | none |
-| 2026-07-14 | [inkling](https://github.com/smg-project/bellwether/tree/main/fixtures/inkling) | thinkingmachines/Inkling | Inkling-Small | `inkling` | 589,659 | replaying the set | `inkling`, `inkling` |
+| 2026-07-14 | [inkling](https://github.com/smg-project/bellwether/tree/main/fixtures/inkling) | thinkingmachines/Inkling | Inkling-Small, Inkling-NVFP4 | `inkling` | 589,659 | replaying the set | `inkling`, `inkling` |
 | 2026-07-09 | [cosmos3-edge-policy-droid](https://github.com/smg-project/bellwether/tree/main/fixtures/cosmos3-edge-policy-droid) | nvidia/Cosmos3-Edge-Policy-DROID |  | `qwen3`, tagged calls | 12,829 | replaying the set | none |
 | 2026-07-01 | [cosmos3-edge](https://github.com/smg-project/bellwether/tree/main/fixtures/cosmos3-edge) | nvidia/Cosmos3-Edge |  | `qwen3`, tagged calls | 12,829 | replaying the set | none |
 | 2026-06-24 | [nvidia-nemotron-labs-3-puzzle-75b-a9b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-labs-3-puzzle-75b-a9b-bf16) | nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-BF16 |  | `qwen3`, tagged calls | 12,829 | replaying the set | none |

@@ -181,6 +181,9 @@ What the table says beyond the others:
   answer are free text, so the recorded thinking turn stays writable. A marker outside a
   message's header is writable under the tag too and reads as that message's text: the
   grammar is wider than the table there, as the gateway's tag is.
+- **The group is one template.** Inkling, Inkling-Small and Inkling-NVFP4 ship the same chat
+  template byte for byte (one sha256 at the three checkpoints' recorded or current revisions), so
+  the three read with the one table and the recorded `inkling` set stands for the group.
 
 What the table leaves out, for want of fixtures: image and audio messages, which the template writes
 for the user and never for the model; and the text-mode invocation, `<|content_invoke_tool_text|>`,
