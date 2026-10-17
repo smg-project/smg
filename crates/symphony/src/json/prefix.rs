@@ -15,7 +15,10 @@
 //! (`nu`), a number cut anywhere (`-`, `1.`, `1e+`), a string cut anywhere, and the one thing JSON
 //! lacks that it lets through, a raw control character inside a string, which the fragment that
 //! carries it writes as its escape ([`Prefix::escaped`]), so that what a client assembles is JSON
-//! again. What it refuses, at the first byte a strict reader refuses: a value left out before a
+//! again. One place it is wider than `serde_json`: it reads a number's grammar, not its size, so a
+//! number out of the reader's range (`1e400`, an integer past what fits) passes, and a call that
+//! carries one closes whole while a client's reader may refuse the number; the templates' own
+//! readers differ there too (Python's reads it as infinity), so the judge leaves it to the client. What it refuses, at the first byte a strict reader refuses: a value left out before a
 //! comma or a close (`[,,]`, `{"a": }`), a trailing comma before a close (`[1, ]`), a bracket
 //! closed by the wrong kind (`{"a": [1}`), whitespace JSON lacks between tokens (a no-break
 //! space), a number or a word cut short before a delimiter (`1.}`, `nu}`), a container nested
@@ -186,8 +189,9 @@ impl Prefix {
     /// stopped being a prefix of a value, if they have: an offset into the whole text, never past
     /// what has been fed, but anywhere at or after the start, bytes judged sound before included,
     /// since the parser rolls back to a word's first letter when the word is no literal, to the
-    /// backslash before a surrogate's missing other half, and to the value's start when a
-    /// top-level string breaks. A caller that has already passed on the sound bytes clamps the
+    /// backslash of an escape it refuses (one JSON lacks, a `\u` escape short of its digits, a
+    /// surrogate without its other half), and to the value's start when a top-level string
+    /// breaks. A caller that has already passed on the sound bytes clamps the
     /// answer to what it passed on, as the assembler does.
     pub fn feed(&mut self, bytes: &str) -> Option<usize> {
         for (offset, c) in bytes.char_indices() {
@@ -251,9 +255,10 @@ impl Prefix {
     /// Where the escape under way starts, while one is: the backslash of an escape whose letter
     /// has not come, of a `\u` escape whose four hex digits are not all in, and of the `\u` escape
     /// after a high surrogate until it is the low half. The judge refuses at that backslash when
-    /// the escape turns out to be a surrogate without its other half, so an assembler holds from
-    /// there, and no fragment ends inside an escape; a letter JSON knows, four digits that are a
-    /// character, and a high surrogate's four digits release the hold.
+    /// the escape turns out to be one JSON lacks (`\q`), a `\u` escape short of its four hex
+    /// digits, or a surrogate without its other half, so an assembler holds from there, and no
+    /// fragment ends inside an escape; a letter JSON knows, four digits that are a character, and
+    /// a high surrogate's four digits release the hold.
     pub fn escape_start(&self) -> Option<usize> {
         if self.invalid.is_some() {
             return None;
@@ -829,10 +834,7 @@ mod tests {
                 strict_prefix(&text[..at]),
                 "{text:?}: the bytes before {at}"
             );
-            assert!(
-                !strict_prefix(text) || serde_json::from_str::<serde_json::Value>(text).is_err(),
-                "{text:?}: whole"
-            );
+            assert!(!strict_prefix(text), "{text:?}: whole");
             if let Some(refused) = strict_refusal(text) {
                 assert!(
                     at <= refused,
