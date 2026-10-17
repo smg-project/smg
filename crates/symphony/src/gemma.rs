@@ -814,7 +814,7 @@ mod tests {
 
     /// A member the call's end cuts between its colon and its value: the object closed for the
     /// client has no value where one must stand, nothing is made up for it, and the call says
-    /// so, at the closing marker with the key's reason and at the end of the stream as the cut
+    /// so, at the closing marker with the value's reason and at the end of the stream as the cut
     /// region it is. A list closed where a value may come is an empty list, and an object closed
     /// after a comma is whole: no word for those.
     #[test]
