@@ -117,7 +117,7 @@ impl LoadBalancingPolicy for BucketPolicy {
             .buckets
             .get(model_key)
             .map(|entry| entry.value().clone());
-        let prefill_url = if let Some(bucket) = bucket {
+        if let Some(bucket) = bucket {
             let (choiced_url, chars_per_url_snapshot) = {
                 let buc = bucket.read();
                 let chars_per_url_snapshot = buc.chars_per_url.lock().clone();
@@ -162,25 +162,39 @@ impl LoadBalancingPolicy for BucketPolicy {
                 }
             };
 
+            // The bucket chooses among the workers it lists; the caller offers
+            // the ones available now (on a retry, the ones not yet tried). A
+            // listed worker that is not offered, or not healthy, gives way to
+            // an offered one, and the load is booked to the worker that serves
+            // the request.
+            let position = healthy_indices
+                .iter()
+                .copied()
+                .find(|&i| workers[i].url() == prefill_url)
+                .unwrap_or_else(|| {
+                    let fallback = healthy_indices[rng.random_range(0..healthy_indices.len())];
+                    warn!(
+                        "Bucket worker {} is not among the offered workers, randomly selecting: {}",
+                        prefill_url,
+                        workers[fallback].url()
+                    );
+                    fallback
+                });
+
             {
                 let mut buc = bucket.write();
-                buc.post_process_request(char_count, prefill_url.clone());
+                buc.post_process_request(char_count, workers[position].url().to_string());
             }
 
-            prefill_url
-        } else {
-            warn!(
-                "No bucket found for model {}, randomly selecting healthy worker",
-                model_key
-            );
-            let mut rng = rand::rng();
-            let idx = rng.random_range(0..healthy_indices.len());
-            let selected_worker = &workers[healthy_indices[idx]];
-            let prefill_url = selected_worker.url().to_string();
-            prefill_url
-        };
+            return Some(position);
+        }
 
-        workers.iter().position(|w| w.url() == prefill_url)
+        warn!(
+            "No bucket found for model {}, randomly selecting healthy worker",
+            model_key
+        );
+        let mut rng = rand::rng();
+        Some(healthy_indices[rng.random_range(0..healthy_indices.len())])
     }
 
     /// A worker that left the fleet leaves every bucket that listed it; a
@@ -330,8 +344,13 @@ impl Bucket {
 
     pub fn post_process_request(&mut self, char_cnt: usize, prefill_url: String) {
         {
+            // Only a worker the bucket counts takes the load: a selection that
+            // overlapped the worker's removal must not put its counter back,
+            // where it would draw the spill towards a URL no caller offers.
             let mut map = self.chars_per_url.lock();
-            *map.entry(prefill_url.clone()).or_insert(0) += char_cnt;
+            if let Some(count) = map.get_mut(&prefill_url) {
+                *count += char_cnt;
+            }
         }
 
         let now = SystemTime::now();
@@ -378,7 +397,11 @@ impl Bucket {
     /// Forget `url`: its place among the workers, its load counter and its
     /// range, which the previous neighbour takes over (the next one when it
     /// was first). The partition stays contiguous until the next adjustment
-    /// rebuilds it from the request sizes seen. Whether the bucket held it.
+    /// rebuilds it from the request sizes seen: the reference load of the
+    /// last rebuild is cleared, so that tick re-partitions among the workers
+    /// left instead of holding a partition whose per-worker load moved by
+    /// less than the factor of two it otherwise waits for. Whether the bucket
+    /// held it.
     pub fn remove_prefill_worker_url(&mut self, url: &str) -> bool {
         let listed = {
             let mut urls = self.prefill_worker_urls.lock();
@@ -387,6 +410,9 @@ impl Bucket {
             self.bucket_cnt = urls.len();
             urls.len() != before
         };
+        if listed {
+            self.bucket_load = 0;
+        }
         let counted = self.chars_per_url.lock().remove(url).is_some();
         let Some(i) = self.boundary.iter().position(|b| b.url == url) else {
             return listed || counted;
@@ -1423,5 +1449,103 @@ mod tests {
         assert!(boundaries(&policy, &workers).is_empty());
         let newcomer = prefill_workers(&["http://w4:8000"]);
         assert_eq!(select(&policy, &newcomer, 2000), Some(0));
+    }
+
+    /// After a removal the next adjustment re-partitions among the workers
+    /// left: the reference load of the last rebuild is cleared, so the skip
+    /// for a per-worker load that moved by less than a factor of two (three
+    /// workers to two is a factor of one and a half) does not hold the merged
+    /// range in place.
+    #[test]
+    fn a_removal_lets_the_next_adjustment_re_partition_among_the_survivors() {
+        let policy = boundary_only_policy();
+        let workers = prefill_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_prefill_worker_urls(&workers);
+        for size in [100, 200, 3000] {
+            select(&policy, &workers, size).expect("a worker serves the request");
+        }
+        let bucket = {
+            let entry = policy
+                .buckets
+                .get(normalize_model_key(workers[0].model_id()))
+                .expect("the workers' model has a bucket");
+            Arc::clone(entry.value())
+        };
+        bucket.write().adjust_boundary();
+        assert_eq!(
+            bucket.read().bucket_load,
+            1100,
+            "the first rebuild keeps the per-worker load as its reference"
+        );
+
+        policy.remove_worker("http://w2:8000");
+        assert_eq!(bucket.read().bucket_load, 0);
+        let merged = boundaries(&policy, &workers);
+        assert_eq!(
+            merged,
+            [
+                ("http://w1:8000".to_string(), [0, 4101]),
+                ("http://w3:8000".to_string(), [4102, usize::MAX]),
+            ]
+        );
+
+        bucket.write().adjust_boundary();
+        assert_eq!(
+            boundaries(&policy, &workers),
+            [
+                ("http://w1:8000".to_string(), [0, 3000]),
+                ("http://w3:8000".to_string(), [3001, usize::MAX]),
+            ],
+            "the tick after a removal re-partitions among the survivors"
+        );
+        assert_eq!(bucket.read().bucket_load, 1650);
+    }
+
+    /// A selection that chose a worker before its removal and books its load
+    /// after it does not bring the worker's counter back.
+    #[test]
+    fn a_selection_overlapping_a_removal_does_not_resurrect_the_departed_worker() {
+        let policy = boundary_only_policy();
+        let workers = prefill_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_prefill_worker_urls(&workers);
+        policy.remove_worker("http://w2:8000");
+
+        let entry = policy
+            .buckets
+            .get(normalize_model_key(workers[0].model_id()))
+            .expect("the workers' model has a bucket");
+        let mut bucket = entry.write();
+        bucket.post_process_request(500, "http://w2:8000".to_string());
+        assert!(!bucket.chars_per_url.lock().contains_key("http://w2:8000"));
+        bucket.post_process_request(500, "http://w1:8000".to_string());
+        assert_eq!(
+            bucket.chars_per_url.lock().get("http://w1:8000"),
+            Some(&500)
+        );
+    }
+
+    /// A worker the bucket lists but the caller does not offer (not available
+    /// now, or already tried on a retry) gives way to an offered worker, and
+    /// the load is booked to the worker that serves the request.
+    #[test]
+    fn a_listed_worker_the_caller_does_not_offer_gives_way_to_an_offered_one() {
+        let policy = boundary_only_policy();
+        let workers = prefill_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_prefill_worker_urls(&workers);
+
+        // 2000 is in w2's range [1365, 2729]; w2 is listed but not offered.
+        let offered = [Arc::clone(&workers[0]), Arc::clone(&workers[2])];
+        let selected =
+            select(&policy, &offered, 2000).expect("an offered worker serves the request");
+        let served = offered[selected].url().to_string();
+
+        let entry = policy
+            .buckets
+            .get(normalize_model_key(workers[0].model_id()))
+            .expect("the workers' model has a bucket");
+        let bucket = entry.read();
+        let counted = bucket.chars_per_url.lock();
+        assert_eq!(counted.get("http://w2:8000"), Some(&0));
+        assert_eq!(counted.get(served.as_str()), Some(&2000));
     }
 }
