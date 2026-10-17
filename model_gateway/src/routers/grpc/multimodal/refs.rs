@@ -274,11 +274,13 @@ pub(crate) fn vision_worker_without_media_processing(worker: &dyn Worker) -> boo
 
 /// Whether `workers` hold an encode worker, so their model runs the
 /// encode-prefill-decode pipeline: media references never travel on it,
-/// whatever its workers advertise, and selection refuses them with the
-/// request's own 400 (`EncodeNotSupported`), which names the fix that applies
-/// there (`--mm-processing auto` or `router`). Such a model is neither refused
-/// in preparation nor named as waiting for a media-capable worker (readiness,
-/// the registration warning): a capable worker changes nothing for it.
+/// whatever its workers advertise. Under `--mm-processing auto` such a pool
+/// resolves to router-side processing; under `worker`, selection refuses the
+/// references with the request's own 400 (`EncodeNotSupported`), which names
+/// the fix that applies there (`--mm-processing auto` or `router`). Such a
+/// model is neither refused in preparation nor named as waiting for a
+/// media-capable worker (readiness, the registration warning): a capable
+/// worker changes nothing for it.
 pub(crate) fn pool_has_encode_worker<'a>(
     workers: impl IntoIterator<Item = &'a Arc<dyn Worker>>,
 ) -> bool {
@@ -484,7 +486,13 @@ pub(crate) fn resolve_mm_processing(
                 // Every registered worker, healthy or not: a health flap must
                 // not flip a model between modes request to request.
                 let workers = registry.get_by_model(model_id);
+                // On an encode-prefill-decode pool references never travel
+                // (`pool_has_encode_worker`), whatever its workers advertise:
+                // the router processes the media itself rather than resolve
+                // to a mode selection would refuse.
+                let epd = pool_has_encode_worker(workers.iter());
                 let uniform = !workers.is_empty()
+                    && !epd
                     && workers
                         .iter()
                         .all(|worker| worker_accepts_media_refs(worker.as_ref()));
@@ -509,6 +517,8 @@ pub(crate) fn resolve_mm_processing(
                             "auto_uniform"
                         },
                     )
+                } else if epd {
+                    (MmProcessing::Router, "auto_epd")
                 } else {
                     (MmProcessing::Router, "auto_mixed")
                 }
@@ -944,6 +954,42 @@ mod tests {
         let empty = registry_with(vec![]);
         assert_eq!(
             resolve_mm_processing(&components, &empty, MODEL, &plan_ok, &placeholders)
+                .expect("resolves"),
+            MmProcessing::Router
+        );
+    }
+
+    /// An encode-prefill-decode pool resolves to router-side processing under
+    /// `auto`, whatever its workers advertise: references never travel on
+    /// that pipeline, so a pool whose workers all accept them would otherwise
+    /// resolve to a mode selection refuses, with a 400 naming the mode the
+    /// router already runs.
+    #[test]
+    fn auto_processes_in_the_router_for_an_encode_prefill_decode_pool() {
+        let placeholders = expandable_placeholders();
+        let plan_ok = plan(vec![image_url("https://a/1.png")]);
+        let components = components(MmProcessingMode::Auto);
+        let encode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:9410")
+                .model(ModelCard::new(MODEL))
+                .worker_type(WorkerType::Encode)
+                .runtime_type(RuntimeType::Vllm)
+                .connection_mode(ConnectionMode::Grpc)
+                .label(MM_PROCESSOR_LABEL, "inprocess")
+                .label(MM_MEDIA_REF_SCHEMES_LABEL, "http,https,data")
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let epd = registry_with(vec![
+            capable("grpc://127.0.0.1:9411"),
+            capable("grpc://127.0.0.1:9412"),
+            encode,
+        ]);
+        assert_eq!(
+            resolve_mm_processing(&components, &epd, MODEL, &plan_ok, &placeholders)
                 .expect("resolves"),
             MmProcessing::Router
         );
