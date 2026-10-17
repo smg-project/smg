@@ -2058,10 +2058,6 @@ mod tests {
         assert!(deserialized.trace_config.is_none());
     }
 
-    /// A switched-off overload signal (`null`) must come back off from a
-    /// serialize/deserialize round-trip. The field's default is `Some`, so
-    /// skipping `None` on serialize would hand the default back on
-    /// deserialize and turn the signal on again.
     #[test]
     fn symphony_is_the_default_parser_and_legacy_spells_the_opt_out() {
         assert_eq!(ParserChoice::default(), ParserChoice::Symphony);
@@ -2085,6 +2081,10 @@ mod tests {
         assert_eq!(legacy.parser, ParserChoice::Legacy);
     }
 
+    /// A switched-off overload signal (`null`) must come back off from a
+    /// serialize/deserialize round-trip. The field's default is `Some`, so
+    /// skipping `None` on serialize would hand the default back on
+    /// deserialize and turn the signal on again.
     #[test]
     fn disabled_overload_signals_survive_a_serde_round_trip() {
         let config = RouterConfig {

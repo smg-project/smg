@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from smg.launch_router import RouterArgs, launch_router
-from smg.router import build_control_plane_auth_config, policy_from_str
+from smg.router import Router, build_control_plane_auth_config, policy_from_str
 from smg.smg_rs import PolicyType
 from smg.smg_rs import Router as _Router
 
@@ -527,15 +527,23 @@ class TestRouterConstructorSignature:
 
 class TestRouterParserChoice:
     """The launcher reads with Symphony unless ``--parser legacy`` is given: ``RouterArgs.parser``
-    is what ``Router.from_args`` hands to ``_Router(...)`` explicitly. The binding's constructor
-    takes either name (its own default is the same, applied by the binding and checked, like
-    every other name, when the router starts; ``inspect`` renders it as ``...``)."""
+    is what ``Router.from_args`` hands to ``_Router(...)``, by name, so the binding's own
+    signature default never decides for a launcher-started router. The binding stores the
+    name and checks it, like every other name, when the router starts."""
 
-    def test_the_launcher_defaults_to_symphony_and_the_binding_takes_either_name(self):
+    @staticmethod
+    def parser_handed_to_the_binding(args: RouterArgs) -> str:
+        with patch("smg.router._Router") as binding:
+            Router.from_args(args)
+        binding.assert_called_once()
+        return binding.call_args.kwargs["parser"]
+
+    def test_the_launcher_hands_its_default_symphony_to_the_binding(self):
         assert RouterArgs().parser == "symphony"
-        _Router(worker_urls=[])
-        _Router(worker_urls=[], parser="legacy")
-        _Router(worker_urls=[], parser="symphony")
+        assert self.parser_handed_to_the_binding(RouterArgs()) == "symphony"
+
+    def test_legacy_is_handed_to_the_binding_as_spelled(self):
+        assert self.parser_handed_to_the_binding(RouterArgs(parser="legacy")) == "legacy"
 
 
 class TestControlPlaneAuthHalfJwt:

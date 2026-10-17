@@ -220,9 +220,11 @@ router:
   reasoningParser: ""
   toolCallParser: ""
   # -- Which parser reads a chat completion's reasoning and tool calls: symphony (the
-  #    gateway's default) or legacy (the per-model parsers). Passed as --parser; a request's
-  #    X-SMG-Parser header overrides it for that request. Empty leaves the gateway's default.
-  parser: "symphony"
+  #    gateway's default) or legacy (the per-model parsers). Passed as --parser when set; a
+  #    request's X-SMG-Parser header overrides it for that request. Empty (the default) renders
+  #    no flag and follows the gateway's own default on every image tag, including releases
+  #    before the flag existed.
+  parser: ""
 
 # =============================================================================
 # HuggingFace Configuration
