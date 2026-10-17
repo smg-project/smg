@@ -725,10 +725,11 @@ pub(crate) struct Hang {
 
 /// The next event of a request's stream, through the fault hook's hang: when
 /// `delivered` tokens are out and the hang is armed for that many, the stream
-/// delivers nothing for the hold, keeping the events the engine produces
-/// meanwhile (a backend that wedged, then recovered, delivers them late). An
-/// engine that ends the request during the hold (the gateway's abort, a
-/// completion) ends the hold early, with the end of its events.
+/// delivers nothing for the hold, from that moment and not from the engine's
+/// next step, keeping the events the engine produces meanwhile (a backend that
+/// wedged, then recovered, delivers them late). An engine that ends the request
+/// during the hold (the gateway's abort, a completion) ends the hold early,
+/// with the end of its events.
 pub(crate) async fn next_event(
     rx: &mut mpsc::UnboundedReceiver<GenEvent>,
     held: &mut VecDeque<GenEvent>,
@@ -738,25 +739,28 @@ pub(crate) async fn next_event(
     if let Some(ev) = held.pop_front() {
         return Some(ev);
     }
-    let ev = rx.recv().await?;
-    let holds_now = matches!(ev, GenEvent::Token { .. })
-        && hang
-            .as_ref()
-            .is_some_and(|hang| hang.after_tokens == delivered);
+    let holds_now = hang
+        .as_ref()
+        .is_some_and(|hang| hang.after_tokens == delivered);
     if !holds_now {
-        return Some(ev);
+        return rx.recv().await;
     }
+    // The hold starts the moment the armed count is out, before the engine's
+    // next step: the stream stays silent for the hold itself, not for the
+    // hold and one step.
     let Hang {
         hold, hung_total, ..
     } = hang.take()?;
     hung_total.fetch_add(1, Ordering::Relaxed);
-    held.push_back(ev);
     let deadline = tokio::time::Instant::now() + hold;
     // Until the hold ends, or the engine ends the request (its events end).
     while let Ok(Some(ev)) = tokio::time::timeout_at(deadline, rx.recv()).await {
         held.push_back(ev);
     }
-    held.pop_front()
+    match held.pop_front() {
+        Some(ev) => Some(ev),
+        None => rx.recv().await,
+    }
 }
 
 /// Every engine in this process, for the fleet oracle and the admin API.
