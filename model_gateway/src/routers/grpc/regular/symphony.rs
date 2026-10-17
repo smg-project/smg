@@ -1776,6 +1776,16 @@ mod tests {
         assert_eq!(named_table(&pair(Some("cohere"), Some("qwen3"))), None);
         // The older `llama` parser's family (Llama 3.2) reads with the json table.
         assert_eq!(named_table(&pair(Some("llama"), None)), Some(Table::Json));
+        // The older `mistral` parser's list has a table of that name; the v13 spelling keeps its
+        // own.
+        assert_eq!(
+            named_table(&pair(Some("mistral"), None)),
+            Some(Table::Mistral)
+        );
+        assert_eq!(
+            named_table(&pair(Some("mistral_v13"), None)),
+            Some(Table::MistralV13)
+        );
         // The older `pythonic` parser's family reads with the Llama 4 table.
         assert_eq!(
             named_table(&pair(Some("pythonic"), None)),
@@ -3873,7 +3883,7 @@ mod tests {
         for flags in [
             v13.clone(),
             pair(Some(TEMPLATE_PARSER), Some(TEMPLATE_PARSER)),
-            pair(Some("mistral"), None),
+            pair(Some("cohere"), None),
             pair(Some("passthrough"), None),
         ] {
             assert_eq!(
@@ -3896,7 +3906,7 @@ mod tests {
         )
         .is_err());
         assert_eq!(
-            read(&ModelNames::flagged(&pair(Some("mistral"), None)), unknown),
+            read(&ModelNames::flagged(&pair(Some("cohere"), None)), unknown),
             Ok(None)
         );
         assert_eq!(
@@ -3947,7 +3957,7 @@ mod tests {
             qwen3("the model's response template")
         );
         assert_eq!(
-            spelled(pair(Some("mistral"), None), known),
+            spelled(pair(Some("cohere"), None), known),
             qwen3("the legacy parsers")
         );
         assert_eq!(
