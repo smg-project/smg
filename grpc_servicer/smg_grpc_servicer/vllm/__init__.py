@@ -7,6 +7,7 @@ engine-free submodules (media_refs, mm_processor, mm_tensors) import without it.
 import logging
 
 __all__ = [
+    "MULTIPROC_METHOD_ENV",
     "SERVICER_IMPL_ENV",
     "VllmEngineServicer",
     "VllmHealthServicer",
@@ -17,6 +18,10 @@ __all__ = [
 
 # The flag that selects the Rust request path; see `smg_grpc_servicer.vllm.rust`.
 SERVICER_IMPL_ENV = "SMG_VLLM_SERVICER_IMPL"
+# vLLM's own knob for how it starts its processes; the engine cores launched
+# from the servicer process are spawned unless the deployment chose otherwise
+# (see `smg_grpc_servicer.vllm.rust.launch_engine_cores`).
+MULTIPROC_METHOD_ENV = "VLLM_WORKER_MULTIPROC_METHOD"
 
 
 def attach_vllm_logging() -> None:

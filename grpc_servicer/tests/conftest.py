@@ -6,9 +6,10 @@
 ``smg_grpc_proto`` stubs (``scripts/gen_proto_stubs.py``), so the tests see
 this checkout's proto instead of the released package.
 
-Every test runs with no servicer implementation selected by the environment,
+Every test runs with nothing of the launchers in the environment (no servicer
+implementation selected, no handshake address or spawn method of a launch),
 and its teardown puts back what the shell exported, if anything
-(:func:`no_servicer_impl_selected`).
+(:func:`nothing_of_the_launchers_in_the_environment`).
 """
 
 import importlib.util
@@ -29,9 +30,10 @@ if _PROTO_PATH and _PROTO_PATH not in sys.path:
 
 
 @pytest.fixture(autouse=True)
-def no_servicer_impl_selected():
-    """No servicer implementation is selected by the environment while a test
-    runs; at its end the shell's own selection, if any, is put back.
+def nothing_of_the_launchers_in_the_environment():
+    """The variables the launchers write into the process environment are
+    unset while a test runs; at its end the shell's own values, if any, are
+    put back.
 
     The ``SMG_<ENGINE>_SERVICER_IMPL`` variables select the implementation a
     launcher serves, and the switch writes a flag's decision back to them
@@ -40,16 +42,28 @@ def no_servicer_impl_selected():
     drives the switch with a flag against the process environment, as a
     launcher does, would otherwise hand its selection to every test after it:
     the tests that construct the Python vLLM servicer, whose constructor
-    refuses a Rust selection, then fail wherever vLLM is importable. The
-    shell's own export is set aside for the same reason: a unit test is not
-    the launcher the guard protects, and a test that wants a selection makes
-    it itself (``monkeypatch.setenv``). The restore is by hand because
+    refuses a Rust selection, then fail wherever vLLM is importable. A launch
+    writes more, straight into ``os.environ`` for the engine processes to
+    inherit: the SGLang rank launch its ZMQ handshake address and engine
+    index, the vLLM engine-core launch the worker spawn method (the TokenSpeed
+    rank launch writes nothing). A test that drives a launch would hand those
+    to every test after it the same way, whatever it stubbed. The shell's own
+    exports are set aside for the same reason: a unit test is not the launcher
+    the guard protects, and a test that wants a value makes it itself
+    (``monkeypatch.setenv``). The restore is by hand because
     ``monkeypatch.delenv`` of a name that is absent records nothing, and a
     write-back after it would survive the test.
     """
     from smg_grpc_servicer import sglang, tokenspeed, vllm
 
-    names = (vllm.SERVICER_IMPL_ENV, sglang.SERVICER_IMPL_ENV, tokenspeed.SERVICER_IMPL_ENV)
+    names = (
+        vllm.SERVICER_IMPL_ENV,
+        sglang.SERVICER_IMPL_ENV,
+        tokenspeed.SERVICER_IMPL_ENV,
+        sglang.HANDSHAKE_ENV,
+        sglang.ENGINE_INDEX_ENV,
+        vllm.MULTIPROC_METHOD_ENV,
+    )
     before = {name: os.environ.pop(name, None) for name in names}
     try:
         yield
