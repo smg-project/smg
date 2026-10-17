@@ -238,6 +238,13 @@ pub fn check(case: &Case) {
     check_adapters(case, &whole.events, &pieces.events);
 }
 
+/// [`declared`], built once: the tools and their schemas are the same for every replay, and a
+/// replay runs twice per execution.
+fn declared_shared() -> Declared {
+    static DECLARED: OnceLock<Declared> = OnceLock::new();
+    DECLARED.get_or_init(declared).clone()
+}
+
 /// The request's tools: a string and an integer, a string and an object.
 pub fn declared() -> Declared {
     let tool = |name: &str, parameters: Value| Tool {
@@ -428,7 +435,7 @@ struct Replayed {
 /// `case` through a new engine, its output cut at `cuts`, the events drained after every feed as
 /// a stream's reader drains them.
 fn replay(case: &Case, cuts: &[usize]) -> Replayed {
-    let mut engine = Engine::new(case.table.format(), declared());
+    let mut engine = Engine::shared(case.table.shared(), declared_shared());
     let mut out = Events::new();
     let mut events = Vec::new();
     let delta = |text: &'static str| Input::Delta {
@@ -724,7 +731,13 @@ fn check_adapters(case: &Case, whole: &[Event], pieces: &[Event]) {
     let mut content = String::new();
     let mut reasoning = String::new();
     let mut calls: Vec<(u32, Option<String>, String)> = Vec::new();
-    for choice in chat::deltas(0, pieces) {
+    // The stream as the gateway renders it: each event given up to `into_delta`, the path the
+    // streaming processor takes; the borrowing `delta` is the robustness suite's.
+    for choice in pieces
+        .iter()
+        .cloned()
+        .filter_map(|event| chat::into_delta(0, event))
+    {
         if let Some(text) = &choice.delta.content {
             content.push_str(text);
         }

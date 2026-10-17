@@ -127,8 +127,12 @@ for target in "${targets[@]}"; do
   executions=$(grep -oE '^#[0-9]+' "$log" | tail -1 | tr -d '#' || true)
   per_second=$(grep -oE 'exec/s:? *[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
   edges=$(grep -o 'cov: [0-9]*' "$log" | tail -1 | awk '{print $2}' || true)
-  units=$(find "corpus/$target" -type f | wc -l | tr -d ' ')
-  crashes=$(find "$artifacts/$target" -type f | wc -l | tr -d ' ')
+  # A target the label never ran has no directories yet: zero units, zero crashes, and the
+  # table goes on (set -e would otherwise stop at the first missing one under --summary-only).
+  units=0
+  if [ -d "corpus/$target" ]; then units=$(find "corpus/$target" -type f | wc -l | tr -d ' '); fi
+  crashes=0
+  if [ -d "$artifacts/$target" ]; then crashes=$(find "$artifacts/$target" -type f | wc -l | tr -d ' '); fi
   classes=none
   if [ "$crashes" -gt 0 ]; then
     failed=1
