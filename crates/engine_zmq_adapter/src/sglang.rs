@@ -707,6 +707,22 @@ pub(crate) fn normalize_finish_reason(reason: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use engine_zmq_client::{
+        codec::{decode_msgpack, encode_msgpack},
+        mock_engine::{connect_to_frontend, default_ready_response},
+        protocol::sglang::{
+            output::BatchTokenIDSlimOutput,
+            request::{SglangRequestType, TokenizedGenerateReqInput as WireRequest},
+        },
+        EngineId,
+    };
+    use openai_protocol::worker::RuntimeType;
+
+    use super::*;
+    use crate::{client::ZmqEngineClient, eos::EosTokenIds};
+
     #[test]
     fn a_scheduler_abort_carries_the_status_its_http_code_means() {
         let rows = [
@@ -726,22 +742,6 @@ mod tests {
             assert_eq!(got.message(), "why");
         }
     }
-
-    use std::time::Duration;
-
-    use engine_zmq_client::{
-        codec::{decode_msgpack, encode_msgpack},
-        mock_engine::{connect_to_frontend, default_ready_response},
-        protocol::sglang::{
-            output::BatchTokenIDSlimOutput,
-            request::{SglangRequestType, TokenizedGenerateReqInput as WireRequest},
-        },
-        EngineId,
-    };
-    use openai_protocol::worker::RuntimeType;
-
-    use super::*;
-    use crate::{client::ZmqEngineClient, eos::EosTokenIds};
 
     #[test]
     fn sglang_sampling_translation_keeps_the_api_form_and_maps_the_constraint() {
