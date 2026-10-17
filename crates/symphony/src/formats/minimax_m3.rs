@@ -49,8 +49,8 @@ mod tests {
     use crate::{
         engine::Engine,
         event::{DropReason, Event, MalformedReason, Text},
-        tagged::Declared,
         testing::{arguments_of, bytes, content, drive, names, reasoning},
+        Declared,
     };
 
     const SEP: &str = "]<]minimax[>[";

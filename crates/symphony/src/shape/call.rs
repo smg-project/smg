@@ -57,7 +57,7 @@ use crate::{
         Arguments, Atom, CallShape, Match, Matcher, NameSource, Pattern, Schema, Slot, Suffix,
         ValueParser, Values, Verdict,
     },
-    tagged::Declared,
+    Declared,
 };
 
 /// The call's id as `header` wrote it: the header's text without the literal that ends

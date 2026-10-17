@@ -49,8 +49,8 @@ mod tests {
     use crate::{
         engine::Engine,
         event::{DropReason, Event, Text},
-        tagged::Declared,
         testing::{arguments_of, bytes, content, drive, reasoning},
+        Declared,
     };
 
     fn declared() -> Declared {

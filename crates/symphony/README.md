@@ -45,6 +45,10 @@ and a client that wants the raw text back can have it.
 
 ### The public types
 
+The surface is the crate root: the modules it declares public and the names it re-exports, which
+the gateway, the bindings and the tests build on (`tests/surface.rs` pins the list). The assemblers,
+the scanner and the token ledger are the engine's own.
+
 | Type or function | What it is |
 |---|---|
 | `Parser` (`feed`) | The one trait: one instance per generated choice, fed `Input`s, filling `Events`. |
@@ -62,15 +66,16 @@ and a client that wants the raw text back can have it.
 | `adapt::chat`, `adapt::responses`, `adapt::messages` | Pure functions from events to Chat Completions, Responses and Messages API shapes, streamed (`delta`, `Stream`) and whole (`message`, `output`); the driver adds only the envelope. |
 | `Grammar`, `Tag`, `Format::grammar`, `Format::grammar_for`, `grammar::Options` | The structural tag an engine takes for a forced or required call, derived from the same table and the request's tools, or `None` for a table without calls: `to_json()` as the engine reads it, `payload()` as a request carries it. `grammar_for` takes the request's `Options`, one call among them (a named function, `parallel_tool_calls: false`); `Format::answer_grammar` is the tag for an answer that is JSON a schema accepts (`response_format`). A table given its vocabulary's added tokens (`Format::marker_tokens`) writes each marker that is one token as that token (`Grammar::Token`) inside its tags; `CallSyntax::tag_texts` lists each syntax's own tags. A call given as data gets its tag from the table's layout (`Format::with_layout`): what the model's chat template writes, and no tag without one. |
 | `Format::turn_grammar`, `Turn`, `Format::output_spelling`, `OutputSpelling`, `Output`, `Format::output_position` | The output grammar for a whole assistant turn, for a table whose calls are addressed to a tool (a call given as data whose header names the tool and whose parameters are tags around raw text): the thought, then an answer (free, JSON, a regex or an EBNF grammar) or calls to the tools the request lets the model call, each held to its schema, from the first token. `output_spelling` reads the turn's texts from the table's rows and the call's shape; `OutputSpelling::grammar` builds the grammar for one request (`Output`: where `output_position` says the prompt leaves the model, the tools, the choice, the answer's format). `turn_grammar` is the one call a gateway makes: it builds that grammar for a request (`Turn`) or refuses what it cannot hold. A tag may end at any of several texts (`Bound`), and JSON may keep words out of its strings. |
-| `Scanner`, `Piece` | Marker matching across chunk boundaries, holding back a half-arrived marker. |
-| `Ledger` | Token accounting: which tokens wrote which bytes, so every text event can say what it cost. |
 
 ### The modules
 
 - `format`, `formats`: the table type and the tables, one per family. A table is data, read by
   the engine and by the grammar derivation alike; it says what the template writes and nothing
   about how to parse it.
-- `engine`, `markers`, `tokens`: the engine, its scanner and its token ledger.
+- `engine`, `markers`, `tokens`, `ids`: the engine, its scanner and its token ledger (both
+  crate-private) and the call ids it mints (`CallIds`, for a harness that replays a nonce).
+- `declared`: the parameter types the request's tools declare and the function its `tool_choice`
+  forces, which type a tagged call's values.
 - `json`: the JSON family's assembler (`{"name": ..., "arguments": {...}}` as it arrives,
   streaming the model's own argument bytes), the JSON list (xLAM's bare, Llama Nemotron's between
   markers), the named call (a tool's name, a marker, then the call's object as Inkling writes it

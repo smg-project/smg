@@ -71,8 +71,8 @@ mod tests {
         event::{Event, Events},
         input::{EngineFinish, Input},
         parser::Parser,
-        tagged::Declared,
         testing::{arguments_of, bytes, content, drive, reasoning},
+        Declared,
     };
 
     fn declared() -> Declared {

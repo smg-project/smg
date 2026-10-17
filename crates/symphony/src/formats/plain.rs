@@ -23,8 +23,8 @@ mod tests {
     use crate::{
         engine::Engine,
         event::{Event, Text},
-        tagged::Declared,
         testing::{content, drive},
+        Declared,
     };
 
     fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {

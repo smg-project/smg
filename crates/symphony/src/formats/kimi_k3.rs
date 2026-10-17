@@ -70,7 +70,7 @@ mod tests {
     use crate::{
         engine::Engine,
         event::{DropReason, Event, MalformedReason, Text},
-        tagged::Declared,
+        Declared,
     };
 
     /// The generation prompt's tail: the assistant's message opened, and its thought.

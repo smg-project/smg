@@ -54,7 +54,7 @@ mod tests {
         event::{DropReason, Event, Events, Text},
         input::{EngineFinish, Input},
         parser::Parser,
-        tagged::Declared,
+        Declared,
     };
 
     /// A recorded output, qwen-style spacing and all: an empty thought, two invokes, a string and

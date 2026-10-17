@@ -28,8 +28,9 @@ use crate::{
     markers::{Piece, Scanner},
     tagged::{
         end_cut_call,
-        value::{json, Declared, Kind},
+        value::{json, Kind},
     },
+    Declared,
 };
 
 const KEY_OPEN: usize = 0;

@@ -137,8 +137,8 @@ mod tests {
         engine::Engine,
         event::{DropReason, Event, FinishReason},
         input::EngineFinish,
-        tagged::Declared,
         testing::{bytes, calls, content, drive, drive_to, reasoning},
+        Declared,
     };
 
     /// The generation prompt's tail as K2 Instruct and K2 Thinking end it: the user's message and

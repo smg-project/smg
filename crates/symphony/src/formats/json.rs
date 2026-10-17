@@ -21,8 +21,8 @@ mod tests {
         event::{DropReason, Event, Events, MalformedReason},
         input::{EngineFinish, Input},
         parser::Parser,
-        tagged::Declared,
         testing::calls,
+        Declared,
     };
 
     fn run(pieces: &[&str]) -> Vec<Event> {

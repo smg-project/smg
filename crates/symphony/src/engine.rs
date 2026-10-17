@@ -1,7 +1,7 @@
 //! The engine: one [`Parser`] that runs any [`Format`]. The scanner splits the model's text into
 //! text and the format's terminals, holding back a half-arrived terminal; the table says which
 //! state the text is in and where a terminal moves the engine; inside an arguments state the call
-//! syntax's assembler ([`json::Assembler`] or [`tagged::Assembler`]) turns the call into its
+//! syntax's assembler (`json::Assembler` or `tagged::Assembler`) turns the call into its
 //! events, streaming the model's own argument bytes.
 //!
 //! Every byte of the output lands in exactly one event: a terminal that moves the engine as
@@ -28,8 +28,9 @@ use crate::{
     parser::{ParseError, Parser},
     pythonic,
     shape::{self, Values},
-    tagged::{self, Declared},
+    tagged,
     tokens::Ledger,
+    Declared,
 };
 
 /// Why a call region closed: its closing terminal (or the next opener) arrived, or the stream

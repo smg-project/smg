@@ -38,6 +38,7 @@ pub struct Outline {
 
 impl Outline {
     /// Whether the object's closing brace has arrived.
+    #[cfg(test)]
     pub fn complete(&self) -> bool {
         self.close.is_some()
     }
@@ -86,6 +87,7 @@ const ARGUMENTS_KEYS: [&str; 3] = ["arguments", "parameters", "args"];
 /// Text before the brace is skipped if it is whitespace; anything else, or no brace, gives an empty
 /// outline. Members are read in order; a member whose key or value has not finished arriving ends
 /// the reading, with the arguments span open if that member is the arguments.
+#[cfg(test)]
 pub fn outline(text: &str) -> Outline {
     let mut scanner = Scanner::default();
     scanner.advance(text);

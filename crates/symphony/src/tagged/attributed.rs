@@ -60,8 +60,9 @@ use crate::{
     markers::{Piece, Scanner},
     tagged::{
         end_cut_call,
-        value::{json, Declared, Kind},
+        value::{json, Kind},
     },
+    Declared,
 };
 
 /// A CDATA section's opener and closer, where the family's template writes one around a value.

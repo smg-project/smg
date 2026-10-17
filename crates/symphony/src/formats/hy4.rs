@@ -45,8 +45,8 @@ mod tests {
         event::{Event, Events},
         input::{EngineFinish, Input},
         parser::Parser,
-        tagged::Declared,
         testing::{bytes, drive},
+        Declared,
     };
 
     fn declared() -> Declared {

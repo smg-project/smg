@@ -321,7 +321,7 @@ impl Assembler {
 }
 
 impl crate::engine::CallAssembler for Assembler {
-    fn feed(&mut self, text: &str, _declared: &crate::tagged::Declared, out: &mut Events) -> usize {
+    fn feed(&mut self, text: &str, _declared: &crate::Declared, out: &mut Events) -> usize {
         self.feed(text, out);
         text.len()
     }

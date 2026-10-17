@@ -20,7 +20,7 @@ mod tests {
         event::{Event, Events, Text},
         input::{EngineFinish, Input},
         parser::Parser,
-        tagged::Declared,
+        Declared,
     };
 
     fn run(output: &str) -> Vec<Event> {

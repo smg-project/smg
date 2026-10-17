@@ -54,7 +54,7 @@ mod tests {
         event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
         input::{EngineFinish, Input, TokenSpan},
         parser::{ParseError, Parser},
-        tagged::Declared,
+        Declared,
     };
 
     const CALL: &str = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>";

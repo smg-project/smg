@@ -42,8 +42,8 @@ mod tests {
     use crate::{
         engine::Engine,
         event::{DropReason, Event, FinishReason},
-        tagged::Declared,
         testing::{calls, content, drive, reasoning},
+        Declared,
     };
 
     /// The generation prompt's tail: the assistant header, and nothing more.

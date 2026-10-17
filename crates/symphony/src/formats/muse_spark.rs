@@ -200,8 +200,8 @@ mod tests {
         event::{DropReason, Event, Text},
         grammar::{GrammarStart, Options},
         input::EngineFinish,
-        tagged::Declared,
         testing::{bytes, content, drive_to, reasoning},
+        Declared,
     };
 
     fn tool(name: &str, parameters: Value) -> Tool {

@@ -427,8 +427,7 @@ mod tests {
         input::{EngineFinish, Input},
         parser::Parser as _,
         shape::{intern, CallLayout, Class, Message, NameSource, Pattern, ValueParser, Written},
-        tagged::Declared,
-        CallSyntax,
+        CallSyntax, Declared,
     };
 
     fn tool(name: &str, parameters: Value) -> Tool {

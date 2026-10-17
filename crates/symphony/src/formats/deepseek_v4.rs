@@ -73,7 +73,7 @@ mod tests {
         event::{DropReason, Event, Events, MalformedReason, Text},
         input::{EngineFinish, Input},
         parser::Parser,
-        tagged::Declared,
+        Declared,
     };
 
     /// The turn the reference encoder renders for its first test, after the prompt's `<think>`: a

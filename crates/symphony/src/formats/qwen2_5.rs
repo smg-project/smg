@@ -30,7 +30,7 @@ mod tests {
         event::{DropReason, Event, Events, Text},
         input::{EngineFinish, Input},
         parser::Parser,
-        tagged::Declared,
+        Declared,
     };
 
     const CALL: &str = concat!(

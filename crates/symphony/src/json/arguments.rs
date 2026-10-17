@@ -227,6 +227,7 @@ impl Arguments {
     }
 
     /// Whether the bytes stopped being a JSON prefix.
+    #[cfg(test)]
     pub fn refused(&self) -> bool {
         self.invalid_from.is_some()
     }
@@ -257,11 +258,6 @@ impl Arguments {
         let before = self.value.chars().next_back().or(self.led_by);
         self.emitted = self.emitted.min(from);
         Some((tail, before))
-    }
-
-    /// Whether the value's first byte has arrived.
-    pub fn started(&self) -> bool {
-        self.started
     }
 
     /// Whether the value is whole.

@@ -45,8 +45,8 @@ mod tests {
     use crate::{
         engine::Engine,
         event::{DropReason, Event, Text},
-        tagged::Declared,
         testing::{arguments_of, bytes, content, drive, names, reasoning},
+        Declared,
     };
 
     /// The generation prompt's tail: the turn's first message opened, and nothing more.

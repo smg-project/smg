@@ -2755,7 +2755,7 @@ mod tests {
             event::Events,
             input::{EngineFinish, Input},
             parser::Parser as _,
-            tagged::Declared,
+            Declared,
         };
         let mut engine = Engine::new(format.clone(), Declared::of(tools));
         let mut out = Events::new();

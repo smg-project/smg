@@ -1515,7 +1515,7 @@ mod tests {
             event::Events,
             input::{EngineFinish, Input},
             parser::Parser,
-            tagged::Declared,
+            Declared,
         };
         let mut parser = Engine::new(format, Declared::default());
         let mut out = Events::new();

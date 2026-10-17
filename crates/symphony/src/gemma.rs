@@ -95,7 +95,7 @@ const DEEPEST: usize = PartialJson::DEFAULT_MAX_DEPTH;
 
 /// The events of one call, from the bytes after `<|tool_call>`.
 #[derive(Clone, Debug)]
-pub struct Assembler {
+pub(crate) struct Assembler {
     index: u32,
     id: String,
     /// Bytes read into no event yet: the header before its `{`, a key before its `:`, a key and
@@ -172,11 +172,6 @@ impl Assembler {
             done: false,
             spelling,
         }
-    }
-
-    /// Whether a call has started, that is, whether `ToolCallStart` has been pushed.
-    pub fn started(&self) -> bool {
-        self.started
     }
 
     /// Append the next bytes of the call and push the events they complete. Every byte is the
@@ -720,7 +715,7 @@ fn push_bare(json: &mut String, literal: &str, null: &str) {
 }
 
 impl crate::engine::CallAssembler for Assembler {
-    fn feed(&mut self, text: &str, _declared: &crate::tagged::Declared, out: &mut Events) -> usize {
+    fn feed(&mut self, text: &str, _declared: &crate::Declared, out: &mut Events) -> usize {
         self.feed(text, out);
         text.len()
     }

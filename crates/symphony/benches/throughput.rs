@@ -30,7 +30,7 @@ use slices::{Slice, FAMILIES};
 use symphony::{
     adapt::{chat, messages},
     formats::Table,
-    Declared, Engine, EngineFinish, Event, Events, Input, Parser, Scanner,
+    Declared, Engine, EngineFinish, Event, Events, Input, Parser,
 };
 
 #[path = "../tests/common/slices.rs"]
@@ -449,10 +449,6 @@ fn setup(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("validate", name), subject, |b, subject| {
             let format = subject.table.format();
             b.iter(|| black_box(format.validate()));
-        });
-        group.bench_with_input(BenchmarkId::new("scanner", name), subject, |b, subject| {
-            let format = subject.table.format();
-            b.iter(|| black_box(Scanner::new(format.terminal_texts())));
         });
         group.bench_with_input(BenchmarkId::new("engine", name), subject, |b, subject| {
             b.iter(|| black_box(engine(subject.table, subject.prompt, &tools)));

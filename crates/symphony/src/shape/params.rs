@@ -34,7 +34,8 @@ use crate::{
         Atom, CallShape, Duplicates, End, Match, Matcher, Pattern, Schema, Slot, Suffix,
         ValueParser, Values, Verdict,
     },
-    tagged::{assembler::push_quoted, value::Declared},
+    tagged::assembler::push_quoted,
+    Declared,
 };
 
 /// The parameters of one shaped call, from the bytes after its header.

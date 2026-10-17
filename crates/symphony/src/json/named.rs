@@ -143,6 +143,7 @@ impl Assembler {
     }
 
     /// Whether a call has started, that is, whether `ToolCallStart` has been pushed.
+    #[cfg(test)]
     pub fn started(&self) -> bool {
         self.body.as_ref().is_some_and(Body::started)
     }
@@ -190,6 +191,7 @@ impl Assembler {
 }
 
 impl Body {
+    #[cfg(test)]
     fn started(&self) -> bool {
         match self {
             Self::Object(object) => object.started(),
@@ -213,7 +215,7 @@ impl Body {
 }
 
 impl crate::engine::CallAssembler for Assembler {
-    fn feed(&mut self, text: &str, _declared: &crate::tagged::Declared, out: &mut Events) -> usize {
+    fn feed(&mut self, text: &str, _declared: &crate::Declared, out: &mut Events) -> usize {
         self.feed(text, out)
     }
 

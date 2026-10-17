@@ -172,7 +172,7 @@ mod tests {
     use serde_json::json as value;
 
     use super::*;
-    use crate::tagged::Declared;
+    use crate::Declared;
 
     fn declared() -> Declared {
         Declared::of(&[Tool {

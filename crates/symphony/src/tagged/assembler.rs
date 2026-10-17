@@ -29,8 +29,9 @@ use crate::{
     markers::{Piece, Scanner},
     tagged::{
         end_cut_call,
-        value::{json, Declared, Kind, NULL_WORDS},
+        value::{json, Kind, NULL_WORDS},
     },
+    Declared,
 };
 
 const FUNCTION_OPEN: usize = 0;
@@ -143,6 +144,7 @@ impl Assembler {
 
     /// Whether the call has closed, at `</function>` or as a block that never named a function;
     /// `feed` takes nothing after that, so the format stops here.
+    #[cfg(test)]
     pub fn done(&self) -> bool {
         self.done
     }

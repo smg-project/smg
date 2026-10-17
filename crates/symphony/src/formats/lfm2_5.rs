@@ -40,7 +40,7 @@ pub fn lfm2_5() -> Format {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{engine::Engine, event::Event, tagged::Declared, testing::drive};
+    use crate::{engine::Engine, event::Event, testing::drive, Declared};
 
     fn run(prompt: &str, output: &str) -> Vec<Event> {
         drive(
