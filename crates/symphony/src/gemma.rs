@@ -61,14 +61,17 @@ impl Spelling {
 /// The call's header up to the tool's name.
 const HEADER: &str = "call:";
 
-/// Why a header is no call's, from the name after `call:` when the header has the prefix: no
-/// prefix is text where a call should begin, an empty name a call without one, a name with
-/// whitespace in it text where the name should be.
-fn header_reason(name: Option<&str>) -> MalformedReason {
-    match name {
-        None => MalformedReason::TextBetweenCalls,
-        Some("") => MalformedReason::CallWithoutName,
-        Some(_) => MalformedReason::TextWhereTheNameShouldBe,
+/// The tool's name in a header up to its `{`, or why the header is no call's: no `call:` prefix
+/// is text where a call should begin, an empty name a call without one, a name with whitespace in
+/// it text where the name should be.
+fn header_name(head: &str) -> Result<&str, MalformedReason> {
+    match head.strip_prefix(HEADER).map(str::trim) {
+        None => Err(MalformedReason::TextBetweenCalls),
+        Some("") => Err(MalformedReason::CallWithoutName),
+        Some(name) if name.contains(char::is_whitespace) => {
+            Err(MalformedReason::TextWhereTheNameShouldBe)
+        }
+        Some(name) => Ok(name),
     }
 }
 
@@ -222,10 +225,8 @@ impl Assembler {
         let Some(brace) = rest.find('{') else {
             return 0;
         };
-        let head = &rest[..brace];
-        let name = head.strip_prefix(HEADER).map(str::trim);
-        match name {
-            Some(name) if !name.is_empty() && !name.contains(char::is_whitespace) => {
+        match header_name(&rest[..brace]) {
+            Ok(name) => {
                 self.started = true;
                 out.push(Event::ToolCallStart {
                     index: self.index,
@@ -240,10 +241,10 @@ impl Assembler {
                 });
                 self.stage = Stage::Key;
             }
-            other => {
+            Err(why) => {
                 out.push(Event::Malformed {
                     text: Text::uncounted(&rest[..=brace]),
-                    why: header_reason(other),
+                    why,
                 });
                 self.stage = Stage::Closed;
             }
@@ -470,12 +471,8 @@ impl Assembler {
         let held = std::mem::take(&mut self.carried);
         match self.stage {
             Stage::Header if !held.is_empty() => {
-                let why = match held.strip_prefix(HEADER).map(str::trim) {
-                    Some(name) if !name.is_empty() && !name.contains(char::is_whitespace) => {
-                        MalformedReason::NameWithoutACall
-                    }
-                    other => header_reason(other),
-                };
+                let why = header_name(&held)
+                    .map_or_else(|why| why, |_| MalformedReason::NameWithoutACall);
                 out.push(Event::Malformed {
                     text: Text::uncounted(held),
                     why,
@@ -961,6 +958,28 @@ mod tests {
                 Event::Dropped { text, why: DropReason::Wrapper } if text.text == " "
             )));
             assert_eq!(bytes(&tail), format!("call:f{{x:1}} trailing{CLOSE}"));
+        }
+    }
+
+    #[test]
+    fn a_header_that_is_no_call_says_which_shape_it_saw() {
+        for (text, why) in [
+            ("hello{x:1}", MalformedReason::TextBetweenCalls),
+            ("call:{x:1}", MalformedReason::CallWithoutName),
+            (
+                "call:get weather{x:1}",
+                MalformedReason::TextWhereTheNameShouldBe,
+            ),
+            ("call:", MalformedReason::CallWithoutName),
+            ("call:get_weather", MalformedReason::NameWithoutACall),
+        ] {
+            let reasons = malformed(&run(&[text], false));
+            assert_eq!(reasons[0].1, why, "{text:?}");
+            assert_eq!(
+                reasons.last().map(|(_, why)| *why),
+                Some(MalformedReason::BlockWithoutACompleteCall),
+                "{text:?}: the close with no call started"
+            );
         }
     }
 
