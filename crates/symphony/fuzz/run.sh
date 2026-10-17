@@ -62,7 +62,7 @@ mkdir -p "$logs" "$artifacts" corpus prepared
 if [ -z "$summary_only" ]; then
   cargo +nightly run --quiet --release --example prepare -- ../tests/fixtures/slices prepared
   # `cargo fuzz build` takes one target or all of them.
-  if [ ${#targets[@]} -eq $(cargo +nightly fuzz list | wc -l) ]; then
+  if [ "${#targets[@]}" -eq "$(cargo +nightly fuzz list | wc -l)" ]; then
     cargo +nightly fuzz build --sanitizer "$sanitizer" "${target_dir[@]}"
   else
     for target in "${targets[@]}"; do

@@ -27,11 +27,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::{
-    fs,
-    path::Path,
-    sync::OnceLock,
-};
+use std::{fs, path::Path, sync::OnceLock};
 
 /// The macro a target is written with, so that the targets and the harness share one dependency.
 pub use libfuzzer_sys::fuzz_target;

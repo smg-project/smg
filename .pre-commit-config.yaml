@@ -55,6 +55,15 @@ repos:
         types: [rust]
         pass_filenames: false
 
+      - id: rustfmt-symphony-fuzz
+        name: rustfmt (symphony fuzz workspace)
+        description: Format the Symphony fuzz crate, a workspace of its own that `cargo fmt --all` from the root does not reach
+        entry: cargo +nightly fmt --manifest-path crates/symphony/fuzz/Cargo.toml --all --
+        language: system
+        types: [rust]
+        files: ^crates/symphony/fuzz/
+        pass_filenames: false
+
       - id: clippy
         name: clippy
         description: Lint Rust code with clippy

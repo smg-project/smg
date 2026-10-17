@@ -33,10 +33,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           key: symphony-fuzz
           workspaces: crates/symphony/fuzz
+      # The crate is a workspace of its own, outside the repository's fmt and clippy jobs.
+      - name: Format and lint the fuzz crate
+        run: |
+          cargo fmt --manifest-path crates/symphony/fuzz/Cargo.toml --all -- --check
+          cargo clippy --manifest-path crates/symphony/fuzz/Cargo.toml --all-targets -- -D warnings
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       - name: Run the targets
