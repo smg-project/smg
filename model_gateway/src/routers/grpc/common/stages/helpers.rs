@@ -2063,62 +2063,28 @@ mod wire_prompt_text_tests {
 
 #[cfg(test)]
 mod shared_pieces_tests {
-    use std::{sync::Arc, time::Duration};
+    use std::sync::Arc;
 
     use llm_multimodal::MediaContentPart;
     use llm_tokenizer::TokenizerRegistry;
     use openai_protocol::generate::GenerateRequest;
     use smg_grpc_client::VllmEngineClient;
-    use tokio::{net::TcpListener, task::JoinHandle};
+    use tokio::task::JoinHandle;
 
     use super::*;
     use crate::{
         routers::grpc::{
             client::GrpcClient, context::SharedComponents, multimodal::MediaPlan,
-            regular::symphony::template::Templates,
+            regular::symphony::template::Templates, test_engine::mock_engine,
         },
         worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, WorkerRegistry, WorkerType},
     };
-
-    /// A mock engine on a loopback port, as its URL and its server task; the
-    /// pieces under test send it nothing.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "bounded test fixture; server task is explicitly aborted"
-    )]
-    async fn mock_engine() -> (String, JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind mock worker");
-        let port = listener.local_addr().expect("mock worker address").port();
-        let config = Arc::new(mock_worker::config::Config {
-            admin_port: None,
-            context_length: 32768,
-            host: "127.0.0.1".to_string(),
-            http_base_port: 0,
-            http_count: 0,
-            grpc_base_port: port,
-            grpc_count: 1,
-            zmq_handshake: None,
-            zmq_count: 0,
-            zmq_start_index: 0,
-            model_id: "test-model".to_string(),
-            tokenizer_path: "test-model".to_string(),
-            gen_delay: Duration::ZERO,
-            output_tokens: 0,
-            realistic: false,
-            engine: mock_worker::engine::EngineParams::default(),
-            ..mock_worker::config::Config::default()
-        });
-        let server = tokio::spawn(mock_worker::grpc::serve_with_listener(config, listener));
-        (format!("http://127.0.0.1:{port}"), server)
-    }
 
     /// A request context after worker selection and client acquisition: one
     /// selected worker, a builder client on the mock engine, and the media
     /// references of worker-side processing waiting to be attached.
     async fn context_with_media_refs() -> (RequestContext, JoinHandle<()>) {
-        let (url, server) = mock_engine().await;
+        let (url, server) = mock_engine("test-model").await;
         let client = VllmEngineClient::connect(&url)
             .await
             .expect("connect mock worker");
@@ -2188,16 +2154,19 @@ mod shared_pieces_tests {
         server.abort();
     }
 
-    /// A request without media assembles none and reserves no share of the
-    /// in-flight media budget.
+    /// A request whose preparation left no multimodal intermediate assembles
+    /// nothing: the helper answers before it needs the builder client or the
+    /// budget behind it, so it answers the same with the clients taken away.
+    /// (The media references the fixture carries are worker-side work for the
+    /// finishing, not an intermediate.)
     #[tokio::test]
-    async fn a_request_without_media_assembles_none() {
+    async fn without_an_intermediate_nothing_is_assembled() {
         let (mut ctx, server) = context_with_media_refs().await;
+        ctx.state.clients = None;
         let assembled = assemble_prompt_media(&mut ctx, "a_builder")
             .await
             .expect("assembled");
         assert!(assembled.is_none());
-        assert!(ctx.state.multimodal_inflight.is_none());
         server.abort();
     }
 

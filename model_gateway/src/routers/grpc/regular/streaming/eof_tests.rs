@@ -17,13 +17,16 @@ use smg_grpc_client::vllm_engine::{
     proto, proto::generate_response::Response as GenerationEvent, AbortOnDropStream,
     VllmEngineClient,
 };
-use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle, time::timeout};
+use tokio::{sync::oneshot, task::JoinHandle, time::timeout};
 use tonic::codec::Codec;
 use tool_parser::types::ToolCallItem;
 
 use super::*;
 use crate::{
-    routers::{common::sse::SseReceiver, grpc::regular::processor::ResponseProcessor},
+    routers::{
+        common::sse::SseReceiver,
+        grpc::{regular::processor::ResponseProcessor, test_engine::mock_engine},
+    },
     worker::{
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
         BasicWorkerBuilder, Worker, WorkerRegistry,
@@ -231,36 +234,8 @@ where
 /// The mock worker a test's client connects to, as its URL and its server
 /// task. The test supplies the response frames itself; the server only
 /// accepts the connection.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "bounded test fixture; server task is explicitly aborted"
-)]
 pub(super) async fn mock_worker_endpoint() -> (String, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock worker");
-    let port = listener.local_addr().expect("mock worker address").port();
-    let config = Arc::new(mock_worker::config::Config {
-        admin_port: None,
-        context_length: 32768,
-        host: "127.0.0.1".to_string(),
-        http_base_port: 0,
-        http_count: 0,
-        grpc_base_port: port,
-        grpc_count: 1,
-        zmq_handshake: None,
-        zmq_count: 0,
-        zmq_start_index: 0,
-        model_id: "eof-test".to_string(),
-        tokenizer_path: "eof-test".to_string(),
-        gen_delay: Duration::ZERO,
-        output_tokens: 0,
-        realistic: false,
-        engine: mock_worker::engine::EngineParams::default(),
-        ..mock_worker::config::Config::default()
-    });
-    let server = tokio::spawn(mock_worker::grpc::serve_with_listener(config, listener));
-    (format!("http://127.0.0.1:{port}"), server)
+    mock_engine("eof-test").await
 }
 
 async fn mock_client() -> (VllmEngineClient, JoinHandle<()>) {
