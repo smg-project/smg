@@ -374,7 +374,7 @@ fn replay(
     finish: &EngineFinish,
     with_spans: bool,
     empty_between: bool,
-) -> Result<(Vec<Event>, u32), ParseError> {
+) -> Result<(Vec<Event<'static>>, u32), ParseError> {
     let mut out = Events::new();
     parser.feed(
         Input::Prompt {
@@ -383,46 +383,45 @@ fn replay(
         },
         &mut out,
     )?;
+    // Each piece's tokens are built first: a piece's events borrow its delta for as long as the
+    // buffer they are read into lives, here the whole output.
+    let mut pieces: Vec<(&str, Vec<u32>, Vec<TokenSpan>)> = Vec::new();
     let mut from = 0;
     let mut next_id = 1;
     let mut sent = 0;
     for &cut in cuts.iter().chain(std::iter::once(&text.len())) {
         if cut > from {
-            if empty_between {
-                parser.feed(
-                    Input::Delta {
-                        token_ids: &[],
-                        text: "",
-                        spans: &[],
-                    },
-                    &mut out,
-                )?;
-            }
             let piece = &text[from..cut];
-            if with_spans {
-                let spans = spans(piece, &mut next_id);
-                sent += spans.len() as u32;
-                let ids: Vec<u32> = spans.iter().map(|span| span.token_id).collect();
-                parser.feed(
-                    Input::Delta {
-                        token_ids: &ids,
-                        text: piece,
-                        spans: &spans,
-                    },
-                    &mut out,
-                )?;
+            let spans = if with_spans {
+                spans(piece, &mut next_id)
             } else {
-                parser.feed(
-                    Input::Delta {
-                        token_ids: &[],
-                        text: piece,
-                        spans: &[],
-                    },
-                    &mut out,
-                )?;
-            }
+                Vec::new()
+            };
+            sent += spans.len() as u32;
+            let ids: Vec<u32> = spans.iter().map(|span| span.token_id).collect();
+            pieces.push((piece, ids, spans));
             from = cut;
         }
+    }
+    for (piece, ids, spans) in &pieces {
+        if empty_between {
+            parser.feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: "",
+                    spans: &[],
+                },
+                &mut out,
+            )?;
+        }
+        parser.feed(
+            Input::Delta {
+                token_ids: ids,
+                text: piece,
+                spans,
+            },
+            &mut out,
+        )?;
     }
     if empty_between {
         parser.feed(
@@ -440,7 +439,7 @@ fn replay(
         },
         &mut out,
     )?;
-    Ok((out.drain(), sent))
+    Ok((out.into_owned().drain(), sent))
 }
 
 /// Token identity on a replay with spans: every token counted once, in the event that carries

@@ -111,3 +111,38 @@ the state that anchor names, and not at all when the prompt holds none. A table 
 state moves the engine as any terminal does, and anything else starts the turn in the start state,
 where it is read; the first piece is the replay's first, or the output's when the prompt left
 nothing to replay.
+
+## The shape of a step's events
+
+The engine fills a buffer the caller keeps; it never hands out a vector of its own. One
+`Events` per stream, one `feed` per step, the step's events read in place, then the buffer
+recycled for the next step:
+
+```rust
+let mut spare = Events::new();                      // one buffer for the stream
+loop {
+    let mut events = spare;                         // this step's view of it
+    engine.feed(Input::Delta { token_ids, text: &delta, spans }, &mut events)?;
+    for event in &events { /* render it */ }
+    spare = events.recycle();                       // empty, allocation kept
+}
+```
+
+- `Event<'d>` and `Text<'d>` carry the delta's lifetime. A text event borrows the delta's bytes
+  where the engine held nothing back: the whole-text path (a delta with nothing held and no byte
+  that starts a marker, the common content or reasoning delta) costs no copy. A run the engine
+  held (a content stay's lead, a trimmed stay's tail, a shaped call's header), a run merged with
+  an earlier one in the same buffer, and the events an assembler builds carry their text owned
+  (`Cow::Owned`): an arguments delta takes the whole-text path too, which saves it the scan and
+  the piece, but its bytes go to the assembler, whose events own their text and their JSON.
+- The buffer's lifetime is the step's: `Events<'d>` cannot outlive the delta it borrows, so a
+  delta's text lives with the caller, next to the buffer, and a caller that keeps events past the
+  step takes them with `Event::into_owned` (or the whole buffer with `Events::into_owned`). A
+  caller that reads an output whole feeds every input into one buffer and takes the events with
+  `drain`, as the tests do.
+- `recycle` empties the buffer and keeps its allocation for the next step's lifetime: an empty
+  vector collected into a vector of the same layout is collected in place by the standard
+  library, and `Events::capacity` shows it; a unit test holds the property.
+- What was read is final: merging adjacent text of one kind only ever touches events pushed
+  into the same buffer since it was last recycled or drained, so a stream sees one `Content`
+  event per step for a run of content, and a whole read sees one for the whole run.

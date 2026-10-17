@@ -48,7 +48,7 @@ mod tests {
         tagged::Declared,
     };
 
-    fn run(prompt: &str, output: &str) -> Vec<Event> {
+    fn run(prompt: &str, output: &str) -> Vec<Event<'static>> {
         let mut parser = Engine::new(lfm2_5(), Declared::default());
         let mut out = Events::new();
         parser
@@ -78,15 +78,15 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     fn text_of(events: &[Event], reasoning: bool) -> String {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Reasoning(text) if reasoning => Some(text.text.as_str()),
-                Event::Content(text) if !reasoning => Some(text.text.as_str()),
+                Event::Reasoning(text) if reasoning => Some(&*text.text),
+                Event::Content(text) if !reasoning => Some(&*text.text),
                 _ => None,
             })
             .collect()

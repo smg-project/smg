@@ -210,7 +210,7 @@ impl Assembler {
         self.close_object(source, out);
         out.push(Event::ToolCallEnd {
             index: self.index,
-            source: Text::uncounted(terminal),
+            source: Text::uncounted(terminal.to_owned()),
         });
         self.done = true;
     }
@@ -425,7 +425,7 @@ impl Assembler {
             Some(_) | None => {
                 self.drop_carried(out);
                 out.push(Event::Malformed {
-                    text: Text::uncounted(bytes),
+                    text: Text::uncounted(bytes.to_owned()),
                     why: MalformedReason::Other(TAG_OUT_OF_PLACE.into()),
                 });
             }
@@ -506,7 +506,7 @@ impl Assembler {
             } else {
                 self.drop_carried(out);
                 out.push(Event::Malformed {
-                    text: Text::uncounted(run),
+                    text: Text::uncounted(run.to_owned()),
                     why: MalformedReason::Other(TEXT_BETWEEN_TAGS.into()),
                 });
             }
@@ -681,12 +681,12 @@ impl Assembler {
     }
 
     /// `}` or `{}`, with `source` as its bytes.
-    fn close_object(&mut self, source: Text, out: &mut Events) {
+    fn close_object<'d>(&mut self, source: Text<'d>, out: &mut Events<'d>) {
         let json = if self.written == 0 { "{}" } else { "}" }.to_string();
         self.push_fragment(json, source, out);
     }
 
-    fn push_fragment(&self, json: String, source: Text, out: &mut Events) {
+    fn push_fragment<'d>(&self, json: String, source: Text<'d>, out: &mut Events<'d>) {
         out.push(Event::ToolCallArguments {
             index: self.index,
             json,

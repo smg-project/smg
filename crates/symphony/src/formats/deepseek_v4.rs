@@ -90,7 +90,7 @@ mod tests {
         "</｜DSML｜tool_calls>"
     );
 
-    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
+    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         let mut parser = Engine::new(deepseek_v4(), Declared::default());
         let mut out = Events::new();
         parser
@@ -122,18 +122,18 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     fn bytes(events: &[Event]) -> String {
         events
             .iter()
             .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
+                Event::Content(t) | Event::Reasoning(t) => &*t.text,
+                Event::Dropped { text, .. } | Event::Malformed { text, .. } => &*text.text,
                 Event::ToolCallStart { source, .. }
                 | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
+                | Event::ToolCallEnd { source, .. } => &*source.text,
                 Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
             })
             .collect()
@@ -155,7 +155,7 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
+                Event::Content(text) => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -165,7 +165,7 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
+                Event::Reasoning(text) => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -181,9 +181,9 @@ mod tests {
             .collect()
     }
 
-    fn dropped(text: &str) -> Event {
+    fn dropped(text: &str) -> Event<'static> {
         Event::Dropped {
-            text: Text::uncounted(text),
+            text: Text::uncounted(text.to_owned()),
             why: DropReason::Wrapper,
         }
     }
@@ -229,7 +229,7 @@ mod tests {
         let ends: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::ToolCallEnd { source, .. } => Some(source.text.as_str()),
+                Event::ToolCallEnd { source, .. } => Some(&*source.text),
                 _ => None,
             })
             .collect();
@@ -398,14 +398,14 @@ mod tests {
     }
 
     /// The whitespace the engine dropped as the template's spacing, event by event.
-    fn spacing(events: &[Event]) -> Vec<&str> {
+    fn spacing<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
                 Event::Dropped {
                     text,
                     why: DropReason::Whitespace,
-                } => Some(text.text.as_str()),
+                } => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -447,7 +447,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        deltas.push(content_of(&out.drain()));
+        deltas.push(content_of(&out.into_owned().drain()));
         deltas.retain(|delta| !delta.is_empty());
         deltas
     }
@@ -517,7 +517,7 @@ mod tests {
         let ends: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::ToolCallEnd { source, .. } => Some(source.text.as_str()),
+                Event::ToolCallEnd { source, .. } => Some(&*source.text),
                 _ => None,
             })
             .collect();

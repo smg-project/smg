@@ -167,11 +167,11 @@ impl Assembler {
         if self.started {
             out.push(Event::ToolCallEnd {
                 index: self.index,
-                source: Text::uncounted(terminal),
+                source: Text::uncounted(terminal.to_owned()),
             });
         } else if !terminal.is_empty() {
             out.push(Event::Malformed {
-                text: Text::uncounted(terminal),
+                text: Text::uncounted(terminal.to_owned()),
                 why: MalformedReason::Other(NOT_A_CALL.into()),
             });
         }
@@ -220,7 +220,7 @@ impl Assembler {
                     index: self.index,
                     id: self.id.clone(),
                     name: name.to_string(),
-                    source: Text::uncounted(&rest[..=brace]),
+                    source: Text::uncounted(rest[..=brace].to_owned()),
                 });
                 self.push_fragment("{".to_string(), Text::default(), out);
                 self.containers.push(Container {
@@ -231,7 +231,7 @@ impl Assembler {
             }
             _ => {
                 out.push(Event::Malformed {
-                    text: Text::uncounted(&rest[..=brace]),
+                    text: Text::uncounted(rest[..=brace].to_owned()),
                     why: MalformedReason::Other(NOT_A_CALL.into()),
                 });
                 self.stage = Stage::Closed;
@@ -258,7 +258,7 @@ impl Assembler {
             // The colon is reported; the member keeps its place with an empty key, so that the
             // value that follows it stays inside a valid object.
             out.push(Event::Malformed {
-                text: Text::uncounted(&rest[..=colon]),
+                text: Text::uncounted(rest[..=colon].to_owned()),
                 why: MalformedReason::Other(EMPTY_KEY.into()),
             });
             let mut json = self.separator();
@@ -268,7 +268,7 @@ impl Assembler {
             let mut json = self.separator();
             push_quoted(&mut json, key);
             json.push_str(": ");
-            self.push_fragment(json, Text::uncounted(&rest[..=colon]), out);
+            self.push_fragment(json, Text::uncounted(rest[..=colon].to_owned()), out);
         }
         self.stage = Stage::Value;
         colon + 1
@@ -300,14 +300,18 @@ impl Assembler {
         };
         if string {
             let json = format!("{separator}\"");
-            self.push_fragment(json, Text::uncounted(&rest[..space + token.len()]), out);
+            self.push_fragment(
+                json,
+                Text::uncounted(rest[..space + token.len()].to_owned()),
+                out,
+            );
             self.stage = Stage::Text;
             return space + token.len();
         }
         match first {
             '{' | '[' => {
                 let json = format!("{separator}{first}");
-                self.push_fragment(json, Text::uncounted(&rest[..=space]), out);
+                self.push_fragment(json, Text::uncounted(rest[..=space].to_owned()), out);
                 self.containers.push(Container {
                     list: first == '[',
                     members: 0,
@@ -328,7 +332,7 @@ impl Assembler {
                 let literal = after[..end].trim_end();
                 let mut json = separator;
                 push_bare(&mut json, literal, self.spelling.null);
-                self.push_fragment(json, Text::uncounted(&rest[..space + end]), out);
+                self.push_fragment(json, Text::uncounted(rest[..space + end].to_owned()), out);
                 self.stage = Stage::AfterValue;
                 space + end
             }
@@ -343,7 +347,11 @@ impl Assembler {
             let mut json = String::with_capacity(at + 1);
             push_escaped(&mut json, &rest[..at]);
             json.push('"');
-            self.push_fragment(json, Text::uncounted(&rest[..at + token.len()]), out);
+            self.push_fragment(
+                json,
+                Text::uncounted(rest[..at + token.len()].to_owned()),
+                out,
+            );
             self.stage = Stage::AfterValue;
             return at + token.len();
         }
@@ -361,7 +369,7 @@ impl Assembler {
         }
         let mut json = String::with_capacity(give.len());
         push_escaped(&mut json, give);
-        self.push_fragment(json, Text::uncounted(give), out);
+        self.push_fragment(json, Text::uncounted(give.to_owned()), out);
         give.len()
     }
 
@@ -374,7 +382,11 @@ impl Assembler {
         let first = rest[space..].chars().next().unwrap_or_default();
         match first {
             ',' => {
-                self.push_fragment(String::new(), Text::uncounted(&rest[..=space]), out);
+                self.push_fragment(
+                    String::new(),
+                    Text::uncounted(rest[..=space].to_owned()),
+                    out,
+                );
                 self.stage = if self.in_list() {
                     Stage::Value
                 } else {
@@ -388,7 +400,7 @@ impl Assembler {
                 // it reported.
                 if space > 0 {
                     out.push(Event::Malformed {
-                        text: Text::uncounted(&rest[..space]),
+                        text: Text::uncounted(rest[..space].to_owned()),
                         why: MalformedReason::Other(VALUE_CUT_SHORT.into()),
                     });
                 }
@@ -414,7 +426,7 @@ impl Assembler {
         } else {
             "}"
         };
-        self.push_fragment(json.to_string(), Text::uncounted(source), out);
+        self.push_fragment(json.to_string(), Text::uncounted(source.to_owned()), out);
         self.stage = if self.containers.is_empty() {
             Stage::Closed
         } else {
@@ -498,7 +510,7 @@ impl Assembler {
         self.stage = Stage::Closed;
     }
 
-    fn push_fragment(&self, json: String, source: Text, out: &mut Events) {
+    fn push_fragment<'d>(&self, json: String, source: Text<'d>, out: &mut Events<'d>) {
         out.push(Event::ToolCallArguments {
             index: self.index,
             json,
@@ -513,12 +525,12 @@ fn after_the_object(text: &str, out: &mut Events) -> usize {
     for (run, space) in runs(text) {
         out.push(if space {
             Event::Dropped {
-                text: Text::uncounted(run),
+                text: Text::uncounted(run.to_owned()),
                 why: DropReason::Wrapper,
             }
         } else {
             Event::Malformed {
-                text: Text::uncounted(run),
+                text: Text::uncounted(run.to_owned()),
                 why: MalformedReason::Other(TEXT_AFTER_THE_OBJECT.into()),
             }
         });
@@ -569,7 +581,7 @@ mod tests {
 
     const CLOSE: &str = "<tool_call|>";
 
-    fn run(pieces: &[&str], cut: bool) -> Vec<Event> {
+    fn run(pieces: &[&str], cut: bool) -> Vec<Event<'static>> {
         let mut assembler = Assembler::new(0, "call_0", Spelling::GEMMA4);
         let mut out = Events::new();
         for piece in pieces {
@@ -580,18 +592,18 @@ mod tests {
         } else {
             assembler.close(CLOSE, &mut out);
         }
-        out.drain()
+        out.into_owned().drain()
     }
 
     fn bytes(events: &[Event]) -> String {
         events
             .iter()
             .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
+                Event::Content(t) | Event::Reasoning(t) => &*t.text,
+                Event::Dropped { text, .. } | Event::Malformed { text, .. } => &*text.text,
                 Event::ToolCallStart { source, .. }
                 | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
+                | Event::ToolCallEnd { source, .. } => &*source.text,
                 Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
             })
             .collect()
@@ -614,7 +626,7 @@ mod tests {
                 Event::Malformed {
                     text,
                     why: MalformedReason::Other(why),
-                } => Some((text.text.clone(), why.to_string())),
+                } => Some((text.text.to_string(), why.to_string())),
                 _ => None,
             })
             .collect()
@@ -697,7 +709,7 @@ mod tests {
         let mut out = Events::new();
         assembler.feed(output, &mut out);
         assembler.close("<end_function_call>", &mut out);
-        let events = out.drain();
+        let events = out.into_owned().drain();
         assert_eq!(bytes(&events), format!("{output}<end_function_call>"));
         assert_eq!(
             arguments(&events),
@@ -713,7 +725,10 @@ mod tests {
             assembler.feed(piece, &mut out);
         }
         assembler.close("<end_function_call>", &mut out);
-        assert_eq!(arguments(&out.drain()), "{\"a\": \"null\", \"b\": \"x\"}");
+        assert_eq!(
+            arguments(&out.into_owned().drain()),
+            "{\"a\": \"null\", \"b\": \"x\"}"
+        );
     }
 
     #[test]

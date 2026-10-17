@@ -96,7 +96,7 @@ mod tests {
         "<param name=\"duration\">15</param></function>"
     );
 
-    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
+    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         let mut parser = Engine::new(minicpm5(), declared());
         let mut out = Events::new();
         parser
@@ -128,18 +128,18 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     fn bytes(events: &[Event]) -> String {
         events
             .iter()
             .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
+                Event::Content(t) | Event::Reasoning(t) => &*t.text,
+                Event::Dropped { text, .. } | Event::Malformed { text, .. } => &*text.text,
                 Event::ToolCallStart { source, .. }
                 | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
+                | Event::ToolCallEnd { source, .. } => &*source.text,
                 Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
             })
             .collect()
@@ -161,7 +161,7 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Content(Text { text, .. }) => Some(text.as_str()),
+                Event::Content(Text { text, .. }) => Some(&**text),
                 _ => None,
             })
             .collect()
@@ -171,7 +171,7 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Reasoning(Text { text, .. }) => Some(text.as_str()),
+                Event::Reasoning(Text { text, .. }) => Some(&**text),
                 _ => None,
             })
             .collect()
@@ -181,7 +181,7 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(text.text.clone()),
+                Event::Malformed { text, .. } => Some(text.text.to_string()),
                 _ => None,
             })
             .collect()
@@ -317,7 +317,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        let events = out.drain();
+        let events = out.into_owned().drain();
         assert_eq!(arguments_of(&events, 0), "{\"artist\": \"Tay");
         assert!(events.iter().any(
             |event| matches!(event, Event::ToolCallEnd { source, .. } if source.text.is_empty())

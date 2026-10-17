@@ -51,7 +51,10 @@ pub struct Output {
 }
 
 /// The output of the response `response_id`, folded from a whole event sequence.
-pub fn output<'a>(response_id: &str, events: impl IntoIterator<Item = &'a Event>) -> Output {
+pub fn output<'a, 'd: 'a>(
+    response_id: &str,
+    events: impl IntoIterator<Item = &'a Event<'d>>,
+) -> Output {
     let folded = fold(events);
     let (status, incomplete_details) =
         response_status(folded.finish.as_ref().map(|finish| &finish.reason));
@@ -268,7 +271,7 @@ impl Stream {
 
     /// Appends the stream events `event` produces to `out`, in order. Returns the response's
     /// [`Output`] when `event` is `Finish`, after completing every open item.
-    pub fn feed(&mut self, event: &Event, out: &mut Vec<StreamEvent>) -> Option<Output> {
+    pub fn feed(&mut self, event: &Event<'_>, out: &mut Vec<StreamEvent>) -> Option<Output> {
         match event {
             Event::Content(text) | Event::Malformed { text, .. } => self.content(&text.text, out),
             Event::Reasoning(text) => self.reasoning(&text.text, out),
@@ -282,6 +285,25 @@ impl Stream {
             Event::ReasoningStart | Event::Dropped { .. } => {}
         }
         None
+    }
+
+    /// Feeds a step's events in order, as [`Stream::feed`] does one, and coalesces the deltas
+    /// they make for one part: the stream events for `events` are appended to `out` with at most
+    /// one text, reasoning or arguments delta per item in a row, so a step that completes several
+    /// runs of one part sends one delta. Returns the response's [`Output`] when `Finish` was among
+    /// the events.
+    pub fn feed_step(
+        &mut self,
+        events: &[Event<'_>],
+        out: &mut Vec<StreamEvent>,
+    ) -> Option<Output> {
+        let from = out.len();
+        let mut output = None;
+        for event in events {
+            output = self.feed(event, out).or(output);
+        }
+        coalesce(out, from);
+        output
     }
 
     /// Completes every open item and returns the [`Output`] for a stream that ends without
@@ -673,6 +695,76 @@ fn whole_arguments(arguments: &str) -> bool {
     arguments.is_empty() || serde_json::from_str::<IgnoredAny>(arguments).is_ok()
 }
 
+/// Joins the deltas from `from` on that continue the one before them, in place: the same item
+/// and part, the same kind of delta. A step of one event, the usual one, is left as it is.
+fn coalesce(out: &mut Vec<StreamEvent>, from: usize) {
+    if out.len() < from + 2 {
+        return;
+    }
+    let mut kept = from;
+    for next in from + 1..out.len() {
+        let (before, after) = out.split_at_mut(next);
+        if !joined(&mut before[kept], &mut after[0]) {
+            kept += 1;
+            out.swap(kept, next);
+        }
+    }
+    out.truncate(kept + 1);
+}
+
+/// Whether `next` continues `last`, and if so its text appended to `last`'s.
+fn joined(last: &mut StreamEvent, next: &mut StreamEvent) -> bool {
+    match (last, next) {
+        (
+            StreamEvent::OutputTextDelta {
+                output_index,
+                content_index,
+                delta,
+                ..
+            },
+            StreamEvent::OutputTextDelta {
+                output_index: of_next,
+                content_index: part,
+                delta: more,
+                ..
+            },
+        )
+        | (
+            StreamEvent::ReasoningTextDelta {
+                output_index,
+                content_index,
+                delta,
+                ..
+            },
+            StreamEvent::ReasoningTextDelta {
+                output_index: of_next,
+                content_index: part,
+                delta: more,
+                ..
+            },
+        ) if output_index == of_next && content_index == part => {
+            delta.push_str(more);
+            true
+        }
+        (
+            StreamEvent::FunctionCallArgumentsDelta {
+                output_index,
+                delta,
+                ..
+            },
+            StreamEvent::FunctionCallArgumentsDelta {
+                output_index: of_next,
+                delta: more,
+                ..
+            },
+        ) if output_index == of_next => {
+            delta.push_str(more);
+            true
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
@@ -680,7 +772,7 @@ mod tests {
     use super::*;
     use crate::event::{DropReason, MalformedReason, Text};
 
-    fn call(index: u32, name: &str) -> Event {
+    fn call(index: u32, name: &str) -> Event<'static> {
         Event::ToolCallStart {
             index,
             id: format!("call_{index}"),
@@ -689,7 +781,7 @@ mod tests {
         }
     }
 
-    fn arguments(index: u32, json: &str) -> Event {
+    fn arguments(index: u32, json: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index,
             json: json.into(),
@@ -697,14 +789,14 @@ mod tests {
         }
     }
 
-    fn end(index: u32) -> Event {
+    fn end(index: u32) -> Event<'static> {
         Event::ToolCallEnd {
             index,
             source: Text::default(),
         }
     }
 
-    fn finish(reason: FinishReason, tool_calls: u32) -> Event {
+    fn finish(reason: FinishReason, tool_calls: u32) -> Event<'static> {
         Event::Finish {
             reason,
             tool_calls,
@@ -1406,6 +1498,78 @@ mod tests {
                 "{expected} in {seen:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_step_sends_one_delta_per_part_where_its_events_made_several() {
+        let step = [
+            Event::Reasoning(Text::uncounted("pl")),
+            Event::Dropped {
+                text: Text::uncounted("|"),
+                why: DropReason::Wrapper,
+            },
+            Event::Reasoning(Text::uncounted("an")),
+            Event::ReasoningEnd,
+            Event::Content(Text::uncounted("Sure")),
+            Event::Malformed {
+                text: Text::uncounted("."),
+                why: MalformedReason::UnknownTool,
+            },
+            call(0, "f"),
+            arguments(0, r#"{"a":"#),
+            arguments(0, "1}"),
+            end(0),
+        ];
+        let is_delta = |event: &StreamEvent| {
+            matches!(
+                event,
+                StreamEvent::OutputTextDelta { .. }
+                    | StreamEvent::ReasoningTextDelta { .. }
+                    | StreamEvent::FunctionCallArgumentsDelta { .. }
+            )
+        };
+        let (one_by_one, _) = stream("resp_s", &step);
+        assert_eq!(one_by_one.iter().filter(|event| is_delta(event)).count(), 6);
+        let mut machine = Stream::new("resp_s");
+        let mut out = Vec::new();
+        assert!(machine.feed_step(&step, &mut out).is_none());
+        let deltas: Vec<(String, String)> = out
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ReasoningTextDelta { delta, .. } => {
+                    Some(("reasoning".to_string(), delta.clone()))
+                }
+                StreamEvent::OutputTextDelta { delta, .. } => {
+                    Some(("text".to_string(), delta.clone()))
+                }
+                StreamEvent::FunctionCallArgumentsDelta { delta, .. } => {
+                    Some(("arguments".to_string(), delta.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            deltas,
+            [
+                ("reasoning".to_string(), "plan".to_string()),
+                ("text".to_string(), "Sure.".to_string()),
+                ("arguments".to_string(), "{\"a\":1}".to_string()),
+            ]
+        );
+        let rest = |events: &[StreamEvent]| -> Vec<String> {
+            types(
+                &events
+                    .iter()
+                    .filter(|event| !is_delta(event))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            rest(&out),
+            rest(&one_by_one),
+            "the joining changes nothing else"
+        );
     }
 
     #[test]

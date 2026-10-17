@@ -20,7 +20,7 @@
 //! that do not partition its text, turns the rest of the stream uncounted (`tokens: None`), since a
 //! partial count would be a wrong one.
 
-use std::collections::VecDeque;
+use std::{borrow::Cow, collections::VecDeque};
 
 use crate::{
     event::{DropReason, Event, Events, Text},
@@ -73,7 +73,7 @@ impl Ledger {
     /// The output has ended: the tokens still queued had no bytes to follow them, and are reported
     /// once as control tokens with their count. A text token whose held bytes were never released
     /// is among them, as the module doc says.
-    pub fn finish(&mut self, out: &mut Events) {
+    pub fn finish(&mut self, out: &mut Events<'_>) {
         if self.uncounted || self.starts.is_empty() {
             return;
         }
@@ -85,8 +85,10 @@ impl Ledger {
         });
     }
 
-    /// The next run of the output's bytes as text, with the tokens that start in it.
-    pub fn text(&mut self, bytes: &str) -> Text {
+    /// The next run of the output's bytes as text, with the tokens that start in it. The text
+    /// keeps the bytes as given: a slice of the delta stays borrowed, an owned run stays owned.
+    pub fn text<'d>(&mut self, bytes: impl Into<Cow<'d, str>>) -> Text<'d> {
+        let bytes = bytes.into();
         let end = self.emitted + bytes.len();
         self.emitted = end;
         if self.uncounted {
@@ -101,16 +103,16 @@ impl Ledger {
     }
 
     /// The same event with its text counted, for events another component built uncounted.
-    pub fn relabel(&mut self, event: Event) -> Event {
+    pub fn relabel<'d>(&mut self, event: Event<'d>) -> Event<'d> {
         match event {
-            Event::Content(t) => Event::Content(self.text(&t.text)),
-            Event::Reasoning(t) => Event::Reasoning(self.text(&t.text)),
+            Event::Content(t) => Event::Content(self.text(t.text)),
+            Event::Reasoning(t) => Event::Reasoning(self.text(t.text)),
             Event::Dropped { text, why } => Event::Dropped {
-                text: self.text(&text.text),
+                text: self.text(text.text),
                 why,
             },
             Event::Malformed { text, why } => Event::Malformed {
-                text: self.text(&text.text),
+                text: self.text(text.text),
                 why,
             },
             Event::ToolCallStart {
@@ -122,7 +124,7 @@ impl Ledger {
                 index,
                 id,
                 name,
-                source: self.text(&source.text),
+                source: self.text(source.text),
             },
             Event::ToolCallArguments {
                 index,
@@ -131,11 +133,11 @@ impl Ledger {
             } => Event::ToolCallArguments {
                 index,
                 json,
-                source: self.text(&source.text),
+                source: self.text(source.text),
             },
             Event::ToolCallEnd { index, source } => Event::ToolCallEnd {
                 index,
-                source: self.text(&source.text),
+                source: self.text(source.text),
             },
             other @ (Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. }) => other,
         }

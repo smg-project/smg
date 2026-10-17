@@ -76,7 +76,7 @@ mod tests {
                 &mut out,
             )
             .expect("delta");
-        let events = out.drain();
+        let events = out.into_owned().drain();
         assert_eq!(
             events[0],
             Event::Content(Text::uncounted("It opens a thought."))
@@ -106,7 +106,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        let events = out.drain();
+        let events = out.into_owned().drain();
         assert_eq!(
             events[..3],
             [
@@ -135,7 +135,7 @@ mod tests {
         let content: String = events
             .iter()
             .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
+                Event::Content(text) => Some(&*text.text),
                 _ => None,
             })
             .collect();
@@ -209,7 +209,7 @@ mod tests {
                         &mut out,
                     )
                     .expect("end");
-                let events = out.drain();
+                let events = out.into_owned().drain();
                 let arguments: String = events
                     .iter()
                     .filter_map(|event| match event {

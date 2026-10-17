@@ -1808,7 +1808,7 @@ fn replay(
     text: &str,
     cuts: &[usize],
     empty_between: bool,
-) -> Result<Vec<Event>, ParseError> {
+) -> Result<Vec<Event<'static>>, ParseError> {
     common::replay(
         &mut *(subject.new)(),
         text,
@@ -2141,13 +2141,17 @@ fn token_boundaries(text: &str) -> Vec<usize> {
 /// Replay `text` through a new parser of `subject` cut at `cuts`, after the prompt, each delta
 /// carrying the spans of the synthetic tokens it holds, a token cut by a delta boundary continuing
 /// into the next delta, and a byte-less token at the very end, as an end-of-turn token would be.
-fn replay_counted(subject: &Subject, text: &str, cuts: &[usize]) -> Result<Vec<Event>, ParseError> {
+fn replay_counted(
+    subject: &Subject,
+    text: &str,
+    cuts: &[usize],
+) -> Result<Vec<Event<'static>>, ParseError> {
     let boundaries = token_boundaries(text);
     let mut tokens: Vec<(usize, usize)> = boundaries.windows(2).map(|w| (w[0], w[1])).collect();
     tokens.push((text.len(), text.len()));
-    let mut parser = (subject.new)();
-    let mut out = Events::new();
-    parser.feed(prompt(), &mut out)?;
+    // Each delta's spans are built first: a delta's events borrow it for as long as the buffer
+    // they are read into lives, here the whole output.
+    let mut deltas: Vec<(usize, usize, Vec<TokenSpan>)> = Vec::new();
     let mut from = 0;
     for &cut in cuts.iter().chain(std::iter::once(&text.len())) {
         if cut > from {
@@ -2164,16 +2168,22 @@ fn replay_counted(subject: &Subject, text: &str, cuts: &[usize]) -> Result<Vec<E
                     continued: start < from,
                 })
                 .collect();
-            parser.feed(
-                Input::Delta {
-                    token_ids: &[],
-                    text: &text[from..cut],
-                    spans: &spans,
-                },
-                &mut out,
-            )?;
+            deltas.push((from, cut, spans));
             from = cut;
         }
+    }
+    let mut parser = (subject.new)();
+    let mut out = Events::new();
+    parser.feed(prompt(), &mut out)?;
+    for (from, cut, spans) in &deltas {
+        parser.feed(
+            Input::Delta {
+                token_ids: &[],
+                text: &text[*from..*cut],
+                spans,
+            },
+            &mut out,
+        )?;
     }
     if text.is_empty() {
         // No delta carried text, so the byte-less token arrives in an empty one.
@@ -2197,7 +2207,7 @@ fn replay_counted(subject: &Subject, text: &str, cuts: &[usize]) -> Result<Vec<E
         },
         &mut out,
     )?;
-    Ok(out.drain())
+    Ok(out.into_owned().drain())
 }
 
 fn tokens_of(event: &Event) -> Option<u32> {
@@ -2279,7 +2289,7 @@ fn every_token_is_counted_in_the_event_that_carries_its_first_byte_whatever_the_
 }
 
 /// Feed `input`, which is out of order, and check that it is a `Lifecycle` error and emits nothing.
-fn rejected(parser: &mut dyn Parser, input: Input<'_>, out: &mut Events, what: &str) {
+fn rejected<'d>(parser: &mut dyn Parser, input: Input<'d>, out: &mut Events<'d>, what: &str) {
     let before = out.len();
     assert!(
         matches!(parser.feed(input, out), Err(ParseError::Lifecycle(_))),

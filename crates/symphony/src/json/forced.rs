@@ -113,7 +113,7 @@ impl Assembler {
 /// Bytes with no forced function to name a call for them: reported, not read.
 fn unnamed(bytes: &str, out: &mut Events) {
     out.push(Event::Malformed {
-        text: Text::uncounted(bytes),
+        text: Text::uncounted(bytes.to_owned()),
         why: MalformedReason::Other(NO_FORCED_FUNCTION.into()),
     });
 }
@@ -140,7 +140,7 @@ mod tests {
 
     const ARGUMENTS: &str = "{\"city\": \"Paris\", \"days\": [1, 2]}";
 
-    fn run(pieces: &[&str], declared: &Declared) -> (Vec<Event>, usize) {
+    fn run(pieces: &[&str], declared: &Declared) -> (Vec<Event<'static>>, usize) {
         let mut assembler = Assembler::new(0, "call_0");
         let mut out = Events::new();
         let mut taken = 0;
@@ -148,7 +148,7 @@ mod tests {
             taken += assembler.feed(piece, declared, &mut out);
         }
         assembler.finish(&mut out);
-        (out.drain(), taken)
+        (out.into_owned().drain(), taken)
     }
 
     fn arguments(events: &[Event]) -> String {
@@ -161,7 +161,7 @@ mod tests {
             .collect()
     }
 
-    fn names(events: &[Event]) -> Vec<&str> {
+    fn names<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|e| match e {
@@ -229,7 +229,7 @@ mod tests {
                 Event::Malformed {
                     text,
                     why: MalformedReason::Other(why),
-                } if why == NO_FORCED_FUNCTION => Some(text.text.as_str()),
+                } if why == NO_FORCED_FUNCTION => Some(&*text.text),
                 _ => None,
             })
             .collect();

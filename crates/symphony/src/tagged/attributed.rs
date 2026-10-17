@@ -400,7 +400,7 @@ impl Assembler {
         self.object.close(source, out);
         out.push(Event::ToolCallEnd {
             index: self.object.index,
-            source: Text::uncounted(terminal),
+            source: Text::uncounted(terminal.to_owned()),
         });
         self.done = true;
     }
@@ -589,7 +589,7 @@ impl Assembler {
             } else {
                 self.object.drop_carried(out);
                 out.push(Event::Malformed {
-                    text: Text::uncounted(run),
+                    text: Text::uncounted(run.to_owned()),
                     why: MalformedReason::Other(TEXT_BETWEEN_TAGS.into()),
                 });
             }
@@ -895,11 +895,11 @@ mod tests {
     }
 
     /// The events of one invoke fed in `pieces`, closed by its tag or cut.
-    fn run(pieces: &[&str], cut: bool) -> Vec<Event> {
+    fn run(pieces: &[&str], cut: bool) -> Vec<Event<'static>> {
         run_with(Tags::MINIMAX_M2, pieces, cut)
     }
 
-    fn run_with(tags: Tags, pieces: &[&str], cut: bool) -> Vec<Event> {
+    fn run_with(tags: Tags, pieces: &[&str], cut: bool) -> Vec<Event<'static>> {
         let mut assembler = Assembler::new(0, "call_0", tags);
         let mut out = Events::new();
         let declared = declared();
@@ -911,18 +911,18 @@ mod tests {
         } else {
             assembler.close(tags.invoke_close, &mut out);
         }
-        out.drain()
+        out.into_owned().drain()
     }
 
     fn bytes(events: &[Event]) -> String {
         events
             .iter()
             .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
+                Event::Content(t) | Event::Reasoning(t) => &*t.text,
+                Event::Dropped { text, .. } | Event::Malformed { text, .. } => &*text.text,
                 Event::ToolCallStart { source, .. }
                 | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
+                | Event::ToolCallEnd { source, .. } => &*source.text,
                 Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
             })
             .collect()
@@ -945,7 +945,7 @@ mod tests {
                 Event::Malformed {
                     text,
                     why: MalformedReason::Other(why),
-                } => Some((text.text.clone(), why.to_string())),
+                } => Some((text.text.to_string(), why.to_string())),
                 _ => None,
             })
             .collect()
@@ -1095,7 +1095,7 @@ mod tests {
             &mut out,
         );
         assembler.close("", &mut out);
-        let events = out.drain();
+        let events = out.into_owned().drain();
         nothing_empty(&events);
         assert_eq!(arguments(&events), "{}");
         assert!(malformed(&events)

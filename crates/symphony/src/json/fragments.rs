@@ -74,7 +74,7 @@ impl Fragments {
             out.push(Event::ToolCallArguments {
                 index,
                 json: fresh.to_string(),
-                source: Text::uncounted(fresh),
+                source: Text::uncounted(fresh.to_owned()),
             });
             self.emitted = valid_end;
         }
@@ -86,7 +86,7 @@ impl Fragments {
     pub(super) fn send_malformed(&mut self, value: &str, out: &mut Events) {
         if self.invalid_from.is_some() && self.emitted < value.len() {
             out.push(Event::Malformed {
-                text: Text::uncounted(&value[self.emitted..]),
+                text: Text::uncounted(value[self.emitted..].to_owned()),
                 why: MalformedReason::InvalidArguments,
             });
             self.emitted = value.len();
@@ -101,7 +101,7 @@ impl Fragments {
             out.push(Event::ToolCallArguments {
                 index,
                 json: held.to_string(),
-                source: Text::uncounted(held),
+                source: Text::uncounted(held.to_owned()),
             });
             self.emitted = value.len();
         }

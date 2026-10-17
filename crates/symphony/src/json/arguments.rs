@@ -282,7 +282,7 @@ impl Arguments {
             if let Some(last) = space.chars().next_back() {
                 self.led_by = Some(last);
                 out.push(Event::Dropped {
-                    text: Text::uncounted(space),
+                    text: Text::uncounted(space.to_owned()),
                     why: DropReason::Whitespace,
                 });
             }
@@ -384,14 +384,14 @@ impl Arguments {
             out.push(Event::ToolCallArguments {
                 index: self.index,
                 json: typed.unwrap_or_else(|| raw.to_string()),
-                source: Text::uncounted(raw),
+                source: Text::uncounted(raw.to_owned()),
             });
             self.emitted = close;
         }
         self.fragment(valid_end, out);
         if self.invalid_from.is_some() && self.emitted < end {
             out.push(Event::Malformed {
-                text: Text::uncounted(&self.value[self.emitted..end]),
+                text: Text::uncounted(self.value[self.emitted..end].to_owned()),
                 why: MalformedReason::InvalidArguments,
             });
             self.emitted = end;
@@ -405,7 +405,7 @@ impl Arguments {
             out.push(Event::ToolCallArguments {
                 index: self.index,
                 json: fresh.to_string(),
-                source: Text::uncounted(fresh),
+                source: Text::uncounted(fresh.to_owned()),
             });
             self.emitted = upto;
         }
@@ -418,7 +418,7 @@ mod tests {
 
     /// The events for `pieces`, what the value took of each, and whether it is whole after the
     /// last piece and after `finish`.
-    fn run(pieces: &[&str]) -> (Vec<Event>, Vec<usize>, bool, bool) {
+    fn run(pieces: &[&str]) -> (Vec<Event<'static>>, Vec<usize>, bool, bool) {
         let mut arguments = Arguments::new(0);
         let mut out = Events::new();
         let taken = pieces
@@ -427,7 +427,7 @@ mod tests {
             .collect();
         let fed = arguments.whole();
         let finished = arguments.finish(&mut out);
-        (out.drain(), taken, fed, finished)
+        (out.into_owned().drain(), taken, fed, finished)
     }
 
     fn fragments(events: &[Event]) -> String {
@@ -445,8 +445,8 @@ mod tests {
         events
             .iter()
             .map(|event| match event {
-                Event::ToolCallArguments { source, .. } => source.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
+                Event::ToolCallArguments { source, .. } => &*source.text,
+                Event::Dropped { text, .. } | Event::Malformed { text, .. } => &*text.text,
                 _ => "",
             })
             .collect()
@@ -553,11 +553,11 @@ mod tests {
             arguments.feed(piece, &HoldsN, &mut out);
         }
         arguments.finish(&mut out);
-        let events = out.drain();
+        let events = out.into_owned().drain();
         let malformed = events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(text.text.as_str()),
+                Event::Malformed { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect();
@@ -618,7 +618,7 @@ mod tests {
         assert!(!arguments.refused(), "a word being spelled is held");
         assert_eq!(arguments.feed("uex</f>", &AsWritten, &mut out), 7);
         assert!(arguments.refused());
-        assert_eq!(fragments(&out.drain()), "{\"a\": ");
+        assert_eq!(fragments(&out.into_owned().drain()), "{\"a\": ");
         assert_eq!(
             arguments.refused_tail(),
             Some(("truex</f>".to_string(), Some(' '))),

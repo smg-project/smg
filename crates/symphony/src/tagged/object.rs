@@ -58,7 +58,7 @@ impl Object {
     }
 
     /// A fragment of the arguments, with `source` as the bytes it accounts for.
-    pub(super) fn push_fragment(&self, json: String, source: Text, out: &mut Events) {
+    pub(super) fn push_fragment<'d>(&self, json: String, source: Text<'d>, out: &mut Events<'d>) {
         out.push(Event::ToolCallArguments {
             index: self.index,
             json,
@@ -67,7 +67,7 @@ impl Object {
     }
 
     /// `}` after the members, or `{}` when there were none, with `source` as its bytes.
-    pub(super) fn close(&mut self, source: Text, out: &mut Events) {
+    pub(super) fn close<'d>(&mut self, source: Text<'d>, out: &mut Events<'d>) {
         let json = if self.written == 0 { "{}" } else { "}" }.to_string();
         self.push_fragment(json, source, out);
     }
@@ -148,7 +148,7 @@ impl Object {
         }
         let mut json = String::with_capacity(text.len());
         push_escaped(&mut json, text);
-        self.push_fragment(json, Text::uncounted(text), out);
+        self.push_fragment(json, Text::uncounted(text.to_owned()), out);
     }
 
     /// A member written whole: `"key": json` after the separator, counted as written.
@@ -180,10 +180,10 @@ mod tests {
             .iter()
             .map(|event| match event {
                 Event::ToolCallArguments { json, source, .. } => {
-                    (json.clone(), source.text.clone())
+                    (json.clone(), source.text.to_string())
                 }
-                Event::Dropped { text, .. } => ("dropped".to_string(), text.text.clone()),
-                Event::Malformed { text, .. } => ("malformed".to_string(), text.text.clone()),
+                Event::Dropped { text, .. } => ("dropped".to_string(), text.text.to_string()),
+                Event::Malformed { text, .. } => ("malformed".to_string(), text.text.to_string()),
                 other => panic!("unexpected {other:?}"),
             })
             .collect()

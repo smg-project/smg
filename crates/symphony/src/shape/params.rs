@@ -298,7 +298,7 @@ impl Params {
         let again = self.keys.iter().any(|written| written == key);
         if again && self.values.reader().duplicates() == Duplicates::First {
             out.push(Event::Malformed {
-                text: Text::uncounted(parameter),
+                text: Text::uncounted(parameter.to_owned()),
                 why: MalformedReason::Other(KEY_WRITTEN_TWICE.into()),
             });
             return;
@@ -316,7 +316,7 @@ impl Params {
         out.push(Event::ToolCallArguments {
             index: self.index,
             json: member,
-            source: Text::uncounted(parameter),
+            source: Text::uncounted(parameter.to_owned()),
         });
         self.written += 1;
     }
@@ -327,7 +327,7 @@ impl Params {
             return;
         }
         out.push(Event::Dropped {
-            text: Text::uncounted(text),
+            text: Text::uncounted(text.to_owned()),
             why: DropReason::Wrapper,
         });
         self.dropped += text.len();

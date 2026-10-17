@@ -99,7 +99,7 @@ pub fn run(
     text: &str,
     cuts: &[usize],
     end: &EngineFinish,
-) -> Vec<Event> {
+) -> Vec<Event<'static>> {
     let mut parser = Engine::new(format.clone(), declared.clone());
     let mut out = Events::new();
     if !prompt.is_empty() {
@@ -129,7 +129,7 @@ pub fn run(
             &mut out,
         )
         .unwrap();
-    out.drain()
+    out.into_owned().drain()
 }
 
 /// The places to cut `text` at, each plan named: whole, a character at a time, steps of three
@@ -259,13 +259,13 @@ impl Said {
 }
 
 /// The output bytes `event` accounts for.
-pub fn bytes_of(event: &Event) -> &str {
+pub fn bytes_of<'a>(event: &'a Event<'_>) -> &'a str {
     match event {
-        Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-        Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
+        Event::Content(t) | Event::Reasoning(t) => &t.text,
+        Event::Dropped { text, .. } | Event::Malformed { text, .. } => &text.text,
         Event::ToolCallStart { source, .. }
         | Event::ToolCallArguments { source, .. }
-        | Event::ToolCallEnd { source, .. } => source.text.as_str(),
+        | Event::ToolCallEnd { source, .. } => &source.text,
         Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
     }
 }

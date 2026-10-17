@@ -11,6 +11,14 @@ The shapes are the ones SMG's gateway sends today, the same fields in the same p
 - content and reasoning deltas carry `role: "assistant"`; reasoning goes to `reasoning_content`;
 - a call begins with its `id`, `type: "function"` and `name` and no arguments; every later
   fragment carries the call's `index` and `arguments` only;
+- rendered per engine step (`step`, which the gateway's stream uses, except for a response it
+  rechunks for a provider that reads each delta's shape, where `into_delta` keeps one chunk per
+  event), a step's events are one
+  choice: its content and malformed text as `content`, its reasoning as `reasoning_content`, one
+  `tool_calls` entry per call the step touched with the step's fragments joined, so a call's
+  opening entry may carry its first `arguments` next to its `id` and `name`, and one chunk may
+  hold `content`, `reasoning_content` and `tool_calls` together; the choice carries no role, as
+  only a choice's opening chunk does on the wire, and the driver writes that one;
 - the finishing choice has an empty delta without a role;
 - the whole message has `content` null when it is only whitespace, `reasoning_content` only when
   there was reasoning, and `tool_calls` only when a call was made, each call with its id, name

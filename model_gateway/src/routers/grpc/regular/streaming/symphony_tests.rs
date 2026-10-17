@@ -716,3 +716,64 @@ async fn a_conversation_that_ends_with_a_system_turn_keeps_the_thought_out_of_th
     assert_eq!(chat_text(&events, 0, "content").trim(), "");
     assert!(!tool_call_deltas(&events).is_empty(), "{events:#?}");
 }
+
+/// A step that mixes text and a call's start: the stream renders it as one chunk, `content` and
+/// the call's opening `tool_calls` entry together; a response the gateway rechunks for a provider
+/// that reads each delta's shape (the MiniMax profile) keeps one chunk per event, the text before
+/// the call's identity, so the rechunker never puts the identity ahead of the text before it.
+#[tokio::test]
+async fn a_rechunked_stream_keeps_one_chunk_per_event_and_the_plain_stream_one_per_step() {
+    const OUTPUT: &str =
+        "Sure. <tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": 1}}\n</tool_call>";
+    for (provider, per_event) in [
+        (ProviderProfile::Generic, false),
+        (ProviderProfile::Minimax, true),
+    ] {
+        let mut spec = assigned(
+            chat_spec(true),
+            qwen3(CallSyntax::Json),
+            "<|im_start|>assistant\n",
+        );
+        spec.provider = provider;
+        let responses = vec![chunk(0, OUTPUT), complete(0, "stop")];
+        let (result, events) = stream_events(responses, true, spec).await;
+        assert!(result.is_ok(), "{result:?}");
+        // The deltas of choice 0 that carry text or a call (the role and finish chunks aside).
+        let deltas: Vec<&Value> = events
+            .iter()
+            .map(|event| &event["choices"][0]["delta"])
+            .filter(|delta| {
+                delta["content"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty())
+                    || delta["tool_calls"].is_array()
+            })
+            .collect();
+        let mixed = |delta: &Value| {
+            delta["content"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+                && delta["tool_calls"].is_array()
+        };
+        if per_event {
+            assert!(
+                deltas.len() >= 2 && deltas.iter().all(|delta| !mixed(delta)),
+                "one chunk per event: {deltas:#?}"
+            );
+            assert_eq!(deltas[0]["content"].as_str().map(str::trim), Some("Sure."));
+            assert!(deltas[0]["tool_calls"].is_null(), "{:?}", deltas[0]);
+            assert_eq!(deltas[1]["tool_calls"][0]["function"]["name"], "lookup");
+            assert!(
+                deltas[1]["tool_calls"][0]["id"].is_string(),
+                "{:?}",
+                deltas[1]
+            );
+            assert!(deltas[1]["content"].is_null(), "{:?}", deltas[1]);
+        } else {
+            assert_eq!(deltas.len(), 1, "one chunk per step: {deltas:#?}");
+            assert!(mixed(deltas[0]), "{:?}", deltas[0]);
+            assert_eq!(deltas[0]["content"].as_str().map(str::trim), Some("Sure."));
+            assert_eq!(deltas[0]["tool_calls"][0]["function"]["name"], "lookup");
+        }
+    }
+}

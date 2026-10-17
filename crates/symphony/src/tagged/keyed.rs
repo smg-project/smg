@@ -287,7 +287,7 @@ impl Assembler {
         self.object.close(source, out);
         out.push(Event::ToolCallEnd {
             index: self.object.index,
-            source: Text::uncounted(terminal),
+            source: Text::uncounted(terminal.to_owned()),
         });
         self.done = true;
     }
@@ -403,7 +403,7 @@ impl Assembler {
             } else {
                 self.object.drop_carried(out);
                 out.push(Event::Malformed {
-                    text: Text::uncounted(run),
+                    text: Text::uncounted(run.to_owned()),
                     why: MalformedReason::Other(TEXT_BETWEEN_TAGS.into()),
                 });
             }
@@ -542,7 +542,7 @@ mod tests {
     }
 
     /// The events of one block fed in `pieces`, closed by the call's marker or cut.
-    fn run(pieces: &[&str], cut: bool) -> Vec<Event> {
+    fn run(pieces: &[&str], cut: bool) -> Vec<Event<'static>> {
         let mut assembler = Assembler::new(0, "call_0", Tags::PLAIN);
         let mut out = Events::new();
         let declared = declared();
@@ -554,24 +554,24 @@ mod tests {
         } else {
             assembler.close(CLOSE, &mut out);
         }
-        out.drain()
+        out.into_owned().drain()
     }
 
     fn bytes(events: &[Event]) -> String {
         events
             .iter()
             .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
+                Event::Content(t) | Event::Reasoning(t) => &*t.text,
+                Event::Dropped { text, .. } | Event::Malformed { text, .. } => &*text.text,
                 Event::ToolCallStart { source, .. }
                 | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
+                | Event::ToolCallEnd { source, .. } => &*source.text,
                 Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
             })
             .collect()
     }
 
-    fn fragments(events: &[Event]) -> Vec<&str> {
+    fn fragments<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
@@ -585,15 +585,15 @@ mod tests {
         fragments(events).concat()
     }
 
-    fn malformed(events: &[Event]) -> Vec<(&str, &str)> {
+    fn malformed<'a>(events: &'a [Event<'_>]) -> Vec<(&'a str, &'a str)> {
         events
             .iter()
             .filter_map(|event| match event {
                 Event::Malformed {
                     text,
                     why: MalformedReason::Other(why),
-                } => Some((text.text.as_str(), why.as_ref())),
-                Event::Malformed { text, .. } => Some((text.text.as_str(), "unterminated")),
+                } => Some((text.text.as_ref(), why.as_ref())),
+                Event::Malformed { text, .. } => Some((text.text.as_ref(), "unterminated")),
                 _ => None,
             })
             .collect()
@@ -606,11 +606,11 @@ mod tests {
             .count()
     }
 
-    fn ends(events: &[Event]) -> Vec<&str> {
+    fn ends<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::ToolCallEnd { source, .. } => Some(source.text.as_str()),
+                Event::ToolCallEnd { source, .. } => Some(&*source.text),
                 _ => None,
             })
             .collect()

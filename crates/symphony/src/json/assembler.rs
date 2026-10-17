@@ -141,7 +141,7 @@ impl Assembler {
                 if let Some(end) = close.or_else(|| self.stopped_at()) {
                     if end > 0 {
                         out.push(Event::Malformed {
-                            text: Text::uncounted(&self.text[..end]),
+                            text: Text::uncounted(self.text[..end].to_owned()),
                             why: MalformedReason::Other(WITHOUT_A_NAME.into()),
                         });
                     }
@@ -166,7 +166,7 @@ impl Assembler {
                 index: self.index,
                 id: self.id.clone(),
                 name,
-                source: Text::uncounted(&self.text[..head_end]),
+                source: Text::uncounted(self.text[..head_end].to_owned()),
             });
             self.started = true;
         }
@@ -196,7 +196,7 @@ impl Assembler {
                 .map_or(at, |end| end.min(at));
             out.push(Event::ToolCallEnd {
                 index: self.index,
-                source: Text::uncounted(&self.text[tail_start..at]),
+                source: Text::uncounted(self.text[tail_start..at].to_owned()),
             });
             self.done = true;
             return taken;
@@ -210,7 +210,7 @@ impl Assembler {
                 .unwrap_or(close);
             out.push(Event::ToolCallEnd {
                 index: self.index,
-                source: Text::uncounted(&self.text[tail_start..close]),
+                source: Text::uncounted(self.text[tail_start..close].to_owned()),
             });
             self.done = true;
         }
@@ -269,7 +269,7 @@ impl Assembler {
                 .unwrap_or(self.text.len());
             if tail_start < self.text.len() {
                 out.push(Event::Malformed {
-                    text: Text::uncounted(&self.text[tail_start..]),
+                    text: Text::uncounted(self.text[tail_start..].to_owned()),
                     why: MalformedReason::UnterminatedRegion,
                 });
             }
@@ -355,14 +355,14 @@ mod tests {
     const CALL: &str = r#"{"name": "get_weather", "arguments": {"city": "Paris", "days": [1, 2]}}"#;
     const ARGUMENTS: &str = r#"{"city": "Paris", "days": [1, 2]}"#;
 
-    fn run(pieces: &[&str]) -> Vec<Event> {
+    fn run(pieces: &[&str]) -> Vec<Event<'static>> {
         let mut assembler = Assembler::new(0, "call_0");
         let mut out = Events::new();
         for piece in pieces {
             assembler.feed(piece, &mut out);
         }
         assembler.finish(&mut out);
-        out.drain()
+        out.into_owned().drain()
     }
 
     fn sources(events: &[Event]) -> String {
@@ -371,8 +371,8 @@ mod tests {
             .map(|e| match e {
                 Event::ToolCallStart { source, .. }
                 | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::Malformed { text, .. } => text.text.as_str(),
+                | Event::ToolCallEnd { source, .. } => &*source.text,
+                Event::Malformed { text, .. } => &*text.text,
                 _ => "",
             })
             .collect()
@@ -388,13 +388,11 @@ mod tests {
             .collect()
     }
 
-    fn starts(events: &[Event]) -> Vec<(&str, &str)> {
+    fn starts<'a>(events: &'a [Event<'_>]) -> Vec<(&'a str, &'a str)> {
         events
             .iter()
             .filter_map(|e| match e {
-                Event::ToolCallStart { name, source, .. } => {
-                    Some((name.as_str(), source.text.as_str()))
-                }
+                Event::ToolCallStart { name, source, .. } => Some((name.as_str(), &*source.text)),
                 _ => None,
             })
             .collect()
@@ -405,7 +403,7 @@ mod tests {
         events
             .iter()
             .filter_map(|e| match e {
-                Event::Malformed { text, .. } => Some(text.text.as_str()),
+                Event::Malformed { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -555,7 +553,7 @@ mod tests {
         assembler.feed(&text[..cut], &mut out);
         assert!(out.is_empty(), "nothing is said before the name is known");
         assembler.feed(&text[cut..], &mut out);
-        let events = out.drain();
+        let events = out.into_owned().drain();
         assert_eq!(starts(&events), vec![("get_weather", r#"{"arguments": "#)]);
         assert_eq!(arguments(&events), r#"{"city": "Paris"}"#);
         assert_eq!(
@@ -855,7 +853,7 @@ mod tests {
         let malformed: String = events
             .iter()
             .filter_map(|e| match e {
-                Event::Malformed { text, .. } => Some(text.text.as_str()),
+                Event::Malformed { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect();
@@ -888,7 +886,7 @@ mod tests {
                 back.push_str(&piece[taken..]);
             }
             assembler.finish(&mut out);
-            let events = out.drain();
+            let events = out.into_owned().drain();
             (arguments(&events), malformed(&events), back)
         };
         for (text, expected_arguments, expected_back) in [
@@ -933,17 +931,17 @@ mod tests {
             );
             assert_eq!(assembler.feed("more", &mut out), 0, "{text:?}");
             assembler.finish(&mut out);
-            (out.drain(), tail)
+            (out.into_owned().drain(), tail)
         };
         let start = |source: &str| Event::ToolCallStart {
             index: 0,
             id: "call_0".into(),
             name: "f".into(),
-            source: Text::uncounted(source),
+            source: Text::uncounted(source.to_owned()),
         };
         let end = |source: &str| Event::ToolCallEnd {
             index: 0,
-            source: Text::uncounted(source),
+            source: Text::uncounted(source.to_owned()),
         };
         let head = r#"{"name": "f", "arguments": "#;
         let value = Event::ToolCallArguments {
@@ -1061,7 +1059,7 @@ mod tests {
         for (i, c) in call.char_indices() {
             assembler.feed(&call[i..i + c.len_utf8()], &mut out);
         }
-        let by_char = out.drain();
+        let by_char = out.into_owned().drain();
         let elapsed = started.elapsed();
         let mut whole = Events::new();
         Assembler::new(0, "call_0").feed(&call, &mut whole);
