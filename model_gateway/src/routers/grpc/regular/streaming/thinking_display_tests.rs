@@ -156,7 +156,7 @@ async fn the_thinking_text_is_in_the_message_unless_the_display_is_omitted() {
                 let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
                 let mut decoder =
                     utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
-                let message = response_processor()
+                let (message, _counts) = response_processor()
                     .process_non_streaming_messages_response(
                         context::ExecutionResult::Single { stream },
                         spec(display, with_symphony),

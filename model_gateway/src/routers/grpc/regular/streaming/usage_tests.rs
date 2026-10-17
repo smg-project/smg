@@ -368,6 +368,7 @@ async fn non_streamed_generate((stream, server): Scripted) -> Vec<GenerateRespon
 fn messages_spec(thinking: bool) -> MessagesResponseSpec {
     MessagesResponseSpec {
         thinking_requested: thinking,
+        thinking_text_returned: true,
         reasoning_in_prefill: false,
         tool_choice: None,
         has_tools: false,
