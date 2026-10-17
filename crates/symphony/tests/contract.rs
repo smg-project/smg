@@ -326,6 +326,10 @@ fn kimi_k2() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::KimiK2.format(), Declared::default()))
 }
 
+fn mistral() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::Mistral.format(), Declared::default()))
+}
+
 fn mistral_v13() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::MistralV13.format(), Declared::default()))
 }
@@ -1021,6 +1025,12 @@ const FORMATS: &[Subject] = &[
         table: None,
     },
     Subject {
+        name: "mistral",
+        new: mistral,
+        outputs: MISTRAL_LIST_OUTPUTS,
+        table: Some(Table::Mistral),
+    },
+    Subject {
         name: "mistral v13",
         new: mistral_v13,
         outputs: MISTRAL_OUTPUTS,
@@ -1461,6 +1471,21 @@ const LLAMA4_OUTPUTS: &[&str] = &[
     "Hello!",
     "[get_wea",
     "[get_weather(city=\"Par",
+];
+
+/// The Mistral list: `[TOOL_CALLS]`, a space or none, the JSON list of calls with their ids, the
+/// content before it; two markers; one cut short; prose with the marker's look; a list that is
+/// not one.
+const MISTRAL_LIST_OUTPUTS: &[&str] = &[
+    "[TOOL_CALLS] [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}, \"id\": \"call00000\"}]",
+    "[TOOL_CALLS][{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"days\": [1, 2.5, true, null]}}, {\"name\": \"get_stock_price\", \"arguments\": {}}]",
+    "Let me check.[TOOL_CALLS] [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}, \"id\": \"call00000\"}]",
+    "[TOOL_CALLS] [{\"name\": \"save_note\", \"arguments\": {\"title\": \"計画 🌍\", \"body\": \"a ] b [TOOL_CALLS] c\"}, \"id\": \"call00000\"}]",
+    "[TOOL_CALLS] [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}, \"id\": \"call00000\"}][TOOL_CALLS] [{\"name\": \"get_stock_price\", \"arguments\": {}, \"id\": \"call00001\"}]",
+    "[TOOL_CALLS] [{\"name\": \"get_weather\", \"argu",
+    "[TOOL_CALLS] not a list",
+    "The marker is [TOOL_CALLS]; the list follows it.",
+    "Hello!",
 ];
 
 /// Mistral's calls: the tool's name, `[ARGS]`, the arguments object alone, one call per opener,

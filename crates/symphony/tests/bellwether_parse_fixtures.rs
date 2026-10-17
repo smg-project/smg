@@ -355,6 +355,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ),
     // A bare JSON list of calls, or content; no thought.
     ("llama-xlam-2-8b-fc-r", GenerationPrompt::Plain),
+    // The Mistral list behind `[TOOL_CALLS]`; Mistral Small 3's template renders no tool call,
+    // so its recorded sets hold content alone, and no thought.
+    ("mistral-small-24b-instruct-2501", GenerationPrompt::Plain),
     // An XML tree of arguments behind a separator token; the model writes the thought or closes
     // an empty one, and the generation prompt adds nothing.
     ("minimax-m3", GenerationPrompt::ModelDecides),
@@ -653,6 +656,7 @@ impl Recorded for Table {
             | Self::Inkling
             | Self::Gemma4
             | Self::FunctionGemma
+            | Self::Mistral
             | Self::MistralV13
             | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the

@@ -478,6 +478,16 @@ mod tests {
         );
         // The older `llama` parser's format is the json table's.
         assert_eq!(named_table(&pair(Some("llama"), None)), Some(Table::Json));
+        // The older `mistral` parser's list has a table of that name; the v13 spelling keeps its
+        // own.
+        assert_eq!(
+            named_table(&pair(Some("mistral"), None)),
+            Some(Table::Mistral)
+        );
+        assert_eq!(
+            named_table(&pair(Some("mistral_v13"), None)),
+            Some(Table::MistralV13)
+        );
         // The older DeepSeek pairings read with the tables, the thought included: the R1 line
         // behind `deepseek` + `deepseek_r1` writes V3's calls after a thought, and the V3 table
         // reads it, whether the prompt opens the thought (the original R1's tail, below) or the
@@ -586,6 +596,7 @@ mod tests {
             ("deepseek", "deepseek_v3"),
             ("deepseek31", "deepseek_v3.1"),
             ("deepseek_v31", "deepseek_v3.1"),
+            ("mistral", "mistral"),
         ];
         let mut legacy: Vec<(String, &str)> = tools
             .list_parsers()

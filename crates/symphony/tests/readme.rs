@@ -1634,9 +1634,9 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2024-05-22",
         smg: (Some("mistral"), None),
-        table: None,
+        table: Some(Table::Mistral),
         set: None,
-        status: Status::Pending,
+        status: Status::AwaitingFixtures,
     },
     Group {
         slug: "mistral-medium-3.5-128b",
@@ -1651,12 +1651,16 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "mistral-small-24b-instruct-2501",
         model: "mistralai/Mistral-Small-24B-Instruct-2501",
-        also: &[],
+        also: &[
+            "Mistral-Small-3.1-24B-Instruct-2503",
+            "Devstral-Small-2505",
+            "Magistral-Small-2506",
+        ],
         released: "2025-01-28",
         smg: (Some("mistral"), None),
-        table: None,
+        table: Some(Table::Mistral),
         set: Some(184_972),
-        status: Status::Pending,
+        status: Status::Replaying,
     },
     Group {
         slug: "mistral-small-4-119b-2603",
