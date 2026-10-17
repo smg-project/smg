@@ -329,6 +329,10 @@ class RouterArgs:
     # mTLS for worker communication: the client certificate and key (with ca_cert_paths)
     client_cert_path: str | None = None
     client_key_path: str | None = None
+    # Cut a grammar-constrained streamed generation that produces no token for this many
+    # seconds after its first one: aborted on the engine, its slot freed, the client answered a
+    # constrained_no_progress error; 0 disables
+    constrained_no_progress_secs: int = 0
     # API keys for control plane auth (list of tuples: id, name, key, role)
     control_plane_api_keys: list[tuple] = dataclasses.field(default_factory=list)
     control_plane_audit_enabled: bool = False
@@ -1357,6 +1361,24 @@ class RouterArgs:
                 " pauses while the worker applies backpressure, so a slow"
                 " worker read never trips it. Applies only to streamed"
                 " request bodies. 0 disables"
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}constrained-no-progress-secs",
+            type=_non_negative_int,
+            default=RouterArgs.constrained_no_progress_secs,
+            help=(
+                "Cut a grammar-constrained streamed generation (JSON schema,"
+                " regex, grammar, structural tag, forced tool call) that"
+                " produces no token for this many seconds after its first one:"
+                " the request is aborted on the engine, its slot freed, the"
+                " client gets a constrained_no_progress error, and"
+                " smg_constrained_no_progress_total counts it. The budget runs"
+                " between the engine's responses once the stream has started;"
+                " the first token's wait stays under the request timeout, and a"
+                " non-streamed generation is not bounded by it. gRPC workers only:"
+                " the HTTP router does not apply it. Must stay below"
+                " --request-timeout-secs. 0 disables"
             ),
         )
         routing_group.add_argument(

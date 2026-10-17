@@ -11,7 +11,7 @@
 //!   cache and publish `AllBlocksCleared` (an engine restart, to the index).
 //! - `POST /admin/fault/{worker}/drop?batches=N`, `.../delay?ms=D`,
 //!   `.../restart-publisher`, `.../pause`, `.../resume`,
-//!   `.../fail?status=S[&count=N|&secs=T][&after_tokens=K][&stall_ms=M]` and
+//!   `.../fail?status=S[&count=N|&secs=T][&after_tokens=K][&stall_ms=M][&hang_ms=H]` and
 //!   `GET /admin/fault/{worker}`: the fault hooks (see the README).
 //! - `POST /admin/truth/{worker}` with `{"token_ids": [...]}`: what the
 //!   worker would serve from cache for that prompt right now;
@@ -151,9 +151,11 @@ fn status_json(e: &Engine) -> Value {
         "fail_after_tokens": fail.and_then(|f| f.after_tokens),
         "fail_finish_error": fail.is_some_and(|f| f.finish_error),
         "fail_stall_ms": fail.map_or(0, |f| f.stall.as_millis() as u64),
+        "fail_hang_ms": fail.map_or(0, |f| f.hang.as_millis() as u64),
         "failed_total": s.failed_total,
         "cut_total": s.cut_total,
         "stalled_total": s.stalled_total,
+        "hung_total": s.hung_total,
     })
 }
 
@@ -187,14 +189,17 @@ fn optional<T: std::str::FromStr>(
 /// after a `stall_ms=M` hold; `after_tokens=K` serves K tokens first and cuts
 /// the stream with S. `finish=error` ends the stream as an engine that failed
 /// the request does, a `Complete` with finish reason `error` after K tokens
-/// (0 when unset), with no status needed. `status=0` alone clears; with
-/// `stall_ms` it stalls and then serves.
+/// (0 when unset), with no status needed. `hang_ms=H` holds the stream for H
+/// ms once K tokens are out (0 when unset), delivering nothing; with
+/// `status=0` it then serves on. `status=0` alone clears; with `stall_ms` it
+/// stalls and then serves.
 fn fail_query(q: &HashMap<String, String>) -> Result<Option<RequestFault>, String> {
     let status: u16 = optional(q, "status")?.unwrap_or(0);
     let count: Option<u32> = optional(q, "count")?;
     let secs: Option<f64> = optional(q, "secs")?;
     let mut after_tokens: Option<u32> = optional(q, "after_tokens")?;
     let stall_ms: u64 = optional(q, "stall_ms")?.unwrap_or(0);
+    let hang_ms: u64 = optional(q, "hang_ms")?.unwrap_or(0);
     let finish_error = match q.get("finish").map(String::as_str) {
         None => false,
         Some("error") => true,
@@ -207,10 +212,12 @@ fn fail_query(q: &HashMap<String, String>) -> Result<Option<RequestFault>, Strin
     }
     if finish_error {
         after_tokens = Some(after_tokens.unwrap_or(0));
-    } else if status == 0 && after_tokens.is_some() {
-        return Err("after_tokens needs a status to cut the stream with".to_string());
+    } else if status == 0 && after_tokens.is_some() && hang_ms == 0 {
+        return Err(
+            "after_tokens needs a status to cut the stream with, or hang_ms to hold it".to_string(),
+        );
     }
-    if status == 0 && stall_ms == 0 && !finish_error {
+    if status == 0 && stall_ms == 0 && hang_ms == 0 && !finish_error {
         return Ok(None);
     }
     let scope = match (count, secs) {
@@ -228,6 +235,7 @@ fn fail_query(q: &HashMap<String, String>) -> Result<Option<RequestFault>, Strin
     Ok(Some(RequestFault {
         status,
         stall: Duration::from_millis(stall_ms),
+        hang: Duration::from_millis(hang_ms),
         after_tokens,
         finish_error,
         scope,
@@ -251,6 +259,7 @@ async fn fleet(State(state): State<Arc<AdminState>>) -> Json<Value> {
                 "num_cached_blocks": load.num_cached_blocks,
                 "num_preemptions": load.num_preemptions,
                 "num_kv_batches": load.num_kv_batches,
+                "aborted_total": e.aborted_total(),
             })
         })
         .collect();
@@ -565,6 +574,34 @@ mod tests {
         assert_eq!(
             (stall_only.status, stall_only.scope),
             (0, FaultScope::Requests(1))
+        );
+        assert_eq!(cut.hang, Duration::ZERO);
+        let hung = fail_query(&query(&[
+            ("after_tokens", "2"),
+            ("hang_ms", "1500"),
+            ("count", "1"),
+        ]))
+        .unwrap()
+        .expect("armed: a hold needs no status");
+        assert_eq!(
+            (hung.status, hung.after_tokens, hung.hang, hung.scope),
+            (
+                0,
+                Some(2),
+                Duration::from_millis(1500),
+                FaultScope::Requests(1)
+            )
+        );
+        let hung_then_cut = fail_query(&query(&[
+            ("status", "503"),
+            ("after_tokens", "1"),
+            ("hang_ms", "20"),
+        ]))
+        .unwrap()
+        .expect("armed");
+        assert_eq!(
+            (hung_then_cut.status, hung_then_cut.hang),
+            (503, Duration::from_millis(20))
         );
         let timed = fail_query(&query(&[("status", "429"), ("secs", "0.5")]))
             .unwrap()

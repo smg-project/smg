@@ -1699,6 +1699,19 @@ class TestRouterArgsFieldOrder:
         assert tail == sorted(tail), out_of_place(tail)
 
 
+class TestConstrainedNoProgress:
+    """The no-progress budget of a grammar-constrained stream: off by default,
+    a number of seconds when set."""
+
+    def test_default_is_off(self):
+        args = parse_router_args([])
+        assert args.constrained_no_progress_secs == 0
+
+    def test_flag_sets_the_budget(self):
+        args = parse_router_args(["--constrained-no-progress-secs", "45"])
+        assert args.constrained_no_progress_secs == 45
+
+
 class TestConnectionTimeouts:
     """The HTTP edge's connection-level timeouts: their defaults and the
     disabling zero."""
