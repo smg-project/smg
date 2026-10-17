@@ -88,10 +88,12 @@ the output, where anything but a list is prose; `Framed` (Llama Nemotron) is the
 markers, where text in place of it is malformed; `ObjectOrList` (the `json` table) also reads a
 `{` at the first byte as one call alone. The stages (deciding at the first byte that is not
 whitespace, between objects, inside one, after the `]`) and what they say of the bytes around the
-objects (the brackets, commas and wrapping whitespace `Dropped`, text between objects or after the
-list `Malformed`, one run per event) are the same under every framing. A call written as one
-object inside a table's markers (`CallSyntax::Json`) is not a framing of this reader: it is the JSON
-assembler itself, and the engine, not the reader, reports what follows the object.
+objects (the brackets, commas and wrapping whitespace `Dropped`; text between objects `Malformed`,
+one run per event, a run ending at whitespace, a comma, a brace or the `]`; text after the list or
+the lone object `Malformed` with its whitespace, one event per piece once text follows) are the
+same under every framing. A call written as one object inside a table's markers
+(`CallSyntax::Json`) is not a framing of this reader: it is the JSON assembler itself, and the
+engine, not the reader, reports what follows the object.
 
 ## The Qwen tagged assembler (`tagged::assembler`)
 
