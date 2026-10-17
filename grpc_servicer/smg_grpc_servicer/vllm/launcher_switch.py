@@ -166,19 +166,21 @@ def with_servicer_switch(
             # the launcher's own coroutine builds the engine and loads the
             # model (the servicer's own refusal would come after that load).
             require_python_media_mode(args)
+            # The Python servicer gets the Rust path's KV-events default too:
+            # a namespace without --kv-events-config has vLLM's ZMQ publisher
+            # on, at a port found free on this host, before the launcher
+            # builds the engine from it, so SubscribeKvEvents relays the
+            # events a cache-aware router routes by (the rule, the opt-out
+            # and the log line of `RustLauncher.serve`); a host with no free
+            # block of ports is refused here as on the Rust path.
+            if default_kv_events_config(args) is not None:
+                configure_logging()
+                announce_kv_events_default("vLLM", KV_EVENTS_ENV, logger)
         except ServicerConfigError as error:
             # A knob the servicer cannot use: one named ERROR line and exit
             # code 2, not the launcher's traceback.
             configure_logging()
             raise configuration_exit(error) from None
-        # The Python servicer gets the Rust path's KV-events default too: a
-        # namespace without --kv-events-config has vLLM's ZMQ publisher on
-        # before the launcher builds the engine from it, so SubscribeKvEvents
-        # relays the events a cache-aware router routes by (the rule, the
-        # opt-out and the log line of `RustLauncher.serve`).
-        if default_kv_events_config(args) is not None:
-            configure_logging()
-            announce_kv_events_default("vLLM", KV_EVENTS_ENV, logger)
         return await serve_grpc(args, *rest, **kwargs)
 
     setattr(serve_grpc_with_switch, _SWITCH_MARK, True)

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import logging
 import sys
 from pathlib import Path
@@ -26,6 +27,16 @@ class _HardExit(BaseException):
     def __init__(self, code):
         super().__init__(code)
         self.code = code
+
+
+_SCHEDULER_PB2 = SimpleNamespace(
+    DESCRIPTOR=SimpleNamespace(
+        services_by_name={
+            "TokenSpeedScheduler": SimpleNamespace(full_name="test.TokenSpeedScheduler")
+        }
+    ),
+    GenerateResponse=object,
+)
 
 
 @pytest.fixture
@@ -82,17 +93,13 @@ def server_mod(monkeypatch):
                 add_TokenSpeedSchedulerServicer_to_server=Mock(),
                 TokenSpeedSchedulerStub=Mock(),
             ),
+            # The load-reply conversion the Rust-path module imports reads
+            # the scheduler protobuf through the package's lazy attribute.
+            tokenspeed_scheduler_pb2=_SCHEDULER_PB2,
         ),
         "smg_grpc_proto.generated": _module(
             "smg_grpc_proto.generated",
-            tokenspeed_scheduler_pb2=SimpleNamespace(
-                DESCRIPTOR=SimpleNamespace(
-                    services_by_name={
-                        "TokenSpeedScheduler": SimpleNamespace(full_name="test.TokenSpeedScheduler")
-                    }
-                ),
-                GenerateResponse=object,
-            ),
+            tokenspeed_scheduler_pb2=_SCHEDULER_PB2,
             tokenspeed_encoder_pb2=SimpleNamespace(
                 DESCRIPTOR=SimpleNamespace(
                     services_by_name={
@@ -396,15 +403,22 @@ def test_the_python_servicer_turns_the_kv_event_publisher_on_by_default_too(
         assert servicer.kwargs["server_args"] is server_args
         return seen["launched_with"], getattr(server_args, "kv_events_config", None)
 
-    # Nothing given: the engine starts with the publisher on, the servicer
-    # reads the same server args, and the operator reads why.
-    default = '{"enable_kv_cache_events": true, "publisher": "zmq"}'
-    assert tokenspeed_rust.DEFAULT_KV_EVENTS_CONFIG == default
-    assert serve(lambda args: None) == (default, default)
+    # Nothing given: the engine starts with the publisher on, at a free port
+    # of this host rather than TokenSpeed's fixed default, the servicer reads
+    # the same server args, and the operator reads why.
+    launched_with, applied = serve(lambda args: None)
+    assert launched_with == applied
+    config = json.loads(applied)
+    assert config == {
+        "enable_kv_cache_events": True,
+        "publisher": "zmq",
+        "endpoint": config["endpoint"],
+    }
+    assert config["endpoint"].startswith("tcp://*:") and config["endpoint"] != "tcp://*:5557"
     assert (
         "KV event publishing enabled: no --kv-events-config was given, so TokenSpeed's ZMQ "
-        "publisher is on with its default endpoint and SubscribeKvEvents relays it; pass "
-        f"--kv-events-config to configure it, or set {tokenspeed_rust.KV_EVENTS_ENV}=0 to leave it off"
+        "publisher is on at a port found free on this host and SubscribeKvEvents relays "
+        f"it; pass --kv-events-config to name the endpoint, or set {tokenspeed_rust.KV_EVENTS_ENV}=0 to leave it off"
     ) in caplog.text
     # The opt-out: the server args reach the engine as parsed, and nothing is said.
     monkeypatch.setenv(tokenspeed_rust.KV_EVENTS_ENV, "false")
@@ -417,3 +431,33 @@ def test_the_python_servicer_turns_the_kv_event_publisher_on_by_default_too(
     # An encode worker runs the vision tower only: no KV cache, nothing to turn on.
     assert serve(lambda args: setattr(args, "disaggregation_mode", "encode")) == (None, None)
     assert "KV event publishing" not in caplog.text
+
+
+def test_a_host_with_no_free_publisher_port_is_a_named_exit_on_the_python_path_too(
+    monkeypatch, server_mod, caplog
+):
+    """The default's endpoint is a port found free on the host; a host with no
+    free block of them is a configuration error, and the Python path answers
+    it as the Rust path does: one ERROR line naming the knob and exit code 2,
+    before the engine is launched, not a traceback."""
+    from smg_grpc_servicer import rust_lifecycle
+    from smg_grpc_servicer.tokenspeed import rust as tokenspeed_rust
+
+    monkeypatch.delenv(tokenspeed_rust.KV_EVENTS_ENV, raising=False)
+    refusal = "no block of 1 consecutive free ports for the KV event publishers"
+
+    def no_block(ranks=1):
+        raise rust_lifecycle.ServicerConfigError(
+            f"{refusal} after 64 draws; pass --kv-events-config with an endpoint"
+        )
+
+    monkeypatch.setattr(rust_lifecycle, "free_kv_events_endpoint", no_block)
+    server_args = _wire(monkeypatch, server_mod, [])
+    launched = Mock()
+    monkeypatch.setattr(server_mod, "launch_engine", launched)
+    caplog.set_level(logging.ERROR)
+    with pytest.raises(SystemExit) as raised:
+        asyncio.run(server_mod.serve_grpc(server_args))
+    assert raised.value.code == 2
+    assert refusal in caplog.text and "--kv-events-config" in caplog.text
+    launched.assert_not_called()

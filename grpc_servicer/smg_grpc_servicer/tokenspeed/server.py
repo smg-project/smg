@@ -20,7 +20,9 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 from smg_grpc_servicer.hostport import host_port, loopback_target
 from smg_grpc_servicer.rust_lifecycle import (
     EXIT_GRACE_SECS,
+    ServicerConfigError,
     announce_kv_events_default,
+    configuration_exit,
     guarded_exit,
 )
 from smg_grpc_servicer.tokenspeed import engine_watchdog
@@ -111,15 +113,20 @@ async def serve_grpc(server_args: ServerArgs) -> None:
     until the engine dies: then the servicer exits with code 1."""
 
     # The Python servicer gets the Rust path's KV-events default too: server
-    # args without --kv-events-config have TokenSpeed's ZMQ publisher on
-    # before the engine and the servicer are built from them, so
-    # SubscribeKvEvents relays the events a cache-aware router routes by (the
-    # rule, the opt-out and the log line of `RustLauncher.serve`). An encode
-    # worker runs the vision tower only, with no KV cache to publish from: its
-    # server args are left as given.
+    # args without --kv-events-config have TokenSpeed's ZMQ publisher on, at
+    # a port found free on this host, before the engine and the servicer are
+    # built from them, so SubscribeKvEvents relays the events a cache-aware
+    # router routes by (the rule, the opt-out and the log line of
+    # `RustLauncher.serve`); a host with no free block of ports is refused as
+    # on the Rust path: one named ERROR line and exit code 2, not a traceback.
+    # An encode worker runs the vision tower only, with no KV cache to publish
+    # from: its server args are left as given.
     encode_worker = server_args.disaggregation_mode == "encode"
-    if not encode_worker and default_kv_events_config(server_args) is not None:
-        announce_kv_events_default("TokenSpeed", KV_EVENTS_ENV, logger)
+    try:
+        if not encode_worker and default_kv_events_config(server_args) is not None:
+            announce_kv_events_default("TokenSpeed", KV_EVENTS_ENV, logger)
+    except ServicerConfigError as error:
+        raise configuration_exit(error, logger) from None
 
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()

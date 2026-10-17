@@ -483,12 +483,13 @@ def apply_kv_events_default(
 def announce_kv_events_default(engine: str, env_name: str, log: logging.Logger = logger) -> None:
     """The line an operator reads once :func:`apply_kv_events_default` turned
     the publisher on, the same under either servicer implementation: what is
-    on, and the two ways to decide otherwise (``engine`` is the engine's name
-    in the line, ``env_name`` its opt-out variable)."""
+    on and where (a port found free on this host, :func:`free_kv_events_endpoint`),
+    and the two ways to decide otherwise (``engine`` is the engine's name in
+    the line, ``env_name`` its opt-out variable)."""
     log.info(
         "KV event publishing enabled: no --kv-events-config was given, so %s's ZMQ "
-        "publisher is on with its default endpoint and SubscribeKvEvents relays it; pass "
-        "--kv-events-config to configure it, or set %s=0 to leave it off",
+        "publisher is on at a port found free on this host and SubscribeKvEvents relays "
+        "it; pass --kv-events-config to name the endpoint, or set %s=0 to leave it off",
         engine,
         env_name,
     )

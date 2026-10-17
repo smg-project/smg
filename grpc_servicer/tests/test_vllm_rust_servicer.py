@@ -1771,6 +1771,42 @@ def test_require_python_media_mode_is_the_servicers_refusal_as_a_configuration_e
     assert rust.require_python_media_mode(argparse.Namespace(model="org/m"), environ={}) == "off"
 
 
+def test_the_switch_refuses_a_host_with_no_free_publisher_port_as_the_rust_path_does(
+    monkeypatch, caplog
+):
+    """The default's endpoint is a port found free on the host; a host with no
+    free block of them is a configuration error, and the switch answers it as
+    the Rust path does: one ERROR line naming the knob and exit code 2, and
+    the launcher's coroutine never runs, not a traceback out of it."""
+    import logging
+
+    from smg_grpc_servicer.vllm import launcher_switch
+
+    monkeypatch.delenv(rust.SERVICER_IMPL_ENV, raising=False)
+    monkeypatch.delenv(rust.KV_EVENTS_ENV, raising=False)
+    refusal = "no block of 1 consecutive free ports for the KV event publishers"
+
+    def no_block(ranks=1):
+        raise rust_lifecycle.ServicerConfigError(
+            f"{refusal} after 64 draws; pass --kv-events-config with an endpoint"
+        )
+
+    monkeypatch.setattr(rust_lifecycle, "free_kv_events_endpoint", no_block)
+    served = []
+
+    async def serve_grpc(args):
+        served.append(args)
+
+    switched = launcher_switch.with_servicer_switch(serve_grpc)
+    caplog.set_level(logging.ERROR)
+    with pytest.raises(SystemExit) as raised:
+        asyncio.run(
+            switched(argparse.Namespace(servicer_impl=None, model="org/m", kv_events_config=None))
+        )
+    assert raised.value.code == 2 and served == []
+    assert refusal in caplog.text and "--kv-events-config" in caplog.text
+
+
 def test_the_switch_turns_the_kv_event_publisher_on_for_the_python_servicer_too(
     monkeypatch, caplog
 ):
@@ -1799,11 +1835,12 @@ def test_the_switch_turns_the_kv_event_publisher_on_for_the_python_servicer_too(
     args = argparse.Namespace(servicer_impl=None, model="org/m", kv_events_config=None)
     with caplog.at_level(logging.INFO):
         asyncio.run(switched(args))
-    assert served == [args] and _kv_events(args.kv_events_config) == KV_EVENTS_ON
+    assert served == [args]
+    _publisher_port(args.kv_events_config)
     assert (
         "KV event publishing enabled: no --kv-events-config was given, so vLLM's ZMQ "
-        "publisher is on with its default endpoint and SubscribeKvEvents relays it; pass "
-        f"--kv-events-config to configure it, or set {rust.KV_EVENTS_ENV}=0 to leave it off"
+        "publisher is on at a port found free on this host and SubscribeKvEvents relays "
+        f"it; pass --kv-events-config to name the endpoint, or set {rust.KV_EVENTS_ENV}=0 to leave it off"
     ) in caplog.text
     # The opt-out: the namespace reaches the launcher as parsed, and nothing is said.
     caplog.clear()

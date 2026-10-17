@@ -934,7 +934,7 @@ def test_the_kv_events_default_announcement_is_one_line_for_both_implementations
     assert [record.name for record in caplog.records] == [rust_lifecycle.logger.name, "test.entry"]
     line = (
         "KV event publishing enabled: no --kv-events-config was given, so Engine's ZMQ "
-        "publisher is on with its default endpoint and SubscribeKvEvents relays it; pass "
-        f"--kv-events-config to configure it, or set {env}=0 to leave it off"
+        "publisher is on at a port found free on this host and SubscribeKvEvents relays "
+        f"it; pass --kv-events-config to name the endpoint, or set {env}=0 to leave it off"
     )
     assert [record.getMessage() for record in caplog.records] == [line, line]

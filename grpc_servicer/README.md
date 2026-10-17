@@ -37,12 +37,12 @@ vllm serve meta-llama/Llama-2-7b-hf --grpc
 ```
 
 Without `--kv-events-config`, the servicer turns vLLM's ZMQ KV-event publisher
-on by itself (the engine's default endpoint), under either implementation,
-before the engine is built, so `SubscribeKvEvents` relays the events a
-cache-aware router routes by; an explicit configuration is kept as given, off
-included, and `SMG_VLLM_SERVICER_KV_EVENTS=0` leaves the publisher off. Workers
-that share a host want distinct endpoints: give each its own
-`--kv-events-config`.
+on by itself, under either implementation, before the engine is built, at a
+port found free on the host rather than vLLM's fixed default (one per
+data-parallel rank), so `SubscribeKvEvents` relays the events a cache-aware
+router routes by and workers that share a host do not collide; an explicit
+configuration is kept as given, its endpoint and off included, and
+`SMG_VLLM_SERVICER_KV_EVENTS=0` leaves the publisher off.
 
 #### Worker-side multimodal processing (media refs)
 
@@ -509,13 +509,13 @@ SMG_TOKENSPEED_SERVICER_IMPL=rust python -m smg_grpc_servicer.tokenspeed --model
 ```
 
 Without `--kv-events-config`, the servicer turns TokenSpeed's ZMQ KV-event
-publisher on by itself (the engine's default endpoint), under either
-implementation, before the engine is built, so `SubscribeKvEvents` relays the
-events a cache-aware router routes by; an explicit configuration is kept as
-given, off included, and `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0` leaves the
-publisher off. An encode worker (`--disaggregation-mode encode`) has no KV
-cache and is left as given. Workers that share a host want distinct endpoints:
-give each its own `--kv-events-config`.
+publisher on by itself, under either implementation, before the engine is
+built, at a port found free on the host rather than TokenSpeed's fixed default,
+so `SubscribeKvEvents` relays the events a cache-aware router routes by and
+workers that share a host do not collide; an explicit configuration is kept as
+given, its endpoint and off included, and `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0`
+leaves the publisher off. An encode worker (`--disaggregation-mode encode`) has
+no KV cache and is left as given.
 
 This is the process `ts serve` spawns for its gRPC worker; `--servicer-impl`
 is this package's flag (listed first by `--help`, ahead of TokenSpeed's own
@@ -616,12 +616,12 @@ sglang serve --model-path meta-llama/Llama-2-7b-hf --grpc-mode
 ```
 
 Without `--kv-events-config`, the servicer turns SGLang's ZMQ KV-event
-publisher on by itself (the engine's default endpoint), under either
-implementation, before the schedulers are started, so `SubscribeKvEvents`
-relays the events a cache-aware router routes by; an explicit configuration is
-kept as given, off included, and `SMG_SGLANG_SERVICER_KV_EVENTS=0` leaves the
-publisher off. Workers that share a host want distinct endpoints: give each its
-own `--kv-events-config`.
+publisher on by itself, under either implementation, before the schedulers are
+started, at a port found free on the host rather than SGLang's fixed default,
+so `SubscribeKvEvents` relays the events a cache-aware router routes by and
+workers that share a host do not collide; an explicit configuration is kept as
+given, its endpoint and off included, and `SMG_SGLANG_SERVICER_KV_EVENTS=0`
+leaves the publisher off.
 
 Both SGLang servicers advertise the engine's `--limit-mm-data-per-request` as
 the flat `mm_item_limits` label (`image=1,video=1`) in `GetServerInfo`'s
