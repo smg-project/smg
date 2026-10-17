@@ -1346,6 +1346,7 @@ mod tests {
                 "{call:?} per character"
             );
             assert!(said_cut(&streamed), "{call:?} per character: {streamed:?}");
+            assert_eq!(malformed(&streamed).len(), 1, "{call:?} per character");
             assert_eq!(bytes(&streamed), call, "{call:?} per character");
         }
         // A newline held at the cut, which may have been the template's, rides in the one word.
