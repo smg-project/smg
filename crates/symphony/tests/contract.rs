@@ -285,6 +285,10 @@ fn lfm2_5() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::Lfm2_5.format(), Declared::default()))
 }
 
+fn llama4() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::Llama4.format(), recorded_tools()))
+}
+
 fn xlam() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::Xlam.format(), Declared::default()))
 }
@@ -891,6 +895,12 @@ const FORMATS: &[Subject] = &[
         table: Some(Table::Lfm2_5),
     },
     Subject {
+        name: "llama4",
+        new: llama4,
+        outputs: LLAMA4_OUTPUTS,
+        table: Some(Table::Llama4),
+    },
+    Subject {
         name: "xlam",
         new: xlam,
         outputs: XLAM_OUTPUTS,
@@ -1421,6 +1431,23 @@ const LFM_OUTPUTS: &[&str] = &[
     "<think>The user asks.</think><|tool_call_start|>[get_weather(city='計画 🌍 \"q\"')]\
      <|tool_call_end|>",
     "<|tool_call_start|>[]<|tool_call_end|>Nothing to call.",
+];
+
+/// Python calls as Llama 4 writes them: a list bare in the turn, every value in double quotes,
+/// after the content when the turn has both; the markers the model may put around them; prose
+/// with brackets in it; text after the list; and one cut short.
+const LLAMA4_OUTPUTS: &[&str] = &[
+    "[get_weather(city=\"Paris\", days=\"3\"), get_stock_price()]",
+    "Let me check.[get_weather(city=\"Paris\", unit=\"celsius\")]",
+    "[save_note(title=\"計画 🌍\", tags=\"['a', 'b']\", meta=\"{'deep': [1, 2.5, True, None]}\")]",
+    "<|python_start|>[get_weather(city='Paris', days=3)]<|python_end|>",
+    "<|python_start|>print(1)<|python_end|>",
+    "See [1] and [a link](https://example.com); the list [a, b] is prose.",
+    "[get_weather(city=\"Paris\")]\n\nDone.",
+    "[get_weather(\"Paris\", days=3) junk, get_stock_price()] after",
+    "Hello!",
+    "[get_wea",
+    "[get_weather(city=\"Par",
 ];
 
 /// Mistral's calls: the tool's name, `[ARGS]`, the arguments object alone, one call per opener,

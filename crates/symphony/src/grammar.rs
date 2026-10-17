@@ -690,9 +690,12 @@ impl Format {
                     true,
                 )
             }
-            CallSyntax::Pythonic(dialect) => {
-                (pythonic::calls(markers?, *dialect, &named, count), true)
-            }
+            // Llama 4's list stands alone in the turn, as xLAM's does, and its table has no
+            // thought; Olmo 3's and LFM2.5's are one tag between their markers.
+            CallSyntax::Pythonic(dialect) => match markers {
+                None => (pythonic::list_alone(*dialect, &named, count), false),
+                Some(markers) => (pythonic::calls(markers, *dialect, &named, count), true),
+            },
             CallSyntax::NamedArguments(marker) => (
                 json::named_arguments_calls(self, marker, &named, count)?,
                 true,

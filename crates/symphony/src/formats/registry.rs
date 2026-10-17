@@ -25,8 +25,8 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use super::{
     deepseek_v3, deepseek_v3_1, deepseek_v3_2, deepseek_v4, deepseek_v4_1, dots3, function_gemma,
     gemma4, glm, glm4, hy4, inkling, iquest, json, k2_horizon, kimi_k2, kimi_k3, lfm2_5, ling,
-    llama_nemotron, minicpm5, minimax_m2, minimax_m3, mistral_v13, muse_spark, olmo3, plain,
-    qwen2_5, qwen3, seed_oss, xlam,
+    llama4, llama_nemotron, minicpm5, minimax_m2, minimax_m3, mistral_v13, muse_spark, olmo3,
+    plain, qwen2_5, qwen3, seed_oss, xlam,
 };
 use crate::{
     format::{CallSyntax, Format},
@@ -128,6 +128,8 @@ tables! {
     DeepSeekV3_1 => "deepseek_v3.1", deepseek_v3_1;
     /// [`deepseek_v3_2()`].
     DeepSeekV3_2 => "deepseek_v3.2", deepseek_v3_2;
+    /// [`llama4()`].
+    Llama4 => "llama4", llama4;
     /// [`kimi_k2()`].
     KimiK2 => "kimi_k2", kimi_k2;
 }

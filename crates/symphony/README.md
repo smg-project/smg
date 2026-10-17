@@ -230,8 +230,8 @@ three: a table's own name (`qwen3`, `gemma4`), a row of `ALIASES`, or a row of `
 table and no alias: it stays on the Harmony pipeline, by the maintainers' decision of 2026-10-17.
 
 <!-- models: begin -->
-212 groups, 358 checkpoints, newest first.
-12 ready, 138 replaying a recorded set, 10 on main awaiting fixtures, 52 pending.
+215 groups, 362 checkpoints, newest first.
+12 ready, 140 replaying a recorded set, 10 on main awaiting fixtures, 53 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
@@ -419,6 +419,9 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2025-04-08 | [llama-3-1-nemotron-ultra-253b-cpt-v1](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3-1-nemotron-ultra-253b-cpt-v1) | nvidia/Llama-3_1-Nemotron-Ultra-253B-CPT-v1 |  | `json` | 458,185 | replaying the set | `json`, none |
 | 2025-04-07 | [baichuanmed-ocr-7b](https://github.com/smg-project/bellwether/tree/main/fixtures/baichuanmed-ocr-7b) | baichuan-inc/BaichuanMed-OCR-7B | BaichuanMed-OCR-72B | `qwen2.5` | 576,772 | replaying the set | none |
 | 2025-04-07 | [llama-3-1-nemotron-ultra-253b-v1](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3-1-nemotron-ultra-253b-v1) | nvidia/Llama-3_1-Nemotron-Ultra-253B-v1 |  | `llama_nemotron` | 328,643 | replaying the set | `json`, none |
+| 2025-04-02 | [llama-4-scout-17b-16e](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-4-scout-17b-16e) | meta-llama/Llama-4-Scout-17B-16E |  | — | 576,758 | pending | `pythonic`, none |
+| 2025-04-02 | [llama-4-scout-17b-16e-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-4-scout-17b-16e-instruct) | meta-llama/Llama-4-Scout-17B-16E-Instruct |  | `llama4` | 576,438 | replaying the set | `pythonic`, none |
+| 2025-04-01 | [llama-4-maverick-17b-128e-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-4-maverick-17b-128e-instruct) | meta-llama/Llama-4-Maverick-17B-128E-Instruct | Llama-4-Maverick-17B-128E-Instruct-FP8 | `llama4` | 576,438 | replaying the set | `pythonic`, none |
 | 2025-03-27 | [llama-xlam-2-8b-fc-r](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-xlam-2-8b-fc-r) | Salesforce/Llama-xLAM-2-8b-fc-r |  | `xlam` | 483,062 | replaying the set | `json`, none |
 | 2025-03-26 | [granite-speech-3.2-8b](https://github.com/smg-project/bellwether/tree/main/fixtures/granite-speech-3.2-8b) | ibm-granite/granite-speech-3.2-8b |  | — | 328,662 | pending | none |
 | 2025-03-24 | [deepseek-v3-0324](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v3-0324) | deepseek-ai/DeepSeek-V3-0324 | DeepSeek-Prover-V2-671B | `deepseek_v3` | 19,299 | replaying the set | `deepseek`, none |

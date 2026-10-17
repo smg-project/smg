@@ -343,6 +343,14 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // either thinking setting (its render set), and the model writes `<think>` itself or not.
     ("olmo-3-7b-instruct", GenerationPrompt::Plain),
     ("lfm2.5-1.2b-instruct", GenerationPrompt::ModelDecides),
+    // Llama 4's list stands bare in the turn after the content, every value between double
+    // quotes; the template has no thought and ends the generation prompt with the opener and two
+    // newlines, which the shared tail does not write and the replay does not need.
+    ("llama-4-scout-17b-16e-instruct", GenerationPrompt::Plain),
+    (
+        "llama-4-maverick-17b-128e-instruct",
+        GenerationPrompt::Plain,
+    ),
     // A bare JSON list of calls, or content; no thought.
     ("llama-xlam-2-8b-fc-r", GenerationPrompt::Plain),
     // An XML tree of arguments behind a separator token; the model writes the thought or closes
@@ -567,6 +575,8 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
 trait Recorded: Copy {
     fn think_markers(self) -> (&'static str, &'static str);
     fn respells_arguments(self) -> bool;
+    fn quotes_values(self) -> bool;
+    fn holds_a_list_after_content(self) -> bool;
     fn known_differences(self, slug: &str, prompt: GenerationPrompt) -> Vec<KnownDifference>;
     fn allowances(self, slug: &str, prompt: GenerationPrompt) -> Vec<Allowance>;
 }
@@ -597,6 +607,23 @@ impl Recorded for Table {
         matches!(self, Self::Inkling | Self::Gemma4 | Self::FunctionGemma)
     }
 
+    /// Whether the table's template writes every value between double quotes without escaping
+    /// a quote inside it (Llama 4's `"%s"`): a string argument that holds a `"` cannot be read
+    /// back from what the template wrote, by this parser or any other, so a case whose reference
+    /// holds one is counted apart from the differences (`docs/tables.md`).
+    fn quotes_values(self) -> bool {
+        matches!(self, Self::Llama4)
+    }
+
+    /// Whether the table's list of calls stands bare after the content, so that the table reads
+    /// one there only when it is whole, well formed and made of calls to the request's tools
+    /// (Llama 4, `docs/tables.md`): a reference whose message holds content and then a call to a
+    /// tool the request does not declare is read as content, as the family's own reader reads
+    /// it, and such a case is counted apart from the differences.
+    fn holds_a_list_after_content(self) -> bool {
+        matches!(self, Self::Llama4)
+    }
+
     /// The probe cases known to differ under this syntax: the code fence holds the JSON syntax,
     /// which the JSON assembler reads as a call and the tagged one reports as text between a
     /// call's tags.
@@ -604,13 +631,14 @@ impl Recorded for Table {
         let list = match self {
             Self::Qwen3 | Self::Qwen2_5 => KNOWN_DIFFERENCES,
             Self::Qwen3Tagged | Self::Qwen3TaggedDirect => KNOWN_TAGGED_DIFFERENCES,
-            // Seed-OSS, Hy4, Olmo 3, xLAM, the json table, Kimi K3, Muse Spark, K2-Horizon,
+            // Seed-OSS, Hy4, Olmo 3, Llama 4, xLAM, the json table, Kimi K3, Muse Spark, K2-Horizon,
             // Inkling, Gemma 4 and the plain table read neither of the probes' Qwen markers:
             // `</think>` stays reasoning text and the fenced `<tool_call>` block stays content,
             // as the reference says.
             Self::SeedOss
             | Self::Hy4
             | Self::Olmo3
+            | Self::Llama4
             | Self::Xlam
             | Self::Json
             | Self::KimiK3
@@ -1141,6 +1169,22 @@ impl Said {
         }
     }
 
+    /// Whether a call's arguments hold a string, at any depth, with a `"` in it: what a template
+    /// that quotes every value without escaping it cannot write readably.
+    fn holds_a_quote_in_a_string(&self) -> bool {
+        fn quoted(value: &serde_json::Value) -> bool {
+            match value {
+                serde_json::Value::String(text) => text.contains('"'),
+                serde_json::Value::Array(items) => items.iter().any(quoted),
+                serde_json::Value::Object(members) => members.values().any(quoted),
+                _ => false,
+            }
+        }
+        self.calls.iter().any(|(_, arguments)| {
+            serde_json::from_str::<serde_json::Value>(arguments).is_ok_and(|value| quoted(&value))
+        })
+    }
+
     /// Whether `other` says the same, the calls' arguments compared as JSON values: a template that
     /// re-serializes the arguments (Inkling's `tojson(sort_keys=true, separators=(",", ":"))`)
     /// writes the keys sorted and the spaces dropped, and the parser hands on what the model
@@ -1213,6 +1257,8 @@ fn qwen3_parse_fixtures_match_the_reference() {
             allowed: &[],
             think_markers: Table::Qwen3.think_markers(),
             respells_arguments: false,
+            quotes_values: false,
+            holds_a_list_after_content: false,
         },
     );
     let verbose = verbose();
@@ -1405,6 +1451,8 @@ fn replay_model(root: &std::path::Path, slug: &str, prompt: GenerationPrompt) ->
             allowed: &allowed,
             think_markers: table.think_markers(),
             respells_arguments: table.respells_arguments(),
+            quotes_values: table.quotes_values(),
+            holds_a_list_after_content: table.holds_a_list_after_content(),
         },
     );
     Replayed::Compared {
@@ -1526,6 +1574,10 @@ struct Rules<'a> {
     think_markers: (&'a str, &'a str),
     /// [`Recorded::respells_arguments`].
     respells_arguments: bool,
+    /// [`Recorded::quotes_values`].
+    quotes_values: bool,
+    /// [`Recorded::holds_a_list_after_content`].
+    holds_a_list_after_content: bool,
 }
 
 /// Replays every fixture through a fresh parser from `new_parser`, after a prompt ending in the
@@ -1549,6 +1601,8 @@ fn parity(
         allowed,
         think_markers,
         respells_arguments,
+        quotes_values,
+        holds_a_list_after_content,
     } = rules;
     let known = |id: &str| {
         known_differences
@@ -1560,6 +1614,7 @@ fn parity(
     let mut shown = Shown::default();
     let (mut bitwise, mut separators_only, mut respelled, mut listed, mut allowed_count) =
         (0, 0, 0, 0, 0);
+    let (mut unreadable, mut undeclared_after_content) = (0, 0);
     let (mut token_plans_run, mut without_pieces, mut content_off_whole) = (0, 0, 0);
     for fixture in fixtures {
         let text = fixture.reference.text.as_str();
@@ -1667,6 +1722,24 @@ fn parity(
         } else if respells_arguments && said.trimmed().same_values(&expected.trimmed()) {
             respelled += 1;
             "respelled arguments (the template re-serializes them)"
+        } else if quotes_values && expected.holds_a_quote_in_a_string() {
+            // The template wrote the quote unescaped, so where the string ends is anyone's guess
+            // and what follows it may land anywhere: the case is counted apart as a whole.
+            unreadable += 1;
+            "unreadable: a quote inside a quoted value"
+        } else if holds_a_list_after_content
+            && said.calls.is_empty()
+            && expected.content.is_some()
+            && expected.calls.iter().any(|(name, _)| {
+                !fixture
+                    .request
+                    .tools
+                    .iter()
+                    .any(|tool| tool.function.name == *name)
+            })
+        {
+            undeclared_after_content += 1;
+            "undeclared call after content (read as content)"
         } else if let Some(listed_case) = known(&fixture.id) {
             if said.calls.len() != listed_case.calls || said.finish != listed_case.finish {
                 failures.push(format!(
@@ -1726,10 +1799,25 @@ fn parity(
         }
     }
     let sample = sample_note(sample_every());
+    // The unreadable class is named only for a family whose template writes it, so every other
+    // family's totals line reads as before.
+    let unreadable = if quotes_values {
+        format!(", {unreadable} unreadable (a quote inside a quoted value)")
+    } else {
+        String::new()
+    };
+    let undeclared = if holds_a_list_after_content {
+        format!(
+            ", {undeclared_after_content} undeclared calls after content (read as content, as the \
+             family's reader does)"
+        )
+    } else {
+        String::new()
+    };
     let totals = format!(
         "{} cases{sample}: {bitwise} bitwise, {separators_only} separators only, {respelled} \
-         respelled, {listed} listed, {allowed_count} allowed for the corpus; {token_plans_run} \
-         token plans replayed, {without_pieces} cases without output_pieces, \
+         respelled, {listed} listed, {allowed_count} allowed for the corpus{unreadable}{undeclared}; \
+         {token_plans_run} token plans replayed, {without_pieces} cases without output_pieces, \
          {content_off_whole} cases whose streamed content differs from the whole answer's\n",
         fixtures.len()
     );

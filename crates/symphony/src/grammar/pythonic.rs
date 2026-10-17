@@ -1,6 +1,7 @@
 //! Python calls written from the table's markers: Olmo 3's, one call per line between
 //! `<function_calls>` and `</function_calls>`, and LFM2.5's, a Python list between
-//! `<|tool_call_start|>` and `<|tool_call_end|>`.
+//! `<|tool_call_start|>` and `<|tool_call_end|>`; and Llama 4's list alone in the turn, with no
+//! marker around it, written as the bare JSON list is.
 //!
 //! A call is the tool's name, `(`, its arguments and `)`. The arguments are `key=value` pairs in
 //! the schema's order, joined by `, `, each present when the schema requires it and otherwise
@@ -9,9 +10,10 @@
 //! the template's: LFM2.5 writes Python, a string in either quote (`"Paris"`, `'Paris'`), a
 //! string `enum` as one of its values quoted the same way, a boolean as `True` or `False`, `null`
 //! as `None`; Olmo 3 writes every value through `tojson`, so JSON, a string in double quotes, an
-//! `enum` value the same, `true`, `false` and `null`. A number, an object or an array is the JSON
-//! the property's schema accepts under both, which the templates write with `tojson` and the
-//! assembler reads as it reads a Python literal. An `enum` behind a `$ref` is the target's, as
+//! `enum` value the same, `true`, `false` and `null`; Llama 4's template quotes every value, and
+//! its tags write Python's, the spelling its model card gives the model. A number, an object or
+//! an array is the JSON the property's schema accepts under every dialect, which the templates
+//! write with `tojson` and the assembler reads as it reads a Python literal. An `enum` behind a `$ref` is the target's, as
 //! every keyword is. A property that pins no type, or a schema without properties, takes any text
 //! up to the call's `)`.
 
@@ -37,6 +39,52 @@ pub(super) fn calls(
     tools: &[&Tool],
     count: Count<'_>,
 ) -> Grammar {
+    let (open, between, close) = framing(dialect.framing);
+    count.triggered(
+        vec![markers.call_open.to_string()],
+        vec![Tag::new(
+            format!("{}{open}", markers.call_open),
+            calls_joined(dialect, tools, count, between),
+            format!("{close}{}", markers.call_close),
+        )],
+    )
+}
+
+/// The calls for `tools` as a list alone in the turn, no marker before or after it (Llama 4):
+/// the list, closed with the end of the turn, or, when no call is required, prose that does not
+/// start with a bracket, as xLAM's bare list has it.
+pub(super) fn list_alone(dialect: Dialect, tools: &[&Tool], count: Count<'_>) -> Grammar {
+    let (open, between, close) = framing(dialect.framing);
+    let list = Grammar::Sequence(vec![
+        Grammar::ConstString(open.to_string()),
+        calls_joined(dialect, tools, count, between),
+        Grammar::ConstString(count.end(close)),
+    ]);
+    if count.at_least_one {
+        list
+    } else {
+        Grammar::Or(vec![
+            Grammar::Sequence(vec![
+                Grammar::Regex(r"\s*[^\s\[]".to_string()),
+                Grammar::AnyText {
+                    excludes: Vec::new(),
+                },
+            ]),
+            list,
+        ])
+    }
+}
+
+/// What the framing writes around the calls and between them.
+fn framing(framing: Framing) -> (&'static str, &'static str, &'static str) {
+    match framing {
+        Framing::OnePerLine => ("", "\n", ""),
+        Framing::List => ("[", ", ", "]"),
+    }
+}
+
+/// One call of `tools`, or more joined by `between`, as many as `count` lets the model write.
+fn calls_joined(dialect: Dialect, tools: &[&Tool], count: Count<'_>, between: &str) -> Grammar {
     let one_call = Grammar::Or(
         tools
             .iter()
@@ -49,11 +97,7 @@ pub(super) fn calls(
             })
             .collect(),
     );
-    let (open, between, close) = match dialect.framing {
-        Framing::OnePerLine => ("", "\n", ""),
-        Framing::List => ("[", ", ", "]"),
-    };
-    let content = if count.one {
+    if count.one {
         one_call
     } else {
         Grammar::Sequence(vec![
@@ -63,15 +107,7 @@ pub(super) fn calls(
                 one_call,
             ]))),
         ])
-    };
-    count.triggered(
-        vec![markers.call_open.to_string()],
-        vec![Tag::new(
-            format!("{}{open}", markers.call_open),
-            content,
-            format!("{close}{}", markers.call_close),
-        )],
-    )
+    }
 }
 
 /// One call: the name and `(`, the arguments, `)`.
@@ -140,17 +176,17 @@ fn value(schema: &Value, definitions: Definitions<'_>, values: Values) -> Gramma
         }
     }
     let string = move || match values {
-        Values::Python => python_string(),
+        Values::Python | Values::Quoted => python_string(),
         Values::Json => json_string(),
     };
     match shape(schema, definitions, string) {
         Some(("boolean", _)) => match values {
-            Values::Python => words(&["True", "False"]),
+            Values::Python | Values::Quoted => words(&["True", "False"]),
             Values::Json => words(&["true", "false"]),
         },
         Some(("null", _)) => Grammar::ConstString(
             match values {
-                Values::Python => "None",
+                Values::Python | Values::Quoted => "None",
                 Values::Json => "null",
             }
             .to_string(),
@@ -164,7 +200,7 @@ fn value(schema: &Value, definitions: Definitions<'_>, values: Values) -> Gramma
 /// escaping; as the one JSON string under JSON.
 fn quoted(option: &str, values: Values) -> Vec<Grammar> {
     match values {
-        Values::Python => vec![
+        Values::Python | Values::Quoted => vec![
             Grammar::ConstString(format!("\"{}\"", escape(option, '"'))),
             Grammar::ConstString(format!("'{}'", escape(option, '\''))),
         ],

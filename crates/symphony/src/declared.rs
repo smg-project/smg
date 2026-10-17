@@ -36,6 +36,11 @@ impl Declared {
         Self::shared(Arc::from(tools))
     }
 
+    /// Whether a tool of the request declares `function`.
+    pub fn declares(&self, function: &str) -> bool {
+        self.tools.functions.contains_key(function)
+    }
+
     /// [`Declared::of`] over tools the caller keeps: they are read in place, and nothing of them
     /// is copied or indexed.
     pub fn shared(tools: Arc<[Tool]>) -> Self {

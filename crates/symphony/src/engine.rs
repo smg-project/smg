@@ -258,7 +258,15 @@ fn assembler(
             Box::new(tagged::Assembler::new(index, ids, placement))
         }
         Some(CallSyntax::Keyed(tags)) => Box::new(tagged::keyed::Assembler::new(index, id(), tags)),
-        Some(CallSyntax::Pythonic(_)) => Box::new(pythonic::Assembler::new(index, ids)),
+        // The list between markers (Olmo 3, LFM2.5) reads what the markers frame; the bare list
+        // the output starts in (Llama 4) reads the turn's content before it and the wrapping
+        // after it.
+        Some(CallSyntax::Pythonic(dialect)) if framed => {
+            Box::new(pythonic::Assembler::new(index, ids, dialect))
+        }
+        Some(CallSyntax::Pythonic(dialect)) => {
+            Box::new(pythonic::Assembler::bare(index, ids, dialect))
+        }
         // The list between markers (Llama Nemotron) takes text in place of it as malformed; the
         // bare list the output starts in (xLAM) takes it for prose.
         Some(CallSyntax::JsonList) if framed => Box::new(json::list::Assembler::framed(index, ids)),
