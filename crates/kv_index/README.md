@@ -174,8 +174,10 @@ The servicer relays the engine's publisher into `SubscribeKvEvents` through one 
   the engines' grpc-core servers) or at the next poll's deadline; a liveness tracker turns a
   connection failure on the KV stream or the load poll into an `unreachable` veto after
   `--worker-stall-secs`, vetoes a worker that holds requests and a growing queue without producing a
-  token for `--worker-wedge-secs` as `wedged` (the clock starts at the first dispatch and the bound
-  stretches to the prefill still in flight), re-admits a worker on its first contact with a closed
+  token for `--worker-wedge-secs` as `wedged` (the clock starts at the first dispatch; the bound
+  stretches to the prefill still in flight, and is the 120 s cap outright while the worker is on a
+  prompt longer than any it has answered, as an engine meeting a new shape may build a kernel for
+  it first: that grace arms no veto and lifts none), re-admits a worker on its first contact with a closed
   circuit breaker, and never touches the health status. A veto steers, it never refuses: when every
   candidate is vetoed, the request goes to the least-loaded ready worker among them.
 - **Warm-up slice.** A worker that just became routable, or whose index is thin against the

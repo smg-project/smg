@@ -62,7 +62,19 @@
 //!   tracked requests, never at registration, and the bound is the
 //!   configured threshold or, if longer, the time the engine may still need
 //!   to prefill what is in flight ([`Worker::prefill_backlog`]): a batch that
-//!   is all in prefill streams nothing and is not wedged. A zero threshold
+//!   is all in prefill streams nothing and is not wedged. The bound is the
+//!   cap outright ([`COLD_SHAPE_GRACE`]) while the worker is on a prompt
+//!   longer than any it has answered, once it has answered one
+//!   ([`Worker::prefill_cold_shape`]): an engine meeting a shape it has not
+//!   run may build a kernel for it first, a minute of silence on the engines
+//!   we know, with nothing on any wire to tell it from a freeze (the
+//!   servicer's record flows through both, its health answers through
+//!   both), and the gateway's own books are the one evidence there is. The
+//!   grace arms no veto and lifts none: a worker vetoed before the longer
+//!   prompt reached it is judged as before until it produces; a real wedge
+//!   met on such a prompt is caught at the cap instead of the threshold,
+//!   once per new longest prompt; a worker that has answered nothing is
+//!   judged as before. A zero threshold
 //!   turns the rule off. The same bound, read per request, caps how long a
 //!   disaggregated prefill leg may stay silent ([`prefill_leg_bound`]): a
 //!   leg is not part of any pile, so its request is what fails, over to
@@ -123,11 +135,36 @@ const WEDGE_PILE: usize = 4;
 /// rule for good.
 const WEDGE_BOUND_CAP: Duration = Duration::from_secs(120);
 
+/// The wedge bound while a worker is on a prompt longer than any it has
+/// answered ([`Worker::prefill_cold_shape`]): the cap, outright. An engine
+/// meeting a shape it has not run may build a kernel for it first, a minute
+/// of silence with nothing on the wire to tell it from a freeze, so the
+/// gateway gives the shape the most the prefill stretch could, and a real
+/// wedge met there is caught at the cap, once per new longest prompt.
+const COLD_SHAPE_GRACE: Duration = WEDGE_BOUND_CAP;
+
 /// The wedge bound for `worker` now: the configured threshold, or the time
 /// the engine may still need before the first token of its in-flight prompts
-/// is due, whichever is longer.
+/// is due, or the cold-shape grace while one of them is longer than any the
+/// worker has answered, whichever is longest.
 fn wedge_bound(worker: &Arc<dyn Worker>, wedge: Duration) -> Duration {
-    bound_over(wedge, worker.prefill_backlog())
+    wedge_bound_given(worker, wedge, cold_shape_grace(worker, 0))
+}
+
+/// [`wedge_bound`] at the given cold-shape `grace`.
+fn wedge_bound_given(worker: &Arc<dyn Worker>, wedge: Duration, grace: Duration) -> Duration {
+    bound_over(wedge, worker.prefill_backlog().max(grace))
+}
+
+/// The cold-shape grace for `worker` with `extra` more prompt tokens about
+/// to be dispatched: [`COLD_SHAPE_GRACE`] while the worker is on a prompt
+/// longer than any it has answered, zero otherwise.
+fn cold_shape_grace(worker: &Arc<dyn Worker>, extra: u64) -> Duration {
+    if worker.prefill_cold_shape(extra) {
+        COLD_SHAPE_GRACE
+    } else {
+        Duration::ZERO
+    }
 }
 
 /// The wedge rule's bound over an `eta` the engine may still need: the
@@ -141,7 +178,8 @@ fn bound_over(wedge: Duration, eta: Duration) -> Duration {
 /// wedge rule's bound, with the leg's own prompt behind what the worker is
 /// already prefilling ([`Worker::prefill_eta`]), so a long prompt on a busy
 /// worker gets the time its measured rate says it needs, a short one the
-/// configured threshold, and nothing more than the cap. A PD leg joins no
+/// configured threshold, a prompt longer than any the worker has answered
+/// the cold-shape grace, and nothing more than the cap. A PD leg joins no
 /// pile and is never vetoed by one; the request is what the bound ends.
 /// `None` when the rule is off (a zero threshold).
 pub(crate) fn prefill_leg_bound(worker: &Arc<dyn Worker>, prompt_tokens: u64) -> Option<Duration> {
@@ -155,7 +193,10 @@ fn prefill_leg_bound_with(
     prompt_tokens: u64,
     wedge: Duration,
 ) -> Option<Duration> {
-    (!wedge.is_zero()).then(|| bound_over(wedge, worker.prefill_eta(prompt_tokens)))
+    (!wedge.is_zero()).then(|| {
+        let eta = worker.prefill_eta(prompt_tokens);
+        bound_over(wedge, eta.max(cold_shape_grace(worker, prompt_tokens)))
+    })
 }
 
 /// How long a sequential disaggregated decode leg of `prompt_tokens`
@@ -516,12 +557,21 @@ fn on_load_report_with(
     wedge: Duration,
 ) {
     let previous = worker.swap_waiting_reqs(waiting);
-    let bound = wedge_bound(worker, wedge);
+    // The grace of a cold shape arms no veto and lifts none: a worker vetoed
+    // before the longer prompt reached it is judged as before until it
+    // produces, so the grace never reads as the engine producing again.
+    let grace = if worker.stall_reason().is_none() {
+        cold_shape_grace(worker, 0)
+    } else {
+        Duration::ZERO
+    };
+    let bound = wedge_bound_given(worker, wedge, grace);
     let engine_stalled = engine_stalled(
         engine_silence,
         engine_reports_steps,
         wedge,
         silence_allowance(worker, wedge, engine_prefill_pending),
+        grace,
     );
     worker.note_engine_stall(engine_stalled);
     match worker.stall_reason() {
@@ -572,14 +622,16 @@ fn on_load_report_with(
 /// scheduler step (`reports_steps`: the silence is the scheduler's own), or
 /// the `allowance` or longer when it carries token batches only (a long
 /// prefill is silence there; the allowance covers the prefill the servicer
-/// reports in hand, and is `None` when this gateway cannot size it). Off at
-/// a zero threshold; a record without the figure (an idle engine, an older
-/// servicer) says nothing.
+/// reports in hand, and is `None` when this gateway cannot size it), or the
+/// cold-shape `grace` or longer when that is more. Off at a zero threshold;
+/// a record without the figure (an idle engine, an older servicer) says
+/// nothing.
 fn engine_stalled(
     silence: Option<Duration>,
     reports_steps: bool,
     wedge: Duration,
     allowance: Option<Duration>,
+    grace: Duration,
 ) -> bool {
     let allowed = if reports_steps {
         wedge
@@ -588,7 +640,7 @@ fn engine_stalled(
     } else {
         return false;
     };
-    !wedge.is_zero() && silence.is_some_and(|silence| silence >= allowed)
+    !wedge.is_zero() && silence.is_some_and(|silence| silence >= allowed.max(grace))
 }
 
 /// What a token-batch wire may be silent for before its silence counts: the
@@ -1610,13 +1662,15 @@ mod tests {
             Some(Duration::from_secs(600)),
             true,
             Duration::ZERO,
-            Some(Duration::ZERO)
+            Some(Duration::ZERO),
+            Duration::ZERO
         ));
         assert!(!engine_stalled(
             None,
             true,
             DEFAULT_WEDGE,
-            Some(DEFAULT_WEDGE)
+            Some(DEFAULT_WEDGE),
+            Duration::ZERO
         ));
     }
 
@@ -1652,7 +1706,11 @@ mod tests {
         let with_backlog: Arc<dyn Worker> = Arc::new(with_backlog);
         let idle: Arc<dyn Worker> = Arc::new(idle);
         tracked_pile(&with_backlog, 1);
-        with_backlog.note_prefill_started(16 * 1_152, true);
+        // Sixteen prompts of the length it has answered: a shape it has
+        // shown, no cold-shape grace.
+        for _ in 0..16 {
+            with_backlog.note_prefill_started(1_152, true);
+        }
         let pending = Some(16 * 1_152);
         // 18,432 tokens at 1,536 tokens/s: 12 s of prefill, 24 s allowed.
         assert_eq!(
@@ -1696,7 +1754,9 @@ mod tests {
         // pending) and the veto; with nothing pending the allowance is the
         // threshold again, so a frozen engine on such a wire is vetoed at the
         // threshold like any other, on both gateways.
-        with_backlog.note_prefill_ended(16 * 1_152, true, Some(0));
+        for _ in 0..16 {
+            with_backlog.note_prefill_ended(1_152, true, Some(0));
+        }
         for w in [&with_backlog, &idle] {
             on_token_progress(w);
             assert!(w.stall_reason().is_none());
@@ -1756,13 +1816,165 @@ mod tests {
             Some(Duration::from_secs(60)),
             false,
             DEFAULT_WEDGE,
-            None
+            None,
+            Duration::ZERO
         ));
         // The allowance never exceeds the wedge bound's cap.
         assert_eq!(
             silence_allowance(&idle, DEFAULT_WEDGE, Some(100_000_000)),
             Some(WEDGE_BOUND_CAP)
         );
+    }
+
+    /// A worker that has answered prompts up to a length is silent on a
+    /// longer one: an engine meeting a new shape may be building a kernel
+    /// for it, which no wire tells from a freeze, so every wedge rule's
+    /// bound is the cap for that prompt, once; a real wedge met there is
+    /// caught at the cap.
+    #[test]
+    fn a_prompt_longer_than_any_answered_is_given_the_cap_once() {
+        let w = worker();
+        w.note_prefill_started(1_024, true);
+        w.note_prefill_ended(1_024, true, Some(0));
+        assert_eq!(
+            wedge_bound(&w, DEFAULT_WEDGE),
+            DEFAULT_WEDGE,
+            "nothing pending"
+        );
+        // An 8k prompt, the longest yet, on a step-reporting wire silent
+        // from its dispatch on.
+        tracked_pile(&w, 1);
+        w.note_prefill_started(8_192, true);
+        assert!(w.prefill_cold_shape(0));
+        assert_eq!(wedge_bound(&w, DEFAULT_WEDGE), COLD_SHAPE_GRACE);
+        assert_eq!(
+            prefill_leg_bound_with(&w, 8_192, DEFAULT_WEDGE),
+            Some(COLD_SHAPE_GRACE),
+            "a prefill leg of the new shape"
+        );
+        assert_eq!(
+            prefill_leg_bound_with(&w, 512, DEFAULT_WEDGE),
+            Some(COLD_SHAPE_GRACE),
+            "any leg while the worker is on the new shape"
+        );
+        for secs in [3, 60, 119] {
+            on_load_report_with(
+                &w,
+                0,
+                Some(Duration::from_secs(secs)),
+                true,
+                None,
+                DEFAULT_WEDGE,
+            );
+            assert!(w.stall_reason().is_none(), "{secs} s of silence: building");
+        }
+        // The sweep's own rules read the same bound: a pile behind the
+        // prompt, or a queue, is not a wedge under the cap.
+        let bound = wedge_bound(&w, DEFAULT_WEDGE);
+        assert!(!wedged_by_pile(9, 1, Duration::from_secs(119), bound));
+        assert!(!wedged_by_queue(9, 4, 0, Duration::from_secs(119), bound));
+        assert!(wedged_by_pile(9, 1, COLD_SHAPE_GRACE, bound), "at the cap");
+        // Past the cap it is a wedge like any other.
+        on_load_report_with(&w, 0, Some(COLD_SHAPE_GRACE), true, None, DEFAULT_WEDGE);
+        assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
+        // The first token: progress, and the shape shown; the next 8k prompt
+        // is judged at the threshold.
+        on_token_progress(&w);
+        w.note_prefill_ended(8_192, true, Some(0));
+        assert!(w.stall_reason().is_none());
+        w.note_prefill_started(8_192, true);
+        assert!(!w.prefill_cold_shape(0));
+        assert_eq!(wedge_bound(&w, DEFAULT_WEDGE), DEFAULT_WEDGE);
+        on_load_report_with(&w, 0, Some(DEFAULT_WEDGE), true, None, DEFAULT_WEDGE);
+        assert_eq!(w.stall_reason(), Some(StallReason::Wedged), "once");
+        // A token-batch wire: the grace stands above the allowance too,
+        // and no allowance is still no verdict.
+        let allowance = Some(Duration::from_secs(24));
+        assert!(!engine_stalled(
+            Some(Duration::from_secs(60)),
+            false,
+            DEFAULT_WEDGE,
+            allowance,
+            COLD_SHAPE_GRACE
+        ));
+        assert!(engine_stalled(
+            Some(COLD_SHAPE_GRACE),
+            false,
+            DEFAULT_WEDGE,
+            allowance,
+            COLD_SHAPE_GRACE
+        ));
+        assert!(!engine_stalled(
+            Some(Duration::from_secs(600)),
+            false,
+            DEFAULT_WEDGE,
+            None,
+            COLD_SHAPE_GRACE
+        ));
+        // A longer configured threshold stands above the grace.
+        let long = worker();
+        long.note_prefill_started(1_024, true);
+        long.note_prefill_ended(1_024, true, Some(0));
+        long.note_prefill_started(8_192, true);
+        assert_eq!(
+            wedge_bound(&long, Duration::from_secs(600)),
+            Duration::from_secs(600)
+        );
+    }
+
+    /// The first prompt on a worker is the longest it has seen as well;
+    /// with nothing answered the gateway has no shape to go by and judges
+    /// the worker as before, so an engine frozen from its first request is
+    /// caught at the threshold.
+    #[test]
+    fn a_worker_that_has_answered_nothing_gets_no_grace() {
+        let w = worker();
+        tracked_pile(&w, 1);
+        w.note_prefill_started(8_192, true);
+        assert!(!w.prefill_cold_shape(0));
+        assert_eq!(wedge_bound(&w, DEFAULT_WEDGE), DEFAULT_WEDGE);
+        assert_eq!(
+            prefill_leg_bound_with(&w, 8_192, DEFAULT_WEDGE),
+            Some(DEFAULT_WEDGE)
+        );
+        on_load_report_with(&w, 0, Some(DEFAULT_WEDGE), true, None, DEFAULT_WEDGE);
+        assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
+    }
+
+    /// A frozen engine vetoed on a shape it has shown, and a longer prompt
+    /// lands on it (a veto steers, it never refuses): the grace does not
+    /// re-read the engine's silence as output, and the veto stands until
+    /// the engine produces.
+    #[test]
+    fn the_grace_lifts_no_standing_veto() {
+        let w = worker();
+        w.note_prefill_started(1_024, true);
+        w.note_prefill_ended(1_024, true, Some(0));
+        tracked_pile(&w, 1);
+        w.note_prefill_started(1_024, true);
+        on_load_report_with(&w, 0, Some(DEFAULT_WEDGE), true, None, DEFAULT_WEDGE);
+        assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
+        tracked_pile(&w, 1);
+        w.note_prefill_started(8_192, true);
+        assert!(w.prefill_cold_shape(0));
+        on_load_report_with(
+            &w,
+            0,
+            Some(Duration::from_secs(4)),
+            true,
+            None,
+            DEFAULT_WEDGE,
+        );
+        assert_eq!(
+            w.stall_reason(),
+            Some(StallReason::Wedged),
+            "the grace is no engine output"
+        );
+        assert!(w.engine_stalled());
+        sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, DEFAULT_STALE);
+        assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
+        on_token_progress(&w);
+        assert!(w.stall_reason().is_none(), "progress clears it");
     }
 
     #[test]

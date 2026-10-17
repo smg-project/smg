@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fmt,
     sync::{
         atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering},
@@ -803,6 +803,17 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// started, or does not track it.
     fn prefill_answered_ago(&self) -> Option<Duration> {
         None
+    }
+
+    /// Whether the engine behind the worker is on a prompt shape it has not
+    /// shown it runs: a prompt pending on the worker, or one of `tokens`
+    /// about to be dispatched, longer than any the worker has answered since
+    /// the gateway started, on a worker that has answered at least one. A
+    /// worker that has answered nothing has shown no shape to go by, and is
+    /// judged like any other; so is a worker that does not track it
+    /// (`false`).
+    fn prefill_cold_shape(&self, _tokens: u64) -> bool {
+        false
     }
 
     /// One-shot routing snapshot for the per-request O(workers) selection loops:
@@ -1613,6 +1624,12 @@ struct PrefillBook {
     /// Gateway clock of the latest first response (or one answer) to a
     /// prompt dispatched here; zero until one.
     last_answer_ms: u64,
+    /// The prompts pending, prompt tokens to how many of that length, for
+    /// the longest of them: the largest shape the engine is on.
+    pending_prompts: BTreeMap<u64, u32>,
+    /// The longest prompt answered with a first token (or one answer): the
+    /// largest shape the engine has shown it runs; zero until one.
+    longest_answered: u64,
 }
 
 impl PrefillBook {
@@ -1621,6 +1638,7 @@ impl PrefillBook {
             return;
         }
         self.pending = self.pending.saturating_add(tokens);
+        *self.pending_prompts.entry(tokens).or_insert(0) += 1;
         if !timed {
             return;
         }
@@ -1632,8 +1650,10 @@ impl PrefillBook {
 
     fn ended(&mut self, tokens: u64, timed: bool, cached: Option<u64>, now_ms: u64) {
         self.pending = self.pending.saturating_sub(tokens);
+        self.forget_prompt(tokens);
         if cached.is_some() {
             self.last_answer_ms = now_ms;
+            self.longest_answered = self.longest_answered.max(tokens);
         }
         if !timed {
             return;
@@ -1711,6 +1731,31 @@ impl PrefillBook {
     fn answered_ago(&self, now_ms: u64) -> Option<Duration> {
         (self.last_answer_ms > 0)
             .then(|| Duration::from_millis(now_ms.saturating_sub(self.last_answer_ms)))
+    }
+
+    /// Whether the engine is on a shape it has not shown it runs: a prompt
+    /// pending here, or one of `extra` tokens about to be dispatched, longer
+    /// than any answered, on a worker that has answered one. A worker that
+    /// has answered nothing has shown no shape to go by.
+    fn cold_shape(&self, extra: u64) -> bool {
+        let longest_pending = self
+            .pending_prompts
+            .keys()
+            .next_back()
+            .copied()
+            .unwrap_or(0);
+        self.longest_answered > 0 && longest_pending.max(extra) > self.longest_answered
+    }
+
+    /// A prompt of `tokens` is no longer pending; one that was never booked
+    /// (a release with tokens no start had) changes nothing.
+    fn forget_prompt(&mut self, tokens: u64) {
+        if let Some(count) = self.pending_prompts.get_mut(&tokens) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.pending_prompts.remove(&tokens);
+            }
+        }
     }
 }
 
@@ -1979,6 +2024,10 @@ impl WorkerRuntime {
     /// [`Self::prefill_answered_ago`] as of `now_ms` on the gateway clock.
     pub fn prefill_answered_ago_at(&self, now_ms: u64) -> Option<Duration> {
         self.prefill.lock().answered_ago(now_ms)
+    }
+
+    pub fn prefill_cold_shape(&self, tokens: u64) -> bool {
+        self.prefill.lock().cold_shape(tokens)
     }
 
     pub fn swap_waiting_reqs(&self, waiting: i64) -> i64 {
@@ -2850,6 +2899,10 @@ impl Worker for BasicWorker {
 
     fn prefill_answered_ago(&self) -> Option<Duration> {
         self.runtime.load().prefill_answered_ago()
+    }
+
+    fn prefill_cold_shape(&self, tokens: u64) -> bool {
+        self.runtime.load().prefill_cold_shape(tokens)
     }
 
     fn note_tracked_started(&self) {
@@ -5065,6 +5118,52 @@ mod tests {
         runtime.note_prefill_ended_at(10_000, true, Some(0), 2_500);
         assert_eq!(runtime.prefill_rate_tps(), 13_333);
         assert_eq!(runtime.prefill_eta(40_000), Duration::from_millis(3_000));
+    }
+
+    #[test]
+    fn a_prompt_longer_than_any_answered_is_a_cold_shape_once_the_worker_has_answered_one() {
+        // The wedge rule's grace for an engine building a kernel at a new
+        // shape reads these books: the longest prompt answered against the
+        // longest pending (or about to be dispatched).
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        // Nothing answered yet: no shape to go by, whatever is pending.
+        runtime.note_prefill_started_at(8_192, true, 1_000);
+        assert!(!runtime.prefill_cold_shape(0));
+        assert!(!runtime.prefill_cold_shape(100_000));
+        runtime.note_prefill_ended_at(8_192, true, Some(0), 2_000);
+        assert!(!runtime.prefill_cold_shape(0), "nothing pending");
+        // 8k answered: a 4k prompt is a shape shown, a 16k one is not,
+        // pending or about to be dispatched.
+        runtime.note_prefill_started_at(4_096, true, 2_000);
+        assert!(!runtime.prefill_cold_shape(0));
+        assert!(
+            !runtime.prefill_cold_shape(8_192),
+            "as long as one answered"
+        );
+        assert!(runtime.prefill_cold_shape(16_384), "about to be dispatched");
+        runtime.note_prefill_started_at(16_384, true, 2_100);
+        runtime.note_prefill_started_at(16_384, true, 2_200);
+        assert!(runtime.prefill_cold_shape(0), "pending");
+        // The 4k prompt's answer shows nothing new; a 16k stream dropped
+        // before its first token shows nothing either, and its twin keeps
+        // the shape cold; the twin's answer shows it, and the next 16k
+        // prompt is a shape run.
+        runtime.note_prefill_ended_at(4_096, true, Some(0), 2_500);
+        assert!(runtime.prefill_cold_shape(0));
+        runtime.note_prefill_ended_at(16_384, true, None, 3_000);
+        assert!(runtime.prefill_cold_shape(0), "the twin is still pending");
+        runtime.note_prefill_ended_at(16_384, true, Some(0), 4_000);
+        assert!(!runtime.prefill_cold_shape(0), "nothing pending");
+        assert!(!runtime.prefill_cold_shape(16_384), "shown");
+        assert!(runtime.prefill_cold_shape(16_385));
+        // A non-streaming generation's one answer shows its shape too.
+        runtime.note_prefill_started_at(32_768, false, 5_000);
+        assert!(runtime.prefill_cold_shape(0));
+        runtime.note_prefill_ended_at(32_768, false, Some(0), 9_000);
+        assert!(!runtime.prefill_cold_shape(32_768));
+        // A release of tokens no start booked changes nothing.
+        runtime.note_prefill_ended_at(1_000_000, true, None, 9_500);
+        assert!(!runtime.prefill_cold_shape(0));
     }
 
     #[test]
