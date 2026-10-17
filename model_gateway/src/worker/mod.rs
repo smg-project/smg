@@ -15,7 +15,7 @@ pub mod kv_event_monitor;
 mod kv_event_recovery;
 pub mod kv_index_backend;
 pub(crate) mod liveness;
-pub(crate) mod load_state;
+pub mod load_state;
 pub mod manager;
 pub mod metrics_aggregator;
 pub mod monitor;

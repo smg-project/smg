@@ -84,7 +84,6 @@ use kv_index::{
     compute_request_content_hashes, request_prefix_hashes, salt::request_content_hashes_with_seed,
     ContentHash, OverlapScores, TenantId, TokenTree, Tree,
 };
-use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::RwLock;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
@@ -99,13 +98,15 @@ use super::{
     CacheAwareConfig, CacheNamespace, LeastLoadPolicy, LoadBalancingPolicy, SelectWorkerInfo,
     TEXT_MARKER_LEN,
 };
-/// Latest per-worker backend load snapshot stream, keyed by worker URL.
-pub(crate) use crate::worker::load_state::{LoadReceiver, LoadSnapshot};
 use crate::{
     config::CacheIndexKind,
     mesh::adapters::tree_sync::{RepairEntry, TreeDelta, TreeRepairPage, TreeSyncAdapter},
     observability::{cache_trace, metrics::Metrics},
-    worker::{liveness, KvEventMonitor, KvIndex, Worker},
+    worker::{
+        liveness,
+        load_state::{LoadReceiver, LoadSnapshot},
+        KvEventMonitor, KvIndex, Worker,
+    },
 };
 
 /// An overlap of at most this many blocks counts as a miss for the warm-up
@@ -181,10 +182,10 @@ pub struct CacheAwarePolicy {
     _eviction_task: Option<PeriodicTask>,
     /// Event-driven KV cache monitor for overlap scoring (gRPC workers only).
     kv_monitor: RwLock<Option<Arc<KvEventMonitor>>>,
-    /// Latest per-worker backend load snapshot (keyed by worker URL) from the
-    /// `WorkerMonitor` load poll. Read on the hot path for the KV-usage imbalance
-    /// trigger. `None` until wired by the registry (then the policy stays
-    /// count-only, preserving current behavior).
+    /// The worker monitor's load feed, read on the hot path for the KV-usage
+    /// imbalance trigger and the waiting-prefill decay; the expected-wait
+    /// scorer holds its own handle to the same feed. `None` until wired by
+    /// the registry (then the policy stays count-only).
     load_rx: RwLock<Option<LoadReceiver>>,
     /// Misses seen by the warm-up slice; every `period`th goes to a warming
     /// worker (see [`liveness::Warmup`]).
@@ -600,13 +601,6 @@ impl CacheAwarePolicy {
     /// Uses interior mutability so this works on policies behind `Arc<dyn LoadBalancingPolicy>`.
     pub fn set_kv_event_monitor(&self, monitor: Option<Arc<KvEventMonitor>>) {
         *self.kv_monitor.write() = monitor;
-    }
-
-    /// Set the backend load-snapshot receiver (thread-safe, after construction).
-    /// Wired from the `WorkerMonitor` via the `PolicyRegistry` so the KV-usage
-    /// imbalance trigger can read fresh per-worker `token_usage`.
-    pub(crate) fn set_load_receiver(&self, rx: Option<LoadReceiver>) {
-        *self.load_rx.write() = rx;
     }
 
     #[cfg(test)]
@@ -1418,15 +1412,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         false
     }
 
-    fn update_loads(&self, loads: &HashMap<String, WorkerLoadResponse>) {
-        // WorkerMonitor invokes this immediately before publishing its complete
-        // immutable snapshot (with no await between the two operations). Advance
-        // ExpectedWait here so each successful worker's new load and credit
-        // reset stay atomic. KV-pressure and overlap decay intentionally keep
-        // using the last fully published snapshot during that handoff; scoring
-        // ExpectedWait from its old value would instead pair an
-        // old queue with a new reset and reopen the incast race.
-        self.load_scorer.update_loads(loads);
+    fn set_load_receiver(&self, rx: Option<LoadReceiver>) {
+        // The scorer reads the feed for the expected wait; this policy reads
+        // it for KV pressure and the waiting-prefill decay.
+        self.load_scorer.set_load_receiver(rx.clone());
+        *self.load_rx.write() = rx;
     }
 
     /// Expected-wait selection needs backend snapshots for every CacheAware
@@ -1783,23 +1773,8 @@ impl CacheAwarePolicy {
         candidates: &[usize],
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
-        // Clone the immutable snapshot out of both guards before scoring. The
-        // snapshot is only a freshness fence; LeastLoad's poll-fed cache stays
-        // the score source so publication cannot split a load update from its
-        // matching since-poll credit reset.
-        let complete_snapshot = {
-            let receiver_guard = self.load_rx.read();
-            receiver_guard
-                .as_ref()
-                .map(|receiver| receiver.borrow().clone())
-        };
-        self.load_scorer.select_min_expected_wait_with_freshness(
-            workers,
-            candidates,
-            info,
-            self.name(),
-            complete_snapshot.as_deref(),
-        )
+        self.load_scorer
+            .select_min_expected_wait(workers, candidates, info, self.name())
     }
 
     /// The count-pressure gate's comparison alone, with no trace record: a
@@ -3314,6 +3289,7 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
+    use crate::worker::load_state::TestFeed;
 
     #[test]
     fn text_is_wanted_only_without_token_ids() {
@@ -3616,10 +3592,6 @@ mod tests {
         }
     }
 
-    fn complete_load_snapshot(loads: HashMap<String, WorkerLoadResponse>) -> Arc<LoadSnapshot> {
-        LoadSnapshot::from_loads_for_test(loads.into_iter().collect())
-    }
-
     /// Healthy workers (health checks disabled) for the given URLs.
     fn make_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
         urls.iter()
@@ -3649,7 +3621,7 @@ mod tests {
                 )
             })
             .collect();
-        policy.update_loads(&loads);
+        TestFeed::attached_to(policy).publish(&loads);
     }
 
     /// Like [`update_expected_wait_loads`], with each report counting the
@@ -3673,7 +3645,7 @@ mod tests {
                 (worker.url().to_string(), load)
             })
             .collect();
-        policy.update_loads(&loads);
+        TestFeed::attached_to(policy).publish(&loads);
     }
 
     /// One selection for `text` through the string path.
@@ -3917,7 +3889,7 @@ mod tests {
         }
         let mut one_queued = expected_wait_load(10, 0.1, 100.0);
         one_queued.loads[0].num_waiting_reqs = 1;
-        policy.update_loads(&HashMap::from([
+        TestFeed::attached_to(&policy).publish(&HashMap::from([
             (workers[0].url().to_string(), one_queued),
             (
                 workers[1].url().to_string(),
@@ -3950,7 +3922,7 @@ mod tests {
         }
         let mut running = expected_wait_load(0, 0.1, 100.0);
         running.loads[0].num_running_reqs = 3;
-        policy.update_loads(&HashMap::from([
+        TestFeed::attached_to(&policy).publish(&HashMap::from([
             (workers[0].url().to_string(), running),
             (
                 workers[1].url().to_string(),
@@ -3965,7 +3937,7 @@ mod tests {
         let policy = CacheAwarePolicy::with_config(test_config());
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         policy.init_workers(&workers);
-        policy.update_loads(&HashMap::from([
+        TestFeed::attached_to(&policy).publish(&HashMap::from([
             (
                 workers[0].url().to_string(),
                 expected_wait_load(0, 0.1, 100.0),
@@ -3991,12 +3963,12 @@ mod tests {
     }
 
     #[test]
-    fn cache_aware_ignores_cached_load_after_complete_snapshot_drops_worker() {
+    fn a_report_the_snapshot_dropped_is_no_longer_scored() {
         let policy = CacheAwarePolicy::with_config(test_config());
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         policy.init_workers(&workers);
-
-        let old_loads = HashMap::from([
+        let feed = TestFeed::attached_to(&policy);
+        feed.publish(&HashMap::from([
             (
                 workers[0].url().to_string(),
                 expected_wait_load(0, 0.1, 100.0),
@@ -4005,24 +3977,18 @@ mod tests {
                 workers[1].url().to_string(),
                 expected_wait_load(1_000, 0.1, 100.0),
             ),
-        ]);
-        policy.update_loads(&old_loads);
-        let (load_tx, load_rx) = watch::channel(complete_load_snapshot(old_loads));
-        policy.set_load_receiver(Some(load_rx));
+        ]));
 
-        // The next complete WorkerMonitor snapshot drops w1 after its load
-        // fetch fails. Its old cached report says idle, but its five live
-        // requests make the documented missing-snapshot estimate (51.2s)
-        // worse than w2's reported 10s queue.
+        // The next snapshot drops w1 after its load fetch fails. Its old
+        // report said idle, but its five live requests make the documented
+        // missing-report estimate (51.2s) worse than w2's reported 10s queue.
         for _ in 0..5 {
             workers[0].increment_load();
         }
-        load_tx
-            .send(complete_load_snapshot(HashMap::from([(
-                workers[1].url().to_string(),
-                expected_wait_load(1_000, 0.1, 100.0),
-            )])))
-            .unwrap();
+        feed.publish(&HashMap::from([(
+            workers[1].url().to_string(),
+            expected_wait_load(1_000, 0.1, 100.0),
+        )]));
 
         let selected = policy.select_worker(
             &workers,
@@ -4034,22 +4000,35 @@ mod tests {
         assert_eq!(
             selected,
             Some(1),
-            "a report absent from the complete snapshot must not remain scoreable"
+            "a report the snapshot dropped must not stay scoreable"
         );
         assert_only_final_worker_credited(&policy, &workers, 1, 1024);
     }
 
     #[test]
-    fn complete_snapshot_masks_absence_without_replacing_poll_fed_scores() {
+    fn the_shared_snapshot_is_the_score_source() {
         let policy = CacheAwarePolicy::with_config(test_config());
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         policy.init_workers(&workers);
+        let feed = TestFeed::attached_to(&policy);
+        feed.publish(&HashMap::from([
+            (
+                workers[0].url().to_string(),
+                expected_wait_load(10_000, 0.1, 100.0),
+            ),
+            (
+                workers[1].url().to_string(),
+                expected_wait_load(0, 0.1, 100.0),
+            ),
+        ]));
+        assert_eq!(
+            route_text(&policy, &workers, "alpha snapshot miss"),
+            Some(1)
+        );
 
-        // The poll-fed scorer prefers w2. Both URLs remain present in the
-        // complete snapshot, whose deliberately contradictory values prefer
-        // w1. The watch map is an absence mask, not a second score source.
-        update_expected_wait_loads(&policy, &workers, &[10_000, 0]);
-        let current_loads = HashMap::from([
+        // The next publication turns the scores around: nothing is kept
+        // policy-side, and the credit w2 took is released by its new report.
+        feed.publish(&HashMap::from([
             (
                 workers[0].url().to_string(),
                 expected_wait_load(0, 0.1, 100.0),
@@ -4058,117 +4037,16 @@ mod tests {
                 workers[1].url().to_string(),
                 expected_wait_load(10_000, 0.1, 100.0),
             ),
-        ]);
-        let (_load_tx, load_rx) = watch::channel(complete_load_snapshot(current_loads));
-        policy.set_load_receiver(Some(load_rx));
-
-        let selected = policy.select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                request_text: Some("coherent-snapshot miss"),
-                ..Default::default()
-            },
-        );
-        assert_eq!(selected, Some(1));
-        assert_only_final_worker_credited(&policy, &workers, 1, 1024);
+        ]));
+        assert_eq!(route_text(&policy, &workers, "zulu snapshot miss"), Some(0));
     }
 
     #[test]
-    fn monitor_update_before_watch_publish_keeps_load_and_credit_paired() {
-        use std::sync::mpsc::sync_channel;
-
-        let policy = Arc::new(CacheAwarePolicy::with_config(test_config()));
-        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-        policy.init_workers(&workers);
-
-        let revision_a = HashMap::from([
-            (
-                workers[0].url().to_string(),
-                expected_wait_load(500, 0.1, 100.0),
-            ),
-            (
-                workers[1].url().to_string(),
-                expected_wait_load(0, 0.1, 100.0),
-            ),
-        ]);
-        policy.update_loads(&revision_a);
-        let (load_tx, load_rx) = watch::channel(complete_load_snapshot(revision_a));
-        policy.set_load_receiver(Some(load_rx));
-
-        assert_eq!(
-            policy.select_worker(
-                &workers,
-                &SelectWorkerInfo {
-                    request_text: Some("alpha revision-a miss"),
-                    ..Default::default()
-                },
-            ),
-            Some(1)
-        );
-        assert_eq!(
-            policy.load_scorer.load_state_for_test(workers[1].url()),
-            (true, 1024, 1)
-        );
-
-        // Match WorkerMonitor's production order: push successful reports and
-        // reset their credits, pause, then publish the pruned complete watch
-        // snapshot. During the pause, w2's new heavy load must stay paired
-        // with its reset instead of scoring the old watch value (idle).
-        let revision_b = HashMap::from([(
-            workers[1].url().to_string(),
-            expected_wait_load(10_000, 0.1, 100.0),
-        )]);
-        let (updated_tx, updated_rx) = sync_channel::<()>(0);
-        let (publish_tx, publish_rx) = sync_channel::<()>(0);
-        let updater_policy = Arc::clone(&policy);
-        let updater = std::thread::spawn(move || {
-            updater_policy.update_loads(&revision_b);
-            updated_tx.send(()).unwrap();
-            publish_rx.recv().unwrap();
-            load_tx.send(complete_load_snapshot(revision_b)).unwrap();
-        });
-
-        updated_rx.recv().unwrap();
-        let reset_state = policy.load_scorer.load_state_for_test(workers[1].url());
-        let selected_during_publication_gap = policy.select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                request_text: Some("zulu publication-gap miss"),
-                ..Default::default()
-            },
-        );
-        publish_tx.send(()).unwrap();
-        updater.join().unwrap();
-
-        assert_eq!(reset_state, (true, 0, 0));
-        assert_eq!(
-            selected_during_publication_gap,
-            Some(0),
-            "selection must pair w2's new report with its newly reset credit"
-        );
-    }
-
-    #[test]
-    fn cache_aware_reset_discards_expected_wait_state() {
+    fn cache_aware_reset_discards_the_in_flight_credit() {
         let policy = CacheAwarePolicy::with_config(test_config());
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         policy.init_workers(&workers);
-        for _ in 0..5 {
-            workers[1].increment_load();
-        }
         update_expected_wait_loads(&policy, &workers, &[100_000, 0]);
-        let reset_snapshot = HashMap::from([
-            (
-                workers[0].url().to_string(),
-                expected_wait_load(100_000, 0.1, 100.0),
-            ),
-            (
-                workers[1].url().to_string(),
-                expected_wait_load(0, 0.1, 100.0),
-            ),
-        ]);
-        let (_load_tx, load_rx) = watch::channel(complete_load_snapshot(reset_snapshot));
-        policy.set_load_receiver(Some(load_rx));
 
         let first = SelectWorkerInfo {
             request_text: Some("alpha reset miss"),
@@ -4184,19 +4062,15 @@ mod tests {
         for worker in &workers {
             assert_eq!(
                 policy.load_scorer.load_state_for_test(worker.url()),
-                (false, 0, 0),
-                "reset must clear cached backend load and in-flight credit"
+                (true, 0, 0),
+                "reset must clear the in-flight credit and leave the feed alone"
             );
         }
         let second = SelectWorkerInfo {
             request_text: Some("zulu reset miss"),
             ..Default::default()
         };
-        assert_eq!(
-            policy.select_worker(&workers, &second),
-            Some(0),
-            "reset must return the scorer to its dark-fleet live-load fallback"
-        );
+        assert_eq!(policy.select_worker(&workers, &second), Some(1));
     }
 
     #[test]
@@ -4207,7 +4081,20 @@ mod tests {
         for _ in 0..5 {
             workers[1].increment_load();
         }
-        update_expected_wait_loads(&policy, &workers, &[100_000, 0]);
+        // Both reports sampled before the dispatch below, so republishing w2's
+        // report releases nothing.
+        let sampled_at = Instant::now();
+        let mut loads: HashMap<String, WorkerLoadResponse> = workers
+            .iter()
+            .zip([100_000, 0])
+            .map(|(worker, queued)| {
+                let mut load = expected_wait_load(queued, 0.1, 100.0);
+                load.sampled_at = Some(sampled_at);
+                (worker.url().to_string(), load)
+            })
+            .collect();
+        let feed = TestFeed::attached_to(&policy);
+        feed.publish(&loads);
 
         let first = SelectWorkerInfo {
             request_text: Some("alpha removal miss"),
@@ -4215,11 +4102,15 @@ mod tests {
         };
         assert_eq!(policy.select_worker(&workers, &first), Some(1));
 
+        // The monitor evicts the removed worker's report; the policy drops
+        // its tally.
+        loads.remove(workers[0].url());
+        feed.publish(&loads);
         LoadBalancingPolicy::remove_worker(&policy, workers[0].url());
         assert_eq!(
             policy.load_scorer.load_state_for_test(workers[0].url()),
             (false, 0, 0),
-            "worker removal must prune cached backend load and in-flight credit"
+            "worker removal must prune the in-flight credit"
         );
         assert_eq!(
             policy.load_scorer.load_state_for_test(workers[1].url()),
@@ -6385,9 +6276,7 @@ mod tests {
                 expected_wait_load(8, 0.0, 1_000.0),
             ),
         ]);
-        policy.update_loads(&overlap_loads);
-        let (_tx, rx) = watch::channel(complete_load_snapshot(overlap_loads));
-        policy.set_load_receiver(Some(rx));
+        TestFeed::attached_to(&policy).publish(&overlap_loads);
 
         let monitor = Arc::new(KvEventMonitor::new());
         monitor.indexers.insert("unknown".to_string(), indexer);
