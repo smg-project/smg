@@ -22,7 +22,8 @@
 //!   no byte up); and a call that ended, at its own terminal or at the stream's end, has
 //!   arguments that are whole JSON, unless the engine said `Malformed` while the call was open
 //!   (three names for the breach: `empty-arguments`, `tolerated-json`, `whole-json`, so that a
-//!   run allows a class already reported and still catches the others);
+//!   run allows a class already reported and still catches the others); and a pythonic call
+//!   that ended without its own `)` has its object left open, closed for it by nothing;
 //! - the adapters render any event sequence without a panic, and the Chat Completions stream,
 //!   concatenated, says what the whole message says.
 //!
@@ -45,8 +46,8 @@ use symphony::{
     adapt::{chat, messages, responses},
     formats::Table,
     json::PartialJson,
-    CallIds, Declared, DropReason, Engine, EngineFinish, Event, Events, FinishReason, Input,
-    MalformedReason, Parser,
+    CallIds, CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, FinishReason,
+    Input, MalformedReason, Parser,
 };
 
 /// The recorded output slices the seeds are made from, one definition with the crate's bench.
@@ -659,6 +660,13 @@ fn valid_json_prefix(text: &str) -> bool {
 
 /// What a client relies on in the shape of the stream, checked event by event.
 fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
+    // A pythonic call ends at its own `)`, which every template writes before the region's
+    // marker; the other syntaxes' ends may carry no bytes by design (the block's close ends
+    // the call).
+    let pythonic = matches!(
+        case.table.format().call_syntax(),
+        Some(CallSyntax::Pythonic(_))
+    );
     let mut started: Vec<u32> = Vec::new();
     let mut ended: Vec<u32> = Vec::new();
     let mut arguments: Vec<(u32, String)> = Vec::new();
@@ -756,7 +764,7 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                     }
                 }
             }
-            Event::ToolCallEnd { index, .. } => {
+            Event::ToolCallEnd { index, source } => {
                 breach("end-before-start", started.contains(index), || {
                     format!("{}: an end before the call's start", place())
                 });
@@ -802,6 +810,23 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                             )
                         });
                     }
+                }
+                // A pythonic end with no bytes of its own is a call the region's marker or the
+                // stream's end cut: nothing closes its object for it, whatever it said. A cut
+                // call that said nothing and left its object open is one of the whole-JSON
+                // names' breaches above, so no event is named twice.
+                if pythonic && source.text.is_empty() {
+                    let so_far = arguments
+                        .iter()
+                        .find(|(i, _)| i == index)
+                        .map(|(_, so_far)| so_far.as_str())
+                        .unwrap_or_default();
+                    breach("pythonic-cut-call-closed", !whole_json(so_far), || {
+                        format!(
+                            "{}: a pythonic call ended without its `)` with arguments {so_far:?}: a cut call's object stays open",
+                            place()
+                        )
+                    });
                 }
             }
             Event::Malformed { text, why } => {
@@ -1588,6 +1613,52 @@ mod tests {
             ));
         }
         Ok(())
+    }
+
+    #[test]
+    fn a_pythonic_call_that_ended_without_its_close_said_so_and_stays_open() {
+        // The region's marker cut the call: an end of no bytes with the object closed for it is
+        // a breach, with a word or without; with the word and the object left open it holds;
+        // and a tagged call ends without bytes of its own by design.
+        let closed_for_it = vec![
+            start(0),
+            arguments(0, "{\"city\": \"Paris\"}", "city='Paris'"),
+            end(0, ""),
+            finish(1),
+        ];
+        assert_eq!(
+            breach_in(Table::Lfm2_5, closed_for_it).as_deref(),
+            Some("pythonic-cut-call-closed")
+        );
+        let said_and_closed = vec![
+            start(0),
+            arguments(0, "{\"city\": \"Paris\"", "city='Paris'"),
+            malformed(),
+            arguments(0, "}", ""),
+            end(0, ""),
+            finish(1),
+        ];
+        assert_eq!(
+            breach_in(Table::Lfm2_5, said_and_closed).as_deref(),
+            Some("pythonic-cut-call-closed")
+        );
+        let said = vec![
+            start(0),
+            arguments(0, "{\"city\": \"Paris\"", "city='Paris'"),
+            malformed(),
+            end(0, ""),
+            finish(1),
+        ];
+        assert_eq!(breach_in(Table::Lfm2_5, said), None);
+        let closed_itself = vec![
+            start(0),
+            arguments(0, "{\"city\": \"Paris\"}", "city='Paris')"),
+            end(0, ")"),
+            finish(1),
+        ];
+        assert_eq!(breach_in(Table::Lfm2_5, closed_itself), None);
+        let tagged = vec![start(0), arguments(0, "{}", ""), end(0, ""), finish(1)];
+        assert_eq!(breach_in(Table::Qwen3Tagged, tagged), None);
     }
 
     #[test]
