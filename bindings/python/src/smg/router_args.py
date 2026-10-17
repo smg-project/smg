@@ -554,7 +554,6 @@ class RouterArgs:
     request_id_headers: list[str] | None = None
     # Request timeout in seconds
     request_timeout_secs: int = 1800
-    # Retries (disable_retries switches them off)
     # The exact-match response cache (--response-cache off|memory): a repeated
     # deterministic request (temperature 0 or a seed, not streamed, one choice,
     # no tools) is answered from memory for the tenant that sent it, for
@@ -565,6 +564,7 @@ class RouterArgs:
     response_cache_max_entries: int = 10000
     response_cache_max_entry_bytes: int = 1024 * 1024
     response_cache_ttl_secs: int = 300
+    # Retries (disable_retries switches them off)
     retry_backoff_multiplier: float = 1.5
     retry_initial_backoff_ms: int = 50
     retry_jitter_factor: float = 0.2

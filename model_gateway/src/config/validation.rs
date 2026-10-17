@@ -1903,6 +1903,9 @@ impl ConfigValidator {
     /// a byte budget of zero would keep nothing, and an entry cap above the
     /// byte budget could never be met.
     fn validate_response_cache(cache: &ResponseCacheConfig) -> ConfigResult<()> {
+        /// The longest life of an in-memory entry: a bound the clock
+        /// arithmetic of every store holds within.
+        const RESPONSE_CACHE_MAX_TTL_SECS: u64 = 365 * 24 * 60 * 60;
         if !cache.enabled() {
             return Ok(());
         }
@@ -1918,6 +1921,13 @@ impl ConfigValidator {
                 "ttl_secs",
                 cache.ttl_secs.to_string(),
                 "Must be > 0 when the response cache is on",
+            );
+        }
+        if cache.ttl_secs > RESPONSE_CACHE_MAX_TTL_SECS {
+            return refuse(
+                "ttl_secs",
+                cache.ttl_secs.to_string(),
+                "Must be at most one year (31536000 seconds) when the response cache is on",
             );
         }
         if cache.max_entries == 0 {
@@ -4863,6 +4873,21 @@ mod tests {
                 ..on.clone()
             }),
             "response_cache.ttl_secs"
+        );
+        assert_eq!(
+            refused(ResponseCacheConfig {
+                ttl_secs: 365 * 24 * 60 * 60 + 1,
+                ..on.clone()
+            }),
+            "response_cache.ttl_secs",
+            "a TTL past a year is refused before it can run past the clock"
+        );
+        assert!(
+            ConfigValidator::validate_response_cache(&ResponseCacheConfig {
+                ttl_secs: 365 * 24 * 60 * 60,
+                ..on.clone()
+            })
+            .is_ok()
         );
         assert_eq!(
             refused(ResponseCacheConfig {

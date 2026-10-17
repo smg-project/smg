@@ -54,7 +54,7 @@ fn bench_key(c: &mut Criterion) {
             |b, request| {
                 b.iter(|| {
                     let canonical = canonical_bytes(request).expect("serializes");
-                    key_for(Scope::Chat, "header:bench", &canonical)
+                    key_for(Scope::Chat, "header:bench", &canonical, &[])
                 });
             },
         );

@@ -8,8 +8,13 @@
 //! every object's keys sorted and the fields that identify the caller rather
 //! than the answer (`user`, `metadata`, ...) left out, so two callers of one
 //! tenant who send the same request in a different key order share an entry
-//! and two tenants never do. Without tenant identity the tenant key is the
-//! client address, so entries are shared by one client address only.
+//! and two tenants never do. The request headers that shape the answer
+//! without being in the body (the parser choice, the Messages protocol
+//! version and beta headers) are part of the key too. Without tenant
+//! identity the tenant key is the client address, and a caller's own
+//! credential, when it forwards one, tells it apart from the other callers
+//! of that address: an answer a provider generated under one key is never
+//! replayed under another, or under none.
 //!
 //! Only a complete `200` JSON answer is stored, recorded while it streams to
 //! the client (so a miss costs no extra latency) and dropped unrecorded when
@@ -53,6 +58,8 @@ use crate::{
     config::{ResponseCacheBackend, ResponseCacheConfig},
     middleware::TenantRequestMeta,
     observability::metrics::Metrics,
+    routers::grpc::regular::symphony::HEADER as PARSER_HEADER,
+    tenant::storage_tenant,
 };
 
 /// The request header a caller steers the cache with: `no-store` (neither
@@ -278,14 +285,55 @@ fn sort_keys(value: &mut Value) {
 }
 
 /// The key of `canonical` for `tenant` under `scope`.
-pub fn key_for(scope: Scope, tenant: &str, canonical: &[u8]) -> Key {
+pub fn key_for(scope: Scope, tenant: &str, canonical: &[u8], variant: &[u8]) -> Key {
     let mut hasher = blake3::Hasher::new();
     hasher.update(scope.tag());
     hasher.update(&[0]);
     hasher.update(tenant.as_bytes());
     hasher.update(&[0]);
     hasher.update(canonical);
+    hasher.update(&[0]);
+    hasher.update(variant);
     *hasher.finalize().as_bytes()
+}
+
+/// The request headers that shape an answer without being in the body: the
+/// parser choice the gateway reads per request, and the Messages protocol
+/// headers an engine selects its version and beta behaviour from (forwarded
+/// for that reason). Their values are part of the key, so a stored answer is
+/// replayed only to a request that asked for the same shape.
+const ANSWER_HEADERS: [&str; 3] = [PARSER_HEADER, "anthropic-version", "anthropic-beta"];
+
+/// The credential headers the provider routers forward as the caller's own
+/// key. A caller the gateway does not vouch for (known by its address only,
+/// or anonymous) is told apart by them, so a provider's check of a key is
+/// never skipped on a hit under another key, or under none.
+const CREDENTIAL_HEADERS: [&str; 3] = ["authorization", "x-api-key", "x-goog-api-key"];
+
+/// The part of a key that comes from the request headers (see
+/// [`ANSWER_HEADERS`] and [`CREDENTIAL_HEADERS`]): empty when the request
+/// carries none of them; otherwise each present header's name and its
+/// values in order, in a fixed header order, so two requests share a key
+/// only when they agree on every one of these headers.
+fn variant_bytes(headers: Option<&HeaderMap>, vouched: bool) -> Vec<u8> {
+    let Some(headers) = headers else {
+        return Vec::new();
+    };
+    let credentials: &[&str] = if vouched { &[] } else { &CREDENTIAL_HEADERS };
+    let mut bytes = Vec::new();
+    for name in ANSWER_HEADERS.iter().chain(credentials) {
+        let mut values = headers.get_all(*name).iter().peekable();
+        if values.peek().is_none() {
+            continue;
+        }
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(1);
+        for value in values {
+            bytes.extend_from_slice(value.as_bytes());
+            bytes.push(0);
+        }
+    }
+    bytes
 }
 
 /// A stored answer.
@@ -390,7 +438,10 @@ impl ResponseCache {
         let Some(canonical) = canonical_bytes(request) else {
             return bypass("serialization");
         };
-        let key = key_for(R::SCOPE, tenant.tenant_key().as_str(), &canonical);
+        // A tenant the gateway vouches for shares its entries whatever its
+        // callers forward; one known by its address alone does not.
+        let variant = variant_bytes(headers, storage_tenant(tenant).is_some());
+        let key = key_for(R::SCOPE, tenant.tenant_key().as_str(), &canonical, &variant);
         let ttl = match directive {
             Directive::Ttl(ttl) => ttl.min(self.ttl),
             Directive::Default | Directive::NoStore => self.ttl,
@@ -494,7 +545,7 @@ impl ResponseCache {
 
     /// Store `body` under `key` for `ttl` from `now`; the least recently
     /// used entries leave until the budgets hold. A body over the per-entry
-    /// cap is not stored.
+    /// cap is not stored, nor is one whose `ttl` runs past the clock.
     fn insert_at(
         &self,
         key: Key,
@@ -503,11 +554,14 @@ impl ResponseCache {
         ttl: Duration,
         now: Instant,
     ) {
+        let Some(expires_at) = now.checked_add(ttl) else {
+            return;
+        };
         let entry = Entry {
             body,
             content_type,
             stored_at: now,
-            expires_at: now + ttl,
+            expires_at,
         };
         let cost = entry.cost();
         if cost > self.max_entry_bytes {
@@ -839,9 +893,128 @@ mod tests {
         assert_ne!(key_of(&request, "t"), key_of(&chat(max_tokens), "t"));
         let canonical = canonical_bytes(&request).unwrap();
         assert_ne!(
-            key_for(Scope::Chat, "t", &canonical),
-            key_for(Scope::Completion, "t", &canonical)
+            key_for(Scope::Chat, "t", &canonical, &[]),
+            key_for(Scope::Completion, "t", &canonical, &[])
         );
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.append(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        headers
+    }
+
+    fn key_with(headers: &HeaderMap, tenant_name: &str) -> Key {
+        match cache().decide(
+            Some(headers),
+            &tenant(tenant_name),
+            &chat(deterministic_chat()),
+        ) {
+            Decision::Lookup { key, .. } => key,
+            Decision::Bypass => panic!("expected a cacheable request"),
+        }
+    }
+
+    /// The parser choice and the Messages protocol headers shape the answer
+    /// without being in the body: a request under another value, or under
+    /// none, never gets the stored answer. Headers that do not shape it
+    /// (tracing, the cache directive itself) leave the key alone.
+    #[test]
+    fn the_key_tells_apart_the_headers_that_shape_the_answer() {
+        let none = key_with(&HeaderMap::new(), "header:t");
+        let symphony = key_with(&headers(&[("x-smg-parser", "symphony")]), "header:t");
+        let legacy = key_with(&headers(&[("x-smg-parser", "legacy")]), "header:t");
+        assert_ne!(none, symphony);
+        assert_ne!(symphony, legacy);
+        assert_eq!(
+            symphony,
+            key_with(&headers(&[("X-SMG-Parser", "symphony")]), "header:t")
+        );
+        let beta = key_with(&headers(&[("anthropic-beta", "beta-1")]), "header:t");
+        assert_ne!(none, beta);
+        assert_ne!(
+            beta,
+            key_with(
+                &headers(&[
+                    ("anthropic-beta", "beta-1"),
+                    ("anthropic-version", "2023-06-01")
+                ]),
+                "header:t"
+            )
+        );
+        assert_ne!(
+            beta,
+            key_with(
+                &headers(&[("anthropic-beta", "beta-1"), ("anthropic-beta", "beta-2")]),
+                "header:t"
+            )
+        );
+        assert_eq!(
+            none,
+            key_with(
+                &headers(&[("x-request-id", "r1"), ("x-smg-cache", "ttl=5")]),
+                "header:t"
+            )
+        );
+    }
+
+    /// A caller the gateway vouches for (a tenant key, a trusted header)
+    /// shares its tenant's entries whatever credential it forwards; one it
+    /// knows by its address alone is told apart by its own credential, so an
+    /// answer a provider generated under one key is never replayed under
+    /// another, or under none.
+    #[test]
+    fn an_unvouched_caller_is_told_apart_by_its_own_credential() {
+        let address = "ip:10.0.0.1";
+        let bare = key_with(&HeaderMap::new(), address);
+        let alice = key_with(&headers(&[("authorization", "Bearer alice")]), address);
+        let bob = key_with(&headers(&[("authorization", "Bearer bob")]), address);
+        assert_ne!(bare, alice);
+        assert_ne!(alice, bob);
+        assert_eq!(
+            alice,
+            key_with(&headers(&[("authorization", "Bearer alice")]), address)
+        );
+        assert_ne!(
+            alice,
+            key_with(&headers(&[("x-api-key", "alice")]), address)
+        );
+        assert_ne!(
+            key_with(&HeaderMap::new(), "anonymous"),
+            key_with(&headers(&[("x-goog-api-key", "g")]), "anonymous")
+        );
+        for vouched in ["header:t", "auth:t"] {
+            assert_eq!(
+                key_with(&headers(&[("authorization", "Bearer alice")]), vouched),
+                key_with(&headers(&[("authorization", "Bearer bob")]), vouched)
+            );
+            assert_eq!(
+                key_with(&HeaderMap::new(), vouched),
+                key_with(&headers(&[("x-api-key", "k")]), vouched)
+            );
+        }
+    }
+
+    /// A TTL that runs past the clock stores nothing, instead of panicking
+    /// inside the recording body.
+    #[test]
+    fn a_ttl_past_the_clock_stores_nothing() {
+        let cache = cache();
+        let now = Instant::now();
+        cache.insert_at(
+            [7; 32],
+            Bytes::from_static(b"{}"),
+            HeaderValue::from_static("application/json"),
+            Duration::MAX,
+            now,
+        );
+        assert!(cache.lookup_at(&[7; 32], now).is_none());
+        assert_eq!(cache.occupancy(), (0, 0));
     }
 
     #[test]
