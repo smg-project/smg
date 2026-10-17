@@ -45,6 +45,16 @@
     When the system is imbalanced, routes to LeastLoad's atomic expected-wait
     winner regardless of cache affinity.
 
+    Spill Gate, Cost Form (balance_cost_gate)
+    -------------------------------------------
+    Opt-in. Instead of leaving a matched worker once its in-flight count
+    clears the two count margins, every eligible worker is ranked on its
+    expected wait plus the prefill the request still needs there (a holder's
+    uncached share of the prompt, a cold worker's whole prompt, at the
+    fleet's nominal drain rate): a holder is left exactly when its wait
+    exceeds a colder worker's by more than the time the prefix saves. The
+    chosen worker is credited with the work it must do, not the whole prompt.
+
     Hash Index Under-Layer (cache_index = hash)
     -------------------------------------------
     Replaces all three tree modes with a TTL'd exact-match placement map
@@ -60,6 +70,8 @@
                              the in-flight count's natural swing at the pool's mean, never under four
                              unless the configured value itself is lower (0: the relative part alone)
     balance_rel_threshold:   Relative margin of the spill gate (multiple of the fleet mean)
+    balance_cost_gate:       Cost form of the spill gate (expected wait plus uncached prefill)
+                             instead of the two count margins; off by default
     eviction_interval_secs:  Interval between LRU eviction / TTL sweep cycles
     max_tree_size:           Max total size (chars/tokens) of each model's approximate tree,
                              shared across all workers; enforced by eviction
@@ -1626,7 +1638,18 @@ impl CacheAwarePolicy {
         self.selection.name() == cost::DEFAULT_POLICY
             && tuning.selection_temperature <= 0.0
             && self.accounting.is_none()
+            && !self.config.balance_cost_gate
             && (tuning.overlap_decay <= 0.0 || tuning.waiting_prefill_tokens.is_none())
+    }
+
+    /// Whether a decision gathers every eligible worker as a row beside the
+    /// holders: an all-workers selection policy, the optimistic accounting
+    /// (a prediction may name a worker the index does not), or the cost
+    /// gate, which ranks every eligible worker on the wait it would add.
+    fn wants_all_rows(&self) -> bool {
+        self.selection.needs().all_workers
+            || self.accounting.is_some()
+            || self.config.balance_cost_gate
     }
 
     /// Whether the KV-pressure gate is configured: it reads the whole
@@ -1775,6 +1798,72 @@ impl CacheAwarePolicy {
     ) -> Option<usize> {
         self.load_scorer
             .select_min_expected_wait(workers, candidates, info, self.name())
+    }
+
+    /// The cost form of the spill decision (`balance_cost_gate`): every row
+    /// the decision read is a candidate at its expected wait plus the
+    /// prefill the request still needs there, its uncached share of the
+    /// prompt (see [`LeastLoadPolicy::select_min_total_wait`]), read as the
+    /// tokens of the blocks it holds over the prompt's tokens, so a prompt
+    /// that ends inside a block is not read as cached whole. The holders of
+    /// the prefix are left for a colder worker exactly when their wait
+    /// exceeds its by more than the time the prefix saves; a shallower
+    /// holder keeps the credit of its own overlap; the in-flight count
+    /// margins do not apply, nor do the group a selection policy formed or
+    /// `overlap_decay`: the cost ranks every row on its blocks. Selection
+    /// and credit stay one atomic step.
+    fn select_final_by_cost(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        inputs: &[CandidateInputs<'_>],
+        request: &RequestInputs<'_>,
+        info: &SelectWorkerInfo,
+    ) -> Option<usize> {
+        let prompt_tokens = request.prompt_tokens.max(1) as f64;
+        let block_size = request.block_size as f64;
+        let rows: Vec<usize> = inputs.iter().map(|candidate| candidate.idx).collect();
+        let shares: Vec<f64> = inputs
+            .iter()
+            .map(|candidate| {
+                (candidate.device_blocks.max(0.0) * block_size / prompt_tokens).clamp(0.0, 1.0)
+            })
+            .collect();
+        let selected =
+            self.load_scorer
+                .select_min_total_wait(workers, &rows, &shares, info, self.name())?;
+        if cache_trace::enabled() {
+            let share = rows
+                .iter()
+                .position(|&idx| idx == selected)
+                .map_or(0.0, |pos| shares[pos]);
+            cache_trace::gate(serde_json::json!({
+                "source": "cost_gate", "worker": workers[selected].url(),
+                "cached_share": share, "request_blocks": request.request_blocks,
+                "spill": share <= 0.0 && shares.iter().any(|&held| held > 0.0),
+            }));
+        }
+        Some(selected)
+    }
+
+    /// The cost form of the hash-mode decision: the holders of the deepest
+    /// applicable head hold `boundary` of the prompt's `prompt_tokens`
+    /// tokens, every other eligible worker none of them.
+    fn select_hash_holders_by_cost(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+        holders: &[usize],
+        boundary: usize,
+        prompt_tokens: usize,
+        info: &SelectWorkerInfo,
+    ) -> Option<usize> {
+        let held = (boundary as f64 / prompt_tokens.max(1) as f64).clamp(0.0, 1.0);
+        let shares: Vec<f64> = healthy_indices
+            .iter()
+            .map(|idx| if holders.contains(idx) { held } else { 0.0 })
+            .collect();
+        self.load_scorer
+            .select_min_total_wait(workers, healthy_indices, &shares, info, self.name())
     }
 
     /// The count-pressure gate's comparison alone, with no trace record: a
@@ -2109,9 +2198,8 @@ impl CacheAwarePolicy {
         avg_load: f64,
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
-        let needs = self.selection.needs();
         let accounting = self.accounting.as_ref();
-        let wants_all = needs.all_workers || accounting.is_some();
+        let wants_all = self.wants_all_rows();
         if candidates.is_empty() && !wants_all {
             return self.select_final_from_affinity(workers, &[], healthy_indices, avg_load, info);
         }
@@ -2194,6 +2282,13 @@ impl CacheAwarePolicy {
         let selected = match self.selection.select(request, &inputs) {
             Pick::None => {
                 self.select_final_from_affinity(workers, &[], healthy_indices, avg_load, info)
+            }
+            Pick::Group(rows) if self.config.balance_cost_gate => {
+                // The group names the hit; the cost ranks every row, so a
+                // shallower holder and a cold worker compete with it on the
+                // wait each would add, not on a count margin.
+                debug_assert!(!rows.is_empty());
+                self.select_final_by_cost(workers, &inputs, request, info)
             }
             Pick::Group(rows) => {
                 let group: Vec<usize> = rows.iter().map(|&row| inputs[row].idx).collect();
@@ -2372,7 +2467,7 @@ impl CacheAwarePolicy {
         let gather = if self.exact_maximum_decision(&tuning) {
             Gather::TopGroup { cap }
         } else {
-            let wants_all = self.selection.needs().all_workers || self.accounting.is_some();
+            let wants_all = self.wants_all_rows();
             Gather::All {
                 cap: cap.filter(|_| wants_all),
             }
@@ -2928,13 +3023,24 @@ impl CacheAwarePolicy {
             if holder_candidates.is_empty() {
                 continue;
             }
-            let selected = self.select_final_from_affinity(
-                workers,
-                &holder_candidates,
-                healthy_indices,
-                avg_load,
-                info,
-            )?;
+            let selected = if self.config.balance_cost_gate {
+                self.select_hash_holders_by_cost(
+                    workers,
+                    healthy_indices,
+                    &holder_candidates,
+                    boundary,
+                    tokens.len(),
+                    info,
+                )
+            } else {
+                self.select_final_from_affinity(
+                    workers,
+                    &holder_candidates,
+                    healthy_indices,
+                    avg_load,
+                    info,
+                )
+            }?;
             let branch = if holder_candidates.contains(&selected) {
                 "hash_hit"
             } else {
@@ -3279,6 +3385,16 @@ impl Default for CacheAwarePolicy {
 }
 
 #[cfg(test)]
+impl CacheAwarePolicy {
+    /// The policy with `load_scorer` in place of the default one, so a test
+    /// can size the mean prefill the credit floors at.
+    fn with_load_scorer(mut self, load_scorer: LeastLoadPolicy) -> Self {
+        self.load_scorer = load_scorer;
+        self
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use kv_index::{compute_content_hash, SequenceHash, StoredBlock};
     use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
@@ -3289,7 +3405,10 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::worker::load_state::TestFeed;
+    use crate::worker::{
+        expected_wait::{DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_THROUGHPUT},
+        load_state::TestFeed,
+    };
 
     #[test]
     fn text_is_wanted_only_without_token_ids() {
@@ -4708,6 +4827,170 @@ mod tests {
         // At high means the relative margin decides, with either rule.
         assert!(!policy.over_count_pressure_gate(290.0, 200.0));
         assert!(policy.over_count_pressure_gate(301.0, 200.0));
+    }
+
+    /// The config of the cost form of the spill gate over the test defaults.
+    fn cost_gate() -> CacheAwareConfig {
+        CacheAwareConfig {
+            balance_cost_gate: true,
+            ..test_config()
+        }
+    }
+
+    /// One selection of a 32-token request on a two-worker pool where `w1`
+    /// holds the request's first `held` tokens, with `queued` uncached
+    /// tokens reported per worker at 100 tokens/s and no request in flight
+    /// on either worker. The scorer's mean prefill is 4 tokens, so the
+    /// credit floor stays under the work the table reads. Returns the
+    /// policy and workers for credit checks.
+    fn cost_pick(
+        config: CacheAwareConfig,
+        held: usize,
+        queued: [i32; 2],
+    ) -> (CacheAwarePolicy, Vec<Arc<dyn Worker>>, usize) {
+        let policy = CacheAwarePolicy::with_config(config).with_load_scorer(
+            LeastLoadPolicy::with_params(DEFAULT_KV_PRESSURE_WEIGHT, 4, DEFAULT_THROUGHPUT, 0),
+        );
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let tokens: Vec<u32> = (0..32).collect();
+        seed_token_tenants(&policy, &workers, &tokens[..held], &["http://w1:8000"]);
+        update_expected_wait_loads(&policy, &workers, &queued);
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        let idx = policy.select_worker(&workers, &info).unwrap();
+        (policy, workers, idx)
+    }
+
+    #[test]
+    fn the_cost_gate_leaves_the_home_once_its_wait_exceeds_the_prefill_it_saves() {
+        // Reports at 100 tokens/s, so a queue's depth in tokens is its wait
+        // in hundredths of a second. The 32-token prompt is cached whole on
+        // its home, which saves 32 tokens of prefill there (0.32 s against a
+        // cold worker's whole prompt): the home is left only once its queue
+        // is more than 32 tokens deeper than the cold worker's. The count
+        // gate never opens here (no request in flight on either worker), so
+        // under it affinity holds whatever the queues.
+        for (queued, pick) in [
+            ([0, 0], 0),
+            ([31, 0], 0),
+            // Equal totals go to the warmer worker.
+            ([32, 0], 0),
+            ([33, 0], 1),
+            ([1_000, 970], 0),
+            ([1_000, 960], 1),
+        ] {
+            let (_, _, idx) = cost_pick(cost_gate(), 32, queued);
+            assert_eq!(idx, pick, "cost gate, queued {queued:?}");
+            let (_, _, idx) = cost_pick(test_config(), 32, queued);
+            assert_eq!(idx, 0, "count gate, queued {queued:?}");
+        }
+    }
+
+    #[test]
+    fn the_cost_gate_prices_a_partial_prefix_at_its_uncached_share() {
+        // 24 of the 32 tokens are held: 8 remain to prefill on the home
+        // against 32 on a cold worker, so the gap that opens the gate is 24
+        // tokens, and the home is credited the 8 it must compute (over the
+        // scorer's 4-token floor) where the count gate credits the whole
+        // prompt.
+        let (policy, workers, idx) = cost_pick(cost_gate(), 24, [24, 0]);
+        assert_eq!(idx, 0);
+        assert_only_final_worker_credited(&policy, &workers, 0, 8);
+        let (policy, workers, idx) = cost_pick(cost_gate(), 24, [25, 0]);
+        assert_eq!(idx, 1);
+        assert_only_final_worker_credited(&policy, &workers, 1, 32);
+        let (policy, workers, idx) = cost_pick(test_config(), 24, [25, 0]);
+        assert_eq!(idx, 0);
+        assert_only_final_worker_credited(&policy, &workers, 0, 32);
+    }
+
+    #[test]
+    fn without_load_reports_the_cost_gate_weighs_counts_against_the_work_in_mean_prefill_units() {
+        // No report anywhere: a worker's wait is its in-flight count, and
+        // the uncached work weighs tokens over mean_prefill_tokens (32 /
+        // 1024 of a request here), so one request of gap already outweighs
+        // the 32-token prefix where the count gate's margin would not open
+        // before four requests above the mean.
+        for ((w1_load, w2_load), pick) in [((0, 0), 0), ((1, 1), 0), ((1, 0), 1)] {
+            let policy = CacheAwarePolicy::with_config(cost_gate());
+            let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+            let tokens: Vec<u32> = (0..32).collect();
+            seed_token_tenants(&policy, &workers, &tokens, &["http://w1:8000"]);
+            for _ in 0..w1_load {
+                workers[0].increment_load();
+            }
+            for _ in 0..w2_load {
+                workers[1].increment_load();
+            }
+            let info = SelectWorkerInfo {
+                tokens: Some(&tokens),
+                ..Default::default()
+            };
+            assert_eq!(
+                policy.select_worker(&workers, &info),
+                Some(pick),
+                "loads {w1_load}/{w2_load}"
+            );
+        }
+        assert_eq!(affinity_pick(test_config(), 1, 0), 0);
+    }
+
+    #[test]
+    fn the_cost_gate_applies_to_the_hash_index_at_the_boundarys_share() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_index: CacheIndexKind::Hash,
+            cache_boundaries: vec![16],
+            ..cost_gate()
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        let tokens: Vec<u32> = (0..32).collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        // No holder yet: the expected wait places the first request on w1.
+        update_expected_wait_loads(&policy, &workers, &[0, 10]);
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
+        // w1 now holds the 16-token head, half the prompt: it is left once
+        // its queue is more than 16 tokens deeper than w2's.
+        update_expected_wait_loads(&policy, &workers, &[16, 0]);
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
+        update_expected_wait_loads(&policy, &workers, &[17, 0]);
+        assert_eq!(policy.select_worker(&workers, &info), Some(1));
+    }
+
+    #[test]
+    fn event_cost_gate_leaves_the_holder_for_a_cold_worker_only_past_the_prefix_it_saves() {
+        // w1 holds the request's one block (4 tokens at block 4); reports at
+        // 100 tokens/s: w1 is left once its queue is more than 4 tokens
+        // deeper than w2's, where the count gate keeps the hit on w1.
+        for (config, queued, pick) in [
+            (cost_gate(), [4, 0], 0),
+            (cost_gate(), [5, 0], 1),
+            (test_config(), [5, 0], 0),
+        ] {
+            let policy = CacheAwarePolicy::with_config(config);
+            let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+            policy.init_workers(&workers);
+            update_expected_wait_loads(&policy, &workers, &queued);
+            let monitor = Arc::new(KvEventMonitor::new());
+            let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]]);
+            monitor.indexers.insert("unknown".to_string(), indexer);
+            policy.set_kv_event_monitor(Some(monitor));
+            let tokens = [1, 2, 3, 4];
+            let info = SelectWorkerInfo {
+                tokens: Some(&tokens),
+                ..Default::default()
+            };
+            assert_eq!(
+                policy.select_worker(&workers, &info),
+                Some(pick),
+                "queued {queued:?}"
+            );
+        }
     }
 
     #[test]

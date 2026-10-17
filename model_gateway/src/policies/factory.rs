@@ -56,6 +56,7 @@ impl PolicyFactory {
                 cache_boundaries,
                 selection_policy,
                 selection_accounting_ttl_ms,
+                balance_cost_gate,
             } => {
                 let config = CacheAwareConfig {
                     cache_threshold: *cache_threshold,
@@ -73,6 +74,7 @@ impl PolicyFactory {
                     cache_boundaries: cache_boundaries.clone(),
                     selection_policy: selection_policy.clone(),
                     selection_accounting_ttl_ms: *selection_accounting_ttl_ms,
+                    balance_cost_gate: *balance_cost_gate,
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
             }
@@ -175,6 +177,7 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_cost_gate: false,
         });
         assert_eq!(policy.name(), "cache_aware");
 

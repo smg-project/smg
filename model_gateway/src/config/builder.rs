@@ -147,6 +147,7 @@ impl RouterConfigBuilder {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_cost_gate: false,
         };
         self
     }

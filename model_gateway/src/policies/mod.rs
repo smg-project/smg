@@ -167,6 +167,19 @@ pub struct CacheAwareConfig {
     /// per-request candidate gate; fires only together with
     /// `balance_abs_threshold`.
     pub balance_rel_threshold: f32,
+    /// The cost form of the spill gate (off by default). On, the request is
+    /// not kept on a matched worker until its in-flight count clears the two
+    /// margins above: every eligible worker is ranked on its expected wait
+    /// plus the prefill the request still needs there (a holder's uncached
+    /// share of the prompt, a cold worker's whole prompt, at the fleet's
+    /// nominal drain rate), so a holder is left for a colder worker exactly
+    /// when its wait exceeds the other's by more than the time the held
+    /// prefix saves, and a deep prefix is kept through a bigger gap than a
+    /// shallow one. The count margins then serve only the warm-up checks.
+    /// Needs backend load reports to be more than a count comparison;
+    /// without any it ranks in-flight counts plus the uncached work in
+    /// mean-prefill units.
+    pub balance_cost_gate: bool,
     pub eviction_interval_secs: u64,
     pub max_tree_size: usize,
     /// Backend KV cache block size (tokens per block) for event-driven routing.
@@ -228,6 +241,7 @@ impl Default for CacheAwareConfig {
             cache_threshold: 0.5,
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.1,
+            balance_cost_gate: false,
             eviction_interval_secs: 30,
             max_tree_size: 10000,
             block_size: 16,

@@ -768,6 +768,7 @@ class TestParseRouterArgs:
                 "cache-aware-default",
                 "--selection-accounting-ttl-ms",
                 "250",
+                "--balance-cost-gate",
             ]
         )
         assert router_args.worker_overload_shed is True
@@ -789,6 +790,7 @@ class TestParseRouterArgs:
         assert router_args.worker_warmup_divert_every == 4
         assert router_args.selection_policy == "cache-aware-default"
         assert router_args.selection_accounting_ttl_ms == 250
+        assert router_args.balance_cost_gate is True
 
         defaults = parse_router_args([])
         assert defaults.worker_overload_shed is False
@@ -803,6 +805,7 @@ class TestParseRouterArgs:
         assert defaults.worker_warmup_divert_every == 8
         assert defaults.selection_policy == "cache-aware-default"
         assert defaults.selection_accounting_ttl_ms == 0
+        assert defaults.balance_cost_gate is False
 
     def test_parse_tenancy_flags(self):
         """The tenancy flags of the Rust CLI reach RouterArgs: tenant header

@@ -306,6 +306,8 @@ class RouterArgs:
     assignment_mode: str | None = None
     backend: str = "sglang"
     balance_abs_threshold: int = 64
+    # The cost form of the cache-aware spill gate
+    balance_cost_gate: bool = False
     balance_rel_threshold: float = 1.5
     balance_token_usage_threshold: float = 1.0
     block_size: int = 16
@@ -997,6 +999,21 @@ class RouterArgs:
                 "Spill gate, relative part: a matched worker is skipped when its load exceeds"
                 " this multiple of the healthy-fleet mean AND the absolute threshold is also met."
                 " Finite, at least 1.0."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}balance-cost-gate",
+            action="store_true",
+            help=(
+                "Spill gate, cost form: a matched worker is left for another when its"
+                " expected wait exceeds the other's by more than the time the matched prefix"
+                " saves (every eligible worker ranked on its expected wait plus the prefill"
+                " the request still needs there), instead of when its in-flight count clears"
+                " the absolute and relative thresholds. The cost ranks the candidates on the"
+                " blocks they hold: overlap decay does not shape it, a selection policy's"
+                " group is re-ranked (its final pick stands), and a selection temperature"
+                " above 0 is refused with it. Needs backend load reports to be more"
+                " than a count comparison. Off by default."
             ),
         )
         routing_group.add_argument(

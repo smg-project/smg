@@ -464,6 +464,23 @@ struct RoutingArgs {
     )]
     balance_rel_threshold: f32,
 
+    /// Spill gate, cost form: a matched worker is left for another when its
+    /// expected wait exceeds the other's by more than the time the matched
+    /// prefix saves, instead of when its in-flight count clears
+    /// --balance-abs-threshold and --balance-rel-threshold. Every eligible
+    /// worker is ranked on its expected wait plus the prefill the request
+    /// still needs there (a holder's uncached share of the prompt, a cold
+    /// worker's whole prompt, at the fleet's nominal drain rate), so a deep
+    /// prefix is kept through a bigger wait gap than a shallow one and the
+    /// chosen worker is credited with the work it must do, never under the
+    /// mean prefill. The cost ranks the candidates on the blocks they hold:
+    /// --overlap-decay does not shape it, a selection policy's group is
+    /// re-ranked (its final pick stands), and a --selection-temperature
+    /// above 0 is refused with it. Needs backend load reports to be more
+    /// than a count comparison. Off by default
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    balance_cost_gate: bool,
+
     /// Seconds between the bucket policy's boundary adjustments (at least 1)
     #[arg(long, default_value_t = 5, help_heading = "Routing Policy")]
     bucket_adjust_interval_secs: usize,
@@ -2463,6 +2480,7 @@ impl CliArgs {
                 selection_policy: (self.routing.selection_policy != DEFAULT_SELECTION_POLICY)
                     .then(|| self.routing.selection_policy.clone()),
                 selection_accounting_ttl_ms: self.routing.selection_accounting_ttl_ms,
+                balance_cost_gate: self.routing.balance_cost_gate,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
@@ -5203,6 +5221,26 @@ mod tests {
                 assert_eq!(*cache_ttl_secs, 180);
                 assert!(cache_boundaries.is_empty());
             }
+            other => panic!("expected cache_aware policy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn balance_cost_gate_flag_reaches_the_cache_aware_policy_and_defaults_off() {
+        let on = cli_args_from(&["--balance-cost-gate"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        match &on.policy {
+            PolicyConfig::CacheAware {
+                balance_cost_gate, ..
+            } => assert!(*balance_cost_gate),
+            other => panic!("expected cache_aware policy, got {other:?}"),
+        }
+        let off = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        match &off.policy {
+            PolicyConfig::CacheAware {
+                balance_cost_gate, ..
+            } => assert!(!*balance_cost_gate),
             other => panic!("expected cache_aware policy, got {other:?}"),
         }
     }

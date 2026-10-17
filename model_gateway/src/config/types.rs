@@ -1158,6 +1158,19 @@ pub enum PolicyConfig {
         /// `balance_abs_threshold`.
         #[serde(alias = "spill_rel_threshold")]
         balance_rel_threshold: f32,
+        /// Spill gate, cost form (default `false`): a matched worker is left
+        /// for another when its expected wait exceeds the other's by more
+        /// than the time the matched prefix saves (every eligible worker
+        /// ranked on its expected wait plus the prefill the request still
+        /// needs there, at the fleet's nominal drain rate), instead of when
+        /// its in-flight count clears `balance_abs_threshold` and
+        /// `balance_rel_threshold`. The cost ranks the candidates on the
+        /// blocks they hold: `overlap_decay` does not shape it, a selection
+        /// policy's group is re-ranked (its final pick stands), and a
+        /// `selection_temperature` above 0 is refused with it. Needs backend
+        /// load reports to be more than a count comparison.
+        #[serde(default)]
+        balance_cost_gate: bool,
         eviction_interval_secs: u64,
         max_tree_size: usize,
         #[serde(default = "default_block_size")]
@@ -2560,6 +2573,7 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_cost_gate: false,
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -2592,6 +2606,7 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_cost_gate: false,
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
@@ -2625,6 +2640,7 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_cost_gate: false,
         };
 
         match cache_aware {
@@ -2670,6 +2686,43 @@ mod tests {
             }
             _ => panic!("Expected CacheAware"),
         }
+    }
+
+    #[test]
+    fn test_cache_aware_cost_gate_defaults_off_when_absent_and_round_trips() {
+        let json = r#"{
+            "type": "cache_aware",
+            "cache_threshold": 0.5,
+            "balance_abs_threshold": 32,
+            "balance_rel_threshold": 1.1,
+            "eviction_interval_secs": 60,
+            "max_tree_size": 1000
+        }"#;
+        match serde_json::from_str(json).unwrap() {
+            PolicyConfig::CacheAware {
+                balance_cost_gate, ..
+            } => assert!(!balance_cost_gate),
+            _ => panic!("Expected CacheAware"),
+        }
+
+        let json = r#"{
+            "type": "cache_aware",
+            "cache_threshold": 0.5,
+            "balance_abs_threshold": 32,
+            "balance_rel_threshold": 1.1,
+            "balance_cost_gate": true,
+            "eviction_interval_secs": 60,
+            "max_tree_size": 1000
+        }"#;
+        let policy: PolicyConfig = serde_json::from_str(json).unwrap();
+        match &policy {
+            PolicyConfig::CacheAware {
+                balance_cost_gate, ..
+            } => assert!(*balance_cost_gate),
+            _ => panic!("Expected CacheAware"),
+        }
+        let serialized = serde_json::to_string(&policy).unwrap();
+        assert!(serialized.contains("\"balance_cost_gate\":true"));
     }
 
     #[test]
@@ -3321,6 +3374,7 @@ discovery:
                 cache_boundaries: Vec::new(),
                 selection_policy: None,
                 selection_accounting_ttl_ms: 0,
+                balance_cost_gate: false,
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -3362,6 +3416,7 @@ discovery:
                 cache_boundaries: Vec::new(),
                 selection_policy: None,
                 selection_accounting_ttl_ms: 0,
+                balance_cost_gate: false,
             }),
             decode_policy: None,
         };
@@ -3429,6 +3484,7 @@ discovery:
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_cost_gate: false,
         };
 
         match pd.get_prefill_policy(&main_policy) {

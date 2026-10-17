@@ -513,6 +513,48 @@ impl LeastLoadPolicy {
         info: &SelectWorkerInfo,
         policy: &'static str,
     ) -> Option<usize> {
+        self.select_min_wait(workers, candidates, None, info, policy)
+    }
+
+    /// Argmin over `candidates` of the expected wait plus the work the
+    /// request itself adds at each worker: `cached_share[i]` is the share of
+    /// the prompt `candidates[i]` already holds in its cache (0 for a cold
+    /// worker, 1 for a prompt cached whole), so the worker still has
+    /// `request_tokens × (1 − share)` to prefill before the request's first
+    /// token. That work is priced like the queued work ahead of it, at the
+    /// fleet's nominal drain rate (a dark fleet, scored in requests, prices
+    /// it in mean-prefill units). A holder is therefore left for a colder
+    /// worker exactly when the holder's wait exceeds the other's by more
+    /// than the time the held prefix saves. Equal totals go to the warmer
+    /// worker, then to the draw. The winner is credited with the work it
+    /// must do, not the whole prompt. The waiting-queue veto, the critical
+    /// section and the tie draw are those of
+    /// [`Self::select_min_expected_wait`].
+    pub(super) fn select_min_total_wait(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        candidates: &[usize],
+        cached_share: &[f64],
+        info: &SelectWorkerInfo,
+        policy: &'static str,
+    ) -> Option<usize> {
+        debug_assert_eq!(candidates.len(), cached_share.len());
+        self.select_min_wait(workers, candidates, Some(cached_share), info, policy)
+    }
+
+    /// The shared body of the two selections above: `cached_share`, when
+    /// given, adds each candidate's own uncached work to its score and sets
+    /// the winner's credit to that work, never under the mean prefill (the
+    /// price a report puts on a running request), so a run of cached hits
+    /// within one poll interval still moves the home's score.
+    fn select_min_wait(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        candidates: &[usize],
+        cached_share: Option<&[f64]>,
+        info: &SelectWorkerInfo,
+        policy: &'static str,
+    ) -> Option<usize> {
         let snapshot = self.snapshot();
         let snapshot = snapshot.as_deref();
 
@@ -530,16 +572,16 @@ impl LeastLoadPolicy {
         // requests dispatched since their last report and the requests the
         // router holds on them beyond the report, has reached the cap.
         // Workers without a report stay eligible — there is no queue
-        // evidence to veto on, and a dark fleet must keep routing.
+        // evidence to veto on, and a dark fleet must keep routing. The
+        // positions kept are into `candidates`, so each keeps its share.
         let capped: Vec<usize>;
-        let candidates = if self.max_waiting_requests == 0 {
-            candidates
+        let positions: &[usize] = if self.max_waiting_requests == 0 {
+            &[]
         } else {
             let cap = self.max_waiting_requests as u64;
-            capped = candidates
-                .iter()
-                .copied()
-                .filter(|&i| {
+            capped = (0..candidates.len())
+                .filter(|&pos| {
+                    let i = candidates[pos];
                     let url = workers[i].url();
                     match Self::fresh_load(snapshot, url) {
                         Some(load) => {
@@ -565,16 +607,53 @@ impl LeastLoadPolicy {
                 .collect();
             &capped
         };
+        let scored: Vec<usize>;
+        let (candidates, shares): (&[usize], Option<Vec<f64>>) = if self.max_waiting_requests == 0 {
+            (candidates, cached_share.map(<[f64]>::to_vec))
+        } else {
+            scored = positions.iter().map(|&pos| candidates[pos]).collect();
+            (
+                &scored,
+                cached_share.map(|shares| positions.iter().map(|&pos| shares[pos]).collect()),
+            )
+        };
         let (&first, rest) = candidates.split_first()?;
 
         let inputs = self.score_inputs(workers, candidates, snapshot, &inflight);
+
+        // The request's own work at the candidate in position `pos`: the
+        // whole prompt, or the uncached share of it when shares are given;
+        // and that work in the score's unit (seconds at the nominal drain
+        // rate; requests, in mean-prefill units, over a dark fleet).
+        let request_work = self.request_tokens(info);
+        let own_tokens = |pos: usize| -> u64 {
+            match &shares {
+                Some(shares) => {
+                    (request_work as f64 * (1.0 - shares[pos].clamp(0.0, 1.0))).round() as u64
+                }
+                None => request_work,
+            }
+        };
+        let own_wait = |pos: usize| -> f64 {
+            if shares.is_none() {
+                return 0.0;
+            }
+            let tokens = own_tokens(pos) as f64;
+            if inputs.fleet_has_loads {
+                tokens / inputs.nominal_throughput
+            } else {
+                tokens / f64::from(self.mean_prefill_tokens)
+            }
+        };
+        let share_of = |pos: usize| shares.as_ref().map_or(0.0, |shares| shares[pos]);
 
         // Argmin with reservoir tie-breaking: workers within
         // `TIE_EPSILON_SECS` of the minimum (the common idle/homogeneous case
         // scores equal to the digit) are sampled uniformly instead of
         // first-index-wins, which herded ties onto one worker.
-        let observe_score = |idx: usize, score: f64| {
+        let observe_score = |pos: usize, score: f64| {
             if cache_trace::enabled() {
+                let idx = candidates[pos];
                 let url = workers[idx].url();
                 let load = Self::fresh_load(snapshot, url);
                 cache_trace::score(serde_json::json!({
@@ -591,38 +670,64 @@ impl LeastLoadPolicy {
                         Self::unaccounted_requests(&workers[idx], load, since_poll)
                     }),
                     "fresh_load": load.is_some(),
+                    "cached_share": shares.as_ref().map(|shares| shares[pos]),
+                    "own_work_tokens": shares.as_ref().map(|_| own_tokens(pos)),
+                    "own_wait": shares.as_ref().map(|_| own_wait(pos)),
                 }));
             }
         };
+        let mut best_pos = 0usize;
         let mut best = first;
-        let mut best_score = self.score(&workers[best], &inputs);
-        observe_score(best, best_score);
+        let mut best_score = self.score(&workers[best], &inputs) + own_wait(0);
+        observe_score(0, best_score);
         let mut tied = 1u32;
-        for &idx in rest {
-            let s = self.score(&workers[idx], &inputs);
-            observe_score(idx, s);
+        for (offset, &idx) in rest.iter().enumerate() {
+            let pos = offset + 1;
+            let s = self.score(&workers[idx], &inputs) + own_wait(pos);
+            observe_score(pos, s);
             if s < best_score - TIE_EPSILON_SECS {
+                best_pos = pos;
                 best = idx;
                 best_score = s;
                 tied = 1;
             } else if (s - best_score).abs() <= TIE_EPSILON_SECS {
-                // Keep each tying candidate with probability 1/k so the final
-                // pick is uniform over all ties without collecting them.
-                tied += 1;
-                best_score = best_score.min(s);
-                if self.tie_draw(tied) == 0 {
+                // Equal totals go to the warmer worker (the one with more of
+                // the prompt cached: its affinity is kept for the turns to
+                // come); between equally warm ones, keep each tying
+                // candidate with probability 1/k so the final pick is
+                // uniform over all ties without collecting them.
+                let warmer = share_of(pos) - share_of(best_pos);
+                if warmer > 0.0 {
+                    best_pos = pos;
                     best = idx;
+                    best_score = best_score.min(s);
+                    tied = 1;
+                } else if warmer == 0.0 {
+                    tied += 1;
+                    best_score = best_score.min(s);
+                    if self.tie_draw(tied) == 0 {
+                        best_pos = pos;
+                        best = idx;
+                    }
                 }
             }
         }
 
         // In-flight correction: credit the chosen worker with this request's
-        // token-work until its next poll refreshes the snapshot.
-        let req_tokens = self.request_tokens(info);
+        // token-work until its next poll refreshes the snapshot: the part it
+        // must still prefill, when the shares are known, and never less than
+        // the mean prefill, the price a report puts on a running request. A
+        // hit cached whole would otherwise credit nothing, and every arrival
+        // of one poll interval would land on the home before its next
+        // report, the incast this correction exists to prevent.
+        let credited_tokens = match &shares {
+            Some(_) => own_tokens(best_pos).max(u64::from(self.mean_prefill_tokens)),
+            None => own_tokens(best_pos),
+        };
         inflight
             .entry(workers[best].url().to_string())
             .or_default()
-            .record(Instant::now(), req_tokens);
+            .record(Instant::now(), credited_tokens);
         drop(inflight);
 
         debug!(
@@ -1355,6 +1460,150 @@ mod tests {
         // a: 8000/100 = 80s ; b: 1000/100 = 10s -> pick b.
         assert_eq!(
             policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn total_wait_ranks_the_queue_plus_the_work_each_worker_still_has_to_do() {
+        // Three workers at 100 tokens/s and equal KV; the prompt is 64
+        // tokens: a holds none of it, b half, c all. Totals in seconds:
+        // queue / 100 plus the uncached tokens / 100. The winner is
+        // credited its uncached work, never under the mean prefill (4 here).
+        let policy =
+            LeastLoadPolicy::with_params(DEFAULT_KV_PRESSURE_WEIGHT, 4, DEFAULT_THROUGHPUT, 0);
+        let feed = TestFeed::attached_to(&policy);
+        let workers = vec![
+            mk("http://a:8000"),
+            mk("http://b:8000"),
+            mk("http://c:8000"),
+        ];
+        let tokens: Vec<u32> = (0..64).collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        let shares = [0.0, 0.5, 1.0];
+        // (queued tokens per worker) -> the pick and the tokens it is credited.
+        for (queued, pick, credited) in [
+            // a 0.64, b 0.30 + 0.32, c 0.50: c, with nothing to prefill,
+            // credited the mean-prefill floor.
+            ([0, 30, 50], 2, 4),
+            // c at 0.70: b.
+            ([0, 30, 70], 1, 32),
+            // b at 0.60 + 0.32: a, with the whole prompt to do.
+            ([0, 60, 70], 0, 64),
+        ] {
+            let loads = workers
+                .iter()
+                .zip(queued)
+                .map(|(worker, queued)| (worker.url().to_string(), make_load(queued, 0.2, 100.0)))
+                .collect();
+            feed.publish(&loads);
+            let selected =
+                policy.select_min_total_wait(&workers, &[0, 1, 2], &shares, &info, "test");
+            assert_eq!(selected, Some(pick), "queued {queued:?}");
+            assert_eq!(
+                policy.load_state_for_test(workers[pick].url()),
+                (true, credited, 1),
+                "credit, queued {queued:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn equal_total_waits_go_to_the_warmer_worker() {
+        // a: a 32-token queue and the 32-token prompt cached whole; b: an
+        // empty queue and none of it. Both total 0.32 s: a keeps the
+        // request, no draw.
+        let policy = LeastLoadPolicy::new();
+        let feed = TestFeed::attached_to(&policy);
+        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        feed.publish(&HashMap::from([
+            (workers[0].url().to_string(), make_load(32, 0.2, 100.0)),
+            (workers[1].url().to_string(), make_load(0, 0.2, 100.0)),
+        ]));
+        let tokens: Vec<u32> = (0..32).collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        assert_eq!(
+            policy.select_min_total_wait(&workers, &[0, 1], &[1.0, 0.0], &info, "test"),
+            Some(0)
+        );
+        // The plain selection, which gives no credit for the cache, would
+        // have found a's queue the deeper.
+        assert_eq!(policy.select_worker(&workers, &info), Some(1));
+    }
+
+    #[test]
+    fn a_run_of_full_hits_leaves_the_home_before_the_next_report() {
+        // a holds the 32-token prompt whole, b none of it, both queues
+        // empty, no report between the picks. Each hit costs a nothing to
+        // prefill, but is credited the mean prefill (16 here) like any
+        // dispatch, so a's score climbs and the gate opens within the poll
+        // interval: b is left with the prompt to prefill once a's lead
+        // passes the 32 tokens the prefix saves, then a is preferred again.
+        let policy =
+            LeastLoadPolicy::with_params(DEFAULT_KV_PRESSURE_WEIGHT, 16, DEFAULT_THROUGHPUT, 0);
+        let feed = TestFeed::attached_to(&policy);
+        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        feed.publish(&HashMap::from([
+            (workers[0].url().to_string(), make_load(0, 0.2, 100.0)),
+            (workers[1].url().to_string(), make_load(0, 0.2, 100.0)),
+        ]));
+        let tokens: Vec<u32> = (0..32).collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        let picks: Vec<usize> = (0..20)
+            .map(|_| {
+                let pick = policy
+                    .select_min_total_wait(&workers, &[0, 1], &[1.0, 0.0], &info, "test")
+                    .expect("two candidates");
+                workers[pick].increment_load();
+                pick
+            })
+            .collect();
+        assert_eq!(picks[0], 0, "the home takes the first hit");
+        assert_eq!(
+            picks[..3],
+            [0, 0, 0],
+            "a credit of 16 per hit opens the gate only past the 32 tokens saved"
+        );
+        assert!(
+            picks.contains(&1),
+            "the home is left before the next report"
+        );
+        let to_home = picks.iter().filter(|&&pick| pick == 0).count();
+        assert!(
+            to_home > picks.len() - to_home,
+            "and still takes most of the run"
+        );
+    }
+
+    #[test]
+    fn a_dark_fleet_prices_the_work_in_mean_prefill_units() {
+        // No report anywhere: the score is the in-flight count, and the
+        // uncached work counts tokens / mean_prefill_tokens (1024). a holds
+        // the 512-token prompt whole, b none: idle, a wins (0 against 0.5);
+        // with one request on a, b wins (1 against 0.5).
+        let policy = LeastLoadPolicy::new();
+        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let tokens: Vec<u32> = (0..512).collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        assert_eq!(
+            policy.select_min_total_wait(&workers, &[0, 1], &[1.0, 0.0], &info, "test"),
+            Some(0)
+        );
+        workers[0].increment_load();
+        assert_eq!(
+            policy.select_min_total_wait(&workers, &[0, 1], &[1.0, 0.0], &info, "test"),
             Some(1)
         );
     }
