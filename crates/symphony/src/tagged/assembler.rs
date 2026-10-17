@@ -200,7 +200,7 @@ impl Assembler {
             let source = Text::uncounted(std::mem::take(&mut self.carried));
             self.close_object(source, out);
             self.carried = held;
-            self.leftover(MalformedReason::ClosedBeforeTheName, out);
+            self.leftover(MalformedReason::TagCutShort, out);
         } else if self.open_string() {
             // The newline held as the template's and the start of a tag ride in the one word; the
             // marker's bytes are the region's.
@@ -208,8 +208,17 @@ impl Assembler {
             end_cut_call(self.index, std::mem::take(&mut self.carried), "", out);
             return;
         } else {
+            // The call's name is complete: what the close cut short is the key being written, a
+            // value held for its close, or a second function tag, a call that closed before its
+            // name closed.
+            let why = match self.stage {
+                Stage::ParameterName { .. } => MalformedReason::KeyCutShort,
+                Stage::Value(_) => MalformedReason::ValueCutShort,
+                Stage::FunctionName { .. } => MalformedReason::ClosedBeforeTheName,
+                Stage::Opening | Stage::Between => MalformedReason::TagCutShort,
+            };
             self.carried.push_str(&held);
-            self.report_tag(MalformedReason::ClosedBeforeTheName, out);
+            self.report_tag(why, out);
             self.close_object(Text::default(), out);
         }
         out.push(Event::ToolCallEnd {
@@ -1212,7 +1221,7 @@ mod tests {
             malformed(&events),
             vec![(
                 "<parameter=limit>\n5".to_string(),
-                MalformedReason::ClosedBeforeTheName
+                MalformedReason::ValueCutShort
             )]
         );
         assert_eq!(dropped(&events), vec!["\n"]);
@@ -1223,7 +1232,7 @@ mod tests {
             malformed(&events),
             vec![(
                 "<parameter=note>\nnul".to_string(),
-                MalformedReason::ClosedBeforeTheName
+                MalformedReason::ValueCutShort
             )]
         );
         // Inside a key, and a tag the scanner held between parameters: the same.
@@ -1231,10 +1240,7 @@ mod tests {
         assert_eq!(arguments(&events), "{}");
         assert_eq!(
             malformed(&events),
-            vec![(
-                "<parameter=ci".to_string(),
-                MalformedReason::ClosedBeforeTheName
-            )]
+            vec![("<parameter=ci".to_string(), MalformedReason::KeyCutShort)]
         );
         let events = closed(&["<function=f>\n<param"]);
         assert_eq!(
@@ -1243,7 +1249,7 @@ mod tests {
                 fragment("{}", "\n"),
                 Event::Malformed {
                     text: Text::uncounted("<param"),
-                    why: MalformedReason::ClosedBeforeTheName,
+                    why: MalformedReason::TagCutShort,
                 },
                 end(""),
             ]
