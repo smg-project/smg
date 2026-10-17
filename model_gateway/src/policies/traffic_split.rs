@@ -4,8 +4,9 @@
 //! weight with `traffic_weight`; a worker without a group is in the group
 //! [`DEFAULT_GROUP`], which weighs [`DEFAULT_WEIGHT`] when none of its
 //! workers carries a weight. A named group weighs the highest weight among
-//! its available workers and nothing without one, so label every worker of
-//! a named group: its weight never silently becomes the default when the
+//! its available workers, and every worker of a named group carries one
+//! (registration and update refuse a named group without a weight), so a
+//! group's weight never silently becomes the default, or nothing, when the
 //! worker carrying it is down. The split runs before the routing policy:
 //! with two or more groups among a request's available candidates, one
 //! group is picked by weight and the configured policy (and the sticky
@@ -17,8 +18,10 @@
 //! labels, and a weight of 0 drains a group while it stays registered.
 //!
 //! The split confines the regular selection and the prefill and decode legs
-//! of a disaggregated pair, whose decode follows the prefill's group (see
-//! `PolicyRegistry::select_worker_for_model_following`). The encode leg of
+//! of a disaggregated pair, whose decode follows the group the prefill leg
+//! was split into (see `PolicyRegistry::select_worker_for_model_split`; a
+//! prefill pool of one group leaves the decode leg to its own split, so a
+//! canary only the decode pool carries keeps its share). The encode leg of
 //! an encode-prefill-decode deployment keys every media item by its content
 //! hash over all encode workers and is not confined: a weight of 0 does not
 //! drain an encode worker.
@@ -37,8 +40,9 @@ pub const WEIGHT_LABEL: &str = "traffic_weight";
 pub const DEFAULT_GROUP: &str = "default";
 /// The weight of the default group when none of its workers carries one: a
 /// canary labelled `traffic_weight=5` next to an unlabelled fleet takes
-/// about 5 %. A named group has no default: it weighs what its available
-/// workers carry, and nothing without one.
+/// about 5 %. A named group has no default: every worker of one carries a
+/// weight ([`validate_label_set`] refuses one without), and the group weighs
+/// the highest among its available workers.
 pub const DEFAULT_WEIGHT: u32 = 100;
 /// The largest weight accepted.
 pub const MAX_WEIGHT: u32 = 1_000_000;
@@ -67,8 +71,10 @@ pub fn validate_group_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The rules of both labels over a worker's label set, each named in its
-/// error; labels that are absent pass.
+/// The shape of both labels over a worker's label set, each named in its
+/// error; labels that are absent pass. The check for a partial set, such as
+/// a `PATCH` that sends one label onto a worker that has the other; a whole
+/// set is held to [`validate_label_set`].
 pub fn validate_labels(labels: &HashMap<String, String>) -> Result<(), String> {
     if let Some(group) = labels.get(GROUP_LABEL) {
         validate_group_name(group).map_err(|why| format!("label '{GROUP_LABEL}' {why}"))?;
@@ -77,6 +83,31 @@ pub fn validate_labels(labels: &HashMap<String, String>) -> Result<(), String> {
         parse_weight(weight).map_err(|why| format!("label '{WEIGHT_LABEL}' {why}"))?;
     }
     Ok(())
+}
+
+/// The rule a worker's whole label set adds to [`validate_labels`]: a
+/// `traffic_group` other than [`DEFAULT_GROUP`] carries a `traffic_weight`,
+/// since a named group weighs only what its workers carry (a stable fleet
+/// labelled without a weight would otherwise hand a canary every request).
+/// `PATCH` merges and never removes labels, so a set that passed at
+/// registration keeps passing.
+pub fn validate_named_group_has_weight(labels: &HashMap<String, String>) -> Result<(), String> {
+    if let Some(group) = labels.get(GROUP_LABEL) {
+        if group != DEFAULT_GROUP && !labels.contains_key(WEIGHT_LABEL) {
+            return Err(format!(
+                "label '{GROUP_LABEL}' {group:?} needs a '{WEIGHT_LABEL}': a named group weighs \
+                 only what its workers carry"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Both rules over a worker's whole label set: at registration, and over the
+/// merged set an update leaves on the worker.
+pub fn validate_label_set(labels: &HashMap<String, String>) -> Result<(), String> {
+    validate_labels(labels)?;
+    validate_named_group_has_weight(labels)
 }
 
 /// One group of a split: its name, the weight it carries and the positions
@@ -327,6 +358,45 @@ mod tests {
         labels.insert(WEIGHT_LABEL.to_string(), "5".to_string());
         labels.insert(GROUP_LABEL.to_string(), "no spaces".to_string());
         let err = validate_labels(&labels).unwrap_err();
+        assert!(err.starts_with("label 'traffic_group' must be"), "{err}");
+    }
+
+    /// A whole label set with a named group needs the weight: a stable
+    /// fleet labelled without one next to a canary at 5 would hand the
+    /// canary every request, so the stable workers are refused.
+    #[test]
+    fn a_whole_label_set_with_a_named_group_needs_a_weight() {
+        let stable: HashMap<String, String> =
+            [(GROUP_LABEL.to_string(), "stable".to_string())].into();
+        let canary: HashMap<String, String> = [
+            (GROUP_LABEL.to_string(), "canary".to_string()),
+            (WEIGHT_LABEL.to_string(), "5".to_string()),
+        ]
+        .into();
+        assert_eq!(validate_label_set(&canary), Ok(()));
+        assert_eq!(
+            validate_label_set(&stable),
+            Err(
+                "label 'traffic_group' \"stable\" needs a 'traffic_weight': a named group \
+                 weighs only what its workers carry"
+                    .to_string()
+            )
+        );
+        // The partial check, for a PATCH onto a worker that has the weight,
+        // passes the group alone.
+        assert_eq!(validate_labels(&stable), Ok(()));
+        // The default group, named or implied, needs none.
+        let default_named: HashMap<String, String> =
+            [(GROUP_LABEL.to_string(), DEFAULT_GROUP.to_string())].into();
+        assert_eq!(validate_label_set(&default_named), Ok(()));
+        assert_eq!(validate_label_set(&HashMap::new()), Ok(()));
+        // The shape rules run first.
+        let bad: HashMap<String, String> = [
+            (GROUP_LABEL.to_string(), "two words".to_string()),
+            (WEIGHT_LABEL.to_string(), "5".to_string()),
+        ]
+        .into();
+        let err = validate_label_set(&bad).unwrap_err();
         assert!(err.starts_with("label 'traffic_group' must be"), "{err}");
     }
 

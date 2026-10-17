@@ -1978,9 +1978,15 @@ impl WorkerSelectionStage {
             role: WorkerRole::Prefill,
             overload_lifted: false,
         };
-        let prefill_idx = self
+        let (prefill_idx, prefill_group) = self
             .policy_registry
-            .select_worker_for_model(&prefill_policy, model_id, &available_prefill, &info)
+            .select_worker_for_model_split(
+                &prefill_policy,
+                model_id,
+                &available_prefill,
+                &info,
+                None,
+            )
             .ok_or(EpdSelectionFailure::Unavailable)?;
         if prefill_capacity
             .is_some_and(|capacity| !capacity.has_capacity(&available_prefill[prefill_idx]))
@@ -1988,18 +1994,18 @@ impl WorkerSelectionStage {
             return Err(EpdSelectionFailure::PrefillAtCapacity);
         }
         info.role = WorkerRole::Decode;
-        // The decode follows the prefill's traffic group, so a pair never
-        // spans two groups (see `PolicyRegistry::select_worker_for_model_following`).
-        let decode_idx = self
+        // The decode follows the traffic group the prefill leg was split
+        // into, so a pair never spans two groups; an unsplit prefill leaves
+        // it to decide for itself (see
+        // `PolicyRegistry::select_worker_for_model_split`).
+        let (decode_idx, _) = self
             .policy_registry
-            .select_worker_for_model_following(
+            .select_worker_for_model_split(
                 &decode_policy,
                 model_id,
                 &available_decode,
                 &info,
-                Some(traffic_split::group_of(
-                    available_prefill[prefill_idx].as_ref(),
-                )),
+                prefill_group,
             )
             .ok_or(EpdSelectionFailure::Unavailable)?;
 

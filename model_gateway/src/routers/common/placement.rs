@@ -1125,8 +1125,8 @@ pub(crate) fn select_pair(
             verdict: PlacementFailure::PolicyDeclined(policy),
         })
     };
-    let Some(prefill_idx) =
-        policies.select_worker_for_model(&prefill_policy, model_id, &prefill, &info)
+    let Some((prefill_idx, prefill_group)) =
+        policies.select_worker_for_model_split(&prefill_policy, model_id, &prefill, &info, None)
     else {
         // A policy that declines a lifted pool all over the thresholds: the
         // least-loaded default steers it, as it steers any other such pool.
@@ -1170,15 +1170,15 @@ pub(crate) fn select_pair(
     // A decode pool all over the thresholds pairs by load, as the default
     // paired it: the least-loaded of the pick's partners, counted as a veto
     // fallback and not as a selection of the decode policy. Any other keeps
-    // the veto for its policy. Either way the decode follows the prefill's
-    // traffic group, so a pair never spans two groups (see
-    // `PolicyRegistry::select_worker_for_model_following`).
-    let prefill_group = traffic_split::group_of(selected_prefill.as_ref());
+    // the veto for its policy. Either way the decode follows the traffic
+    // group the prefill leg was split into, so a pair never spans two groups;
+    // an unsplit prefill leaves it to decide for itself (see
+    // `PolicyRegistry::select_worker_for_model_split`).
     let selected_decode = if lift_decode {
         overload::least_loaded_uniform(
-            decode
-                .iter()
-                .filter(|d| traffic_split::group_of(d.as_ref()) == prefill_group),
+            decode.iter().filter(|d| {
+                prefill_group.is_none_or(|group| traffic_split::group_of(d.as_ref()) == group)
+            }),
             &mut rand::rng(),
         )
         .cloned()
@@ -1186,14 +1186,14 @@ pub(crate) fn select_pair(
     } else {
         info.role = WorkerRole::Decode;
         info.overload_lifted = false;
-        match policies.select_worker_for_model_following(
+        match policies.select_worker_for_model_split(
             &decode_policy,
             model_id,
             &decode,
             &info,
-            Some(prefill_group),
+            prefill_group,
         ) {
-            Some(decode_idx) => decode[decode_idx].clone(),
+            Some((decode_idx, _)) => decode[decode_idx].clone(),
             None => return Err(declined(WorkerRole::Decode, decode_policy.name())),
         }
     };
