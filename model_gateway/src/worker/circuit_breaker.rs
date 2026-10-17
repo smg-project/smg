@@ -265,41 +265,54 @@ impl CircuitBreaker {
         }
     }
 
-    /// Transition to a new state (uses CAS for lock-free operation)
+    /// Move to `new_state` by a swap: the counters' own moves (a trip, a
+    /// close, a forced open, a reset). A swap onto the same state is no
+    /// transition and leaves no trace.
     fn transition_to(&self, new_state: CircuitState) {
-        let new_state_int = new_state.as_int();
-        let old_state_int = self.state.swap(new_state_int, Ordering::AcqRel);
-        let old_state = CircuitState::from_int(old_state_int);
-
+        let old_state =
+            CircuitState::from_int(self.state.swap(new_state.as_int(), Ordering::AcqRel));
         if old_state != new_state {
-            self.last_state_change_ms.store(now_ms(), Ordering::Release);
+            self.entered(old_state, new_state, None);
+        }
+    }
 
-            match new_state {
-                CircuitState::Closed => {
-                    self.consecutive_failures.store(0, Ordering::Release);
-                    self.consecutive_successes.store(0, Ordering::Release);
-                }
-                CircuitState::Open => {
-                    self.consecutive_successes.store(0, Ordering::Release);
-                }
-                CircuitState::HalfOpen => {
-                    self.consecutive_failures.store(0, Ordering::Release);
-                    self.consecutive_successes.store(0, Ordering::Release);
-                }
+    /// The bookkeeping of a state the circuit has just entered, whichever
+    /// path moved it: the change's timestamp, the counters the new state
+    /// starts with (an open circuit keeps its failure streak, a closed one
+    /// and a trial start clean), the transition log line (with `cause` when
+    /// something other than the counters moved the circuit), the transition
+    /// counter, and the gauges.
+    fn entered(&self, from: CircuitState, to: CircuitState, cause: Option<&'static str>) {
+        self.last_state_change_ms.store(now_ms(), Ordering::Release);
+        match to {
+            CircuitState::Closed | CircuitState::HalfOpen => {
+                self.consecutive_failures.store(0, Ordering::Release);
+                self.consecutive_successes.store(0, Ordering::Release);
             }
+            CircuitState::Open => {
+                self.consecutive_successes.store(0, Ordering::Release);
+            }
+        }
 
-            let from = old_state.as_str();
-            let to = new_state.as_str();
-            info!(
+        let (from, to) = (from.as_str(), to.as_str());
+        match cause {
+            Some(cause) => info!(
+                worker_url = %self.metric_label,
+                from,
+                to,
+                cause,
+                "Circuit breaker state transition: {from} -> {to}"
+            ),
+            None => info!(
                 worker_url = %self.metric_label,
                 from,
                 to,
                 "Circuit breaker state transition: {from} -> {to}"
-            );
-            Metrics::record_worker_cb_transition(&self.metric_label, from, to);
-            self.publish_state_gauge();
-            self.publish_gauge_metrics();
+            ),
         }
+        Metrics::record_worker_cb_transition(&self.metric_label, from, to);
+        self.publish_state_gauge();
+        self.publish_gauge_metrics();
     }
 
     /// Get the number of consecutive failures
@@ -340,7 +353,9 @@ impl CircuitBreaker {
         Duration::from_millis(elapsed_ms)
     }
 
-    /// Reset the circuit breaker to closed state
+    /// Reset the circuit breaker to closed state. A circuit that is closed
+    /// already makes no transition, so the counters are zeroed and the gauges
+    /// published here as well.
     pub fn reset(&self) {
         self.transition_to(CircuitState::Closed);
         self.consecutive_failures.store(0, Ordering::Release);
@@ -388,20 +403,7 @@ impl CircuitBreaker {
         {
             return false;
         }
-        self.last_state_change_ms.store(now_ms(), Ordering::Release);
-        self.consecutive_failures.store(0, Ordering::Release);
-        self.consecutive_successes.store(0, Ordering::Release);
-
-        info!(
-            worker_url = %self.metric_label,
-            from = "open",
-            to = "half_open",
-            cause,
-            "Circuit breaker state transition: open -> half_open"
-        );
-        Metrics::record_worker_cb_transition(&self.metric_label, "open", "half_open");
-        self.publish_state_gauge();
-        self.publish_gauge_metrics();
+        self.entered(CircuitState::Open, CircuitState::HalfOpen, Some(cause));
         true
     }
 
@@ -836,5 +838,48 @@ mod tests {
         }
 
         assert_eq!(cb.total_failures(), 1000);
+    }
+
+    /// The swap path (a trip, a close) and the CAS path (the trial) leave
+    /// the same bookkeeping behind: a fresh state-change timestamp and the
+    /// counters the entered state starts with.
+    #[test]
+    fn both_entry_paths_leave_the_same_bookkeeping() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 1,
+            timeout_duration: Duration::from_secs(3600),
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::with_config_and_label(config, "worker".to_string());
+        let settle = Duration::from_millis(100);
+
+        cb.record_success();
+        cb.record_failure(); // the swap path: closed -> open keeps the failure streak
+        assert_eq!(cb.state(), CircuitState::Open);
+        assert_eq!(
+            (cb.consecutive_failures(), cb.consecutive_successes()),
+            (1, 0)
+        );
+
+        thread::sleep(settle);
+        let since_open = cb.time_since_last_state_change();
+        assert!(cb.try_half_open()); // the CAS path: open -> half_open starts clean
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        assert_eq!(
+            (cb.consecutive_failures(), cb.consecutive_successes()),
+            (0, 0)
+        );
+        assert!(cb.time_since_last_state_change() < since_open);
+
+        thread::sleep(settle);
+        let since_trial = cb.time_since_last_state_change();
+        cb.record_success(); // the swap path again: half_open -> closed starts clean
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert_eq!(
+            (cb.consecutive_failures(), cb.consecutive_successes()),
+            (0, 0)
+        );
+        assert!(cb.time_since_last_state_change() < since_trial);
     }
 }
