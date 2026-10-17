@@ -1939,26 +1939,6 @@ async fn decode_video_with_ffmpeg(
     // A probe that fails leaves the clip to the metadata-less runner, which
     // reads the stream as it comes.
     let metadata = probe_video_metadata(input_path).await.ok();
-    // A probe that states no size (ffprobe's `0x0` for a stream whose codec
-    // parameters it could not find; the decoder still decodes it, its filter
-    // graph set up from the first frame) frames nothing for the headed and
-    // raw runners and counts no pixels for the work cap. The clip keeps the
-    // probe's frames and duration, so it gets its selection, and goes
-    // straight to the PNG runner, whose frames carry their own size: the
-    // decode ends at the selection's last pick, under the process budget,
-    // never on the resample route over every source frame.
-    if let Some(probed) = metadata.filter(VideoMetadata::is_unsized) {
-        let selection = FrameSelection::from_metadata(probed, cfg);
-        return decode_video_png_frames(
-            input_path,
-            input_bytes,
-            cfg,
-            Some(probed),
-            selection.as_ref(),
-            selection.as_ref().map(FrameSelection::sampling_info),
-        )
-        .await;
-    }
     let Some((probed, selection)) = metadata.and_then(|probed| {
         FrameSelection::from_metadata(probed, cfg).map(|selection| (probed, selection))
     }) else {
@@ -1971,8 +1951,16 @@ async fn decode_video_with_ffmpeg(
     // its own segment and comes back short at once. The sequential decode
     // answers that, and anything else that goes wrong with the seeks, but a
     // run past the process budget: the plan is at most half the sequential
-    // decode's work, so that would run past it as well.
-    if let Some(plan) = seek_plan_for(input_path, &selection).await {
+    // decode's work, so that would run past it as well. A probe that states
+    // no size (ffprobe's `0x0` for a stream whose codec parameters it could
+    // not find) frames nothing for the seek runner, as for the headed and
+    // raw ones: such a clip takes the sequential route, where the runner
+    // pass hands it to the PNG runner (`decode_video_with_ffmpeg_runners`),
+    // and the recoveries after it as a sized clip does; the work cap counts
+    // no pixels for it, and the process budget bounds it.
+    if probed.is_unsized() {
+        // No seeks.
+    } else if let Some(plan) = seek_plan_for(input_path, &selection).await {
         ensure_decode_work_limit(plan.decoded_frames(), &selection, probed)?;
         let started = Instant::now();
         match decode_video_with_ffmpeg_seek(input_path, probed, &selection, &plan).await {
@@ -2092,6 +2080,23 @@ async fn decode_video_with_ffmpeg_runners(
 ) -> Result<DecodedVideoFrames, MediaConnectorError> {
     let sampling = selection.map(FrameSelection::sampling_info);
     if let Some(mut metadata) = metadata {
+        // A probe that states no size frames nothing for the headed and raw
+        // runners: straight to the PNG runner, whose frames carry their own
+        // size, with the selection when there is one (the decoder still
+        // decodes such a stream, its filter graph set up from the first
+        // frame); the caller's recoveries after a short selection apply as
+        // for a sized clip.
+        if metadata.is_unsized() {
+            return decode_video_png_frames(
+                input_path,
+                input_bytes,
+                cfg,
+                Some(metadata),
+                selection,
+                sampling,
+            )
+            .await;
+        }
         let sample_fps = effective_sample_fps(metadata.duration_seconds, cfg);
         let mut started = Instant::now();
         let mut headed = decode_video_with_ffmpeg_ppm(input_path, cfg, metadata, selection).await;
@@ -5617,6 +5622,25 @@ mod video_sampling_tests {
     /// frame. Skipped when ffmpeg or ffprobe is not on PATH.
     #[tokio::test]
     async fn a_probe_that_states_no_size_goes_straight_to_the_png_runner() {
+        unsized_clip_decodes(24, 4).await;
+    }
+
+    /// The same clip behind a probe that states no size and twice the frames
+    /// the stream holds (an estimate, as such probes' durations are): the
+    /// PNG runner comes back short of the selection, and the recovery a
+    /// sized clip gets runs for this one too: the decoded count is probed,
+    /// the selection sized to it, and the frames come back. Skipped when
+    /// ffmpeg or ffprobe is not on PATH.
+    #[tokio::test]
+    async fn a_probe_that_states_no_size_and_too_many_frames_recovers_as_a_sized_clip_does() {
+        unsized_clip_decodes(48, 4).await;
+    }
+
+    /// A one-second 24 fps clip (not an MP4, so the probe answers for it)
+    /// decoded under a stated `0x0` probe with `probed_frames`, four frames
+    /// asked for: the frames come back from the PNG runner, `expected` of
+    /// them, at the clip's size.
+    async fn unsized_clip_decodes(probed_frames: usize, expected: usize) {
         let dir = tempfile::tempdir().expect("temp dir");
         // Not an MP4 whose tables are read: the probe answers for the clip.
         let Some(path) = small_clip(dir.path(), "unsized.avi") else {
@@ -5627,13 +5651,13 @@ mod video_sampling_tests {
             answer.set(Some(ProbedVideoInfo {
                 width: Some(0),
                 height: Some(0),
-                duration_seconds: Some(1.0),
+                duration_seconds: Some(probed_frames as f64 / 24.0),
                 source_fps: Some(24.0),
-                total_frames: Some(24),
-                container_frames: Some(24),
+                total_frames: Some(probed_frames),
+                container_frames: Some(probed_frames),
             }));
         });
-        let decoded = decode_video_with_ffmpeg(&path, input_bytes, up_to_cfg(4)).await;
+        let decoded = decode_video_with_ffmpeg(&path, input_bytes, up_to_cfg(expected)).await;
         probe_switch::ANSWER.with(|answer| answer.set(None));
         let DecodedVideoFrames::Images {
             frames, sampling, ..
@@ -5643,10 +5667,15 @@ mod video_sampling_tests {
         };
         let sampling = sampling.expect("the clip kept its selection");
         assert_eq!(sampling.source_fps, 24.0);
-        assert_eq!(sampling.frame_indices.len(), 4);
+        assert_eq!(sampling.frame_indices.len(), expected);
+        assert!(
+            sampling.frame_indices.iter().all(|&index| index < 24),
+            "every pick is a frame the stream holds: {:?}",
+            sampling.frame_indices
+        );
         assert_eq!(
             frames.len(),
-            4,
+            expected,
             "the selection's frames, not every source frame"
         );
         assert_eq!((frames[0].width(), frames[0].height()), (64, 48));
