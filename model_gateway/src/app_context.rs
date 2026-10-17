@@ -461,8 +461,8 @@ impl AppContextBuilder {
                 .map(|table| table.name())
                 .collect();
             // The other names a table answers to: the legacy names that read a table's format,
-            // and a launcher's name for a family whose table has no older parser, which is in
-            // no other list.
+            // and the names no other list has, a launcher's for a family whose table has no
+            // older parser and an engine's exact name for a table.
             let symphony_aliases: Vec<&str> = ALIASES.iter().map(|(alias, _)| *alias).collect();
             tracing::error!(
                 tool_call_parser = ?names.tool,
@@ -486,8 +486,9 @@ impl AppContextBuilder {
                  --parser symphony every model the registry does not know is read by the legacy \
                  parsers (the registry's table reads the models it knows, a worker's own labels \
                  aside); a table's name, a legacy name that reads a table's format (qwen, \
-                 qwen_xml, ...), or a launcher's name for a family whose table has no older \
-                 parser (muse), reads those models with that table"
+                 qwen_xml, ...), a launcher's name for a family whose table has no older \
+                 parser (muse), or an engine's exact name for a table (llama4_pythonic), reads \
+                 those models with that table"
             );
         }
 
