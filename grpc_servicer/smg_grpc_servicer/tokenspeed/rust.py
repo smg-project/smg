@@ -34,19 +34,20 @@ import threading
 from collections.abc import Mapping
 from typing import Any
 
-# The lifecycle's defaults and the switch's choices, re-exported: this
-# launcher's own documented values.
-from smg_grpc_servicer import rust_lifecycle
 from smg_grpc_servicer.constrained_decoding import (
     grammar_start_labels,
     tokenspeed_constrained_decoding_start,
 )
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
+
+# The lifecycle's defaults and the switch's flag and choices, re-exported:
+# this launcher's own documented values.
 from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     DEFAULT_DRAIN_SECS,
     DEFAULT_STARTUP_CEILING_SECS,
     DEFAULT_STARTUP_TIMEOUT_SECS,
     IMPLS,
+    SERVICER_IMPL_FLAG,
     EngineProcess,
     EngineProcessGroup,
     FaultLatch,
@@ -58,6 +59,9 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     resolve_tokenizer_dir,
     servicer_switch,
     wait_for_ready_reports,
+)
+from smg_grpc_servicer.servicer_impl_flag import (
+    add_servicer_impl_argument as _add_servicer_impl_argument,
 )
 from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
@@ -78,13 +82,12 @@ KV_EVENTS_ENV = "SMG_TOKENSPEED_SERVICER_KV_EVENTS"
 # the ZMQ publisher, with TokenSpeed's own defaults for the rest (the
 # endpoint, the topic).
 DEFAULT_KV_EVENTS_CONFIG = '{"enable_kv_cache_events": true, "publisher": "zmq"}'
-SERVICER_IMPL_FLAG = rust_lifecycle.SERVICER_IMPL_FLAG
 
 
 def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
     """Add ``--servicer-impl`` to a launcher's parser that lacks it; returns
     whether it was added."""
-    return rust_lifecycle.add_servicer_impl_argument(
+    return _add_servicer_impl_argument(
         parser,
         help=(
             "Which implementation serves the gRPC contract: the Python servicer (default) "

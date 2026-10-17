@@ -39,7 +39,7 @@ import sys
 from typing import Any
 
 # Loaded in every vLLM process: nothing heavier than the package init here.
-from smg_grpc_servicer import rust_lifecycle
+from smg_grpc_servicer import servicer_impl_flag
 from smg_grpc_servicer.vllm import SERVICER_IMPL_ENV
 from smg_grpc_servicer.vllm.launcher_switch import (
     LAUNCHER_MODULES,
@@ -47,8 +47,8 @@ from smg_grpc_servicer.vllm.launcher_switch import (
     install_launcher_switch,
 )
 
-SERVICER_IMPL_FLAG = rust_lifecycle.SERVICER_IMPL_FLAG
-SERVICER_IMPL_CHOICES = rust_lifecycle.IMPLS
+SERVICER_IMPL_FLAG = servicer_impl_flag.SERVICER_IMPL_FLAG
+SERVICER_IMPL_CHOICES = servicer_impl_flag.IMPLS
 _FLAG_MARK = "_smg_servicer_impl_flag"
 
 
@@ -56,7 +56,7 @@ def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
     """Add ``--servicer-impl`` to a parser that serves gRPC (``vllm serve``'s,
     which defines ``--grpc``, or the stock gRPC launcher's own, see
     :func:`serves_grpc`) and lacks it; returns whether it was added."""
-    return rust_lifecycle.add_servicer_impl_argument(
+    return servicer_impl_flag.add_servicer_impl_argument(
         parser,
         applies=serves_grpc,
         help=(

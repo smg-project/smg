@@ -22,11 +22,11 @@ import os
 from typing import Any
 
 # Loaded in every SGLang process: nothing heavier than the package init here.
-from smg_grpc_servicer import rust_lifecycle
+from smg_grpc_servicer import servicer_impl_flag
 from smg_grpc_servicer.sglang import SERVICER_IMPL_ENV
 
-SERVICER_IMPL_FLAG = rust_lifecycle.SERVICER_IMPL_FLAG
-SERVICER_IMPL_CHOICES = rust_lifecycle.IMPLS
+SERVICER_IMPL_FLAG = servicer_impl_flag.SERVICER_IMPL_FLAG
+SERVICER_IMPL_CHOICES = servicer_impl_flag.IMPLS
 # SGLang's parser builder; the flag joins each parser after it ran.
 ADD_CLI_ARGS = "sglang.srt.server_args.ServerArgs.add_cli_args"
 
@@ -78,7 +78,7 @@ def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
     ``prepare_server_args``): the choice an earlier parser in this process
     remembered is dropped, so a parse without the flag falls through to the
     environment."""
-    return rust_lifecycle.add_servicer_impl_argument(
+    return servicer_impl_flag.add_servicer_impl_argument(
         parser,
         action=_ServicerImplAction,
         on_add=_state.forget_parse,
