@@ -55,6 +55,16 @@ impl std::fmt::Display for AuthMethod {
     }
 }
 
+impl AuthMethod {
+    /// The method's name in the audit lines and logs: `jwt` or `api_key`.
+    fn kind(&self) -> &'static str {
+        match self {
+            AuthMethod::Jwt { .. } => "jwt",
+            AuthMethod::ApiKey { .. } => "api_key",
+        }
+    }
+}
+
 /// Extension trait for extracting Principal from request extensions.
 pub trait PrincipalExt {
     fn principal(&self) -> Option<&Principal>;
@@ -223,6 +233,70 @@ pub fn bearer_token(header_value: &str) -> Option<&str> {
     (!token.is_empty()).then_some(token)
 }
 
+/// The request's audit facts, held apart from the request so they survive
+/// its move into the handler.
+struct Attempt {
+    method: String,
+    path: String,
+    request_id: Option<String>,
+}
+
+impl Attempt {
+    fn of(request: &Request<Body>) -> Self {
+        Self {
+            method: request.method().to_string(),
+            path: request.uri().path().to_string(),
+            request_id: request.extensions().get::<RequestId>().map(|r| r.0.clone()),
+        }
+    }
+
+    /// Refuse the request: the audit line with `reason`, then a 401 whose
+    /// challenge names this listener's realm and whose body says `detail`.
+    fn unauthorized(&self, audit_logger: &AuditLogger, reason: &str, detail: &str) -> Response {
+        audit_logger.log_auth_failure(&self.method, &self.path, reason, self.request_id.as_deref());
+        (
+            StatusCode::UNAUTHORIZED,
+            [("WWW-Authenticate", "Bearer realm=\"control-plane\"")],
+            detail.to_string(),
+        )
+            .into_response()
+    }
+
+    /// Admit `principal`, whichever credential proved it: the role check (a
+    /// 403 for a method the role may not use), the audit line, the extension
+    /// the handlers read, then the request itself.
+    async fn admit(
+        &self,
+        audit_logger: &AuditLogger,
+        principal: Principal,
+        mut request: Request<Body>,
+        next: Next,
+    ) -> Response {
+        let kind = principal.auth_method.kind();
+        if let Some(resp) = check_role(
+            &principal.id,
+            kind,
+            principal.role,
+            &self.method,
+            &self.path,
+            self.request_id.as_deref(),
+            audit_logger,
+        ) {
+            return resp;
+        }
+        log_auth_success(
+            &principal,
+            kind,
+            &self.method,
+            &self.path,
+            self.request_id.as_deref(),
+            audit_logger,
+        );
+        request.extensions_mut().insert(principal);
+        next.run(request).await
+    }
+}
+
 /// Control plane authentication middleware.
 ///
 /// This middleware:
@@ -237,7 +311,7 @@ pub fn bearer_token(header_value: &str) -> Option<&str> {
 /// Returns 403 Forbidden if the principal's role does not allow the method.
 pub async fn control_plane_auth_middleware(
     State(auth_state): State<ControlPlaneAuthState>,
-    mut request: Request<Body>,
+    request: Request<Body>,
     next: Next,
 ) -> Response {
     // If no authentication is configured, allow through (backward compatibility)
@@ -245,9 +319,8 @@ pub async fn control_plane_auth_middleware(
         return next.run(request).await;
     }
 
-    let method = request.method().to_string();
-    let path = request.uri().path().to_string();
-    let request_id = request.extensions().get::<RequestId>().map(|r| r.0.clone());
+    let attempt = Attempt::of(&request);
+    let audit_logger = &auth_state.audit_logger;
 
     // Extract Bearer token from Authorization header
     let token = request
@@ -258,72 +331,30 @@ pub async fn control_plane_auth_middleware(
 
     let Some(token) = token else {
         debug!("Missing or invalid Authorization header for control plane API");
-        auth_state.audit_logger.log_auth_failure(
-            &method,
-            &path,
-            "Missing or invalid Authorization header",
-            request_id.as_deref(),
-        );
-        return (
-            StatusCode::UNAUTHORIZED,
-            [("WWW-Authenticate", "Bearer realm=\"control-plane\"")],
-            "Missing or invalid Authorization header",
-        )
-            .into_response();
+        let reason = "Missing or invalid Authorization header";
+        return attempt.unauthorized(audit_logger, reason, reason);
     };
 
     // Try JWT validation first
     if let Some(jwt_validator) = &auth_state.jwt_validator {
         match jwt_validator.validate(token).await {
             Ok(validated_token) => {
-                if let Some(resp) = check_role(
-                    &validated_token.subject,
-                    "jwt",
-                    validated_token.role,
-                    &method,
-                    &path,
-                    request_id.as_deref(),
-                    &auth_state.audit_logger,
-                ) {
-                    return resp;
-                }
-
                 let principal = Principal {
-                    id: validated_token.subject.clone(),
-                    name: validated_token.name.clone(),
+                    id: validated_token.subject,
+                    name: validated_token.name,
                     auth_method: AuthMethod::Jwt {
-                        issuer: validated_token.issuer.clone(),
+                        issuer: validated_token.issuer,
                     },
                     role: validated_token.role,
                 };
-
-                log_auth_success(
-                    &principal,
-                    "jwt",
-                    &method,
-                    &path,
-                    request_id.as_deref(),
-                    &auth_state.audit_logger,
-                );
-                request.extensions_mut().insert(principal);
-                return next.run(request).await;
+                return attempt.admit(audit_logger, principal, request, next).await;
             }
             Err(e) => {
                 // 3 dot-separated parts => almost certainly a JWT; fail fast instead of trying API key.
                 if token.split('.').count() == 3 {
                     warn!("Invalid JWT provided: {}. Not falling back to API key.", e);
-                    auth_state.audit_logger.log_auth_failure(
-                        &method,
-                        &path,
-                        &format!("Invalid JWT: {e}"),
-                        request_id.as_deref(),
-                    );
-                    return (
-                        StatusCode::UNAUTHORIZED,
-                        [("WWW-Authenticate", "Bearer realm=\"control-plane\"")],
-                        format!("Invalid JWT: {e}"),
-                    )
-                        .into_response();
+                    let reason = format!("Invalid JWT: {e}");
+                    return attempt.unauthorized(audit_logger, &reason, &reason);
                 }
                 debug!("JWT validation failed: {}, trying API key", e);
             }
@@ -332,18 +363,6 @@ pub async fn control_plane_auth_middleware(
 
     // Try API key validation
     if let Some(api_key_entry) = auth_state.config.find_api_key(token) {
-        if let Some(resp) = check_role(
-            &api_key_entry.id,
-            "api_key",
-            api_key_entry.role,
-            &method,
-            &path,
-            request_id.as_deref(),
-            &auth_state.audit_logger,
-        ) {
-            return resp;
-        }
-
         let principal = Principal {
             id: api_key_entry.id.clone(),
             name: Some(api_key_entry.name.clone()),
@@ -352,34 +371,16 @@ pub async fn control_plane_auth_middleware(
             },
             role: api_key_entry.role,
         };
-
-        log_auth_success(
-            &principal,
-            "api_key",
-            &method,
-            &path,
-            request_id.as_deref(),
-            &auth_state.audit_logger,
-        );
-        request.extensions_mut().insert(principal);
-        return next.run(request).await;
+        return attempt.admit(audit_logger, principal, request, next).await;
     }
 
     // Authentication failed
     debug!("Control plane authentication failed: invalid token");
-    auth_state.audit_logger.log_auth_failure(
-        &method,
-        &path,
+    attempt.unauthorized(
+        audit_logger,
         "Invalid token",
-        request_id.as_deref(),
-    );
-
-    (
-        StatusCode::UNAUTHORIZED,
-        [("WWW-Authenticate", "Bearer realm=\"control-plane\"")],
         "Invalid authentication token",
     )
-        .into_response()
 }
 
 #[cfg(test)]
@@ -511,5 +512,104 @@ mod tests {
         };
         let state = ControlPlaneAuthState::new(config, None);
         assert!(state.is_auth_required());
+    }
+
+    /// The handler the middleware admits to answers with the principal it
+    /// finds in the request, so the test sees what reached it.
+    async fn whoami(request: Request<Body>) -> String {
+        request
+            .principal()
+            .map(|p| format!("{} via {} as {:?}", p.id, p.auth_method, p.role))
+            .unwrap_or_else(|| "nobody".to_string())
+    }
+
+    async fn call(
+        app: &axum::Router,
+        method: &str,
+        key: Option<&str>,
+    ) -> (StatusCode, Option<String>, String) {
+        use tower::ServiceExt;
+
+        let mut request = Request::builder().method(method).uri("/thing");
+        if let Some(key) = key {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {key}"));
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let challenge = response
+            .headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        (status, challenge, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    /// One admission path for every credential: a missing or unknown token is
+    /// refused with the realm's challenge, a role short of the method is
+    /// forbidden, and an admitted caller reaches the handler as the principal
+    /// its credential names.
+    #[tokio::test]
+    async fn an_api_key_caller_is_refused_forbidden_or_admitted_through_one_path() {
+        use axum::{middleware::from_fn_with_state, routing::get, Router};
+
+        use crate::config::ApiKeyEntry;
+
+        let state = ControlPlaneAuthState::new(
+            ControlPlaneAuthConfig {
+                jwt: None,
+                api_keys: vec![ApiKeyEntry::new(
+                    "reader",
+                    "Reader",
+                    "reader-key",
+                    Role::User,
+                )],
+                audit_enabled: false,
+            },
+            None,
+        );
+        let app = Router::new()
+            .route("/thing", get(whoami).post(whoami))
+            .layer(from_fn_with_state(state, control_plane_auth_middleware));
+        let challenge = Some("Bearer realm=\"control-plane\"".to_string());
+
+        assert_eq!(
+            call(&app, "GET", None).await,
+            (
+                StatusCode::UNAUTHORIZED,
+                challenge.clone(),
+                "Missing or invalid Authorization header".to_string()
+            )
+        );
+        assert_eq!(
+            call(&app, "GET", Some("not-a-key")).await,
+            (
+                StatusCode::UNAUTHORIZED,
+                challenge,
+                "Invalid authentication token".to_string()
+            )
+        );
+        let (status, _, body) = call(&app, "POST", Some("reader-key")).await;
+        assert_eq!(
+            (status, body),
+            (
+                StatusCode::FORBIDDEN,
+                "Admin role required for this control plane operation".to_string()
+            )
+        );
+        let (status, _, body) = call(&app, "GET", Some("reader-key")).await;
+        assert_eq!(
+            (status, body),
+            (
+                StatusCode::OK,
+                "reader via api_key:reader as User".to_string()
+            )
+        );
     }
 }

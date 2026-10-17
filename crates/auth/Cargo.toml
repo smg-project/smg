@@ -40,6 +40,7 @@ url = "2.5"
 base64 = "0.22"
 rsa = "0.9"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
+tower = { version = "0.5", features = ["util"] }
 
 [lints]
 workspace = true
