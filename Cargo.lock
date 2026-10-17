@@ -3899,7 +3899,7 @@ dependencies = [
 
 [[package]]
 name = "kv-index"
-version = "1.7.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -4064,6 +4064,7 @@ dependencies = [
  "rayon",
  "reqwest 0.13.4",
  "rustfft",
+ "rustix",
  "rustls",
  "serde",
  "serde_bytes",
@@ -4089,6 +4090,7 @@ dependencies = [
  "chrono",
  "criterion",
  "dashmap",
+ "foldhash 0.2.0",
  "futures",
  "hf-hub",
  "minijinja",
@@ -4495,6 +4497,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bytes",
  "clap",
  "engine-servicer",
  "engine-zmq-client",
@@ -7888,6 +7891,7 @@ dependencies = [
  "subtle",
  "thiserror 2.0.21",
  "tokio",
+ "tower",
  "tracing",
  "url",
 ]
@@ -7926,6 +7930,7 @@ dependencies = [
  "http-body-util",
  "memchr",
  "metrics",
+ "metrics-exporter-prometheus",
  "multer",
  "once_cell",
  "openai-protocol",
@@ -7960,6 +7965,7 @@ dependencies = [
  "once_cell",
  "openai-protocol",
  "reqwest 0.13.4",
+ "serde",
  "serde_json",
  "smg",
  "smg-grpc-client",
@@ -8150,7 +8156,10 @@ dependencies = [
 name = "smg-symphony"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "openai-protocol",
+ "rand 0.10.2",
+ "regex",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -9249,7 +9258,6 @@ dependencies = [
  "futures-core",
  "http",
  "http-body",
- "http-body-util",
  "percent-encoding",
  "pin-project-lite",
  "tokio",

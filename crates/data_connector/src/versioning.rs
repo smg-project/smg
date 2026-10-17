@@ -146,6 +146,53 @@ fn pending_migrations_error(
     msg
 }
 
+// ── Pending migrations ─────────────────────────────────────────────────────
+
+/// The migrations a store at `current` still needs, the prelude the Oracle
+/// and Postgres runners share: the schema config's `version` is a floor under
+/// the recorded version and the migrations above the higher of the two are
+/// pending. `None` when there are none; the actionable
+/// [`pending_migrations_error`] when there are some and automatic migration
+/// is off. `backend` names the store in the log and the error.
+fn pending_migrations<'a>(
+    backend: &str,
+    current: u32,
+    migrations: &'a [Migration],
+    config_version: Option<u32>,
+    auto_migrate: bool,
+    schema: &SchemaConfig,
+) -> Result<Option<Vec<&'a Migration>>, String> {
+    let effective_start = current.max(config_version.unwrap_or(0));
+
+    let pending: Vec<&Migration> = migrations
+        .iter()
+        .filter(|m| m.version > effective_start)
+        .collect();
+
+    if pending.is_empty() {
+        tracing::debug!(current_version = effective_start, "schema is up to date");
+        return Ok(None);
+    }
+
+    // When auto_migrate is off, fail with actionable info
+    if !auto_migrate {
+        return Err(pending_migrations_error(
+            backend,
+            effective_start,
+            &pending,
+            schema,
+        ));
+    }
+
+    tracing::info!(
+        current_version = effective_start,
+        pending = pending.len(),
+        "applying schema migrations"
+    );
+
+    Ok(Some(pending))
+}
+
 // ── A schema ahead of this build ───────────────────────────────────────────
 
 /// Refuses a store whose schema version is ahead of the migrations this
@@ -160,18 +207,33 @@ pub(crate) fn schema_ahead_check(
     migrations: &[Migration],
     config_version: Option<u32>,
 ) -> Result<(), String> {
-    let latest = migrations.last().map_or(0, |m| m.version);
-    if current <= latest {
-        return Ok(());
-    }
-    if config_version.is_some_and(|version| version >= current) {
+    if schema_ahead_override(backend, current, migrations, config_version)? {
         tracing::warn!(
             backend,
             schema_version = current,
-            latest_known = latest,
+            latest_known = migrations.last().map_or(0, |m| m.version),
             "the schema is ahead of the migrations this build knows; running on the schema config's `version`"
         );
-        return Ok(());
+    }
+    Ok(())
+}
+
+/// The verdict of [`schema_ahead_check`] without its log line: `Ok(false)`
+/// when the schema is not ahead of this build, `Ok(true)` when it is and the
+/// schema config's `version` lets this build run on it, the refusal
+/// otherwise. For a re-check after the check that logged.
+pub(crate) fn schema_ahead_override(
+    backend: &str,
+    current: u32,
+    migrations: &[Migration],
+    config_version: Option<u32>,
+) -> Result<bool, String> {
+    let latest = migrations.last().map_or(0, |m| m.version);
+    if current <= latest {
+        return Ok(false);
+    }
+    if config_version.is_some_and(|version| version >= current) {
+        return Ok(true);
     }
     Err(format!(
         "The {backend} schema is at version {current}, ahead of the latest migration this build knows \
@@ -183,7 +245,61 @@ pub(crate) fn schema_ahead_check(
 
 // ── Oracle helpers ─────────────────────────────────────────────────────────
 
-/// Run pending Oracle migrations on a synchronous `oracle::Connection`.
+/// What an Oracle store's start-up does to its database, as the steps
+/// [`bootstrap_oracle_schema`] orders. The store runs them on its connection;
+/// the unit tests run them on a fake that records their order.
+pub(crate) trait OracleSchemaSteps {
+    /// The highest recorded schema version, `None` when the versions table
+    /// does not exist. A read: nothing is created before the verdict on it.
+    fn recorded_version(&self) -> Result<Option<u32>, String>;
+    /// Creates the history tables and indexes that do not exist yet.
+    fn create_tables(&self) -> Result<(), String>;
+    /// Creates the versions table when it is missing, applies the pending
+    /// `migrations` (or refuses to start on them; `config_version` is the
+    /// schema config's `version`) and returns the versions it applied.
+    fn migrate(
+        &self,
+        migrations: &[Migration],
+        config_version: Option<u32>,
+    ) -> Result<Vec<u32>, String>;
+}
+
+/// Brings an Oracle database to the schema this build expects, in the order
+/// that leaves a database this build does not understand untouched: the
+/// recorded version against this build's migrations first, so a database a
+/// newer build migrated forward is refused before any history table is
+/// created or indexed (a table a newer migration renamed or dropped would
+/// otherwise be re-created in its legacy shape, and an index on a column it
+/// dropped would fail with the server's error instead of the refusal, see
+/// [`schema_ahead_check`]); a database without a versions table is at version
+/// 0, which no build is behind. Then the history tables, then the migrations,
+/// then the tables once more when migrations were applied, so that the
+/// indexes on the columns they added are created in this start rather than
+/// the next. Oracle DDL commits as it runs, so there is no transaction to roll
+/// the steps back into: the order is what keeps the refused database as it
+/// was.
+pub(crate) fn bootstrap_oracle_schema(
+    steps: &impl OracleSchemaSteps,
+    migrations: &[Migration],
+    config_version: Option<u32>,
+) -> Result<(), String> {
+    if let Some(current) = steps.recorded_version()? {
+        schema_ahead_check("oracle", current, migrations, config_version)?;
+    }
+    steps.create_tables()?;
+    let applied = steps.migrate(migrations, config_version)?;
+    if !applied.is_empty() {
+        // The initializers once more: the indexes on the columns the
+        // migrations added (e.g. the safety identifier's, v1) are created in
+        // this start rather than the next.
+        steps.create_tables()?;
+    }
+    Ok(())
+}
+
+/// Run pending Oracle migrations on a synchronous `oracle::Connection`: the
+/// `migrate` step of [`bootstrap_oracle_schema`], which checked the recorded
+/// version against this build's migrations before the tables were created.
 ///
 /// Returns the list of newly applied version numbers.
 pub fn run_oracle_migrations(
@@ -197,35 +313,24 @@ pub fn run_oracle_migrations(
     ensure_oracle_versions_table(conn, schema)?;
 
     let current = oracle_current_version(conn, schema)?;
-    schema_ahead_check("oracle", current, migrations, config_version)?;
-    let skip_up_to = config_version.unwrap_or(0);
-    let effective_start = current.max(skip_up_to);
-
-    let pending: Vec<&Migration> = migrations
-        .iter()
-        .filter(|m| m.version > effective_start)
-        .collect();
-
-    if pending.is_empty() {
-        tracing::debug!(current_version = effective_start, "schema is up to date");
+    // A newer build may have migrated the database between the start-up's
+    // early check (`bootstrap_oracle_schema`, before the tables were created)
+    // and this read -- a rolling update starts old and new builds together,
+    // and Oracle has no schema lock to serialize them -- so the version is
+    // judged again here, before this build serves on it. The override's
+    // warning was logged by the early check; this one only refuses.
+    schema_ahead_override("oracle", current, migrations, config_version)?;
+    let Some(pending) = pending_migrations(
+        "oracle",
+        current,
+        migrations,
+        config_version,
+        auto_migrate,
+        schema,
+    )?
+    else {
         return Ok(Vec::new());
-    }
-
-    // When auto_migrate is off, fail with actionable info
-    if !auto_migrate {
-        return Err(pending_migrations_error(
-            "oracle",
-            effective_start,
-            &pending,
-            schema,
-        ));
-    }
-
-    tracing::info!(
-        current_version = effective_start,
-        pending = pending.len(),
-        "applying schema migrations"
-    );
+    };
 
     let versions_table = oracle_versions_table(schema);
 
@@ -292,22 +397,15 @@ pub fn run_oracle_migrations(
     Ok(applied)
 }
 
-/// Ensure the `_schema_versions` table exists in Oracle.
-///
-/// Uses `all_tables` with an owner filter when `schema.owner` is set,
-/// falling back to `user_tables` for the current user's schema.
+/// The query that counts the `_schema_versions` table in Oracle's catalog:
+/// `all_tables` under the configured owner (the catalog holds owners in
+/// upper case), `user_tables` for the current user's schema otherwise.
 ///
 /// The table is always created with a quoted identifier since `_` is not
 /// valid as the first character of an unquoted Oracle identifier. This
-/// preserves the lowercase name in the catalog.
-fn ensure_oracle_versions_table(
-    conn: &oracle::Connection,
-    schema: &SchemaConfig,
-) -> Result<(), String> {
-    // The table is always created with a quoted identifier (preserves
-    // lowercase in Oracle's catalog) since `_` is invalid as the first
-    // character of an unquoted Oracle identifier.
-    let check_sql = match &schema.owner {
+/// preserves the lowercase name in the catalog, which is the name looked up.
+pub(crate) fn oracle_versions_table_exists_sql(schema: &SchemaConfig) -> String {
+    match &schema.owner {
         Some(owner) => format!(
             "SELECT COUNT(*) FROM all_tables WHERE owner = '{}' AND table_name = '{VERSIONS_TABLE}'",
             owner.to_ascii_uppercase()
@@ -315,12 +413,41 @@ fn ensure_oracle_versions_table(
         None => {
             format!("SELECT COUNT(*) FROM user_tables WHERE table_name = '{VERSIONS_TABLE}'")
         }
-    };
-    let present: i64 = conn
-        .query_row_as(&check_sql, &[])
-        .map_err(|e| format!("failed to check for {VERSIONS_TABLE} table: {e}"))?;
+    }
+}
 
-    if present == 0 {
+/// Whether the `_schema_versions` table exists in the Oracle database `conn`
+/// is connected to.
+fn oracle_versions_table_exists(
+    conn: &oracle::Connection,
+    schema: &SchemaConfig,
+) -> Result<bool, String> {
+    let present: i64 = conn
+        .query_row_as(&oracle_versions_table_exists_sql(schema), &[])
+        .map_err(|e| format!("failed to check for {VERSIONS_TABLE} table: {e}"))?;
+    Ok(present > 0)
+}
+
+/// The highest schema version an Oracle database records, `None` when it has
+/// no versions table (no build has versioned it yet): the `recorded_version`
+/// step of [`bootstrap_oracle_schema`], a read that creates nothing.
+pub(crate) fn oracle_recorded_version(
+    conn: &oracle::Connection,
+    schema: &SchemaConfig,
+) -> Result<Option<u32>, String> {
+    if !oracle_versions_table_exists(conn, schema)? {
+        return Ok(None);
+    }
+    oracle_current_version(conn, schema).map(Some)
+}
+
+/// Ensure the `_schema_versions` table exists in Oracle (see
+/// [`oracle_versions_table_exists_sql`] for the lookup and the quoting).
+fn ensure_oracle_versions_table(
+    conn: &oracle::Connection,
+    schema: &SchemaConfig,
+) -> Result<(), String> {
+    if !oracle_versions_table_exists(conn, schema)? {
         let ddl = oracle_create_versions_table(schema);
         if let Err(err) = conn.execute(&ddl, &[]) {
             // ORA-00955: name is already used — another instance created
@@ -361,34 +488,17 @@ pub async fn run_postgres_migrations(
     auto_migrate: bool,
 ) -> Result<Vec<u32>, String> {
     let current = postgres_current_version(tx).await?;
-    let skip_up_to = config_version.unwrap_or(0);
-    let effective_start = current.max(skip_up_to);
-
-    let pending: Vec<&Migration> = migrations
-        .iter()
-        .filter(|m| m.version > effective_start)
-        .collect();
-
-    if pending.is_empty() {
-        tracing::debug!(current_version = effective_start, "schema is up to date");
+    let Some(pending) = pending_migrations(
+        "postgres",
+        current,
+        migrations,
+        config_version,
+        auto_migrate,
+        schema,
+    )?
+    else {
         return Ok(Vec::new());
-    }
-
-    // When auto_migrate is off, fail with actionable info
-    if !auto_migrate {
-        return Err(pending_migrations_error(
-            "postgres",
-            effective_start,
-            &pending,
-            schema,
-        ));
-    }
-
-    tracing::info!(
-        current_version = effective_start,
-        pending = pending.len(),
-        "applying schema migrations"
-    );
+    };
 
     let mut applied = Vec::new();
     for migration in pending {
@@ -518,8 +628,169 @@ pub(crate) async fn postgres_current_version(client: &impl GenericClient) -> Res
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
     use crate::schema::TableConfig;
+
+    /// The start-up steps on a database that records `recorded` (`None`: no
+    /// versions table) and whose migrate step applies `applies`; `ran` is
+    /// the order the steps ran in.
+    struct RecordedSteps {
+        recorded: Option<u32>,
+        applies: Vec<u32>,
+        ran: RefCell<Vec<&'static str>>,
+    }
+
+    impl RecordedSteps {
+        fn on(recorded: Option<u32>, applies: Vec<u32>) -> Self {
+            Self {
+                recorded,
+                applies,
+                ran: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn ran(&self) -> Vec<&'static str> {
+            self.ran.borrow().clone()
+        }
+    }
+
+    impl OracleSchemaSteps for RecordedSteps {
+        fn recorded_version(&self) -> Result<Option<u32>, String> {
+            self.ran.borrow_mut().push("read the version");
+            Ok(self.recorded)
+        }
+
+        fn create_tables(&self) -> Result<(), String> {
+            self.ran.borrow_mut().push("create the tables");
+            Ok(())
+        }
+
+        fn migrate(
+            &self,
+            _migrations: &[Migration],
+            _config_version: Option<u32>,
+        ) -> Result<Vec<u32>, String> {
+            self.ran.borrow_mut().push("migrate");
+            Ok(self.applies.clone())
+        }
+    }
+
+    fn three_migrations() -> Vec<Migration> {
+        (1..=3)
+            .map(|version| Migration {
+                version,
+                description: "test",
+                up: |_| vec![],
+            })
+            .collect()
+    }
+
+    /// A database whose recorded version is ahead of the migrations this
+    /// build knows is refused before any history table is created or
+    /// indexed: the version is the only thing the start-up read.
+    #[test]
+    fn an_oracle_database_ahead_of_this_build_is_refused_before_its_tables_are_touched() {
+        let steps = RecordedSteps::on(Some(99), vec![]);
+        let message = bootstrap_oracle_schema(&steps, &three_migrations(), None)
+            .expect_err("a database ahead of this build must be refused at start-up");
+        assert!(
+            message.contains("version 99") && message.contains("ahead of the latest migration"),
+            "{message}"
+        );
+        assert_eq!(
+            steps.ran(),
+            ["read the version"],
+            "the refusal must come before the tables are touched"
+        );
+    }
+
+    /// The schema config's `version` at the database's version is the
+    /// operator's word that this build may run against it: the start-up goes
+    /// on, in its order.
+    #[test]
+    fn the_version_setting_lets_this_build_start_on_a_newer_oracle_database() {
+        let steps = RecordedSteps::on(Some(99), vec![]);
+        bootstrap_oracle_schema(&steps, &three_migrations(), Some(99))
+            .expect("`version: 99` lets the build run against the newer database");
+        assert_eq!(
+            steps.ran(),
+            ["read the version", "create the tables", "migrate"]
+        );
+    }
+
+    /// A database without a versions table (nothing is ahead of it) or at a
+    /// version this build knows gets its tables, then its migrations, then
+    /// its tables once more only when a migration was applied (the indexes
+    /// on the columns it added).
+    #[test]
+    fn an_oracle_database_this_build_knows_gets_its_tables_then_its_migrations() {
+        let settled = ["read the version", "create the tables", "migrate"];
+        let migrated = [
+            "read the version",
+            "create the tables",
+            "migrate",
+            "create the tables",
+        ];
+        for (recorded, applies, expected) in [
+            (None, vec![], &settled[..]),
+            (Some(3), vec![], &settled[..]),
+            (Some(0), vec![1, 2, 3], &migrated[..]),
+            (Some(1), vec![2, 3], &migrated[..]),
+        ] {
+            let steps = RecordedSteps::on(recorded, applies);
+            bootstrap_oracle_schema(&steps, &three_migrations(), None)
+                .expect("a database this build knows comes up");
+            assert_eq!(steps.ran(), expected, "recorded version {recorded:?}");
+        }
+    }
+
+    /// The version is read from the catalog's lowercase, quoted name: under
+    /// the configured owner (upper-cased, as the catalog holds it) or in the
+    /// current user's schema.
+    #[test]
+    fn the_versions_table_lookup_follows_the_owner() {
+        let no_owner = SchemaConfig::default();
+        assert_eq!(
+            oracle_versions_table_exists_sql(&no_owner),
+            "SELECT COUNT(*) FROM user_tables WHERE table_name = '_schema_versions'"
+        );
+        let with_owner = SchemaConfig {
+            owner: Some("admin".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            oracle_versions_table_exists_sql(&with_owner),
+            "SELECT COUNT(*) FROM all_tables WHERE owner = 'ADMIN' AND table_name = '_schema_versions'"
+        );
+    }
+
+    /// The re-check in `run_oracle_migrations` is the ahead check's verdict
+    /// without its log: not ahead, ahead under the config's `version`, or
+    /// the same refusal.
+    #[test]
+    fn the_ahead_verdict_is_the_same_with_and_without_the_log() {
+        let migrations = three_migrations();
+        assert_eq!(
+            schema_ahead_override("oracle", 3, &migrations, None),
+            Ok(false)
+        );
+        assert_eq!(
+            schema_ahead_override("oracle", 4, &migrations, Some(4)),
+            Ok(true)
+        );
+        let refused = schema_ahead_override("oracle", 4, &migrations, None)
+            .expect_err("a schema ahead of this build is refused");
+        assert_eq!(
+            schema_ahead_check("oracle", 4, &migrations, None),
+            Err(refused.clone())
+        );
+        assert!(
+            refused.contains("version 4") && refused.contains("ahead of the latest migration"),
+            "{refused}"
+        );
+    }
 
     #[test]
     fn oracle_versions_table_name_is_always_quoted() {
@@ -698,6 +969,44 @@ mod tests {
         assert!(schema_ahead_check("oracle", 99, &migrations, Some(50)).is_err());
         assert!(schema_ahead_check("oracle", 99, &migrations, Some(99)).is_ok());
         assert!(schema_ahead_check("oracle", 99, &migrations, Some(100)).is_ok());
+    }
+
+    /// The prelude the two runners share: the migrations above the recorded
+    /// version are pending, the schema config's `version` is a floor under
+    /// it, nothing pending is `None`, and pending migrations without
+    /// automatic migration are the refusal that names them.
+    #[test]
+    fn pending_migrations_follow_the_recorded_version_the_floor_and_the_automatic_setting() {
+        let schema = SchemaConfig::default();
+        let migrations = three_migrations();
+        let versions = |pending: Option<Vec<&Migration>>| -> Option<Vec<u32>> {
+            pending.map(|pending| pending.iter().map(|m| m.version).collect())
+        };
+
+        // Nothing pending: the store is at the last version this build knows.
+        let none = pending_migrations("postgres", 3, &migrations, None, false, &schema);
+        assert_eq!(versions(none.unwrap()), None);
+
+        // Pending with automatic migration: the ones above the recorded version.
+        let above = pending_migrations("postgres", 1, &migrations, None, true, &schema);
+        assert_eq!(versions(above.unwrap()), Some(vec![2, 3]));
+
+        // The floor above the recorded version takes the version's place.
+        let floored = pending_migrations("oracle", 1, &migrations, Some(2), true, &schema);
+        assert_eq!(versions(floored.unwrap()), Some(vec![3]));
+
+        // Pending without automatic migration: the refusal, counted from the
+        // floor and naming only the migrations above it.
+        let refused = pending_migrations("oracle", 1, &migrations, Some(2), false, &schema);
+        let Err(err) = refused else {
+            panic!("pending migrations without automatic migration are a refusal");
+        };
+        assert!(err.contains("current version: 2"), "{err}");
+        assert!(
+            err.contains("v3: test") && !err.contains("v2: test"),
+            "{err}"
+        );
+        assert!(err.contains("oracle schema config"), "{err}");
     }
 
     #[test]

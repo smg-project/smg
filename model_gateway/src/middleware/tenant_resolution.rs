@@ -17,7 +17,7 @@ use axum::{
     response::Response,
 };
 
-use super::request_id::RequestId;
+use super::{logging::AccessLogRecord, request_id::RequestId};
 use crate::{
     config::{RouterConfig, TenantResolutionConfig},
     routers::error,
@@ -173,6 +173,10 @@ pub async fn route_request_meta_middleware(
         Ok(request_meta) => request_meta,
         Err(response) => return response,
     };
+    // The access log, when it carries the tenant.
+    if let Some(record) = request.extensions().get::<AccessLogRecord>() {
+        record.tenant(request_meta.tenant_key().as_str());
+    }
     request.extensions_mut().insert(request_meta);
     next.run(request).await
 }

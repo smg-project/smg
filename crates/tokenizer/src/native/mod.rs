@@ -36,11 +36,12 @@ use std::{
 };
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 use serde_json::Value;
 use thread_local::ThreadLocal;
-use tokenizers::{models::ModelWrapper, Model, Tokenizer as HfTokenizer};
+use tokenizers::{models::ModelWrapper, Model};
 use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
 
 mod pattern;
@@ -48,7 +49,10 @@ mod unicode;
 
 use pattern::Pattern;
 
-use crate::encode_path::{Declined, Fallback};
+use crate::{
+    encode_path::{Declined, Fallback},
+    word_cache::{ModelView, TokenizerOf},
+};
 
 /// The split the `ByteLevel` pre-tokenizer applies itself when `use_regex`
 /// is on (GPT-2 and its descendants).
@@ -64,7 +68,12 @@ const CACHED_PIECE_MAX_BYTES: usize = 64;
 /// every time.
 const LONG_PIECE_MAX_BYTES: usize = 256;
 /// Entries a thread's piece cache holds for one encoder before it is cleared,
-/// at most; see `PIECE_CACHE_TOTAL_CAPACITY`.
+/// at most; see `PIECE_CACHE_TOTAL_CAPACITY`. This is also the cliff of a
+/// repeated document: one with fewer distinct pieces is encoded again at the
+/// cost of its lookups, one with more at first-pass cost on every pass, since
+/// the clear takes the pieces that recur with the rest (the crate bench
+/// `encode_volume` shows both, and that the cost of text no pass has seen
+/// does not depend on how much a thread encoded before).
 const PIECE_CACHE_CAPACITY: usize = 16_384;
 /// Entries all threads together hold for one encoder: a thread's own cap is
 /// this divided by the number of threads that have encoded with the encoder
@@ -84,6 +93,21 @@ const LONG_PIECE_BYTES_CAPACITY: usize = 2 << 20;
 const LONG_PIECE_BYTES_TOTAL: usize = 32 << 20;
 /// What an entry of the long tier takes beyond its piece and ids.
 const LONG_PIECE_ENTRY_BYTES: usize = size_of::<(Box<[u8]>, Box<[u32]>)>();
+
+/// Inputs at least this long are encoded unit by unit on the thread pool (a
+/// text between added tokens, or a chunk of one cut at a stable boundary);
+/// shorter inputs would spend more on the hand-offs than they save.
+const PARALLEL_MIN_BYTES: usize = 64 << 10;
+/// The size a long text unit is cut into for the pool, at the first stable
+/// boundary past each multiple of it.
+const PARALLEL_CHUNK_BYTES: usize = 32 << 10;
+/// Text on each side of a candidate cut that every stage's pattern is run
+/// over to confirm a piece starts there (widened to the spaces around it).
+const CUT_CHECK_WINDOW: usize = 512;
+/// Candidates one cut search may reject before it gives up: the byte scan for
+/// a candidate is cheap, the window check on each one is not, so a text whose
+/// candidates keep failing the check costs at most this many checks per cut.
+const MAX_REJECTED_CUT_CANDIDATES: usize = 64;
 
 /// Piece bytes to the ids they tokenize to.
 type PieceIds = FxHashMap<Box<[u8]>, Box<[u32]>>;
@@ -262,14 +286,16 @@ fn type_of<'v>(what: &str, component: &'v Value) -> Result<&'v str, Declined> {
 impl NativeEncoder {
     /// This path's encoder for `tokenizer`, or why it declines: a shape
     /// outside what the module documentation lists.
-    pub(crate) fn from_tokenizer(tokenizer: &HfTokenizer) -> Result<Self, Declined> {
+    pub(crate) fn from_tokenizer<M: Model + ModelView>(
+        tokenizer: &TokenizerOf<M>,
+    ) -> Result<Self, Declined> {
         if tokenizer.get_truncation().is_some() {
             return Err(Declined::from("truncation is configured"));
         }
         if tokenizer.get_padding().is_some() {
             return Err(Declined::from("padding is configured"));
         }
-        if !matches!(tokenizer.get_model(), ModelWrapper::BPE(_)) {
+        if !matches!(tokenizer.get_model().wrapper(), ModelWrapper::BPE(_)) {
             return Err(Declined::from("the model is not BPE"));
         }
         let normalizer =
@@ -335,8 +361,8 @@ impl NativeEncoder {
     /// The added tokens the path cuts out itself, those matched on the raw
     /// text and those matched after normalization (normalized here, once),
     /// each in a stable order so leftmost-longest ties stay deterministic.
-    fn added_tokens_of(
-        tokenizer: &HfTokenizer,
+    fn added_tokens_of<M: Model>(
+        tokenizer: &TokenizerOf<M>,
         normalizer: Normalizer,
     ) -> Result<(AddedTokenList, AddedTokenList), Declined> {
         let added = tokenizer.get_added_vocabulary();
@@ -460,36 +486,188 @@ impl NativeEncoder {
     /// goes through `tokenizers` instead, for the caller to count: not in
     /// NFC under an NFC normalizer, found before any work, or a piece the
     /// model declines, found after the pieces before it were tokenized, so
-    /// that the error surfaces from the `tokenizers` encode.
+    /// that the error surfaces from the `tokenizers` encode. A long input is
+    /// encoded on the thread pool, unit by unit (see [`Self::units`]), with
+    /// the same code per unit.
     pub(crate) fn encode(&self, model: &ModelWrapper, text: &str) -> Result<Vec<u32>, Fallback> {
+        self.encode_with(model, text, text.len() >= PARALLEL_MIN_BYTES)
+    }
+
+    /// [`Self::encode`] with the thread pool used or not; the ids are the
+    /// same either way (the units are encoded by the same code in the same
+    /// order).
+    pub(crate) fn encode_with(
+        &self,
+        model: &ModelWrapper,
+        text: &str,
+        parallel: bool,
+    ) -> Result<Vec<u32>, Fallback> {
         if self.normalizer == Normalizer::Nfc && !is_nfc(text) {
             return Err(Fallback::NotNfc);
         }
+        let units = self.units(text, parallel);
+        if parallel && units.len() >= 2 {
+            let encoded: Result<Vec<Vec<u32>>, Fallback> = units
+                .par_iter()
+                .map(|unit| {
+                    let mut ids = Vec::new();
+                    let mut mapped = String::new();
+                    self.encode_unit(model, unit, &mut mapped, &mut ids)
+                        .map(|()| ids)
+                })
+                .collect();
+            return encoded.map(|parts| parts.concat());
+        }
         let mut ids = Vec::with_capacity(text.len() / 3 + 8);
         let mut mapped = String::new();
+        for unit in &units {
+            self.encode_unit(model, unit, &mut mapped, &mut ids)?;
+        }
+        Ok(ids)
+    }
+
+    /// The input as the units its encode is made of: the added tokens
+    /// matched on the raw text, then the ones matched after normalization on
+    /// the texts between them (the text is in its normal form here, see
+    /// [`Self::encode_with`]), and the texts between all of them; for the
+    /// thread pool a long text is cut further at stable boundaries
+    /// ([`Self::stable_cut`]). Both kinds of added token come out before any
+    /// cut: a cut inside one would turn it into pieces.
+    fn units<'t>(&self, text: &'t str, chunked: bool) -> Vec<Segment<'t>> {
+        let mut units = Vec::new();
+        let push_text = |text: &'t str, units: &mut Vec<Segment<'t>>| {
+            let mut rest = text;
+            while chunked && rest.len() > 2 * PARALLEL_CHUNK_BYTES {
+                let Some(cut) = self.stable_cut(rest, PARALLEL_CHUNK_BYTES) else {
+                    break;
+                };
+                units.push(Segment::Text(&rest[..cut]));
+                rest = &rest[cut..];
+            }
+            units.push(Segment::Text(rest));
+        };
+        let push_normalized =
+            |text: &'t str, units: &mut Vec<Segment<'t>>| match &self.normalized_added {
+                Some(added) => added.split(text, |segment| match segment {
+                    Segment::Added(id) => units.push(Segment::Added(id)),
+                    Segment::Text(text) => push_text(text, units),
+                }),
+                None => push_text(text, units),
+            };
+        match &self.raw_added {
+            Some(added) => added.split(text, |segment| match segment {
+                Segment::Added(id) => units.push(Segment::Added(id)),
+                Segment::Text(text) => push_normalized(text, &mut units),
+            }),
+            None => push_normalized(text, &mut units),
+        }
+        units
+    }
+
+    /// A byte offset at or past `from` where the stages' pieces can be cut
+    /// without changing them: a space followed by a letter after a character
+    /// that is not whitespace, where the patterns, run over the text around
+    /// it, cut cleanly ([`Self::piece_starts_at`]). No piece spans such a
+    /// point (letters, digits and punctuation stop at the space, a whitespace
+    /// run cannot start before it) and the patterns have no lookbehind, so
+    /// the pieces of the two halves are the pieces of the whole. `None` when
+    /// the text has no such point past `from`, or when
+    /// [`MAX_REJECTED_CUT_CANDIDATES`] candidates past `from` failed the
+    /// check: a stretch without candidates (a blob, a table of numbers) costs
+    /// only the byte scan and the search goes on past it, a text whose
+    /// candidates keep failing stays one unit after that many checks.
+    fn stable_cut(&self, text: &str, from: usize) -> Option<usize> {
+        if self.stages.is_empty() {
+            return None;
+        }
+        let bytes = text.as_bytes();
+        let mut rejected = 0;
+        let mut p = from;
+        while p + 1 < text.len() {
+            if bytes[p] != b' ' {
+                p += 1;
+                continue;
+            }
+            if text[p + 1..]
+                .chars()
+                .next()
+                .is_some_and(char::is_alphabetic)
+                && text[..p]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| !c.is_whitespace())
+            {
+                if self.piece_starts_at(text, p) {
+                    return Some(p);
+                }
+                rejected += 1;
+                if rejected >= MAX_REJECTED_CUT_CANDIDATES {
+                    return None;
+                }
+            }
+            p += 1;
+        }
+        None
+    }
+
+    /// Whether the stages, run over a window of text around `p` that starts
+    /// and ends at whitespace, cut cleanly at `p`: at each stage in turn, no
+    /// match may span `p`; a match that starts at `p` settles it (the deeper
+    /// stages see that match from `p` on either way), a gap around `p` hands
+    /// the question to the next stage, and a gap at the last stage would be
+    /// split, so that is no cut.
+    fn piece_starts_at(&self, text: &str, p: usize) -> bool {
+        let mut start = p.saturating_sub(CUT_CHECK_WINDOW);
+        while start > 0 && !(text.is_char_boundary(start) && text.as_bytes()[start] == b' ') {
+            start -= 1;
+        }
+        let mut end = (p + CUT_CHECK_WINDOW).min(text.len());
+        while end < text.len() && !(text.is_char_boundary(end) && text.as_bytes()[end] == b' ') {
+            end += 1;
+        }
+        let window = &text[start..end];
+        let at = p - start;
+        for stage in &self.stages {
+            for (piece_start, piece_end) in stage.pattern.find_iter(window) {
+                if piece_start == at {
+                    return true;
+                }
+                if piece_start < at && at < piece_end {
+                    return false;
+                }
+                if piece_start > at {
+                    break;
+                }
+            }
+        }
+        false
+    }
+
+    /// Appends the ids of one unit: an added token's id, or a text's pieces
+    /// through the stages and the model (the text has no added token left in
+    /// it, see [`Self::units`]); the reason when the model declines a piece
+    /// (the pieces after it are tokenized all the same, as in the whole-text
+    /// encode).
+    fn encode_unit(
+        &self,
+        model: &ModelWrapper,
+        unit: &Segment<'_>,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+    ) -> Result<(), Fallback> {
         let mut fallback = None;
         let mut tokenize = |segment: &str, ids: &mut Vec<u32>| {
             self.pieces(0, segment, &mut |piece| {
-                if let Err(declined) = self.tokenize_piece(model, piece, &mut mapped, ids) {
+                if let Err(declined) = self.tokenize_piece(model, piece, mapped, ids) {
                     fallback = Some(declined);
                 }
             });
         };
-        let mut after_raw = |segment: Segment<'_>, ids: &mut Vec<u32>| match segment {
+        match *unit {
             Segment::Added(id) => ids.push(id),
-            Segment::Text(text) => match &self.normalized_added {
-                Some(added) => added.split(text, |inner| match inner {
-                    Segment::Added(id) => ids.push(id),
-                    Segment::Text(text) => tokenize(text, ids),
-                }),
-                None => tokenize(text, ids),
-            },
-        };
-        match &self.raw_added {
-            Some(added) => added.split(text, |segment| after_raw(segment, &mut ids)),
-            None => after_raw(Segment::Text(text), &mut ids),
+            Segment::Text(text) => tokenize(text, ids),
         }
-        fallback.map_or(Ok(ids), Err)
+        fallback.map_or(Ok(()), Err)
     }
 
     /// Applies the stages from `depth` on to `text`, calling `f` with each
@@ -602,7 +780,7 @@ mod tests {
             PreTokenizerWrapper,
         },
         processors::{byte_level::ByteLevel as ByteLevelProcessor, template::TemplateProcessing},
-        AddedToken, SplitDelimiterBehavior,
+        AddedToken, SplitDelimiterBehavior, Tokenizer as HfTokenizer,
     };
 
     use super::*;
@@ -893,6 +1071,24 @@ mod tests {
                 special: &["<|endoftext|>"],
                 added: &[],
             },
+            // Added tokens with a space inside, matched after normalization
+            // (the default of `add_tokens`): a cut at that space would turn
+            // the token into pieces.
+            Shape {
+                name: "normalized-words",
+                nfc: false,
+                pre_tokenizers: vec![
+                    split(CL100K, SplitDelimiterBehavior::Isolated, false),
+                    byte_level(false),
+                ],
+                ignore_merges: false,
+                special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
+                added: &[
+                    ("foo bar", true),
+                    ("### Instruction", true),
+                    ("<tool_call>", false),
+                ],
+            },
         ]
     }
 
@@ -1078,6 +1274,189 @@ mod tests {
         }
     }
 
+    /// A text long enough for the pool, with spaces, words, digits, CJK and
+    /// added tokens, so that stable cuts exist and the units are several.
+    fn long_text(state: &mut u64, added: &[&str], bytes: usize) -> String {
+        let mut text = String::with_capacity(bytes + 64);
+        while text.len() < bytes {
+            let words = 1 + (pseudo_random(state) % 12) as usize;
+            text.push_str(&random_text(state, words, added));
+            text.push(' ');
+            text.push_str(
+                ["word", "Wort", "parole", "palabra", "slovo"][(pseudo_random(state) % 5) as usize],
+            );
+            if pseudo_random(state).is_multiple_of(7) {
+                text.push_str(" 12345 ");
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
+        let mut state = 0x5A5A_1234_5678_9ABCu64;
+        for shape in shapes() {
+            let tokenizer = tokenizer_of(&shape, &mut state);
+            let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+            let added: Vec<&str> = shape
+                .special
+                .iter()
+                .copied()
+                .chain(shape.added.iter().map(|(s, _)| *s))
+                .collect();
+            let mut compared = 0;
+            for _ in 0..3 {
+                let mut text = long_text(&mut state, &added, 3 * PARALLEL_MIN_BYTES);
+                if shape.nfc {
+                    text = text.nfc().collect();
+                }
+                let units = native.units(&text, true).len();
+                assert!(
+                    units >= 4,
+                    "{}: {units} units for {} bytes",
+                    shape.name,
+                    text.len()
+                );
+                let (Ok(pooled), Ok(serial)) = (
+                    native.encode_with(tokenizer.get_model(), &text, true),
+                    native.encode_with(tokenizer.get_model(), &text, false),
+                ) else {
+                    assert!(
+                        shape.nfc && text.nfc().ne(text.chars()),
+                        "{}: declined",
+                        shape.name
+                    );
+                    continue;
+                };
+                compared += 1;
+                assert_eq!(pooled, serial, "{}: the pool changed the ids", shape.name);
+                let reference = tokenizer
+                    .encode(text.as_str(), false)
+                    .expect("encode")
+                    .get_ids()
+                    .to_vec();
+                assert_eq!(pooled, reference, "{}: against the reference", shape.name);
+            }
+            assert!(
+                compared >= 2,
+                "{}: {compared} long texts compared",
+                shape.name
+            );
+        }
+    }
+
+    /// An added token matched after normalization whose inner space is the
+    /// first cut candidate past the chunk size: it comes out as a unit of its
+    /// own before any cut, so the pooled ids are the one-piece ids.
+    #[test]
+    fn a_normalized_added_token_across_a_cut_stays_whole() {
+        let mut state = 0x0F1E_2D3C_4B5A_6978u64;
+        let shape = shapes()
+            .into_iter()
+            .find(|shape| shape.name == "normalized-words")
+            .expect("the shape");
+        let tokenizer = tokenizer_of(&shape, &mut state);
+        let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        let foo_bar = tokenizer.token_to_id("foo bar").expect("the added token");
+        // No candidate before the token (letters only), the token's space as
+        // the first candidate past the chunk size, then text enough for cuts.
+        let mut text = "x".repeat(PARALLEL_CHUNK_BYTES + 5);
+        text.push_str("foo bar");
+        text.push_str(&long_text(&mut state, &[], 3 * PARALLEL_CHUNK_BYTES));
+        let units = native.units(&text, true);
+        assert!(
+            units
+                .iter()
+                .any(|unit| matches!(unit, Segment::Added(id) if *id == foo_bar)),
+            "the added token is a unit of its own ({} units)",
+            units.len()
+        );
+        assert!(units.len() >= 4, "{} units", units.len());
+        let pooled = native
+            .encode_with(tokenizer.get_model(), &text, true)
+            .expect("pooled");
+        let serial = native
+            .encode_with(tokenizer.get_model(), &text, false)
+            .expect("serial");
+        let reference = tokenizer
+            .encode(text.as_str(), false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        assert_eq!(pooled, serial, "the pool changed the ids");
+        assert_eq!(pooled, reference, "against the reference");
+        assert!(pooled.contains(&foo_bar), "the token's id is in the ids");
+    }
+
+    /// A stretch without a cut candidate (a table of numbers: spaces before
+    /// digits, never before a letter) longer than two chunks, then prose: the
+    /// search goes on past the stretch and the prose is chunked.
+    #[test]
+    fn chunking_goes_on_past_a_stretch_without_candidates() {
+        let mut state = 0x7E57_C0DE_0BAD_F00Du64;
+        let shape = shapes()
+            .into_iter()
+            .find(|shape| shape.name == "cl100k-ignore-merges")
+            .expect("the shape");
+        let tokenizer = tokenizer_of(&shape, &mut state);
+        let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        let mut text = "0.125, -3.5, 42, ".repeat(PARALLEL_CHUNK_BYTES / 8);
+        assert!(text.len() > 2 * PARALLEL_CHUNK_BYTES);
+        text.push_str(&long_text(&mut state, &[], 4 * PARALLEL_CHUNK_BYTES));
+        let units = native.units(&text, true);
+        assert!(
+            units.len() > 2,
+            "{} units: the prose after the table is chunked",
+            units.len()
+        );
+        let pooled = native
+            .encode_with(tokenizer.get_model(), &text, true)
+            .expect("pooled");
+        let serial = native
+            .encode_with(tokenizer.get_model(), &text, false)
+            .expect("serial");
+        let reference = tokenizer
+            .encode(text.as_str(), false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        assert_eq!(pooled, serial, "the pool changed the ids");
+        assert_eq!(pooled, reference, "against the reference");
+    }
+
+    #[test]
+    fn stable_cuts_leave_the_pieces_as_they_are() {
+        let mut state = 0x0BAD_CAFE_F00D_0001u64;
+        for shape in shapes() {
+            let tokenizer = tokenizer_of(&shape, &mut state);
+            let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+            let mut text = long_text(&mut state, &[], 2 * PARALLEL_MIN_BYTES);
+            if shape.nfc {
+                text = text.nfc().collect();
+            }
+            let whole: Vec<String> = {
+                let mut out = Vec::new();
+                native.pieces(0, &text, &mut |piece| out.push(piece.to_owned()));
+                out
+            };
+            let mut chunked = Vec::new();
+            let units = native.units(&text, true);
+            assert!(
+                units.len() >= 2,
+                "{}: no cut in {} bytes",
+                shape.name,
+                text.len()
+            );
+            for unit in &units {
+                let Segment::Text(chunk) = unit else {
+                    panic!("no added tokens in this text");
+                };
+                native.pieces(0, chunk, &mut |piece| chunked.push(piece.to_owned()));
+            }
+            assert_eq!(chunked, whole, "{}: a cut split a piece", shape.name);
+        }
+    }
+
     #[test]
     fn ids_match_tokenizers_on_random_text_for_every_shape() {
         let mut state = 0x0F0F_1234_ABCD_9876u64;
@@ -1136,6 +1515,9 @@ mod tests {
             "日本語のテキスト、한국어 텍스트, 中文文本。",
             "ครับ ผม ชื่อ นาย คำ ไทย",
             "कृपया यह पढ़ें और समझें",
+            "একটি নতুন প্রোগ্রাম 16টি",
+            "ఒక కొత్త కార్యక్రమం",
+            "يَتَلَقَّى مَرْحَبًا",
             "fn main() { println!(\"hi\"); }\n\n\n// done\r\n",
             "a\tb\u{A0}c\u{3000}d\u{2028}e",
             "<｜begin▁of▁sentence｜>hello<｜User｜>q<｜tool▁call▁begin｜>x<｜fim▁hole｜>",
@@ -1156,6 +1538,145 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The letters-only split of the Qwen2 family, under which a combining
+    /// mark (`\p{M}`) starts a new piece; the Qwen3.5-family files carry
+    /// [`QWEN35`], whose `[\p{L}\p{M}]+` keeps a letter and its marks together.
+    const LETTERS_ONLY: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+    /// A byte-level BPE that learned `letter` and `marks` byte by byte and
+    /// then their merge, the way a vocabulary that keeps letters and marks
+    /// together holds a cluster: the letter, the marks and the cluster are
+    /// tokens, and the cluster is reached only from the other two.
+    fn cluster_model(letter: &str, marks: &str) -> BPE {
+        let table = bytes_char();
+        let mut alphabet: Vec<char> = table.to_vec();
+        alphabet.sort_unstable();
+        let mut vocab = Vocab::default();
+        for ch in alphabet {
+            let next = vocab.len() as u32;
+            vocab.insert(ch.to_string(), next);
+        }
+        let mut merges = Merges::new();
+        let mut learn = |left: String, right: String| {
+            let merged = format!("{left}{right}");
+            if !vocab.contains_key(&merged) {
+                let next = vocab.len() as u32;
+                vocab.insert(merged.clone(), next);
+                merges.push((left, right));
+            }
+            merged
+        };
+        let mut chain = |word: &str| {
+            let mut mapped = word.bytes().map(|b| table[usize::from(b)].to_string());
+            let mut token = mapped.next().expect("a non-empty word");
+            for right in mapped {
+                token = learn(token, right);
+            }
+            token
+        };
+        let letter = chain(letter);
+        let marks = chain(marks);
+        learn(letter, marks);
+        BPE::builder()
+            .vocab_and_merges(vocab, merges)
+            .build()
+            .expect("bpe")
+    }
+
+    /// An NFC byte-level tokenizer over `model` with one split `pattern`.
+    fn split_tokenizer(pattern: &str, model: BPE) -> HfTokenizer {
+        let mut tokenizer = HfTokenizer::new(model);
+        tokenizer
+            .with_normalizer(Some(NormalizerWrapper::NFC(NFC)))
+            .expect("normalizer");
+        tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+            split(pattern, SplitDelimiterBehavior::Isolated, false),
+            byte_level(false),
+        ]))));
+        tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+        tokenizer.with_post_processor(Some(ByteLevelProcessor::default().trim_offsets(false)));
+        tokenizer
+    }
+
+    /// The pieces the native pre-tokenizer cuts `text` into.
+    fn native_pieces(native: &NativeEncoder, text: &str) -> Vec<String> {
+        let mut pieces = Vec::new();
+        native.pieces(0, text, &mut |piece| pieces.push(piece.to_owned()));
+        pieces
+    }
+
+    /// A letter followed by its combining `marks` is one piece under a split
+    /// that admits marks, and so one token when the vocabulary has it, and two
+    /// pieces and two tokens under the letters-only split: the native path
+    /// follows the file's pattern either way and gives `tokenizers`' ids on
+    /// the cluster and on `sentence`.
+    fn marks_stay_with_their_letter(letter: &str, marks: &str, sentence: &str) {
+        let cluster = format!("{letter}{marks}");
+        let model = || cluster_model(letter, marks);
+        let with_marks = split_tokenizer(QWEN35, model());
+        let letters_only = split_tokenizer(LETTERS_ONLY, model());
+        let native_with_marks = NativeEncoder::from_tokenizer(&with_marks).expect("native path");
+        let native_letters_only =
+            NativeEncoder::from_tokenizer(&letters_only).expect("native path");
+        assert_eq!(
+            native_pieces(&native_with_marks, &cluster),
+            std::slice::from_ref(&cluster)
+        );
+        assert_eq!(
+            native_pieces(&native_letters_only, &cluster),
+            [letter.to_owned(), marks.to_owned()]
+        );
+        let mut lengths = Vec::new();
+        for (tokenizer, native) in [
+            (&with_marks, &native_with_marks),
+            (&letters_only, &native_letters_only),
+        ] {
+            for text in [cluster.as_str(), sentence] {
+                let reference = tokenizer
+                    .encode(text, false)
+                    .expect("encode")
+                    .get_ids()
+                    .to_vec();
+                let ids = native
+                    .encode(tokenizer.get_model(), text)
+                    .expect("the native path takes NFC text");
+                assert_eq!(ids, reference, "{text:?}");
+            }
+            lengths.push(
+                native
+                    .encode(tokenizer.get_model(), &cluster)
+                    .unwrap()
+                    .len(),
+            );
+        }
+        assert_eq!(lengths, [1, 2], "{cluster:?}");
+    }
+
+    #[test]
+    fn bengali_marks_stay_with_their_letter() {
+        marks_stay_with_their_letter("ট", "\u{9BF}", "একটি নতুন প্রোগ্রাম 16টি");
+    }
+
+    #[test]
+    fn telugu_marks_stay_with_their_letter() {
+        marks_stay_with_their_letter("క", "\u{C3E}", "ఒక కొత్త కార్యక్రమం");
+    }
+
+    #[test]
+    fn thai_marks_stay_with_their_letter() {
+        marks_stay_with_their_letter("น", "\u{E47}", "โปรแกรมใหม่หนึ่ง เน็ต");
+    }
+
+    #[test]
+    fn devanagari_marks_stay_with_their_letter() {
+        marks_stay_with_their_letter("क", "\u{948}", "चाय कैसे बनाएँ");
+    }
+
+    #[test]
+    fn arabic_marks_stay_with_their_letter() {
+        marks_stay_with_their_letter("ق", "\u{64E}\u{651}", "يَتَلَقَّى مَرْحَبًا");
     }
 
     #[test]
@@ -1331,7 +1852,9 @@ mod tests {
                     let text: String = (0..15_000)
                         .map(|i| format!(" {}", word(i * threads + t)))
                         .collect();
-                    native.encode(model, &text).expect("ids");
+                    // On this thread, not the pool: the test is about the
+                    // caches the encoding threads hold.
+                    native.encode_with(model, &text, false).expect("ids");
                 });
             }
         });

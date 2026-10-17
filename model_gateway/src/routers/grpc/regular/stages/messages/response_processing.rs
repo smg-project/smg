@@ -15,7 +15,7 @@ use crate::{
     routers::{
         error,
         grpc::{
-            common::stages::{helpers, ProcessStage, RateLimitCell},
+            common::stages::{ProcessStage, RateLimitCell},
             context::{DispatchContext, FinalResponse},
             regular::{processor, streaming},
             spec::ResponseSpec,
@@ -103,8 +103,8 @@ impl ProcessStage for MessageResponseProcessingStage {
 
             // Reserved (if tenant rate limiting is enabled): settled with real
             // usage inside the streaming processor on success, or abandoned
-            // via the attached ReservationAttachment's Drop below on early
-            // disconnect/error.
+            // on early disconnect/error by the reservation's safety net the
+            // processor hands the response body (ReservationAttachment's Drop).
             let reservation = ctx
                 .rate_limit_cell
                 .as_deref()
@@ -125,15 +125,11 @@ impl ProcessStage for MessageResponseProcessingStage {
                     dispatch,
                     tokenizer,
                     skip_special_tokens,
-                    reservation.clone(),
+                    reservation,
+                    ctx.load_guards.take(),
                     source,
                 )
                 .await;
-
-            // Attach load guards (and the reservation's disconnect/error
-            // safety net) for RAII lifecycle.
-            let response =
-                helpers::attach_response_guards(response, ctx.load_guards.take(), reservation);
 
             return Ok(Some(response));
         }
@@ -150,7 +146,7 @@ impl ProcessStage for MessageResponseProcessingStage {
             )
         })?;
 
-        let response = self
+        let (response, counts) = self
             .processor
             .process_non_streaming_messages_response(
                 execution_result,
@@ -161,8 +157,9 @@ impl ProcessStage for MessageResponseProcessingStage {
             )
             .await?;
 
-        // Store the final response
+        // Store the final response, and the engine's counters for the settlement
         ctx.response.final_response = Some(FinalResponse::Messages(Box::new(response)));
+        ctx.response.engine_counts = Some(counts);
 
         Ok(None)
     }

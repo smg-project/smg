@@ -17,13 +17,16 @@ use smg_grpc_client::vllm_engine::{
     proto, proto::generate_response::Response as GenerationEvent, AbortOnDropStream,
     VllmEngineClient,
 };
-use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle, time::timeout};
+use tokio::{sync::oneshot, task::JoinHandle, time::timeout};
 use tonic::codec::Codec;
 use tool_parser::types::ToolCallItem;
 
 use super::*;
 use crate::{
-    routers::{common::sse::SseReceiver, grpc::regular::processor::ResponseProcessor},
+    routers::{
+        common::sse::SseReceiver,
+        grpc::{regular::processor::ResponseProcessor, test_engine::mock_engine},
+    },
     worker::{
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
         BasicWorkerBuilder, Worker, WorkerRegistry,
@@ -231,36 +234,8 @@ where
 /// The mock worker a test's client connects to, as its URL and its server
 /// task. The test supplies the response frames itself; the server only
 /// accepts the connection.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "bounded test fixture; server task is explicitly aborted"
-)]
 pub(super) async fn mock_worker_endpoint() -> (String, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock worker");
-    let port = listener.local_addr().expect("mock worker address").port();
-    let config = Arc::new(mock_worker::config::Config {
-        admin_port: None,
-        context_length: 32768,
-        host: "127.0.0.1".to_string(),
-        http_base_port: 0,
-        http_count: 0,
-        grpc_base_port: port,
-        grpc_count: 1,
-        zmq_handshake: None,
-        zmq_count: 0,
-        zmq_start_index: 0,
-        model_id: "eof-test".to_string(),
-        tokenizer_path: "eof-test".to_string(),
-        gen_delay: Duration::ZERO,
-        output_tokens: 0,
-        realistic: false,
-        engine: mock_worker::engine::EngineParams::default(),
-        ..mock_worker::config::Config::default()
-    });
-    let server = tokio::spawn(mock_worker::grpc::serve_with_listener(config, listener));
-    (format!("http://127.0.0.1:{port}"), server)
+    mock_engine("eof-test").await
 }
 
 async fn mock_client() -> (VllmEngineClient, JoinHandle<()>) {
@@ -348,6 +323,7 @@ async fn byte_fallback_completion_sse_keeps_tail_and_exact_usage() {
                 CompletionResponseSpec::from(&request),
                 dispatch(),
                 tokenizer.clone(),
+                None,
                 None,
                 utils::StreamSource::new(None, &dispatch(), metrics_labels::ENDPOINT_COMPLETIONS),
             )
@@ -651,11 +627,12 @@ async fn byte_fallback_messages_eof_emits_exact_text_before_block_stop() {
     let (tx, rx) = sse_channel();
     let spec = MessagesResponseSpec {
         thinking_requested: false,
+        thinking_text_returned: true,
         reasoning_in_prefill: false,
         tool_choice: None,
         has_tools: false,
         history_tool_calls_count: 0,
-        chat_tools: Vec::new(),
+        chat_tools: Vec::new().into(),
         stop_sequences: None,
         symphony: None,
         first_tool_call_only: false,
@@ -747,11 +724,12 @@ fn byte_fallback_reasoning_tokenizer() -> Arc<dyn Tokenizer> {
 fn byte_fallback_messages_spec(thinking: bool) -> MessagesResponseSpec {
     MessagesResponseSpec {
         thinking_requested: thinking,
+        thinking_text_returned: true,
         reasoning_in_prefill: false,
         tool_choice: None,
         has_tools: false,
         history_tool_calls_count: 0,
-        chat_tools: Vec::new(),
+        chat_tools: Vec::new().into(),
         stop_sequences: None,
         symphony: None,
         first_tool_call_only: false,
@@ -1125,7 +1103,7 @@ async fn byte_fallback_unary_valid_reasoning_counts_original_tokens() {
             response: Some(GenerationEvent::Complete(complete)),
         };
         let (stream, server) = scripted_stream(vec![frame], "0").await;
-        let message = processor
+        let (message, _) = processor
             .process_non_streaming_messages_response(
                 context::ExecutionResult::Single { stream },
                 byte_fallback_messages_spec(true),
@@ -1634,7 +1612,7 @@ async fn kimi_k3_cut_inside_the_closing_structure_keeps_the_markers_out_of_conte
         let (stream, server) = scripted_stream(vec![chunk(0, &text), last], "0").await;
         let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
         let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
-        let response = ResponseProcessor::new(
+        let (response, _) = ResponseProcessor::new(
             ToolParserFactory::new(),
             ReasoningParserFactory::new(),
             resolver(),
@@ -1733,7 +1711,7 @@ async fn chat_unary_logprobs_cover_the_content_only() {
     let stop = Some(StringOrArray::String("STOP".to_string()));
     let mut decoder =
         utils::create_stop_decoder(&tokenizer, stop.as_ref(), None, false, false, false);
-    let response = ResponseProcessor::new(
+    let (response, _) = ResponseProcessor::new(
         ToolParserFactory::new(),
         ReasoningParserFactory::new(),
         utils::ParserResolver::new(
@@ -1916,11 +1894,12 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
         let (tx, rx) = sse_channel();
         let spec = MessagesResponseSpec {
             thinking_requested: true,
+            thinking_text_returned: true,
             reasoning_in_prefill: false,
             tool_choice: None,
             has_tools: false,
             history_tool_calls_count: 0,
-            chat_tools: Vec::new(),
+            chat_tools: Vec::new().into(),
             stop_sequences: None,
             symphony: None,
             first_tool_call_only: false,
@@ -2001,11 +1980,12 @@ async fn messages_stream_stop_reason_follows_what_the_engine_matched() {
         let (tx, rx) = sse_channel();
         let spec = MessagesResponseSpec {
             thinking_requested: false,
+            thinking_text_returned: true,
             reasoning_in_prefill: false,
             tool_choice: None,
             has_tools: false,
             history_tool_calls_count: 0,
-            chat_tools: Vec::new(),
+            chat_tools: Vec::new().into(),
             stop_sequences: Some(StringOrArray::Array(vec!["###".to_string()])),
             symphony: None,
             first_tool_call_only: false,
@@ -2098,7 +2078,7 @@ async fn qwen_xml_messages(text: &str, finish: &str, stream: bool) -> (Vec<Strin
             resolver(),
         );
         let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
-        let message = processor
+        let (message, _) = processor
             .process_non_streaming_messages_response(
                 context::ExecutionResult::Single {
                     stream: grpc_stream,
@@ -2375,6 +2355,7 @@ async fn messages_blocks_and_inputs(
 ) -> (Vec<String>, Vec<Value>) {
     let spec = MessagesResponseSpec {
         thinking_requested: true,
+        thinking_text_returned: true,
         reasoning_in_prefill: false,
         tool_choice,
         has_tools: true,
@@ -2748,7 +2729,7 @@ async fn gemma4_rendered_prompt_state_controls_chat_responses() {
                 } else {
                     let mut decoder =
                         utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
-                    let response = ResponseProcessor::new(
+                    let (response, _) = ResponseProcessor::new(
                         ToolParserFactory::new(),
                         ReasoningParserFactory::new(),
                         resolver,
@@ -2885,7 +2866,7 @@ async fn gemma4_rendered_prompt_state_controls_messages_responses() {
                 } else {
                     let mut decoder =
                         utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
-                    let response = ResponseProcessor::new(
+                    let (response, _) = ResponseProcessor::new(
                         ToolParserFactory::new(),
                         ReasoningParserFactory::new(),
                         resolver,
@@ -3053,7 +3034,8 @@ plan<|tool_call>call:lookup{q:<|"|>Paris<|"|>}<tool_call|>"#;
                 tokenizer,
                 &mut decoder,
             )
-            .await;
+            .await
+            .map(|(message, _)| message);
         server.abort();
         let response =
             serde_json::to_value(result.unwrap_or_else(|error| panic!("{}", error.status())))
@@ -3389,6 +3371,7 @@ async fn frames_of_a_chat_stream_cut_with(status: tonic::Status) -> (Vec<String>
             Arc::new(CharacterTokenizer::default()),
             false,
             None,
+            None,
             source,
         )
         .await;
@@ -3453,6 +3436,106 @@ async fn chat_stream_the_engine_rejects_after_its_first_chunk_is_the_requests_fa
         "Stream error: the grammar does not compile"
     );
     assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+}
+
+/// The load guards a processor is handed ride on the body it builds: the
+/// worker stays loaded after the processor returns, read to the end or
+/// dropped unread, and is unloaded when the body goes.
+#[tokio::test]
+async fn the_load_guards_of_a_chat_stream_go_with_its_body() {
+    for read_to_the_end in [true, false] {
+        let (stream, server) =
+            scripted_stream(vec![chunk(0, "Hi"), complete(0, "stop")], "0").await;
+        let worker = breaker_worker();
+        let selection = context::WorkerSelection::Single {
+            worker: Arc::clone(&worker),
+        };
+        let guards = context::LoadGuards::new(&selection, None);
+        assert_eq!(worker.load(), 1, "the dispatch loaded the worker");
+        let source =
+            utils::StreamSource::new(Some(&selection), &dispatch(), metrics_labels::ENDPOINT_CHAT);
+        let response = Arc::new(processor(false))
+            .process_streaming_response(
+                context::ExecutionResult::Single { stream },
+                chat_spec(false),
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                false,
+                None,
+                Some(guards),
+                source,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            worker.load(),
+            1,
+            "the guards ride on the body (read_to_the_end={read_to_the_end})"
+        );
+        if read_to_the_end {
+            let body = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .expect("the SSE body")
+                .to_bytes();
+            let text = std::str::from_utf8(&body).expect("UTF-8 SSE");
+            assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+        } else {
+            drop(response);
+        }
+        assert_eq!(
+            worker.load(),
+            0,
+            "the body took the guards with it (read_to_the_end={read_to_the_end})"
+        );
+        server.abort();
+    }
+}
+
+/// A completion stream refused before its first frame (the execution result
+/// is no stream) carries its load guards on the refusal's body all the same.
+#[tokio::test]
+async fn the_load_guards_of_a_completion_stream_refused_before_its_first_frame_go_with_its_body() {
+    let worker = breaker_worker();
+    let selection = context::WorkerSelection::Single {
+        worker: Arc::clone(&worker),
+    };
+    let guards = context::LoadGuards::new(&selection, None);
+    let request: openai_protocol::completion::CompletionRequest = serde_json::from_value(
+        serde_json::json!({"model":"eof-test", "prompt":"test", "stream":true}),
+    )
+    .unwrap();
+    let nested = context::ExecutionResult::Batch {
+        results: vec![context::ExecutionResult::Batch {
+            results: Vec::new(),
+        }],
+    };
+    let response = Arc::new(processor(false))
+        .process_completion_streaming_response(
+            nested,
+            CompletionResponseSpec::from(&request),
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            None,
+            Some(guards),
+            utils::StreamSource::new(
+                Some(&selection),
+                &dispatch(),
+                metrics_labels::ENDPOINT_COMPLETIONS,
+            ),
+        )
+        .await;
+    assert_eq!(worker.load(), 1, "the refusal's body holds the guards");
+    let body = http_body_util::BodyExt::collect(response.into_body())
+        .await
+        .expect("the SSE body")
+        .to_bytes();
+    let text = std::str::from_utf8(&body).expect("UTF-8 SSE");
+    assert!(
+        text.contains("Nested batch or embedding result in completion streaming"),
+        "{text}"
+    );
+    assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+    assert_eq!(worker.load(), 0, "the body took the guards with it");
 }
 
 /// Two calls in the `qwen` tool format, one per chunk.
@@ -3596,7 +3679,7 @@ async fn messages_tool_inputs(tool_choice: &Value, texts: &[&str], stream: bool)
             qwen_resolver(),
         );
         let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
-        let message = processor
+        let (message, _) = processor
             .process_non_streaming_messages_response(
                 context::ExecutionResult::Single {
                     stream: grpc_stream,

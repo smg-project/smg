@@ -7,7 +7,8 @@
 //! alone, whatever the request says: the template has no thinking switch (a system message carries
 //! the `reasoning_effort`), so the output starts where a message's kind is said, and the model
 //! writes the thought or not. Everything the markers do not frame is the message's text. Recorded
-//! as `inkling` (thinkingmachines/Inkling).
+//! as `inkling` (thinkingmachines/Inkling); Inkling-Small and Inkling-NVFP4 ship the same template
+//! byte for byte and read with it.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 

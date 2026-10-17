@@ -91,87 +91,6 @@ impl BucketPolicy {
             bucket_guard.init_prefill_worker_urls(worker_urls);
         }
     }
-
-    pub fn add_prefill_url(&self, worker: &dyn Worker) {
-        let model_key = normalize_model_key(worker.model_id());
-        let bucket = self
-            .buckets
-            .entry(model_key.to_string())
-            .or_insert_with(|| {
-                Arc::new(RwLock::new(Bucket::new(
-                    self.config.bucket_adjust_interval_secs * 1000,
-                )))
-            })
-            .clone();
-
-        let mut bucket_guard = bucket.write();
-        let worker_url = worker.url().to_string();
-
-        // Check for duplicate before modifying state to avoid resetting load counters
-        {
-            let prefill_worker_urls = bucket_guard.prefill_worker_urls.lock();
-            if prefill_worker_urls.contains(&worker_url) {
-                debug!(
-                    "Worker {} already in bucket for model {}, skipping",
-                    worker_url, model_key
-                );
-                return;
-            }
-        }
-
-        let prefill_worker_urls_clone = {
-            let mut prefill_worker_urls = bucket_guard.prefill_worker_urls.lock();
-            prefill_worker_urls.push(worker_url.clone());
-            let cloned = prefill_worker_urls.clone();
-
-            let mut chars_per_url = bucket_guard.chars_per_url.lock();
-            chars_per_url.entry(worker_url.clone()).or_insert(0);
-
-            cloned
-        };
-
-        bucket_guard.init_prefill_worker_urls(prefill_worker_urls_clone);
-
-        info!(
-            "Added worker {} to bucket for model {}",
-            worker_url, model_key
-        );
-    }
-
-    pub fn remove_prefill_url(&self, worker: &dyn Worker) {
-        let model_key = normalize_model_key(worker.model_id());
-
-        if let Some(bucket_entry) = self.buckets.get(model_key) {
-            let bucket = bucket_entry.value();
-            let worker_url = worker.url().to_string();
-
-            let mut bucket_guard = bucket.write();
-            let (updated_len, updated_urls) = {
-                let mut prefill_worker_urls = bucket_guard.prefill_worker_urls.lock();
-                prefill_worker_urls.retain(|u| u != &worker_url);
-                let len = prefill_worker_urls.len();
-                let urls_clone = prefill_worker_urls.clone();
-
-                let mut chars_per_url = bucket_guard.chars_per_url.lock();
-                chars_per_url.remove(&worker_url);
-
-                (len, urls_clone)
-            };
-
-            bucket_guard.bucket_cnt = updated_len;
-            bucket_guard.init_prefill_worker_urls(updated_urls);
-
-            info!(
-                "Removed worker {} from bucket for model {} (remaining workers: {})",
-                worker_url, model_key, bucket_guard.bucket_cnt
-            );
-        } else {
-            warn!(
-                "No bucket found for model {} when trying to remove worker",
-                model_key
-            );
-        }
-    }
 }
 
 impl LoadBalancingPolicy for BucketPolicy {
@@ -198,15 +117,28 @@ impl LoadBalancingPolicy for BucketPolicy {
             .buckets
             .get(model_key)
             .map(|entry| entry.value().clone());
-        let prefill_url = if let Some(bucket) = bucket {
+        if let Some(bucket) = bucket {
             let (choiced_url, chars_per_url_snapshot) = {
                 let buc = bucket.read();
                 let chars_per_url_snapshot = buc.chars_per_url.lock().clone();
                 let choiced_url = buc.find_boundary(char_count);
                 (choiced_url, chars_per_url_snapshot)
             };
-            let max_load = chars_per_url_snapshot.values().copied().max().unwrap_or(0);
-            let min_load = chars_per_url_snapshot.values().copied().min().unwrap_or(0);
+            // The imbalance test and the spill weigh the offered healthy
+            // workers alone: a listed worker nobody offers drains to zero and
+            // would otherwise drag the minimum down and draw every spill to a
+            // worker that cannot serve.
+            let offered: Vec<(&String, usize)> = chars_per_url_snapshot
+                .iter()
+                .filter(|(url, _)| {
+                    healthy_indices
+                        .iter()
+                        .any(|&i| workers[i].url() == url.as_str())
+                })
+                .map(|(url, &chars)| (url, chars))
+                .collect();
+            let max_load = offered.iter().map(|&(_, chars)| chars).max().unwrap_or(0);
+            let min_load = offered.iter().map(|&(_, chars)| chars).min().unwrap_or(0);
             let abs_diff = max_load.saturating_sub(min_load);
             let rel_threshold = self.config.balance_rel_threshold * min_load as f32;
             let is_imbalanced =
@@ -219,10 +151,10 @@ impl LoadBalancingPolicy for BucketPolicy {
             let mut rng = rand::rng();
             let prefill_url = if is_imbalanced {
                 debug!("select prefill instance by Load Balance policy");
-                let min_url = chars_per_url_snapshot
+                let min_url = offered
                     .iter()
-                    .min_by_key(|(_, &chars)| chars)
-                    .map(|(url, _)| url.clone())
+                    .min_by_key(|&&(_, chars)| chars)
+                    .map(|&(url, _)| url.clone())
                     .unwrap_or_else(|| {
                         let idx = rng.random_range(0..healthy_indices.len());
                         let url = workers[healthy_indices[idx]].url();
@@ -243,25 +175,60 @@ impl LoadBalancingPolicy for BucketPolicy {
                 }
             };
 
+            // The bucket chooses among the workers it lists; the caller offers
+            // the ones available now (on a retry, the ones not yet tried). A
+            // listed worker that is not offered, or not healthy, gives way to
+            // an offered one, and the load is booked to the worker that serves
+            // the request.
+            let position = healthy_indices
+                .iter()
+                .copied()
+                .find(|&i| workers[i].url() == prefill_url)
+                .unwrap_or_else(|| {
+                    let fallback = healthy_indices[rng.random_range(0..healthy_indices.len())];
+                    warn!(
+                        "Bucket worker {} is not among the offered workers, randomly selecting: {}",
+                        prefill_url,
+                        workers[fallback].url()
+                    );
+                    fallback
+                });
+
             {
                 let mut buc = bucket.write();
-                buc.post_process_request(char_count, prefill_url.clone());
+                buc.post_process_request(char_count, workers[position].url().to_string());
             }
 
-            prefill_url
-        } else {
-            warn!(
-                "No bucket found for model {}, randomly selecting healthy worker",
-                model_key
-            );
-            let mut rng = rand::rng();
-            let idx = rng.random_range(0..healthy_indices.len());
-            let selected_worker = &workers[healthy_indices[idx]];
-            let prefill_url = selected_worker.url().to_string();
-            prefill_url
-        };
+            return Some(position);
+        }
 
-        workers.iter().position(|w| w.url() == prefill_url)
+        warn!(
+            "No bucket found for model {}, randomly selecting healthy worker",
+            model_key
+        );
+        let mut rng = rand::rng();
+        Some(healthy_indices[rng.random_range(0..healthy_indices.len())])
+    }
+
+    /// A worker that left the fleet leaves every bucket that listed it; a
+    /// neighbour takes its size range over (see
+    /// [`Bucket::remove_prefill_worker_url`]). A URL names one worker across
+    /// models, so every bucket is asked.
+    fn remove_worker(&self, url: &str) {
+        let buckets: Vec<(String, Arc<RwLock<Bucket>>)> = self
+            .buckets
+            .iter()
+            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+            .collect();
+        for (model_key, bucket) in buckets {
+            let mut bucket = bucket.write();
+            if bucket.remove_prefill_worker_url(url) {
+                info!(
+                    "Removed worker {} from bucket for model {} (remaining workers: {})",
+                    url, model_key, bucket.bucket_cnt
+                );
+            }
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -270,6 +237,13 @@ impl LoadBalancingPolicy for BucketPolicy {
 
     fn needs_request_text(&self) -> bool {
         true // Bucket policy needs request text
+    }
+
+    /// The size signal is the token count when the ids are there and the
+    /// text's length only without them, so a tokenized request keeps no
+    /// copy of its prompt for a retry's re-selection.
+    fn needs_request_text_with_tokens(&self) -> bool {
+        false
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -383,8 +357,13 @@ impl Bucket {
 
     pub fn post_process_request(&mut self, char_cnt: usize, prefill_url: String) {
         {
+            // Only a worker the bucket counts takes the load: a selection that
+            // overlapped the worker's removal must not put its counter back,
+            // where it would draw the spill towards a URL no caller offers.
             let mut map = self.chars_per_url.lock();
-            *map.entry(prefill_url.clone()).or_insert(0) += char_cnt;
+            if let Some(count) = map.get_mut(&prefill_url) {
+                *count += char_cnt;
+            }
         }
 
         let now = SystemTime::now();
@@ -426,6 +405,38 @@ impl Bucket {
         });
 
         self.load_total = self.load_total.saturating_add(char_cnt);
+    }
+
+    /// Forget `url`: its place among the workers, its load counter and its
+    /// range, which the previous neighbour takes over (the next one when it
+    /// was first). The partition stays contiguous until the next adjustment
+    /// rebuilds it from the request sizes seen: the reference load of the
+    /// last rebuild is cleared, so that tick re-partitions among the workers
+    /// left instead of holding a partition whose per-worker load moved by
+    /// less than the factor of two it otherwise waits for. Whether the bucket
+    /// held it.
+    pub fn remove_prefill_worker_url(&mut self, url: &str) -> bool {
+        let listed = {
+            let mut urls = self.prefill_worker_urls.lock();
+            let before = urls.len();
+            urls.retain(|u| u != url);
+            self.bucket_cnt = urls.len();
+            urls.len() != before
+        };
+        if listed {
+            self.bucket_load = 0;
+        }
+        let counted = self.chars_per_url.lock().remove(url).is_some();
+        let Some(i) = self.boundary.iter().position(|b| b.url == url) else {
+            return listed || counted;
+        };
+        let gone = self.boundary.remove(i);
+        if let Some(previous) = i.checked_sub(1) {
+            self.boundary[previous].range[1] = gone.range[1];
+        } else if let Some(next) = self.boundary.first_mut() {
+            next.range[0] = gone.range[0];
+        }
+        true
     }
 
     pub fn find_boundary(&self, char_count: usize) -> Option<String> {
@@ -1324,6 +1335,261 @@ mod tests {
                     assert_eq!(bucket_guard.boundary[1].range[1], 26);
                 }
             }
+        }
+    }
+
+    fn prefill_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
+        urls.iter()
+            .map(|url| {
+                Arc::new(
+                    BasicWorkerBuilder::new(*url)
+                        .worker_type(WorkerType::Prefill)
+                        .health_config(no_health_check())
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect()
+    }
+
+    /// A policy whose selection follows the boundaries alone: the load spill
+    /// never fires and the periodic adjustment never runs within a test.
+    fn boundary_only_policy() -> BucketPolicy {
+        BucketPolicy::with_config(BucketConfig {
+            balance_abs_threshold: usize::MAX,
+            bucket_adjust_interval_secs: 3600,
+            ..Default::default()
+        })
+    }
+
+    /// The boundaries of the bucket `workers` share, as (url, range).
+    fn boundaries(policy: &BucketPolicy, workers: &[Arc<dyn Worker>]) -> Vec<(String, [usize; 2])> {
+        let entry = policy
+            .buckets
+            .get(normalize_model_key(workers[0].model_id()))
+            .expect("the workers' model has a bucket");
+        let bucket = entry.read();
+        bucket
+            .boundary
+            .iter()
+            .map(|b| (b.url.clone(), b.range))
+            .collect()
+    }
+
+    fn select(policy: &BucketPolicy, workers: &[Arc<dyn Worker>], size: usize) -> Option<usize> {
+        let text = "a".repeat(size);
+        policy.select_worker(
+            workers,
+            &SelectWorkerInfo {
+                request_text: Some(&text),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A removed worker leaves the bucket with its range: a request of a size
+    /// it owned goes to the neighbour that took the range over, not to no
+    /// worker because a boundary still named a departed URL.
+    #[test]
+    fn a_removed_worker_leaves_the_boundaries_and_a_neighbour_takes_its_range() {
+        let policy = boundary_only_policy();
+        let workers = prefill_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_prefill_worker_urls(&workers);
+        // The first split hands 4096 out evenly: w2 owns [1365, 2729].
+        assert_eq!(
+            boundaries(&policy, &workers),
+            [
+                ("http://w1:8000".to_string(), [0, 1364]),
+                ("http://w2:8000".to_string(), [1365, 2729]),
+                ("http://w3:8000".to_string(), [2730, usize::MAX]),
+            ]
+        );
+
+        policy.remove_worker("http://w2:8000");
+
+        let remaining = [Arc::clone(&workers[0]), Arc::clone(&workers[2])];
+        let selected = select(&policy, &remaining, 2000)
+            .expect("a request in the removed worker's range selects a worker");
+        assert_eq!(remaining[selected].url(), "http://w1:8000");
+        assert_eq!(
+            boundaries(&policy, &workers),
+            [
+                ("http://w1:8000".to_string(), [0, 2729]),
+                ("http://w3:8000".to_string(), [2730, usize::MAX]),
+            ]
+        );
+        let entry = policy
+            .buckets
+            .get(normalize_model_key(workers[0].model_id()))
+            .unwrap();
+        let bucket = entry.read();
+        assert_eq!(
+            *bucket.prefill_worker_urls.lock(),
+            ["http://w1:8000", "http://w3:8000"]
+        );
+        assert!(!bucket.chars_per_url.lock().contains_key("http://w2:8000"));
+        assert_eq!(bucket.bucket_cnt, 2);
+    }
+
+    /// At either end the one neighbour takes the range; the last worker
+    /// standing owns every size; an emptied bucket still selects among the
+    /// workers the caller offers; a URL the bucket never held is a no-op.
+    #[test]
+    fn removal_at_either_end_hands_the_range_to_the_one_neighbour() {
+        let policy = boundary_only_policy();
+        let workers = prefill_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_prefill_worker_urls(&workers);
+
+        policy.remove_worker("http://w1:8000");
+        assert_eq!(
+            boundaries(&policy, &workers),
+            [
+                ("http://w2:8000".to_string(), [0, 2729]),
+                ("http://w3:8000".to_string(), [2730, usize::MAX]),
+            ]
+        );
+        policy.remove_worker("http://w3:8000");
+        assert_eq!(
+            boundaries(&policy, &workers),
+            [("http://w2:8000".to_string(), [0, usize::MAX])]
+        );
+        let only = [Arc::clone(&workers[1])];
+        for size in [0, 1365, 4096, 100_000] {
+            assert_eq!(select(&policy, &only, size), Some(0), "size {size}");
+        }
+
+        policy.remove_worker("http://w2:8000");
+        policy.remove_worker("http://w9:8000");
+        assert!(boundaries(&policy, &workers).is_empty());
+        let newcomer = prefill_workers(&["http://w4:8000"]);
+        assert_eq!(select(&policy, &newcomer, 2000), Some(0));
+    }
+
+    /// After a removal the next adjustment re-partitions among the workers
+    /// left: the reference load of the last rebuild is cleared, so the skip
+    /// for a per-worker load that moved by less than a factor of two (three
+    /// workers to two is a factor of one and a half) does not hold the merged
+    /// range in place.
+    #[test]
+    fn a_removal_lets_the_next_adjustment_re_partition_among_the_survivors() {
+        let policy = boundary_only_policy();
+        let workers = prefill_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_prefill_worker_urls(&workers);
+        for size in [100, 200, 3000] {
+            select(&policy, &workers, size).expect("a worker serves the request");
+        }
+        let bucket = {
+            let entry = policy
+                .buckets
+                .get(normalize_model_key(workers[0].model_id()))
+                .expect("the workers' model has a bucket");
+            Arc::clone(entry.value())
+        };
+        bucket.write().adjust_boundary();
+        assert_eq!(
+            bucket.read().bucket_load,
+            1100,
+            "the first rebuild keeps the per-worker load as its reference"
+        );
+
+        policy.remove_worker("http://w2:8000");
+        assert_eq!(bucket.read().bucket_load, 0);
+        let merged = boundaries(&policy, &workers);
+        assert_eq!(
+            merged,
+            [
+                ("http://w1:8000".to_string(), [0, 4101]),
+                ("http://w3:8000".to_string(), [4102, usize::MAX]),
+            ]
+        );
+
+        bucket.write().adjust_boundary();
+        assert_eq!(
+            boundaries(&policy, &workers),
+            [
+                ("http://w1:8000".to_string(), [0, 3000]),
+                ("http://w3:8000".to_string(), [3001, usize::MAX]),
+            ],
+            "the tick after a removal re-partitions among the survivors"
+        );
+        assert_eq!(bucket.read().bucket_load, 1650);
+    }
+
+    /// A selection that chose a worker before its removal and books its load
+    /// after it does not bring the worker's counter back.
+    #[test]
+    fn a_selection_overlapping_a_removal_does_not_resurrect_the_departed_worker() {
+        let policy = boundary_only_policy();
+        let workers = prefill_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_prefill_worker_urls(&workers);
+        policy.remove_worker("http://w2:8000");
+
+        let entry = policy
+            .buckets
+            .get(normalize_model_key(workers[0].model_id()))
+            .expect("the workers' model has a bucket");
+        let mut bucket = entry.write();
+        bucket.post_process_request(500, "http://w2:8000".to_string());
+        assert!(!bucket.chars_per_url.lock().contains_key("http://w2:8000"));
+        bucket.post_process_request(500, "http://w1:8000".to_string());
+        assert_eq!(
+            bucket.chars_per_url.lock().get("http://w1:8000"),
+            Some(&500)
+        );
+    }
+
+    /// A worker the bucket lists but the caller does not offer (not available
+    /// now, or already tried on a retry) gives way to an offered worker, and
+    /// the load is booked to the worker that serves the request.
+    #[test]
+    fn a_listed_worker_the_caller_does_not_offer_gives_way_to_an_offered_one() {
+        let policy = boundary_only_policy();
+        let workers = prefill_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_prefill_worker_urls(&workers);
+
+        // 2000 is in w2's range [1365, 2729]; w2 is listed but not offered.
+        let offered = [Arc::clone(&workers[0]), Arc::clone(&workers[2])];
+        let selected =
+            select(&policy, &offered, 2000).expect("an offered worker serves the request");
+        let served = offered[selected].url().to_string();
+
+        let entry = policy
+            .buckets
+            .get(normalize_model_key(workers[0].model_id()))
+            .expect("the workers' model has a bucket");
+        let bucket = entry.read();
+        let counted = bucket.chars_per_url.lock();
+        assert_eq!(counted.get("http://w2:8000"), Some(&0));
+        assert_eq!(counted.get(served.as_str()), Some(&2000));
+    }
+
+    /// The imbalance test and the spill weigh the offered workers alone: a
+    /// listed worker nobody offers drains to zero and must neither trip the
+    /// spill on every request nor receive it.
+    #[test]
+    fn the_spill_weighs_the_offered_workers_alone() {
+        for _ in 0..8 {
+            let policy = BucketPolicy::with_config(BucketConfig {
+                balance_abs_threshold: 100,
+                balance_rel_threshold: 1.1,
+                bucket_adjust_interval_secs: 3600,
+            });
+            let workers = prefill_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+            policy.init_prefill_worker_urls(&workers);
+            // w2 is listed but never offered; w1 takes 50 chars, then w3 3000.
+            let offered = [Arc::clone(&workers[0]), Arc::clone(&workers[2])];
+            assert_eq!(select(&policy, &offered, 50), Some(0));
+            assert_eq!(select(&policy, &offered, 3000), Some(1));
+            // Among the offered workers w3 is 2950 chars ahead: the spill sends
+            // the next request to w1, never to the unoffered w2.
+            assert_eq!(select(&policy, &offered, 3000), Some(0));
+            let entry = policy
+                .buckets
+                .get(normalize_model_key(workers[0].model_id()))
+                .expect("the workers' model has a bucket");
+            let bucket = entry.read();
+            let counted = bucket.chars_per_url.lock();
+            assert_eq!(counted.get("http://w2:8000"), Some(&0));
+            assert_eq!(counted.get("http://w1:8000"), Some(&3050));
         }
     }
 }

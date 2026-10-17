@@ -56,12 +56,6 @@ use crate::{
     worker::{RoutingPool, WorkerRegistry, WorkerType},
 };
 
-/// `501 NOT_IMPLEMENTED`, returned by endpoints this router's mode doesn't
-/// serve (matching the `RouterTrait` default).
-fn not_implemented(message: &'static str) -> Response {
-    (StatusCode::NOT_IMPLEMENTED, message).into_response()
-}
-
 /// gRPC router implementation for SGLang.
 ///
 /// A single `Mode`-parameterized router serving Regular, PrefillDecode, and
@@ -402,10 +396,16 @@ impl GrpcRouter {
         let (Some(responses_context), Some(harmony_responses_context)) =
             (&self.responses_context, &self.harmony_responses_context)
         else {
-            return not_implemented("Responses endpoint not implemented");
+            return error::not_implemented(
+                "responses_not_implemented",
+                "Responses endpoint not implemented",
+            );
         };
         let Some(harmony_pipeline) = self.harmony_pipeline.as_ref() else {
-            return not_implemented("Responses endpoint not implemented");
+            return error::not_implemented(
+                "responses_not_implemented",
+                "Responses endpoint not implemented",
+            );
         };
 
         // 0. Fast worker validation (fail-fast before expensive operations)
@@ -634,7 +634,10 @@ impl GrpcRouter {
         model_id: &str,
     ) -> Response {
         let Some(embedding_pipeline) = self.embedding_pipeline.as_ref() else {
-            return not_implemented("Embeddings not implemented");
+            return error::not_implemented(
+                "embeddings_not_implemented",
+                "Embeddings not implemented",
+            );
         };
         debug!("Processing embedding request for model: {}", model_id);
 
@@ -998,7 +1001,7 @@ impl GrpcRouter {
         model_id: &str,
     ) -> Response {
         let Some(classify_pipeline) = self.classify_pipeline.as_ref() else {
-            return not_implemented("Classify not implemented");
+            return error::not_implemented("classify_not_implemented", "Classify not implemented");
         };
         debug!("Processing classify request for model: {}", model_id);
 
@@ -1090,7 +1093,10 @@ impl RouterTrait for GrpcRouter {
         response_id: &str,
     ) -> Response {
         let Some(responses_context) = self.responses_context.as_ref() else {
-            return not_implemented("Cancel response not implemented");
+            return error::not_implemented(
+                "cancel_response_not_implemented",
+                "Cancel response not implemented",
+            );
         };
         let tenant = crate::tenant::storage_tenant(tenant_meta);
         cancel_response_impl(responses_context, tenant.as_deref(), response_id).await
@@ -1141,7 +1147,10 @@ impl RouterTrait for GrpcRouter {
         // `None` in PD/EPD). Detection, the chat-shaped request synthesis, and
         // output parsing all live inside the pipeline's transcription stages.
         let Some(pipeline) = self.transcription_pipeline.as_ref() else {
-            return not_implemented("Audio transcriptions not implemented");
+            return error::not_implemented(
+                "audio_transcriptions_not_implemented",
+                "Audio transcriptions not implemented",
+            );
         };
         pipeline
             .execute_transcription(
@@ -1276,6 +1285,68 @@ mod pd_tests {
             encode_policy: None,
             prefill_policy: None,
             decode_policy: None,
+        }
+    }
+
+    /// A mode that does not serve an endpoint refuses it with the JSON error
+    /// object under the endpoint's code, as the router trait's default does.
+    #[tokio::test]
+    async fn a_mode_without_the_endpoint_refuses_it_with_the_json_error_object() {
+        let ctx = grpc_ctx(pd_routing_mode()).await;
+        let router = GrpcRouter::new(&ctx, Mode::PrefillDecode).expect("pd router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let audio = AudioFile {
+            bytes: bytes::Bytes::new(),
+            file_name: "a.wav".to_owned(),
+            content_type: None,
+        };
+        fn body<T: serde::de::DeserializeOwned>(json: serde_json::Value) -> T {
+            serde_json::from_value(json).expect("a request body")
+        }
+        let answers = [
+            (
+                router
+                    .route_embeddings(
+                        None,
+                        &tenant_meta,
+                        body(serde_json::json!({"model": "m", "input": "hi"})),
+                        "m",
+                    )
+                    .await,
+                "embeddings_not_implemented",
+            ),
+            (
+                router
+                    .route_classify(
+                        None,
+                        &tenant_meta,
+                        body(serde_json::json!({"model": "m", "input": "hi"})),
+                        "m",
+                    )
+                    .await,
+                "classify_not_implemented",
+            ),
+            (
+                router
+                    .route_audio_transcriptions(
+                        None,
+                        &tenant_meta,
+                        &TranscriptionRequest::default(),
+                        audio,
+                        "m",
+                    )
+                    .await,
+                "audio_transcriptions_not_implemented",
+            ),
+        ];
+        for (answer, code) in answers {
+            let status = answer.status();
+            let body = axum::body::to_bytes(answer.into_body(), usize::MAX)
+                .await
+                .expect("drain body");
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+            assert_eq!(body["error"]["code"], code, "{body}");
         }
     }
 

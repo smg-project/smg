@@ -25,21 +25,19 @@
 //!
 //! [`formats::inkling`]: crate::formats::inkling()
 
+use super::header::{Found, Header};
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
     json,
 };
-
-const NAME_WITHOUT_A_CALL: &str = "a message that names a tool and writes no call";
 
 /// The events of one call message, from the bytes after `<|message_model|>`.
 #[derive(Clone, Debug)]
 pub struct Assembler {
     index: u32,
     id: String,
-    marker: &'static str,
     /// The bytes before the marker, held until it arrives or the message ends.
-    header: String,
+    header: Header,
     /// The object, once the marker has arrived.
     object: Option<json::Assembler>,
 }
@@ -51,8 +49,7 @@ impl Assembler {
         Self {
             index,
             id: id.into(),
-            marker,
-            header: String::new(),
+            header: Header::new(marker),
             object: None,
         }
     }
@@ -69,22 +66,9 @@ impl Assembler {
         if let Some(object) = &mut self.object {
             return object.feed(bytes, out);
         }
-        // The marker can only end inside the new bytes, so the search starts `marker.len() - 1`
-        // bytes before them (at a character boundary): a header that never meets the marker
-        // costs each piece its own length, not the header's.
-        let before = self.header.len();
-        self.header.push_str(bytes);
-        let from = before.saturating_sub(self.marker.len() - 1);
-        let from = (0..=from)
-            .rev()
-            .find(|&at| self.header.is_char_boundary(at))
-            .unwrap_or(0);
-        let Some(at) = self.header[from..].find(self.marker).map(|at| from + at) else {
+        let Some(Found { framing, after, .. }) = self.header.push(bytes) else {
             return bytes.len();
         };
-        // The marker ends inside this piece, so what follows it is this piece's too.
-        let after = self.header.split_off(at + self.marker.len());
-        let framing = std::mem::take(&mut self.header);
         out.push(Event::Dropped {
             text: Text::uncounted(framing),
             why: DropReason::Wrapper,
@@ -101,11 +85,7 @@ impl Assembler {
     pub fn close(self, out: &mut Events) {
         match self.object {
             Some(object) => object.finish(out),
-            None if !self.header.is_empty() => out.push(Event::Malformed {
-                text: Text::uncounted(self.header),
-                why: MalformedReason::Other(NAME_WITHOUT_A_CALL.to_string()),
-            }),
-            None => {}
+            None => self.header.ended(MalformedReason::NameWithoutACall, out),
         }
     }
 
@@ -114,11 +94,7 @@ impl Assembler {
     pub fn finish(self, out: &mut Events) {
         match self.object {
             Some(object) => object.finish(out),
-            None if !self.header.is_empty() => out.push(Event::Malformed {
-                text: Text::uncounted(self.header),
-                why: MalformedReason::UnterminatedRegion,
-            }),
-            None => {}
+            None => self.header.ended(MalformedReason::UnterminatedRegion, out),
         }
     }
 }
@@ -186,6 +162,23 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn an_object_without_its_arguments_member_is_a_call_with_an_empty_object() {
+        // The object's assembler says `{}` for a call whose object lacks the member, here `args`,
+        // whole and byte by byte.
+        let call = "get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\"}";
+        let per_char: Vec<&str> = call
+            .char_indices()
+            .map(|(i, c)| &call[i..i + c.len_utf8()])
+            .collect();
+        for (events, taken) in [run(&[call], false), run(&per_char, false)] {
+            assert_eq!(taken, call.len());
+            assert_eq!(bytes(&events), call);
+            assert_eq!(arguments(&events), "{}");
+            assert!(matches!(events.last(), Some(Event::ToolCallEnd { .. })));
+        }
     }
 
     #[test]
@@ -271,7 +264,7 @@ mod tests {
             events,
             [Event::Malformed {
                 text: Text::uncounted("get_weather"),
-                why: MalformedReason::Other(NAME_WITHOUT_A_CALL.to_string()),
+                why: MalformedReason::NameWithoutACall,
             }]
         );
     }

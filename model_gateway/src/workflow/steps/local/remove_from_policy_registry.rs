@@ -79,11 +79,11 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
                 monitor.on_worker_removed(worker.url()).await;
             }
 
-            // Drop the worker's cached load report from load-aware policies
-            // (power_of_two, least_load) so their caches don't leak under churn.
+            // Drop the state the policies keep on the worker (a load-aware
+            // policy's dispatch tally) so it does not leak under churn.
             app_context
                 .policy_registry
-                .remove_worker_from_load_aware(worker.url());
+                .remove_worker_from_policies(worker.url());
         }
 
         let mut cache_removals: HashMap<String, HashSet<String>> = HashMap::new();

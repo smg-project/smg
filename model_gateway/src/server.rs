@@ -1,4 +1,6 @@
 use std::{
+    future::Future,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -45,6 +47,7 @@ use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
 
+pub mod connection_limit;
 pub mod connection_timeouts;
 
 use crate::{
@@ -69,7 +72,10 @@ use crate::{
         http::router::{stream_eligible_request_bodies, StreamBodyState},
         RouterTrait,
     },
-    server::connection_timeouts::{ConnectionTimeoutAcceptor, ConnectionTimeouts},
+    server::{
+        connection_limit::ConnectionLimitAcceptor,
+        connection_timeouts::{ConnectionTimeoutAcceptor, ConnectionTimeouts},
+    },
     service_discovery::{start_service_discovery, RuntimeDiscoveryConfig},
     tenant,
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
@@ -1007,6 +1013,11 @@ pub struct ServerConfig {
     /// STUN server for ICE candidate gathering (host:port).
     /// Defaults to `stun.l.google.com:19302`; `"none"` to disable.
     pub webrtc_stun_server: Option<String>,
+    /// Where the serving keys and the store URLs were read from (the
+    /// command line, the environment or a file), for the start-up record;
+    /// a caller that did not track them leaves the default, which logs
+    /// nothing.
+    pub secret_sources: crate::posture::SecretSources,
 }
 
 /// Apply the request-admission layer to a protected route group.
@@ -1040,10 +1051,23 @@ fn with_admission_layer(
     }
 }
 
-/// `serving_auth_config` covers inference-serving routes and may include
-/// per-tenant keys. `admin_auth_config` is the admin/worker-management
-/// fallback (used when `control_plane_auth_state` is `None`) and must
-/// contain only the shared gateway-wide key, never per-tenant keys.
+/// A listener's serve future, boxed so the plain and the TLS stacks share a
+/// type.
+type Serving = Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>;
+
+/// The routers of one start: the data plane's and, with an admin listener,
+/// the control plane's.
+pub struct GatewayApps {
+    /// The serving routes; the control-plane routes too without an admin
+    /// listener.
+    pub data: Router,
+    /// The control-plane routes (admin, worker registry, RL) with the probe
+    /// routes, for the admin listener; `None` without one.
+    pub admin: Option<Router>,
+}
+
+/// One router with every route: the layout without an admin listener. See
+/// [`build_apps`] for the arguments.
 pub fn build_app(
     app_state: Arc<AppState>,
     serving_auth_config: AuthConfig,
@@ -1053,6 +1077,40 @@ pub fn build_app(
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
 ) -> Result<Router, InvalidHeaderName> {
+    build_apps(
+        app_state,
+        serving_auth_config,
+        admin_auth_config,
+        control_plane_auth_state,
+        max_payload_size,
+        request_id_headers,
+        cors_allowed_origins,
+        false,
+    )
+    .map(|apps| apps.data)
+}
+
+/// `serving_auth_config` covers inference-serving routes and may include
+/// per-tenant keys. `admin_auth_config` is the admin/worker-management
+/// fallback (used when `control_plane_auth_state` is `None`) and must
+/// contain only the shared gateway-wide key, never per-tenant keys.
+/// `admin_listener` puts the control-plane routes on a router of their own,
+/// for the admin listener, and leaves them off the data router, which then
+/// answers 404 for them.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the inputs of the route groups, named one by one as `build_app` names them"
+)]
+pub fn build_apps(
+    app_state: Arc<AppState>,
+    serving_auth_config: AuthConfig,
+    admin_auth_config: AuthConfig,
+    control_plane_auth_state: Option<smg_auth::ControlPlaneAuthState>,
+    max_payload_size: usize,
+    request_id_headers: Vec<String>,
+    cors_allowed_origins: Vec<String>,
+    admin_listener: bool,
+) -> Result<GatewayApps, InvalidHeaderName> {
     // Pending (upgrade not completed): 30s TTL
     // Disconnected: 60 min TTL
     app_state.context.realtime_registry.start_reaper(
@@ -1296,29 +1354,58 @@ pub fn build_app(
     // A v2-aware admin surface will return in a follow-up PR once
     // adapters are production-wired.
 
-    let mut app = Router::new()
+    let data = Router::new()
         .merge(protected_routes)
         .merge(realtime_routes)
         .merge(multipart_upload_routes)
-        .merge(public_routes)
-        .merge(admin_routes)
-        .merge(worker_routes);
+        .merge(public_routes);
+    let mut control_plane = Router::new().merge(admin_routes).merge(worker_routes);
     if let Some(rl_routes) = rl_routes {
-        app = app.merge(rl_routes);
+        control_plane = control_plane.merge(rl_routes);
     }
 
-    Ok(attach_edge_layers(
-        app,
-        max_payload_size,
-        app_state.context.inflight_tracker.clone(),
-        request_id_headers,
-        cors_allowed_origins,
-    )
-    .with_state(app_state))
+    // Each listener's router gets the edge layers; their not-found fallback
+    // is what answers 404 for a route that lives on the other listener.
+    let access_log_fields = middleware::AccessLogFields::from_fields(
+        &app_state.context.router_config.access_log_fields,
+    );
+    let finish = |app: Router<Arc<AppState>>| {
+        attach_edge_layers(
+            app,
+            max_payload_size,
+            app_state.context.inflight_tracker.clone(),
+            request_id_headers.clone(),
+            cors_allowed_origins.clone(),
+            access_log_fields,
+        )
+        .with_state(Arc::clone(&app_state))
+    };
+    if admin_listener {
+        // The public `/loads` stays with the data routes: a gateway registered
+        // as a worker is polled there by its parent's monitor.
+        // The probe routes answer on the admin listener too, so it can be
+        // checked on its own, by an orchestrator or through a network policy.
+        let probes = Router::new()
+            .route("/liveness", get(liveness))
+            .route("/readiness", get(readiness))
+            .route("/health", get(health));
+        Ok(GatewayApps {
+            admin: Some(finish(control_plane.merge(probes))),
+            data: finish(data),
+        })
+    } else {
+        Ok(GatewayApps {
+            data: finish(data.merge(control_plane)),
+            admin: None,
+        })
+    }
 }
 
 /// The middleware every request crosses, matched or not: body limits, the
 /// trace-context echo, access logging, HTTP metrics, request ids and CORS.
+/// The metrics layer wraps the response body, once, with everything the
+/// layers inside hold until the body ends (the request span, an admission
+/// permit, an SSE keep-alive): see `middleware::edge_body`.
 ///
 /// `Router::layer` wraps only what the router holds when it is called, so the
 /// not-found fallback goes in first. Registered after the layers, unknown
@@ -1330,29 +1417,18 @@ fn attach_edge_layers<S>(
     inflight_tracker: Arc<InFlightRequestTracker>,
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
+    access_log_fields: middleware::AccessLogFields,
 ) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
     app.fallback(sink_handler)
         .method_not_allowed_fallback(method_not_allowed_handler)
-        // Marks every response that came back through the body-limit layer
-        // below, so the envelope pass outside it re-shapes only the limit
-        // layer's own refusal (a 413 minted inside, a handler's or a relayed
-        // upstream's, keeps its body).
-        .layer(axum::middleware::from_fn(
-            middleware::mark_passed_body_limit_middleware,
-        ))
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(
-            max_payload_size,
-        ))
-        // The limit layer refuses a declared over-limit length with a plain
-        // text 413: the gateway's envelope and error code go on here, outside
-        // it, the same as the chunked refusal the extractor builds.
-        .layer(axum::middleware::from_fn(
-            middleware::payload_too_large_envelope_middleware,
-        ))
+        // The payload limit on the request body: a declared over-limit
+        // length is refused here, in the gateway's envelope, before any
+        // layer inside runs; a chunked upload is capped on its way in.
+        .layer(middleware::RequestBodyLimitLayer::new(max_payload_size))
         // The Messages envelope once more, outside the body-size limit: a
         // declared over-limit length is refused by the limit layer before any
         // route layer runs, and still leaves in the envelope.
@@ -1362,7 +1438,7 @@ where
         .layer(axum::middleware::from_fn(
             middleware::trace_context_response,
         ))
-        .layer(middleware::create_logging_layer())
+        .layer(middleware::create_logging_layer(access_log_fields))
         .layer(middleware::HttpMetricsLayer::new(inflight_tracker))
         .layer(middleware::RequestIdLayer::new(request_id_headers))
         .layer(tower::util::option_layer(create_cors_layer(
@@ -1409,6 +1485,38 @@ fn supervise_discovery(
     abort
 }
 
+/// [`startup`] on `runtime` to its end, then the process-wide observability
+/// closed behind it, on every exit alike: the log writers are flushed and
+/// stopped, then the tracer is flushed and shut down (a bounded wait, see
+/// [`otel_trace::shutdown_otel`]), and only then is the result read. A
+/// failed start-up used to return before the tracer's shutdown, and the
+/// spans the batch exporter still held were lost with the process. The
+/// result is `startup`'s own: the error line and the exit code are the
+/// caller's, as before. The runtime stays up throughout: the exporter's
+/// connection lives on it, and the shutdown is driven from it, so a
+/// current-thread runtime serves as well as a multi-thread one.
+///
+/// For a caller whose process goes on after the server (a language
+/// binding), [`startup`] alone is the entry point.
+pub fn run(
+    runtime: &tokio::runtime::Runtime,
+    config: ServerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let served = runtime.block_on(Box::pin(startup(config)));
+    // The writer threads outlive `startup` (a process may start more than one
+    // router); flush and stop them now that this process is done logging.
+    logging::close_logging();
+    // Driven from the runtime: on a current-thread runtime nothing else polls
+    // the exporter's connection while the shutdown waits for the export.
+    if let Err(e) = runtime.block_on(runtime.spawn_blocking(otel_trace::shutdown_otel)) {
+        #[expect(clippy::print_stderr)]
+        {
+            eprintln!("[tracing] OpenTelemetry shutdown task failed: {e}");
+        }
+    }
+    served
+}
+
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     crate::tls::install_crypto_provider();
 
@@ -1433,6 +1541,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                 .as_ref()
                 .map(|prometheus_config| prometheus_config.port),
             config.health_check_port,
+            config.router_config.admin_port,
         )?;
     }
 
@@ -1495,6 +1604,18 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         pinned = config.runtime_worker_threads.is_some(),
         "Tokio runtime sized"
     );
+    // A pinned count well above the CPUs available to the process is the
+    // operator's choice, served with a warning: a worker thread beyond the
+    // CPUs only waits for one. The ceiling on the count is the validator's,
+    // and reads nothing of the host.
+    if let Some(warning) = config.runtime_worker_threads.and_then(|threads| {
+        crate::config::runtime_worker_threads_oversubscription(
+            threads,
+            crate::config::available_cpus(),
+        )
+    }) {
+        tracing::warn!("{warning}");
+    }
 
     // Who else can read the private key files: checked here, once the
     // subscriber exists, so the line reaches the log (the configuration is
@@ -1912,6 +2033,27 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let control_plane_auth_state =
         smg_auth::ControlPlaneAuthState::try_init(config.control_plane_auth.as_ref()).await;
 
+    // The admin listener's address, when the control plane has a listener of
+    // its own (`--admin-port`); its bind host defaults to the data listener's.
+    // Read from the router configuration, the copy `validate` above checked
+    // (port, host, distinct ports), whichever way the caller built it.
+    let admin_addr = match config.router_config.admin_port {
+        Some(admin_port) => Some(
+            crate::config::bind_socket_addr(
+                config
+                    .router_config
+                    .admin_host
+                    .as_deref()
+                    .unwrap_or(&config.host),
+                admin_port,
+            )
+            .map_err(|e| {
+                format!("Invalid admin listener address (--admin-host, --admin-port): {e}")
+            })?,
+        ),
+        None => None,
+    };
+
     // Name what this start leaves open, once, before the listener opens:
     // an unauthenticated gateway is a decision, not an omission.
     crate::posture::log_open_posture(
@@ -1920,9 +2062,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         control_plane_auth_state.is_some(),
         config.prometheus_config.as_ref(),
         config.mesh_server_config.as_ref(),
+        admin_addr,
     );
+    // And where a keyed start's secrets came from, sources alone.
+    crate::posture::log_secret_sources(&config.secret_sources);
 
-    let app = build_app(
+    let GatewayApps {
+        data: app,
+        admin: admin_app,
+    } = build_apps(
         app_state,
         serving_auth_config,
         admin_auth_config,
@@ -1930,6 +2078,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.max_payload_size,
         request_id_headers,
         config.router_config.cors_allowed_origins.clone(),
+        admin_addr.is_some(),
     )?;
 
     // One bind-host rule for every listener: IPv6 with or without brackets.
@@ -1982,6 +2131,20 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         }
         _ => None,
     };
+    // The admin listener binds now, before the HTTP listener, for the reason
+    // the mesh listener did: a port another process holds fails the start
+    // here, before anything serves.
+    let admin_listener = match admin_addr {
+        Some(admin_addr) => Some(
+            tokio::net::TcpListener::bind(admin_addr)
+                .await
+                .and_then(tokio::net::TcpListener::into_std)
+                .map_err(|e| {
+                    format!("Failed to bind the admin listener on {admin_addr} (--admin-port): {e}")
+                })?,
+        ),
+        None => None,
+    };
     // The HTTP listener binds now, eagerly, the last of the listeners: a port
     // another process holds fails the start here, before the mesh server
     // below has joined the cluster. Bound through tokio, as axum-server
@@ -2015,6 +2178,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     let handle = axum_server::Handle::new();
     let handle_clone = handle.clone();
+    let data_stop = handle.clone();
+    // The admin listener's handle: it drains with the data listener's.
+    let admin_handle = axum_server::Handle::new();
+    let admin_handle_clone = admin_handle.clone();
+    let admin_stop = admin_handle.clone();
     let inflight_tracker = app_context.inflight_tracker.clone();
     let grace = Duration::from_secs(config.shutdown_grace_period_secs);
     // Keep accepting for a short settle window before gating, so requests still
@@ -2049,6 +2217,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             tokio::time::sleep(settle).await;
         }
         handle_clone.graceful_shutdown(Some(drain_timeout));
+        admin_handle_clone.graceful_shutdown(Some(drain_timeout));
 
         // Phase 2: Drain — wait for in-flight requests to complete
         // Re-check after gating to catch requests that arrived between the
@@ -2080,22 +2249,100 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         idle_connection_timeout_secs = config.router_config.idle_connection_timeout_secs,
         "HTTP connection timeouts (0 = disabled)"
     );
+    // The bound on the connections open at once (see [`connection_limit`]):
+    // a connection beyond it is closed at accept, unanswered. 0 is no bound.
+    let max_connections = config.router_config.max_connections;
+    info!(
+        max_connections,
+        "HTTP connection limit on the data listener (0 = unlimited; the admin and probe listeners \
+         are outside it)"
+    );
+    // The admission limit the bound is compared with is the effective one
+    // (the one resolution of `max_concurrent_requests`, shared with the
+    // admission bucket).
+    let admission_limit = crate::app_context::effective_max_concurrent_requests(
+        config.router_config.max_concurrent_requests,
+    );
+    if let Some(admission_limit) =
+        admission_limit.filter(|limit| max_connections > 0 && max_connections < *limit)
+    {
+        warn!(
+            max_connections,
+            admission_limit,
+            "The connection limit is below the admission limit: clients on HTTP/1, one request \
+             per connection, are refused at the listener (a closed connection, no response) \
+             before admission can queue or answer them"
+        );
+    }
 
-    let server_result = if let Some(tls_config) = tls_config {
+    // The admin listener serves the control plane with the data listener's
+    // TLS material and connection timeouts, but outside its connection limit
+    // (`--max-connections`), so the control plane and the probes it serves
+    // stay reachable while the data plane is saturated; it drains with it
+    // (the shutdown above closes both handles together).
+    let admin_serving: Serving = match (admin_listener, admin_app) {
+        (Some(admin_listener), Some(admin_app)) => {
+            let admin_addr = admin_listener.local_addr()?;
+            info!(
+                "Admin listener serving the control plane on {admin_addr} (--admin-port): the \
+                 admin, worker-registry and RL routes answer there, and 404 on {addr}"
+            );
+            let admin_app = admin_app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+            match tls_config.clone() {
+                Some(tls_config) => Box::pin(
+                    axum_server::from_tcp_rustls(admin_listener, tls_config)?
+                        .map(|acceptor| tls_acceptor(acceptor, connection_timeouts))
+                        .handle(admin_handle)
+                        .serve(admin_app),
+                ),
+                None => Box::pin(
+                    axum_server::from_tcp(admin_listener)?
+                        .acceptor(http_acceptor(connection_timeouts))
+                        .handle(admin_handle)
+                        .serve(admin_app),
+                ),
+            }
+        }
+        _ => Box::pin(std::future::ready(Ok(()))),
+    };
+    let app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let data_serving: Serving = if let Some(tls_config) = tls_config {
         info!("TLS enabled");
 
-        axum_server::from_tcp_rustls(listener, tls_config)?
-            .map(|acceptor| tls_acceptor(acceptor, connection_timeouts))
-            .handle(handle)
-            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .await
+        Box::pin(
+            axum_server::from_tcp_rustls(listener, tls_config)?
+                .map(|acceptor| {
+                    ConnectionLimitAcceptor::new(
+                        tls_acceptor(acceptor, connection_timeouts),
+                        max_connections,
+                    )
+                })
+                .handle(handle)
+                .serve(app),
+        )
     } else {
-        axum_server::from_tcp(listener)?
-            .acceptor(http_acceptor(connection_timeouts))
-            .handle(handle)
-            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .await
+        Box::pin(
+            axum_server::from_tcp(listener)?
+                .acceptor(ConnectionLimitAcceptor::new(
+                    http_acceptor(connection_timeouts),
+                    max_connections,
+                ))
+                .handle(handle)
+                .serve(app),
+        )
     };
+    // Until both listeners have stopped; one that fails stops the other
+    // (see `serve_together`), so the gateway is never half-served.
+    let (server_result, admin_result) = serve_together(
+        data_serving,
+        admin_serving,
+        move || data_stop.graceful_shutdown(Some(drain_timeout)),
+        move || admin_stop.graceful_shutdown(Some(drain_timeout)),
+    )
+    .await;
+    if let Err(e) = &admin_result {
+        error!("Admin listener stopped with an error: {e}");
+    }
 
     // Graceful Shutdown
 
@@ -2110,8 +2357,128 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     info!("Cleanup complete. Process exiting.");
 
-    // Return original server error if any, otherwise Ok
-    server_result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    // The data listener's error if any, else the admin listener's, else Ok.
+    match (server_result, admin_result) {
+        (Err(e), _) | (Ok(()), Err(e)) => Err(Box::new(e) as Box<dyn std::error::Error>),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+/// Both listeners, until both have stopped. The normal end is the shutdown
+/// signal, which closes both handles together, so each ends by itself. A
+/// listener that stops on its own with an error (its accept loop failed)
+/// must not leave the gateway half-served, the data routes up with the
+/// control plane gone or the other way round: `stop_data` / `stop_admin`
+/// (a graceful shutdown of the other handle) is called, the other listener
+/// is awaited, and both results come back for the caller to report.
+async fn serve_together(
+    data: Serving,
+    admin: Serving,
+    stop_data: impl FnOnce(),
+    stop_admin: impl FnOnce(),
+) -> (std::io::Result<()>, std::io::Result<()>) {
+    tokio::pin!(data);
+    tokio::pin!(admin);
+    tokio::select! {
+        data_result = &mut data => {
+            if data_result.is_err() {
+                stop_admin();
+            }
+            (data_result, admin.await)
+        }
+        admin_result = &mut admin => {
+            if admin_result.is_err() {
+                stop_data();
+            }
+            (data.await, admin_result)
+        }
+    }
+}
+
+#[cfg(test)]
+mod serve_together_tests {
+    use std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+
+    use tokio::sync::oneshot;
+
+    use super::{serve_together, Serving};
+
+    /// A listener that fails at once, one that ends when told to, and one
+    /// that ends by itself a moment later.
+    fn failing() -> Serving {
+        Box::pin(async { Err(std::io::Error::other("accept failed")) })
+    }
+    fn until_stopped() -> (Serving, oneshot::Sender<()>) {
+        let (tx, rx) = oneshot::channel::<()>();
+        let serving: Serving = Box::pin(async move {
+            let _ = rx.await;
+            Ok(())
+        });
+        (serving, tx)
+    }
+    fn ending_by_itself() -> Serving {
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(())
+        })
+    }
+
+    /// The failing listener's error comes back with the other's clean end,
+    /// after the other was told to stop.
+    #[tokio::test]
+    async fn a_listener_that_fails_stops_the_other() {
+        for data_fails in [true, false] {
+            let (other, stop) = until_stopped();
+            let stopped = Arc::new(AtomicBool::new(false));
+            let told = {
+                let stopped = Arc::clone(&stopped);
+                move || {
+                    stopped.store(true, Ordering::SeqCst);
+                    let _ = stop.send(());
+                }
+            };
+            let not_told = || panic!("the failing listener is not the one to stop");
+            let (data, admin) = if data_fails {
+                serve_together(failing(), other, not_told, told).await
+            } else {
+                serve_together(other, failing(), told, not_told).await
+            };
+            let (failed, clean) = if data_fails {
+                (data, admin)
+            } else {
+                (admin, data)
+            };
+            assert_eq!(
+                failed.expect_err("the failure").to_string(),
+                "accept failed",
+                "data_fails = {data_fails}"
+            );
+            clean.expect("the other listener ended cleanly once told");
+            assert!(stopped.load(Ordering::SeqCst), "data_fails = {data_fails}");
+        }
+    }
+
+    /// A listener that ends cleanly (the shutdown signal's doing) tells the
+    /// other nothing; the other ends by itself, as the signal closes both.
+    #[tokio::test]
+    async fn a_clean_end_leaves_the_other_to_end_by_itself() {
+        let ready: Serving = Box::pin(async { Ok(()) });
+        let (data, admin) = serve_together(
+            ready,
+            ending_by_itself(),
+            || panic!("nothing to stop"),
+            || panic!("nothing to stop"),
+        )
+        .await;
+        data.expect("clean");
+        admin.expect("ended by itself");
+    }
 }
 
 /// The plain-HTTP acceptor: Nagle buffering disabled on accepted sockets so
@@ -2328,6 +2695,7 @@ mod tests {
             InFlightRequestTracker::new(),
             vec![],
             vec![],
+            middleware::AccessLogFields::NONE,
         );
         for (path, status) in [("/known", StatusCode::OK), ("/nope", StatusCode::NOT_FOUND)] {
             let response = app
@@ -2363,6 +2731,7 @@ mod tests {
             InFlightRequestTracker::new(),
             vec![],
             vec![],
+            middleware::AccessLogFields::NONE,
         );
         for (method, path, version, status, messages_shape) in [
             (
@@ -2473,6 +2842,7 @@ mod tests {
             InFlightRequestTracker::new(),
             vec![],
             vec![],
+            middleware::AccessLogFields::NONE,
         );
         let oversized = format!(
             r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
@@ -2540,9 +2910,8 @@ mod tests {
         assert_eq!(json["error"]["type"], "request_too_large", "{json}");
         assert_eq!(json["request_id"], request_id, "{json}");
 
-        // Declared length: refused by the limit layer before the body, and
-        // still the JSON envelope with the same code as the chunked refusal
-        // (the limit layer's own answer is plain text).
+        // Declared length: refused by the limit layer before the body, with
+        // the JSON envelope and the same code as the chunked refusal.
         let response = app
             .oneshot(
                 http::Request::builder()
@@ -2601,6 +2970,7 @@ mod tests {
             InFlightRequestTracker::new(),
             vec![],
             vec![],
+            middleware::AccessLogFields::NONE,
         );
         let oversized = format!(
             r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
@@ -2655,6 +3025,7 @@ mod tests {
                 InFlightRequestTracker::new(),
                 vec![],
                 origins,
+                middleware::AccessLogFields::NONE,
             );
             let mut request = http::Request::builder()
                 .method(if preflight { "OPTIONS" } else { "GET" })
@@ -2940,6 +3311,7 @@ mod tests {
             mesh_server_config: None,
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
+            secret_sources: Default::default(),
         }
     }
 

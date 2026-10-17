@@ -3,7 +3,7 @@
 //! This benchmark tests all three implementations:
 //! - StringTree: Character-based tree for HTTP router (text input)
 //! - TokenTree: Token-based tree for gRPC router (pre-tokenized input)
-//! - PositionalIndexer: Event-driven indexer for gRPC router (KV cache events)
+//! - ChainIndex: Event-driven indexer for gRPC router (KV cache events)
 //!
 //! Run with: cargo bench --bench radix_tree_benchmark
 //!
@@ -27,8 +27,8 @@ use std::{
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use kv_index::{
-    compute_content_hash, compute_request_content_hashes, ContentHash, PositionalIndexer,
-    SequenceHash, StoredBlock, StringTree, TokenTree, WorkerBlockMap,
+    compute_content_hash, compute_request_content_hashes, ChainBlockMap, ChainIndex, ContentHash,
+    SequenceHash, StoredBlock, StringTree, TokenTree,
 };
 use rand::{
     distr::{Alphanumeric, SampleString},
@@ -398,8 +398,12 @@ macro_rules! bench_token_concurrent {
 }
 
 // ============================================================================
-// PositionalIndexer Helpers
+// ChainIndex Helpers
 // ============================================================================
+
+/// Worker slots of the benchmark's chain indexes: the largest fleet below,
+/// which is also the index's own ceiling.
+const MAX_WORKERS: usize = 1024;
 
 /// Generate token chunks of `block_size` tokens each.
 fn generate_token_chunks(num_blocks: usize, block_size: usize) -> Vec<Vec<TokenId>> {
@@ -435,9 +439,8 @@ fn build_populated_indexer(
     blocks_per_worker: usize,
     block_size: usize,
     shared_prefix_blocks: usize,
-    jump_size: usize,
-) -> (Arc<PositionalIndexer>, Vec<Vec<Vec<TokenId>>>) {
-    let indexer = Arc::new(PositionalIndexer::new(jump_size));
+) -> (Arc<ChainIndex>, Vec<Vec<Vec<TokenId>>>) {
+    let indexer = Arc::new(ChainIndex::with_max_workers(MAX_WORKERS));
 
     let shared_chunks = generate_token_chunks(shared_prefix_blocks, block_size);
     let shared_blocks = chunks_to_stored_blocks(&shared_chunks);
@@ -446,7 +449,7 @@ fn build_populated_indexer(
 
     for worker in workers {
         let worker_id = indexer.intern_worker(worker).unwrap();
-        let mut wb = WorkerBlockMap::default();
+        let mut wb = ChainBlockMap::default();
         indexer
             .apply_stored(worker_id, &shared_blocks, None, &mut wb)
             .unwrap();
@@ -478,10 +481,10 @@ fn build_populated_indexer(
 }
 
 // ============================================================================
-// PositionalIndexer Benchmark Macros
+// ChainIndex Benchmark Macros
 // ============================================================================
 
-/// Macro for STORE benchmarks with PositionalIndexer
+/// Macro for STORE benchmarks with ChainIndex
 macro_rules! bench_indexer_store {
     ($group:expr, $num_workers:expr, $blocks_per_worker:expr, $block_size:expr, $workers:expr) => {{
         let printed = Arc::new(AtomicBool::new(false));
@@ -498,10 +501,10 @@ macro_rules! bench_indexer_store {
             b.iter_custom(|iters| {
                 let start = Instant::now();
                 for _ in 0..iters {
-                    let indexer = PositionalIndexer::new(32);
+                    let indexer = ChainIndex::with_max_workers(MAX_WORKERS);
                     for worker in &workers {
                         let worker_id = indexer.intern_worker(worker).unwrap();
-                        let mut wb = WorkerBlockMap::default();
+                        let mut wb = ChainBlockMap::default();
                         let chunks = generate_token_chunks($blocks_per_worker, $block_size);
                         let blocks = chunks_to_stored_blocks(&chunks);
                         let _ = indexer.apply_stored(black_box(worker_id), black_box(&blocks), None, &mut wb);
@@ -530,7 +533,7 @@ macro_rules! bench_indexer_store {
     }};
 }
 
-/// Macro for MATCH benchmarks with PositionalIndexer (find_matches — the hot path)
+/// Macro for MATCH benchmarks with ChainIndex (find_matches — the hot path)
 macro_rules! bench_indexer_match {
     ($group:expr, $num_workers:expr, $query_blocks:expr, $block_size:expr,
      $indexer:expr, $query_hashes:expr) => {{
@@ -577,7 +580,7 @@ macro_rules! bench_indexer_match {
     }};
 }
 
-/// Macro for CONCURRENT benchmarks with PositionalIndexer.
+/// Macro for CONCURRENT benchmarks with ChainIndex.
 ///
 /// All setup (indexer creation, population, worker interning, data generation)
 /// happens OUTSIDE the timing loop. Only actual concurrent DashMap operations
@@ -589,7 +592,7 @@ macro_rules! bench_indexer_concurrent {
 
         // === Pre-compute everything OUTSIDE timing ===
         let workers = generate_worker_endpoints($num_workers);
-        let (indexer, worker_chunks) = build_populated_indexer(&workers, 64, $block_size, 8, 64);
+        let (indexer, worker_chunks) = build_populated_indexer(&workers, 64, $block_size, 8);
 
         // Per-thread data: worker_id, pre-computed query hashes, pre-computed write blocks
         let thread_data: Arc<Vec<_>> = Arc::new(
@@ -634,7 +637,7 @@ macro_rules! bench_indexer_concurrent {
 
                         thread::spawn(move || {
                             let (worker_id, ref content_hashes, ref write_pool) = thread_data[t];
-                            let mut wb = WorkerBlockMap::default();
+                            let mut wb = ChainBlockMap::default();
 
                             for _ in 0..iters {
                                 for i in 0..$ops_per_thread {
@@ -685,7 +688,7 @@ macro_rules! bench_indexer_concurrent {
 // Main Benchmark
 // ============================================================================
 
-/// Main benchmark for StringTree, TokenTree, and PositionalIndexer
+/// Main benchmark for StringTree, TokenTree, and ChainIndex
 fn bench_summary(c: &mut Criterion) {
     let mut group = c.benchmark_group("benchmark_summary");
 
@@ -782,13 +785,12 @@ fn bench_summary(c: &mut Criterion) {
     }
 
     // ========================================================================
-    // PositionalIndexer Benchmark
+    // ChainIndex Benchmark
     // ========================================================================
     const BLOCK_SIZES: [usize; 2] = [16, 64];
     const BLOCKS_PER_WORKER: [usize; 3] = [64, 256, 1024];
     const QUERY_BLOCK_COUNTS: [usize; 3] = [32, 128, 512];
     const SHARED_PREFIX_BLOCKS: usize = 8;
-    const JUMP_SIZE: usize = 32;
 
     for &num_workers in &WORKER_COUNTS {
         let workers = generate_worker_endpoints(num_workers);
@@ -801,13 +803,8 @@ fn bench_summary(c: &mut Criterion) {
 
             // MATCH benchmarks: build a populated indexer, then query it
             let max_blocks = *BLOCKS_PER_WORKER.last().unwrap();
-            let (indexer, worker_chunks) = build_populated_indexer(
-                &workers,
-                max_blocks,
-                block_size,
-                SHARED_PREFIX_BLOCKS,
-                JUMP_SIZE,
-            );
+            let (indexer, worker_chunks) =
+                build_populated_indexer(&workers, max_blocks, block_size, SHARED_PREFIX_BLOCKS);
 
             for &query_blocks in &QUERY_BLOCK_COUNTS {
                 // Generate query hashes: mix of cached (from worker 0) and novel tokens
@@ -886,7 +883,7 @@ fn print_summary() {
     }
 
     eprintln!("\n{}", "=".repeat(95));
-    eprintln!("POSITIONALINDEXER (kv_index::PositionalIndexer) — event-driven KV cache routing");
+    eprintln!("CHAININDEX (kv_index::ChainIndex) — event-driven KV cache routing");
     eprintln!("{}", "=".repeat(95));
     eprintln!(
         "{:>4} | {:>15} | {:>6} | {:>10} | {:>9} | {:>12}",

@@ -172,12 +172,15 @@ mod tests {
     fn a_rendered_turn_gives_its_thought_and_its_call_typed_by_the_tools_and_every_byte() {
         let events = run(PROMPT, &[OUTPUT]);
         assert_eq!(bytes(&events), OUTPUT);
-        // The newline before the thought is the model's, so it is content; the markers are
-        // wrappers.
+        // The newline before the thought is the template's spacing, held until the thought's
+        // open showed no text followed it, and dropped; the markers are wrappers.
         assert_eq!(
             events[..3],
             [
-                Event::Content(Text::uncounted("\n")),
+                Event::Dropped {
+                    text: Text::uncounted("\n"),
+                    why: DropReason::Whitespace,
+                },
                 dropped("<think>"),
                 Event::ReasoningStart,
             ]
@@ -188,7 +191,12 @@ mod tests {
                 Event::Reasoning(Text::uncounted("The user wants a latte, large and hot.")),
                 dropped("</think>"),
                 Event::ReasoningEnd,
-                Event::Content(Text::uncounted("\n")),
+                // The newline between the thought and the call is the template's spacing,
+                // held until the call's opener came and dropped.
+                Event::Dropped {
+                    text: Text::uncounted("\n"),
+                    why: DropReason::Whitespace,
+                },
                 dropped("<tool_call>"),
             ]
         );
@@ -201,7 +209,7 @@ mod tests {
             arguments_of(&events, 0),
             r#"{"drink_id": "latte", "new_preferences": {"size": "large", "temperature": "hot"}}"#
         );
-        assert_eq!(content(&events), "\n\n");
+        assert_eq!(content(&events), "");
         assert!(matches!(
             events.last(),
             Some(Event::Finish { tool_calls: 1, .. })
@@ -233,9 +241,10 @@ mod tests {
         );
         let events = run(PROMPT, &[output]);
         assert_eq!(bytes(&events), output);
-        // The template's newlines around the content and between the calls ride in the content
-        // stream (bellwether #17); the words are the content.
-        assert_eq!(content(&events), "\n\nTwo drinks.\n\n");
+        // The template's newlines around the words ride in the content stream (bellwether #17);
+        // the newline before the thought, with no text after it in its stay, and the one between
+        // the calls are the template's spacing, dropped.
+        assert_eq!(content(&events), "\nTwo drinks.\n");
         // A declared string keeps the digits as text.
         assert_eq!(arguments_of(&events, 0), r#"{"drink_id": "123"}"#);
         assert_eq!(arguments_of(&events, 1), r#"{"drink_id": "tea"}"#);

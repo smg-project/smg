@@ -68,13 +68,17 @@ impl HarmonyResponseProcessor {
     /// `router_stop_strings` is non-empty only when the router must enforce
     /// string `stop` sequences itself (direct-ZMQ backends: the engine sees
     /// token ids only).
+    ///
+    /// Returns the response with the engine's counters it was built from:
+    /// the response's usage may carry the parser's reasoning count where
+    /// the engine reports none; the settlement takes the counters.
     pub async fn process_non_streaming_chat_response(
         &self,
         execution_result: ExecutionResult,
         chat_request: Arc<ChatCompletionRequest>,
         dispatch: DispatchMetadata,
         router_stop_strings: &[String],
-    ) -> Result<ChatCompletionResponse, Response> {
+    ) -> Result<(ChatCompletionResponse, response_formatting::TokenCounts), Response> {
         let request_logprobs = chat_request.logprobs;
 
         // Collect all completed responses (one per choice)
@@ -203,20 +207,17 @@ impl HarmonyResponseProcessor {
         // The usage from the engine's counters, built as the streamed answer
         // builds its usage chunk: with the reasoning tokens the parser
         // counted and every detail counter present as the OpenAI API sends it.
-        let usage = chat_usage(
-            response_formatting::TokenCounts::of(&all_responses),
-            total_reasoning_tokens,
-        );
+        let counts = response_formatting::TokenCounts::of(&all_responses);
+        let usage = chat_usage(counts, total_reasoning_tokens);
 
         // Final ChatCompletionResponse
-        Ok(
-            ChatCompletionResponse::builder(&dispatch.request_id, &chat_request.model)
-                .created(dispatch.created)
-                .choices(choices)
-                .usage(usage)
-                .maybe_system_fingerprint(dispatch.weight_version.as_deref())
-                .build(),
-        )
+        let response = ChatCompletionResponse::builder(&dispatch.request_id, &chat_request.model)
+            .created(dispatch.created)
+            .choices(choices)
+            .usage(usage)
+            .maybe_system_fingerprint(dispatch.weight_version.as_deref())
+            .build();
+        Ok((response, counts))
     }
 }
 

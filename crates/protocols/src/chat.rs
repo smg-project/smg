@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -811,6 +811,21 @@ impl ChatCompletionRequest {
         ProviderProfile::for_model(&self.model).dynamic_tools(self)
     }
 
+    /// Whether the request offers the model any tool: a request-level `tools`
+    /// field, an empty list included (the normalizer answers an empty list
+    /// with `tool_choice: none`, which switches the calls off), or a tool a
+    /// message declares. Every gate on the serving path that asks "does this
+    /// request have tools" (whether the response is scanned for calls, whether
+    /// the engine keeps the special tokens the call markers are made of,
+    /// whether a prompt opens its tool channel) reads this one answer: a gate
+    /// that read `tools` alone took a request whose tools are all declared on
+    /// messages for a request without tools, and its calls came back as text.
+    /// Whether a call can be forced is a question for the narrowed set,
+    /// [`Self::callable_tools`].
+    pub fn declares_tools(&self) -> bool {
+        self.tools.is_some() || self.dynamic_tools().next().is_some()
+    }
+
     /// Every tool the model will see: the request-level `tools` followed by
     /// the dynamic tools. Anything that resolves a tool name in the response,
     /// tool-call parsing first of all, must work from this set rather than
@@ -819,16 +834,41 @@ impl ChatCompletionRequest {
         self.tools.iter().flatten().chain(self.dynamic_tools())
     }
 
-    /// The tools a `tool_choice` may force: [`Self::effective_tools`] narrowed
-    /// by the choice (see [`ToolChoice::narrow_tools`]). A `tool_choice`
-    /// grammar must be built from this set; built from `tools` alone, a
-    /// forced call could only ever land on a request-level tool.
-    pub fn callable_tools(&self) -> Vec<Tool> {
-        let tools: Vec<Tool> = self.effective_tools().cloned().collect();
-        self.tool_choice
+    /// [`Self::effective_tools`] as one list: the request's own `tools`,
+    /// borrowed as they are, when no message declares a tool; a list that
+    /// chains both otherwise. The serving path reads the set several times per
+    /// request (the constraint, the response spec, the table that reads the
+    /// calls), so where nothing narrows it, nothing copies it.
+    pub fn effective_tool_list(&self) -> Cow<'_, [Tool]> {
+        let mut dynamic = self.dynamic_tools().peekable();
+        if dynamic.peek().is_none() {
+            return Cow::Borrowed(self.tools.as_deref().unwrap_or(&[]));
+        }
+        Cow::Owned(
+            self.tools
+                .iter()
+                .flatten()
+                .chain(dynamic)
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// The tools a `tool_choice` may force: [`Self::effective_tool_list`]
+    /// narrowed by the choice (see [`ToolChoice::narrow_tools`]). A
+    /// `tool_choice` grammar must be built from this set; built from `tools`
+    /// alone, a forced call could only ever land on a request-level tool. The
+    /// list is borrowed from the request where the choice narrows nothing.
+    pub fn callable_tools(&self) -> Cow<'_, [Tool]> {
+        let tools = self.effective_tool_list();
+        match self
+            .tool_choice
             .as_ref()
             .and_then(|choice| choice.narrow_tools(&tools))
-            .unwrap_or(tools)
+        {
+            Some(narrowed) => Cow::Owned(narrowed),
+            None => tools,
+        }
     }
 }
 

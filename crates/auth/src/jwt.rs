@@ -185,12 +185,6 @@ pub struct JwtValidator {
 }
 
 impl JwtValidator {
-    /// Create a new JWT validator with explicit JWKS URI.
-    #[expect(dead_code)]
-    pub(crate) fn new(config: JwtConfig, jwks_provider: Arc<JwksProvider>) -> Self {
-        Self::new_with_options(config, jwks_provider, false)
-    }
-
     /// Create a new JWT validator with optional JTI replay protection.
     pub(crate) fn new_with_options(
         config: JwtConfig,
@@ -505,20 +499,16 @@ impl JwtValidator {
         }
     }
 
-    /// Get a reference to the JWKS provider.
-    #[expect(dead_code)]
-    pub(crate) fn jwks_provider(&self) -> &Arc<JwksProvider> {
-        &self.jwks_provider
-    }
-
     /// Get a reference to the JWT config.
     pub fn config(&self) -> &JwtConfig {
         &self.config
     }
 }
 
+/// A loopback JWKS and signed tokens for the tests of the validator and of
+/// the middleware that runs it.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use std::{
         sync::LazyLock,
         time::{SystemTime, UNIX_EPOCH},
@@ -526,7 +516,7 @@ mod tests {
 
     use axum::{routing::get, Json, Router};
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    use jsonwebtoken::{encode, errors::ErrorKind, EncodingKey, Header};
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     use rsa::{
         pkcs8::{EncodePrivateKey, LineEnding},
         rand_core::OsRng,
@@ -536,25 +526,10 @@ mod tests {
     use serde_json::json;
     use tokio::net::TcpListener;
 
-    use super::*;
+    use super::JwtValidator;
+    use crate::config::{JwtConfig, Role};
 
-    #[test]
-    fn test_audience_contains() {
-        let single = Audience::Single("api://test".to_string());
-        assert!(single.contains("api://test"));
-        assert!(!single.contains("other"));
-
-        let multiple =
-            Audience::Multiple(vec!["api://test".to_string(), "api://other".to_string()]);
-        assert!(multiple.contains("api://test"));
-        assert!(multiple.contains("api://other"));
-        assert!(!multiple.contains("unknown"));
-
-        let none = Audience::None;
-        assert!(!none.contains("anything"));
-    }
-
-    const ISSUER: &str = "https://issuer.example.com";
+    pub(crate) const ISSUER: &str = "https://issuer.example.com";
     const AUDIENCE: &str = "smg";
     const KID: &str = "test-key-1";
 
@@ -590,7 +565,7 @@ mod tests {
         clippy::disallowed_methods,
         reason = "the JWKS server lives exactly as long as the test"
     )]
-    async fn validator() -> JwtValidator {
+    pub(crate) async fn validator() -> JwtValidator {
         let jwks = json!({ "keys": [TEST_KEYS.jwk.clone()] });
         let app = Router::new().route(
             "/jwks.json",
@@ -612,15 +587,15 @@ mod tests {
         JwtValidator::from_config(config).await.unwrap()
     }
 
-    fn now() -> u64 {
+    pub(crate) fn now() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
     }
 
-    /// An admin token good for an hour, with the given `nbf`.
-    fn token(nbf: Option<u64>) -> String {
+    /// An admin token for `alice`, good for an hour, with the given `nbf`.
+    pub(crate) fn token(nbf: Option<u64>) -> String {
         let now = now();
         let mut claims = json!({
             "iss": ISSUER,
@@ -637,6 +612,33 @@ mod tests {
         header.kid = Some(KID.to_string());
         let key = EncodingKey::from_rsa_pem(TEST_KEYS.private_key_pem.as_bytes()).unwrap();
         encode(&header, &claims, &key).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use jsonwebtoken::errors::ErrorKind;
+
+    use super::{
+        test_support::{now, token, validator, ISSUER},
+        *,
+    };
+    use crate::jwks::test_support::discovery_server;
+
+    #[test]
+    fn test_audience_contains() {
+        let single = Audience::Single("api://test".to_string());
+        assert!(single.contains("api://test"));
+        assert!(!single.contains("other"));
+
+        let multiple =
+            Audience::Multiple(vec!["api://test".to_string(), "api://other".to_string()]);
+        assert!(multiple.contains("api://test"));
+        assert!(multiple.contains("api://other"));
+        assert!(!multiple.contains("unknown"));
+
+        let none = Audience::None;
+        assert!(!none.contains("anything"));
     }
 
     #[tokio::test]
@@ -671,5 +673,25 @@ mod tests {
             assert_eq!(validated.subject, "alice");
             assert_eq!(validated.role, Role::Admin);
         }
+    }
+
+    #[tokio::test]
+    async fn no_validator_is_built_on_a_discovery_document_for_another_issuer() {
+        // The document at the configured issuer's discovery endpoint names another
+        // issuer: the key set provider refuses it, so no validator comes to be.
+        let origin = discovery_server(|_| ISSUER.to_string()).await;
+
+        let Err(err) = JwtValidator::from_config(JwtConfig::new(&origin, "smg")).await else {
+            panic!("no validator may be built on a discovery document for another issuer");
+        };
+
+        assert!(
+            matches!(
+                &err,
+                JwtValidatorError::KeyError(JwksError::IssuerMismatch { configured, discovered })
+                    if configured == &origin && discovered == ISSUER
+            ),
+            "{err:?}"
+        );
     }
 }

@@ -347,7 +347,7 @@ def effective_startup_timeout(spec_timeout: int) -> int:
     raised to ``E2E_STARTUP_TIMEOUT`` when that is larger. The per-model bound
     assumes warm caches; on a fresh host an engine's first start JIT-compiles
     and autotunes kernels for minutes, which the env floor covers for every
-    wait that gates on a loaded model (worker health, ZMQ gateway readiness).
+    wait that gates on a loaded model (worker health, gateway readiness).
     An explicitly larger per-model bound is never shrunk.
     """
     return max(spec_timeout, get_startup_timeout() or 0)

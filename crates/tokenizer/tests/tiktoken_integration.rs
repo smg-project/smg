@@ -106,7 +106,7 @@ fn ensure_kimi_k2_cached() -> PathBuf {
 // -- Tests --
 
 #[test]
-#[ignore]
+#[ignore = "downloads the tokenizer files; run with --ignored"]
 fn test_tiktoken_from_dir_loads_kimi_k2() {
     let dir = ensure_kimi_k2_cached();
     let tokenizer = TiktokenTokenizer::from_dir(&dir).expect("Failed to load Kimi K2 tokenizer");
@@ -124,7 +124,7 @@ fn test_tiktoken_from_dir_loads_kimi_k2() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "downloads the tokenizer files; run with --ignored"]
 fn test_tiktoken_kimi_k2_special_tokens() {
     let dir = ensure_kimi_k2_cached();
     let tokenizer = TiktokenTokenizer::from_dir(&dir).expect("Failed to load Kimi K2 tokenizer");
@@ -139,7 +139,7 @@ fn test_tiktoken_kimi_k2_special_tokens() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "downloads the tokenizer files; run with --ignored"]
 fn test_tiktoken_kimi_k2_encode_decode_roundtrip() {
     let dir = ensure_kimi_k2_cached();
     let tokenizer = TiktokenTokenizer::from_dir(&dir).expect("Failed to load Kimi K2 tokenizer");
@@ -174,7 +174,7 @@ fn test_tiktoken_kimi_k2_encode_decode_roundtrip() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "downloads the tokenizer files; run with --ignored"]
 fn test_tiktoken_kimi_k2_token_to_id() {
     let dir = ensure_kimi_k2_cached();
     let tokenizer = TiktokenTokenizer::from_dir(&dir).expect("Failed to load Kimi K2 tokenizer");
@@ -188,7 +188,7 @@ fn test_tiktoken_kimi_k2_token_to_id() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "downloads the tokenizer files; run with --ignored"]
 fn test_tiktoken_kimi_k2_id_to_token() {
     let dir = ensure_kimi_k2_cached();
     let tokenizer = TiktokenTokenizer::from_dir(&dir).expect("Failed to load Kimi K2 tokenizer");
@@ -202,7 +202,7 @@ fn test_tiktoken_kimi_k2_id_to_token() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "downloads the tokenizer files; run with --ignored"]
 fn test_tiktoken_kimi_k2_chat_template() {
     let dir = ensure_kimi_k2_cached();
     let tokenizer = TiktokenTokenizer::from_dir(&dir).expect("Failed to load Kimi K2 tokenizer");
@@ -238,7 +238,7 @@ fn test_tiktoken_kimi_k2_chat_template() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "downloads the tokenizer files; run with --ignored"]
 fn test_tiktoken_kimi_k2_chat_template_multi_turn() {
     let dir = ensure_kimi_k2_cached();
     let tokenizer = TiktokenTokenizer::from_dir(&dir).expect("Failed to load Kimi K2 tokenizer");
@@ -271,7 +271,7 @@ fn test_tiktoken_kimi_k2_chat_template_multi_turn() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "downloads the tokenizer files; run with --ignored"]
 fn test_factory_creates_tiktoken_from_directory() {
     let dir = ensure_kimi_k2_cached();
     let dir_str = dir.to_str().unwrap();
@@ -291,7 +291,7 @@ fn test_factory_creates_tiktoken_from_directory() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "downloads the tokenizer files; run with --ignored"]
 fn test_factory_creates_tiktoken_from_model_file_path() {
     let dir = ensure_kimi_k2_cached();
     let model_path = dir.join("tiktoken.model");
@@ -312,7 +312,7 @@ fn test_factory_creates_tiktoken_from_model_file_path() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "downloads the tokenizer files; run with --ignored"]
 fn test_tiktoken_kimi_k2_batch_encode() {
     let dir = ensure_kimi_k2_cached();
     let tokenizer = TiktokenTokenizer::from_dir(&dir).expect("Failed to load Kimi K2 tokenizer");
@@ -332,7 +332,7 @@ fn test_tiktoken_kimi_k2_batch_encode() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "downloads the tokenizer files; run with --ignored"]
 #[expect(clippy::print_stdout, reason = "test diagnostic output")]
 fn test_factory_creates_tiktoken_from_hf_model_id() {
     // This test exercises the full HF download → tiktoken detection path.
@@ -390,7 +390,7 @@ fn test_factory_creates_tiktoken_from_hf_model_id() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "downloads the tokenizer files; run with --ignored"]
 fn test_tiktoken_kimi_k2_encoding_stability() {
     let dir = ensure_kimi_k2_cached();
     let tokenizer = TiktokenTokenizer::from_dir(&dir).expect("Failed to load Kimi K2 tokenizer");

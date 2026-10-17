@@ -223,11 +223,7 @@ impl EncoderInput {
 
     /// Elements in all.
     pub fn len(&self) -> usize {
-        match self {
-            Self::F32(array) => array.len(),
-            Self::U8 { patches, .. } => patches.len(),
-            Self::Wire { shape, .. } => shape.iter().product(),
-        }
+        self.shape().iter().product()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -510,11 +506,7 @@ impl<'a> EncoderInputView<'a> {
 
     /// Elements in all.
     pub fn len(&self) -> usize {
-        match self {
-            Self::F32(array) => array.len(),
-            Self::U8 { patches, .. } => patches.len(),
-            Self::Wire { shape, .. } => shape.iter().product(),
-        }
+        self.shape().iter().product()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -649,106 +641,140 @@ impl<'a> EncoderInputView<'a> {
         match self {
             Self::Wire {
                 bytes, dtype: own, ..
-            } => match (own, dtype) {
-                (own, asked) if own == &asked => {
-                    if bytes.len() != out.len() {
-                        return Err(format!(
-                            "wire holds {} bytes, {} needed for its shape in {own}",
-                            bytes.len(),
-                            out.len()
-                        ));
-                    }
-                    out.copy_from_slice(bytes);
-                }
-                // A float32 wire holds the normalized values exactly; the
-                // narrower floats round from them as the float path rounds.
-                (EncoderDtype::Float32, EncoderDtype::BFloat16 | EncoderDtype::Float16) => {
-                    if bytes.len() != 2 * out.len() {
-                        return Err(format!(
-                            "wire holds {} bytes, {} needed for its shape in float32",
-                            bytes.len(),
-                            2 * out.len()
-                        ));
-                    }
-                    let convert: fn(f32) -> u16 = if dtype == EncoderDtype::BFloat16 {
-                        f32_to_bf16_bits
-                    } else {
-                        f32_to_f16_bits
-                    };
-                    for (d, word) in out
-                        .as_chunks_mut::<2>()
-                        .0
-                        .iter_mut()
-                        .zip(bytes.as_chunks::<4>().0)
-                    {
-                        *d = convert(f32::from_le_bytes(*word)).to_le_bytes();
-                    }
-                }
-                (own, asked) => {
-                    return Err(format!(
-                        "encoder input holds {own} wire values, which cannot be written as {asked}"
-                    ))
-                }
-            },
+            } => write_wire(bytes, *own, dtype, out),
             Self::U8 { patches, norm } => {
-                let standard = patches.as_standard_layout();
-                let src = standard.as_slice().unwrap_or(&[]);
-                let block = norm.channel_block.max(1);
-                match dtype {
-                    EncoderDtype::Uint8 => out.copy_from_slice(src),
-                    EncoderDtype::Float32 => {
-                        let table = norm.table_f32().map(|channel| channel.map(f32::to_bits));
-                        fill_rows_bytes(out, src, row, 4, |dst, src| {
-                            pixel_convert::write_f32(dst, src, block, norm, &table);
-                        });
-                    }
-                    EncoderDtype::BFloat16 => {
-                        let table = norm.table_u16(f32_to_bf16_bits);
-                        fill_rows_bytes(out, src, row, 2, |dst, src| {
-                            pixel_convert::write_bf16(dst, src, block, norm, &table);
-                        });
-                    }
-                    EncoderDtype::Float16 => {
-                        let table = norm.table_u16(f32_to_f16_bits);
-                        fill_rows_bytes(out, src, row, 2, |dst, src| {
-                            pixel_convert::write_u16(dst, src, block, &table);
-                        });
-                    }
-                }
+                write_u8(patches, norm, row, dtype, out);
+                Ok(())
             }
             Self::F32(array) => {
-                let standard = array.as_standard_layout();
-                let src = standard.as_slice().unwrap_or(&[]);
-                match dtype {
-                    EncoderDtype::Float32 => {
-                        fill_rows_bytes(out, src, row, 4, |dst, src| {
-                            for (d, &v) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
-                                *d = v.to_le_bytes();
-                            }
-                        });
-                    }
-                    EncoderDtype::BFloat16 | EncoderDtype::Float16 => {
-                        let convert: fn(f32) -> u16 = if dtype == EncoderDtype::BFloat16 {
-                            f32_to_bf16_bits
-                        } else {
-                            f32_to_f16_bits
-                        };
-                        fill_rows_bytes(out, src, row, 2, |dst, src| {
-                            for (d, &v) in dst.as_chunks_mut::<2>().0.iter_mut().zip(src) {
-                                *d = convert(v).to_le_bytes();
-                            }
-                        });
-                    }
-                    EncoderDtype::Uint8 => {
-                        for (d, &v) in out.iter_mut().zip(src) {
-                            *d = v.round().clamp(0.0, 255.0) as u8;
-                        }
-                    }
-                }
+                write_f32(array, row, dtype, out);
+                Ok(())
             }
         }
-        Ok(())
     }
+}
+
+/// A wire's bytes written as `asked`: copied in its own dtype, rounded to a
+/// narrower float from a `float32` wire (the normalized values exactly, so
+/// the halves round as the float path rounds), nothing else.
+fn write_wire(
+    bytes: &[u8],
+    own: EncoderDtype,
+    asked: EncoderDtype,
+    out: &mut [u8],
+) -> Result<(), String> {
+    match (own, asked) {
+        (own, asked) if own == asked => {
+            if bytes.len() != out.len() {
+                return Err(format!(
+                    "wire holds {} bytes, {} needed for its shape in {own}",
+                    bytes.len(),
+                    out.len()
+                ));
+            }
+            out.copy_from_slice(bytes);
+            Ok(())
+        }
+        (EncoderDtype::Float32, EncoderDtype::BFloat16) => {
+            narrow_wire(bytes, out, f32_to_bf16_bits)
+        }
+        (EncoderDtype::Float32, EncoderDtype::Float16) => narrow_wire(bytes, out, f32_to_f16_bits),
+        (own, asked) => Err(format!(
+            "encoder input holds {own} wire values, which cannot be written as {asked}"
+        )),
+    }
+}
+
+/// A `float32` wire narrowed to a half width, `convert` fixed at compile time
+/// so the conversion inlines into the loop whichever half it is.
+fn narrow_wire(bytes: &[u8], out: &mut [u8], convert: impl Fn(f32) -> u16) -> Result<(), String> {
+    if bytes.len() != 2 * out.len() {
+        return Err(format!(
+            "wire holds {} bytes, {} needed for its shape in float32",
+            bytes.len(),
+            2 * out.len()
+        ));
+    }
+    for (d, word) in out
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .zip(bytes.as_chunks::<4>().0)
+    {
+        *d = convert(f32::from_le_bytes(*word)).to_le_bytes();
+    }
+    Ok(())
+}
+
+/// Pixel bytes in their patch layout (rows of `row` elements) written as
+/// `dtype`: the bytes themselves for `Uint8`, the normalization table's
+/// values for a float dtype.
+fn write_u8(
+    patches: &ArrayViewD<'_, u8>,
+    norm: &PixelNorm,
+    row: usize,
+    dtype: EncoderDtype,
+    out: &mut [u8],
+) {
+    let standard = patches.as_standard_layout();
+    let src = standard.as_slice().unwrap_or(&[]);
+    let block = norm.channel_block.max(1);
+    match dtype {
+        EncoderDtype::Uint8 => out.copy_from_slice(src),
+        EncoderDtype::Float32 => {
+            let table = norm.table_f32().map(|channel| channel.map(f32::to_bits));
+            fill_rows_bytes(out, src, row, 4, |dst, src| {
+                pixel_convert::write_f32(dst, src, block, norm, &table);
+            });
+        }
+        EncoderDtype::BFloat16 => {
+            let table = norm.table_u16(f32_to_bf16_bits);
+            fill_rows_bytes(out, src, row, 2, |dst, src| {
+                pixel_convert::write_bf16(dst, src, block, norm, &table);
+            });
+        }
+        EncoderDtype::Float16 => {
+            let table = norm.table_u16(f32_to_f16_bits);
+            fill_rows_bytes(out, src, row, 2, |dst, src| {
+                pixel_convert::write_u16(dst, src, block, &table);
+            });
+        }
+    }
+}
+
+/// Normalized floats (rows of `row` elements) written as `dtype`: their own
+/// bytes for `Float32`, rounded to nearest even for the half widths, the
+/// rounded and clamped value for `Uint8`.
+fn write_f32(array: &ArrayViewD<'_, f32>, row: usize, dtype: EncoderDtype, out: &mut [u8]) {
+    let standard = array.as_standard_layout();
+    let src = standard.as_slice().unwrap_or(&[]);
+    match dtype {
+        EncoderDtype::Float32 => {
+            fill_rows_bytes(out, src, row, 4, |dst, src| {
+                for (d, &v) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
+                    *d = v.to_le_bytes();
+                }
+            });
+        }
+        EncoderDtype::BFloat16 => write_f32_halves(out, src, row, f32_to_bf16_bits),
+        EncoderDtype::Float16 => write_f32_halves(out, src, row, f32_to_f16_bits),
+        EncoderDtype::Uint8 => {
+            for (d, &v) in out.iter_mut().zip(src) {
+                *d = v.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+}
+
+/// Floats (rows of `row` elements) written as a half width, `convert` fixed
+/// at compile time so the conversion inlines into the row loop whichever
+/// half it is.
+fn write_f32_halves(out: &mut [u8], src: &[f32], row: usize, convert: impl Fn(f32) -> u16 + Sync) {
+    fill_rows_bytes(out, src, row, 2, |dst, src| {
+        for (d, &v) in dst.as_chunks_mut::<2>().0.iter_mut().zip(src) {
+            *d = convert(v).to_le_bytes();
+        }
+    });
 }
 
 /// A wire's values as `f32`: exact from a `float32` wire, the rounded values

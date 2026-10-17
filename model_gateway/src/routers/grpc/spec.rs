@@ -78,7 +78,9 @@ pub(crate) struct ChatResponseSpec {
     pub provider: ProviderProfile,
     pub separate_reasoning: bool,
     pub tool_choice: Option<ToolChoice>,
-    pub tools: Option<Vec<Tool>>,
+    /// The tools the response is read against, shared with the readers that
+    /// type its calls (one per choice) rather than copied into each.
+    pub tools: Option<Arc<[Tool]>>,
     pub history_tool_calls_count: usize,
     pub stream_options: Option<StreamOptions>,
     /// `parallel_tool_calls: false`: only the first tool call is returned.
@@ -104,23 +106,33 @@ pub(crate) struct ChatResponseSpec {
     pub symphony: Option<Assignment>,
 }
 
+/// Whether the response to a chat `request` is scanned for tool calls: the
+/// request declares tools (an empty list included), a message declares one,
+/// or the model's provider reads tool calls without any
+/// ([`ProviderProfile::parses_tool_calls_without_tools`]). A `tool_choice`
+/// of `none` is the drivers' to check. [`ChatResponseSpec::tools`] is `Some`
+/// exactly then, and Symphony keeps a table's calls exactly then
+/// (`regular::symphony::assign`), so a call the conversation established
+/// without a tool inventory comes back as a call under either parser.
+pub(crate) fn scans_for_tool_calls(request: &ChatCompletionRequest) -> bool {
+    request.declares_tools()
+        || ProviderProfile::for_model(&request.model).parses_tool_calls_without_tools()
+}
+
 impl From<&ChatCompletionRequest> for ChatResponseSpec {
     fn from(request: &ChatCompletionRequest) -> Self {
+        let provider = ProviderProfile::for_model(&request.model);
         Self {
-            provider: ProviderProfile::for_model(&request.model),
+            provider,
             separate_reasoning: request.separate_reasoning,
             tool_choice: request.tool_choice.clone(),
             // Every tool the model may call, dynamic tools declared on messages
             // included. `None` when the response is not scanned for tool calls:
-            // the request declares no tools anywhere and the provider does not
-            // parse tool calls without them.
-            tools: {
-                let tools: Vec<Tool> = request.effective_tools().cloned().collect();
-                let scanned = request.tools.is_some()
-                    || !tools.is_empty()
-                    || ProviderProfile::for_model(&request.model).parses_tool_calls_without_tools();
-                scanned.then_some(tools)
-            },
+            // the request declares no tools anywhere
+            // (`ChatCompletionRequest::declares_tools`, the one answer every
+            // gate reads) and the provider does not parse tool calls without
+            // them (`scans_for_tool_calls`).
+            tools: scans_for_tool_calls(request).then(|| Arc::from(request.effective_tool_list())),
             history_tool_calls_count: request.history_tool_calls_count(),
             stream_options: request.stream_options.clone(),
             first_tool_call_only: request.disables_parallel_tool_calls(),
@@ -163,6 +175,9 @@ impl From<&GenerateRequest> for GenerateResponseSpec {
 pub(crate) struct MessagesResponseSpec {
     /// The `thinking` block asks for thinking (`enabled` or `adaptive`).
     pub thinking_requested: bool,
+    /// The thinking blocks carry their text: a `thinking.display` other than
+    /// `omitted`, or none (see `ThinkingDisplay::returns_text`).
+    pub thinking_text_returned: bool,
     /// Whether the prompt ends inside the model's thinking block, decided by
     /// request building from the rendered prompt.
     pub reasoning_in_prefill: bool,
@@ -171,8 +186,8 @@ pub(crate) struct MessagesResponseSpec {
     pub history_tool_calls_count: usize,
     /// The custom tools as chat tools, converted once: the template renders
     /// them (narrowed by `tool_choice`), the constraints and the parsers
-    /// read them.
-    pub chat_tools: Vec<Tool>,
+    /// read them; shared with the reader that types the calls.
+    pub chat_tools: Arc<[Tool]>,
     /// The stop sequences as the decoders match them.
     pub stop_sequences: Option<StringOrArray>,
     /// Symphony's assignment when a table reads the message (see `regular::symphony`).
@@ -186,11 +201,14 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
     fn from(request: &CreateMessageRequest) -> Self {
         Self {
             thinking_requested: request.thinking_toggle().unwrap_or(false),
+            thinking_text_returned: request
+                .thinking_display()
+                .is_none_or(messages::ThinkingDisplay::returns_text),
             reasoning_in_prefill: false,
             tool_choice: request.tool_choice.clone(),
             has_tools: request.tools.is_some(),
             history_tool_calls_count: request.history_tool_calls_count(),
-            chat_tools: request.chat_tools(),
+            chat_tools: request.chat_tools().into(),
             stop_sequences: request.stop_sequences.clone().map(StringOrArray::Array),
             symphony: None,
             first_tool_call_only: request.disables_parallel_tool_use(),
@@ -274,7 +292,7 @@ mod tests {
     fn tool_names(spec: &ChatResponseSpec) -> Vec<String> {
         spec.tools
             .iter()
-            .flatten()
+            .flat_map(|tools| tools.iter())
             .map(|tool| tool.function.name.clone())
             .collect()
     }
@@ -310,6 +328,39 @@ mod tests {
         let spec = ChatResponseSpec::from(&request);
 
         assert_eq!(tool_names(&spec), ["global", "dynamic_a", "dynamic_b"]);
+    }
+
+    #[test]
+    fn chat_spec_tools_follow_an_empty_request_list_beside_a_message_declaration() {
+        // The empty request-level list is a declaration (the normalizer answers
+        // it with `tool_choice: none`, which switches the calls off); the
+        // message's tool is the set.
+        let request = chat_request(json!({
+            "model": "kimi-k3",
+            "messages": [
+                {"role": "system", "content": "", "tools": [tool("get_weather")]},
+                {"role": "user", "content": "hi"}
+            ],
+            "tools": []
+        }));
+
+        assert_eq!(
+            tool_names(&ChatResponseSpec::from(&request)),
+            ["get_weather"]
+        );
+    }
+
+    #[test]
+    fn chat_spec_tools_none_for_a_message_declaration_the_profile_does_not_read() {
+        let request = chat_request(json!({
+            "model": "self-hosted-model",
+            "messages": [
+                {"role": "system", "content": "", "tools": [tool("get_weather")]},
+                {"role": "user", "content": "hi"}
+            ]
+        }));
+
+        assert!(ChatResponseSpec::from(&request).tools.is_none());
     }
 
     #[test]
@@ -350,6 +401,9 @@ mod tests {
             "messages": [{"role": "user", "content": "try again"}]
         }));
 
-        assert_eq!(ChatResponseSpec::from(&request).tools, Some(Vec::new()));
+        assert_eq!(
+            ChatResponseSpec::from(&request).tools.as_deref(),
+            Some(&[][..])
+        );
     }
 }

@@ -25,11 +25,14 @@ use openai_protocol::common::Tool;
 use serde_json::{json, Value};
 
 use super::{
-    block_of,
+    calls,
     schema::{self, shape, Definitions},
-    CallMarkers, Count, Grammar, Tag, WayIn,
+    CallMarkers, Count, Grammar, WayIn,
 };
-use crate::tagged::{assembler::TAGS, Spelling};
+use crate::{
+    format::Whitespace,
+    tagged::{assembler::TAGS, Spelling},
+};
 
 const FUNCTION_OPEN: &str = TAGS[0];
 const PARAMETER_OPEN: &str = TAGS[1];
@@ -57,28 +60,9 @@ pub(super) fn calls(
             &tool.function.parameters,
         )
     });
-    match markers.block.as_ref() {
-        Some(block) => {
-            let one_call = Grammar::Or(
-                calls
-                    .map(|(begin, content, end)| {
-                        Grammar::Sequence(vec![
-                            Grammar::ConstString(begin),
-                            content,
-                            Grammar::ConstString(end),
-                        ])
-                    })
-                    .collect(),
-            );
-            block_of(ways_in, count.calls(one_call), block.close, count)
-        }
-        None => count.triggered(
-            vec![markers.call_open.to_string()],
-            calls
-                .map(|(begin, content, end)| Tag::new(begin, content, end))
-                .collect(),
-        ),
-    }
+    calls::in_block(markers, ways_in, calls.collect(), count, |one_call| {
+        count.calls(one_call)
+    })
 }
 
 /// How a table's values are written: the family's spelling of what is not a string, and the
@@ -135,6 +119,8 @@ fn words<const N: usize>(schema: Value, python: [&str; N]) -> Grammar {
     let mut options = vec![Grammar::JsonSchema {
         schema,
         style: None,
+        excludes: Vec::new(),
+        whitespace: Whitespace::Free,
     }];
     options.extend(
         python

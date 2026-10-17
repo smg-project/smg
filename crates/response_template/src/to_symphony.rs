@@ -18,8 +18,9 @@
 //!   is a content state, trimmed unless `strip: false`; any other name, or no such field, is a
 //!   framing state, whose text the template discards (transformers' null sink). An explicit
 //!   `thinking` or `reasoning_content` is a reasoning state, `content` a content state (each
-//!   trimmed unless `strip: false`), and a field of another name a framing state. Each open of a
-//!   field is a row into its state from the outside, each close a row back.
+//!   trimmed unless `strip: false`), and a field of another name a framing state. A content state
+//!   that is not trimmed keeps its text as written, whitespace alone included (the kept row).
+//!   Each open of a field is a row into its state from the outside, each close a row back.
 //! - **Delimiters.** A delimiter's marker is a literal: an open's first literal after optional
 //!   whitespace, a close's last literal before it. Whitespace the delimiter takes beside its
 //!   marker is text of the state next to it, which is trimmed, so trimming drops what the pattern
@@ -1314,6 +1315,9 @@ impl Table {
             }
             if state.trims {
                 format = format.trims(&state.name);
+            } else if state.emits == Emits::Content && !state.framing {
+                // A `strip: false` field: the reader keeps whitespace alone as its value.
+                format = format.keeps(&state.name);
             }
         }
         for anchor in &self.anchors {

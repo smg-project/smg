@@ -76,7 +76,7 @@ use crate::{
         PD_PREFILL_QUEUE_TIMEOUT,
     },
     worker::{
-        acquire_prefill, PdPairIndex, PdWire, PrefillAcquireError, PrefillAdmission,
+        acquire_prefill, GuardedStream, PdPairIndex, PdWire, PrefillAcquireError, PrefillAdmission,
         PrefillAdmissionRejection, PrefillLoadGuard, PrefillSelectionContext, RoutingPool,
         RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
@@ -2120,8 +2120,6 @@ impl PDRouter {
         headers: Option<HeaderMap>,
         decode_guard: WorkerLoadGuard,
     ) -> Response {
-        use crate::worker::AttachedBody;
-
         let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
 
         // The same rule as the regular relay: a successful stream with no
@@ -2226,8 +2224,9 @@ impl PDRouter {
             .instrument(span),
         );
 
-        let stream = ReceiverStream::new(rx);
-        let body = Body::from_stream(stream);
+        // The decode guard rides in the body's own stream: released when
+        // the body is dropped, at its end or when the client leaves.
+        let body = Body::from_stream(GuardedStream::new(ReceiverStream::new(rx), decode_guard));
 
         let mut response = Response::new(body);
         *response.status_mut() = status;
@@ -2238,8 +2237,7 @@ impl PDRouter {
         if head_success_recorded {
             mark_head_success_recorded(&mut response);
         }
-
-        AttachedBody::wrap_response(response, decode_guard)
+        response
     }
 
     /// Build a non-streaming PD response with `Content-Type: application/json`.

@@ -13,24 +13,59 @@ What the engine decides for every format, and what it leaves open:
   #2788).
 - The template's separator bytes stay where the model put them: the newline after `<think>`, the
   two after `</think>`, and so on are reasoning or content, not dropped. Whether they should be
-  is bellwether #17; `Dropped { Whitespace }` exists for the other answer.
+  is bellwether #17; `Dropped { Whitespace }` exists for the other answer. One exception, so
+  that a stream shows the content the whole answer has: whitespace a content stay begins with
+  is held while nothing else has arrived in the stay, and leaves as content before the stay's
+  first other text, as `Dropped { Whitespace }` when the stay ends without any (a call's opener
+  after `</think>` or after a call, the end of the output after a thought, a second thought's
+  open). The whole answer's message shows no content for whitespace alone, and a stream that
+  showed it as it arrived carried content deltas the whole answer does not have. A trimmed state
+  has its own rule; a shown marker (the variants that do not separate a channel) is text, so a
+  lead held before it is content, and whitespace after it is content as after any text. A kept
+  state (the kept row: a response template's `strip: false` field) holds nothing: whitespace
+  alone there is content, as the template's reader gives it. The whole answer's message still
+  shows no content for whitespace alone, so for such a table a Chat Completions stream can carry
+  content deltas, and their logprobs, that the whole answer does not; the template's reader,
+  which keeps the whitespace, is the reference there. The Responses and Messages streams hold
+  whitespace alone until text with substance follows and let it go if none does, as their whole
+  answers leave it out.
 - A terminal with no transition from the current state is text, as the model wrote it:
   `</think>` in content is content. A terminal inside a code fence, or inside a string in a
   call's arguments, is a terminal, as for every parser that reads markers: `</tool_call>` in an
   argument's text ends the call there. Bellwether #16 is where that policy is judged.
-- A terminal the table ignores (MiniMax M3's separator token) is `Dropped { Wrapper }` wherever
-  it stands and moves nothing; inside a call the assembler accounts for it, so that its bytes
-  keep their place among the bytes the assembler holds.
+- A terminal the table ignores (MiniMax M3's separator token, Inkling's end-of-sampling token)
+  is `Dropped { Wrapper }` wherever it stands and moves nothing. Inside a call whose assembler
+  holds bytes (a header until its marker, a word until it is spelled) it is placed where it
+  arrived once the bytes around it leave: spliced into a call event's source, which no client
+  reads, or split out of a text event as a `Dropped` event of its own, so that its bytes keep
+  their place and none joins text a client reads; a syntax that reads it as its own separator
+  (M3's XML) acts on it and leaves the bytes to the engine.
 - A call region that never closes is finished at the end of the stream: a call with what
   arrived, or the bytes as `Malformed { UnterminatedRegion }`. A region whose closing terminal
   comes before a complete call gives what is left as `Malformed` with a reason that says so,
   since `UnterminatedRegion` means the stream ended inside the region; with the tagged syntax
-  the call is closed for the client first, as `tagged::Assembler::close` says.
+  the call is closed for the client first, as `tagged::Assembler::close` says, unless the close
+  fell inside a streamed string. A JSON call whose arguments value the close cut ends with the
+  fragments it sent and a `Malformed` event of no bytes, with the region's reason, before its
+  end: a cut call is never handed over as a whole one without a word (`json::assembler`). A tagged
+  call the end of the stream cut ends the same way whatever stage the cut found, since the object
+  the assembler writes closes only at the call's own end, and so does one whose close cut a streamed
+  string, in every tag-based syntax (`tagged::end_cut_call`): no closing quote and no closing brace
+  are made up for a value the model never finished, and the one event carries the bytes still held,
+  when there are any. Gemma's reader does the same in its own way (`gemma::Assembler::end`): its one
+  event names the value's reason, which the engine does not rename, and the bytes held at the marker
+  are the string's text, not the event's.
 - With the tagged syntax, a value's type comes from the request's tools (`Declared`): a
   declared string streams, every other value is written at its close. A call to a function the
   request did not declare has every value inferred.
-- Call ids are `call_<index>` for now; the id scheme is the maintainer's decision
-  (deterministic or carrying the conversation's history) and changes only this one line.
+- Call ids are `call_` and 24 lowercase hex characters, the shape the gateway's older parsers
+  mint, so a client tells no difference. The engine draws a nonce at random when it is made
+  (`CallIds::fresh`: 96 random bits; not a UUIDv7, whose in-process counter steps consecutive
+  values by one) and the output's call `index` is the nonce `index` steps on: an id repeats in
+  no other request, since a client pairs its tool results with its calls by id across a
+  conversation, and is the same for one output however its stream is cut.
+  `Engine::with_call_ids` names the nonce for a replay that wants the ids reproducible. No table
+  or assembler chooses an id (`ids.rs`).
 - Every text event says how many tokens it carries, counted by the `Ledger` from the deltas'
   spans: a token in the event that carries its first byte, a byte-less span (a held half of a
   character, or a hidden special token) into the run that carries the next byte, and the tokens

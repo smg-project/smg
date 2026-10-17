@@ -1,12 +1,11 @@
 //! A run-compressed KV index: the event-driven prefix index as a tree of runs with per-run
 //! worker coverage bitsets, lock-free and allocation-free for readers, bounded in memory.
 //!
-//! The index answers the same question as [`PositionalIndexer`](crate::PositionalIndexer): for a
-//! request given as its per-block content hashes, how many leading blocks does each worker hold,
-//! where "holds" means the worker stored, at every position up to there, the block that sits on
-//! the request's chain. It is fed by the same engine events (stored / removed / cleared, keyed by
-//! the engine's block hashes) and keeps the same per-worker block map the gateway's event monitor
-//! owns, so it drops into the same call sites. Its results are checked against
+//! The index answers one question: for a request given as its per-block content hashes, how many
+//! leading blocks does each worker hold, where "holds" means the worker stored, at every position
+//! up to there, the block that sits on the request's chain. It is fed by the engines' events
+//! (stored / removed / cleared, keyed by the engine's block hashes) and keeps a per-worker block
+//! map the gateway's event monitor owns. Its results are checked against
 //! [`ReferenceIndexer`](crate::ReferenceIndexer) by `tests/exactness_chain.rs` (including evictions
 //! that leave holes in a chain) and under concurrent lanes by `tests/concurrency_chain.rs`.
 //!
@@ -39,8 +38,8 @@
 //!   Children are an open-addressing table (linear probing, tombstones, rebuilt at 3/4 load), so
 //!   a node with many children, the root above all, inserts in constant time.
 //!
-//! Engine hashes: the index trusts the engine's parent pointers and block identities, as the
-//! positional indexer does. Nothing is shared between workers through the maps, so one engine
+//! Engine hashes: the index trusts the engine's parent pointers and block identities. Nothing is
+//! shared between workers through the maps, so one engine
 //! reusing a hash cannot corrupt another worker's view. The index carries one engine hash per
 //! distinct block, the one its first holder stored, in an array parallel to the content hashes.
 //! The engine hash is a chain hash (a hash of the parent's hash and the block's content), which
@@ -81,7 +80,7 @@ use dashmap::{mapref::entry::Entry, DashMap};
 use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
-use crate::event_tree::{
+use crate::block::{
     chain_prefix_hash, ApplyError, ContentHash, OverlapScores, SequenceHash, StoredBlock,
     WorkerIdExhausted,
 };
@@ -234,7 +233,7 @@ struct WorkerRegistry {
     free: Vec<u32>,
 }
 
-/// The run-compressed index. Worker ids are interned `u32`s, as in the positional indexer.
+/// The run-compressed index. Worker ids are interned `u32`s.
 pub struct ChainIndex {
     slab: RunSlab,
     arena: WordArena,

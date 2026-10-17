@@ -62,9 +62,9 @@ fn assert_refused(name: &str, launch: &Launch, named: &[&str]) {
     }
 }
 
-/// Every pair of the HTTP, metrics and probe ports on one port, and the mesh
-/// port on the HTTP port: refused naming both flags, with the port never
-/// answering.
+/// Every pair of the HTTP, metrics and probe ports on one port, the mesh
+/// port on the HTTP port, and the admin port on the HTTP and on the metrics
+/// port: refused naming both flags, with the port never answering.
 #[test]
 fn equal_listener_ports_refuse_to_start() {
     let _serial = serial();
@@ -80,8 +80,12 @@ fn equal_listener_ports_refuse_to_start() {
     probe_on_metrics_port.extend(["--health-check-port", &m].map(str::to_string));
     let mut mesh_on_http_port = base_args(port, metrics_port);
     mesh_on_http_port.extend(mesh_args(port));
+    let mut admin_on_http_port = base_args(port, metrics_port);
+    admin_on_http_port.extend(["--admin-port", &p].map(str::to_string));
+    let mut admin_on_metrics_port = base_args(port, metrics_port);
+    admin_on_metrics_port.extend(["--admin-port", &m].map(str::to_string));
 
-    let cases: [(&str, Vec<String>, [&str; 2]); 4] = [
+    let cases: [(&str, Vec<String>, [&str; 2]); 6] = [
         (
             "prometheus-port-eq-port",
             same_metrics_port,
@@ -101,6 +105,16 @@ fn equal_listener_ports_refuse_to_start() {
             "mesh-port-eq-port",
             mesh_on_http_port,
             ["--mesh-port", "--port"],
+        ),
+        (
+            "admin-port-eq-port",
+            admin_on_http_port,
+            ["--admin-port", "--port"],
+        ),
+        (
+            "admin-port-eq-prometheus-port",
+            admin_on_metrics_port,
+            ["--admin-port", "--prometheus-port"],
         ),
     ];
     for (name, args, flags) in cases {

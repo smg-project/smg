@@ -659,7 +659,7 @@ mod router_policy_tests {
     }
 
     #[tokio::test]
-    async fn test_worker_selection() {
+    async fn a_started_worker_is_in_the_registry_under_the_url_it_bound() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18207,
             worker_type: WorkerType::Regular,
@@ -669,14 +669,14 @@ mod router_policy_tests {
         }])
         .await;
 
-        let _payload = json!({
-            "text": "Test selection",
-            "stream": false
-        });
-
-        // Check that router has the worker
-        // TODO: Update test after worker management refactoring
-        // For now, skip this check
+        assert!(
+            ctx.app_context
+                .worker_registry
+                .get_by_url(&ctx.worker_urls[0])
+                .is_some(),
+            "the started worker is registered under {}",
+            ctx.worker_urls[0]
+        );
 
         ctx.shutdown().await;
     }
@@ -1266,42 +1266,6 @@ mod error_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
-
-        ctx.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn test_payload_too_large() {
-        // Create context with small payload limit
-        let mut config = RouterConfig::builder()
-            .regular_mode(vec![])
-            .random_policy()
-            .host("127.0.0.1")
-            .port(3010)
-            .max_payload_size(1024) // 1KB limit
-            .request_timeout_secs(600)
-            .worker_startup_timeout_secs(1)
-            .worker_startup_check_interval_secs(1)
-            .max_concurrent_requests(64)
-            .queue_timeout_secs(60)
-            .build_unchecked();
-        config.health_check.disable_health_check = true;
-
-        let ctx = AppTestContext::new_with_config(
-            config,
-            vec![MockWorkerConfig {
-                port: 18403,
-                worker_type: WorkerType::Regular,
-                health_status: HealthStatus::Healthy,
-                response_delay_ms: 0,
-                fail_rate: 0.0,
-            }],
-        )
-        .await;
-
-        // Note: The server would have payload size middleware configured
-        // but we cannot test it directly through the test app
-        // This test is kept for documentation purposes
 
         ctx.shutdown().await;
     }

@@ -3,13 +3,14 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
-use tracing::error;
 
 use crate::routers::{
     error,
     grpc::{
         common::stages::BuildStage,
-        context::{BuildOutput, ExecutionPlanKind, PreparationOutput, RequestContext},
+        context::{
+            stage_output, BuildOutput, ExecutionPlanKind, PreparationOutput, RequestContext,
+        },
         regular::stages::chat::build_chat_backed_plan,
         spec::{ResponseSpec, TranscriptionResponseSpec},
     },
@@ -31,13 +32,10 @@ impl TranscriptionRequestBuildingStage {
 #[async_trait]
 impl BuildStage for TranscriptionRequestBuildingStage {
     async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
-        let prep = ctx.state.preparation.take().ok_or_else(|| {
-            error!(
-                function = "TranscriptionRequestBuildingStage::build",
-                "Preparation not completed"
-            );
-            error::internal_error("preparation_not_completed", "Preparation not completed")
-        })?;
+        let prep = stage_output(
+            ctx.state.preparation.take(),
+            "TranscriptionRequestBuildingStage::build",
+        )?;
 
         let PreparationOutput::Transcription {
             token_ids,
@@ -63,6 +61,7 @@ impl BuildStage for TranscriptionRequestBuildingStage {
             processed_messages.text,
             processed_messages.continued_final_message,
             token_ids,
+            None,
             None,
             "transcription-",
             /* inject_pd_metadata */ false,

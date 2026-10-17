@@ -39,17 +39,18 @@ use uuid::Uuid;
 use super::{
     common::{
         apply_mcp_tool_call_limit, build_next_request, convert_mcp_tools_to_chat_tools,
-        extract_all_tool_calls_from_chat, has_unfinished_mcp_call, prepare_chat_tools_and_choice,
-        ExtractedToolCall, McpToolCallLimit, ResponsesCallContext, ToolLoopState,
+        dispatch_arguments, extract_all_tool_calls_from_chat, has_unfinished_mcp_call,
+        prepare_chat_tools_and_choice, record_mcp_call, ExtractedToolCall, McpToolCallLimit,
+        ResponsesCallContext, ToolLoopState,
     },
     conversions,
 };
 use crate::{
-    observability::metrics::{metrics_labels, Metrics},
+    observability::metrics::Metrics,
     routers::{
         common::{
-            mcp_utils::{prepare_hosted_dispatch_args, DEFAULT_MAX_ITERATIONS},
-            openai_bridge::{self, ResponseFormat},
+            mcp_utils::DEFAULT_MAX_ITERATIONS,
+            openai_bridge::{self, FormatRegistry, ResponseFormat},
             sse::{sse_channel, SseSender},
         },
         error,
@@ -662,6 +663,163 @@ pub(super) async fn execute_tool_loop_streaming(
     await_stream_startup(startup_rx, rx).await
 }
 
+/// What every MCP call of one turn shares.
+struct CallSite<'a> {
+    session: &'a McpToolSession<'a>,
+    format_registry: &'a FormatRegistry,
+    original_request: &'a ResponsesRequest,
+    model: &'a str,
+}
+
+/// One MCP call's whole life on the stream: announced with its progress
+/// events, run, closed with its completion or failure, done, and recorded.
+async fn stream_mcp_call(
+    site: &CallSite<'_>,
+    state: &mut ToolLoopState,
+    emitter: &mut ResponseStreamEventEmitter,
+    tx: &SseSender,
+    tool_call: ExtractedToolCall,
+) -> Result<(), String> {
+    state.total_calls += 1;
+
+    trace!(
+        "Executing tool call {}/{}: {} (call_id: {})",
+        state.total_calls,
+        state.total_calls,
+        tool_call.name,
+        tool_call.call_id
+    );
+
+    let response_format =
+        openai_bridge::lookup_tool_format(site.session, site.format_registry, &tool_call.name);
+
+    // Use emitter helpers to determine correct type and allocate index
+    let item_type = ResponseStreamEventEmitter::type_str_for_format(Some(&response_format));
+    let resolved_label = site.session.resolve_tool_server_label(&tool_call.name);
+
+    // Allocate output_index with the format's id-prefix discriminator
+    // (e.g. `ws_…` for web_search_call); see FormatDescriptor.
+    let (output_index, item_id) = emitter.allocate_output_index_for_format(Some(response_format));
+
+    // Build initial tool call item
+    let mut item = json!({
+        "id": item_id,
+        "type": item_type,
+        "name": tool_call.name,
+        "status": "in_progress",
+        "arguments": ""
+    });
+    attach_mcp_server_label(
+        &mut item,
+        Some(resolved_label.as_str()),
+        Some(&response_format),
+    );
+
+    // Emit output_item.added
+    let event = emitter.emit_output_item_added(output_index, &item);
+    emitter.send_event(&event, tx).await?;
+
+    // Emit tool_call.in_progress
+    let event = emitter.emit_tool_call_in_progress(output_index, &item_id, response_format);
+    emitter.send_event(&event, tx).await?;
+
+    // Emit arguments events for mcp_call only (skip for builtin tools)
+    if matches!(response_format, ResponseFormat::Passthrough) {
+        // Emit mcp_call_arguments.delta (simulate streaming by sending full arguments)
+        let event =
+            emitter.emit_mcp_call_arguments_delta(output_index, &item_id, &tool_call.arguments);
+        emitter.send_event(&event, tx).await?;
+
+        // Emit mcp_call_arguments.done
+        let event =
+            emitter.emit_mcp_call_arguments_done(output_index, &item_id, &tool_call.arguments);
+        emitter.send_event(&event, tx).await?;
+    }
+
+    // Emit searching/interpreting event for builtin tools
+    if let Some(event) = emitter.emit_tool_call_searching(output_index, &item_id, response_format) {
+        emitter.send_event(&event, tx).await?;
+    }
+
+    // Execute the MCP tool
+    trace!(
+        "Calling MCP tool '{}' with args: {}",
+        tool_call.name,
+        tool_call.arguments
+    );
+    let arguments =
+        dispatch_arguments(response_format, site.original_request, &tool_call.arguments);
+
+    // Execute the single tool via the normalized MCP execution API.
+    // This avoids custom serialization and manual re-transformation in streaming paths.
+    let tool_output = site
+        .session
+        .execute_tool(ToolExecutionInput {
+            call_id: tool_call.call_id,
+            tool_name: tool_call.name,
+            arguments,
+        })
+        .await;
+
+    let success = !tool_output.is_error;
+    let output_str = tool_output.output.to_string();
+
+    let output_item = openai_bridge::transform_tool_output(&tool_output, response_format);
+    let mut item_done = serde_json::to_value(&output_item).unwrap_or_else(|e| {
+        warn!(
+            tool = %tool_output.tool_name,
+            error = %e,
+            "Failed to serialize transformed output item; falling back to a minimal stub",
+        );
+        json!({
+            "id": item_id,
+            "type": item_type,
+            "status": if success { "completed" } else { "failed" },
+        })
+    });
+    // Override the typed item's id so output_item.done matches the
+    // streaming-allocated id used by the earlier output_item.added.
+    if let Some(obj) = item_done.as_object_mut() {
+        obj.insert("id".to_string(), json!(&item_id));
+    }
+    attach_mcp_server_label(
+        &mut item_done,
+        Some(tool_output.server_label.as_str()),
+        Some(&response_format),
+    );
+
+    if success {
+        let event = emitter.emit_tool_call_completed(output_index, &item_id, response_format);
+        emitter.send_event(&event, tx).await?;
+    } else {
+        let err_text = tool_output
+            .error_message
+            .clone()
+            .unwrap_or_else(|| output_str.clone());
+        warn!("Tool execution returned error: {}", err_text);
+
+        // `response.mcp_call.failed` is the only `*.failed` event
+        // in the Responses API. Hosted-builtin families close via
+        // `*.completed` to mirror OpenAI cloud's wire shape;
+        // the failure context (when present) lives in the item
+        // content.
+        if matches!(response_format, ResponseFormat::Passthrough) {
+            let event = emitter.emit_mcp_call_failed(output_index, &item_id, &err_text);
+            emitter.send_event(&event, tx).await?;
+        } else {
+            let event = emitter.emit_tool_call_completed(output_index, &item_id, response_format);
+            emitter.send_event(&event, tx).await?;
+        }
+    }
+
+    let event = emitter.emit_output_item_done(output_index, &item_done);
+    emitter.send_event(&event, tx).await?;
+    emitter.complete_output_item(output_index);
+
+    record_mcp_call(state, site.model, tool_output, output_str, output_item);
+    Ok(())
+}
+
 /// Internal streaming tool loop implementation
 async fn execute_tool_loop_streaming_internal(
     ctx: &ResponsesContext,
@@ -672,7 +830,9 @@ async fn execute_tool_loop_streaming_internal(
     tx: SseSender,
     mut startup: Option<StreamStartupSender>,
 ) -> Result<(), String> {
-    let mut state = ToolLoopState::new(original_request);
+    // The loop is rebuilt on the loaded request: a stored turn's tool calls
+    // and outputs stay in front of the calls this loop executes.
+    let mut state = ToolLoopState::new(&current_request);
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
     // Generate response ID first so we can use it for both emitter and session
@@ -829,197 +989,14 @@ async fn execute_tool_loop_streaming_internal(
                 apply_mcp_tool_call_limit(&mut mcp_tool_calls, state.total_calls, max_tool_calls);
 
             // Process each MCP tool call
+            let site = CallSite {
+                session: &session,
+                format_registry: &ctx.mcp_format_registry,
+                original_request,
+                model: &current_request.model,
+            };
             for tool_call in mcp_tool_calls {
-                state.total_calls += 1;
-
-                trace!(
-                    "Executing tool call {}/{}: {} (call_id: {})",
-                    state.total_calls,
-                    state.total_calls,
-                    tool_call.name,
-                    tool_call.call_id
-                );
-
-                let response_format = openai_bridge::lookup_tool_format(
-                    &session,
-                    &ctx.mcp_format_registry,
-                    &tool_call.name,
-                );
-
-                // Use emitter helpers to determine correct type and allocate index
-                let item_type =
-                    ResponseStreamEventEmitter::type_str_for_format(Some(&response_format));
-                let resolved_label = session.resolve_tool_server_label(&tool_call.name);
-
-                // Allocate output_index with the format's id-prefix discriminator
-                // (e.g. `ws_…` for web_search_call); see FormatDescriptor.
-                let (output_index, item_id) =
-                    emitter.allocate_output_index_for_format(Some(response_format));
-
-                // Build initial tool call item
-                let mut item = json!({
-                    "id": item_id,
-                    "type": item_type,
-                    "name": tool_call.name,
-                    "status": "in_progress",
-                    "arguments": ""
-                });
-                attach_mcp_server_label(
-                    &mut item,
-                    Some(resolved_label.as_str()),
-                    Some(&response_format),
-                );
-
-                // Emit output_item.added
-                let event = emitter.emit_output_item_added(output_index, &item);
-                emitter.send_event(&event, &tx).await?;
-
-                // Emit tool_call.in_progress
-                let event =
-                    emitter.emit_tool_call_in_progress(output_index, &item_id, response_format);
-                emitter.send_event(&event, &tx).await?;
-
-                // Emit arguments events for mcp_call only (skip for builtin tools)
-                if matches!(response_format, ResponseFormat::Passthrough) {
-                    // Emit mcp_call_arguments.delta (simulate streaming by sending full arguments)
-                    let event = emitter.emit_mcp_call_arguments_delta(
-                        output_index,
-                        &item_id,
-                        &tool_call.arguments,
-                    );
-                    emitter.send_event(&event, &tx).await?;
-
-                    // Emit mcp_call_arguments.done
-                    let event = emitter.emit_mcp_call_arguments_done(
-                        output_index,
-                        &item_id,
-                        &tool_call.arguments,
-                    );
-                    emitter.send_event(&event, &tx).await?;
-                }
-
-                // Emit searching/interpreting event for builtin tools
-                if let Some(event) =
-                    emitter.emit_tool_call_searching(output_index, &item_id, response_format)
-                {
-                    emitter.send_event(&event, &tx).await?;
-                }
-
-                // Execute the MCP tool
-                trace!(
-                    "Calling MCP tool '{}' with args: {}",
-                    tool_call.name,
-                    tool_call.arguments
-                );
-                // Parse arguments to Value, coercing scalar/array/null payloads
-                // to an empty object so hosted-tool override merge can actually
-                // apply. `apply_hosted_tool_overrides` is a no-op on non-objects;
-                // silently dropping caller-declared config would be surprising.
-                let mut arguments = match serde_json::from_str::<Value>(&tool_call.arguments) {
-                    Ok(Value::Object(map)) => Value::Object(map),
-                    _ => json!({}),
-                };
-                prepare_hosted_dispatch_args(
-                    &mut arguments,
-                    response_format,
-                    original_request.tools.as_deref().unwrap_or(&[]),
-                    original_request.user.as_deref(),
-                );
-
-                // Execute the single tool via the normalized MCP execution API.
-                // This avoids custom serialization and manual re-transformation in streaming paths.
-                let tool_output = session
-                    .execute_tool(ToolExecutionInput {
-                        call_id: tool_call.call_id.clone(),
-                        tool_name: tool_call.name.clone(),
-                        arguments,
-                    })
-                    .await;
-
-                let success = !tool_output.is_error;
-                let output_str = tool_output.output.to_string();
-
-                let output_item =
-                    openai_bridge::transform_tool_output(&tool_output, response_format);
-                let mut item_done = serde_json::to_value(&output_item).unwrap_or_else(|e| {
-                    warn!(
-                        tool = %tool_output.tool_name,
-                        error = %e,
-                        "Failed to serialize transformed output item; falling back to a minimal stub",
-                    );
-                    json!({
-                        "id": item_id,
-                        "type": item_type,
-                        "status": if success { "completed" } else { "failed" },
-                    })
-                });
-                // Override the typed item's id so output_item.done matches the
-                // streaming-allocated id used by the earlier output_item.added.
-                if let Some(obj) = item_done.as_object_mut() {
-                    obj.insert("id".to_string(), json!(&item_id));
-                }
-                attach_mcp_server_label(
-                    &mut item_done,
-                    Some(tool_output.server_label.as_str()),
-                    Some(&response_format),
-                );
-
-                if success {
-                    let event =
-                        emitter.emit_tool_call_completed(output_index, &item_id, response_format);
-                    emitter.send_event(&event, &tx).await?;
-                } else {
-                    let err_text = tool_output
-                        .error_message
-                        .clone()
-                        .unwrap_or_else(|| output_str.clone());
-                    warn!("Tool execution returned error: {}", err_text);
-
-                    // `response.mcp_call.failed` is the only `*.failed` event
-                    // in the Responses API. Hosted-builtin families close via
-                    // `*.completed` to mirror OpenAI cloud's wire shape;
-                    // the failure context (when present) lives in the item
-                    // content.
-                    if matches!(response_format, ResponseFormat::Passthrough) {
-                        let event = emitter.emit_mcp_call_failed(output_index, &item_id, &err_text);
-                        emitter.send_event(&event, &tx).await?;
-                    } else {
-                        let event = emitter.emit_tool_call_completed(
-                            output_index,
-                            &item_id,
-                            response_format,
-                        );
-                        emitter.send_event(&event, &tx).await?;
-                    }
-                }
-
-                let event = emitter.emit_output_item_done(output_index, &item_done);
-                emitter.send_event(&event, &tx).await?;
-                emitter.complete_output_item(output_index);
-
-                Metrics::record_mcp_tool_duration(
-                    &current_request.model,
-                    &tool_output.tool_name,
-                    tool_output.duration,
-                );
-                Metrics::record_mcp_tool_call(
-                    &current_request.model,
-                    &tool_output.tool_name,
-                    if success {
-                        metrics_labels::RESULT_SUCCESS
-                    } else {
-                        metrics_labels::RESULT_ERROR
-                    },
-                );
-
-                state.record_call(
-                    tool_output.call_id,
-                    tool_output.tool_name,
-                    tool_output.arguments_str,
-                    output_str,
-                    output_item,
-                    success,
-                );
+                stream_mcp_call(&site, &mut state, &mut emitter, &tx, tool_call).await?;
             }
 
             if let Some(limit) = tool_call_limit {

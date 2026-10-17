@@ -3,6 +3,31 @@
 
 use symphony::{EngineFinish, Event, Events, Input, ParseError, Parser};
 
+/// The number in a call id the engine minted, `call_` and 24 lowercase hex characters; `None` for
+/// an id of any other shape.
+pub fn minted_id(id: &str) -> Option<u128> {
+    let hex = id.strip_prefix("call_")?;
+    if hex.len() != 24
+        || !hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    u128::from_str_radix(hex, 16).ok()
+}
+
+/// A call id as a replay's record keeps it: a minted id by its shape alone, since the ids count
+/// from a nonce drawn per engine and two replays of one output never share one; any other id as
+/// it is.
+pub fn id_shape(id: &str) -> String {
+    if minted_id(id).is_some() {
+        "call_<24 hex>".to_string()
+    } else {
+        id.to_string()
+    }
+}
+
 /// The ways to replay `text`, each named: whole, character by character, thirty seeded plans of
 /// one to eight characters and, for a text of at most `every_split_up_to` bytes, every two-way
 /// split; every cut on a character boundary. The two-way splits are quadratic in the length, so

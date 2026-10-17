@@ -258,11 +258,12 @@ impl ModelProcessorSpec for Glm53FlashSpec {
         input: &PreprocessedEncoderInputs,
     ) -> RegistryResult<Vec<PromptReplacement>> {
         let id = Self::image_id(metadata)?;
-        Ok(input
-            .feature_token_counts
-            .iter()
-            .map(|&count| PromptReplacement::repeated(Modality::Image, IMAGE, id, count))
-            .collect())
+        Ok(PromptReplacement::repeated_per_item(
+            Modality::Image,
+            IMAGE,
+            id,
+            &input.feature_token_counts,
+        ))
     }
 
     fn prompt_replacements_for(

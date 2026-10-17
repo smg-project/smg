@@ -39,7 +39,7 @@ use smg_response_template::to_symphony::{
     Transformers,
 };
 use symphony::{
-    grammar::Options,
+    grammar::{GrammarStart, Options},
     shape::{
         self, Arguments, Atom, CallLayout, CallShape, Class, Dialect, End, Layout, Message,
         NameSource, Nested, Pattern, Segment, Slot, Spellings, ValueParser, Words, Written,
@@ -396,6 +396,7 @@ fn every_mode_has_a_tag(format: &Format, layout: Layout) {
                 at_least_one,
                 reasoning_open,
                 one_call,
+                start: GrammarStart::Unknown,
             };
             assert!(format.grammar_for(&tools, options).is_some(), "{options:?}");
         }

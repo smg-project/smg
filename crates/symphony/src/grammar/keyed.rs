@@ -17,11 +17,7 @@
 use openai_protocol::common::Tool;
 use serde_json::Value;
 
-use super::{
-    block_of,
-    schema::{self, shape, Definitions},
-    CallMarkers, Count, Grammar, Tag, WayIn,
-};
+use super::{calls, CallMarkers, Count, Grammar, WayIn};
 use crate::tagged::keyed::Tags;
 
 /// The calls for `tools`: in a block, the block's ways in around one or more calls (one, when
@@ -46,42 +42,20 @@ pub(super) fn calls(
             &tool.function.parameters,
         )
     });
-    match markers.block.as_ref() {
-        Some(block) => {
-            let one_call = Grammar::Or(
-                calls
-                    .map(|(begin, content, end)| {
-                        Grammar::Sequence(vec![
-                            Grammar::ConstString(begin),
-                            content,
-                            Grammar::ConstString(end),
-                        ])
-                    })
-                    .collect(),
-            );
-            // The block's own newlines, where the template writes them: before each call and
-            // before the block's close (K2-Horizon); Hy4's block writes none.
-            let newlines = &tags.newlines;
-            let each = match newlines.block_before_call {
-                "" => one_call,
-                before => {
-                    Grammar::Sequence(vec![Grammar::ConstString(before.to_string()), one_call])
-                }
-            };
-            let all = count.calls(each);
-            let inside = match newlines.block_before_close {
-                "" => all,
-                before => Grammar::Sequence(vec![all, Grammar::ConstString(before.to_string())]),
-            };
-            block_of(ways_in, inside, block.close, count)
+    // The block's own newlines, where the template writes them: before each call and before the
+    // block's close (K2-Horizon); Hy4's block writes none.
+    let newlines = &tags.newlines;
+    calls::in_block(markers, ways_in, calls.collect(), count, |one_call| {
+        let each = match newlines.block_before_call {
+            "" => one_call,
+            before => Grammar::Sequence(vec![Grammar::ConstString(before.to_string()), one_call]),
+        };
+        let all = count.calls(each);
+        match newlines.block_before_close {
+            "" => all,
+            before => Grammar::Sequence(vec![all, Grammar::ConstString(before.to_string())]),
         }
-        None => count.triggered(
-            vec![markers.call_open.to_string()],
-            calls
-                .map(|(begin, content, end)| Tag::new(begin, content, end))
-                .collect(),
-        ),
-    }
+    })
 }
 
 /// What ends a value: its own closing tag, and the terminals the table has a row for out of the
@@ -121,14 +95,12 @@ fn call(
 /// The arguments the tool's schema asks for: one pair per property, in the schema's order, each
 /// optional unless required; any pairs at all for a schema without properties.
 fn arguments(tags: &Tags, ends: &Ends<'_>, parameters: &Value) -> Grammar {
-    let pair = |key: &str, property: &Value, definitions: Definitions<'_>| {
-        let value = shape(property, definitions, || ends.text())
-            .map_or_else(|| ends.text(), |(_, value)| value);
-        argument(tags, Grammar::ConstString(key.to_string()), value)
-    };
-    schema::arguments(parameters, pair, || {
-        Grammar::Star(Box::new(any_argument(tags, ends)))
-    })
+    calls::arguments(
+        parameters,
+        || ends.text(),
+        |key, value| argument(tags, key, value),
+        || any_argument(tags, ends),
+    )
 }
 
 /// One pair: the key between its tags, the newline the spelling writes after the key, the value

@@ -13,6 +13,7 @@ import sys
 import threading
 import uuid
 from collections.abc import AsyncGenerator
+from contextlib import aclosing
 from typing import Any
 
 import grpc
@@ -313,8 +314,15 @@ class GrpcRequestManager:
         n = getattr(obj.sampling_params, "n", 1)
 
         if n <= 1:
-            async for response in self._handle_single_request(obj, request_id, grpc_context):
-                yield response
+            # Closing this stream closes the handler with it: a consumer that
+            # leaves after an output (the health probe does, on its first)
+            # has the request's state released before its close returns,
+            # not when the garbage collector finalizes the abandoned handler.
+            async with aclosing(
+                self._handle_single_request(obj, request_id, grpc_context)
+            ) as responses:
+                async for response in responses:
+                    yield response
             return
 
         # N>1 handling - two-phase approach

@@ -178,6 +178,10 @@ impl MessagePreparationStage {
                     media_items = media_plan.parts().len(),
                     "Forwarding media references for worker-side processing"
                 );
+                // Which of the workers that process references may take the
+                // plan (see `resolve_mm_processing` and `PipelinePin`).
+                ctx.state.media_refs_pipeline =
+                    multimodal::media_refs_pipeline_pin(&media_plan, &placeholders);
                 multimodal_refs = Some(media_plan);
             } else {
                 // The dtype every worker the selection can pick reads image
@@ -238,26 +242,41 @@ impl MessagePreparationStage {
         // `regular::symphony`, which decides both with one predicate); the older
         // registry decides for every other request. On a thinking prompt a
         // parser with a reasoning prefix gets its tag wrapped so a forced call
-        // follows the reasoning instead of preempting it.
+        // follows the reasoning instead of preempting it. The table's refusal
+        // waits for request building, which decides on the selected worker
+        // (`regular::symphony::worker_constraint`).
+        let names = ctx.components.parser_resolver.names(&request.model);
+        // The thinking switch's answer, or the table's replay of the rendered
+        // prompt where a table reads the message: a turn the prompt leaves
+        // unopened starts inside the thought whatever the switch says, and the
+        // tag must read it as the engine will (`regular::symphony::reasoning_open`).
         let reasoning = utils::messages_reasoning_starts_in_prefill(
             request,
             processed_messages.continued_final_message,
             tokenizer.as_ref(),
+        ) || symphony::reasoning_open(
+            parser,
+            &names,
+            &request.model,
+            &ctx.components.templates,
+            &processed_messages.text,
         );
-        let names = ctx.components.parser_resolver.names(&request.model);
+        let workers = ctx
+            .components
+            .worker_registry
+            .get_by_model(&ctx.input.model_id);
         let symphony_constraint = symphony::constraint_messages(
             parser,
             &names,
             request,
             &filtered_tools,
             reasoning,
+            symphony::grammar_start_of(&workers),
             request.continues_final_assistant(),
             &ctx.components.templates,
-        )
-        .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
+        );
         let tool_call_constraint = match (symphony_constraint, chat_tool_choice.as_ref()) {
-            (Some(constraint), _) => Some(constraint),
-            (None, Some(tool_choice)) if !filtered_tools.is_empty() => ctx
+            (Ok(None), Some(tool_choice)) if !filtered_tools.is_empty() => Ok(ctx
                 .components
                 .tool_parser_factory
                 .registry()
@@ -273,8 +292,8 @@ impl MessagePreparationStage {
                         "invalid_tool_configuration",
                         format!("Invalid tool configuration: {e}"),
                     )
-                })?,
-            (None, _) => None,
+                })?),
+            (prepared, _) => prepared,
         };
 
         let legacy_parser_needs_special_tokens = utils::reasoning_parser_requires_special_tokens(
@@ -293,7 +312,7 @@ impl MessagePreparationStage {
                 &names,
                 &request.model,
                 &ctx.components.templates,
-                tokenizer.as_ref(),
+                &tokenizer,
             );
 
         // Derive skip_special_tokens from parser and constraint type:
@@ -304,7 +323,7 @@ impl MessagePreparationStage {
             false
         } else {
             match &tool_call_constraint {
-                Some(c) if c.is_json_schema() => true,
+                Ok(Some(c)) if c.is_json_schema() => true,
                 _ if !filtered_tools.is_empty()
                     && !matches!(
                         chat_tool_choice,
@@ -334,7 +353,7 @@ impl MessagePreparationStage {
         ctx.state.preparation = Some(PreparationOutput::Messages {
             token_ids,
             processed_messages,
-            tool_constraints: tool_call_constraint.map(|c| c.to_tuple()),
+            tool_constraints: tool_call_constraint,
             spec,
         });
 

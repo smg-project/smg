@@ -12,6 +12,8 @@ mod manager;
 mod policy;
 mod rejection;
 mod reservation;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use backend::{RateLimitBackend, ReserveOutcome, ReserveRequest, UsageSettlement};
 pub use config::{

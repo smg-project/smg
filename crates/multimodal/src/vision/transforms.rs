@@ -263,6 +263,46 @@ fn build_planar_tensor(
     Array3::from_shape_vec((3, h, w), data).expect("shape matches pre-allocated buffer")
 }
 
+/// Paint an `image_w` x `image_h` image, given as interleaved RGB bytes, onto
+/// the top-left of a `canvas_w` x `canvas_h` planar canvas: `planes` holds the
+/// R, G and B planes back to back (`3 * canvas_w * canvas_h` elements), every
+/// painted byte maps through `byte * scale[c] + bias[c]`, and the canvas
+/// outside the image holds the mapped black, `bias[c]`. An image larger than
+/// the canvas is cropped at its right and bottom edges.
+pub fn paint_rgb_onto_planes(
+    rgb: &[u8],
+    (image_w, image_h): (usize, usize),
+    (canvas_w, canvas_h): (usize, usize),
+    scale: [f32; 3],
+    bias: [f32; 3],
+    planes: &mut [f32],
+) {
+    let canvas_pixels = canvas_w * canvas_h;
+    debug_assert_eq!(planes.len(), 3 * canvas_pixels);
+    debug_assert!(rgb.len() >= image_w * image_h * 3);
+    let (r_plane, rest) = planes.split_at_mut(canvas_pixels);
+    let (g_plane, b_plane) = rest.split_at_mut(canvas_pixels);
+
+    r_plane.fill(bias[0]);
+    g_plane.fill(bias[1]);
+    b_plane.fill(bias[2]);
+
+    let painted_w = image_w.min(canvas_w);
+    let painted_h = image_h.min(canvas_h);
+    for y in 0..painted_h {
+        let src_row = &rgb[y * image_w * 3..(y * image_w + painted_w) * 3];
+        let dst = y * canvas_w;
+        deinterleave_rgb_to_planes(
+            src_row,
+            &mut r_plane[dst..dst + painted_w],
+            &mut g_plane[dst..dst + painted_w],
+            &mut b_plane[dst..dst + painted_w],
+            scale,
+            bias,
+        );
+    }
+}
+
 /// Convert image to tensor [C, H, W] normalized to [0, 1].
 ///
 /// This matches the default behavior of `torchvision.transforms.ToTensor()`.
@@ -2179,5 +2219,50 @@ mod tests {
             config.chessboard_square_size,
             TransparentBgConfig::default().chessboard_square_size
         );
+    }
+
+    #[test]
+    fn paint_rgb_onto_planes_maps_the_image_and_fills_the_margin_with_bias() {
+        // A 2x2 image on a 3x2 canvas: the right column is margin.
+        let rgb: [u8; 12] = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
+        let scale = [0.5, 0.25, 2.0];
+        let bias = [-1.0, 0.5, 3.0];
+        let mut planes = vec![f32::NAN; 3 * 3 * 2];
+        paint_rgb_onto_planes(&rgb, (2, 2), (3, 2), scale, bias, &mut planes);
+        for c in 0..3 {
+            for y in 0..2 {
+                for x in 0..3 {
+                    let expected = if x < 2 {
+                        f32::from(rgb[(y * 2 + x) * 3 + c]) * scale[c] + bias[c]
+                    } else {
+                        bias[c]
+                    };
+                    assert_eq!(
+                        planes[c * 6 + y * 3 + x].to_bits(),
+                        expected.to_bits(),
+                        "channel {c} at ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn paint_rgb_onto_planes_crops_an_image_larger_than_the_canvas() {
+        // A 3x3 image on a 2x2 canvas keeps its top-left 2x2 pixels.
+        let rgb: Vec<u8> = (0..27).collect();
+        let mut planes = vec![f32::NAN; 3 * 2 * 2];
+        paint_rgb_onto_planes(&rgb, (3, 3), (2, 2), [1.0; 3], [0.0; 3], &mut planes);
+        for c in 0..3 {
+            for y in 0..2 {
+                for x in 0..2 {
+                    assert_eq!(
+                        planes[c * 4 + y * 2 + x].to_bits(),
+                        f32::from(rgb[(y * 3 + x) * 3 + c]).to_bits(),
+                        "channel {c} at ({x}, {y})"
+                    );
+                }
+            }
+        }
     }
 }

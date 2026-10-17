@@ -714,10 +714,7 @@ pub(super) fn handle_streaming_with_tool_interception(
         reason = "fire-and-forget MCP tool loop; gateway shutdown need not wait for individual tool loops"
     )]
     tokio::spawn(async move {
-        let mut state = ToolLoopState::new(
-            original_request.input.clone(),
-            existing_mcp_list_tools_labels,
-        );
+        let mut state = ToolLoopState::new(existing_mcp_list_tools_labels);
         let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
         // Create session inside spawned task (borrows from orchestrator_clone which lives in closure)
@@ -1073,7 +1070,6 @@ pub(super) fn handle_streaming_with_tool_interception(
             match build_resume_payload(
                 &base_payload,
                 &state.conversation_history,
-                &state.original_input,
                 &tools_json,
                 true, // is_streaming = true
             ) {

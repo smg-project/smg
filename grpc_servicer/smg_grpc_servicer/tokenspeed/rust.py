@@ -40,13 +40,14 @@ from smg_grpc_servicer.constrained_decoding import (
 )
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
 
-# The lifecycle's defaults and the switch's choices, re-exported: this
-# launcher's own documented values.
+# The lifecycle's defaults and the switch's flag and choices, re-exported:
+# this launcher's own documented values.
 from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     DEFAULT_DRAIN_SECS,
     DEFAULT_STARTUP_CEILING_SECS,
     DEFAULT_STARTUP_TIMEOUT_SECS,
     IMPLS,
+    SERVICER_IMPL_FLAG,
     EngineProcess,
     EngineProcessGroup,
     FaultLatch,
@@ -58,6 +59,9 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     resolve_tokenizer_dir,
     servicer_switch,
     wait_for_ready_reports,
+)
+from smg_grpc_servicer.servicer_impl_flag import (
+    add_servicer_impl_argument as _add_servicer_impl_argument,
 )
 from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
@@ -74,31 +78,26 @@ STARTUP_CEILING_SECS_ENV = "SMG_TOKENSPEED_SERVICER_STARTUP_CEILING_SECS"
 # Set to 0/false/no/off to keep TokenSpeed's KV event publisher off when the
 # launcher was given no --kv-events-config (see `default_kv_events_config`).
 KV_EVENTS_ENV = "SMG_TOKENSPEED_SERVICER_KV_EVENTS"
-# What a launcher without --kv-events-config gets under the Rust servicer:
-# the ZMQ publisher, with TokenSpeed's own defaults for the rest (the
-# endpoint, the topic).
-DEFAULT_KV_EVENTS_CONFIG = '{"enable_kv_cache_events": true, "publisher": "zmq"}'
-SERVICER_IMPL_FLAG = "--servicer-impl"
+
+
+def default_kv_events_json(endpoint: str) -> str:
+    """What a launcher without --kv-events-config gets under the Rust servicer,
+    as TokenSpeed's server args carry it (JSON text): the ZMQ publisher at
+    ``endpoint``, with TokenSpeed's own defaults for the rest (the topic)."""
+    return json.dumps({"enable_kv_cache_events": True, "publisher": "zmq", "endpoint": endpoint})
 
 
 def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
     """Add ``--servicer-impl`` to a launcher's parser that lacks it; returns
     whether it was added."""
-    actions = parser._option_string_actions  # noqa: SLF001 — argparse's registry of option strings
-    if SERVICER_IMPL_FLAG in actions:
-        return False
-    parser.add_argument(
-        SERVICER_IMPL_FLAG,
-        dest="servicer_impl",
-        choices=list(IMPLS),
-        default=None,
+    return _add_servicer_impl_argument(
+        parser,
         help=(
             "Which implementation serves the gRPC contract: the Python servicer (default) "
             "or the Rust one (smg.servicer.TokenSpeedGrpcServer, with the scheduler(s) "
             f"headless). Unset falls back to ${SERVICER_IMPL_ENV}."
         ),
     )
-    return True
 
 
 def resolve_servicer_impl(args: Any = None, environ: Mapping[str, str] | None = None) -> str:
@@ -267,10 +266,16 @@ def default_kv_events_config(
     """Turn TokenSpeed's KV event publisher on when the launcher was given no
     ``--kv-events-config``; returns the configuration applied, or None: the
     shared rule (``rust_lifecycle.apply_kv_events_default``) with
-    ``DEFAULT_KV_EVENTS_CONFIG``, applied to the server args before the facts
-    and the headless scheduler are built from them."""
+    :func:`default_kv_events_json` at a free port of this host, one per
+    attention-DP rank (each publishes at the port after its predecessor's),
+    applied to the server args before the facts and the schedulers are built
+    from them."""
     return apply_kv_events_default(
-        server_args, DEFAULT_KV_EVENTS_CONFIG, env_name=KV_EVENTS_ENV, environ=environ
+        server_args,
+        default_kv_events_json,
+        env_name=KV_EVENTS_ENV,
+        environ=environ,
+        ranks=EngineConfigView(server_args).server_args.attention_dp_size or 1,
     )
 
 

@@ -1,8 +1,8 @@
 //! Plain: a template that writes the message's content and nothing else. No thought, no calls, no
 //! marker: the output is the content, byte for byte. As recorded for
-//! `TinyLlama/TinyLlama-1.1B-Chat-v1.0` and `microsoft/Phi-4-mini-instruct`, whose parse sets carry
-//! neither a reasoning nor a call (bellwether refuses a parse case whose template drops either),
-//! only content.
+//! `TinyLlama/TinyLlama-1.1B-Chat-v1.0`, `microsoft/Phi-4-mini-instruct` and
+//! `microsoft/Phi-4-multimodal-instruct`, whose parse sets carry neither a reasoning nor a call
+//! (bellwether refuses a parse case whose template drops either), only content.
 //!
 //! The table has one state, content, and no terminal, so every byte of the output is content and
 //! the prompt replay moves nothing: it is the table for a model the gateway otherwise reads

@@ -46,12 +46,14 @@ from smg_grpc_servicer.mm_sidecar_protocol import (
     hello_schemes,
     resolve_namespace,
 )
+from smg_grpc_servicer.vllm import config_view
 from smg_grpc_servicer.vllm.media_refs import (
     BASE_SCHEMES,
     FETCHABLE_MODALITIES,
     advertised_schemes,
     parse_scheme_list,
 )
+from smg_grpc_servicer.vllm.short_side_floor import FloorRule, floor_rule, raise_to_floor_off_loop
 
 logger = logging.getLogger(__name__)
 
@@ -266,6 +268,9 @@ class InProcessMediaProcessor:
     """Fetch with vLLM's MediaConnector and process with the engine's own renderer."""
 
     name = MODE_INPROCESS
+    # The served family's short-side floor (`floor_rule`), applied to a
+    # fetched image before the engine's processor sees it; None raises nothing.
+    _short_side_floor: FloorRule | None = None
 
     def __init__(
         self,
@@ -311,6 +316,13 @@ class InProcessMediaProcessor:
         self._video_processor = get_video_processor_cls_name(model_config)
         self.schemes = advertised_schemes(model_config.allowed_local_media_path)
         self.accepted_schemes = parse_scheme_list(self.schemes)
+        self._short_side_floor = floor_rule(model_config)
+        if self._short_side_floor is not None:
+            logger.info(
+                "images below a %d px short side are raised to it before the engine's "
+                "processor, as the router's own pipeline does for this model family",
+                self._short_side_floor.floor,
+            )
         if not model_config.allowed_media_domains:
             logger.warning(
                 "%s=inprocess with no --allowed-media-domains: this worker will fetch media "
@@ -367,7 +379,8 @@ class InProcessMediaProcessor:
         """
         try:
             if item.modality == "image":
-                return await self._connector.fetch_image_async(item.url)
+                image = await self._connector.fetch_image_async(item.url)
+                return await raise_to_floor_off_loop(image, self._short_side_floor)
             if item.modality == "audio":
                 return await self._connector.fetch_audio_async(item.url)
             if item.modality == "video":
@@ -436,7 +449,9 @@ def resolved_mm_limits(mm_config) -> dict[str, dict[str, Any]]:
 
 
 def fingerprint_from_model_config(model_config) -> Fingerprint:
-    """The one derivation the worker and the sidecar share."""
+    """The one derivation the worker and the sidecar share. The processor
+    kwargs are read where the engine keeps them (:func:`.config_view.mm_processor_kwargs`),
+    as the Rust launcher reads them for the worker-side pipeline."""
     import vllm
     from vllm import envs
 
@@ -448,7 +463,7 @@ def fingerprint_from_model_config(model_config) -> Fingerprint:
         video_backend=envs.VLLM_VIDEO_LOADER_BACKEND,
         media_io_kwargs=json.dumps(mm_config.media_io_kwargs or {}, sort_keys=True, default=str),
         mm_processor_kwargs=json.dumps(
-            mm_config.mm_processor_kwargs or {}, sort_keys=True, default=str
+            config_view.mm_processor_kwargs(model_config), sort_keys=True, default=str
         ),
         limit_per_prompt=json.dumps(resolved_mm_limits(mm_config), sort_keys=True, default=str),
     )
@@ -935,13 +950,51 @@ def _read_env(name: str, env: Mapping[str, str], env_name: str) -> Any:
     return raw if raw else None
 
 
+# Why the Python servicer refuses `smg`: the one text, wherever the refusal comes.
+SMG_MODE_REFUSAL = (
+    f"{PROCESSOR_FLAG}={MODE_SMG} is smg's own media pipeline, which runs inside the "
+    "Rust servicer (--servicer-impl rust / SMG_VLLM_SERVICER_IMPL=rust); the Python "
+    f"servicer serves {MODE_INPROCESS} or {MODE_REDIS}"
+)
+
+
+def require_python_servicer_mode(
+    settings: MmSettings | None = None, env: Mapping[str, str] = os.environ
+) -> str:
+    """The processor mode the Python servicer is asked for (flag > env > default),
+    refused when it is the Rust servicer's own pipeline, with every other
+    `--mm-*` setting, and the video frame budget variable for the modes that
+    read it, validated as the servicer's constructor will validate them.
+
+    For a launcher to call before it builds the engine: the settings are known
+    from the flags and the environment long before any weights load, and a
+    refusal that comes after a full model load (what the servicer's own
+    resolve gives, as it runs once the engine exists) is a crash loop under a
+    restart policy, each turn paying the load. Logs no deprecation line for a
+    variable behind a flag: the servicer's own resolve does that once.
+    """
+    requested = settings or MmSettings()
+    # Every setting, as the servicer's constructor resolves them all; without
+    # `flags_defined`, so the deprecation line stays the servicer's to log.
+    requested = MmSettings(**{name: getattr(requested, name) for name in _MM_SETTING_SPECS})
+    mode = requested.resolve(env).processor
+    if mode == MODE_SMG:
+        raise ValueError(SMG_MODE_REFUSAL)
+    if mode in (MODE_INPROCESS, MODE_REDIS):
+        # The frame budget the processors read at construction, checked the same way.
+        env_int(env, ENV_MAX_VIDEO_FRAMES, DEFAULT_MAX_VIDEO_FRAMES, minimum=0)
+    return mode
+
+
 def build_mm_processor(
     engine, *, env: Mapping[str, str] = os.environ, settings: MmSettings | None = None
 ):
     """Construct the configured backend, or None when worker-side processing is off.
 
     `settings` are the launcher's flags (already resolved or not); without them
-    everything comes from the env, as before.
+    everything comes from the env, as before. A launcher with the servicer
+    switch refused `smg` before it built the engine
+    (`require_python_servicer_mode`); the check here is for one without it.
     """
     resolved = (settings or MmSettings()).resolve(env)
     if missing := _MM_SETTING_SPECS.keys() - resolved.sources.keys():
@@ -950,11 +1003,7 @@ def build_mm_processor(
     if mode == MODE_OFF:
         return None
     if mode == MODE_SMG:
-        raise ValueError(
-            f"{PROCESSOR_FLAG}={MODE_SMG} is smg's own media pipeline, which runs inside the "
-            "Rust servicer (--servicer-impl rust / SMG_VLLM_SERVICER_IMPL=rust); the Python "
-            f"servicer serves {MODE_INPROCESS} or {MODE_REDIS}"
-        )
+        raise ValueError(SMG_MODE_REFUSAL)
     model_config = getattr(engine, "model_config", None)
     if model_config is None or not getattr(model_config, "is_multimodal_model", False):
         logger.warning("mm_processor=%s ignored: the served model is not multimodal", mode)

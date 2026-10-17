@@ -3,7 +3,8 @@
 //! scripted engine frames equals, field for field, the usage of the
 //! non-streamed answer built from the same frames, with the reasoning tokens
 //! the Harmony parser counts and every detail counter present. The usage of a
-//! Responses API iteration is checked the same way.
+//! Responses API iteration is checked the same way, and so is the settlement
+//! of a chat request's reservation: the engine's counts, streamed and not.
 
 use std::sync::Arc;
 
@@ -14,6 +15,7 @@ use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as 
 use super::HarmonyStreamingProcessor;
 use crate::{
     observability::metrics::metrics_labels,
+    rate_limit::{test_support::RecordingBackend, SharedReservationHandle, UsageSettlement},
     routers::{
         common::sse::sse_channel,
         grpc::{
@@ -120,7 +122,11 @@ fn chat_request(choices: u32, stream: bool) -> ChatCompletionRequest {
 
 /// The `usage` of the usage-only chunk that ends a Harmony chat stream with
 /// `stream_options.include_usage`.
-async fn streamed_chat_usage(frames: Vec<proto::GenerateResponse>, choices: u32) -> Value {
+async fn streamed_chat_usage(
+    frames: Vec<proto::GenerateResponse>,
+    choices: u32,
+    reservation: Option<Arc<SharedReservationHandle>>,
+) -> Value {
     let (stream, server) = scripted_stream(frames, "0").await;
     let dispatch = dispatch();
     let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_CHAT);
@@ -130,6 +136,7 @@ async fn streamed_chat_usage(frames: Vec<proto::GenerateResponse>, choices: u32)
             Arc::new(chat_request(choices, true)),
             dispatch,
             Vec::new(),
+            reservation,
             None,
             source,
         )
@@ -156,9 +163,13 @@ async fn streamed_chat_usage(frames: Vec<proto::GenerateResponse>, choices: u32)
     usage_chunk["usage"].clone()
 }
 
-async fn non_streamed_chat_usage(frames: Vec<proto::GenerateResponse>, choices: u32) -> Value {
+/// The non-streamed answer's usage and the settlement its counters make.
+async fn non_streamed_chat(
+    frames: Vec<proto::GenerateResponse>,
+    choices: u32,
+) -> (Value, UsageSettlement) {
     let (stream, server) = scripted_stream(frames, "0").await;
-    let response = HarmonyResponseProcessor::new()
+    let (response, counts) = HarmonyResponseProcessor::new()
         .process_non_streaming_chat_response(
             context::ExecutionResult::Single { stream },
             Arc::new(chat_request(choices, false)),
@@ -168,7 +179,12 @@ async fn non_streamed_chat_usage(frames: Vec<proto::GenerateResponse>, choices: 
         .await
         .unwrap_or_else(|response| panic!("{}", response.status()));
     server.abort();
-    serde_json::to_value(response).expect("a JSON response")["usage"].clone()
+    let usage = serde_json::to_value(response).expect("a JSON response")["usage"].clone();
+    (usage, counts.settlement())
+}
+
+async fn non_streamed_chat_usage(frames: Vec<proto::GenerateResponse>, choices: u32) -> Value {
+    non_streamed_chat(frames, choices).await.0
 }
 
 /// The detail counters the OpenAI API sends on every chat completion.
@@ -211,7 +227,7 @@ async fn harmony_chat_usage_is_the_same_streamed_and_not() {
         ),
     ] {
         let tokens = harmony_tokens(analysis, "Hello there!");
-        let streamed = streamed_chat_usage(frames(&tokens, choices, counters), choices).await;
+        let streamed = streamed_chat_usage(frames(&tokens, choices, counters), choices, None).await;
         let whole = non_streamed_chat_usage(frames(&tokens, choices, counters), choices).await;
         assert_eq!(
             streamed, whole,
@@ -319,4 +335,43 @@ async fn harmony_responses_iteration_usage_is_the_same_streamed_and_not() {
         streamed["completion_tokens_details"]["accepted_prediction_tokens"], 2,
         "{streamed}"
     );
+}
+
+/// The settlement of a Harmony chat request carries the engine's counts,
+/// streamed and not: the cache hit of the shared prompt, and the engine's
+/// own reasoning count, zero here (the engine proto's terminal frame carries
+/// none) though the parser counted the analysis channel and the usage
+/// object shows that count.
+#[tokio::test]
+async fn harmony_chat_settlement_carries_the_engines_counts_streamed_and_not() {
+    let counters = Counters {
+        prompt: 10,
+        cached: 4,
+        spec_accepted: 0,
+        spec_drafted: 0,
+    };
+    let tokens = harmony_tokens(Some("Think first."), "Hello there!");
+    let choices = 2;
+    let expected = UsageSettlement {
+        actual_input_tokens: 10,
+        completion_tokens: tokens.len() as u32 * choices,
+        cached_input_tokens: 4,
+        reasoning_tokens: 0,
+    };
+
+    let (handle, backend) = RecordingBackend::reservation();
+    let streamed =
+        streamed_chat_usage(frames(&tokens, choices, counters), choices, Some(handle)).await;
+    assert!(
+        streamed["completion_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .is_some_and(|reasoning| reasoning > 0),
+        "the usage shows the parser's count: {streamed}"
+    );
+    assert_eq!(backend.settlements(), vec![expected]);
+    assert_eq!(backend.closes(), 0);
+
+    let (whole, settlement) = non_streamed_chat(frames(&tokens, choices, counters), choices).await;
+    assert_eq!(whole, streamed);
+    assert_eq!(settlement, expected);
 }

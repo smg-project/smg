@@ -315,7 +315,11 @@ impl Arguments {
         }
         let mut upto = end;
         if self.invalid_from.is_none() && self.whole.is_none() {
-            let held = [self.prefix.word_start(), self.members.open];
+            // A word being spelled and a surrogate escape awaiting its low half are held; a
+            // string streams on, as a string parameter would otherwise wait for its closing
+            // quote, and a surrogate that breaks inside it is the one case where the pieces say
+            // more of the value than the whole, which refuses it (`Prefix::held_from`).
+            let held = [self.prefix.held_from(), self.members.open];
             upto = held.into_iter().flatten().fold(end, usize::min);
         }
         // A value that ends where refused keeps the bytes from the refusal on for the caller
@@ -330,7 +334,10 @@ impl Arguments {
     }
 
     /// No more bytes come: a number or a literal the bytes end on is whole now, and a word they
-    /// end on is sent as the prefix it is. Returns whether the value is whole.
+    /// end on is sent as the prefix it is. A value that began and is no whole one (a string or a
+    /// container left open, a word that is no literal's prefix) is said to be none, by a
+    /// `Malformed` event of no bytes after its fragments: nothing sent is revised and nothing is
+    /// made up for what the model never finished. Returns whether the value is whole.
     pub fn finish(&mut self, out: &mut Events) -> bool {
         if self.whole.is_none()
             && self.started
@@ -341,6 +348,19 @@ impl Arguments {
         }
         let end = self.value.len();
         self.emit(end, end, &AsWritten, out);
+        // A break the value reported itself has said it; one whose tail it handed back
+        // (`ends_where_refused`) has not, and the bytes before the break are no whole value.
+        let unsaid = self.invalid_from.is_none() || self.ends_where_refused;
+        if self.started && self.whole.is_none() && unsaid {
+            out.push(Event::Malformed {
+                text: Text::default(),
+                why: if self.ended_where_refused() {
+                    MalformedReason::InvalidArguments
+                } else {
+                    MalformedReason::UnterminatedRegion
+                },
+            });
+        }
         self.whole.is_some()
     }
 
@@ -559,7 +579,9 @@ mod tests {
 
     /// A value that ends where refused takes the piece that breaks it, reports the prefix before
     /// the break and nothing after, hands the bytes from the break on back once with the character
-    /// before them, and takes nothing more; a value refused at the end of a piece has no tail.
+    /// before them, and takes nothing more; at its end it says, in a `Malformed` event of no
+    /// bytes, that what it reported is no whole value. A value refused at the end of a piece has
+    /// no tail.
     #[test]
     fn a_value_ending_where_refused_hands_its_tail_back_once() {
         let mut arguments = Arguments::new(0).ending_where_refused();
@@ -581,7 +603,14 @@ mod tests {
         assert_eq!(arguments.refused_tail(), None);
         assert_eq!(arguments.feed("more", &AsWritten, &mut out), 0);
         assert!(!arguments.finish(&mut out));
-        assert!(out.drain().is_empty(), "nothing more is reported");
+        assert_eq!(
+            out.drain(),
+            vec![Event::Malformed {
+                text: Text::default(),
+                why: MalformedReason::InvalidArguments,
+            }],
+            "the end says the value is no whole one; its bytes were handed back"
+        );
 
         let mut arguments = Arguments::new(0).ending_where_refused();
         let mut out = Events::new();

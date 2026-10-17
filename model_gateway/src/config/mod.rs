@@ -5,9 +5,11 @@ pub(crate) mod validation;
 
 pub use builder::*;
 pub use types::*;
+pub(crate) use validation::parse_listen_ip;
 pub use validation::{
-    bind_socket_addr, parse_bind_host, validate_mesh_listener_port, validate_mesh_server_name,
-    validate_worker_url,
+    available_cpus, bind_socket_addr, parse_bind_host, runtime_worker_threads_oversubscription,
+    validate_mesh_listener_port, validate_mesh_server_name, validate_worker_url,
+    RUNTIME_WORKER_THREADS_CEILING, RUNTIME_WORKER_THREADS_PER_CPU,
 };
 
 #[derive(Debug, thiserror::Error)]

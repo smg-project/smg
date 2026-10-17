@@ -448,6 +448,26 @@ struct FileDiscovery {
     last_good: Option<DesiredState>,
 }
 
+/// The loop's timers, held across passes: the tick, and the retry of a watch
+/// that could not be started. A timer rebuilt on every pass is set back by
+/// every pass another cause starts: the retry, once a sleep rebuilt that way,
+/// never fired under a check interval no longer than [`REWATCH`], because the
+/// tick came first on every pass.
+struct Timers {
+    tick: time::Interval,
+    rewatch: time::Interval,
+}
+
+impl Timers {
+    fn new(check_interval: Duration) -> Self {
+        let mut tick = time::interval(check_interval);
+        tick.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        let mut rewatch = time::interval(REWATCH);
+        rewatch.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        Self { tick, rewatch }
+    }
+}
+
 impl FileDiscovery {
     fn new(config: FileProviderConfig, app_context: Arc<AppContext>) -> Self {
         let (wake, woken) = mpsc::channel(1);
@@ -463,20 +483,24 @@ impl FileDiscovery {
     }
 
     async fn run(mut self) {
-        self.start_watch();
-        let mut interval = time::interval(self.config.check_interval);
-        interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        let mut timers = Timers::new(self.config.check_interval);
+        self.start_watch(&mut timers);
         loop {
-            if !self.next_pass(&mut interval).await {
-                continue;
-            }
-            self.rewatch_if_lost();
-            let started_at = time::Instant::now();
-            self.reread().await;
-            if let Some(desired) = &self.last_good {
-                reconciler::reconcile(desired, DiscoveryKind::File, &self.app_context, started_at)
-                    .await;
-            }
+            self.pass(&mut timers).await;
+        }
+    }
+
+    /// One pass: wait for its cause, then reread and reconcile.
+    async fn pass(&mut self, timers: &mut Timers) {
+        if !self.next_pass(timers).await {
+            return;
+        }
+        self.rewatch_if_lost(timers);
+        let started_at = time::Instant::now();
+        self.reread().await;
+        if let Some(desired) = &self.last_good {
+            reconciler::reconcile(desired, DiscoveryKind::File, &self.app_context, started_at)
+                .await;
         }
     }
 
@@ -484,24 +508,24 @@ impl FileDiscovery {
     /// once it has settled, or the watch starting after the directory came
     /// back, since nothing reported changes until then. `false` when the
     /// directory is still missing, which is no pass at all.
-    async fn next_pass(&mut self, interval: &mut time::Interval) -> bool {
+    async fn next_pass(&mut self, timers: &mut Timers) -> bool {
         tokio::select! {
-            _ = interval.tick() => true,
+            _ = timers.tick.tick() => true,
             Some(()) = self.woken.recv() => {
                 settle(&mut self.woken).await;
                 true
             }
             // Unwatched, because the directory does not exist (yet, or any
-            // more): retry soon rather than on the tick.
-            () = time::sleep(REWATCH), if self.watch.is_none() => {
-                self.start_watch();
+            // more): retry on the watch's own cadence rather than on the tick.
+            _ = timers.rewatch.tick(), if self.watch.is_none() => {
+                self.start_watch(timers);
                 self.watch.is_some()
             }
         }
     }
 
     /// Start the watch again once the directory it was on is gone.
-    fn rewatch_if_lost(&mut self) {
+    fn rewatch_if_lost(&mut self, timers: &mut Timers) {
         if self.watch.as_ref().is_some_and(ManifestWatch::is_lost) {
             warn!(
                 "The directory of discovery manifest {} was removed or moved; watching it again once it exists",
@@ -509,14 +533,14 @@ impl FileDiscovery {
             );
             // Logged here, so a failed retry stays quiet.
             self.warned = true;
-            self.start_watch();
+            self.start_watch(timers);
         }
     }
 
-    /// Start watching, or say why the provider is polling only. Polling alone
-    /// is still correct: the tick rereads whatever the watch would have
-    /// reported.
-    fn start_watch(&mut self) {
+    /// Start watching, or say why the provider is polling only and have the
+    /// watch tried again in [`REWATCH`]. Polling alone is still correct: the
+    /// tick rereads whatever the watch would have reported.
+    fn start_watch(&mut self, timers: &mut Timers) {
         self.watch = match watch_manifest(&self.config.path, self.wake.clone()) {
             Ok(watch) => {
                 if self.warned {
@@ -538,6 +562,9 @@ impl FileDiscovery {
                     );
                     self.warned = true;
                 }
+                // A full `REWATCH` from now, wherever the retry's schedule
+                // stood while the watch was up.
+                timers.rewatch.reset();
                 None
             }
         };
@@ -1000,9 +1027,13 @@ mod tests {
     }
 
     fn discovery(path: &Path) -> FileDiscovery {
+        discovery_checking_every(path, Duration::from_secs(60))
+    }
+
+    fn discovery_checking_every(path: &Path, check_interval: Duration) -> FileDiscovery {
         let config = FileProviderConfig::new(
             path.to_path_buf(),
-            Duration::from_secs(60),
+            check_interval,
             &RoutingMode::Regular {
                 worker_urls: vec![],
             },
@@ -1063,22 +1094,64 @@ mod tests {
     /// Until the manifest's directory exists the provider polls only: the
     /// watch is retried after the one warning, and starts once the directory
     /// is there.
-    #[test]
-    fn an_unwatchable_directory_leaves_the_provider_polling() {
+    #[tokio::test]
+    async fn an_unwatchable_directory_leaves_the_provider_polling() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("smg");
         let mut discovery = discovery(&dir.join("workers.json"));
+        let mut timers = Timers::new(discovery.config.check_interval);
 
-        discovery.start_watch();
+        discovery.start_watch(&mut timers);
         assert!(discovery.watch.is_none());
         assert!(discovery.warned, "the failure is logged");
-        discovery.start_watch();
+        discovery.start_watch(&mut timers);
         assert!(discovery.watch.is_none());
         assert!(discovery.warned, "a failed retry stays quiet");
 
         std::fs::create_dir(&dir).unwrap();
-        discovery.start_watch();
+        discovery.start_watch(&mut timers);
         assert!(discovery.watch.is_some(), "the directory exists now");
         assert!(!discovery.warned, "the watch starting is logged in turn");
+    }
+
+    /// A watch lost with its directory is tried again on its own cadence,
+    /// under a check interval no longer than that cadence too: the loop, as
+    /// it runs, sees the directory removed (the watch reports its own loss)
+    /// and recreated, and has the watch back within a few passes. A retry
+    /// rebuilt on every pass lost to the tick on every pass and never fired.
+    #[tokio::test]
+    async fn a_lost_watch_is_retried_under_a_check_interval_as_short_as_the_retry() {
+        for check_interval in [Duration::from_millis(250), REWATCH] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("smg");
+            std::fs::create_dir(&dir).unwrap();
+            let path = dir.join("workers.json");
+            std::fs::write(&path, manifest("")).unwrap();
+            let mut discovery = discovery_checking_every(&path, check_interval);
+            let mut timers = Timers::new(check_interval);
+            discovery.start_watch(&mut timers);
+            assert!(discovery.watch.is_some());
+
+            std::fs::remove_file(&path).unwrap();
+            std::fs::remove_dir(&dir).unwrap();
+            let deadline = time::Instant::now() + Duration::from_secs(10);
+            while discovery.watch.is_some() {
+                assert!(time::Instant::now() < deadline, "the loss was never seen");
+                discovery.pass(&mut timers).await;
+            }
+            assert!(discovery.warned, "polling only, and said so");
+
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(&path, manifest("")).unwrap();
+            let deadline = time::Instant::now() + Duration::from_secs(5);
+            while discovery.watch.is_none() && time::Instant::now() < deadline {
+                discovery.pass(&mut timers).await;
+            }
+            assert!(
+                discovery.watch.is_some(),
+                "the watch was not tried again under a check interval of {check_interval:?}"
+            );
+            assert!(!discovery.warned, "the watch starting is logged in turn");
+        }
     }
 }

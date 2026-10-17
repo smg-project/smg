@@ -27,8 +27,15 @@ use super::State;
 /// A `Send` boxed future, the shape a processor's calls take.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
-/// One `media_refs` item: the modality name (`image`, `video`) and the
-/// reference to fetch.
+/// The reference modalities a processor of pixels takes, as `media_refs`
+/// names them.
+pub const PIXEL_MODALITIES: &[&str] = &["image", "video"];
+/// Every reference modality the wire names, for a processor that takes what
+/// the model takes.
+pub const ALL_MODALITIES: &[&str] = &["image", "video", "audio"];
+
+/// One `media_refs` item: the modality name (`image`, `video`, `audio`) and
+/// the reference to fetch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaRefItem {
     pub modality: String,
@@ -114,6 +121,14 @@ pub trait MediaProcessor: Send + Sync + 'static {
     fn source(&self) -> &str;
     /// How many requests it processes at once; as many again may wait.
     fn max_inflight(&self) -> usize;
+    /// The modalities it takes references of, as `media_refs` names them
+    /// ([`ALL_MODALITIES`] for the engine's own processors, which take
+    /// whatever the model takes, audio included; [`PIXEL_MODALITIES`] for a
+    /// pipeline of pixels); a reference of another modality is refused
+    /// before any work, naming the modes that take it. Every processor
+    /// states its set: a default would let the next bridge refuse audio
+    /// without a word.
+    fn modalities(&self) -> &'static [&'static str];
     /// Whether it can take requests now (a sidecar's liveness); the backend
     /// is advertised only while this holds.
     fn probe(&self) -> BoxFuture<bool>;
@@ -182,13 +197,20 @@ pub(super) const PROCESSOR_OFF: &str =
 
 /// The request's `media_refs` as processor items, checked as the Python
 /// servicer checks them (`parse_media_refs`): a fetchable modality and a
-/// non-empty reference each, at least one item.
-fn parse_media_refs(refs: &vllm::MediaRefs) -> Result<Vec<MediaRefItem>, Status> {
+/// non-empty reference each, at least one item; and, on this servicer, a
+/// modality the configured processor takes, so a reference it would refuse
+/// after the fetch is refused before it.
+fn parse_media_refs(
+    refs: &vllm::MediaRefs,
+    processor: &dyn MediaProcessor,
+) -> Result<Vec<MediaRefItem>, Status> {
+    let taken = processor.modalities();
     let mut items = Vec::with_capacity(refs.items.len());
     for (index, item) in refs.items.iter().enumerate() {
         let modality = match common::Modality::try_from(item.modality) {
             Ok(common::Modality::Image) => "image",
             Ok(common::Modality::Video) => "video",
+            Ok(common::Modality::Audio) => "audio",
             other => {
                 let name = other.map_or_else(
                     |_| item.modality.to_string(),
@@ -199,6 +221,15 @@ fn parse_media_refs(refs: &vllm::MediaRefs) -> Result<Vec<MediaRefItem>, Status>
                 )));
             }
         };
+        if !taken.contains(&modality) {
+            return Err(Status::invalid_argument(format!(
+                "media_refs[{index}]: the {} media processor on this worker takes {} \
+                 references, not {modality}; --mm-processor inprocess or redis processes \
+                 {modality} with the engine's own processor",
+                processor.name(),
+                taken.join(" and "),
+            )));
+        }
         if item.url.is_empty() {
             return Err(Status::invalid_argument(format!(
                 "media_refs[{index}]: empty url"
@@ -242,7 +273,7 @@ pub(super) async fn process_media_refs(
     let Some(gate) = state.media.as_ref() else {
         return Err(Status::invalid_argument(PROCESSOR_OFF));
     };
-    let items = parse_media_refs(&refs)?;
+    let items = parse_media_refs(&refs, gate.processor.as_ref())?;
     let request = MediaRequest {
         request_id: req.request_id.clone(),
         prompt_token_ids: tokenized.input_ids.clone(),

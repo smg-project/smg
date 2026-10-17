@@ -277,29 +277,14 @@ impl Llama4VisionProcessor {
         let bias: [f32; 3] = std::array::from_fn(|c| -(self.mean[c] as f32) / (self.std[c] as f32));
 
         let mut data = vec![0.0f32; 3 * canvas_pixels];
-        let (r_plane, rest) = data.split_at_mut(canvas_pixels);
-        let (g_plane, b_plane) = rest.split_at_mut(canvas_pixels);
-
-        // Pre-fill with normalized black: 0 * scale + bias = bias
-        r_plane.fill(bias[0]);
-        g_plane.fill(bias[1]);
-        b_plane.fill(bias[2]);
-
-        // Overwrite image region row-by-row using the shared block-optimized helper
-        let rw = img_w.min(canvas_w);
-        let rh = img_h.min(canvas_h);
-        for y in 0..rh {
-            let src_row = &raw[y * img_w * 3..y * img_w * 3 + rw * 3];
-            let dst_offset = y * canvas_w;
-            transforms::deinterleave_rgb_to_planes(
-                src_row,
-                &mut r_plane[dst_offset..dst_offset + rw],
-                &mut g_plane[dst_offset..dst_offset + rw],
-                &mut b_plane[dst_offset..dst_offset + rw],
-                scale,
-                bias,
-            );
-        }
+        transforms::paint_rgb_onto_planes(
+            &raw,
+            (img_w, img_h),
+            (canvas_w, canvas_h),
+            scale,
+            bias,
+            &mut data,
+        );
 
         #[expect(
             clippy::expect_used,
@@ -432,10 +417,7 @@ impl VisionPreProcessor for Llama4VisionProcessor {
         config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
-            return Err(TransformError::InvalidShape {
-                expected: "non-empty image batch".to_string(),
-                actual: vec![0],
-            });
+            return Err(TransformError::EmptyBatch);
         }
 
         let owned_processor;
@@ -728,5 +710,12 @@ mod tests {
             processor.calculate_num_tokens_for_aspect_ratio((1, 2)),
             1728
         );
+    }
+
+    #[test]
+    fn an_empty_batch_is_refused_as_empty_batch() {
+        let processor = Llama4VisionProcessor::new();
+        let result = processor.preprocess(&[], &PreProcessorConfig::default());
+        assert!(matches!(result, Err(TransformError::EmptyBatch)));
     }
 }

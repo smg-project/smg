@@ -60,7 +60,7 @@ See [`values.yaml`](values.yaml) for the full list of configurable parameters.
 | `workers` | Worker (inference engine) deployments |
 | `huggingface` | HuggingFace token for gated model downloads |
 | `auth` | API key authentication, rate limiting |
-| `history` | Storage backend (none/memory/postgres/redis/oracle) |
+| `history` | Storage backend (none/memory/postgres/redis/oracle) and the Secret its connection URL comes from |
 | `serviceAccount` | Service account creation and annotations |
 | `rbac` | RBAC for Kubernetes service discovery |
 
@@ -108,6 +108,39 @@ helm install smg deploy/helm/smg \
 
 The token is stored in a Kubernetes Secret and injected as `HF_TOKEN` env var into both the router and worker pods.
 
+#### API Key
+
+The shared API key the serving routes require (`auth.apiKey`) is written into a chart-managed Secret and mounted into the router pod as a file the gateway reads with `--api-key-file`; the key is never in the pod's arguments, so it is not in the Deployment object, the process listing or `/proc`. A key managed outside the chart's values is mounted the same way from an existing Secret:
+
+```bash
+kubectl create secret generic smg-auth --from-literal=api-key='<key>'
+helm install smg deploy/helm/smg \
+  --set auth.existingSecret=smg-auth \
+  --set auth.apiKeySecretKey=api-key   # the default
+```
+
+The gateway also reads its other secrets from the environment or from files, which `router.extraEnv` can feed from Secrets: `SMG_TENANT_API_KEYS` (or `SMG_TENANT_API_KEYS_FILE`) for per-tenant keys; the store URLs have values of their own ([Store URLs](#store-urls)). On the command line a flag beats the environment, and a value together with a file for the same secret is refused at start-up. The launcher's reference in [the Python package's README](../../../bindings/python/README.md#secrets-from-the-environment-or-files) lists every name.
+
+The gateway reads the key file once, at start-up, so a rotated key reaches a pod when the pod restarts. A rotated `auth.apiKey` rolls the router pods by itself: the pod template carries a `checksum/auth` annotation over the chart-managed Secret, so `helm upgrade` with a new key is a rolling update. A rotated `auth.existingSecret` is not seen by the chart; roll the pods by hand after updating it, or the running pods keep accepting the old key until they restart. By label, which covers both workload kinds and every release name: `kubectl rollout restart deployment,statefulset -l app.kubernetes.io/instance=<release>,app.kubernetes.io/component=router` (the workload is `<fullname>-router`, where `<fullname>` is `<release>-smg` unless the release name contains `smg` or `fullnameOverride` is set).
+
+An older gateway image does not know `--api-key-file`; a chart of this version with such an image refuses to start rather than starting without the key.
+
+#### Store URLs
+
+The connection URL of the history store (`history.postgres.url`, `history.redis.url`) carries the database password, so the chart writes it into a chart-managed Secret and the router pod gets it as the environment variable the gateway reads (`SMG_POSTGRES_DB_URL`, `SMG_REDIS_URL`); the URL is never in the pod's arguments, so it is not in the Deployment object, the process listing or `/proc`. A URL managed outside the chart's values comes from an existing Secret the same way:
+
+```bash
+kubectl create secret generic smg-db-credentials --from-literal=postgres-url='postgresql://smg:<password>@postgres:5432/smg'
+helm install smg deploy/helm/smg \
+  --set history.backend=postgres \
+  --set history.postgres.existingSecret=smg-db-credentials \
+  --set history.postgres.secretKey=postgres-url   # the default (redis: redis-url)
+```
+
+A changed `url` rolls the router pods: the pod template carries a checksum of the chart-managed Secret. The checksum is a hash of the Secret's rendered contents, in which the URL is the only unknown, so a URL set in the values should carry a high-entropy password (anyone who can read the Deployment can test guesses against the hash); an existing Secret exposes no hash. The existing Secret's name must differ from the chart-managed one (`<fullname>-history`, so `smg-history` for a release named `smg`), or a later switch to `url` fails the upgrade because the chart cannot take over a Secret it did not create. A rotated existing Secret does not roll the pods, as the gateway reads the URL once at start-up; restart the router pods after rotating it (`kubectl rollout restart` of the router Deployment, or of the StatefulSet in mesh mode). With neither `url` nor `existingSecret` the chart passes no URL, and the gateway refuses to start a store backend without one, unless `router.extraEnv` provides the variable.
+
+An older gateway image does not read `SMG_POSTGRES_DB_URL` / `SMG_REDIS_URL`; a chart of this version with such an image refuses to start the store backend rather than starting it without the URL.
+
 #### Router Probes and Shutdown
 
 The router's liveness probe is `httpGet /health`, which answers 200 while the process serves. Its readiness probe is `httpGet /readiness`, which answers 503 while the gateway has no healthy worker, while a tokenizer is not yet registered and while the gateway drains after SIGTERM, so the Service stops sending new connections to a pod that cannot take them (`router.livenessProbe.path` and `router.readinessProbe.path` override the routes).
@@ -142,7 +175,7 @@ workers:
 | [`with-vllm-grpc.yaml`](examples/with-vllm-grpc.yaml) | Router + vLLM worker (gRPC) |
 | [`with-sglang.yaml`](examples/with-sglang.yaml) | Router + SGLang worker |
 | [`with-multi-model.yaml`](examples/with-multi-model.yaml) | Multiple models on different engines |
-| [`with-postgres.yaml`](examples/with-postgres.yaml) | PostgreSQL history backend |
+| [`with-postgres.yaml`](examples/with-postgres.yaml) | PostgreSQL history backend, its URL in a Secret |
 | [`with-service-discovery.yaml`](examples/with-service-discovery.yaml) | K8s auto-discovery |
 | [`with-ingress.yaml`](examples/with-ingress.yaml) | Ingress with TLS |
 | [`with-monitoring.yaml`](examples/with-monitoring.yaml) | ServiceMonitor + Grafana dashboard |

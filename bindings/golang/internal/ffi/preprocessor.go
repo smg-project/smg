@@ -25,6 +25,7 @@ SglErrorCode sgl_preprocess_chat_request(
     size_t* token_ids_len_out,
     char** tool_constraints_json_out,
     char** tools_json_out,
+    int32_t* skip_special_tokens_out,
     int32_t* prompt_tokens_out,
     char** error_out
 );
@@ -40,6 +41,7 @@ SglErrorCode sgl_preprocess_chat_request_with_tokenizer(
     size_t* token_ids_len_out,
     char** tool_constraints_json_out,
     char** tools_json_out,
+    int32_t* skip_special_tokens_out,
     int32_t* prompt_tokens_out,
     char** error_out
 );
@@ -78,8 +80,13 @@ type PreprocessedRequest struct {
 	// ToolsJSON is the tool list the response parser resolves calls against:
 	// the request-level tools and the tools declared on messages, as the
 	// preprocessor resolved them ("" when the request declares none).
-	ToolsJSON    string
-	PromptTokens int32
+	ToolsJSON string
+	// SkipSpecialTokens is whether the engine and the response converter skip
+	// special tokens: the request's setting, unless the response parser needs
+	// the engine's tool-call markers kept (tools under a choice that allows
+	// calls, no JSON-schema constraint), as the preprocessor derived it.
+	SkipSpecialTokens bool
+	PromptTokens      int32
 	// Internal pointers for memory management
 	promptTextPtr          *C.char
 	tokenIDsPtr            *C.uint32_t
@@ -108,6 +115,7 @@ func PreprocessChatRequest(requestJSON, tokenizerPath string) (*PreprocessedRequ
 	var tokenIDsLenOut C.size_t
 	var toolConstraintsJSONOut *C.char
 	var toolsJSONOut *C.char
+	var skipSpecialTokensOut C.int32_t
 	var promptTokensOut C.int32_t
 	var errorOut *C.char
 
@@ -119,6 +127,7 @@ func PreprocessChatRequest(requestJSON, tokenizerPath string) (*PreprocessedRequ
 		&tokenIDsLenOut,
 		&toolConstraintsJSONOut,
 		&toolsJSONOut,
+		&skipSpecialTokensOut,
 		&promptTokensOut,
 		&errorOut,
 	)
@@ -156,6 +165,8 @@ func PreprocessChatRequest(requestJSON, tokenizerPath string) (*PreprocessedRequ
 	if toolsJSONOut != nil {
 		result.ToolsJSON = C.GoString(toolsJSONOut)
 	}
+
+	result.SkipSpecialTokens = skipSpecialTokensOut != 0
 
 	// Store pointers for later cleanup
 	result.promptTextPtr = promptTextOut
@@ -187,6 +198,7 @@ func PreprocessChatRequestWithTokenizer(requestJSON string, tokenizerHandle *Tok
 	var tokenIDsLenOut C.size_t
 	var toolConstraintsJSONOut *C.char
 	var toolsJSONOut *C.char
+	var skipSpecialTokensOut C.int32_t
 	var promptTokensOut C.int32_t
 	var errorOut *C.char
 
@@ -198,6 +210,7 @@ func PreprocessChatRequestWithTokenizer(requestJSON string, tokenizerHandle *Tok
 		&tokenIDsLenOut,
 		&toolConstraintsJSONOut,
 		&toolsJSONOut,
+		&skipSpecialTokensOut,
 		&promptTokensOut,
 		&errorOut,
 	)
@@ -235,6 +248,8 @@ func PreprocessChatRequestWithTokenizer(requestJSON string, tokenizerHandle *Tok
 	if toolsJSONOut != nil {
 		result.ToolsJSON = C.GoString(toolsJSONOut)
 	}
+
+	result.SkipSpecialTokens = skipSpecialTokensOut != 0
 
 	// Store pointers for later cleanup
 	result.promptTextPtr = promptTextOut

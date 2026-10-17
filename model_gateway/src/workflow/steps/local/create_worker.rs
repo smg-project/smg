@@ -19,9 +19,11 @@ use crate::{
         zmq_client::zmq_handshake_address,
     },
     worker::{
-        circuit_breaker::CircuitBreakerConfig, overload::OverloadThresholds,
-        resilience::resolve_resilience, worker::RuntimeType, BasicWorkerBuilder, ConnectionMode,
-        Worker, WorkerRegistry, UNKNOWN_MODEL_ID,
+        circuit_breaker::CircuitBreakerConfig,
+        overload::OverloadThresholds,
+        resilience::resolve_resilience,
+        worker::{merge_labels, RuntimeType, WINDOW_LABELS},
+        BasicWorkerBuilder, ConnectionMode, Worker, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
     workflow::data::{WorkerKind, WorkerRegistrationMode, WorkerWorkflowData},
 };
@@ -62,11 +64,9 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             });
         }
 
-        // Merge labels: discovered first, then config (config takes precedence)
-        let mut labels = context.data.discovered_labels.clone();
-        for (key, value) in &config.labels {
-            labels.insert(key.clone(), value.clone());
-        }
+        // Merge labels: discovered first, then config (config takes precedence;
+        // a window set by hand is the worker's only window, see `merge_labels`).
+        let mut labels = merge_labels(&context.data.discovered_labels, &config.labels);
 
         validate_constrained_decoding_label(&labels, &config.url, "create_worker")?;
         let (kv_connector, kv_role, kv_engine_id) = take_kv_transfer_metadata(config, &mut labels);
@@ -386,12 +386,17 @@ pub(super) fn resolve_model_id<'a>(
 /// registered worker serving the same model. Resolution stays deterministic
 /// (lexicographically smallest name wins), but only one format parses
 /// correctly — operators should see the conflict at deploy time.
-fn warn_on_conflicting_parser_overrides(
+pub(super) fn warn_on_conflicting_parser_overrides(
     card: &ModelCard,
     worker_url: &str,
     registry: &WorkerRegistry,
 ) {
     for existing in registry.get_by_model(&card.id).iter() {
+        // The worker itself (every rank of it), replaced at its address: its
+        // old card is still registered while the new one is checked.
+        if existing.base_url() == worker_url {
+            continue;
+        }
         let Some(existing_card) = existing.metadata().spec.models.find(&card.id) else {
             continue;
         };
@@ -425,7 +430,7 @@ fn warn_on_conflicting_parser_overrides(
 /// Reject parser-override names the registries don't know: the legacy parsers', and, under
 /// `--parser symphony`, Symphony's tables (`regular::symphony::check_names`). A name whose
 /// factory is absent is not checked (parsers unused in that configuration).
-fn validate_parser_overrides(
+pub(super) fn validate_parser_overrides(
     card: &ModelCard,
     worker_url: &str,
     parser: ParserChoice,
@@ -436,15 +441,13 @@ fn validate_parser_overrides(
         tool: card.tool_parser.clone(),
         reasoning: card.reasoning_parser.clone(),
     };
-    let legacy_tool = match (&names.tool, tool_parser_factory) {
-        (Some(name), Some(factory)) => factory.registry().has_parser(name),
-        _ => true,
-    };
-    let legacy_reasoning = match (&names.reasoning, reasoning_parser_factory) {
-        (Some(name), Some(factory)) => factory.registry().has_parser(name),
-        _ => true,
-    };
-    check_names(parser, &names, legacy_tool, legacy_reasoning).map_err(|why| {
+    check_names(
+        parser,
+        &names,
+        tool_parser_factory,
+        reasoning_parser_factory,
+    )
+    .map_err(|why| {
         format!(
             "worker {worker_url} declares a parser override for model '{}' the gateway cannot \
              read with: {why}",
@@ -453,16 +456,77 @@ fn validate_parser_overrides(
     })
 }
 
-fn build_model_card(
+/// The card a worker is registered with: the operator's card for `model_id`,
+/// if the spec has one, completed from the labels, else one built from the
+/// labels alone; with the router's aliases for the model attached.
+pub(super) fn build_model_card(
     model_id: &str,
     config: &WorkerSpec,
     labels: &HashMap<String, String>,
     model_aliases: &HashMap<String, String>,
 ) -> ModelCard {
-    let user_provided = config.models.find(model_id).is_some();
-    let mut card = config
-        .models
-        .find(model_id)
+    let mut card = card_from_labels(config.models.find(model_id), model_id, labels);
+
+    // Router-level alias map (`--model-alias alias=canonical`): attach every
+    // alias that names this canonical model. This is the only alias entry
+    // point for automatically registered workers (startup URLs, Kubernetes
+    // service discovery) — the backend reports a single served model name, so
+    // it can never declare aliases itself. A user-provided card keeps its own
+    // aliases; duplicates are skipped so re-registration stays idempotent.
+    for (alias, canonical) in model_aliases {
+        if canonical == &card.id && alias != &card.id && !card.aliases.contains(alias) {
+            card.aliases.push(alias.clone());
+        }
+    }
+
+    card
+}
+
+/// The fields of a worker's model card that come from its labels, derived
+/// again for the labels it has now. A field whose value is what the labels
+/// before gave it (or that no label gave) follows the labels now, the way
+/// registration derived it; one the operator set by hand, on the card or over
+/// a label, stands. The id is the worker's identity in the registry and
+/// stays. Also the names of the fields that changed.
+pub(super) fn model_card_for_labels(
+    card: &ModelCard,
+    labels_before: &HashMap<String, String>,
+    labels_now: &HashMap<String, String>,
+) -> (ModelCard, Vec<&'static str>) {
+    let before = card_from_labels(None, &card.id, labels_before);
+    let now = card_from_labels(None, &card.id, labels_now);
+    let mut next = card.clone();
+    let mut changed = Vec::new();
+    macro_rules! follow {
+        ($($field:ident),+ $(,)?) => {$(
+            if next.$field == before.$field && next.$field != now.$field {
+                next.$field = now.$field;
+                changed.push(stringify!($field));
+            }
+        )+};
+    }
+    follow!(
+        model_type,
+        hf_model_type,
+        architectures,
+        id2label,
+        num_labels,
+        context_length,
+        tokenizer_path,
+        tool_parser,
+        reasoning_parser,
+    );
+    (next, changed)
+}
+
+/// `operator_card` completed from the labels, or a card from the labels alone.
+fn card_from_labels(
+    operator_card: Option<&ModelCard>,
+    model_id: &str,
+    labels: &HashMap<String, String>,
+) -> ModelCard {
+    let user_provided = operator_card.is_some();
+    let mut card = operator_card
         .cloned()
         .unwrap_or_else(|| ModelCard::new(model_id));
 
@@ -551,18 +615,6 @@ fn build_model_card(
         }
     } else if has_vision && !card.model_type.supports_vision() {
         card.model_type |= ModelType::VISION;
-    }
-
-    // Router-level alias map (`--model-alias alias=canonical`): attach every
-    // alias that names this canonical model. This is the only alias entry
-    // point for automatically registered workers (startup URLs, Kubernetes
-    // service discovery) — the backend reports a single served model name, so
-    // it can never declare aliases itself. A user-provided card keeps its own
-    // aliases; duplicates are skipped so re-registration stays idempotent.
-    for (alias, canonical) in model_aliases {
-        if canonical == &card.id && alias != &card.id && !card.aliases.contains(alias) {
-            card.aliases.push(alias.clone());
-        }
     }
 
     card
@@ -765,11 +817,8 @@ fn validate_zmq_worker_type(
 /// unexpanded worker stands for the whole engine and keeps the whole window.
 /// A window the operator set by hand on the worker (`set_by_hand`, the
 /// spec's own labels, which win the merge) is the operator's statement
-/// about each rank worker: it stays as set and is the rank worker's only
-/// window (a discovered window under the other name is dropped, since the
-/// reader prefers `max_num_seqs` to `max_running_requests` and would
-/// otherwise take the engine's figure over the operator's); only a
-/// discovered window is shared.
+/// about each rank worker and stays as set (`merge_labels` already made it
+/// the worker's only window); only a discovered window is shared.
 fn labels_for_rank(
     labels: &HashMap<String, String>,
     dp: Option<(usize, usize)>,
@@ -782,15 +831,12 @@ fn labels_for_rank(
     let Some(width) = attention_dp_width(&labels, size) else {
         return labels;
     };
+    // A hand-set window is the worker's only window (the merge dropped the
+    // discovered one): nothing to share.
     if WINDOW_LABELS
         .iter()
         .any(|key| set_by_hand.contains_key(*key))
     {
-        for key in WINDOW_LABELS {
-            if !set_by_hand.contains_key(key) {
-                labels.remove(key);
-            }
-        }
         return labels;
     }
     for key in WINDOW_LABELS {
@@ -806,10 +852,6 @@ fn labels_for_rank(
     }
     labels
 }
-
-/// The labels that name a worker's running window, in the order the reader
-/// prefers them.
-const WINDOW_LABELS: [&str; 2] = ["max_num_seqs", "max_running_requests"];
 
 /// How many attention-DP workers the engine's labels say its running window
 /// is split across, `None` for an engine that runs the whole window on every
@@ -1877,6 +1919,7 @@ mod rank_window_tests {
     use std::collections::HashMap;
 
     use super::labels_for_rank;
+    use crate::worker::worker::merge_labels;
 
     fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -1893,37 +1936,48 @@ mod rank_window_tests {
         labels_for_rank(engine, dp, &HashMap::new())
     }
 
-    /// A window the operator set by hand on the worker is the operator's
-    /// statement about each rank worker: it stays as set, while a
-    /// discovered window under the other name is dropped rather than
-    /// divided, so the reader's preference between the names cannot
-    /// override the operator's figure; the other labels ride along.
+    /// A window the operator set by hand on the worker is the worker's only
+    /// window, whichever name the operator used: the merge drops a
+    /// discovered window under the other name (the reader prefers
+    /// `max_num_seqs`, which would otherwise override the operator's
+    /// figure), on an attention-DP engine, a plain data-parallel one and an
+    /// unexpanded worker alike; the other labels merge as before, the
+    /// operator's on top.
     #[test]
-    fn a_window_the_operator_set_by_hand_stays_as_set() {
-        let by_hand = labels(&[("max_running_requests", "2048")]);
-        let engine = labels(&[
-            ("max_running_requests", "2048"),
-            ("max_num_seqs", "8192"),
-            ("enable_dp_attention", "true"),
-            ("dp_size", "8"),
+    fn a_window_the_operator_set_by_hand_is_the_workers_only_window() {
+        let by_hand = labels(&[("max_running_requests", "512"), ("served_model_name", "m")]);
+        let replicas = labels(&[
+            ("max_num_seqs", "256"),
+            ("dp_size", "4"),
+            ("served_model_name", "engine"),
         ]);
-        let rank = labels_for_rank(&engine, Some((3, 8)), &by_hand);
+        let merged = merge_labels(&replicas, &by_hand);
         assert_eq!(
-            rank.get("max_running_requests").map(String::as_str),
-            Some("2048")
+            merged,
+            labels(&[
+                ("max_running_requests", "512"),
+                ("dp_size", "4"),
+                ("served_model_name", "m"),
+            ])
         );
-        assert_eq!(rank.get("max_num_seqs"), None);
-        assert_eq!(rank.get("dp_size").map(String::as_str), Some("8"));
+        assert_eq!(labels_for_rank(&merged, Some((1, 4)), &by_hand), merged);
+        assert_eq!(labels_for_rank(&merged, None, &by_hand), merged);
 
         let by_hand = labels(&[("max_num_seqs", "512")]);
-        let engine = labels(&[
-            ("max_running_requests", "16384"),
-            ("max_num_seqs", "512"),
-            ("attn_dp_size", "8"),
-        ]);
-        let rank = labels_for_rank(&engine, Some((0, 8)), &by_hand);
+        let attention = labels(&[("max_running_requests", "16384"), ("attn_dp_size", "8")]);
+        let merged = merge_labels(&attention, &by_hand);
+        assert_eq!(merged.get("max_running_requests"), None);
+        let rank = labels_for_rank(&merged, Some((0, 8)), &by_hand);
         assert_eq!(rank.get("max_num_seqs").map(String::as_str), Some("512"));
-        assert_eq!(rank.get("max_running_requests"), None);
+
+        let nothing_by_hand = labels(&[("served_model_name", "m")]);
+        let both = labels(&[("max_running_requests", "2048"), ("max_num_seqs", "256")]);
+        let merged = merge_labels(&both, &nothing_by_hand);
+        assert_eq!(
+            merged.get("max_running_requests").map(String::as_str),
+            Some("2048")
+        );
+        assert_eq!(merged.get("max_num_seqs").map(String::as_str), Some("256"));
     }
 
     /// An engine that splits its running window across its attention-DP

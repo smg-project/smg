@@ -72,10 +72,14 @@ STARTUP_CEILING_SECS_ENV = "SMG_SGLANG_SERVICER_STARTUP_CEILING_SECS"
 # Set to 0/false/no/off to keep SGLang's KV event publisher off when the
 # launcher was given no --kv-events-config (see `default_kv_events_config`).
 KV_EVENTS_ENV = "SMG_SGLANG_SERVICER_KV_EVENTS"
-# What a launcher without --kv-events-config gets under the Rust servicer:
-# the ZMQ publisher, with SGLang's own defaults for the rest (the endpoint,
-# the topic; no replay socket).
-DEFAULT_KV_EVENTS_CONFIG = '{"publisher": "zmq"}'
+
+
+def default_kv_events_json(endpoint: str) -> str:
+    """What a launcher without --kv-events-config gets under the Rust servicer,
+    as SGLang's server args carry it (JSON text): the ZMQ publisher at
+    ``endpoint``, with SGLang's own defaults for the rest (the topic; no
+    replay socket)."""
+    return json.dumps({"publisher": "zmq", "endpoint": endpoint})
 
 
 def resolve_servicer_impl(args: Any = None, environ: Mapping[str, str] | None = None) -> str:
@@ -257,10 +261,16 @@ def default_kv_events_config(
     """Turn SGLang's KV event publisher on when the launcher was given no
     ``--kv-events-config``; returns the configuration applied, or None: the
     shared rule (``rust_lifecycle.apply_kv_events_default``) with
-    ``DEFAULT_KV_EVENTS_CONFIG``, applied to the server args before the facts
-    and the headless scheduler are built from them."""
+    :func:`default_kv_events_json` at a free port of this host, one per
+    scheduler (each publishes at the port after its predecessor's), applied
+    to the server args before the facts and the schedulers are built from
+    them."""
     return apply_kv_events_default(
-        server_args, DEFAULT_KV_EVENTS_CONFIG, env_name=KV_EVENTS_ENV, environ=environ
+        server_args,
+        default_kv_events_json,
+        env_name=KV_EVENTS_ENV,
+        environ=environ,
+        ranks=EngineConfigView(server_args).server_args.scheduler_count,
     )
 
 

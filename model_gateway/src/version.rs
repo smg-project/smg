@@ -51,11 +51,6 @@ Compiler:\n\
     )
 }
 
-/// Get version number only
-pub fn get_version() -> &'static str {
-    VERSION
-}
-
 /// Print the startup banner with braille art and key configuration info.
 ///
 /// Layout inspired by a serving engine's startup banner — art on the left,

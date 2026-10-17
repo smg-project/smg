@@ -15,8 +15,8 @@ use crate::routers::{
         client::GrpcClient,
         common::stages::{helpers, BuildStage},
         context::{
-            AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, ExecutionPlanKind,
-            PreparationOutput, RequestContext, RequestType,
+            stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan,
+            ExecutionPlanKind, PreparationOutput, RequestContext, RequestType,
         },
         proto_wrapper::ProtoGenerateRequest,
         spec::{HarmonyResponseSpec, ResponseSpec},
@@ -47,13 +47,10 @@ impl HarmonyRequestBuildingStage {
 impl BuildStage for HarmonyRequestBuildingStage {
     async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
         // Take preparation output (last consumer — worker_selection already ran)
-        let prep = ctx.state.preparation.take().ok_or_else(|| {
-            error!(
-                function = "HarmonyRequestBuildingStage::build",
-                "Preparation stage not completed"
-            );
-            error::internal_error("preparation_not_completed", "Preparation not completed")
-        })?;
+        let prep = stage_output(
+            ctx.state.preparation.take(),
+            "HarmonyRequestBuildingStage::build",
+        )?;
         let PreparationOutput::Harmony {
             token_ids,
             tool_constraints,
@@ -70,16 +67,10 @@ impl BuildStage for HarmonyRequestBuildingStage {
         };
 
         // Get clients
-        let clients = ctx.state.clients.as_ref().ok_or_else(|| {
-            error!(
-                function = "HarmonyRequestBuildingStage::build",
-                "Client acquisition stage not completed"
-            );
-            error::internal_error(
-                "client_acquisition_not_completed",
-                "Client acquisition not completed",
-            )
-        })?;
+        let clients = stage_output(
+            ctx.state.clients.as_ref(),
+            "HarmonyRequestBuildingStage::build",
+        )?;
         let builder_client = match clients {
             ClientSelection::Single { client } => client,
             ClientSelection::Disaggregated { prefill, .. } => prefill,

@@ -232,8 +232,15 @@ huggingface:
 # Auth Configuration
 # =============================================================================
 auth:
-  # -- API key authentication (passed via --api-key CLI flag)
+  # -- Shared API key the serving routes require. Written into a chart-managed
+  #    Secret and mounted into the router pod as a file the gateway reads
+  #    (--api-key-file); it is never put in the pod's arguments. Prefer
+  #    existingSecret for a key managed outside the chart's values.
   apiKey: ""
+  # -- Name of an existing Secret holding the API key, instead of apiKey
+  existingSecret: ""
+  # -- The key within that Secret (and the chart-managed one) holding the API key
+  apiKeySecretKey: "api-key"
 
   # -- Rate limiting
   rateLimitTokensPerSecond: -1  # -1 = disabled
@@ -246,13 +253,29 @@ history:
   backend: memory
 
   postgres:
-    url: ""                    # "postgresql://user:pass@host:5432/db"
+    # -- Connection URL, "postgresql://user:pass@host:5432/db". It carries the
+    #    database password, so it is written into a chart-managed Secret and
+    #    reaches the router as the SMG_POSTGRES_DB_URL environment variable;
+    #    it is never put in the pod's arguments. Prefer existingSecret for a
+    #    URL managed outside the chart's values.
+    url: ""
+    # -- Name of an existing Secret holding the URL, instead of url
+    existingSecret: ""
+    # -- The key within that Secret (and the chart-managed one) holding the URL
+    secretKey: "postgres-url"
     poolMax: 10
     # -- Deploy a PostgreSQL instance via sub-chart
     deploy: false
 
   redis:
-    url: ""                    # "redis://localhost:6379"
+    # -- Connection URL, "redis://:pass@host:6379/0", handled like the
+    #    PostgreSQL one: a chart-managed Secret or existingSecret, read by the
+    #    router from the SMG_REDIS_URL environment variable, never an argument
+    url: ""
+    # -- Name of an existing Secret holding the URL, instead of url
+    existingSecret: ""
+    # -- The key within that Secret (and the chart-managed one) holding the URL
+    secretKey: "redis-url"
     poolMax: 10
     # -- Deploy a Redis instance via sub-chart
     deploy: false

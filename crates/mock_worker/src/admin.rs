@@ -60,6 +60,7 @@ fn router(state: Arc<AdminState>) -> Router {
         .route("/admin/fault/{worker}/delay", post(fault_delay))
         .route("/admin/fault/{worker}/admit-delay", post(fault_admit_delay))
         .route("/admin/fault/{worker}/admit-rate", post(fault_admit_rate))
+        .route("/admin/fault/{worker}/cold-shape", post(fault_cold_shape))
         .route(
             "/admin/fault/{worker}/restart-publisher",
             post(fault_restart_publisher),
@@ -140,6 +141,7 @@ fn status_json(e: &Engine) -> Value {
         "delay_ms": s.delay_ms,
         "admit_delay_ms": s.admit_delay_ms,
         "admit_per_sec": s.admit_per_sec,
+        "cold_shape_ms": s.cold_shape_ms,
         "paused": s.paused,
         "generation": s.generation,
         "restarts": s.restarts,
@@ -382,6 +384,17 @@ async fn fault_admit_delay(
         Err(response) => return response,
     };
     apply(&worker, |e| e.fault_admit_delay_ms(ms))
+}
+
+async fn fault_cold_shape(
+    Path(worker): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let ms: u64 = match param(&q, "ms") {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    apply(&worker, |e| e.fault_cold_shape_ms(ms))
 }
 
 async fn fault_admit_rate(

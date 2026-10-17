@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::{Error, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokenizers::{
     decoders::DecoderWrapper,
     models::{bpe::BPE, ModelWrapper},
@@ -14,7 +14,7 @@ use tokenizers::{
     },
     processors::template::TemplateProcessing,
     tokenizer::{SplitDelimiterBehavior, Tokenizer as HfTokenizer},
-    AddedToken,
+    AddedToken, Model,
 };
 use tracing::debug;
 
@@ -32,7 +32,10 @@ use crate::{
         ChatTemplateOutput, DecodeStep, Decoder, Encoder, Encoding, IncrementalDecoder,
         PromptEncoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
     },
+    word_cache::{LateBoundModel, LoadingTokenizer, ModelView, TokenizerOf},
 };
+
+mod glm;
 
 #[derive(Debug, Clone, Copy)]
 enum Renderer {
@@ -68,6 +71,9 @@ pub struct HuggingFaceTokenizer {
     eos_token_ids: Vec<TokenIdType>,
     /// Which renderer applies chat templates for this model.
     renderer: Renderer,
+    /// Checkpoint identity and media policy resolved when binding the template.
+    glm: Option<glm::Checkpoint>,
+    media_handling: crate::traits::MediaHandling,
     /// What that renderer answers around a render when it has an encoder of
     /// its own ([`Renderer::profile`]), built once with it.
     profile: Option<RendererProfile>,
@@ -158,7 +164,7 @@ impl DirectEncoders {
     /// encoder, else none and `tokenizers` encodes. The choice is logged
     /// once, with the reasons the paths before it declined, and counted per
     /// path ([`encode_path::encode_path_loads`]).
-    fn choose(tokenizer: &HfTokenizer) -> Self {
+    fn choose<M: Model + ModelView + Serialize>(tokenizer: &TokenizerOf<M>) -> Self {
         #[cfg(feature = "tokenizers-v1")]
         let v1_declined = match crate::v1::V1Encoder::from_tokenizer(
             tokenizer,
@@ -183,7 +189,7 @@ impl DirectEncoders {
         // is worth a warning (the opt-in did not take where it could have);
         // any other model kind was never its business.
         #[cfg(feature = "tokenizers-v1")]
-        if matches!(tokenizer.get_model(), ModelWrapper::BPE(_)) {
+        if matches!(tokenizer.get_model().wrapper(), ModelWrapper::BPE(_)) {
             tracing::warn!(
                 path = %path,
                 v1_declined = %v1_declined,
@@ -253,7 +259,38 @@ impl HuggingFaceTokenizer {
         self.encode_path() == EncodePath::V1
     }
 
-    /// Create a tokenizer from a HuggingFace tokenizer JSON file
+    /// The `tokenizers` pipeline behind this tokenizer, as loaded: the
+    /// vocabulary and stages of `tokenizer.json`, with the post-processor
+    /// the configuration prescribes when `tokenizer_config.json` sets
+    /// `add_bos_token` or `add_eos_token` (the rule is on
+    /// [`Self::from_file`]). A cross-check of the crate's ids against the
+    /// `tokenizers` crate compares with this pipeline, which adds the same
+    /// special tokens on request, or with `add_special_tokens` off, where it
+    /// and `tokenizer.json` read alone agree.
+    pub fn tokenizers_pipeline(&self) -> &HfTokenizer {
+        &self.tokenizer
+    }
+
+    /// Create a tokenizer from a HuggingFace tokenizer JSON file.
+    ///
+    /// Special tokens on request: an encode with `add_special_tokens` set
+    /// adds what the checkpoint's configuration prescribes, not only what
+    /// `tokenizer.json` holds. When the sibling `tokenizer_config.json` sets
+    /// `add_bos_token` or `add_eos_token` to `true`, the loader replaces the
+    /// file's post-processor with the template `{bos} $A {eos}` (each end as
+    /// configured, when its token is in the vocabulary), the one the
+    /// `transformers` Llama-style fast tokenizer classes install at load
+    /// (`update_post_processor`), so the ids are those the serving engine's
+    /// tokenizer produces. A checkpoint whose `tokenizer.json` carries a
+    /// plain `ByteLevel` post-processor while its configuration says
+    /// `add_bos_token: true` therefore gets the configured BOS prepended on
+    /// request, where the `tokenizers` crate reading `tokenizer.json` alone
+    /// adds nothing; without the flag the ids are the file's in both.
+    /// Nothing changes unless one of the two is an explicit `true` (with
+    /// `add_bos_token` unset and `add_eos_token: true`, the BOS stays when
+    /// the file's post-processor already adds tokens). A cross-check against
+    /// the `tokenizers` crate compares with [`Self::tokenizers_pipeline`],
+    /// the same post-processor, or with the flag off.
     pub fn from_file(file_path: &str) -> Result<Self> {
         // Try to auto-discover chat template if not explicitly provided
         let path = Path::new(file_path);
@@ -263,19 +300,22 @@ impl HuggingFaceTokenizer {
         Self::from_file_with_chat_template(file_path, chat_template_path.as_deref())
     }
 
-    /// Create a tokenizer from a HuggingFace tokenizer JSON file with an optional chat template
+    /// Create a tokenizer from a HuggingFace tokenizer JSON file with an
+    /// optional chat template; the special-token rule of [`Self::from_file`]
+    /// applies.
     pub fn from_file_with_chat_template(
         file_path: &str,
         chat_template_path: Option<&str>,
     ) -> Result<Self> {
-        let tokenizer = HfTokenizer::from_file(file_path)
+        let tokenizer = LoadingTokenizer::from_file(file_path)
             .map_err(|e| Error::msg(format!("Failed to load tokenizer: {e}")))?;
         Self::from_built_tokenizer(tokenizer, Path::new(file_path), chat_template_path)
     }
 
     /// Create a Qwen2-compatible byte-level BPE tokenizer from a Hugging Face
     /// directory containing `vocab.json`, `merges.txt`, and
-    /// `tokenizer_config.json` but no `tokenizer.json`.
+    /// `tokenizer_config.json` but no `tokenizer.json`. The special-token
+    /// rule of [`Self::from_file`] applies to the configuration here too.
     pub fn from_vocab_and_merges_dir(dir: &Path) -> Result<Self> {
         let chat_template_path = crate::factory::discover_chat_template_in_dir(dir);
         Self::from_vocab_and_merges_dir_with_chat_template(dir, chat_template_path.as_deref())
@@ -294,7 +334,7 @@ impl HuggingFaceTokenizer {
         Self::from_built_tokenizer(tokenizer, &logical_tokenizer_path, chat_template_path)
     }
 
-    fn build_qwen2_bpe_tokenizer(dir: &Path) -> Result<HfTokenizer> {
+    fn build_qwen2_bpe_tokenizer(dir: &Path) -> Result<LoadingTokenizer> {
         let vocab_path = dir.join("vocab.json");
         let merges_path = dir.join("merges.txt");
         let config_path = dir.join("tokenizer_config.json");
@@ -336,7 +376,7 @@ impl HuggingFaceTokenizer {
             .files(vocab_path_str.to_string(), merges_path_str.to_string())
             .build()
             .map_err(|error| Error::msg(format!("Failed to build Qwen2 BPE model: {error}")))?;
-        let mut tokenizer = HfTokenizer::new(bpe);
+        let mut tokenizer = LoadingTokenizer::new(LateBoundModel::from(ModelWrapper::BPE(bpe)));
 
         tokenizer
             .with_normalizer(Some(NFC))
@@ -407,8 +447,9 @@ impl HuggingFaceTokenizer {
         Ok(tokenizer)
     }
 
+    /// Bind checkpoint metadata, the active template, and its cached renderer policy.
     fn from_built_tokenizer(
-        mut tokenizer: HfTokenizer,
+        mut tokenizer: LoadingTokenizer,
         tokenizer_path: &Path,
         chat_template_path: Option<&str>,
     ) -> Result<Self> {
@@ -433,8 +474,11 @@ impl HuggingFaceTokenizer {
             chat_template_str = load_chat_template_from_file(template_path)?;
         }
 
-        // Configure post_processor based on tokenizer_config.json (matches Python transformers)
-        // Only modify when at least one setting is explicitly true
+        // The configuration's special tokens on request (the rule is on
+        // `from_file`): an explicit `add_bos_token` / `add_eos_token` of
+        // true replaces the file's post-processor with the template the
+        // `transformers` Llama-style fast classes install at load
+        // (`update_post_processor`); nothing changes unless one is true.
         let needs_eos = add_eos_token == Some(true);
         let needs_bos = match add_bos_token {
             Some(true) => true,
@@ -472,9 +516,17 @@ impl HuggingFaceTokenizer {
             .unwrap_or(Renderer::Jinja);
 
         let encoders = DirectEncoders::choose(&tokenizer);
-        Self::bound_bpe_cache(&mut tokenizer, encoders.bpe_words_cached());
+        // The bound rides on the file's model into the built tokenizer: no
+        // copy of the model (see `word_cache`).
+        tokenizer.get_model().bound(encoders.bpe_words_cached());
+        let tokenizer = HfTokenizer::from(tokenizer);
         let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
         let byte_fallback_values = byte_fallback_values(&reverse_vocab, has_byte_fallback);
+        let chat_template = ChatTemplateState::new(chat_template_str)?;
+        let glm = tokenizer_path.parent().and_then(glm::Checkpoint::load);
+        let media_handling = glm.as_ref().map_or_else(Default::default, |_| {
+            glm::Checkpoint::media_handling(&chat_template)
+        });
         Ok(HuggingFaceTokenizer {
             byte_level: ByteLevelTable::build(&tokenizer),
             pieces: PieceTable::build(&tokenizer),
@@ -485,7 +537,9 @@ impl HuggingFaceTokenizer {
             special_tokens,
             vocab,
             reverse_vocab,
-            chat_template: ChatTemplateState::new(chat_template_str)?,
+            chat_template,
+            glm,
+            media_handling,
             response_template,
             eos_token_ids,
             profile: renderer.profile(),
@@ -541,7 +595,7 @@ impl HuggingFaceTokenizer {
     }
 
     /// Check if the tokenizer's post_processor adds special tokens (e.g., BOS)
-    fn tokenizer_adds_special_tokens(tokenizer: &HfTokenizer) -> bool {
+    fn tokenizer_adds_special_tokens<M: Model>(tokenizer: &TokenizerOf<M>) -> bool {
         tokenizer
             .encode("", true)
             .map(|enc| !enc.get_ids().is_empty())
@@ -596,10 +650,15 @@ impl HuggingFaceTokenizer {
     /// fills first-come and never evicts, so a thread keeps the first
     /// thousand distinct words it sees, which in practice catches the
     /// frequent ones.
-    const BPE_WORDS_CACHED_PER_THREAD: usize = 1024;
+    pub(crate) const BPE_WORDS_CACHED_PER_THREAD: usize = 1024;
 
-    /// Sizes the per-thread word cache of a BPE model to `words`
-    /// ([`DirectEncoders::bpe_words_cached`]); other model kinds have none.
+    /// Sizes the per-thread word cache of a built tokenizer's BPE model to
+    /// `words` ([`DirectEncoders::bpe_words_cached`]); other model kinds have
+    /// none. A built tokenizer hands out its model by shared reference only,
+    /// so this installs a copy of the model with the bound: the price of a
+    /// tokenizer handed over built ([`Self::from_tokenizer`]). The loaders
+    /// read a file into a [`LoadingTokenizer`] and bound its model in place
+    /// instead (see `word_cache`).
     fn bound_bpe_cache(tokenizer: &mut HfTokenizer, words: usize) {
         let bounded = match tokenizer.get_model() {
             ModelWrapper::BPE(bpe) => {
@@ -641,6 +700,8 @@ impl HuggingFaceTokenizer {
             response_template: None,
             eos_token_ids: Vec::new(), // No directory path in from_tokenizer
             renderer: Renderer::Jinja,
+            glm: None,
+            media_handling: Default::default(),
             profile: None,
             has_byte_fallback,
             byte_fallback_values,
@@ -652,8 +713,8 @@ impl HuggingFaceTokenizer {
     /// Prefers explicit values from `tokenizer_config.json` (e.g., `"bos_token": "<|begin_of_text|>"`)
     /// over pattern matching against the vocabulary, since models like Llama 4 use non-standard
     /// token names that aren't in the hardcoded pattern list.
-    fn extract_special_tokens(
-        tokenizer: &HfTokenizer,
+    fn extract_special_tokens<M: Model>(
+        tokenizer: &TokenizerOf<M>,
         config_tokens: &ConfigTokens,
     ) -> SpecialTokens {
         // Get vocab with special tokens included (added_tokens like <|im_start|>)
@@ -1432,14 +1493,18 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         )
     }
 
+    /// Combine native profiles with checkpoint-specific Jinja media handling.
     fn renderer_capabilities(&self) -> crate::traits::RendererCapabilities {
         // A renderer with an encoder of its own answers from its profile; the
         // Jinja renderer continues a trailing assistant message the way
         // transformers' `continue_final_message` does.
-        self.profile
-            .map_or(RendererProfile::TEMPLATE_CAPABILITIES, |profile| {
-                profile.capabilities
-            })
+        self.profile.map_or_else(
+            || crate::traits::RendererCapabilities {
+                media_handling: self.media_handling,
+                ..RendererProfile::TEMPLATE_CAPABILITIES
+            },
+            |profile| profile.capabilities,
+        )
     }
 
     fn native_thinking_mode(
@@ -1452,8 +1517,13 @@ impl TokenizerTrait for HuggingFaceTokenizer {
             .map(|resolve| resolve(template_kwargs, thinking))
     }
 
+    /// Refresh media handling only after a replacement template compiles successfully.
     fn set_chat_template(&mut self, template: String) -> Result<()> {
-        self.chat_template.set(template)
+        self.chat_template.set(template)?;
+        self.media_handling = self.glm.as_ref().map_or_else(Default::default, |_| {
+            glm::Checkpoint::media_handling(&self.chat_template)
+        });
+        Ok(())
     }
 }
 

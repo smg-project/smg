@@ -11,7 +11,7 @@ use axum::response::Response;
 use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
-    traits::{PromptEncoding, RendererCapabilities, Tokenizer},
+    traits::{MediaHandling, PromptEncoding, RendererCapabilities, Tokenizer},
 };
 use openai_protocol::{
     common::{Tool as ChatTool, ToolChoice as ChatToolChoice},
@@ -153,9 +153,19 @@ pub(crate) fn process_messages_prompt(
         transformed_messages.insert(0, json!({"role": "system", "content": system_text}));
     }
 
+    // Step 2b: a renderer whose reference writes no turn for a system
+    // message past the leading run gets the ones sent inside `messages[]`
+    // after it as user turns at their positions; the leading run (the
+    // top-level system prompt and any system messages that open the array)
+    // is the system prompt and stays.
+    let capabilities = tokenizer.renderer_capabilities();
+    if capabilities.leading_system_only {
+        system_messages_after_the_first_as_user_turns(&mut transformed_messages);
+    }
+
     // Step 3: Process tool call arguments in assistant messages (reuse from
     // chat_utils), unless the renderer parses them itself as written.
-    if !tokenizer.renderer_capabilities().raw_tool_call_arguments {
+    if !capabilities.raw_tool_call_arguments {
         chat_utils::process_tool_call_arguments(&mut transformed_messages)?;
     }
 
@@ -314,6 +324,12 @@ pub(crate) async fn resolve_messages_media(
     tokenizer: &dyn Tokenizer,
     messages: &[InputMessage],
 ) -> Result<MessagesMedia, Response> {
+    if tokenizer.renderer_capabilities().media_handling == MediaHandling::TemplateText {
+        return Ok(MessagesMedia {
+            media_order: MediaPartOrder::Authored,
+            media: None,
+        });
+    }
     let tokenizer_entry = components
         .tokenizer_registry
         .get_by_name(model_id)
@@ -483,7 +499,10 @@ pub(crate) fn process_message_content_format(
                 // A `system`-role message in `messages[]` (e.g. from Claude Code) is
                 // forwarded in place, preserving its position in the conversation so
                 // inline-`system` chat templates render it where it was sent.
-                // See https://github.com/smg-project/smg/issues/1795
+                // See https://github.com/smg-project/smg/issues/1795. A renderer
+                // that writes no turn for a system message past the leading run
+                // gets it as a user turn there instead, once the system prompt is
+                // in (`system_messages_after_the_first_as_user_turns`).
                 messages::Role::System => {
                     result.push(convert_system_message(&message.content));
                 }
@@ -508,6 +527,28 @@ fn convert_system_message(content: &InputContent) -> Value {
             .join("\n"),
     };
     json!({"role": "system", "content": text})
+}
+
+/// For a renderer whose reference writes no turn for a system message after
+/// the first ([`RendererCapabilities::leading_system_only`]): every `system`
+/// message past the leading run becomes a user turn at its position. A
+/// coding agent sends its environment block and its notes as `system`-role
+/// messages inside `messages[]`, after tool results too; such a renderer
+/// would write the message as bare text with no role marker and, for one
+/// that ends the conversation, no assistant header, and the model answers
+/// an empty turn. As a user turn the text keeps its place and the header
+/// follows it, the way the family's newer encoder renders a mid-conversation
+/// system message. The leading run stays: it is the system prompt, which
+/// every renderer writes.
+fn system_messages_after_the_first_as_user_turns(messages: &mut [Value]) {
+    let mut leading_run = true;
+    for message in messages.iter_mut() {
+        let is_system = message.get("role").and_then(Value::as_str) == Some("system");
+        if is_system && !leading_run {
+            message["role"] = Value::String("user".to_owned());
+        }
+        leading_run &= is_system;
+    }
 }
 
 /// Convert a user message content to JSON values.
@@ -806,11 +847,52 @@ pub(crate) fn anthropic_tool_use_id(id: &str) -> String {
     }
 }
 
+/// Empties the text of the thinking blocks in `content`, as a
+/// `thinking.display` of `omitted` returns them: the blocks and their
+/// signature stay where they are, the reasoning does not leave the gateway
+/// (see `ThinkingDisplay::returns_text`).
+pub(crate) fn omit_thinking_text(content: &mut [messages::ContentBlock]) {
+    for block in content {
+        if let messages::ContentBlock::Thinking { thinking, .. } = block {
+            thinking.clear();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use messages::{InputMessage, Role, TextBlock};
 
     use super::*;
+
+    /// `omit_thinking_text` empties the thinking blocks' text and touches
+    /// nothing else: the blocks stay, with their signature, in their place.
+    #[test]
+    fn omit_thinking_text_keeps_the_blocks_and_drops_their_text() {
+        let mut content = vec![
+            messages::ContentBlock::Thinking {
+                thinking: "plan".to_string(),
+                signature: "sig".to_string(),
+            },
+            messages::ContentBlock::Text {
+                text: "Hello".to_string(),
+                citations: None,
+            },
+            messages::ContentBlock::Thinking {
+                thinking: "more".to_string(),
+                signature: String::new(),
+            },
+        ];
+        omit_thinking_text(&mut content);
+        assert_eq!(
+            serde_json::to_value(&content).unwrap(),
+            json!([
+                {"type": "thinking", "thinking": "", "signature": "sig"},
+                {"type": "text", "text": "Hello"},
+                {"type": "thinking", "thinking": "", "signature": ""},
+            ])
+        );
+    }
 
     #[test]
     fn anthropic_tool_use_id_swaps_standard_prefix() {
@@ -1741,6 +1823,177 @@ mod tests {
         assert_eq!(
             render(&request, &tokenizer),
             "user: Hello\nassistant: \nassistant: "
+        );
+    }
+
+    /// The coding agent's shape: its environment block after the first user
+    /// turn and a note after every tool result, both `system`-role messages
+    /// inside `messages[]`, beside a top-level system prompt.
+    fn coding_agent_request() -> CreateMessageRequest {
+        serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 2048,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "system": "You are a coding assistant.",
+            "messages": [
+                {"role": "user", "content": "Fix the failing test."},
+                {"role": "system", "content": "# Environment\nworking directory: /work"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "Run the suite first.", "signature": "sig"},
+                    {"type": "tool_use", "id": "toolu_01", "name": "Bash",
+                     "input": {"command": "pytest -q"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_01", "content": "1 failed, 14 passed"}
+                ]},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "<total_tokens>14994851 tokens left</total_tokens>",
+                     "cache_control": {"type": "ephemeral"}}
+                ]}
+            ]
+        }))
+        .expect("the request")
+    }
+
+    /// A `system`-role message inside `messages[]` is forwarded in place
+    /// unless the renderer writes no turn for a system message after the
+    /// first: then every one past the leading run is a user turn at its
+    /// position, so the prompt keeps its assistant header after the note
+    /// that ends the conversation and before the historical assistant turn.
+    #[test]
+    fn system_messages_after_the_first_are_user_turns_for_a_leading_system_only_renderer() {
+        let request = coding_agent_request();
+        let in_place = llm_tokenizer::MockTokenizer::new();
+        assert_eq!(
+            render(&request, &in_place),
+            "system: You are a coding assistant.\n\
+             user: Fix the failing test.\n\
+             system: # Environment\nworking directory: /work\n\
+             assistant: \n\
+             tool: 1 failed, 14 passed\n\
+             system: <total_tokens>14994851 tokens left</total_tokens>\n\
+             assistant: "
+        );
+        let leading_system_only =
+            llm_tokenizer::MockTokenizer::new().with_renderer_capabilities(RendererCapabilities {
+                leading_system_only: true,
+                ..RendererCapabilities::default()
+            });
+        assert_eq!(
+            render(&request, &leading_system_only),
+            "system: You are a coding assistant.\n\
+             user: Fix the failing test.\n\
+             user: # Environment\nworking directory: /work\n\
+             assistant: \n\
+             tool: 1 failed, 14 passed\n\
+             user: <total_tokens>14994851 tokens left</total_tokens>\n\
+             assistant: "
+        );
+    }
+
+    /// Without a top-level system prompt a leading `system` message is the
+    /// system prompt, which every renderer writes: it stays where it is.
+    #[test]
+    fn a_leading_system_message_stays_the_system_prompt_for_every_renderer() {
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 8,
+            "messages": [
+                {"role": "system", "content": "Be terse."},
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": "Note"}
+            ]
+        }))
+        .expect("the request");
+        let leading_system_only =
+            llm_tokenizer::MockTokenizer::new().with_renderer_capabilities(RendererCapabilities {
+                leading_system_only: true,
+                ..RendererCapabilities::default()
+            });
+        assert_eq!(
+            render(&request, &leading_system_only),
+            "system: Be terse.\nuser: Hi\nuser: Note\nassistant: "
+        );
+    }
+
+    /// With a top-level system prompt and a `system` message opening the
+    /// array, both are the leading run: the system prompt, which stays as it
+    /// is for every renderer; only the system messages past it become user
+    /// turns for a leading-system-only renderer.
+    #[test]
+    fn a_top_level_system_and_a_leading_system_message_are_both_the_system_prompt() {
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 8,
+            "system": "Be terse.",
+            "messages": [
+                {"role": "system", "content": "# Environment"},
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": "Note"}
+            ]
+        }))
+        .expect("the request");
+        let leading_system_only =
+            llm_tokenizer::MockTokenizer::new().with_renderer_capabilities(RendererCapabilities {
+                leading_system_only: true,
+                ..RendererCapabilities::default()
+            });
+        assert_eq!(
+            render(&request, &leading_system_only),
+            "system: Be terse.\nsystem: # Environment\nuser: Hi\nuser: Note\nassistant: "
+        );
+        assert_eq!(
+            render(&request, &llm_tokenizer::MockTokenizer::new()),
+            "system: Be terse.\nsystem: # Environment\nuser: Hi\nsystem: Note\nassistant: "
+        );
+    }
+
+    /// A model directory the DeepSeek V4 renderer is chosen for, with a
+    /// tokenizer that loads (the render never encodes).
+    fn deepseek_v4_stand_in_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("tokenizer.json"),
+            r#"{"version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+                "normalizer": null, "pre_tokenizer": {"type": "Whitespace"},
+                "post_processor": null, "decoder": null,
+                "model": {"type": "BPE", "vocab": {"hello": 0}, "merges": []}}"#,
+        )
+        .expect("tokenizer.json");
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4"}"#,
+        )
+        .expect("config.json");
+        dir
+    }
+
+    /// Through the DeepSeek V4 renderer the coding agent's notes are user
+    /// turns the encoder merges into the turn before them: the prompt ends
+    /// with the note, the assistant header and the open thought, where the
+    /// in-place system message left it ending with the bare note; and the
+    /// historical assistant turn has its header after the environment block.
+    /// The prompt is rendered before the parser is chosen, so every parser
+    /// reads this one.
+    #[test]
+    fn the_deepseek_v4_renderer_gets_the_coding_agents_notes_as_user_turns() {
+        let dir = deepseek_v4_stand_in_dir();
+        let tok = llm_tokenizer::create_tokenizer(dir.path().to_str().expect("utf-8 path"))
+            .expect("tokenizer");
+        assert!(tok.renderer_capabilities().leading_system_only);
+        let text = render(&coding_agent_request(), tok.as_ref());
+        assert!(
+            text.ends_with(
+                "<tool_result>1 failed, 14 passed</tool_result>\n\n\
+                 <total_tokens>14994851 tokens left</total_tokens><｜Assistant｜><think>"
+            ),
+            "{text:?}"
+        );
+        assert!(
+            text.contains(
+                "<｜User｜>Fix the failing test.\n\n# Environment\nworking directory: /work<｜Assistant｜>"
+            ),
+            "{text:?}"
         );
     }
 

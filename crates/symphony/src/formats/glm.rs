@@ -72,8 +72,69 @@ mod tests {
         "{\"size\": \"large\", \"temperature\": \"hot\"}</arg_value></tool_call>"
     );
 
+    /// The tools of an agentic turn, as a coding agent declares them: strings, numbers, an array.
+    fn coding_tools() -> Declared {
+        let tool = |name: &str, parameters: serde_json::Value| Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: name.to_string(),
+                description: None,
+                parameters,
+                strict: None,
+                extra: Default::default(),
+            },
+        };
+        Declared::of(&[
+            tool(
+                "Read",
+                value!({"type": "object", "properties": {
+                    "file_path": {"type": "string"},
+                    "offset": {"type": "number"},
+                    "limit": {"type": "number"},
+                }}),
+            ),
+            tool(
+                "Bash",
+                value!({"type": "object", "properties": {"command": {"type": "string"}}}),
+            ),
+            tool(
+                "Ls",
+                value!({"type": "object", "properties": {"path": {"type": "string"}}}),
+            ),
+            tool(
+                "TodoWrite",
+                value!({"type": "object", "properties": {"todos": {"type": "array"}}}),
+            ),
+        ])
+    }
+
+    /// The assistant turns the model's chat template renders for a coding agent's requests,
+    /// after the prompt's `<think>`: a thought, content and three calls (strings and numbers), and
+    /// a thought and two calls with no content (a string and an array). What the template writes
+    /// for a request's `tool_calls` is what the table reads back.
+    const AGENT_TURN: &str = concat!(
+        "The user wants three things at once.</think>I'll read both files and check the status.",
+        "<tool_call>Read<arg_key>file_path</arg_key><arg_value>/workspace/cli/help.go</arg_value>",
+        "</tool_call><tool_call>Read<arg_key>file_path</arg_key>",
+        "<arg_value>/workspace/cli/reproduce_issue_test.go</arg_value><arg_key>limit</arg_key>",
+        "<arg_value>120</arg_value><arg_key>offset</arg_key><arg_value>85</arg_value></tool_call>",
+        "<tool_call>Bash<arg_key>command</arg_key><arg_value>git status --short</arg_value>",
+        "</tool_call>"
+    );
+    const AGENT_TURN_WITHOUT_CONTENT: &str = concat!(
+        "Two calls, no prose.</think><tool_call>Ls<arg_key>path</arg_key>",
+        "<arg_value>/workspace/cli</arg_value></tool_call><tool_call>TodoWrite",
+        "<arg_key>todos</arg_key>",
+        "<arg_value>[{\"content\": \"Fix help.go\", \"status\": \"in_progress\"}]</arg_value>",
+        "</tool_call>"
+    );
+
     fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
-        let mut parser = Engine::new(glm(), declared());
+        run_with(declared(), prompt, pieces)
+    }
+
+    fn run_with(declared: Declared, prompt: &str, pieces: &[&str]) -> Vec<Event> {
+        let mut parser = Engine::new(glm(), declared);
         let mut out = Events::new();
         parser
             .feed(
@@ -138,6 +199,30 @@ mod tests {
             .iter()
             .filter_map(|event| match event {
                 Event::Content(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn reasoning(events: &[Event]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Reasoning(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Each call's name and its arguments as a value, in order.
+    fn calls_of(events: &[Event]) -> Vec<(String, serde_json::Value)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallStart { index, name, .. } => Some((
+                    name.clone(),
+                    serde_json::from_str(&arguments_of(events, *index)).expect("arguments"),
+                )),
                 _ => None,
             })
             .collect()
@@ -289,6 +374,121 @@ mod tests {
                 "{earlier:?}"
             );
             assert_eq!(content(&events), "An answer.", "{earlier:?}");
+        }
+    }
+
+    #[test]
+    fn the_templates_agent_turns_read_back_as_the_calls_that_rendered_them() {
+        let events = run_with(coding_tools(), PROMPT, &[AGENT_TURN]);
+        assert_eq!(bytes(&events), AGENT_TURN);
+        assert_eq!(reasoning(&events), "The user wants three things at once.");
+        assert_eq!(
+            content(&events),
+            "I'll read both files and check the status."
+        );
+        assert_eq!(
+            calls_of(&events),
+            [
+                (
+                    "Read".to_string(),
+                    value!({"file_path": "/workspace/cli/help.go"})
+                ),
+                (
+                    "Read".to_string(),
+                    value!({"file_path": "/workspace/cli/reproduce_issue_test.go", "limit": 120, "offset": 85})
+                ),
+                (
+                    "Bash".to_string(),
+                    value!({"command": "git status --short"})
+                ),
+            ]
+        );
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 3, .. })
+        ));
+        let events = run_with(coding_tools(), PROMPT, &[AGENT_TURN_WITHOUT_CONTENT]);
+        assert_eq!(bytes(&events), AGENT_TURN_WITHOUT_CONTENT);
+        assert_eq!(reasoning(&events), "Two calls, no prose.");
+        assert_eq!(content(&events), "");
+        assert_eq!(
+            calls_of(&events),
+            [
+                ("Ls".to_string(), value!({"path": "/workspace/cli"})),
+                (
+                    "TodoWrite".to_string(),
+                    value!({"todos": [{"content": "Fix help.go", "status": "in_progress"}]})
+                ),
+            ]
+        );
+        // Every two-way split of the three-call turn says the same.
+        let whole = calls_of(&run_with(coding_tools(), PROMPT, &[AGENT_TURN]));
+        for cut in 1..AGENT_TURN.len() {
+            let events = run_with(
+                coding_tools(),
+                PROMPT,
+                &[&AGENT_TURN[..cut], &AGENT_TURN[cut..]],
+            );
+            assert_eq!(bytes(&events), AGENT_TURN, "cut at {cut}");
+            assert_eq!(calls_of(&events), whole, "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn a_call_written_as_python_where_the_name_goes_names_no_call() {
+        // On agentic turns the model sometimes writes a call as Python inside the block's markers,
+        // whole, or cut short by a tag with the rest of the block after it. Neither is a name: the
+        // block names no call and its bytes come back, and the well-formed call after it is the
+        // turn's one call.
+        let output = concat!(
+            "</think>I'll read both files.",
+            "<tool_call>Read(filed_path</arg_key><arg_value>/workspace/reproduce_issue.java",
+            "</arg_value>></tool_call>",
+            "<tool_call>Bash<arg_key>command</arg_key><arg_value>ls -la /workspace</arg_value>",
+            "</tool_call>"
+        );
+        let events = run_with(coding_tools(), PROMPT, &[output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(
+            calls_of(&events),
+            [("Bash".to_string(), value!({"command": "ls -la /workspace"}))]
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, .. } if text.text == "Read(filed_path"
+        )));
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 1, .. })
+        ));
+        let output =
+            "</think>Let me look:<tool_call>Read(file_path=\"/workspace/x.java\")</tool_call>";
+        let events = run_with(coding_tools(), PROMPT, &[output]);
+        assert_eq!(bytes(&events), output);
+        assert!(calls_of(&events).is_empty());
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 0, .. })
+        ));
+        // A whole pythonic call with a number and one with no arguments: no quote refuses
+        // these, only the parentheses rule does.
+        for output in [
+            "</think>Let me look:<tool_call>Read(offset=10)</tool_call>",
+            "</think>Let me look:<tool_call>Ls()</tool_call>",
+        ] {
+            let events = run_with(coding_tools(), PROMPT, &[output]);
+            assert_eq!(bytes(&events), output);
+            assert!(calls_of(&events).is_empty(), "{output}");
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, Event::Malformed { .. })),
+                "{output}"
+            );
+            assert!(
+                matches!(events.last(), Some(Event::Finish { tool_calls: 0, .. })),
+                "{output}"
+            );
         }
     }
 }

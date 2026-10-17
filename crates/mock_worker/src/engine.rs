@@ -585,6 +585,11 @@ struct Faults {
     cut_total: Arc<AtomicU64>,
     /// Requests held back by the fault's stall.
     stalled_total: AtomicU64,
+    /// How long the engine holds before the pass that first runs a prompt
+    /// longer than any it has run, in ms (0 = none): a kernel built for a
+    /// new shape, during which the engine produces nothing while its load
+    /// record keeps flowing and its silence grows.
+    cold_shape_ms: AtomicU64,
 }
 
 /// A request fault the admin API arms: what the worker answers instead of
@@ -643,6 +648,7 @@ pub(crate) struct FaultStatus {
     pub failed_total: u64,
     pub cut_total: u64,
     pub stalled_total: u64,
+    pub cold_shape_ms: u64,
 }
 
 /// What the engine itself would serve from cache for a prompt right now.
@@ -666,6 +672,7 @@ pub(crate) struct Published {
 /// Messages into the engine actor.
 enum EngineMsg {
     Request(NewRequest),
+    Abort(String),
     /// Drop every cached block and announce `AllBlocksCleared` (an engine
     /// restart, as far as the gateway's index is concerned).
     Reset,
@@ -813,6 +820,11 @@ impl Engine {
         let _ = self.tx.send(EngineMsg::Request(req));
     }
 
+    /// Abort a queued or running request. Unknown or completed IDs are harmless.
+    pub(crate) fn abort(&self, request_id: String) {
+        let _ = self.tx.send(EngineMsg::Abort(request_id));
+    }
+
     /// Clear the prefix cache and announce it (`AllBlocksCleared`).
     pub fn reset(&self) {
         let _ = self.tx.send(EngineMsg::Reset);
@@ -839,6 +851,18 @@ impl Engine {
         self.shared
             .faults
             .admit_delay_ms
+            .store(ms, Ordering::Relaxed);
+    }
+
+    /// Hold the engine `ms` milliseconds before the pass that first runs a
+    /// prompt longer than any it has run (0 clears): a kernel built for a
+    /// new shape, the engine producing nothing meanwhile while its load
+    /// record flows and its silence grows. Paid once per new longest prompt;
+    /// the prompts run before the hook was set count as shapes run.
+    pub(crate) fn fault_cold_shape_ms(&self, ms: u64) {
+        self.shared
+            .faults
+            .cold_shape_ms
             .store(ms, Ordering::Relaxed);
     }
 
@@ -997,6 +1021,7 @@ impl Engine {
             failed_total: f.failed_total.load(Ordering::Relaxed),
             cut_total: f.cut_total.load(Ordering::Relaxed),
             stalled_total: f.stalled_total.load(Ordering::Relaxed),
+            cold_shape_ms: f.cold_shape_ms.load(Ordering::Relaxed),
         }
     }
 
@@ -1152,6 +1177,14 @@ async fn run(
             }
         }
 
+        // A prompt longer than any pass has run: an engine building a kernel
+        // for the new shape holds its passes first, producing nothing while
+        // its load record flows and its silence grows (the cold-shape hook).
+        let cold_shape_ms = shared.faults.cold_shape_ms.load(Ordering::Relaxed);
+        if let Some(hold) = state.cold_shape_hold(cold_shape_ms) {
+            tokio::time::sleep(hold).await;
+        }
+
         let step = state.step(&params);
         if step.duration > Duration::ZERO {
             tokio::time::sleep(step.duration).await;
@@ -1250,8 +1283,8 @@ async fn deliver(
 }
 
 /// Apply one actor message: enqueue a request (scoring the fleet oracle at
-/// arrival, before this engine's own cache changes), reset the cache, or
-/// restart the publisher.
+/// arrival, before this engine's own cache changes), abort a request, reset
+/// the cache, or restart the publisher.
 fn handle_msg(
     state: &mut SchedulerState,
     shared: &Arc<EngineShared>,
@@ -1286,6 +1319,19 @@ fn handle_msg(
             }
             state.enqueue_with_oracle(req, params, oracle_tokens);
             shared.in_flight.store(state.in_flight(), Ordering::Relaxed);
+        }
+        EngineMsg::Abort(request_id) => {
+            if let Some((tx, event)) = state.abort(&request_id, params) {
+                shared.in_flight.store(state.in_flight(), Ordering::Relaxed);
+                *shared.snapshot.write().unwrap_or_else(|p| p.into_inner()) =
+                    state.snapshot(params);
+                if params.request_overhead_ms > 0.0 {
+                    // Keep the terminal event behind tokens awaiting delivery.
+                    let _ = shared.deliver_tx.send((Instant::now(), tx, event));
+                } else {
+                    let _ = tx.send(event);
+                }
+            }
         }
         EngineMsg::Reset => state.reset(),
         EngineMsg::RestartPublisher(ack) => {
@@ -1531,6 +1577,9 @@ struct SchedulerState {
     preemptions: u64,
     /// A reset was requested; the next pass clears the cache and says so.
     reset_pending: bool,
+    /// The longest prompt any pass has run: the shapes the engine has built
+    /// for (the cold-shape hook holds before a longer one).
+    longest_run: u32,
 }
 
 /// The result of one pass.
@@ -1574,7 +1623,26 @@ impl SchedulerState {
             cache_hit_ewma: 0.0,
             preemptions: 0,
             reset_pending: false,
+            longest_run: 0,
         }
+    }
+
+    /// The hold before this pass when a queued prompt is longer than any
+    /// pass has run and the cold-shape hook is set to `hold_ms`: the new
+    /// longest counts as run from here on, so the hold is paid once per new
+    /// longest prompt, and the shapes run while the hook was off are run.
+    fn cold_shape_hold(&mut self, hold_ms: u64) -> Option<Duration> {
+        let longest_queued = self
+            .waiting
+            .iter()
+            .map(|w| w.prompt_tokens)
+            .max()
+            .unwrap_or(0);
+        if longest_queued <= self.longest_run {
+            return None;
+        }
+        self.longest_run = longest_queued;
+        (hold_ms > 0).then(|| Duration::from_millis(hold_ms))
     }
 
     /// Ask the next pass to clear the cache and announce `AllBlocksCleared`.
@@ -1594,6 +1662,37 @@ impl SchedulerState {
     /// Requests the engine holds: running or queued.
     fn in_flight(&self) -> usize {
         self.running.len() + self.waiting.len()
+    }
+
+    fn abort(
+        &mut self,
+        request_id: &str,
+        p: &EngineParams,
+    ) -> Option<(mpsc::UnboundedSender<GenEvent>, GenEvent)> {
+        let (events, prompt_tokens, completion_tokens, cached_tokens) = if let Some(index) =
+            self.running.iter().position(|r| r.request_id == request_id)
+        {
+            let r = self.running.remove(index);
+            self.release(&r, p);
+            (r.events, r.prompt_tokens, r.generated, r.cached_tokens)
+        } else {
+            let index = self
+                .waiting
+                .iter()
+                .position(|w| w.req.request_id == request_id)?;
+            let w = self.waiting.remove(index)?;
+            let (generated, cached) = w.resume.map_or((0, 0), |r| (r.generated, r.cached_tokens));
+            (w.req.events, w.prompt_tokens, generated, cached)
+        };
+        Some((
+            events,
+            GenEvent::Done {
+                finish_reason: "abort",
+                prompt_tokens,
+                completion_tokens,
+                cached_tokens,
+            },
+        ))
     }
 
     /// Queue a request with no oracle information (tests).
@@ -2339,6 +2438,64 @@ mod tests {
             },
             rx,
         )
+    }
+
+    #[test]
+    fn abort_releases_prefill_and_decode_kv_without_clearing_the_cache() {
+        for prefix_cache in [false, true] {
+            for prompt_len in [4, 12] {
+                let p = EngineParams {
+                    block_size: 4,
+                    max_batched_tokens: 5,
+                    kv_capacity_tokens: 32,
+                    prefix_cache,
+                    ..EngineParams::default()
+                };
+                let mut st = SchedulerState::new();
+                let (r, _rx) = req("cancelled", vec![7; prompt_len], 100);
+                st.enqueue(r, &p);
+                st.step(&p);
+                assert_eq!(st.pool.allocated, 2, "a full block and a partial tail");
+                let cached = st.pool.cached();
+
+                let (_, event) = st.abort("cancelled", &p).expect("the request exists");
+                assert!(matches!(
+                    event,
+                    GenEvent::Done {
+                        finish_reason: "abort",
+                        ..
+                    }
+                ));
+                assert!(st.is_idle());
+                assert_eq!(st.snapshot(&p).num_used_tokens, 0);
+                assert_eq!(st.pool.cached(), cached, "cached prefixes remain reusable");
+                assert_eq!(st.pool.allocated, st.pool.free_lru.len() as u64);
+                assert!(st.pool.fits(p.capacity_blocks(), p.capacity_blocks()));
+                assert!(st.abort("cancelled", &p).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn abort_preserves_usage_for_a_preempted_request() {
+        let p = EngineParams::default();
+        let mut st = SchedulerState::new();
+        let (r, _rx) = req("preempted", vec![7; 64], 100);
+        st.enqueue(r, &p);
+        st.step(&p);
+        st.preempt_last(&p);
+        let (_, event) = st.abort("preempted", &p).expect("the request is queued");
+        assert!(matches!(
+            event,
+            GenEvent::Done {
+                finish_reason: "abort",
+                prompt_tokens: 64,
+                completion_tokens: 1,
+                ..
+            }
+        ));
+        assert!(st.is_idle());
+        assert_eq!(st.pool.allocated, st.pool.free_lru.len() as u64);
     }
 
     /// Run passes until the given request emits its first Token, returning the
@@ -3372,6 +3529,76 @@ mod tests {
                 .is_none_or(|silence| silence < Duration::from_millis(150)),
             "a pass ran"
         );
+    }
+
+    /// A kernel built for a new shape: the engine holds before the pass that
+    /// first runs a prompt longer than any it has run, silent on it the
+    /// while, and only then; a shape run before the hook was set, or once
+    /// since, runs at once.
+    #[tokio::test]
+    async fn a_cold_shape_hold_delays_the_first_pass_of_a_longer_prompt_once() {
+        async fn first_token_after(rx: &mut mpsc::UnboundedReceiver<GenEvent>) -> Duration {
+            let started = Instant::now();
+            loop {
+                let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .expect("an event")
+                    .expect("stream open");
+                if matches!(event, GenEvent::Token { .. }) {
+                    return started.elapsed();
+                }
+            }
+        }
+        async fn drain(rx: &mut mpsc::UnboundedReceiver<GenEvent>) {
+            while let Some(event) = rx.recv().await {
+                if matches!(event, GenEvent::Done { .. }) {
+                    break;
+                }
+            }
+        }
+        let engine = live();
+        // A 16-token prompt runs before the hook is set: a shape run.
+        let mut rx = submit(&engine, "short", vec![3; 16]);
+        assert!(first_token_after(&mut rx).await < Duration::from_millis(500));
+        drain(&mut rx).await;
+        engine.fault_cold_shape_ms(400);
+        assert_eq!(engine.fault_status().cold_shape_ms, 400);
+        // The same length again: no hold.
+        let mut rx = submit(&engine, "short-again", vec![3; 16]);
+        assert!(
+            first_token_after(&mut rx).await < Duration::from_millis(300),
+            "a shape run before the hook was set runs at once"
+        );
+        drain(&mut rx).await;
+        // A longer prompt: the hold, with the engine silent on it meanwhile.
+        let mut rx = submit(&engine, "long", vec![3; 64]);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let silence = engine.output_silence().expect("a request is in flight");
+        assert!(
+            silence >= Duration::from_millis(150),
+            "silent while it builds: {silence:?}"
+        );
+        let waited = first_token_after(&mut rx).await;
+        assert!(
+            (Duration::from_millis(150)..Duration::from_secs(2)).contains(&waited),
+            "the first token came {waited:?} after 200 ms of the hold"
+        );
+        drain(&mut rx).await;
+        // Once: another 64-token prompt runs at once; a longer one holds again.
+        let mut rx = submit(&engine, "long-again", vec![3; 64]);
+        assert!(
+            first_token_after(&mut rx).await < Duration::from_millis(300),
+            "a shape built once is built"
+        );
+        drain(&mut rx).await;
+        let mut rx = submit(&engine, "longer", vec![3; 96]);
+        assert!(
+            first_token_after(&mut rx).await >= Duration::from_millis(400),
+            "a new longest prompt holds again"
+        );
+        drain(&mut rx).await;
+        engine.fault_cold_shape_ms(0);
+        assert_eq!(engine.fault_status().cold_shape_ms, 0);
     }
 
     #[tokio::test]

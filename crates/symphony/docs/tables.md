@@ -15,6 +15,13 @@ The definition is the table below; the `Engine` runs it, and decides everything 
 - No row leaves reasoning on a call marker: Qwen3 closes its thought with `</think>` before a
   call, so a `<tool_call>` inside the thought is reasoning text.
 - The turn opener is ChatML's `<|im_start|>assistant`.
+- Under the tagged syntax with the value between the tags directly (`qwen3_tagged_direct`), MiMo
+  V2.5's template writes a newline after `<tool_call>` and after `<function=…>` and the V2.6 line
+  (Flash-RL, Pro-RL, Flash-MOPD, Pro-MOPD, Distill-Qwen-9B) writes none; the newline is the tags'
+  framing either way, and a value's own bytes stay as written. Both lines' templates write the
+  thought alike: every earlier turn opens with `<think>`, closed at once when it has no thought,
+  and the generation prompt leaves the model to write `<think>` (`<think></think>` with thinking
+  off): the same rows read both, as the recorded sets of the four groups show.
 
 The tests here are the engine's as much as this format's: they were written against the hand-written
 parser this table replaced, and hold the table to the same events.
@@ -63,6 +70,22 @@ V4.1's, and the registry reads each checkpoint with its own. Beyond that:
   The family's reference parser is the one that looks for the block after the two newlines. The prompt ends with `<think>` in thinking mode and with `</think>` right after
   `<｜Assistant｜>` in chat mode, so the replay starts the output inside the thought or in the content;
   bellwether has not recorded the group's set yet.
+- **A turn the prompt leaves unopened starts inside the thought.** The template writes
+  `<｜Assistant｜>` and the thought's opener after a user message only: a conversation that ends with
+  a system message rendered in place (a coding agent's environment notes after the user turn, and
+  after every tool result) has no opener for the model's turn, and the model, which thinks unless
+  told not to, writes its thought and `</think>` as it would after `<｜Assistant｜><think>`. The table
+  names the thought as the state an unopened turn starts in, with `<｜end▁of▁sentence｜>` as the end of
+  a turn the model wrote: a prompt with no opener, or whose last opener's turn ended, starts the
+  output in the thought, and nothing of it is replayed (an earlier turn's markers and a `</think>`
+  quoted in a tool result move nothing). The legacy reasoning parser for this checkpoint starts
+  inside the thought whenever the request leaves thinking on, whatever the prompt; the two agree
+  on this shape. The V4.1 template opens the turn after a mid-conversation system message too, so
+  its table meets no unopened turn. The table is pinned against the turns the
+  family's reference encoder (the model repository's `encoding` module) renders for a tool-calling
+  conversation, each read as the encoder's own parser reads it: every kind of value, two invokes in
+  one block, a call after content, and an invoke with no parameters, which the encoder writes with
+  an empty line inside and the table reads as `{}`.
 
 ## GLM 4.5 and 4.6 (`glm4`)
 
@@ -87,7 +110,7 @@ What this table says beyond the DSML one:
 - **An ignored terminal.** The template writes `]<]minimax[>[` before `<tool_call>`, before
   every tag inside an invoke and before `</tool_call>`; it is one token, and it never stands
   inside prose. The table ignores it: the engine drops it in every state and moves nowhere,
-  and inside an invoke the assembler keeps its bytes in place.
+  and inside an invoke its bytes keep their place among the invoke's.
 - **The model writes the thought, or closes an empty one.** The template renders an assistant
   turn as `<mm:think>…</mm:think>` when it has reasoning and as `</mm:think>` alone when it has
   none, and its generation prompt adds nothing in its default mode (`thinking_mode` unset or
@@ -156,7 +179,8 @@ What the table says beyond the others:
   template's framing, dropped, and the object is the call. The call's end is the object's close;
   `<|end_message|>` is the message's, dropped.
 - **The turn's end token is ignored.** The template writes `<|content_model_end_sampling|>`
-  after the turn; an engine that passes it through has it dropped wherever it stands.
+  after the turn; an engine that passes it through has it dropped wherever it stands, inside
+  a message's header or its call included, where its bytes keep their place.
 - **A forced call's tag is the gateway's.** `Format::grammar` writes the tag the gateway's old
   Inkling parser hand-writes: the call marker triggers it inside whatever message the model is
   writing, the first one included, then `{"name":"NAME","args":`, the schema, `}` and
@@ -164,6 +188,9 @@ What the table says beyond the others:
   answer are free text, so the recorded thinking turn stays writable. A marker outside a
   message's header is writable under the tag too and reads as that message's text: the
   grammar is wider than the table there, as the gateway's tag is.
+- **The group is one template.** Inkling, Inkling-Small and Inkling-NVFP4 ship the same chat
+  template byte for byte (one sha256 at the three checkpoints' recorded or current revisions), so
+  the three read with the one table and the recorded `inkling` set stands for the group.
 
 What the table leaves out, for want of fixtures: image and audio messages, which the template writes
 for the user and never for the model; and the text-mode invocation, `<|content_invoke_tool_text|>`,
@@ -207,7 +234,9 @@ What the table says beyond the others:
   state and the assembler decides at the first byte that is not whitespace; unlike `xlam`, a `{`
   there is one call alone (`json::list::Assembler::object_or_list`), whose object reads as a
   list's object does, `arguments`, `parameters` or `args` naming the arguments. What follows the
-  object is the template's wrapping: whitespace dropped, anything else malformed.
+  object reads as what follows a list's `]`: whitespace that ends the output is the template's
+  wrapping, dropped; text is malformed, with the whitespace before and between its words, since
+  a model that explains its JSON in a sentence wrote that sentence and the reference keeps it.
 - **Prose before the JSON is content, whole.** The gateway's older `json` parser searches the
   output for the first `{` or `[`; this table does not, as no other table scans for a marker.
 - **A forced call is the list.** `Format::grammar` writes the `xlam` list, as the older parser's
@@ -245,24 +274,35 @@ What the table says beyond the others:
   …]` as it reads xLAM's bare list: each object a call, the brackets and the commas the template's
   wrapping. Between markers prose has no place, so text where the list should be, a `[` that opens
   no list of calls included, is malformed where the bare list takes it for content; the engine
-  picks that form for a table with a row into the arguments state. After the `]`, whitespace is
-  dropped and other text malformed, as for the bare list.
+  picks that form for a table with a row into the arguments state. After the `]`, whitespace
+  before the closing marker is dropped; text is malformed with the whitespace before and between
+  its words, as for the bare list.
 - **The thought is the Super template's, and the model's own.** Llama-3.3-Nemotron-Super-49B-v1.5's
   template renders an assistant message's content from its `</think>` on, so the model writes
   `<think>…</think>` itself; `/no_think` in the system prompt makes the template close the thought
   in the prompt (`<think>\n\n</think>\n\n`), and the request's `enable_thinking` changes nothing.
-  The Nano 8B and DLER templates have no thought. Bellwether records no reasoning case for the three
-  groups (their templates render no `reasoning_content`), so the thought's rows rest on the Super
-  template and the model cards, not on a replay.
+  The Nano 8B and DLER templates have no thought. Bellwether records no reasoning case for any of
+  the five groups (their templates render no `reasoning_content`, and the Ultra v1's reasoning probe
+  was refused at record time), so the thought's rows rest on the Super template and the model
+  cards, not on a replay.
 - **The tag is one tag around the list.** `Format::grammar` writes `<TOOLCALL>`, the tools' calls
   as the list, `</TOOLCALL>`, and the table's thought takes the prefix the JSON syntax takes. The
   gateway's older parsers have no tag for this syntax (`llama` reads Llama 3.2's pythonic calls,
   `json` the bare object), so nothing is pinned.
+- **The v1 checkpoints bring their vendor's syntax, not their template's.** The chat templates of
+  Llama-3_3-Nemotron-Super-49B-v1 and Llama-3_1-Nemotron-Ultra-253B-v1 are a Llama 3 header
+  template that renders no tool and no call and keeps an assistant message from its `</think>` on:
+  the thought is the model's own (`detailed thinking on` in the system prompt), and the calls are
+  the `<TOOLCALL>` list the vendor's tool parser reads, written when the system prompt lists the
+  tools. Both read with this table; the CPT checkpoint of the Ultra keeps Llama 3.1's own
+  template and reads with `json`. The Ultra's recorded set holds content alone, as the template
+  writes; the Super v1 has no recorded set.
 
 What the table leaves open: the thought's rows against a recorded reasoning case; Nemotron Nano 4B
 v1.1, whose template writes each call one `}` short (`{"name": …, "arguments": {…}]`), which
-bellwether's reference heals and this table does not read; and Nemotron Ultra's bare
-`{"name": …, "parameters": …}` object, Llama 3.1's own syntax, which the `json` table reads.
+bellwether's reference heals and this table does not read; and the Ultra's CPT checkpoint
+(`Llama-3_1-Nemotron-Ultra-253B-CPT-v1`), whose bare `{"name": …, "parameters": …}` object is
+Llama 3.1's own syntax, which the `json` table reads.
 
 ## MiniCPM5 (`minicpm5`)
 
@@ -375,7 +415,8 @@ What the table says:
   model's to write before them, as gpt-oss's analysis channel is: the template renders a thought
   only when the message has one, so the tags do not require it.
 
-What the table leaves open, for want of fixtures: the recorded sets, once bellwether has them;
+What the table leaves open: the Spark checkpoint's own recorded set, once bellwether has it (the
+table replays Muse Glimmer 30B's set, whose template writes the same turn of messages, bitwise);
 whether the model ever writes a message to a recipient the table has no row for (its text is
 framing today); and whether `commentary` should reach the client as content or as a channel of its
 own, which the API has no place for.

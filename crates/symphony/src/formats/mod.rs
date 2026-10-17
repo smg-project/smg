@@ -66,6 +66,6 @@ pub use olmo3::olmo3;
 pub use plain::plain;
 pub use qwen2_5::qwen2_5;
 pub use qwen3::qwen3;
-pub use registry::{for_model, groups, table_for, Table};
+pub use registry::{for_model, for_model_shared, groups, table_for, Table};
 pub use seed_oss::seed_oss;
 pub use xlam::xlam;

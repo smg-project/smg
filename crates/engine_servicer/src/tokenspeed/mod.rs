@@ -33,7 +33,7 @@ use tracing::{info, warn};
 
 use crate::{
     engine_link::EngineLink, health::HealthReporter, requests::RequestRegistry, ServerThread,
-    ServicerError, Shutdown,
+    ServicerConfig, ServicerError, Shutdown,
 };
 
 /// The gRPC service name, as the health service reports it.
@@ -101,30 +101,14 @@ pub struct TokenSpeedModelInfo {
 /// How to bind, where the engines dial in, and what to advertise.
 #[derive(Debug, Clone)]
 pub struct TokenSpeedServicerConfig {
-    /// `host:port` for the gRPC listener.
-    pub bind_address: String,
-    /// `ipc://<path>` base for the data-plane sockets (`<path>-in.sock` and
-    /// `<path>-out.sock`), owned by this process's uid.
-    pub ipc_base_url: String,
-    /// `tcp://host:port` the headless scheduler dials for the handshake (its
-    /// `--data-parallel-address`/`--data-parallel-rpc-port`).
-    /// An `ipc://<path>` endpoint is accepted too: one per test, so parallel
-    /// tests never share a probed TCP port.
-    pub handshake_address: String,
-    /// Engines that will dial in (the attention data-parallel size).
-    pub engine_count: usize,
-    /// Local directory holding the model's tokenizer files; without it,
-    /// requests carrying string stops are refused.
-    pub tokenizer_dir: Option<String>,
+    /// The listener, the scheduler's endpoints, the tokenizer directory and
+    /// the start-up bounds. `handshake_address` is what the headless
+    /// scheduler dials (its `--data-parallel-address`/
+    /// `--data-parallel-rpc-port`), `engine_count` the attention
+    /// data-parallel size; without `tokenizer_dir`, requests carrying string
+    /// stops are refused.
+    pub servicer: ServicerConfig,
     pub model: TokenSpeedModelInfo,
-    /// Bound on silence during the scheduler's startup handshake: a handshake
-    /// message or a [`TokenSpeedServicerServer::note_engine_alive`] report resets
-    /// it; see [`crate::DEFAULT_ENGINE_STARTUP_TIMEOUT`].
-    pub engine_startup_timeout: Duration,
-    /// Bound on the whole startup handshake however alive the scheduler is;
-    /// `None` leaves that to the silence bound and the lifecycle owner. See
-    /// [`crate::DEFAULT_ENGINE_STARTUP_CEILING`].
-    pub engine_startup_ceiling: Option<Duration>,
 }
 
 /// The servicer's `GetLoads` figures, read for the load record the relay
@@ -231,34 +215,11 @@ impl TokenSpeedServicerServer {
         config: TokenSpeedServicerConfig,
         tokenizer: Option<Arc<dyn Tokenizer>>,
     ) -> Result<Self, ServicerError> {
-        let invalid = |message: &str| ServicerError::InvalidConfig(message.to_string());
-        if config.bind_address.rsplit_once(':').is_none() {
-            return Err(invalid("bind_address must be host:port"));
-        }
-        if !config.ipc_base_url.starts_with("ipc://") {
-            return Err(invalid("ipc_base_url must be ipc://<path>"));
-        }
-        if !config.handshake_address.starts_with("tcp://")
-            && !config.handshake_address.starts_with("ipc://")
-        {
-            return Err(invalid(
-                "handshake_address must be tcp://host:port or ipc://<path>",
-            ));
-        }
-        if config.engine_count == 0 {
-            return Err(invalid("engine_count must be positive"));
-        }
-        if config.engine_startup_timeout.is_zero() {
-            return Err(invalid("engine_startup_timeout must be positive"));
-        }
-        if config
-            .engine_startup_ceiling
-            .is_some_and(|ceiling| ceiling.is_zero())
-        {
-            return Err(invalid("engine_startup_ceiling must be positive when set"));
-        }
+        config.servicer.validate()?;
         if config.model.model_path.trim().is_empty() {
-            return Err(invalid("model_path must not be empty"));
+            return Err(ServicerError::InvalidConfig(
+                "model_path must not be empty".to_string(),
+            ));
         }
         let kv_relay = crate::kv_events::KvEventRelay::for_publisher(
             &config.model.kv_events_endpoint,
@@ -266,7 +227,7 @@ impl TokenSpeedServicerServer {
             &config.model.kv_events_topic,
         );
         let state = Arc::new(State {
-            tokenizer_dir: config.tokenizer_dir.clone(),
+            tokenizer_dir: config.servicer.tokenizer_dir.clone(),
             model: config.model,
             kv_relay,
             engine: EngineLink::default(),
@@ -292,7 +253,7 @@ impl TokenSpeedServicerServer {
         );
         let connect_state = Arc::clone(&state);
         let kv_relay = state.kv_relay.clone();
-        let TokenSpeedServicerConfig {
+        let ServicerConfig {
             bind_address,
             ipc_base_url,
             handshake_address,
@@ -300,8 +261,7 @@ impl TokenSpeedServicerServer {
             tokenizer_dir,
             engine_startup_timeout,
             engine_startup_ceiling,
-            ..
-        } = config;
+        } = config.servicer;
         let thread = ServerThread::start(
             "smg-tokenspeed-servicer",
             &bind_address,

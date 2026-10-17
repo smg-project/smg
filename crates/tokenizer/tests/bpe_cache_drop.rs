@@ -21,7 +21,7 @@ use std::{
     alloc::{GlobalAlloc, Layout, System},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, Mutex, PoisonError,
     },
     thread,
 };
@@ -142,8 +142,14 @@ fn word(i: usize) -> String {
     word
 }
 
-#[test]
-fn a_dropped_tokenizer_leaves_nothing_on_the_threads_that_encoded_with_it() {
+/// The tests of this binary read one allocator count, so they run one at a
+/// time.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+/// Loads, encodes with and drops `CYCLES` tokenizers from `load` in turn on
+/// `THREADS` long-lived threads, and checks what the threads keep.
+fn leaves_nothing_behind(load: impl Fn() -> HuggingFaceTokenizer) {
+    let _one_at_a_time = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let (done, reports) = mpsc::channel::<()>();
     let workers: Vec<_> = (0..THREADS)
         .map(|thread| {
@@ -167,7 +173,7 @@ fn a_dropped_tokenizer_leaves_nothing_on_the_threads_that_encoded_with_it() {
     let mut left_behind = Vec::with_capacity(CYCLES);
     for _ in 0..CYCLES {
         let before = LIVE.load(Ordering::Relaxed);
-        let tokenizer = Arc::new(HuggingFaceTokenizer::from_tokenizer(byte_level_bpe()));
+        let tokenizer = Arc::new(load());
         for (jobs, _) in &workers {
             jobs.send(Arc::clone(&tokenizer)).expect("a live worker");
         }
@@ -193,4 +199,28 @@ fn a_dropped_tokenizer_leaves_nothing_on_the_threads_that_encoded_with_it() {
             .all(|&bytes| bytes < LEFT_BEHIND_MAX),
         "the {THREADS} threads kept {left_behind:?} bytes of the dropped tokenizers"
     );
+}
+
+#[test]
+fn a_dropped_tokenizer_leaves_nothing_on_the_threads_that_encoded_with_it() {
+    leaves_nothing_behind(|| HuggingFaceTokenizer::from_tokenizer(byte_level_bpe()));
+}
+
+/// The file loader bounds the model it reads in place (no copy of it): the
+/// same holds for the tokenizer read from its `tokenizer.json`.
+#[test]
+fn a_dropped_tokenizer_read_from_a_file_leaves_nothing_on_the_threads_either() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("tokenizer.json");
+    std::fs::write(
+        &path,
+        byte_level_bpe()
+            .to_string(false)
+            .expect("the tokenizer serializes"),
+    )
+    .expect("the tokenizer file");
+    let path = path.to_str().expect("a utf-8 path").to_string();
+    leaves_nothing_behind(move || {
+        HuggingFaceTokenizer::from_file(&path).expect("the tokenizer loads")
+    });
 }

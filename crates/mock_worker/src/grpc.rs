@@ -112,6 +112,18 @@ pub async fn serve_with_listener_until(
         prefill_pending: Arc::new(AtomicU64::new(0)),
     };
     let server = async {
+        // tonic drains on incoming EOF when graceful shutdown is enabled,
+        // but retains the stream while waiting for existing connections.
+        // Drop the listener at EOF so the port closes before that wait.
+        let incoming = stream::unfold(
+            Box::pin(connections(listener).take_until(shutdown)),
+            |mut incoming| async move {
+                incoming
+                    .next()
+                    .await
+                    .map(|connection| (connection, incoming))
+            },
+        );
         // tonic's 4 MiB default would refuse the Generate of a long prompt (a
         // million token ids are a few megabytes as varints, more with the
         // prompt text alongside); the limit follows the config: none by
@@ -122,7 +134,7 @@ pub async fn serve_with_listener_until(
                     .max_decoding_message_size(max_message_bytes)
                     .max_encoding_message_size(max_message_bytes),
             )
-            .serve_with_incoming_shutdown(connections(listener), shutdown)
+            .serve_with_incoming_shutdown(incoming, pending())
             .await
         {
             tracing::error!("grpc worker {addr:?} stopped: {e}");
@@ -320,8 +332,11 @@ impl TokenSpeedScheduler for MockScheduler {
 
     async fn abort(
         &self,
-        _request: Request<ts::AbortRequest>,
+        request: Request<ts::AbortRequest>,
     ) -> Result<Response<ts::AbortResponse>, Status> {
+        if let Some(engine) = &self.engine {
+            engine.abort(request.into_inner().request_id);
+        }
         Ok(Response::new(ts::AbortResponse {
             success: true,
             message: String::new(),

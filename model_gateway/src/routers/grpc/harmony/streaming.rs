@@ -30,7 +30,7 @@ use super::{
 };
 use crate::{
     observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
-    rate_limit::{SharedReservationHandle, UsageSettlement},
+    rate_limit::SharedReservationHandle,
     routers::{
         common::{
             openai_bridge::{self, descriptor, FormatRegistry, ResponseFormat},
@@ -41,7 +41,7 @@ use crate::{
                 response_collection::drain_prefill,
                 response_formatting::{CompletionTokenTracker, TokenCounts},
                 responses::{
-                    build_sse_response,
+                    body_guards, build_sse_response_guarded,
                     streaming::{
                         attach_mcp_server_label, OutputItemKind, ResponseStreamEventEmitter,
                     },
@@ -91,12 +91,14 @@ impl HarmonyStreamingProcessor {
     ///
     /// Returns an SSE response with streaming token updates.
     ///
-    /// Note: Caller should attach load guards to the returned response using
-    /// `WorkerLoadGuard::attach_to_response()` for proper RAII lifecycle management.
+    /// The `load_guards` (and the reservation's safety net) ride in the
+    /// response body, released when it is dropped: at the stream's end or
+    /// the client's disconnect.
     #[expect(
         clippy::disallowed_methods,
         reason = "streaming tasks are fire-and-forget by design; client disconnect terminates them"
     )]
+    #[expect(clippy::too_many_arguments)]
     /// `router_stop_strings` is non-empty only when the router must enforce
     /// string `stop` sequences itself (direct-ZMQ backends: the engine sees
     /// token ids only).
@@ -107,9 +109,11 @@ impl HarmonyStreamingProcessor {
         dispatch: context::DispatchMetadata,
         router_stop_strings: Vec<String>,
         reservation: Option<Arc<SharedReservationHandle>>,
+        load_guards: Option<context::LoadGuards>,
         source: utils::StreamSource,
     ) -> Response {
         let source = source.with_backend(metrics_labels::BACKEND_HARMONY);
+        let guards = body_guards(load_guards, reservation.as_ref());
         // Create SSE channel
         let (tx, rx) = sse_channel();
 
@@ -185,7 +189,7 @@ impl HarmonyStreamingProcessor {
         }
 
         // Return SSE response
-        build_sse_response(rx)
+        build_sse_response_guarded(rx, guards)
     }
 
     /// Process streaming chunks from a single stream
@@ -564,12 +568,7 @@ impl HarmonyStreamingProcessor {
             if (decode_completed_indices.len() as u32) < expected_choices {
                 handle.close_reserved_only().await;
             } else {
-                handle
-                    .settle_success(UsageSettlement {
-                        actual_input_tokens: counts.prompt,
-                        completion_tokens: counts.completion,
-                    })
-                    .await;
+                handle.settle_success(counts.settlement()).await;
             }
         }
 

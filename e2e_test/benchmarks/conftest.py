@@ -32,38 +32,49 @@ def _build_command(
     gpu_type: str | None = None,
     gpu_count: int | None = None,
 ) -> list[str]:
-    """Build genai-bench command via docker run."""
-    image = os.environ.get("GENAI_BENCH_IMAGE", _DEFAULT_IMAGE)
+    """Build the genai-bench command: docker run of its image, or GENAI_BENCH_BIN.
+
+    GENAI_BENCH_BIN names a genai-bench executable, for a job without Docker
+    (one that runs inside an engine's image). It runs in this directory and
+    environment, so it needs none of the container's mounts.
+    """
     base_dir = str(Path.cwd())
-
-    cmd = [
-        "docker",
-        "run",
-        "--rm",
-        "--network",
-        "host",
-        "-v",
-        f"{base_dir}:{base_dir}",
-        "-w",
-        base_dir,
-    ]
-
-    # Mount local model directory if configured (e.g. /raid/models)
     local_model_path = os.environ.get("ROUTER_LOCAL_MODEL_PATH")
-    if local_model_path:
-        cmd.extend(["-v", f"{local_model_path}:{local_model_path}"])
+    bench_bin = os.environ.get("GENAI_BENCH_BIN")
 
-    # Mount host HF cache into container so genai-bench reuses tokenizers
-    # already downloaded by sglang workers instead of downloading from HF
-    # (HF downloads inside ephemeral containers hang intermittently).
-    hf_home = os.environ.get("HF_HOME", os.path.join(Path.home(), ".cache", "huggingface"))
-    if os.path.isdir(hf_home):
-        cmd.extend(["-v", f"{hf_home}:{hf_home}", "-e", f"HF_HOME={hf_home}"])
+    if bench_bin:
+        cmd = [bench_bin]
+    else:
+        image = os.environ.get("GENAI_BENCH_IMAGE", _DEFAULT_IMAGE)
+        cmd = [
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "host",
+            "-v",
+            f"{base_dir}:{base_dir}",
+            "-w",
+            base_dir,
+        ]
 
-    # Pass through environment variables the container may need
-    for var in ("HF_TOKEN",):
-        if os.environ.get(var):
-            cmd.extend(["-e", var])
+        # Mount local model directory if configured (e.g. /raid/models)
+        if local_model_path:
+            cmd.extend(["-v", f"{local_model_path}:{local_model_path}"])
+
+        # Mount host HF cache into container so genai-bench reuses tokenizers
+        # already downloaded by sglang workers instead of downloading from HF
+        # (HF downloads inside ephemeral containers hang intermittently).
+        hf_home = os.environ.get("HF_HOME", os.path.join(Path.home(), ".cache", "huggingface"))
+        if os.path.isdir(hf_home):
+            cmd.extend(["-v", f"{hf_home}:{hf_home}", "-e", f"HF_HOME={hf_home}"])
+
+        # Pass through environment variables the container may need
+        for var in ("HF_TOKEN",):
+            if os.environ.get(var):
+                cmd.extend(["-e", var])
+
+        cmd.append(image)
 
     # Use local tokenizer path if model is available on disk (avoids slow HF download)
     tokenizer_path = model_path
@@ -74,7 +85,6 @@ def _build_command(
 
     cmd.extend(
         [
-            image,
             "benchmark",
             "--api-backend",
             "openai",
@@ -255,9 +265,11 @@ def genai_bench_runner():
                 env=os.environ.copy(),
             )
         except FileNotFoundError:
+            if os.environ.get("GENAI_BENCH_BIN"):
+                pytest.fail(f"GENAI_BENCH_BIN not found: {cmd[0]}")
             pytest.fail("docker not found — is Docker installed?")
         except OSError as e:
-            pytest.fail(f"Failed to start genai-bench container: {e}")
+            pytest.fail(f"Failed to start genai-bench: {e}")
 
         # Start GPU monitor if needed
         gpu_monitor: GPUMonitor | None = None

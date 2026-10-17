@@ -752,6 +752,24 @@ impl From<tokenspeed_proto::GetLoadsResponse> for openai_protocol::worker::Worke
 }
 
 #[cfg(test)]
+mod connect_tests {
+    use super::*;
+    use crate::channel::testing::refused_endpoint;
+
+    #[tokio::test]
+    async fn connect_fails_on_a_malformed_or_refused_endpoint() {
+        let malformed = TokenSpeedSchedulerClient::connect("not an endpoint").await;
+        assert!(
+            malformed.is_err(),
+            "a malformed endpoint fails before the dial"
+        );
+        let refused = refused_endpoint();
+        let result = TokenSpeedSchedulerClient::connect(&refused.url).await;
+        assert!(result.is_err(), "a refused dial fails the connect");
+    }
+}
+
+#[cfg(test)]
 mod load_conversion_tests {
     use super::*;
 

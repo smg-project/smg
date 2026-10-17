@@ -22,6 +22,11 @@
 //! unpack` writes (`fixtures-plain/` unless `--out` names another), where
 //! every fixture set is plain JSON Lines beside each model's `manifest.toml`
 //! and `sets.toml`; without it the test prints a skip notice and passes.
+//! The tree the lists below are judged against is the one CI unpacks,
+//! bellwether at the commit `.github/versions/bellwether.ref` pins: a
+//! case's reference moves between bellwether commits, so an entry taken
+//! from another checkout's tree fails the run there as stale, or leaves a
+//! difference unlisted.
 //! bellwether's own `fixtures/` directory keeps a benchmark set as
 //! `<set>.jsonl.zst` in Git LFS, so a compressed set or a Git LFS pointer under
 //! the root fails the run and says to unpack first. Each case is compared as

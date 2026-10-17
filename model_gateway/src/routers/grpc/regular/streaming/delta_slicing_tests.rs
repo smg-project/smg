@@ -93,6 +93,7 @@ async fn content_deltas_around_the_park(model: &str) -> (Vec<String>, Vec<String
             Arc::new(CharacterTokenizer::default()),
             false,
             None,
+            None,
             source,
         )
         .await;

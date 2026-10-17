@@ -24,6 +24,7 @@ use std::sync::Arc;
 pub use activity::{cache_activity_stats, CacheActivityStats};
 use anyhow::Result;
 pub use fingerprint::TokenizerFingerprint;
+use l0::L0Lookup;
 pub use l0::{CacheStats, L0Cache};
 pub use l1::{L1Cache, L1CacheStats};
 use l1::{PrefixLookup, SpecialTokenBoundaries, SpecialTokenFrame};
@@ -207,12 +208,17 @@ impl CachedTokenizer {
 
 impl Encoder for CachedTokenizer {
     fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
-        // L0 cache lookup (exact match, keyed on input + add_special_tokens)
-        if let Some(l0) = &self.l0 {
-            if let Some(cached) = l0.get(input, add_special_tokens) {
-                return Ok((*cached).clone());
-            }
-        }
+        // L0 cache lookup (exact match on input + add_special_tokens); a miss
+        // keeps the key it computed for the fill after the encode.
+        let miss = match self
+            .l0
+            .as_ref()
+            .map(|l0| l0.lookup(input, add_special_tokens))
+        {
+            Some(L0Lookup::Hit(cached)) => return Ok((*cached).clone()),
+            Some(L0Lookup::Miss(miss)) => Some(miss),
+            None => None,
+        };
 
         // L1 path (prefix match at special token boundaries): a hit splices the
         // shared cached prefix with the suffix encoded after the boundary's
@@ -326,12 +332,8 @@ impl Encoder for CachedTokenizer {
                 }
             };
 
-            if let Some(l0) = &self.l0 {
-                l0.insert(
-                    input.to_string(),
-                    add_special_tokens,
-                    Encoding::Plain(encoding.token_ids().to_vec()),
-                );
+            if let (Some(l0), Some(miss)) = (&self.l0, miss) {
+                l0.fill(miss, input, encoding.token_ids().to_vec());
             }
 
             return Ok(encoding);
@@ -340,12 +342,8 @@ impl Encoder for CachedTokenizer {
         // Full tokenization (no L1 configured), cached in L0 only
         let encoding = self.inner.encode(input, add_special_tokens)?;
 
-        if let Some(l0) = &self.l0 {
-            l0.insert(
-                input.to_string(),
-                add_special_tokens,
-                Encoding::Plain(encoding.token_ids().to_vec()),
-            );
+        if let (Some(l0), Some(miss)) = (&self.l0, miss) {
+            l0.fill(miss, input, encoding.token_ids().to_vec());
         }
 
         Ok(encoding)

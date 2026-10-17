@@ -134,6 +134,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
+      # Every process this job starts carries the job's marker in its
+      # environment: exported here, before anything starts, so the harness's
+      # workers and gateway, and their children (an engine's cores, a
+      # scheduler's ranks), inherit it. The job's last step ends whatever
+      # still carries it (scripts/ci_reap_job_processes.py), so an engine a
+      # cancelled or timed-out test step left behind cannot outlive the job.
+      - name: Mark this job's processes
+        run: echo "E2E_JOB_MARKER=e2e-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_NAME}" >> "$GITHUB_ENV"
+
       # The cluster runners share one NAT egress IP and GitHub intermittently
       # 401s anonymous git from it, even for public repos — the TokenSpeed
       # source fetch dies on "could not read Username". Carry the workflow
@@ -284,6 +293,15 @@ jobs:
           path: e2e-logs/
           retention-days: 7
           if-no-files-found: ignore
+
+      # Whatever the job started and did not stop ends here, found by the
+      # marker in its environment: an engine or gateway that outlived a
+      # cancelled or timed-out test step keeps its GPU memory and its
+      # listening ports, and the next job on this runner would start against
+      # them. The script prints what it ended and never fails the job itself.
+      - name: Stop every process this job started
+        if: always() && env.E2E_JOB_MARKER != ''
+        run: python3 scripts/ci_reap_job_processes.py "$E2E_JOB_MARKER"
 
       # The prebuilt TokenSpeed payload is a per-job copy on the node's shared
       # NVMe cache (scripts/ci_fetch_tokenspeed_prebuilt.sh); drop it so the

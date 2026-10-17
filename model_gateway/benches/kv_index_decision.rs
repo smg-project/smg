@@ -1,7 +1,6 @@
 //! T6, the routing decision's cost: what one request pays in `cache_aware`'s
 //! `select_worker` (block hashing, the KV index lookup, the selection) against
-//! an index populated to 128 workers, for the positional indexer and the chain
-//! index (`--kv-index`).
+//! an index populated to 128 workers.
 //!
 //! The index is fed through the KV event monitor's own apply path: the mock
 //! engine's vLLM-shaped stream (`mock_streams`, the exactness tests' generator)
@@ -11,15 +10,12 @@
 //! workers, every worker filled to its block budget). Requests are new turns on
 //! resident sessions, prefixes of them, and novel prompts on a shared prefix.
 //!
-//! Two measurements per backend: the criterion sample of one decision, and the
+//! Two measurements: the criterion sample of one decision, and the
 //! contract's condition, a sustained loop at `T6_RATE` decisions per second
 //! (default 10,000) for `T6_SECS` seconds (default 12, the first 2 discarded)
 //! on whatever core the process is pinned to, reporting p50/p99/p999 over the
 //! decisions with the lookup's and the hashing's own distributions beside
-//! them. `T6_WORKERS` (128) and `T6_BLOCKS_PER_WORKER` (8192) size the fleet;
-//! `T6_INDEX=positional|chain` runs one backend alone, which is how the index's
-//! RSS delta is measured (the second backend in a process reuses the first's
-//! freed pages and reads zero).
+//! them. `T6_WORKERS` (128) and `T6_BLOCKS_PER_WORKER` (8192) size the fleet.
 //!
 //! Run with (one pinned core, outside the measurement set):
 //!   taskset -c 100 cargo bench -p smg --bench kv_index_decision
@@ -41,7 +37,6 @@ use criterion::Criterion;
 use kv_index::{compute_content_hash, compute_request_content_hashes, request_prefix_hashes};
 use openai_protocol::worker::HealthCheckConfig;
 use smg::{
-    config::KvIndexKind,
     policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, SelectWorkerInfo},
     worker::{
         kv_event_monitor::bench_support::IndexFeed, BasicWorkerBuilder, KvEventMonitor, KvIndex,
@@ -223,15 +218,15 @@ struct Setup {
     fill_secs: f64,
 }
 
-fn setup(kind: KvIndexKind, worker_count: usize, blocks_per_worker: usize) -> Setup {
+fn setup(worker_count: usize, blocks_per_worker: usize) -> Setup {
     let rss_before = rss_mb();
     let started = Instant::now();
-    // One seed for both backends: the same fleet, the same requests.
+    // One seed: the same fleet and the same requests, run to run.
     let mut rng = Rng(1);
     let sessions = Sessions::generate(&mut rng, worker_count * 48);
     let engine_stream = engine_batches();
 
-    let index = Arc::new(KvIndex::new(kind, 64));
+    let index = Arc::new(KvIndex::chain());
     let workers: Vec<Arc<dyn Worker>> = (0..worker_count)
         .map(|i| {
             Arc::new(
@@ -297,7 +292,7 @@ fn setup(kind: KvIndexKind, worker_count: usize, blocks_per_worker: usize) -> Se
     }
     let index_mb = rss_mb() - rss_before;
 
-    let monitor = Arc::new(KvEventMonitor::with_kind(kind, None));
+    let monitor = Arc::new(KvEventMonitor::new());
     monitor.set_index(MODEL, Arc::clone(&index));
     monitor.set_block_size(MODEL, BLOCK);
     let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
@@ -439,7 +434,7 @@ fn hashing(_: &Setup, tokens: &[u32]) {
     black_box(compute_request_content_hashes(tokens, BLOCK));
 }
 
-fn report(kind: KvIndexKind, setup: &Setup, rate: u64, secs: u64) {
+fn report(setup: &Setup, rate: u64, secs: u64) {
     let (decision, achieved) = sustained(setup, rate, secs, decide);
     let (lookup_samples, _) = sustained(setup, rate, secs.min(4), lookup);
     let (hash_samples, _) = sustained(setup, rate, secs.min(4), hashing);
@@ -449,7 +444,7 @@ fn report(kind: KvIndexKind, setup: &Setup, rate: u64, secs: u64) {
     let mut lens: Vec<usize> = setup.requests.iter().map(Vec::len).collect();
     lens.sort_unstable();
     eprintln!(
-        "| {kind:?} | {workers} | {memberships} | {index_mb:.0} | {fill:.1} | {achieved:.0} | {n} | \
+        "| chain | {workers} | {memberships} | {index_mb:.0} | {fill:.1} | {achieved:.0} | {n} | \
          {d50:.2} | {d90:.2} | {d99:.2} | {d999:.2} | {dmax:.1} | {l50:.2} | {l99:.2} | {lshare:.0}% | \
          {h50:.2} | {h99:.2} | {tok50} | {tok99} |",
         workers = setup.workers.len(),
@@ -487,27 +482,16 @@ fn main() {
          lookup p50 | lookup p99 | lookup share | hash p50 | hash p99 | req tokens p50 | p99 |"
     );
     eprintln!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
-    // `T6_INDEX=positional|chain` runs one backend in its own process: the second
-    // backend in one process reuses the pages the first freed, so its RSS
-    // delta reads zero.
-    let only = std::env::var("T6_INDEX")
-        .ok()
-        .and_then(|value| KvIndexKind::parse(&value));
-    for kind in [KvIndexKind::Positional, KvIndexKind::Chain] {
-        if only.is_some_and(|only| only != kind) {
-            continue;
-        }
-        let setup = setup(kind, workers, blocks_per_worker);
-        let mut r = 0usize;
-        criterion.bench_function(&format!("decision/{kind:?}"), |b| {
-            b.iter(|| {
-                let request = &setup.requests[r % setup.requests.len()];
-                r += 1;
-                decide(&setup, request);
-            });
+    let setup = setup(workers, blocks_per_worker);
+    let mut r = 0usize;
+    criterion.bench_function("decision/chain", |b| {
+        b.iter(|| {
+            let request = &setup.requests[r % setup.requests.len()];
+            r += 1;
+            decide(&setup, request);
         });
-        report(kind, &setup, rate, secs);
-        drop(setup);
-    }
+    });
+    report(&setup, rate, secs);
+    drop(setup);
     criterion.final_summary();
 }

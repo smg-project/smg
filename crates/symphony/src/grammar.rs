@@ -4,10 +4,11 @@
 //!
 //! [`Grammar`] is Symphony's own tree, in the shape the engines' structural-tag format takes
 //! (xgrammar's, which the serving engines accept): a `triggered_tags` of per-tool `tag`s, each a
-//! `begin`, a content grammar and an `end`; `sequence`, `or`, `star`, `plus` and `optional` to
-//! compose; `const_string`, `any_text`, `regex`, `json_schema` and `token` as leaves.
-//! [`Grammar::to_json`] writes it as the engine reads it, and [`Grammar::payload`] wraps it as the
-//! request carries it.
+//! `begin`, a content grammar and an `end` (one text, or any of several texts); `sequence`, `or`,
+//! `star`, `plus` and `optional` to compose; `const_string`, `any_text`, `regex`, `json_schema`
+//! (whose strings may leave words out), an EBNF `grammar` and `token` as leaves.
+//! [`Grammar::to_json`] writes it as the engine reads it, [`Grammar::payload`] wraps it as the
+//! request carries it, and [`Grammar::payload_text`] writes that as text.
 //!
 //! [`Format::grammar`] derives the tree from the table's rows and the request's tools, one spelling
 //! per call syntax. Notes on how, and on what it leaves open: `docs/grammar.md`.
@@ -15,17 +16,21 @@
 use std::collections::VecDeque;
 
 use openai_protocol::common::Tool;
+use serde::{ser::SerializeMap, Serialize, Serializer};
 use serde_json::{json, Value};
 
+pub use self::output::{Output, OutputAnswer, OutputChoice, OutputPosition, OutputSpelling, Turn};
 use crate::{
-    format::{CallSyntax, Emits, Format},
+    format::{CallSyntax, Emits, Format, Whitespace},
     shape::{Layout, Message},
     tagged::{attributed::Typing, keyed::Tags as KeyedTags},
 };
 
 mod attributed;
+mod calls;
 mod gemma;
 mod keyed;
+mod output;
 mod pythonic;
 mod schema;
 mod shaped;
@@ -43,11 +48,18 @@ pub enum Grammar {
     /// Text the regular expression accepts.
     Regex(String),
     /// A JSON value the schema accepts, written in the engine's `style` when one is named
-    /// (`glm_xml` writes it as `<arg_key>`/`<arg_value>` pairs).
+    /// (`glm_xml` writes it as `<arg_key>`/`<arg_value>` pairs). Its strings and keys hold none of
+    /// `excludes`, a list xgrammar enforces from 0.2.8 on and an older xgrammar ignores; an empty
+    /// list is not written. Its `whitespace` between tokens is free, as JSON has it, or bounded to
+    /// runs of so many characters ([`Whitespace`]); only a bound is written.
     JsonSchema {
         schema: Value,
         style: Option<String>,
+        excludes: Vec<String>,
+        whitespace: Whitespace,
     },
+    /// Text an EBNF grammar in xgrammar's own syntax (`root ::= ...`) accepts.
+    Ebnf(String),
     /// The elements one after another.
     Sequence(Vec<Grammar>),
     /// One of the elements.
@@ -86,84 +98,69 @@ pub enum Grammar {
 pub struct Tag {
     pub begin: String,
     pub content: Box<Grammar>,
-    pub end: String,
+    pub end: Bound,
+}
+
+/// Where a tag ends: a text, or whichever of several texts comes first.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Bound {
+    Text(String),
+    Texts(Vec<String>),
+}
+
+impl Bound {
+    /// The bound with `f` applied to each of its texts.
+    fn map(self, f: impl Fn(String) -> String) -> Self {
+        match self {
+            Self::Text(text) => Self::Text(f(text)),
+            Self::Texts(texts) => Self::Texts(texts.into_iter().map(f).collect()),
+        }
+    }
+}
+
+impl Serialize for Bound {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Text(text) => serializer.serialize_str(text),
+            Self::Texts(texts) => texts.serialize(serializer),
+        }
+    }
 }
 
 impl Tag {
     fn new(begin: impl Into<String>, content: Grammar, end: impl Into<String>) -> Self {
+        Self::bounded(begin, content, Bound::Text(end.into()))
+    }
+
+    fn bounded(begin: impl Into<String>, content: Grammar, end: Bound) -> Self {
         Self {
             begin: begin.into(),
             content: Box::new(content),
-            end: end.into(),
+            end,
         }
     }
 
-    fn to_json(&self) -> Value {
-        json!({
-            "type": "tag",
-            "begin": self.begin,
-            "content": self.content.to_json(),
-            "end": self.end,
-        })
+    /// The tag's keys, written into `map`.
+    fn entries<M: SerializeMap>(&self, map: &mut M) -> Result<(), M::Error> {
+        map.serialize_entry("type", "tag")?;
+        map.serialize_entry("begin", &self.begin)?;
+        map.serialize_entry("content", &self.content)?;
+        map.serialize_entry("end", &self.end)
+    }
+}
+
+impl Serialize for Tag {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(4))?;
+        self.entries(&mut map)?;
+        map.end()
     }
 }
 
 impl Grammar {
     /// The grammar as the engine reads it.
     pub fn to_json(&self) -> Value {
-        match self {
-            Self::ConstString(value) => json!({"type": "const_string", "value": value}),
-            Self::AnyText { excludes } => json!({"type": "any_text", "excludes": excludes}),
-            Self::Regex(pattern) => json!({"type": "regex", "pattern": pattern}),
-            Self::JsonSchema { schema, style } => {
-                let mut written = json!({"type": "json_schema", "json_schema": schema});
-                if let Some(style) = style {
-                    written["style"] = Value::String(style.clone());
-                }
-                written
-            }
-            Self::Sequence(elements) => json!({
-                "type": "sequence",
-                "elements": elements.iter().map(Self::to_json).collect::<Vec<_>>(),
-            }),
-            Self::Or(elements) => json!({
-                "type": "or",
-                "elements": elements.iter().map(Self::to_json).collect::<Vec<_>>(),
-            }),
-            Self::Optional(content) => json!({"type": "optional", "content": content.to_json()}),
-            Self::Star(content) => json!({"type": "star", "content": content.to_json()}),
-            Self::Plus(content) => json!({"type": "plus", "content": content.to_json()}),
-            Self::Tag(tag) => tag.to_json(),
-            Self::Token(token) => json!({"type": "token", "token": token}),
-            Self::TriggeredTags {
-                triggers,
-                tags,
-                at_least_one,
-                stop_after_first,
-            } => stopping(
-                json!({
-                    "type": "triggered_tags",
-                    "triggers": triggers,
-                    "tags": tags.iter().map(Tag::to_json).collect::<Vec<_>>(),
-                    "at_least_one": at_least_one,
-                }),
-                *stop_after_first,
-            ),
-            Self::TagsWithSeparator {
-                tags,
-                separator,
-                at_least_one,
-                stop_after_first,
-            } => stopping(
-                json!({
-                    "type": "tags_with_separator",
-                    "tags": tags.iter().map(Tag::to_json).collect::<Vec<_>>(),
-                    "separator": separator,
-                    "at_least_one": at_least_one,
-                }),
-                *stop_after_first,
-            ),
-        }
+        serde_json::to_value(self).unwrap_or(Value::Null)
     }
 
     /// The grammar as a request carries it to the engine: under `format`.
@@ -171,12 +168,27 @@ impl Grammar {
         json!({"format": self.to_json()})
     }
 
+    /// [`Grammar::payload`] as the text a request carries, written straight from the tree: the
+    /// same bytes as `payload().to_string()`, without building the JSON tree first.
+    pub fn payload_text(&self) -> String {
+        serde_json::to_string(&Payload { format: self }).unwrap_or_default()
+    }
+
+    /// The length of [`Grammar::payload_text`], counted without writing it.
+    pub fn payload_len(&self) -> usize {
+        json_len(&Payload { format: self })
+    }
+
     /// The nodes in the tree, this one included: its size, for a derivation that bounds it. A
     /// JSON schema leaf counts by the size of its schema (a node per four of the schema's own, a
     /// long string weighing its length), since the definitions attached to it are copied with it.
     pub(crate) fn nodes(&self) -> usize {
         1 + match self {
-            Self::ConstString(_) | Self::AnyText { .. } | Self::Regex(_) | Self::Token(_) => 0,
+            Self::ConstString(_)
+            | Self::AnyText { .. }
+            | Self::Regex(_)
+            | Self::Ebnf(_)
+            | Self::Token(_) => 0,
             Self::JsonSchema { schema, .. } => json_nodes(schema) / 4,
             Self::Sequence(elements) | Self::Or(elements) => elements.iter().map(Self::nodes).sum(),
             Self::Optional(content) | Self::Star(content) | Self::Plus(content) => content.nodes(),
@@ -185,6 +197,132 @@ impl Grammar {
                 tags.iter().map(|tag| tag.content.nodes()).sum()
             }
         }
+    }
+}
+
+/// A grammar under `format`, as a request carries it.
+#[derive(Serialize)]
+struct Payload<'a> {
+    format: &'a Grammar,
+}
+
+/// The engine's keys of each node, in the order it writes them; `excludes` of a JSON schema only
+/// when there are words to leave out, `style` only when one is named, `max_whitespace_cnt` only
+/// when the whitespace is bounded, and `stop_after_first` only when the tags stop after the first
+/// (the engines' default otherwise, so a tag that asks for any number of calls is written as it
+/// was before the key existed).
+impl Serialize for Grammar {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        match self {
+            Self::ConstString(value) => {
+                map.serialize_entry("type", "const_string")?;
+                map.serialize_entry("value", value)?;
+            }
+            Self::AnyText { excludes } => {
+                map.serialize_entry("type", "any_text")?;
+                map.serialize_entry("excludes", excludes)?;
+            }
+            Self::Regex(pattern) => {
+                map.serialize_entry("type", "regex")?;
+                map.serialize_entry("pattern", pattern)?;
+            }
+            Self::JsonSchema {
+                schema,
+                style,
+                excludes,
+                whitespace,
+            } => {
+                map.serialize_entry("type", "json_schema")?;
+                map.serialize_entry("json_schema", schema)?;
+                if let Some(style) = style {
+                    map.serialize_entry("style", style)?;
+                }
+                if !excludes.is_empty() {
+                    map.serialize_entry("excludes", excludes)?;
+                }
+                if let Whitespace::Bounded(run) = whitespace {
+                    map.serialize_entry("max_whitespace_cnt", run)?;
+                }
+            }
+            Self::Ebnf(grammar) => {
+                map.serialize_entry("type", "grammar")?;
+                map.serialize_entry("grammar", grammar)?;
+            }
+            Self::Sequence(elements) => {
+                map.serialize_entry("type", "sequence")?;
+                map.serialize_entry("elements", elements)?;
+            }
+            Self::Or(elements) => {
+                map.serialize_entry("type", "or")?;
+                map.serialize_entry("elements", elements)?;
+            }
+            Self::Optional(content) => {
+                map.serialize_entry("type", "optional")?;
+                map.serialize_entry("content", content)?;
+            }
+            Self::Star(content) => {
+                map.serialize_entry("type", "star")?;
+                map.serialize_entry("content", content)?;
+            }
+            Self::Plus(content) => {
+                map.serialize_entry("type", "plus")?;
+                map.serialize_entry("content", content)?;
+            }
+            Self::Tag(tag) => tag.entries(&mut map)?,
+            Self::Token(token) => {
+                map.serialize_entry("type", "token")?;
+                map.serialize_entry("token", token)?;
+            }
+            Self::TriggeredTags {
+                triggers,
+                tags,
+                at_least_one,
+                stop_after_first,
+            } => {
+                map.serialize_entry("type", "triggered_tags")?;
+                map.serialize_entry("triggers", triggers)?;
+                map.serialize_entry("tags", tags)?;
+                map.serialize_entry("at_least_one", at_least_one)?;
+                if *stop_after_first {
+                    map.serialize_entry("stop_after_first", &true)?;
+                }
+            }
+            Self::TagsWithSeparator {
+                tags,
+                separator,
+                at_least_one,
+                stop_after_first,
+            } => {
+                map.serialize_entry("type", "tags_with_separator")?;
+                map.serialize_entry("tags", tags)?;
+                map.serialize_entry("separator", separator)?;
+                map.serialize_entry("at_least_one", at_least_one)?;
+                if *stop_after_first {
+                    map.serialize_entry("stop_after_first", &true)?;
+                }
+            }
+        }
+        map.end()
+    }
+}
+
+/// The length of `value` as JSON text, counted as it is written out.
+pub(super) fn json_len<T: Serialize + ?Sized>(value: &T) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    match serde_json::to_writer(&mut count, value) {
+        Ok(()) => count.0,
+        Err(_) => usize::MAX,
     }
 }
 
@@ -235,6 +373,7 @@ fn bound(grammar: Grammar, tokens: &[String]) -> Grammar {
         leaf @ (Grammar::AnyText { .. }
         | Grammar::Regex(_)
         | Grammar::JsonSchema { .. }
+        | Grammar::Ebnf(_)
         | Grammar::Token(_)) => leaf,
     }
 }
@@ -269,16 +408,6 @@ fn split_tokens(text: String, tokens: &[String]) -> Grammar {
         }
     }
     Grammar::Sequence(pieces)
-}
-
-/// `written` with `stop_after_first` set when the tags stop after the first: the key is left out
-/// otherwise, the engines' default, so a tag that asks for any number of calls is written as it
-/// was before the key existed.
-fn stopping(mut written: Value, stop_after_first: bool) -> Value {
-    if stop_after_first {
-        written["stop_after_first"] = Value::Bool(true);
-    }
-    written
 }
 
 /// The nodes of a JSON value: one per scalar, one per object or array and one per member, and
@@ -374,6 +503,26 @@ pub struct Options {
     /// the first call, and the call's end carries what the template writes after the last call to
     /// end the turn, so nothing else can follow.
     pub one_call: bool,
+    /// Where the engine starts the grammar when the prompt left the model inside its thought.
+    pub start: GrammarStart,
+}
+
+/// Where an engine starts a request's grammar on a prompt that leaves the model inside its
+/// thought: at the first generated token, so the grammar must admit the thought and its close
+/// before what it asks for; or once the engine's own reasoning parser has seen the thought's
+/// close, so the grammar starts where the answer or the calls do and nothing may precede them.
+/// An engine that does not say gets a prefix of free text with nothing owed at its end, which
+/// fits either kind where a trigger opens what follows (a block of calls) and is left as it is
+/// where none does (an answer's schema, which such an engine then holds to loosely).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GrammarStart {
+    /// The engine does not say where it starts.
+    #[default]
+    Unknown,
+    /// The engine starts the grammar once its reasoning parser has seen the thought's close.
+    AfterReasoning,
+    /// The engine starts the grammar at the first generated token.
+    FirstToken,
 }
 
 /// How many calls a syntax's tag holds, and what follows the last: the request's two bounds and
@@ -412,7 +561,7 @@ impl Count<'_> {
         let tags = tags
             .into_iter()
             .map(|tag| Tag {
-                end: self.end(tag.end),
+                end: tag.end.map(|end| self.end(end)),
                 ..tag
             })
             .collect();
@@ -472,6 +621,7 @@ impl Format {
                 at_least_one,
                 reasoning_open,
                 one_call: false,
+                start: GrammarStart::Unknown,
             },
         )
     }
@@ -562,7 +712,7 @@ impl Format {
             // for the function `tool_choice` names; the format derives nothing of its own.
             CallSyntax::ForcedArguments => return None,
         };
-        self.led(calls, options.reasoning_open, prefixed)
+        self.led(calls, options.reasoning_open, prefixed, options.start)
             .map(|grammar| self.bounded(grammar))
     }
 
@@ -583,9 +733,24 @@ impl Format {
     /// model starts, or, with the thought open, a thought that closes only into the block, as for
     /// [`Self::grammar`]; a thought the model may write first leads the answer as it leads a call.
     pub fn answer_grammar(&self, schema: &Value, reasoning_open: bool) -> Option<Grammar> {
+        self.answer_grammar_for(schema, reasoning_open, GrammarStart::Unknown)
+    }
+
+    /// [`Self::answer_grammar`] for an engine whose grammar starts at `start`: an engine that
+    /// starts after its reasoning parser has seen the thought's close gets the schema alone, as
+    /// the answer begins where its grammar does; one that starts at the first token gets the
+    /// thought, closed, before the schema ([`Self::led`]).
+    pub fn answer_grammar_for(
+        &self,
+        schema: &Value,
+        reasoning_open: bool,
+        start: GrammarStart,
+    ) -> Option<Grammar> {
         let answer = Grammar::JsonSchema {
             schema: schema.clone(),
             style: None,
+            excludes: Vec::new(),
+            whitespace: self.answer_whitespace(),
         };
         let content = self.answer_state()?;
         let (before, after) = self.around(|layout| layout.answer.as_ref());
@@ -603,20 +768,31 @@ impl Format {
                 _ => Grammar::Sequence(parts),
             };
             return self
-                .led(answer, reasoning_open, true)
+                .led(answer, reasoning_open, true, start)
                 .map(|grammar| self.bounded(grammar));
         }
         // The model starts in its thought when the prompt opened it, and otherwise in the turn's
         // own state, which a thought written first also closes back to.
-        let start = match self.state_emitting(Emits::Reasoning) {
+        let from = match self.state_emitting(Emits::Reasoning) {
             Some(reasoning) if reasoning_open => reasoning,
             _ => 0,
         };
-        let way = self.way_in(start, content)?;
+        let way = self.way_in(from, content)?;
         // The thought's close and what the layout writes after a thought, then the rows into the
         // answer, what the layout writes before an answer standing right before the last of them,
-        // the terminal that opens it.
-        let mut begin = way.close.unwrap_or("").to_string();
+        // the terminal that opens it. An engine that starts the grammar after its reasoning
+        // parser has seen the close has consumed it, and so has the closed thought that leads the
+        // tag for an engine starting at the first token ([`Self::led`]): the tag starts with what
+        // follows, else the model would be made to write the close again, spelled into its answer.
+        let consumed = reasoning_open
+            && matches!(
+                start,
+                GrammarStart::AfterReasoning | GrammarStart::FirstToken
+            );
+        let mut begin = match way.close {
+            Some(close) if !consumed => close.to_string(),
+            _ => String::new(),
+        };
         if way.close.is_some() {
             begin.push_str(self.around(|layout| layout.thought.as_ref()).1);
         }
@@ -644,13 +820,17 @@ impl Format {
             Grammar::Tag(Tag::new(begin, answer, end)),
             reasoning_open,
             false,
+            start,
         )
         .map(|grammar| self.bounded(grammar))
     }
 
     /// `body` after what the model writes before it. With the prompt's thought open, the prefix
     /// for a tag that takes one (`prefixed`, [`Self::after_the_thought`]), and nothing for a tag
-    /// whose ways in close the thought themselves. With the thought not open, the thought itself
+    /// whose ways in close the thought themselves, when the engine does not say where it starts
+    /// the grammar; nothing either way for one that starts after its reasoning parser, and the
+    /// thought closed by its own marker either way for one that starts at the first token
+    /// ([`Self::after_the_closed_thought`]). With the thought not open, the thought itself
     /// where the table writes one before every call and answer ([`Format::thinks_first`]): the
     /// thought's opener, its text, which writes none of the table's terminals nor the call
     /// syntax's inner tags, and its close; `None` when the thought does not open from the turn's
@@ -658,12 +838,25 @@ impl Format {
     /// to the model, the turn's own state opening it and closing an empty one, admits it first
     /// ([`Self::thought_the_model_may_write_first`]); one that does neither has nothing before
     /// `body`.
-    fn led(&self, body: Grammar, reasoning_open: bool, prefixed: bool) -> Option<Grammar> {
+    fn led(
+        &self,
+        body: Grammar,
+        reasoning_open: bool,
+        prefixed: bool,
+        start: GrammarStart,
+    ) -> Option<Grammar> {
         if reasoning_open {
-            return if prefixed {
-                self.after_the_thought(body)
-            } else {
-                Some(body)
+            return match start {
+                // The engine starts the grammar where the thought's close left it: nothing of
+                // the thought precedes `body`, as nothing precedes it at the engine's own server.
+                GrammarStart::AfterReasoning => Some(body),
+                // The engine runs the grammar from the first token, the model inside its thought:
+                // the thought, closed by its own marker, comes first whether or not the tag takes
+                // a prefix, else the engine would force the tag's first text (a way in restating
+                // the close, or the body itself) before the model has thought.
+                GrammarStart::FirstToken => self.after_the_closed_thought(body),
+                GrammarStart::Unknown if prefixed => self.after_the_thought(body),
+                GrammarStart::Unknown => Some(body),
             };
         }
         if !self.writes_thought_first() {
@@ -715,6 +908,28 @@ impl Format {
         let own: Vec<&str> = std::iter::once(open).chain(closes).collect();
         let excludes = self.excluded_but(&own);
         Some(Grammar::Sequence(vec![Grammar::AnyText { excludes }, body]))
+    }
+
+    /// `body` after the prompt's open thought, for an engine that starts the grammar at the
+    /// first token: the thought's text, which writes none of the table's terminals, ends at one
+    /// of the thought's closes, and `body` follows at once, so the engine neither forces `body`
+    /// into the thought nor lets free text run on after the close. A table without a thought has
+    /// no prefix, and gives `body` as it is; a thought that closes only into the block has no
+    /// prefix, its close being its own way in, and gives `None` ([`Self::thought_markers`]).
+    fn after_the_closed_thought(&self, body: Grammar) -> Option<Grammar> {
+        let Some(reasoning) = self.state_emitting(Emits::Reasoning) else {
+            return Some(body);
+        };
+        let (_, closes) = self.thought_markers(reasoning)?;
+        let end = match closes.as_slice() {
+            [close] => Bound::Text((*close).to_string()),
+            closes => Bound::Texts(closes.iter().map(|close| (*close).to_string()).collect()),
+        };
+        let text = Grammar::AnyText {
+            excludes: self.excluded_but(&[]),
+        };
+        let thought = Grammar::Tag(Tag::bounded("", text, end));
+        Some(Grammar::Sequence(vec![thought, body]))
     }
 
     /// The thought's opener and the closes the model writes for it. Where the thought closes
@@ -845,6 +1060,8 @@ impl Format {
                     Grammar::JsonSchema {
                         schema: tool.function.parameters.clone(),
                         style: None,
+                        excludes: Vec::new(),
+                        whitespace: Whitespace::Free,
                     },
                     format!("}}\n{}", markers.call_close),
                 )
@@ -881,6 +1098,8 @@ impl Format {
                     Grammar::JsonSchema {
                         schema: tool.function.parameters.clone(),
                         style: None,
+                        excludes: Vec::new(),
+                        whitespace: Whitespace::Free,
                     },
                     format!("}}{close}"),
                 )
@@ -913,6 +1132,8 @@ impl Format {
                     Grammar::JsonSchema {
                         schema: tool.function.parameters.clone(),
                         style: None,
+                        excludes: Vec::new(),
+                        whitespace: Whitespace::Free,
                     },
                     "",
                 )
@@ -944,6 +1165,8 @@ impl Format {
                         Grammar::JsonSchema {
                             schema: tool.function.parameters.clone(),
                             style: None,
+                            excludes: Vec::new(),
+                            whitespace: Whitespace::Free,
                         },
                         Grammar::ConstString("}".to_string()),
                     ])
@@ -1008,6 +1231,8 @@ impl Format {
                     Grammar::JsonSchema {
                         schema: tool.function.parameters.clone(),
                         style: Some("glm_xml".to_string()),
+                        excludes: Vec::new(),
+                        whitespace: Whitespace::Free,
                     },
                     markers.call_close,
                 )
@@ -2298,6 +2523,7 @@ mod tests {
                     at_least_one,
                     reasoning_open,
                     one_call: true,
+                    start: GrammarStart::Unknown,
                 },
             )
             .expect("a grammar")
@@ -2510,6 +2736,7 @@ mod tests {
                             at_least_one,
                             reasoning_open,
                             one_call: false,
+                            start: GrammarStart::Unknown,
                         },
                     ),
                     format.grammar(&tools, at_least_one, reasoning_open),
@@ -2836,6 +3063,7 @@ mod tests {
                             at_least_one: true,
                             reasoning_open,
                             one_call,
+                            start: GrammarStart::Unknown,
                         },
                     )
                     .expect("a tag")
@@ -2853,6 +3081,166 @@ mod tests {
             .expect("a tag")
             .payload();
         assert_eq!(call["format"]["elements"][0]["type"], "any_text");
+    }
+
+    #[test]
+    fn where_the_engine_starts_the_grammar_decides_what_precedes_the_answer_and_the_calls() {
+        // DeepSeek V4's template leaves the model inside its thought. An engine that does not say
+        // where it starts gets the prefix of free text, the thought's own markers writable and
+        // nothing owed at its end; one that starts after its reasoning parser has seen the close
+        // gets the schema alone and the bare block of calls, as its own server forces them; one
+        // that starts at the first token gets the thought as a tag closed by `</think>` and then
+        // the schema or the calls, so free text cannot run on after the close.
+        let format = formats::deepseek_v4();
+        let reasoning_open =
+            format.reasoning_open("<｜User｜>Weather in Paris?<｜Assistant｜><think>");
+        assert!(reasoning_open);
+        let tools = weather_tools();
+        let schema = value!({"type": "json_schema", "json_schema": answer_schema()});
+        let answer_for = |start| {
+            format
+                .answer_grammar_for(&answer_schema(), reasoning_open, start)
+                .expect("an answer")
+                .payload()
+        };
+        let calls_for = |start| {
+            format
+                .grammar_for(
+                    &tools,
+                    Options {
+                        at_least_one: true,
+                        reasoning_open,
+                        one_call: false,
+                        start,
+                    },
+                )
+                .expect("a tag")
+                .payload()
+        };
+        let unknown = answer_for(GrammarStart::Unknown);
+        assert_eq!(unknown["format"]["type"], "sequence");
+        assert_eq!(unknown["format"]["elements"][0]["type"], "any_text");
+        assert_eq!(unknown["format"]["elements"][1], schema);
+        assert_eq!(
+            calls_for(GrammarStart::Unknown)["format"]["elements"][0]["type"],
+            "any_text"
+        );
+        assert_eq!(
+            answer_for(GrammarStart::AfterReasoning),
+            value!({"format": schema}),
+            "after the reasoning parser's gate the schema stands alone"
+        );
+        // The bare block at the gate: its opener first, no free text before it.
+        let bare = calls_for(GrammarStart::AfterReasoning);
+        assert_eq!(
+            bare["format"]["elements"][0]["type"], "const_string",
+            "{bare}"
+        );
+        assert!(
+            bare["format"]["elements"][0]["value"]
+                .as_str()
+                .is_some_and(|opener| opener.contains("tool_calls")),
+            "{bare}"
+        );
+        let first = answer_for(GrammarStart::FirstToken);
+        assert_eq!(first["format"]["type"], "sequence");
+        let thought = &first["format"]["elements"][0];
+        assert_eq!(thought["type"], "tag");
+        assert_eq!(thought["begin"], "");
+        assert_eq!(thought["end"], "</think>");
+        assert_eq!(thought["content"]["type"], "any_text");
+        let excludes = thought["content"]["excludes"]
+            .as_array()
+            .expect("excludes")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(excludes.contains(&"</think>"), "{excludes:?}");
+        assert!(excludes.contains(&"<think>"), "{excludes:?}");
+        assert_eq!(first["format"]["elements"][1], schema);
+        let first_calls = calls_for(GrammarStart::FirstToken);
+        assert_eq!(first_calls["format"]["elements"][0], *thought);
+        assert_eq!(
+            first_calls["format"]["elements"][1], bare["format"],
+            "the calls after the closed thought are the bare block"
+        );
+        // A table whose answer is a region of its own (Kimi K3's response) enters it from the
+        // thought with the thought's close first; after the gate the engine has consumed that
+        // close, and the tag starts with the way into the answer, so the model is not made to
+        // spell the close into its answer.
+        let kimi = formats::kimi_k3();
+        let prompt = "<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>";
+        assert!(kimi.reasoning_open(prompt));
+        let close = "<|close|>think<|sep|>";
+        let unknown = kimi
+            .answer_grammar_for(&answer_schema(), true, GrammarStart::Unknown)
+            .expect("an answer")
+            .payload();
+        let begin = unknown["format"]["begin"].as_str().expect("a tag");
+        assert!(begin.starts_with(close), "{begin}");
+        let gated = kimi
+            .answer_grammar_for(&answer_schema(), true, GrammarStart::AfterReasoning)
+            .expect("an answer")
+            .payload();
+        let gated_begin = gated["format"]["begin"].as_str().expect("a tag");
+        assert_eq!(gated_begin, &begin[close.len()..]);
+        assert_eq!(gated["format"]["content"], unknown["format"]["content"]);
+        assert_eq!(gated["format"]["end"], unknown["format"]["end"]);
+        // From the first token the engine runs the grammar with the model inside its thought:
+        // the thought, closed by its own marker, comes first, and the answer's tag follows as it
+        // does after the gate, the close consumed, so the model thinks before it answers and is
+        // not made to spell the close.
+        let first = kimi
+            .answer_grammar_for(&answer_schema(), true, GrammarStart::FirstToken)
+            .expect("an answer")
+            .payload();
+        assert_eq!(first["format"]["type"], "sequence", "{first}");
+        assert_eq!(first["format"]["elements"][0]["type"], "tag");
+        assert_eq!(first["format"]["elements"][0]["begin"], "");
+        assert_eq!(first["format"]["elements"][0]["end"], close);
+        assert_eq!(first["format"]["elements"][1], gated["format"]);
+        // The forced calls the same way: Kimi K3's block has its own ways in, so the tag takes no
+        // prefix when the engine does not say or starts after the gate, and the closed thought
+        // still leads it from the first token.
+        let calls_for = |start| {
+            kimi.grammar_for(
+                &tools,
+                Options {
+                    at_least_one: true,
+                    reasoning_open: true,
+                    one_call: false,
+                    start,
+                },
+            )
+            .expect("a tag")
+            .payload()
+        };
+        let unknown_calls = calls_for(GrammarStart::Unknown);
+        assert_eq!(calls_for(GrammarStart::AfterReasoning), unknown_calls);
+        let first_calls = calls_for(GrammarStart::FirstToken);
+        assert_eq!(first_calls["format"]["type"], "sequence", "{first_calls}");
+        assert_eq!(
+            first_calls["format"]["elements"][0],
+            first["format"]["elements"][0]
+        );
+        assert_eq!(
+            first_calls["format"]["elements"][1],
+            unknown_calls["format"]
+        );
+        // A table whose turn closes the thought itself takes no prefix, whatever the start.
+        let closed = formats::minimax_m3();
+        assert!(!closed.reasoning_open("]~b]ai\n"));
+        for start in [
+            GrammarStart::Unknown,
+            GrammarStart::AfterReasoning,
+            GrammarStart::FirstToken,
+        ] {
+            assert_eq!(
+                closed.answer_grammar_for(&answer_schema(), false, start),
+                closed.answer_grammar(&answer_schema(), false),
+                "{start:?}"
+            );
+        }
     }
 
     #[test]
@@ -2934,6 +3322,7 @@ mod tests {
                 at_least_one: true,
                 reasoning_open: false,
                 one_call,
+                start: GrammarStart::Unknown,
             };
             let calls = plain
                 .grammar_for(&tools, options)
@@ -3513,6 +3902,7 @@ mod tests {
                 at_least_one,
                 reasoning_open,
                 one_call,
+                start: GrammarStart::Unknown,
             };
             let before = plain.grammar_for(&tools, options).expect("a grammar");
             let after = bounded.grammar_for(&tools, options).expect("a grammar");
@@ -3695,5 +4085,166 @@ mod tests {
                 ]},
             ]})
         );
+    }
+
+    #[test]
+    fn an_end_list_json_excludes_and_ebnf_write_the_engines_keys() {
+        // A tag that ends at whichever of several texts comes first, JSON whose strings leave
+        // words out (written only when there are words to leave out), JSON whose whitespace is
+        // bounded (written only when it is), and an EBNF grammar.
+        let excluding = |excludes: &[&str]| Grammar::JsonSchema {
+            schema: value!({"type": "string"}),
+            style: None,
+            excludes: excludes.iter().map(|word| word.to_string()).collect(),
+            whitespace: Whitespace::Free,
+        };
+        let grammar = Grammar::Sequence(vec![
+            Grammar::Tag(Tag {
+                begin: "<a>".to_string(),
+                content: Box::new(excluding(&["</a>"])),
+                end: Bound::Texts(vec!["</a>".to_string(), "</b>".to_string()]),
+            }),
+            excluding(&[]),
+            Grammar::JsonSchema {
+                schema: value!({"type": "object"}),
+                style: None,
+                excludes: Vec::new(),
+                whitespace: Whitespace::Bounded(16),
+            },
+            Grammar::Ebnf("root ::= \"yes\"".to_string()),
+        ]);
+        assert_eq!(
+            grammar.to_json(),
+            value!({"type": "sequence", "elements": [
+                {"type": "tag", "begin": "<a>",
+                 "content": {"type": "json_schema", "json_schema": {"type": "string"},
+                             "excludes": ["</a>"]},
+                 "end": ["</a>", "</b>"]},
+                {"type": "json_schema", "json_schema": {"type": "string"}},
+                {"type": "json_schema", "json_schema": {"type": "object"},
+                 "max_whitespace_cnt": 16},
+                {"type": "grammar", "grammar": "root ::= \"yes\""},
+            ]})
+        );
+    }
+
+    /// The JSON schema node of a tag, wherever it stands: the answer's, under the thought or the
+    /// rows that lead to it.
+    fn json_schema_node(format: &Value) -> Option<&Value> {
+        if format["type"] == "json_schema" {
+            return Some(format);
+        }
+        ["elements", "tags"]
+            .iter()
+            .filter_map(|key| format[*key].as_array())
+            .flatten()
+            .chain(format.get("content"))
+            .find_map(json_schema_node)
+    }
+
+    #[test]
+    fn a_table_that_bounds_the_answers_whitespace_writes_the_bound_on_its_schema_alone() {
+        // LFM2.5's table bounds the runs of whitespace in a JSON answer; the bound is written on
+        // the answer's schema node, for every start and whether or not the prompt left the thought
+        // open, for a schema and for `json_object`'s bare object alike, and nowhere else: the
+        // calls' values are the schema's, and a table that does not bound keeps the node as it was.
+        let lfm = formats::lfm2_5();
+        let schema = value!({"type": "object", "properties": {"city": {"type": "string"}}});
+        for reasoning_open in [false, true] {
+            for start in [
+                GrammarStart::Unknown,
+                GrammarStart::AfterReasoning,
+                GrammarStart::FirstToken,
+            ] {
+                for schema in [&schema, &value!({"type": "object"})] {
+                    let answer = lfm
+                        .answer_grammar_for(schema, reasoning_open, start)
+                        .expect("an answer")
+                        .payload();
+                    let node = json_schema_node(&answer["format"]).expect("the schema node");
+                    assert_eq!(node["json_schema"], *schema, "{answer}");
+                    assert_eq!(
+                        node["max_whitespace_cnt"], 32,
+                        "reasoning_open={reasoning_open} {start:?}: {answer}"
+                    );
+                }
+            }
+            let calls = lfm
+                .grammar_for(
+                    &weather_tools(),
+                    Options {
+                        at_least_one: true,
+                        reasoning_open,
+                        one_call: false,
+                        start: GrammarStart::Unknown,
+                    },
+                )
+                .expect("a tag")
+                .payload_text();
+            assert!(!calls.contains("max_whitespace_cnt"), "{calls}");
+        }
+        let qwen = formats::qwen3(CallSyntax::Json)
+            .answer_grammar_for(&schema, false, GrammarStart::Unknown)
+            .expect("an answer")
+            .payload_text();
+        assert!(!qwen.contains("max_whitespace_cnt"), "{qwen}");
+    }
+
+    #[test]
+    fn the_payload_text_is_the_payloads_json_written_straight() {
+        // Every node, both kinds of bound, a schema with a style and with words to leave out, tags
+        // that stop after the first and tags that do not: the text written from the tree is the
+        // JSON tree's, and its length is counted alike.
+        let tag = |end: Bound| {
+            Tag::bounded(
+                "<t\"\n>",
+                Grammar::Plus(Box::new(Grammar::Token("<|u|>".to_string()))),
+                end,
+            )
+        };
+        let grammar = Grammar::Sequence(vec![
+            Grammar::TriggeredTags {
+                triggers: vec!["<a\"\n>".to_string()],
+                tags: vec![tag(Bound::Text("</a>".to_string()))],
+                at_least_one: true,
+                stop_after_first: false,
+            },
+            Grammar::TriggeredTags {
+                triggers: vec!["<b>".to_string()],
+                tags: vec![tag(Bound::Text("</b>".to_string()))],
+                at_least_one: false,
+                stop_after_first: true,
+            },
+            Grammar::TagsWithSeparator {
+                tags: vec![tag(Bound::Texts(vec!["x".to_string(), "y".to_string()]))],
+                separator: "\u{1}\u{e9}".to_string(),
+                at_least_one: false,
+                stop_after_first: false,
+            },
+            Grammar::TagsWithSeparator {
+                tags: vec![tag(Bound::Text("z".to_string()))],
+                separator: ",".to_string(),
+                at_least_one: true,
+                stop_after_first: true,
+            },
+            Grammar::Tag(tag(Bound::Text("<|e|>".to_string()))),
+            Grammar::JsonSchema {
+                schema: value!({"z": [1, 2.5, null], "a": {"b": "\t"}}),
+                style: Some("glm_xml".to_string()),
+                excludes: vec!["<|e|>".to_string()],
+                whitespace: Whitespace::Bounded(8),
+            },
+            Grammar::Ebnf("root ::= \"yes\"".to_string()),
+            Grammar::Or(vec![
+                Grammar::Optional(Box::new(Grammar::Regex("[0-9]+".to_string()))),
+                Grammar::Star(Box::new(Grammar::AnyText {
+                    excludes: Vec::new(),
+                })),
+                Grammar::ConstString("c".to_string()),
+            ]),
+        ]);
+        let text = grammar.payload_text();
+        assert_eq!(text, grammar.payload().to_string());
+        assert_eq!(grammar.payload_len(), text.len());
     }
 }

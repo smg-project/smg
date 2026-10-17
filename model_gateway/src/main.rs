@@ -1,4 +1,7 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
@@ -27,9 +30,9 @@ use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
-        bind_socket_addr, resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
-        CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, FileDiscoveryConfig,
-        HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind,
+        bind_socket_addr, resolve_worker_auto_recovery, validate_mesh_server_name, AccessLogField,
+        CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
+        FileDiscoveryConfig, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig,
         ManualAssignmentMode, MemoryConfig, MetricsConfig, OracleConfig, ParserChoice,
         PdPairingMode, PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric, RedisConfig,
         RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig,
@@ -37,12 +40,9 @@ use smg::{
         DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
     },
     mesh_discovery::MeshDiscoveryConfig,
-    observability::{
-        logging::close_logging,
-        metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
-        otel_trace::{is_otel_enabled, shutdown_otel},
-    },
+    observability::metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
     policies::cost::DEFAULT_POLICY as DEFAULT_SELECTION_POLICY,
+    posture::{SecretSource, SecretSources},
     server::{self, ServerConfig},
     service_discovery::{ModelIdSource, RuntimeDiscoveryConfig},
     version,
@@ -242,10 +242,22 @@ fn parse_transport_mode(value: &str) -> Result<TransportMode, String> {
         .ok_or_else(|| format!("invalid value '{value}'; expected inline, shm, auto, or rdma"))
 }
 
-/// Parse the `--kv-index` value into a `KvIndexKind`.
-fn parse_kv_index_kind(value: &str) -> Result<KvIndexKind, String> {
-    KvIndexKind::parse(value)
-        .ok_or_else(|| format!("invalid value '{value}'; expected positional or chain"))
+/// Parse the deprecated `--kv-index` value. The chain index is the only KV
+/// index, so `chain` is the one value accepted; `positional` names the index
+/// that went with kv-index 2.0.0 and is refused with the reason.
+fn parse_kv_index(value: &str) -> Result<String, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "chain" => Ok("chain".to_string()),
+        "positional" => Err(
+            "the positional KV index was removed (kv-index 2.0.0): the chain index is the \
+             only KV index, drop --kv-index"
+                .to_string(),
+        ),
+        _ => Err(format!(
+            "invalid value '{value}'; the chain index is the only KV index, so --kv-index \
+             takes chain only (and is deprecated)"
+        )),
+    }
 }
 
 /// Parse the `--power-of-two-load-metric` value into a `PowerOfTwoLoadMetric`.
@@ -253,6 +265,11 @@ fn parse_power_of_two_load_metric(value: &str) -> Result<PowerOfTwoLoadMetric, S
     PowerOfTwoLoadMetric::parse(value).ok_or_else(|| {
         format!("invalid value '{value}'; expected expected_wait, requests, or least_requests")
     })
+}
+
+/// Parse one `--access-log-fields` name into an `AccessLogField`.
+fn parse_access_log_field(value: &str) -> Result<AccessLogField, String> {
+    value.parse()
 }
 
 /// Parse the `--mm-processing` value into an `MmProcessingMode`.
@@ -310,8 +327,30 @@ fn parse_job_queue_concurrency(value: &str) -> Result<usize, String> {
 // --sticky-sessions (--routing-key-override) and --worker-auto-recovery
 // (--remove-unhealthy-workers); the hidden ones: --model (--model-path),
 // --runtime (--backend), and `start` for the `launch` subcommand.
+// Keep clap's generated construction functions on sibling stack frames. In
+// debug builds, deriving all flags together exceeds a 2 MiB thread stack.
+// Add flags to their responsibility's group so construction stays bounded;
+// flatten and declaration order preserve the existing CLI and help layout.
 #[derive(Parser, Debug)]
+#[group(skip)]
 struct CliArgs {
+    #[command(flatten)]
+    routing: RoutingArgs,
+    #[command(flatten)]
+    workers: WorkerArgs,
+    #[command(flatten)]
+    discovery: DiscoveryArgs,
+    #[command(flatten)]
+    serving: ServingArgs,
+    #[command(flatten)]
+    model: ModelArgs,
+    #[command(flatten)]
+    integrations: IntegrationArgs,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(skip)]
+struct RoutingArgs {
     // ==================== Worker Configuration ====================
     /// Host address to bind the router server: an IP literal, IPv6 with or
     /// without brackets (`0.0.0.0`, `::`, `[::]`, `[fd00::1]`)
@@ -334,6 +373,26 @@ struct CliArgs {
     /// Unset = dedicated probe listener off.
     #[arg(long, help_heading = "Worker Configuration")]
     health_check_port: Option<u16>,
+
+    /// Port of the admin listener. When set, the control-plane routes (the
+    /// admin routes /flush_cache, /start_profile, /stop_profile,
+    /// /heap_profile, /get_loads, /parse/*, /wasm and /v1/tokenizers, the
+    /// worker-registry routes /workers and the RL routes /v1/rl) are served
+    /// there, with /health, /liveness and /readiness, and the data listener
+    /// (--port) answers 404 for them: the control plane can sit on a private
+    /// address, behind its own network policy, off the data port's ingress.
+    /// Control-plane authentication applies on it as it does on the data
+    /// listener. The public /loads stays on the data listener (a gateway
+    /// registered as a worker is polled there) and names the backends as
+    /// before. Each listener needs its own port. Unset = the control plane
+    /// stays on the data listener
+    #[arg(long, help_heading = "Worker Configuration")]
+    admin_port: Option<u16>,
+
+    /// Bind host of the admin listener (needs --admin-port). Defaults to
+    /// --host
+    #[arg(long, help_heading = "Worker Configuration")]
+    admin_host: Option<String>,
 
     /// List of worker URLs (supports IPv4 and IPv6)
     #[arg(long, num_args = 0.., help_heading = "Worker Configuration")]
@@ -404,6 +463,10 @@ struct CliArgs {
         help_heading = "Routing Policy"
     )]
     balance_rel_threshold: f32,
+
+    /// Seconds between the bucket policy's boundary adjustments (at least 1)
+    #[arg(long, default_value_t = 5, help_heading = "Routing Policy")]
+    bucket_adjust_interval_secs: usize,
 
     /// Abandon cache affinity for shortest-queue when the KV-usage spread
     /// (hottest minus coldest backend, 0.0-1.0) exceeds this — catches
@@ -659,28 +722,30 @@ struct CliArgs {
     #[arg(long, default_value_t = 8, help_heading = "Routing Policy")]
     worker_warmup_divert_every: u64,
 
-    /// TTL in seconds for event-driven cache-aware indexer entries: entries
-    /// neither stored nor read by a query within this window are pruned.
-    /// Bounds index growth when a backend stops emitting removal events.
-    /// Unset or 0 disables the TTL pass.
+    /// Deprecated and ignored: the TTL prune of the positional indexer, which
+    /// the chain index replaced. The chain index holds what the engines report
+    /// and shrinks with their removals, so it has no prune; the flag is still
+    /// accepted so that existing launch lines keep working, and goes in a
+    /// later release.
     #[arg(long, help_heading = "Routing Policy")]
     kv_indexer_ttl_secs: Option<u64>,
 
-    /// Capacity ceiling per model for the event-driven cache-aware indexer;
-    /// beyond it, oldest-touched entries are pruned down to 90% of the
-    /// ceiling. Unset or 0 disables the ceiling.
+    /// Deprecated and ignored: the capacity ceiling of the positional
+    /// indexer's prune; see --kv-indexer-ttl-secs.
     #[arg(long, help_heading = "Routing Policy")]
     kv_indexer_max_entries: Option<usize>,
 
-    /// The event-driven KV index behind cache-aware routing: `positional`
-    /// (one entry per block position, the default) or `chain` (chains as runs
-    /// with per-run worker coverage; lock-free, store-free lookups; `run` is
-    /// its deprecated spelling). The --kv-indexer-* prune bounds apply to the
-    /// positional index only; the chain index holds what the engines report
-    /// and shrinks with their removals.
-    #[arg(long, default_value = "positional", value_parser = parse_kv_index_kind, help_heading = "Routing Policy")]
-    kv_index: KvIndexKind,
+    /// Deprecated: the chain index is the only KV index behind cache-aware
+    /// routing, so this takes `chain` only and does nothing; the flag goes in
+    /// a later release. `positional` names the index that was removed and is
+    /// refused.
+    #[arg(long, value_parser = parse_kv_index, help_heading = "Routing Policy")]
+    kv_index: Option<String>,
+}
 
+#[derive(clap::Args, Debug)]
+#[group(skip)]
+struct WorkerArgs {
     // ==================== RL Control Plane ====================
     /// Mount the RL control plane under /v1/rl (worker discovery,
     /// engine-route passthrough, fan-out). Off by default; when off, no RL
@@ -880,8 +945,10 @@ struct CliArgs {
     #[arg(long, action = ArgAction::SetTrue, help_heading = "Multimodal")]
     mm_allow_private_media_hosts: bool,
 
-    /// Listener IP for the RDMA pixel lane's metadata exchange; without one
-    /// the lane stays on the inline path. Falls back to `SMG_RDMA_LISTEN_IP`.
+    /// Listener IP for the RDMA pixel lane's metadata exchange, a plain IPv4
+    /// or IPv6 address (no hostname, port or brackets: the workers connect to
+    /// it as written); without one the lane stays on the inline path. Falls
+    /// back to `SMG_RDMA_LISTEN_IP`.
     #[arg(long, help_heading = "Multimodal")]
     rdma_listen_ip: Option<String>,
 
@@ -896,7 +963,11 @@ struct CliArgs {
     /// `SMG_LOG_MM_TIMING`.
     #[arg(long, action = ArgAction::SetTrue, help_heading = "Multimodal")]
     log_mm_timing: bool,
+}
 
+#[derive(clap::Args, Debug)]
+#[group(skip)]
+struct DiscoveryArgs {
     // ==================== Service Discovery (Kubernetes) ====================
     /// Enable Kubernetes service discovery (the legacy spelling of
     /// `--discovery-provider kubernetes`)
@@ -991,7 +1062,11 @@ struct CliArgs {
     /// which is also reread as soon as it changes (default: 30)
     #[arg(long, help_heading = "Service Discovery (File)")]
     discovery_check_interval_secs: Option<u64>,
+}
 
+#[derive(clap::Args, Debug)]
+#[group(skip)]
+struct ServingArgs {
     // ==================== Logging ====================
     /// Directory for the log files, created at start-up when missing (under
     /// a writable directory); an existing path must be a writable directory
@@ -1006,6 +1081,13 @@ struct CliArgs {
     /// Output logs as JSON
     #[arg(long, default_value_t = false, help_heading = "Logging")]
     log_json: bool,
+
+    /// Optional fields of the access-log record, comma-separated:
+    /// client_addr, forwarded_for, user_agent, tenant, key_id,
+    /// request_bytes, response_bytes, worker (default: none, the record
+    /// keeps the fields it has always had)
+    #[arg(long, value_delimiter = ',', value_parser = parse_access_log_field, help_heading = "Logging")]
+    access_log_fields: Vec<AccessLogField>,
 
     // ==================== Prometheus Metrics ====================
     /// Port to expose Prometheus metrics (at least 1). Each listener (--port,
@@ -1125,6 +1207,21 @@ struct CliArgs {
     /// connections open until the client closes them
     #[arg(long, default_value_t = 90, help_heading = "Request Handling")]
     idle_connection_timeout_secs: u64,
+
+    /// Most client connections the data listener (--port) holds open at
+    /// once, counted from accept to close (idle keep-alive connections,
+    /// connections inside a TLS handshake and upgraded connections included).
+    /// A connection beyond the bound is closed at once, before any TLS
+    /// handshake and without a response: the client sees its connection end
+    /// (an end of stream, or a reset when it had already sent its request)
+    /// and should retry with backoff; each is counted in
+    /// smg_http_connections_rejected_total. Readiness is unaffected. Probes
+    /// on the data port are subject to the bound like any connection: point
+    /// them at --health-check-port or --admin-port, which it does not cover
+    /// (the admin listener stays reachable while the data plane is
+    /// saturated). 0 = no bound
+    #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
+    max_connections: usize,
 
     /// Origins a browser may call the gateway from (exact origins,
     /// space-separated), or `*` alone for any origin. Without this flag the
@@ -1300,7 +1397,11 @@ struct CliArgs {
     /// remove immediately without draining.
     #[arg(long, default_value_t = 5, help_heading = "Health Checks")]
     drain_settle_secs: u64,
+}
 
+#[derive(clap::Args, Debug)]
+#[group(skip)]
+struct ModelArgs {
     // ==================== Tokenizer ====================
     /// Model path for loading tokenizer (HuggingFace ID, fetched lazily, or a
     /// local path: one that exists must hold a tokenizer layout; one that
@@ -1416,7 +1517,11 @@ struct CliArgs {
     /// Path to a YAML schema config file for storage table/column remapping; `auto_migrate: true` in it applies pending schema migrations at start-up (the environment variable DB_AUTO_MIGRATE=true does the same without a file)
     #[arg(long, help_heading = "Backend")]
     schema_config: Option<String>,
+}
 
+#[derive(clap::Args, Debug)]
+#[group(skip)]
+struct IntegrationArgs {
     // ==================== Oracle Database ====================
     /// Path to Oracle ATP wallet directory
     #[arg(long, env = "ATP_WALLET_PATH", help_heading = "Oracle Database")]
@@ -1435,7 +1540,12 @@ struct CliArgs {
     oracle_user: Option<String>,
 
     /// Oracle database password
-    #[arg(long, env = "ATP_PASSWORD", help_heading = "Oracle Database")]
+    #[arg(
+        long,
+        env = "ATP_PASSWORD",
+        hide_env_values = true,
+        help_heading = "Oracle Database"
+    )]
     oracle_password: Option<String>,
 
     /// Enable Oracle external authentication
@@ -1470,9 +1580,17 @@ struct CliArgs {
     oracle_pool_timeout_secs: Option<u64>,
 
     // ==================== PostgreSQL Database ====================
-    /// PostgreSQL database connection URL
+    /// PostgreSQL database connection URL (env: SMG_POSTGRES_DB_URL; or a
+    /// file holding it, --postgres-db-url-file). The flag beats the
+    /// environment; a URL and a URL file together are refused
     #[arg(long, help_heading = "PostgreSQL Database")]
     postgres_db_url: Option<String>,
+
+    /// File holding the PostgreSQL connection URL alone, such as a mounted
+    /// secret; the surrounding whitespace is dropped (env:
+    /// SMG_POSTGRES_DB_URL_FILE). Read when the history backend is postgres
+    #[arg(long, help_heading = "PostgreSQL Database")]
+    postgres_db_url_file: Option<PathBuf>,
 
     /// Maximum PostgreSQL connection pool size
     #[arg(long, help_heading = "PostgreSQL Database")]
@@ -1483,9 +1601,17 @@ struct CliArgs {
     postgres_op_timeout_secs: Option<u64>,
 
     // ==================== Redis Database ====================
-    /// Redis connection URL
+    /// Redis connection URL (env: SMG_REDIS_URL; or a file holding it,
+    /// --redis-url-file). The flag beats the environment; a URL and a URL
+    /// file together are refused
     #[arg(long, help_heading = "Redis Database")]
     redis_url: Option<String>,
+
+    /// File holding the Redis connection URL alone, such as a mounted
+    /// secret; the surrounding whitespace is dropped (env:
+    /// SMG_REDIS_URL_FILE). Read when the history backend is redis
+    #[arg(long, help_heading = "Redis Database")]
+    redis_url_file: Option<PathBuf>,
 
     /// Maximum Redis connection pool size
     #[arg(long, help_heading = "Redis Database")]
@@ -1508,6 +1634,20 @@ struct CliArgs {
     #[arg(long, help_heading = "TLS/mTLS Security")]
     tls_key_path: Option<String>,
 
+    /// Client certificate (PEM) presented to workers for mTLS; with
+    /// --client-key-path, both or neither
+    #[arg(long, help_heading = "TLS/mTLS Security")]
+    client_cert_path: Option<String>,
+
+    /// Client private key (PEM) for mTLS with workers; with --client-cert-path
+    #[arg(long, help_heading = "TLS/mTLS Security")]
+    client_key_path: Option<String>,
+
+    /// CA certificates (PEM) the workers' TLS certificates are verified
+    /// against; several paths per flag, and the flag repeats
+    #[arg(long, num_args = 0.., help_heading = "TLS/mTLS Security")]
+    ca_cert_paths: Vec<String>,
+
     // ==================== Tracing (OpenTelemetry) ====================
     /// Enable OpenTelemetry tracing
     #[arg(
@@ -1526,9 +1666,16 @@ struct CliArgs {
     otlp_traces_endpoint: String,
 
     // ==================== Control Plane Authentication ====================
-    /// API key for worker authorization
+    /// Shared API key the serving routes require and the admin routes fall
+    /// back to (env: SMG_API_KEY; or a file holding it, --api-key-file). The
+    /// flag beats the environment; a key and a key file together are refused
     #[arg(long, help_heading = "Control Plane Authentication")]
     api_key: Option<String>,
+
+    /// File holding the shared API key alone, such as a mounted secret; the
+    /// surrounding whitespace is dropped (env: SMG_API_KEY_FILE)
+    #[arg(long, help_heading = "Control Plane Authentication")]
+    api_key_file: Option<PathBuf>,
 
     /// JWT issuer URL for OIDC authentication
     #[arg(
@@ -1568,7 +1715,7 @@ struct CliArgs {
 
     /// API keys for control plane access (format: id:name:role:key; role `admin` reaches every
     /// control plane route, `user` the read-only GET/HEAD routes)
-    #[arg(long = "control-plane-api-keys", action = ArgAction::Append, env = "CONTROL_PLANE_API_KEYS", help_heading = "Control Plane Authentication")]
+    #[arg(long = "control-plane-api-keys", action = ArgAction::Append, env = "CONTROL_PLANE_API_KEYS", hide_env_values = true, help_heading = "Control Plane Authentication")]
     control_plane_api_keys: Vec<String>,
 
     /// Disable audit logging for control plane operations
@@ -1585,8 +1732,23 @@ struct CliArgs {
     /// tenant identity. Stored responses and conversations are scoped to the
     /// tenant that created them: another tenant's id answers 404; records
     /// stored without a tenant identity stay readable by every caller.
+    /// Also read from the environment (SMG_TENANT_API_KEYS, entries
+    /// separated by ',' or a newline) or a file (--tenant-api-keys-file);
+    /// the flag beats the environment, and entries together with a file are
+    /// refused.
     #[arg(long = "tenant-api-key", action = ArgAction::Append, help_heading = "Data Plane Authentication")]
     tenant_api_keys: Vec<String>,
+
+    /// File holding the per-tenant API keys, one tenant_id:key per line
+    /// (blank lines and lines starting with # are skipped), such as a
+    /// mounted secret (env: SMG_TENANT_API_KEYS_FILE)
+    #[arg(long, help_heading = "Data Plane Authentication")]
+    tenant_api_keys_file: Option<PathBuf>,
+
+    /// Where the secrets above were read from, filled by
+    /// `resolve_secret_sources` for the start-up record; not a flag.
+    #[arg(skip)]
+    secret_sources: SecretSources,
 
     // ==================== Mesh Server ====================
     #[arg(long, default_value_t = false)]
@@ -1642,9 +1804,12 @@ struct CliArgs {
     webrtc_stun_server: Option<String>,
 
     // ==================== Runtime ====================
-    /// Explicit async runtime worker-thread count, at least 1. Leave unset to
-    /// use tokio's default (`available_parallelism()`), which already honors the
-    /// cgroup CPU quota on Rust 1.95+ and is therefore container-aware.
+    /// Explicit async runtime worker-thread count, from 1 to 4096 on every
+    /// host (a refusal names the ceiling); a count above 4 x the CPUs
+    /// available to the process starts with a warning, since a worker thread
+    /// beyond the CPUs only waits for one. Leave unset to use tokio's default
+    /// (`available_parallelism()`), which already honors the cgroup CPU quota
+    /// on Rust 1.95+ and is therefore container-aware.
     #[arg(long, help_heading = "Runtime")]
     runtime_worker_threads: Option<usize>,
 }
@@ -1772,6 +1937,277 @@ fn parse_tenant_api_key(key_str: &str) -> ConfigResult<TenantApiKeyEntry> {
     })
 }
 
+// ==================== Secret sources ====================
+
+/// A secret the command line, the environment or a file can give: the
+/// names of its sources, for the resolution and for the refusals. A
+/// refusal names sources and paths; none carries a value.
+struct SecretSetting {
+    /// What the secret is, for the refusals.
+    what: &'static str,
+    /// The `ConfigError` field a bad file is reported under.
+    file_field: &'static str,
+    /// The flag taking the value.
+    flag: &'static str,
+    /// The environment variable taking the value.
+    env: &'static str,
+    /// The flag naming a file that holds the value.
+    file_flag: &'static str,
+    /// The environment variable naming that file.
+    file_env: &'static str,
+}
+
+const API_KEY_SETTING: SecretSetting = SecretSetting {
+    what: "the shared API key",
+    file_field: "api-key-file",
+    flag: "--api-key",
+    env: "SMG_API_KEY",
+    file_flag: "--api-key-file",
+    file_env: "SMG_API_KEY_FILE",
+};
+
+const TENANT_API_KEYS_SETTING: SecretSetting = SecretSetting {
+    what: "the tenant API keys",
+    file_field: "tenant-api-keys-file",
+    flag: "--tenant-api-key",
+    env: "SMG_TENANT_API_KEYS",
+    file_flag: "--tenant-api-keys-file",
+    file_env: "SMG_TENANT_API_KEYS_FILE",
+};
+
+const POSTGRES_DB_URL_SETTING: SecretSetting = SecretSetting {
+    what: "the PostgreSQL connection URL",
+    file_field: "postgres-db-url-file",
+    flag: "--postgres-db-url",
+    env: "SMG_POSTGRES_DB_URL",
+    file_flag: "--postgres-db-url-file",
+    file_env: "SMG_POSTGRES_DB_URL_FILE",
+};
+
+const REDIS_URL_SETTING: SecretSetting = SecretSetting {
+    what: "the Redis connection URL",
+    file_field: "redis-url-file",
+    flag: "--redis-url",
+    env: "SMG_REDIS_URL",
+    file_flag: "--redis-url-file",
+    file_env: "SMG_REDIS_URL_FILE",
+};
+
+/// An environment lookup: the value of a variable, `None` when it is not
+/// set, and a refusal when it is set to bytes that are not UTF-8 (a source
+/// that is set but unusable is refused, not passed over as unset). A
+/// parameter rather than `std::env::var` so a test need not touch the
+/// process environment.
+type EnvLookup<'a> = &'a dyn Fn(&str) -> ConfigResult<Option<String>>;
+
+/// The process environment as an [`EnvLookup`].
+fn process_env(name: &str) -> ConfigResult<Option<String>> {
+    env_value(name, std::env::var_os(name))
+}
+
+/// A variable's raw value as a string: `None` when the variable is unset,
+/// a refusal naming the variable when its bytes are not UTF-8.
+fn env_value(name: &str, raw: Option<std::ffi::OsString>) -> ConfigResult<Option<String>> {
+    raw.map(|value| {
+        value.into_string().map_err(|_| ConfigError::InvalidValue {
+            field: name.to_string(),
+            value: "<not UTF-8>".to_string(),
+            reason: "set, but its value is not UTF-8".to_string(),
+        })
+    })
+    .transpose()
+}
+
+impl SecretSetting {
+    /// The file the flag or, failing that, the environment names.
+    fn file(&self, flag_value: Option<&Path>, env: EnvLookup<'_>) -> ConfigResult<Option<PathBuf>> {
+        Ok(match flag_value {
+            Some(path) => Some(path.to_path_buf()),
+            None => env(self.file_env)?.map(PathBuf::from),
+        })
+    }
+
+    /// The refusal for a value and a file given together: ranking them
+    /// would honour a stale secret in silence.
+    fn given_twice(&self) -> ConfigError {
+        ConfigError::IncompatibleConfig {
+            reason: format!(
+                "{} is given twice, by {} (or {}) and by {} (or {}); give one source",
+                self.what, self.flag, self.env, self.file_flag, self.file_env
+            ),
+        }
+    }
+
+    /// The refusal for a file that cannot be used, naming the path, never
+    /// the content.
+    fn bad_file(&self, path: &Path, reason: &str) -> ConfigError {
+        ConfigError::InvalidValue {
+            field: self.file_field.to_string(),
+            value: path.display().to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
+    fn read_file(&self, path: &Path) -> ConfigResult<String> {
+        std::fs::read_to_string(path)
+            .map_err(|e| self.bad_file(path, &format!("the file cannot be read: {e}")))
+    }
+
+    /// The value of a single-valued secret and its source: the flag's,
+    /// else the environment's, else the content of the file the flag or the
+    /// environment names; the environment's value and the file's content
+    /// have their surrounding whitespace (a trailing newline) dropped, since
+    /// a Secret made from a file usually carries the editor's newline into
+    /// both. A value and a file together are refused, as is a file that is
+    /// empty or holds more than one line (a tenant key file or a
+    /// concatenated pair in the place of one value is a mistake, not a
+    /// value). An empty value from the flag or the environment passes here
+    /// and is refused where the value is validated.
+    fn resolve_value(
+        &self,
+        flag_value: Option<&str>,
+        file_flag_value: Option<&Path>,
+        env: EnvLookup<'_>,
+    ) -> ConfigResult<Option<(String, SecretSource)>> {
+        let value = match flag_value {
+            Some(value) => Some((value.to_string(), SecretSource::Flag)),
+            None => {
+                env(self.env)?.map(|value| (value.trim().to_string(), SecretSource::Environment))
+            }
+        };
+        match (value, self.file(file_flag_value, env)?) {
+            (Some(_), Some(_)) => Err(self.given_twice()),
+            (Some(value), None) => Ok(Some(value)),
+            (None, None) => Ok(None),
+            (None, Some(path)) => {
+                let content = self.read_file(&path)?;
+                let value = content.trim();
+                if value.is_empty() {
+                    return Err(self.bad_file(&path, "the file is empty"));
+                }
+                if value.lines().count() > 1 {
+                    return Err(self.bad_file(
+                        &path,
+                        "the file holds more than one line; it must hold the value alone",
+                    ));
+                }
+                Ok(Some((value.to_string(), SecretSource::File)))
+            }
+        }
+    }
+
+    /// The entries of a list-valued secret and their source: the flag's
+    /// occurrences, else the environment's value split at ',' and at line
+    /// ends, else the lines of the file the flag or the environment names,
+    /// blank lines and `#` comment lines skipped; the whitespace around an
+    /// entry is dropped. Entries and a file together are refused, and so is
+    /// a source that is set but holds no entry: the source was meant to
+    /// close the serving routes, and an empty one would leave them open.
+    fn resolve_entries(
+        &self,
+        flag_values: &[String],
+        file_flag_value: Option<&Path>,
+        env: EnvLookup<'_>,
+    ) -> ConfigResult<Option<(Vec<String>, SecretSource)>> {
+        let entries_of = |text: &str, separators: &[char]| -> Vec<String> {
+            text.split(separators)
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty() && !entry.starts_with('#'))
+                .map(str::to_string)
+                .collect()
+        };
+        let value = if flag_values.is_empty() {
+            match env(self.env)? {
+                Some(text) => {
+                    let entries = entries_of(&text, &[',', '\n']);
+                    if entries.is_empty() {
+                        return Err(ConfigError::InvalidValue {
+                            field: self.env.to_string(),
+                            value: "<empty>".to_string(),
+                            reason: format!(
+                                "set but holds no entry; {} are tenant_id:key entries separated by ',' or a newline",
+                                self.what
+                            ),
+                        });
+                    }
+                    Some((entries, SecretSource::Environment))
+                }
+                None => None,
+            }
+        } else {
+            Some((flag_values.to_vec(), SecretSource::Flag))
+        };
+        match (value, self.file(file_flag_value, env)?) {
+            (Some(_), Some(_)) => Err(self.given_twice()),
+            (Some(value), None) => Ok(Some(value)),
+            (None, None) => Ok(None),
+            (None, Some(path)) => {
+                let content = self.read_file(&path)?;
+                let entries = entries_of(&content, &['\n']);
+                if entries.is_empty() {
+                    return Err(self.bad_file(
+                        &path,
+                        "the file holds no entry; one tenant_id:key per line, blank and # lines skipped",
+                    ));
+                }
+                Ok(Some((entries, SecretSource::File)))
+            }
+        }
+    }
+}
+
+impl CliArgs {
+    /// Phase 1b, resolve: the secrets the environment or a file may give in
+    /// the command line's place, read into the flag fields so the phases
+    /// after this one read flags alone; where each came from is kept for
+    /// the start-up record. One rule for every secret: the command line
+    /// beats the environment, and a value from either together with a file
+    /// is refused rather than ranked. A store URL is read for the selected
+    /// history backend alone, as its flag is. The environment lookup is a
+    /// parameter so a test need not touch the process environment.
+    fn resolve_secret_sources(&mut self, env: EnvLookup<'_>) -> ConfigResult<()> {
+        let mut sources = SecretSources::default();
+        if let Some((value, source)) = API_KEY_SETTING.resolve_value(
+            self.integrations.api_key.as_deref(),
+            self.integrations.api_key_file.as_deref(),
+            env,
+        )? {
+            self.integrations.api_key = Some(value);
+            sources.api_key = Some(source);
+        }
+        if let Some((entries, source)) = TENANT_API_KEYS_SETTING.resolve_entries(
+            &self.integrations.tenant_api_keys,
+            self.integrations.tenant_api_keys_file.as_deref(),
+            env,
+        )? {
+            sources.tenant_api_keys = Some((source, entries.len()));
+            self.integrations.tenant_api_keys = entries;
+        }
+        if self.model.history_backend == "postgres" {
+            if let Some((value, source)) = POSTGRES_DB_URL_SETTING.resolve_value(
+                self.integrations.postgres_db_url.as_deref(),
+                self.integrations.postgres_db_url_file.as_deref(),
+                env,
+            )? {
+                self.integrations.postgres_db_url = Some(value);
+                sources.postgres_db_url = Some(source);
+            }
+        }
+        if self.model.history_backend == "redis" {
+            if let Some((value, source)) = REDIS_URL_SETTING.resolve_value(
+                self.integrations.redis_url.as_deref(),
+                self.integrations.redis_url_file.as_deref(),
+                env,
+            )? {
+                self.integrations.redis_url = Some(value);
+                sources.redis_url = Some(source);
+            }
+        }
+        self.integrations.secret_sources = sources;
+        Ok(())
+    }
+}
+
 impl CliArgs {
     /// Build control plane authentication configuration from CLI args. A
     /// configuration that asks for authentication but cannot be honoured
@@ -1779,19 +2215,25 @@ impl CliArgs {
     /// is an error: silently dropping it would start the control plane open.
     fn build_control_plane_auth_config(&self) -> ConfigResult<ControlPlaneAuthConfig> {
         // Build JWT config if issuer and audience are provided
-        let jwt = match (&self.jwt_issuer, &self.jwt_audience) {
+        let jwt = match (
+            &self.integrations.jwt_issuer,
+            &self.integrations.jwt_audience,
+        ) {
             (Some(issuer), Some(audience)) => {
                 // One malformed mapping refuses the start: dropped, it could widen access
                 let role_mapping = self
+                    .integrations
                     .jwt_role_mapping
                     .iter()
                     .map(|m| parse_role_mapping(m))
                     .collect::<ConfigResult<HashMap<String, Role>>>()?;
 
                 let mut jwt_config = JwtConfig::new(issuer.clone(), audience.clone());
-                jwt_config.role_claim.clone_from(&self.jwt_role_claim);
+                jwt_config
+                    .role_claim
+                    .clone_from(&self.integrations.jwt_role_claim);
                 jwt_config.role_mapping = role_mapping;
-                if let Some(jwks_uri) = &self.jwt_jwks_uri {
+                if let Some(jwks_uri) = &self.integrations.jwt_jwks_uri {
                     jwt_config.jwks_uri = Some(jwks_uri.clone());
                 }
                 Some(jwt_config)
@@ -1811,6 +2253,7 @@ impl CliArgs {
 
         // Build API keys from CLI args; one malformed entry refuses the start
         let api_keys = self
+            .integrations
             .control_plane_api_keys
             .iter()
             .map(|k| parse_control_plane_api_key(k))
@@ -1819,7 +2262,7 @@ impl CliArgs {
         Ok(ControlPlaneAuthConfig {
             jwt,
             api_keys,
-            audit_enabled: !self.disable_audit_logging,
+            audit_enabled: !self.integrations.disable_audit_logging,
         })
     }
 
@@ -1838,18 +2281,18 @@ impl CliArgs {
     /// The worker discovery provider selected by either spelling:
     /// `--service-discovery` is `--discovery-provider kubernetes`.
     fn selected_discovery_provider(&self) -> Option<DiscoveryProvider> {
-        if self.service_discovery {
+        if self.discovery.service_discovery {
             Some(DiscoveryProvider::Kubernetes)
         } else {
-            self.discovery_provider
+            self.discovery.discovery_provider
         }
     }
 
     /// Selecting a discovery provider, by either spelling, turns IGW mode on.
     /// Returns whether this call turned it on.
     fn enable_igw_for_discovery(&mut self) -> bool {
-        let enable = self.selected_discovery_provider().is_some() && !self.enable_igw;
-        self.enable_igw |= enable;
+        let enable = self.selected_discovery_provider().is_some() && !self.routing.enable_igw;
+        self.routing.enable_igw |= enable;
         enable
     }
 
@@ -1868,9 +2311,10 @@ impl CliArgs {
     /// The metrics bind host: `--prometheus-host`, or the unspecified address
     /// of `--host`'s family when it is not given.
     fn metrics_host(&self) -> String {
-        self.prometheus_host
+        self.serving
+            .prometheus_host
             .clone()
-            .unwrap_or_else(|| MetricsConfig::default_host_for(&self.host))
+            .unwrap_or_else(|| MetricsConfig::default_host_for(&self.routing.host))
     }
 
     fn parse_mesh_socket_addr(
@@ -1885,12 +2329,13 @@ impl CliArgs {
         })
     }
 
+    /// Build mesh settings from the integration flags, validating addresses and TLS pairs.
     fn build_mesh_server_config(&self) -> ConfigResult<Option<MeshServerConfig>> {
-        if !self.enable_mesh {
+        if !self.integrations.enable_mesh {
             return Ok(None);
         }
 
-        let self_name = if let Some(name) = &self.mesh_server_name {
+        let self_name = if let Some(name) = &self.integrations.mesh_server_name {
             validate_mesh_server_name(name)?;
             name.to_string()
         } else {
@@ -1900,6 +2345,7 @@ impl CliArgs {
         };
 
         let peer = self
+            .integrations
             .mesh_peer_urls
             .first()
             .map(|url| {
@@ -1917,10 +2363,10 @@ impl CliArgs {
         // bind. It would also reach router discovery as the fallback mesh port
         // for Pods whose annotation is missing or invalid, publishing `IP:0`
         // peers into the cluster state.
-        if self.mesh_port == 0 {
+        if self.integrations.mesh_port == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "mesh_port".to_string(),
-                value: self.mesh_port.to_string(),
+                value: self.integrations.mesh_port.to_string(),
                 reason: "mesh port cannot be 0; peers dial the advertised port, \
                          so it must be a fixed, routable one"
                     .to_string(),
@@ -1929,15 +2375,22 @@ impl CliArgs {
 
         // The mesh port against the other listeners' is checked in
         // `server::startup`, for every way the server configuration is built.
-        let bind_addr = Self::parse_mesh_socket_addr(&self.mesh_host, self.mesh_port, "mesh_host")?;
+        let bind_addr = Self::parse_mesh_socket_addr(
+            &self.integrations.mesh_host,
+            self.integrations.mesh_port,
+            "mesh_host",
+        )?;
         let (advertise_host, advertise_field) =
-            if let Some(host) = self.mesh_advertise_host.as_deref() {
+            if let Some(host) = self.integrations.mesh_advertise_host.as_deref() {
                 (host, "mesh_advertise_host")
             } else {
-                (self.mesh_host.as_str(), "mesh_host")
+                (self.integrations.mesh_host.as_str(), "mesh_host")
             };
-        let advertise_addr =
-            Self::parse_mesh_socket_addr(advertise_host, self.mesh_port, advertise_field)?;
+        let advertise_addr = Self::parse_mesh_socket_addr(
+            advertise_host,
+            self.integrations.mesh_port,
+            advertise_field,
+        )?;
 
         if advertise_addr.ip().is_unspecified() {
             return Err(ConfigError::InvalidValue {
@@ -1962,9 +2415,9 @@ impl CliArgs {
     /// each file has to be readable at start-up, not at the first dial.
     fn mesh_mtls_config(&self) -> ConfigResult<Option<MTLSConfig>> {
         let (Some(ca), Some(cert), Some(key)) = (
-            &self.mesh_tls_ca_cert,
-            &self.mesh_tls_cert,
-            &self.mesh_tls_key,
+            &self.integrations.mesh_tls_ca_cert,
+            &self.integrations.mesh_tls_cert,
+            &self.integrations.mesh_tls_key,
         ) else {
             return Ok(None);
         };
@@ -1987,57 +2440,58 @@ impl CliArgs {
         }))
     }
 
+    /// Build a routing policy with the same per-policy defaults as the CLI flags.
     fn parse_policy(&self, policy_str: &str) -> PolicyConfig {
         match policy_str {
             "random" => PolicyConfig::Random,
             "round_robin" => PolicyConfig::RoundRobin,
             "passthrough" => PolicyConfig::Passthrough,
             "cache_aware" => PolicyConfig::CacheAware {
-                cache_threshold: self.cache_threshold,
-                balance_abs_threshold: self.balance_abs_threshold,
-                balance_rel_threshold: self.balance_rel_threshold,
-                eviction_interval_secs: self.eviction_interval,
-                max_tree_size: self.max_tree_size,
-                block_size: self.block_size,
-                balance_token_usage_threshold: self.balance_token_usage_threshold,
-                overload_token_usage_threshold: self.overload_token_usage_threshold,
-                overlap_decay: self.overlap_decay,
-                selection_temperature: self.selection_temperature,
-                cache_index: Self::parse_cache_index(&self.cache_index),
-                cache_ttl_secs: self.cache_ttl_secs,
-                cache_boundaries: self.cache_boundaries.clone(),
-                selection_policy: (self.selection_policy != DEFAULT_SELECTION_POLICY)
-                    .then(|| self.selection_policy.clone()),
-                selection_accounting_ttl_ms: self.selection_accounting_ttl_ms,
+                cache_threshold: self.routing.cache_threshold,
+                balance_abs_threshold: self.routing.balance_abs_threshold,
+                balance_rel_threshold: self.routing.balance_rel_threshold,
+                eviction_interval_secs: self.routing.eviction_interval,
+                max_tree_size: self.routing.max_tree_size,
+                block_size: self.routing.block_size,
+                balance_token_usage_threshold: self.routing.balance_token_usage_threshold,
+                overload_token_usage_threshold: self.routing.overload_token_usage_threshold,
+                overlap_decay: self.routing.overlap_decay,
+                selection_temperature: self.routing.selection_temperature,
+                cache_index: Self::parse_cache_index(&self.routing.cache_index),
+                cache_ttl_secs: self.routing.cache_ttl_secs,
+                cache_boundaries: self.routing.cache_boundaries.clone(),
+                selection_policy: (self.routing.selection_policy != DEFAULT_SELECTION_POLICY)
+                    .then(|| self.routing.selection_policy.clone()),
+                selection_accounting_ttl_ms: self.routing.selection_accounting_ttl_ms,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
-                load_metric: self.power_of_two_load_metric,
+                load_metric: self.routing.power_of_two_load_metric,
             },
             "least_load" => PolicyConfig::LeastLoad {
                 load_check_interval_secs: 5,
-                kv_pressure_weight: self.least_load_kv_pressure_weight,
-                mean_prefill_tokens: self.least_load_mean_prefill_tokens,
-                default_throughput: self.least_load_default_throughput,
-                max_waiting_requests: self.least_load_max_waiting_requests,
+                kv_pressure_weight: self.routing.least_load_kv_pressure_weight,
+                mean_prefill_tokens: self.routing.least_load_mean_prefill_tokens,
+                default_throughput: self.routing.least_load_default_throughput,
+                max_waiting_requests: self.routing.least_load_max_waiting_requests,
             },
             "bucket" => PolicyConfig::Bucket {
-                balance_abs_threshold: self.balance_abs_threshold,
-                balance_rel_threshold: self.balance_rel_threshold,
-                bucket_adjust_interval_secs: 5,
+                balance_abs_threshold: self.routing.balance_abs_threshold,
+                balance_rel_threshold: self.routing.balance_rel_threshold,
+                bucket_adjust_interval_secs: self.routing.bucket_adjust_interval_secs,
             },
             "prefix_hash" => PolicyConfig::PrefixHash {
-                prefix_token_count: self.prefix_token_count,
-                load_factor: self.prefix_hash_load_factor,
-                balance_abs_threshold: self.prefix_hash_balance_abs_threshold,
-                cache_boundaries: self.cache_boundaries.clone(),
+                prefix_token_count: self.routing.prefix_token_count,
+                load_factor: self.routing.prefix_hash_load_factor,
+                balance_abs_threshold: self.routing.prefix_hash_balance_abs_threshold,
+                cache_boundaries: self.routing.cache_boundaries.clone(),
             },
             "consistent_hashing" => PolicyConfig::ConsistentHashing,
             "manual" => PolicyConfig::Manual {
-                eviction_interval_secs: self.eviction_interval,
-                max_idle_secs: self.max_idle_secs,
+                eviction_interval_secs: self.routing.eviction_interval,
+                max_idle_secs: self.routing.max_idle_secs,
                 assignment_mode: Self::parse_assignment_mode(
-                    self.assignment_mode.as_deref(),
+                    self.routing.assignment_mode.as_deref(),
                     ManualAssignmentMode::Random,
                 ),
             },
@@ -2075,8 +2529,9 @@ impl CliArgs {
         }
     }
 
+    /// Load the optional storage schema, reporting file and YAML errors as configuration errors.
     fn load_schema_config(&self) -> ConfigResult<Option<SchemaConfig>> {
-        match &self.schema_config {
+        match &self.model.schema_config {
             Some(path) => {
                 let content =
                     std::fs::read_to_string(path).map_err(|e| ConfigError::ValidationFailed {
@@ -2092,24 +2547,25 @@ impl CliArgs {
         }
     }
 
+    /// Prefer an explicit Oracle DSN; otherwise require both wallet path and TNS alias.
     fn resolve_oracle_connect_details(&self) -> ConfigResult<OracleConnectSource> {
-        if let Some(dsn) = self.oracle_dsn.clone() {
+        if let Some(dsn) = self.integrations.oracle_dsn.clone() {
             return Ok(OracleConnectSource::Dsn { descriptor: dsn });
         }
 
-        let wallet_path =
-            self.oracle_wallet_path
-                .clone()
-                .ok_or_else(|| ConfigError::MissingRequired {
-                    field: "oracle_wallet_path or ATP_WALLET_PATH".to_string(),
-                })?;
+        let wallet_path = self
+            .integrations
+            .oracle_wallet_path
+            .clone()
+            .ok_or_else(|| ConfigError::MissingRequired {
+                field: "oracle_wallet_path or ATP_WALLET_PATH".to_string(),
+            })?;
 
-        let tns_alias =
-            self.oracle_tns_alias
-                .clone()
-                .ok_or_else(|| ConfigError::MissingRequired {
-                    field: "oracle_tns_alias or ATP_TNS_ALIAS".to_string(),
-                })?;
+        let tns_alias = self.integrations.oracle_tns_alias.clone().ok_or_else(|| {
+            ConfigError::MissingRequired {
+                field: "oracle_tns_alias or ATP_TNS_ALIAS".to_string(),
+            }
+        })?;
 
         Ok(OracleConnectSource::Wallet {
             path: wallet_path,
@@ -2117,35 +2573,41 @@ impl CliArgs {
         })
     }
 
+    /// Build Oracle storage settings after validating authentication and pool bounds.
     fn build_oracle_config(&self, schema: Option<SchemaConfig>) -> ConfigResult<OracleConfig> {
         let (wallet_path, connect_descriptor) = match self.resolve_oracle_connect_details()? {
             OracleConnectSource::Dsn { descriptor } => (None, descriptor),
             OracleConnectSource::Wallet { path, alias } => (Some(path), alias),
         };
-        let (username, password) = if self.oracle_external_auth {
+        let (username, password) = if self.integrations.oracle_external_auth {
             (
-                self.oracle_user.clone().unwrap_or_default(),
-                self.oracle_password.clone().unwrap_or_default(),
+                self.integrations.oracle_user.clone().unwrap_or_default(),
+                self.integrations
+                    .oracle_password
+                    .clone()
+                    .unwrap_or_default(),
             )
         } else {
             (
-                self.oracle_user
-                    .clone()
-                    .ok_or_else(|| ConfigError::MissingRequired {
+                self.integrations.oracle_user.clone().ok_or_else(|| {
+                    ConfigError::MissingRequired {
                         field: "oracle_user or ATP_USER".to_string(),
-                    })?,
-                self.oracle_password
-                    .clone()
-                    .ok_or_else(|| ConfigError::MissingRequired {
+                    }
+                })?,
+                self.integrations.oracle_password.clone().ok_or_else(|| {
+                    ConfigError::MissingRequired {
                         field: "oracle_password or ATP_PASSWORD".to_string(),
-                    })?,
+                    }
+                })?,
             )
         };
 
         let pool_min = self
+            .integrations
             .oracle_pool_min
             .unwrap_or_else(OracleConfig::default_pool_min);
         let pool_max = self
+            .integrations
             .oracle_pool_max
             .unwrap_or_else(OracleConfig::default_pool_max);
 
@@ -2166,13 +2628,14 @@ impl CliArgs {
         }
 
         let pool_timeout_secs = self
+            .integrations
             .oracle_pool_timeout_secs
             .unwrap_or_else(OracleConfig::default_pool_timeout_secs);
 
         Ok(OracleConfig {
             wallet_path,
             connect_descriptor,
-            external_auth: self.oracle_external_auth,
+            external_auth: self.integrations.oracle_external_auth,
             username,
             password,
             pool_min,
@@ -2182,15 +2645,22 @@ impl CliArgs {
         })
     }
 
+    /// Build PostgreSQL storage settings, requiring a URL and valid pool bounds.
     fn build_postgres_config(&self, schema: Option<SchemaConfig>) -> ConfigResult<PostgresConfig> {
-        let db_url = self.postgres_db_url.clone().unwrap_or_default();
+        let db_url = self
+            .integrations
+            .postgres_db_url
+            .clone()
+            .unwrap_or_default();
         let pool_max = self
+            .integrations
             .postgres_pool_max_size
             .unwrap_or_else(PostgresConfig::default_pool_max);
         let pcf = PostgresConfig {
             db_url,
             pool_max,
             op_timeout_secs: self
+                .integrations
                 .postgres_op_timeout_secs
                 .unwrap_or_else(PostgresConfig::default_op_timeout_secs),
             schema,
@@ -2201,11 +2671,12 @@ impl CliArgs {
         Ok(pcf)
     }
 
+    /// Build Redis storage settings, requiring a URL and a nonzero pool size.
     fn build_redis_config(&self, schema: Option<SchemaConfig>) -> ConfigResult<RedisConfig> {
-        let url = self.redis_url.clone().unwrap_or_default();
-        let pool_max = self.redis_pool_max_size.unwrap_or(16);
+        let url = self.integrations.redis_url.clone().unwrap_or_default();
+        let pool_max = self.integrations.redis_pool_max_size.unwrap_or(16);
 
-        let retention_days = match self.redis_retention_days {
+        let retention_days = match self.integrations.redis_retention_days {
             Some(-1) => None, // Persistent
             // A retention of 0 days would expire every record as it is
             // written; -1 is the one spelling of persistent records.
@@ -2224,6 +2695,7 @@ impl CliArgs {
             url,
             pool_max,
             op_timeout_secs: self
+                .integrations
                 .redis_op_timeout_secs
                 .unwrap_or_else(RedisConfig::default_op_timeout_secs),
             retention_days,
@@ -2252,7 +2724,7 @@ impl CliArgs {
         // header names and an empty API key are checked by the shared
         // `ConfigValidator`, which every construction path runs (this CLI
         // through `builder.build()`).
-        let buckets = &self.prometheus_duration_buckets;
+        let buckets = &self.serving.prometheus_duration_buckets;
         if let Some(bad) = buckets.iter().find(|b| !b.is_finite() || **b <= 0.0) {
             return Err(invalid(
                 "prometheus_duration_buckets",
@@ -2267,7 +2739,7 @@ impl CliArgs {
                 "bucket bounds must ascend strictly",
             ));
         }
-        for entry in &self.storage_context_headers {
+        for entry in &self.serving.storage_context_headers {
             if !entry.contains('=') {
                 return Err(invalid(
                     "storage_context_headers",
@@ -2276,7 +2748,7 @@ impl CliArgs {
                 ));
             }
         }
-        for mapping in &self.jwt_role_mapping {
+        for mapping in &self.integrations.jwt_role_mapping {
             match mapping.split_once('=') {
                 Some((idp_role, gateway_role))
                     if !idp_role.is_empty()
@@ -2306,8 +2778,8 @@ impl CliArgs {
     ) -> Vec<String> {
         const PD: &str = "without --pd-disaggregation (or --epd-disaggregation)";
         const EPD: &str = "without --epd-disaggregation";
-        let pd = self.pd_disaggregation || self.epd_disaggregation;
-        let epd = self.epd_disaggregation;
+        let pd = self.workers.pd_disaggregation || self.workers.epd_disaggregation;
+        let epd = self.workers.epd_disaggregation;
         // The selectors select Kubernetes pods: another provider ignores them
         // as the absence of any does.
         let provider = self.selected_discovery_provider();
@@ -2321,7 +2793,7 @@ impl CliArgs {
         };
         // Two worker sources are both honoured, which is worth a line of its
         // own, naming the source as it was given.
-        let source = if self.service_discovery {
+        let source = if self.discovery.service_discovery {
             "--service-discovery".to_string()
         } else {
             provider.map_or_else(String::new, |provider| {
@@ -2331,49 +2803,53 @@ impl CliArgs {
         let ignored = |flag: &str, needs: &str| format!("{flag} is ignored {needs}");
         let warnings = [
             (!prefill_urls.is_empty() && !pd, ignored("--prefill", PD)),
-            (!self.decode.is_empty() && !pd, ignored("--decode", PD)),
             (
-                self.prefill_policy.is_some() && !pd,
+                !self.workers.decode.is_empty() && !pd,
+                ignored("--decode", PD),
+            ),
+            (
+                self.workers.prefill_policy.is_some() && !pd,
                 ignored("--prefill-policy", PD),
             ),
             (
-                self.decode_policy.is_some() && !pd,
+                self.workers.decode_policy.is_some() && !pd,
                 ignored("--decode-policy", PD),
             ),
             (!encode_urls.is_empty() && !epd, ignored("--encode", EPD)),
             (
-                self.encode_policy.is_some() && !epd,
+                self.workers.encode_policy.is_some() && !epd,
                 ignored("--encode-policy", EPD),
             ),
             (
-                !self.selector.is_empty() && !kubernetes,
+                !self.discovery.selector.is_empty() && !kubernetes,
                 ignored("--selector", selectors.as_str()),
             ),
             (
-                !self.prefill_selector.is_empty() && !kubernetes,
+                !self.discovery.prefill_selector.is_empty() && !kubernetes,
                 ignored("--prefill-selector", selectors.as_str()),
             ),
             (
-                !self.decode_selector.is_empty() && !kubernetes,
+                !self.discovery.decode_selector.is_empty() && !kubernetes,
                 ignored("--decode-selector", selectors.as_str()),
             ),
             (
-                !self.encode_selector.is_empty() && !kubernetes,
+                !self.discovery.encode_selector.is_empty() && !kubernetes,
                 ignored("--encode-selector", selectors.as_str()),
             ),
             (
-                !self.router_selector.is_empty() && !kubernetes,
+                !self.discovery.router_selector.is_empty() && !kubernetes,
                 ignored("--router-selector", selectors.as_str()),
             ),
             (
-                provider.is_some() && !self.worker_urls.is_empty(),
+                provider.is_some() && !self.routing.worker_urls.is_empty(),
                 format!(
                     "--worker-urls and {source} are both given: both are worker sources, \
                      the listed workers register first and the discovered ones join them"
                 ),
             ),
             (
-                self.priority_scheduler_config.is_some() && !self.priority_scheduler_enabled,
+                self.serving.priority_scheduler_config.is_some()
+                    && !self.serving.priority_scheduler_enabled,
                 ignored(
                     "--priority-scheduler-config",
                     "without --priority-scheduler-enabled",
@@ -2411,35 +2887,35 @@ impl CliArgs {
     ) -> RoutingMode {
         let policy = |name: Option<&String>| name.map(|p| self.parse_policy(p));
         match (
-            self.backend,
-            self.epd_disaggregation,
-            self.pd_disaggregation,
+            self.model.backend,
+            self.workers.epd_disaggregation,
+            self.workers.pd_disaggregation,
         ) {
             (Some(Backend::Openai), _, _) => RoutingMode::OpenAI {
-                worker_urls: self.worker_urls.clone(),
+                worker_urls: self.routing.worker_urls.clone(),
             },
             (Some(Backend::Anthropic), _, _) => RoutingMode::Anthropic {
-                worker_urls: self.worker_urls.clone(),
+                worker_urls: self.routing.worker_urls.clone(),
             },
             (Some(Backend::Gemini), _, _) => RoutingMode::Gemini {
-                worker_urls: self.worker_urls.clone(),
+                worker_urls: self.routing.worker_urls.clone(),
             },
             (_, true, _) => RoutingMode::EncodePrefillDecode {
                 encode_urls,
                 prefill_urls,
-                decode_urls: self.decode.clone(),
-                encode_policy: policy(self.encode_policy.as_ref()),
-                prefill_policy: policy(self.prefill_policy.as_ref()),
-                decode_policy: policy(self.decode_policy.as_ref()),
+                decode_urls: self.workers.decode.clone(),
+                encode_policy: policy(self.workers.encode_policy.as_ref()),
+                prefill_policy: policy(self.workers.prefill_policy.as_ref()),
+                decode_policy: policy(self.workers.decode_policy.as_ref()),
             },
             (_, false, true) => RoutingMode::PrefillDecode {
                 prefill_urls,
-                decode_urls: self.decode.clone(),
-                prefill_policy: policy(self.prefill_policy.as_ref()),
-                decode_policy: policy(self.decode_policy.as_ref()),
+                decode_urls: self.workers.decode.clone(),
+                prefill_policy: policy(self.workers.prefill_policy.as_ref()),
+                decode_policy: policy(self.workers.decode_policy.as_ref()),
             },
             (_, false, false) => RoutingMode::Regular {
-                worker_urls: self.worker_urls.clone(),
+                worker_urls: self.routing.worker_urls.clone(),
             },
         }
     }
@@ -2452,7 +2928,8 @@ impl CliArgs {
     fn discovery_config(&self) -> ConfigResult<Option<DiscoveryConfig>> {
         let provider = self.selected_discovery_provider();
         if provider != Some(DiscoveryProvider::File)
-            && (self.discovery_file.is_some() || self.discovery_check_interval_secs.is_some())
+            && (self.discovery.discovery_file.is_some()
+                || self.discovery.discovery_check_interval_secs.is_some())
         {
             return Err(ConfigError::IncompatibleConfig {
                 reason: "--discovery-file and --discovery-check-interval-secs apply only to \
@@ -2464,30 +2941,30 @@ impl CliArgs {
             None => None,
             Some(DiscoveryProvider::Kubernetes) => {
                 Some(DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
-                    namespace: self.service_discovery_namespace.clone(),
-                    port: self.service_discovery_port,
+                    namespace: self.discovery.service_discovery_namespace.clone(),
+                    port: self.discovery.service_discovery_port,
                     check_interval_secs: 60,
-                    selector: Self::parse_selector(&self.selector),
-                    encode_selector: Self::parse_selector(&self.encode_selector),
-                    prefill_selector: Self::parse_selector(&self.prefill_selector),
-                    decode_selector: Self::parse_selector(&self.decode_selector),
+                    selector: Self::parse_selector(&self.discovery.selector),
+                    encode_selector: Self::parse_selector(&self.discovery.encode_selector),
+                    prefill_selector: Self::parse_selector(&self.discovery.prefill_selector),
+                    decode_selector: Self::parse_selector(&self.discovery.decode_selector),
                     bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
                     worker_ports_annotation: "smg.ai/worker-ports".to_string(),
-                    kv_connector_annotation: self.kv_connector_annotation.clone(),
-                    kv_engine_id_annotation: self.kv_engine_id_annotation.clone(),
-                    router_selector: Self::parse_selector(&self.router_selector),
+                    kv_connector_annotation: self.discovery.kv_connector_annotation.clone(),
+                    kv_engine_id_annotation: self.discovery.kv_engine_id_annotation.clone(),
+                    router_selector: Self::parse_selector(&self.discovery.router_selector),
                     router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
-                    model_id_source: self.model_id_from.clone(),
+                    model_id_source: self.discovery.model_id_from.clone(),
                 }))
             }
             Some(DiscoveryProvider::File) => Some(DiscoveryConfig::File(FileDiscoveryConfig {
-                path: self
-                    .discovery_file
-                    .clone()
-                    .ok_or_else(|| ConfigError::MissingRequired {
+                path: self.discovery.discovery_file.clone().ok_or_else(|| {
+                    ConfigError::MissingRequired {
                         field: "--discovery-file".to_string(),
-                    })?,
+                    }
+                })?,
                 check_interval_secs: self
+                    .discovery
                     .discovery_check_interval_secs
                     .unwrap_or(DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS),
             })),
@@ -2534,7 +3011,7 @@ impl CliArgs {
         if connection_mode != ConnectionMode::Zmq {
             return None;
         }
-        match self.backend {
+        match self.model.backend {
             Some(Backend::Vllm) => Some(RuntimeType::Vllm),
             Some(Backend::Tokenspeed) => Some(RuntimeType::TokenSpeed),
             Some(Backend::Sglang) => Some(RuntimeType::Sglang),
@@ -2583,19 +3060,19 @@ impl CliArgs {
         self.warn_ignored_companions(&prefill_urls, &encode_urls);
 
         let mode = self.routing_mode(prefill_urls, encode_urls);
-        let policy = self.parse_policy(&self.policy);
+        let policy = self.parse_policy(&self.routing.policy);
         let discovery = self.discovery_config()?;
         let metrics = Some(MetricsConfig {
-            port: self.prometheus_port,
+            port: self.serving.prometheus_port,
             host: self.metrics_host(),
         });
         let trace_config = Some(TraceConfig {
-            enable_trace: self.enable_trace,
-            otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
+            enable_trace: self.integrations.enable_trace,
+            otlp_traces_endpoint: self.integrations.otlp_traces_endpoint.clone(),
         });
         let connection_mode = Self::determine_connection_mode(&Self::startup_worker_urls(&mode));
         let startup_worker_runtime_type = self.startup_worker_runtime_type(connection_mode);
-        let history_backend = match self.history_backend.as_str() {
+        let history_backend = match self.model.history_backend.as_str() {
             "none" => HistoryBackend::None,
             "oracle" => HistoryBackend::Oracle,
             "postgres" => HistoryBackend::Postgres,
@@ -2604,6 +3081,7 @@ impl CliArgs {
         };
         let schema = self.load_schema_config()?;
         let tenant_api_keys = self
+            .integrations
             .tenant_api_keys
             .iter()
             .map(|k| parse_tenant_api_key(k))
@@ -2614,180 +3092,203 @@ impl CliArgs {
             HistoryBackend::Redis => (None, None, Some(self.build_redis_config(schema)?)),
             _ => (None, None, None),
         };
-        let model_aliases = Self::model_aliases(&self.model_alias)?;
+        let model_aliases = Self::model_aliases(&self.discovery.model_alias)?;
 
         let builder = RouterConfig::builder()
             .mode(mode)
             .policy(policy)
-            .cache_boundaries(self.cache_boundaries.clone())
+            .cache_boundaries(self.routing.cache_boundaries.clone())
             .connection_mode(connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
-            .zmq_engine_count(self.zmq_engine_count)
-            .host(&self.host)
-            .port(self.port)
-            .health_check_port(self.health_check_port)
-            .runtime_worker_threads(self.runtime_worker_threads)
-            .max_payload_size(self.max_payload_size)
-            .max_buffered_request_bytes(self.max_buffered_request_bytes)
-            .stream_body_stall_timeout_secs(self.stream_body_stall_timeout_secs)
-            .header_read_timeout_secs(self.header_read_timeout_secs)
-            .idle_connection_timeout_secs(self.idle_connection_timeout_secs)
-            .request_timeout_secs(self.request_timeout_secs)
-            .sse_keepalive_secs(self.sse_keepalive_secs)
-            .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
-            .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
-            .worker_startup_delay_secs(self.worker_startup_delay)
-            .worker_startup_check_interval_secs(self.worker_startup_check_interval)
-            .job_queue_capacity(self.job_queue_capacity)
-            .job_queue_concurrency(self.job_queue_concurrency)
-            .load_monitor_interval_secs(self.load_monitor_interval)
-            .worker_stall_secs(self.worker_stall_secs)
-            .worker_wedge_secs(self.worker_wedge_secs)
-            .worker_stale_secs(self.worker_stale_secs)
+            .zmq_engine_count(self.routing.zmq_engine_count)
+            .host(&self.routing.host)
+            .port(self.routing.port)
+            .health_check_port(self.routing.health_check_port)
+            .admin_port(self.routing.admin_port)
+            .admin_host(self.routing.admin_host.clone())
+            .runtime_worker_threads(self.integrations.runtime_worker_threads)
+            .max_payload_size(self.serving.max_payload_size)
+            .max_buffered_request_bytes(self.serving.max_buffered_request_bytes)
+            .stream_body_stall_timeout_secs(self.serving.stream_body_stall_timeout_secs)
+            .header_read_timeout_secs(self.serving.header_read_timeout_secs)
+            .idle_connection_timeout_secs(self.serving.idle_connection_timeout_secs)
+            .max_connections(self.serving.max_connections)
+            .request_timeout_secs(self.serving.request_timeout_secs)
+            .sse_keepalive_secs(self.serving.sse_keepalive_secs)
+            .upstream_pool_idle_timeout_secs(self.serving.upstream_pool_idle_timeout_secs)
+            .worker_startup_timeout_secs(self.workers.worker_startup_timeout_secs)
+            .worker_startup_delay_secs(self.workers.worker_startup_delay)
+            .worker_startup_check_interval_secs(self.workers.worker_startup_check_interval)
+            .job_queue_capacity(self.routing.job_queue_capacity)
+            .job_queue_concurrency(self.routing.job_queue_concurrency)
+            .load_monitor_interval_secs(self.workers.load_monitor_interval)
+            .worker_stall_secs(self.workers.worker_stall_secs)
+            .worker_wedge_secs(self.workers.worker_wedge_secs)
+            .worker_stale_secs(self.workers.worker_stale_secs)
             .worker_warmup(
-                self.worker_warmup_secs,
-                self.worker_warmup_share,
-                self.worker_warmup_blocks,
-                self.worker_warmup_thin_ratio,
-                self.worker_warmup_divert_every,
+                self.routing.worker_warmup_secs,
+                self.routing.worker_warmup_share,
+                self.routing.worker_warmup_blocks,
+                self.routing.worker_warmup_thin_ratio,
+                self.routing.worker_warmup_divert_every,
             )
-            .pd_admission_wait_secs(self.pd_admission_wait_secs)
-            .disable_load_monitoring(self.disable_load_monitoring)
+            .pd_admission_wait_secs(self.workers.pd_admission_wait_secs)
+            .disable_load_monitoring(self.workers.disable_load_monitoring)
             .worker_overload_protection(
-                self.worker_overload_protection && !self.disable_worker_overload_protection,
+                self.routing.worker_overload_protection
+                    && !self.routing.disable_worker_overload_protection,
             )
-            .worker_overload_waiting_requests(Some(self.worker_overload_waiting_requests))
-            .worker_overload_token_usage(Some(self.worker_overload_token_usage))
-            .worker_overload_shed(self.worker_overload_shed)
-            .kv_indexer_ttl_secs(self.kv_indexer_ttl_secs)
-            .kv_indexer_max_entries(self.kv_indexer_max_entries)
-            .kv_index(self.kv_index)
-            .engine_metrics(self.engine_metrics)
-            .multimodal_tensor_transport(self.multimodal_tensor_transport)
-            .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
-            .multimodal_max_inflight_bytes(self.multimodal_max_inflight_bytes)
-            .mm_per_request_image_limit(self.mm_per_request_image_limit.map(|v| v as usize))
-            .mm_processing(self.mm_processing)
-            .mm_pixel_cache_mb(self.mm_pixel_cache_mb)
-            .mm_pixel_rdma(self.mm_pixel_rdma)
-            .mm_allowed_media_domains(self.mm_allowed_media_domains.clone())
-            .mm_allow_private_media_hosts(self.mm_allow_private_media_hosts)
-            .rdma_listen_ip(self.rdma_listen_ip.clone())
-            .rdma_slot_ttl_s(self.rdma_slot_ttl_s)
-            .log_mm_timing(self.log_mm_timing)
-            .max_concurrent_requests(self.max_concurrent_requests)
-            .queue_size(self.queue_size)
-            .queue_timeout_secs(self.queue_timeout_secs)
-            .prefill_max_inflight_requests_per_worker(self.prefill_max_inflight_requests_per_worker)
-            .prefill_queue_size(self.prefill_queue_size)
-            .prefill_queue_timeout_secs(self.prefill_queue_timeout_secs)
-            .priority_scheduler_enabled(self.priority_scheduler_enabled)
-            .priority_scheduler_default_max_class(self.priority_scheduler_default_max_class.clone())
-            .priority_scheduler_config(self.priority_scheduler_config.clone())
-            .priority_scheduler_tenant_metric_top_n(self.priority_scheduler_tenant_metric_top_n)
-            .tenant_rate_limit_enabled(self.tenant_rate_limit_enabled)
-            .tenant_rate_limit_config(self.tenant_rate_limit_config.clone())
-            .cors_allowed_origins(self.cors_allowed_origins.clone())
+            .worker_overload_waiting_requests(Some(self.routing.worker_overload_waiting_requests))
+            .worker_overload_token_usage(Some(self.routing.worker_overload_token_usage))
+            .worker_overload_shed(self.routing.worker_overload_shed)
+            .kv_indexer_ttl_secs(self.routing.kv_indexer_ttl_secs)
+            .kv_indexer_max_entries(self.routing.kv_indexer_max_entries)
+            .kv_index(self.routing.kv_index.clone())
+            .engine_metrics(self.workers.engine_metrics)
+            .multimodal_tensor_transport(self.workers.multimodal_tensor_transport)
+            .multimodal_shm_min_bytes(self.workers.multimodal_shm_min_bytes)
+            .multimodal_max_inflight_bytes(self.workers.multimodal_max_inflight_bytes)
+            .mm_per_request_image_limit(self.workers.mm_per_request_image_limit.map(|v| v as usize))
+            .mm_processing(self.workers.mm_processing)
+            .mm_pixel_cache_mb(self.workers.mm_pixel_cache_mb)
+            .mm_pixel_rdma(self.workers.mm_pixel_rdma)
+            .mm_allowed_media_domains(self.workers.mm_allowed_media_domains.clone())
+            .mm_allow_private_media_hosts(self.workers.mm_allow_private_media_hosts)
+            .rdma_listen_ip(self.workers.rdma_listen_ip.clone())
+            .rdma_slot_ttl_s(self.workers.rdma_slot_ttl_s)
+            .log_mm_timing(self.workers.log_mm_timing)
+            .max_concurrent_requests(self.serving.max_concurrent_requests)
+            .queue_size(self.serving.queue_size)
+            .queue_timeout_secs(self.serving.queue_timeout_secs)
+            .prefill_max_inflight_requests_per_worker(
+                self.workers.prefill_max_inflight_requests_per_worker,
+            )
+            .prefill_queue_size(self.workers.prefill_queue_size)
+            .prefill_queue_timeout_secs(self.workers.prefill_queue_timeout_secs)
+            .priority_scheduler_enabled(self.serving.priority_scheduler_enabled)
+            .priority_scheduler_default_max_class(
+                self.serving.priority_scheduler_default_max_class.clone(),
+            )
+            .priority_scheduler_config(self.serving.priority_scheduler_config.clone())
+            .priority_scheduler_tenant_metric_top_n(
+                self.serving.priority_scheduler_tenant_metric_top_n,
+            )
+            .tenant_rate_limit_enabled(self.serving.tenant_rate_limit_enabled)
+            .tenant_rate_limit_config(self.serving.tenant_rate_limit_config.clone())
+            .cors_allowed_origins(self.serving.cors_allowed_origins.clone())
             .retry_config(RetryConfig {
-                max_retries: self.retry_max_retries,
-                initial_backoff_ms: self.retry_initial_backoff_ms,
-                max_backoff_ms: self.retry_max_backoff_ms,
-                backoff_multiplier: self.retry_backoff_multiplier,
-                jitter_factor: self.retry_jitter_factor,
+                max_retries: self.serving.retry_max_retries,
+                initial_backoff_ms: self.serving.retry_initial_backoff_ms,
+                max_backoff_ms: self.serving.retry_max_backoff_ms,
+                backoff_multiplier: self.serving.retry_backoff_multiplier,
+                jitter_factor: self.serving.retry_jitter_factor,
             })
             .circuit_breaker_config(CircuitBreakerConfig {
-                failure_threshold: self.cb_failure_threshold,
-                success_threshold: self.cb_success_threshold,
-                timeout_duration_secs: self.cb_timeout_duration_secs,
-                window_duration_secs: self.cb_window_duration_secs,
+                failure_threshold: self.serving.cb_failure_threshold,
+                success_threshold: self.serving.cb_success_threshold,
+                timeout_duration_secs: self.serving.cb_timeout_duration_secs,
+                window_duration_secs: self.serving.cb_window_duration_secs,
             })
             .health_check_config(HealthCheckConfig {
-                failure_threshold: self.health_failure_threshold,
-                success_threshold: self.health_success_threshold,
-                timeout_secs: self.health_check_timeout_secs,
-                check_interval_secs: self.health_check_interval_secs,
-                endpoint: self.health_check_endpoint.clone(),
-                disable_health_check: self.disable_health_check,
+                failure_threshold: self.serving.health_failure_threshold,
+                success_threshold: self.serving.health_success_threshold,
+                timeout_secs: self.serving.health_check_timeout_secs,
+                check_interval_secs: self.serving.health_check_interval_secs,
+                endpoint: self.serving.health_check_endpoint.clone(),
+                disable_health_check: self.serving.disable_health_check,
                 remove_unhealthy_workers: resolve_worker_auto_recovery(
-                    self.remove_unhealthy_workers,
+                    self.serving.remove_unhealthy_workers,
                     self.selected_discovery_provider().is_some(),
                 ),
-                drain_settle_secs: self.drain_settle_secs,
+                drain_settle_secs: self.serving.drain_settle_secs,
             })
             .tokenizer_cache(TokenizerCacheConfig {
-                enable_l0: self.tokenizer_cache_enable_l0,
-                l0_max_entries: self.tokenizer_cache_l0_max_entries,
-                l0_max_memory: self.tokenizer_cache_l0_max_memory,
-                enable_l1: self.tokenizer_cache_enable_l1,
-                l1_max_memory: self.tokenizer_cache_l1_max_memory,
+                enable_l0: self.model.tokenizer_cache_enable_l0,
+                l0_max_entries: self.model.tokenizer_cache_l0_max_entries,
+                l0_max_memory: self.model.tokenizer_cache_l0_max_memory,
+                enable_l1: self.model.tokenizer_cache_enable_l1,
+                l1_max_memory: self.model.tokenizer_cache_l1_max_memory,
             })
-            .disable_tokenizer_autoload(self.disable_tokenizer_autoload)
-            .parser(ParserChoice::parse(&self.parser).unwrap_or_default())
+            .disable_tokenizer_autoload(self.model.disable_tokenizer_autoload)
+            .parser(ParserChoice::parse(&self.model.parser).unwrap_or_default())
             .history_backend(history_backend)
             .memory_config(MemoryConfig {
-                max_responses: self.history_memory_max_responses,
-                max_items: self.history_memory_max_items,
-                retention_secs: (self.history_memory_retention_secs > 0)
-                    .then_some(self.history_memory_retention_secs),
+                max_responses: self.model.history_memory_max_responses,
+                max_items: self.model.history_memory_max_items,
+                retention_secs: (self.model.history_memory_retention_secs > 0)
+                    .then_some(self.model.history_memory_retention_secs),
             })
-            .log_level(&self.log_level)
-            .maybe_api_key(self.api_key.as_ref())
+            .log_level(&self.serving.log_level)
+            .access_log_fields(self.serving.access_log_fields.clone())
+            .maybe_api_key(self.integrations.api_key.as_ref())
             .tenant_api_keys(tenant_api_keys)
             .maybe_discovery(discovery)
             .maybe_metrics(metrics)
             .maybe_trace(trace_config)
-            .maybe_log_dir(self.log_dir.as_ref())
-            .maybe_jemalloc_prof_dir(self.jemalloc_prof_dir.as_ref())
+            .maybe_log_dir(self.serving.log_dir.as_ref())
+            .maybe_jemalloc_prof_dir(self.serving.jemalloc_prof_dir.as_ref())
             .maybe_request_id_headers(
-                (!self.request_id_headers.is_empty()).then(|| self.request_id_headers.clone()),
+                (!self.serving.request_id_headers.is_empty())
+                    .then(|| self.serving.request_id_headers.clone()),
             )
             .maybe_storage_context_headers(
-                (!self.storage_context_headers.is_empty())
-                    .then(|| Self::parse_selector(&self.storage_context_headers)),
+                (!self.serving.storage_context_headers.is_empty())
+                    .then(|| Self::parse_selector(&self.serving.storage_context_headers)),
             )
-            .trust_tenant_header(self.trust_tenant_header)
-            .tenant_header_name(&self.tenant_header_name)
-            .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
-            .max_background_responses(self.max_background_responses)
-            .maybe_model_path(self.model_path.as_ref())
-            .maybe_tokenizer_path(self.tokenizer_path.as_ref())
-            .maybe_chat_template(self.chat_template.as_ref())
+            .trust_tenant_header(self.serving.trust_tenant_header)
+            .tenant_header_name(&self.serving.tenant_header_name)
+            .maybe_rate_limit_tokens_per_second(self.serving.rate_limit_tokens_per_second)
+            .max_background_responses(self.serving.max_background_responses)
+            .maybe_model_path(self.model.model_path.as_ref())
+            .maybe_tokenizer_path(self.model.tokenizer_path.as_ref())
+            .maybe_chat_template(self.model.chat_template.as_ref())
             .model_aliases(model_aliases)
             .maybe_oracle(oracle)
             .maybe_postgres(postgres)
             .maybe_redis(redis)
-            .maybe_reasoning_parser(self.reasoning_parser.as_ref())
-            .maybe_tool_call_parser(self.tool_call_parser.as_ref())
-            .maybe_mcp_config_path(self.mcp_config_path.as_ref())
-            .dp_aware(self.dp_aware)
-            .pd_pairing_mode(PdPairingMode::parse(&self.pd_pairing_mode).unwrap_or_default())
+            .maybe_reasoning_parser(self.model.reasoning_parser.as_ref())
+            .maybe_tool_call_parser(self.model.tool_call_parser.as_ref())
+            .maybe_mcp_config_path(self.model.mcp_config_path.as_ref())
+            .dp_aware(self.routing.dp_aware)
+            .pd_pairing_mode(
+                PdPairingMode::parse(&self.routing.pd_pairing_mode).unwrap_or_default(),
+            )
             .routing_key_override(RoutingKeyOverrideConfig {
-                enabled: self.routing_key_override,
-                eviction_interval_secs: self.eviction_interval,
-                max_idle_secs: self.max_idle_secs,
+                enabled: self.routing.routing_key_override,
+                eviction_interval_secs: self.routing.eviction_interval,
+                max_idle_secs: self.routing.max_idle_secs,
                 assignment_mode: Self::parse_assignment_mode(
-                    self.assignment_mode.as_deref(),
+                    self.routing.assignment_mode.as_deref(),
                     ManualAssignmentMode::Delegate,
                 ),
-                headers: self.routing_key_headers.clone(),
+                headers: self.routing.routing_key_headers.clone(),
             })
-            .retries(!self.disable_retries)
-            .upstream_http2(self.upstream_http2)
-            .circuit_breaker(!self.disable_circuit_breaker)
-            .enable_wasm(self.enable_wasm)
-            .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
-            .igw(self.enable_igw)
+            .retries(!self.serving.disable_retries)
+            .upstream_http2(self.routing.upstream_http2)
+            .circuit_breaker(!self.serving.disable_circuit_breaker)
+            .enable_wasm(self.model.enable_wasm)
+            .maybe_storage_hook_wasm_path(self.model.storage_hook_wasm_path.as_deref())
+            .igw(self.routing.enable_igw)
             .rl(smg_rl::RlConfig {
-                enabled: self.enable_rl,
-                control_timeout_secs: self.rl_control_timeout_secs,
-                fanout_concurrency: self.rl_fanout_concurrency,
+                enabled: self.workers.enable_rl,
+                control_timeout_secs: self.workers.rl_control_timeout_secs,
+                fanout_concurrency: self.workers.rl_fanout_concurrency,
             })
-            .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler)
-            .maybe_server_cert_and_key(self.tls_cert_path.as_ref(), self.tls_key_path.as_ref());
+            .dp_minimum_tokens_scheduler(self.routing.dp_minimum_tokens_scheduler)
+            .maybe_client_cert_and_key(
+                self.integrations.client_cert_path.as_ref(),
+                self.integrations.client_key_path.as_ref(),
+            )
+            .add_ca_certificates(self.integrations.ca_cert_paths.clone())
+            .maybe_server_cert_and_key(
+                self.integrations.tls_cert_path.as_ref(),
+                self.integrations.tls_key_path.as_ref(),
+            );
 
         builder.build()
     }
 
+    /// Combine validated router settings with listener, discovery, and authentication flags.
     fn to_server_config(&self, router_config: RouterConfig) -> ConfigResult<ServerConfig> {
         let service_discovery_config = router_config
             .discovery
@@ -2800,12 +3301,12 @@ impl CliArgs {
             .and_then(MeshDiscoveryConfig::from_discovery);
 
         let prometheus_config = Some(PrometheusConfig {
-            port: self.prometheus_port,
+            port: self.serving.prometheus_port,
             host: self.metrics_host(),
-            duration_buckets: if self.prometheus_duration_buckets.is_empty() {
+            duration_buckets: if self.serving.prometheus_duration_buckets.is_empty() {
                 None
             } else {
-                Some(self.prometheus_duration_buckets.clone())
+                Some(self.serving.prometheus_duration_buckets.clone())
             },
         });
 
@@ -2823,29 +3324,30 @@ impl CliArgs {
         let mesh_server_config = self.build_mesh_server_config()?;
 
         Ok(ServerConfig {
-            host: self.host.clone(),
-            port: self.port,
-            health_check_port: self.health_check_port,
-            runtime_worker_threads: self.runtime_worker_threads,
+            host: self.routing.host.clone(),
+            port: self.routing.port,
+            health_check_port: self.routing.health_check_port,
+            runtime_worker_threads: self.integrations.runtime_worker_threads,
             router_config,
-            max_payload_size: self.max_payload_size,
-            log_dir: self.log_dir.clone(),
-            log_level: Some(self.log_level.clone()),
-            log_json: self.log_json,
+            max_payload_size: self.serving.max_payload_size,
+            log_dir: self.serving.log_dir.clone(),
+            log_level: Some(self.serving.log_level.clone()),
+            log_json: self.serving.log_json,
             service_discovery_config,
             mesh_discovery_config,
             prometheus_config,
-            request_timeout_secs: self.request_timeout_secs,
-            request_id_headers: if self.request_id_headers.is_empty() {
+            request_timeout_secs: self.serving.request_timeout_secs,
+            request_id_headers: if self.serving.request_id_headers.is_empty() {
                 None
             } else {
-                Some(self.request_id_headers.clone())
+                Some(self.serving.request_id_headers.clone())
             },
-            shutdown_grace_period_secs: self.shutdown_grace_period_secs,
+            shutdown_grace_period_secs: self.serving.shutdown_grace_period_secs,
             control_plane_auth,
             mesh_server_config,
-            webrtc_bind_addr: self.webrtc_bind_addr,
-            webrtc_stun_server: self.webrtc_stun_server.clone(),
+            webrtc_bind_addr: self.integrations.webrtc_bind_addr,
+            webrtc_stun_server: self.integrations.webrtc_stun_server.clone(),
+            secret_sources: self.integrations.secret_sources,
         })
     }
 
@@ -2854,17 +3356,17 @@ impl CliArgs {
     /// backends, then the disaggregated modes, then the backend's name
     /// (`--backend gemini` is labelled `Regular (gemini)`, as it always was).
     fn banner_mode(&self) -> String {
-        if self.enable_igw {
+        if self.routing.enable_igw {
             "IGW (Inference Gateway)".to_string()
-        } else if matches!(self.backend, Some(Backend::Openai)) {
+        } else if matches!(self.model.backend, Some(Backend::Openai)) {
             "OpenAI Backend".to_string()
-        } else if matches!(self.backend, Some(Backend::Anthropic)) {
+        } else if matches!(self.model.backend, Some(Backend::Anthropic)) {
             "Anthropic Backend".to_string()
-        } else if self.epd_disaggregation {
+        } else if self.workers.epd_disaggregation {
             "EPD Disaggregated".to_string()
-        } else if self.pd_disaggregation {
+        } else if self.workers.pd_disaggregation {
             "PD Disaggregated".to_string()
-        } else if let Some(backend) = &self.backend {
+        } else if let Some(backend) = &self.model.backend {
             format!("Regular ({backend})")
         } else {
             "Regular".to_string()
@@ -2888,19 +3390,19 @@ impl CliArgs {
         if igw_enabled_for_discovery {
             println!("INFO: IGW mode automatically enabled because service discovery is turned on");
         }
-        version::print_banner(&self.host, self.port, &self.banner_mode());
-        if self.enable_igw {
+        version::print_banner(&self.routing.host, self.routing.port, &self.banner_mode());
+        if self.routing.enable_igw {
             return;
         }
-        println!("Policy: {}", self.policy);
-        if self.pd_disaggregation && !prefill_urls.is_empty() {
+        println!("Policy: {}", self.routing.policy);
+        if self.workers.pd_disaggregation && !prefill_urls.is_empty() {
             println!("Prefill nodes: {prefill_urls:?}");
-            println!("Decode nodes: {:?}", self.decode);
+            println!("Decode nodes: {:?}", self.workers.decode);
         }
-        if self.epd_disaggregation {
+        if self.workers.epd_disaggregation {
             println!("Encode nodes: {encode_urls:?}");
             println!("Prefill nodes: {prefill_urls:?}");
-            println!("Decode nodes: {:?}", self.decode);
+            println!("Decode nodes: {:?}", self.workers.decode);
         }
     }
 
@@ -2947,9 +3449,9 @@ fn parse_cli_args(clap_args: Vec<String>) -> (CliArgs, bool) {
 
 /// Phase 4, serve: the async runtime (tokio's container-aware default size
 /// unless `--runtime-worker-threads` pins one; the size is logged by
-/// `startup` once the log subscriber is up), the server until it stops,
-/// then the log writers flushed; the tracer is shut down after a clean stop
-/// (a failed start-up returns before it, as it always did). The runtime is
+/// `startup` once the log subscriber is up), then [`server::run`]: the
+/// server until it stops, the log writers flushed and the tracer shut down
+/// on every exit, a clean stop and a failed start-up alike. The runtime is
 /// built only now: a refusal before this point costs no threads.
 fn serve(server_config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     let runtime = match server_config.runtime_worker_threads {
@@ -2959,19 +3461,12 @@ fn serve(server_config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> 
             .build()?,
         None => tokio::runtime::Runtime::new()?,
     };
-    let served = runtime.block_on(Box::pin(server::startup(server_config)));
-    // The writer threads outlive `startup` (a process may start more than one
-    // router); flush and stop them now that this process is done logging.
-    close_logging();
-    served?;
-    if is_otel_enabled() {
-        shutdown_otel();
-    }
-    Ok(())
+    server::run(&runtime, server_config)
 }
 
-/// The start-up sequence: parse, announce, configure, serve. The version
-/// flags are answered first, before clap sees the line.
+/// The start-up sequence: parse, resolve the secrets' sources, announce,
+/// configure, serve. The version flags are answered first, before clap sees
+/// the line.
 #[expect(clippy::print_stdout, reason = "the version flags' answer")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     register_jemalloc_as_global_allocator();
@@ -2981,7 +3476,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let command_line = CommandLine::split(&args);
-    let (cli_args, igw_enabled_for_discovery) = parse_cli_args(command_line.clap_args);
+    let (mut cli_args, igw_enabled_for_discovery) = parse_cli_args(command_line.clap_args);
+    cli_args.resolve_secret_sources(&process_env)?;
     cli_args.announce(
         igw_enabled_for_discovery,
         &command_line.prefill_urls,
@@ -2994,6 +3490,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exercise both generated builders and startup parsing on Rust's default
+    /// thread stack. A subprocess contains stack overflow's process-wide abort.
+    #[test]
+    fn cli_startup_fits_a_two_mib_thread_stack() {
+        const CHILD: &str = "SMG_CLI_STACK_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            std::thread::Builder::new()
+                .stack_size(2 * 1024 * 1024)
+                .spawn(|| {
+                    use clap::CommandFactory;
+
+                    Cli::command().debug_assert();
+                    Cli::command_for_update().debug_assert();
+                    for prefix in [&["smg"][..], &["smg", "launch"], &["smg", "start"]] {
+                        let cli =
+                            Cli::try_parse_from(prefix.iter().copied().chain(["--port", "31000"]))
+                                .unwrap();
+                        let mut args = match cli.command {
+                            Some(Commands::Launch { args }) => args,
+                            None => cli.router_args,
+                        };
+                        args.resolve_secret_sources(&|_| Ok(None)).unwrap();
+                        let router = args.to_router_config(vec![], vec![]).unwrap();
+                        let server = args.to_server_config(router).unwrap();
+                        assert_eq!(server.port, 31000);
+                        assert_eq!(server.router_config.port, 31000);
+                    }
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::cli_startup_fits_a_two_mib_thread_stack",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "CLI startup exceeded its thread stack or failed: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
 
     /// Parse top-level CLI args into the flattened `CliArgs` the binary uses.
     fn cli_args_from(args: &[&str]) -> CliArgs {
@@ -3290,14 +3838,16 @@ mod tests {
             }
         }
         for args in [cli_args_from(&spaced), launch_args_from(&spaced)] {
-            assert_eq!(args.max_concurrent_requests, -1);
-            assert_eq!(args.prefill_max_inflight_requests_per_worker, -1);
-            assert_eq!(args.redis_retention_days, Some(-1));
+            assert_eq!(args.serving.max_concurrent_requests, -1);
+            assert_eq!(args.workers.prefill_max_inflight_requests_per_worker, -1);
+            assert_eq!(args.integrations.redis_retention_days, Some(-1));
             // Refused later by the validator, by name, as a negative rate.
-            assert_eq!(args.rate_limit_tokens_per_second, Some(-1));
+            assert_eq!(args.serving.rate_limit_tokens_per_second, Some(-1));
         }
         assert_eq!(
-            launch_args_from(&["--max-concurrent-requests=-1"]).max_concurrent_requests,
+            launch_args_from(&["--max-concurrent-requests=-1"])
+                .serving
+                .max_concurrent_requests,
             -1
         );
         for flag in ["--oracle-pool-min", "--oracle-pool-max"] {
@@ -3418,15 +3968,99 @@ mod tests {
         );
     }
 
-    /// Three files for the mesh TLS flags (their content is not read here).
-    fn mesh_tls_files(tag: &str) -> [String; 3] {
-        let dir = std::env::temp_dir().join(format!("smg-mesh-tls-{}-{tag}", std::process::id()));
+    /// Three non-empty files for a set of TLS flags (the worker flags' files are
+    /// read into the config and must not be empty; nothing parses the PEM).
+    fn tls_files(kind: &str, names: [&str; 3], tag: &str) -> [String; 3] {
+        let dir = std::env::temp_dir().join(format!("smg-{kind}-tls-{}-{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        ["ca.pem", "node.pem", "node-key.pem"].map(|name| {
+        names.map(|name| {
             let path = dir.join(name);
             std::fs::write(&path, b"test").unwrap();
             path.to_string_lossy().into_owned()
         })
+    }
+
+    /// Three files for the mesh TLS flags.
+    fn mesh_tls_files(tag: &str) -> [String; 3] {
+        tls_files("mesh", ["ca.pem", "node.pem", "node-key.pem"], tag)
+    }
+
+    /// `--bucket-adjust-interval-secs` reaches the bucket policy, which only
+    /// the Python launcher could set until now; without the flag the interval
+    /// stays at 5 s, zero is refused by the validator, a negative by the parser.
+    #[test]
+    fn bucket_adjust_interval_flag_reaches_the_bucket_policy() {
+        let interval = |args: &[&str]| match cli_args_from(args)
+            .to_router_config(vec![], vec![])
+            .unwrap()
+            .policy
+        {
+            PolicyConfig::Bucket {
+                bucket_adjust_interval_secs,
+                ..
+            } => bucket_adjust_interval_secs,
+            other => panic!("expected the bucket policy, got {other:?}"),
+        };
+        assert_eq!(interval(&["--policy", "bucket"]), 5);
+        assert_eq!(
+            interval(&["--policy", "bucket", "--bucket-adjust-interval-secs", "9"]),
+            9
+        );
+
+        let err = cli_args_from(&["--policy", "bucket", "--bucket-adjust-interval-secs", "0"])
+            .to_router_config(vec![], vec![])
+            .expect_err("a zero interval is refused");
+        assert!(
+            err.to_string().contains("bucket_adjust_interval_secs"),
+            "{err}"
+        );
+        assert!(Cli::try_parse_from(["smg", "--bucket-adjust-interval-secs", "-1"]).is_err());
+    }
+
+    /// Three files for the worker mTLS flags.
+    fn worker_tls_files(tag: &str) -> [String; 3] {
+        tls_files("worker", ["ca.pem", "client.pem", "client-key.pem"], tag)
+    }
+
+    /// The worker mTLS flags reach the config as the launcher's options of the
+    /// same names do: the certificate and key are read into the client
+    /// identity, every CA path into the trust list (several per flag, the
+    /// flag repeats), and a certificate without its key is refused.
+    #[test]
+    fn worker_mtls_flags_reach_the_config() {
+        let [ca, cert, key] = worker_tls_files("all");
+        let [second_ca, _, _] = worker_tls_files("second");
+        let args = cli_args_from(&[
+            "--client-cert-path",
+            &cert,
+            "--client-key-path",
+            &key,
+            "--ca-cert-paths",
+            &ca,
+            &second_ca,
+            "--ca-cert-paths",
+            &ca,
+        ]);
+        assert_eq!(args.integrations.ca_cert_paths, [ca.clone(), second_ca, ca]);
+        let config = args.to_router_config(vec![], vec![]).unwrap();
+        assert!(
+            config.client_identity.is_some(),
+            "certificate and key form the identity"
+        );
+        assert_eq!(config.client_key_path.as_deref(), Some(key.as_str()));
+        assert_eq!(config.ca_certificates.len(), 3);
+
+        let err = cli_args_from(&["--client-cert-path", &cert])
+            .to_router_config(vec![], vec![])
+            .expect_err("a certificate without its key is refused");
+        assert!(err.to_string().contains("--client-key-path"), "{err}");
+
+        let plain = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert!(
+            plain.client_identity.is_none(),
+            "no flags, no client identity"
+        );
+        assert!(plain.ca_certificates.is_empty(), "no flags, no CA list");
     }
 
     #[test]
@@ -3646,10 +4280,12 @@ mod tests {
     #[test]
     fn zmq_engine_count_rejects_non_positive() {
         assert_eq!(
-            cli_args_from(&["--zmq-engine-count", "2"]).zmq_engine_count,
+            cli_args_from(&["--zmq-engine-count", "2"])
+                .routing
+                .zmq_engine_count,
             Some(2)
         );
-        assert_eq!(cli_args_from(&[]).zmq_engine_count, None);
+        assert_eq!(cli_args_from(&[]).routing.zmq_engine_count, None);
 
         for bad in ["0", "-1"] {
             let argv = ["smg", "--zmq-engine-count", bad];
@@ -3660,8 +4296,8 @@ mod tests {
         }
     }
 
-    /// The indexer prune flags are router-only settings and must flow into
-    /// `RouterConfig` (unset by default so the indexer stays unbounded).
+    /// The deprecated indexer prune flags are still accepted and flow into
+    /// `RouterConfig`, where nothing reads them but the startup warning.
     #[test]
     fn kv_indexer_prune_flags_flow_into_router_config() {
         let cli = cli_args_from(&[
@@ -3679,31 +4315,35 @@ mod tests {
         assert_eq!(defaults.kv_indexer_max_entries, None);
     }
 
-    /// `--kv-index` selects the event-driven index for cache-aware routing;
-    /// the positional indexer stays the default until the chain index has
-    /// passed a soak in the gateway.
+    /// `--kv-index` is deprecated: the chain index is the only KV index, so
+    /// `chain` is accepted (and flows into `RouterConfig` for the startup
+    /// warning), the removed `positional` index is refused with the reason,
+    /// and any other spelling is an invalid value.
     #[test]
-    fn kv_index_flag_flows_into_router_config() {
+    fn kv_index_flag_takes_chain_only() {
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(defaults.kv_index, KvIndexKind::Positional);
+        assert_eq!(defaults.kv_index, None);
 
-        let cli = cli_args_from(&["--kv-index", "chain"]);
+        let cli = cli_args_from(&["--kv-index", "Chain"]);
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(router_config.kv_index, KvIndexKind::Chain);
-        let server_config = cli.to_server_config(router_config).unwrap();
-        assert_eq!(server_config.router_config.kv_index, KvIndexKind::Chain);
-        // The spelling before the rename still selects the chain index.
-        assert_eq!(
-            cli_args_from(&["--kv-index", "run"]).kv_index,
-            KvIndexKind::Chain
-        );
-        assert!(KvIndexKind::deprecated_alias_used());
+        assert_eq!(router_config.kv_index.as_deref(), Some("chain"));
+        router_config.validate().unwrap();
 
-        assert_eq!(
-            cli_args_from(&["--kv-index", "Positional"]).kv_index,
-            KvIndexKind::Positional
+        let err = Cli::try_parse_from(["smg", "--kv-index", "positional"])
+            .expect_err("the removed positional index is refused");
+        let text = err.to_string();
+        assert!(
+            text.contains("positional KV index was removed") && text.contains("--kv-index"),
+            "the refusal names the removal and the flag: {text}"
         );
-        assert!(parse_kv_index_kind("tree").is_err());
+        for value in ["run", "tree"] {
+            let err = Cli::try_parse_from(["smg", "--kv-index", value])
+                .expect_err("only chain is accepted");
+            assert!(
+                err.to_string().contains("takes chain only"),
+                "{value}: {err}"
+            );
+        }
     }
 
     /// The retry-buffer cap must flow through both conversion paths.
@@ -3809,6 +4449,19 @@ mod tests {
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(defaults.header_read_timeout_secs, 30);
         assert_eq!(defaults.idle_connection_timeout_secs, 90);
+    }
+
+    /// The connection limit is a router setting and must flow into
+    /// `RouterConfig`; without the flag there is no bound.
+    #[test]
+    fn max_connections_flag_flows_into_router_config() {
+        let bounded = cli_args_from(&["--max-connections", "4096"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        assert_eq!(bounded.max_connections, 4096);
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.max_connections, 0);
     }
 
     /// The SSE keep-alive interval is a router-only setting and must flow
@@ -4225,16 +4878,16 @@ mod tests {
         ] {
             let mut cli = cli_args_from(selection);
             assert!(cli.enable_igw_for_discovery(), "{selection:?}");
-            assert!(cli.enable_igw, "{selection:?}");
+            assert!(cli.routing.enable_igw, "{selection:?}");
         }
 
         let mut already_on = cli_args_from(&["--service-discovery", "--enable-igw"]);
         assert!(!already_on.enable_igw_for_discovery());
-        assert!(already_on.enable_igw);
+        assert!(already_on.routing.enable_igw);
 
         let mut no_discovery = cli_args_from(&[]);
         assert!(!no_discovery.enable_igw_for_discovery());
-        assert!(!no_discovery.enable_igw);
+        assert!(!no_discovery.routing.enable_igw);
     }
 
     /// `--worker-auto-recovery` defaults to the `--service-discovery`
@@ -4309,6 +4962,27 @@ mod tests {
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert_eq!(server_config.health_check_port, None);
+    }
+
+    /// `--admin-port` and `--admin-host` flow into `RouterConfig`, the copy
+    /// the validator checks and `startup` reads, and reach `ServerConfig`
+    /// nested in it; unset, the control plane stays on the data listener.
+    #[test]
+    fn admin_listener_flags_flow_into_the_router_config() {
+        let cli = cli_args_from(&["--admin-port", "9001", "--admin-host", "127.0.0.1"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.admin_port, Some(9001));
+        assert_eq!(router_config.admin_host.as_deref(), Some("127.0.0.1"));
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(server_config.router_config.admin_port, Some(9001));
+        assert_eq!(
+            server_config.router_config.admin_host.as_deref(),
+            Some("127.0.0.1")
+        );
+
+        let router_config = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.admin_port, None);
+        assert_eq!(router_config.admin_host, None);
     }
 
     /// `--engine-metrics` must flow into `RouterConfig` and survive nesting
@@ -4600,13 +5274,47 @@ mod tests {
         assert!(!server_config.router_config.mm_allow_private_media_hosts);
     }
 
+    /// `--access-log-fields` takes the record's optional fields by name,
+    /// comma-separated or repeated, into both configs; without the flag the
+    /// record keeps its fields; an unknown name is refused with the known
+    /// ones.
+    #[test]
+    fn access_log_fields_flow_into_both_configs() {
+        let cli = cli_args_from(&[
+            "--access-log-fields",
+            "client_addr,worker",
+            "--access-log-fields",
+            "response_bytes",
+        ]);
+        let selected = vec![
+            AccessLogField::ClientAddr,
+            AccessLogField::Worker,
+            AccessLogField::ResponseBytes,
+        ];
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.access_log_fields, selected);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(server_config.router_config.access_log_fields, selected);
+
+        let unset = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert!(unset.access_log_fields.is_empty());
+
+        let err = Cli::try_parse_from(["smg", "--access-log-fields", "client_addr,peer"])
+            .expect_err("an unknown field is refused");
+        let text = err.to_string();
+        assert!(
+            text.contains("peer") && text.contains("forwarded_for"),
+            "the refusal names the unknown field and the known ones: {text}"
+        );
+    }
+
     #[test]
     fn mm_processing_rejects_unknown_modes_at_parse_time() {
         assert!(Cli::try_parse_from(["smg", "--mm-processing", "routers"]).is_err());
         assert!(Cli::try_parse_from(["smg", "--rdma-slot-ttl-s", "soon"]).is_err());
         assert!(Cli::try_parse_from(["smg", "--mm-pixel-cache-mb", "-1"]).is_err());
         let cli = cli_args_from(&["--mm-processing", "Router"]);
-        assert_eq!(cli.mm_processing, Some(MmProcessingMode::Router));
+        assert_eq!(cli.workers.mm_processing, Some(MmProcessingMode::Router));
     }
 
     /// The multimodal transport flags must reach both `RouterConfig` and the
@@ -4710,6 +5418,64 @@ mod tests {
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert_eq!(server_config.runtime_worker_threads, None);
+    }
+
+    /// Both values the validator bounds are checked on the command line's own
+    /// path, after the flags are parsed and before the runtime is built: a
+    /// count above the ceiling is refused naming the field and the
+    /// ceiling, a listener address that is not an IP address naming its field
+    /// and the value; the smallest count and a plain address pass.
+    #[test]
+    fn runtime_worker_threads_and_rdma_listen_ip_are_validated_on_the_cli_path() {
+        // The builder validates as it builds the configuration, and the
+        // configure phase validates once more before the runtime is built;
+        // the refusal reads the same from either.
+        let refusal = |args: &[&str]| match cli_args_from(args).to_router_config(vec![], vec![]) {
+            Err(err) => err.to_string(),
+            Ok(config) => config.validate().expect_err("refused").to_string(),
+        };
+        let text = refusal(&["--runtime-worker-threads", "100000"]);
+        assert!(
+            text.contains("runtime_worker_threads") && text.contains("Must be at most"),
+            "{text}"
+        );
+        let text = refusal(&["--rdma-listen-ip", "999.1.1.1", "--mm-pixel-rdma"]);
+        assert!(
+            text.contains("rdma_listen_ip")
+                && text.contains("999.1.1.1")
+                && text.contains("expected an IP address"),
+            "{text}"
+        );
+        cli_args_from(&[
+            "--runtime-worker-threads",
+            "1",
+            "--rdma-listen-ip",
+            "10.0.0.7",
+            "--mm-pixel-rdma",
+        ])
+        .to_router_config(vec![], vec![])
+        .unwrap()
+        .validate()
+        .unwrap();
+    }
+
+    /// The flag's help states the ceiling the validator refuses above and
+    /// the multiple of the CPUs the start-up warns above, as the constants
+    /// hold them.
+    #[test]
+    fn the_runtime_flag_help_names_the_bound() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        let ceiling = format!(
+            "from 1 to {} on every host",
+            smg::config::RUNTIME_WORKER_THREADS_CEILING
+        );
+        let advised = format!(
+            "above {} x the CPUs available to the process starts with a warning",
+            smg::config::RUNTIME_WORKER_THREADS_PER_CPU
+        );
+        assert!(help.contains(&ceiling) && help.contains(&advised), "{help}");
     }
 
     /// Over ZMQ, `--backend` pins the startup workers' runtime (the shared
@@ -4845,5 +5611,617 @@ mod tests {
             Err(ConfigError::InvalidValue { field, reason, .. })
                 if field == "model_alias" && reason == "Alias maps to both 'a' and 'b'"
         ));
+    }
+
+    // ==================== Secret sources ====================
+
+    /// An environment lookup over a table: no test here touches the
+    /// process environment.
+    fn env_of<'a>(
+        vars: &'a [(&'a str, &'a str)],
+    ) -> impl Fn(&str) -> ConfigResult<Option<String>> + 'a {
+        move |name| {
+            Ok(vars
+                .iter()
+                .find(|(var, _)| *var == name)
+                .map(|(_, value)| (*value).to_string()))
+        }
+    }
+
+    fn resolved(args: &[&str], vars: &[(&str, &str)]) -> ConfigResult<CliArgs> {
+        let mut cli = cli_args_from(args);
+        cli.resolve_secret_sources(&env_of(vars))?;
+        Ok(cli)
+    }
+
+    /// Every secret is read from its environment variable when its flag is
+    /// absent, the tenant entries split at ',' and at line ends with the
+    /// whitespace around them dropped, and the built configuration carries
+    /// the values; the record names the environment as the source.
+    #[test]
+    fn secrets_are_read_from_the_environment_when_the_flags_are_absent() {
+        let vars = [
+            ("SMG_API_KEY", "env-shared-key"),
+            (
+                "SMG_TENANT_API_KEYS",
+                "red:env-red, blue:env-blue\n green:env-green ,",
+            ),
+            (
+                "SMG_POSTGRES_DB_URL",
+                "postgresql://u:env-pg-pass@db.example:5432/smg",
+            ),
+            (
+                "SMG_REDIS_URL",
+                "redis://:env-redis-pass@cache.example:6379/0",
+            ),
+        ];
+
+        let cli = resolved(&["--history-backend", "postgres"], &vars).expect("resolves");
+        assert_eq!(cli.integrations.api_key.as_deref(), Some("env-shared-key"));
+        assert_eq!(
+            cli.integrations.tenant_api_keys,
+            vec!["red:env-red", "blue:env-blue", "green:env-green"]
+        );
+        assert_eq!(
+            cli.integrations.postgres_db_url.as_deref(),
+            Some("postgresql://u:env-pg-pass@db.example:5432/smg")
+        );
+        assert_eq!(
+            cli.integrations.secret_sources,
+            SecretSources {
+                api_key: Some(SecretSource::Environment),
+                tenant_api_keys: Some((SecretSource::Environment, 3)),
+                postgres_db_url: Some(SecretSource::Environment),
+                redis_url: None,
+            }
+        );
+        let config = cli
+            .to_router_config(vec![], vec![])
+            .expect("the resolved secrets build a configuration");
+        assert_eq!(config.api_key.as_deref(), Some("env-shared-key"));
+        assert_eq!(
+            config
+                .tenant_api_keys
+                .iter()
+                .map(|entry| (entry.tenant_id.as_str(), entry.key.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("red", "env-red"),
+                ("blue", "env-blue"),
+                ("green", "env-green")
+            ]
+        );
+        assert_eq!(
+            config.postgres.expect("a postgres store").db_url,
+            "postgresql://u:env-pg-pass@db.example:5432/smg"
+        );
+
+        let cli = resolved(&["--history-backend", "redis"], &vars).expect("resolves");
+        assert_eq!(
+            cli.integrations.redis_url.as_deref(),
+            Some("redis://:env-redis-pass@cache.example:6379/0")
+        );
+        assert_eq!(
+            cli.integrations.secret_sources.redis_url,
+            Some(SecretSource::Environment)
+        );
+        assert_eq!(cli.integrations.secret_sources.postgres_db_url, None);
+        let config = cli.to_router_config(vec![], vec![]).expect("builds");
+        assert_eq!(
+            config.redis.expect("a redis store").url,
+            "redis://:env-redis-pass@cache.example:6379/0"
+        );
+    }
+
+    /// A value from the environment is trimmed as a file's content is: a
+    /// Secret made from a file carries the editor's trailing newline into
+    /// the variable, and no header could carry such a key.
+    #[test]
+    fn a_value_from_the_environment_is_trimmed_like_a_file() {
+        let vars = [
+            ("SMG_API_KEY", "env-shared-key\n"),
+            (
+                "SMG_POSTGRES_DB_URL",
+                " postgresql://u:env-pg-pass@db.example:5432/smg\n",
+            ),
+        ];
+        let cli = resolved(&["--history-backend", "postgres"], &vars).expect("resolves");
+        assert_eq!(cli.integrations.api_key.as_deref(), Some("env-shared-key"));
+        assert_eq!(
+            cli.integrations.postgres_db_url.as_deref(),
+            Some("postgresql://u:env-pg-pass@db.example:5432/smg")
+        );
+    }
+
+    /// A variable set to bytes that are not UTF-8 is refused by name, not
+    /// read as unset: the gateway would otherwise start with no serving key
+    /// where the operator set one.
+    #[test]
+    fn a_variable_that_is_not_utf8_is_refused_not_passed_over() {
+        assert_eq!(env_value("SMG_API_KEY", None).expect("unset"), None);
+        assert_eq!(
+            env_value("SMG_API_KEY", Some("k".into())).expect("set"),
+            Some("k".to_string())
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let raw = std::ffi::OsString::from_vec(vec![b'k', 0xff, b'y']);
+            let err = env_value("SMG_API_KEY", Some(raw)).expect_err("not UTF-8");
+            assert!(
+                matches!(&err, ConfigError::InvalidValue { field, value, .. }
+                    if field == "SMG_API_KEY" && value == "<not UTF-8>"),
+                "{err}"
+            );
+        }
+        let refusing = |name: &str| -> ConfigResult<Option<String>> {
+            if name == "SMG_API_KEY" {
+                Err(ConfigError::InvalidValue {
+                    field: name.to_string(),
+                    value: "<not UTF-8>".to_string(),
+                    reason: "set, but its value is not UTF-8".to_string(),
+                })
+            } else {
+                Ok(None)
+            }
+        };
+        let mut cli = cli_args_from(&[]);
+        let err = cli.resolve_secret_sources(&refusing).expect_err("refused");
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { field, .. } if field == "SMG_API_KEY"),
+            "{err}"
+        );
+        assert_eq!(cli.integrations.api_key, None);
+    }
+
+    /// The command line beats the environment for every secret, and the
+    /// record says so.
+    #[test]
+    fn the_command_line_beats_the_environment() {
+        let vars = [
+            ("SMG_API_KEY", "env-shared-key"),
+            ("SMG_TENANT_API_KEYS", "red:env-red"),
+            (
+                "SMG_POSTGRES_DB_URL",
+                "postgresql://u:env@db.example:5432/smg",
+            ),
+        ];
+        let cli = resolved(
+            &[
+                "--api-key",
+                "flag-shared-key",
+                "--tenant-api-key",
+                "blue:flag-blue",
+                "--history-backend",
+                "postgres",
+                "--postgres-db-url",
+                "postgresql://u:flag@db.example:5432/smg",
+            ],
+            &vars,
+        )
+        .expect("resolves");
+
+        assert_eq!(cli.integrations.api_key.as_deref(), Some("flag-shared-key"));
+        assert_eq!(cli.integrations.tenant_api_keys, vec!["blue:flag-blue"]);
+        assert_eq!(
+            cli.integrations.postgres_db_url.as_deref(),
+            Some("postgresql://u:flag@db.example:5432/smg")
+        );
+        assert_eq!(
+            cli.integrations.secret_sources,
+            SecretSources {
+                api_key: Some(SecretSource::Flag),
+                tenant_api_keys: Some((SecretSource::Flag, 1)),
+                postgres_db_url: Some(SecretSource::Flag),
+                redis_url: None,
+            }
+        );
+    }
+
+    /// Without a source, nothing is set and nothing is recorded.
+    #[test]
+    fn without_a_source_no_secret_is_set() {
+        let cli = resolved(&["--history-backend", "postgres"], &[]).expect("resolves");
+
+        assert_eq!(cli.integrations.api_key, None);
+        assert!(cli.integrations.tenant_api_keys.is_empty());
+        assert_eq!(cli.integrations.postgres_db_url, None);
+        assert_eq!(cli.integrations.redis_url, None);
+        assert_eq!(cli.integrations.secret_sources, SecretSources::default());
+        assert!(!cli.integrations.secret_sources.any());
+    }
+
+    /// A secret file is read whole with its trailing newline dropped, a
+    /// tenant key file one entry per line with blank and comment lines
+    /// skipped; the file is named by its flag or by its environment
+    /// variable, and the record names the file as the source.
+    #[test]
+    fn secrets_are_read_from_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let api_key = dir.path().join("api-key");
+        let tenants = dir.path().join("tenants");
+        let pg = dir.path().join("pg-url");
+        let redis = dir.path().join("redis-url");
+        std::fs::write(&api_key, "file-shared-key\n").unwrap();
+        std::fs::write(
+            &tenants,
+            "# the tenants\r\n\nred:file-red\r\n  blue : file-blue  \n\n# trailing comment\n",
+        )
+        .unwrap();
+        std::fs::write(&pg, "postgresql://u:file-pg@db.example:5432/smg").unwrap();
+        std::fs::write(&redis, "  redis://:file-redis@cache.example:6379/1\n\n").unwrap();
+        let (api_key, tenants, pg, redis) = (
+            api_key.to_str().unwrap(),
+            tenants.to_str().unwrap(),
+            pg.to_str().unwrap(),
+            redis.to_str().unwrap(),
+        );
+
+        let by_flag = resolved(
+            &[
+                "--api-key-file",
+                api_key,
+                "--tenant-api-keys-file",
+                tenants,
+                "--history-backend",
+                "postgres",
+                "--postgres-db-url-file",
+                pg,
+            ],
+            &[],
+        )
+        .expect("resolves");
+        assert_eq!(
+            by_flag.integrations.api_key.as_deref(),
+            Some("file-shared-key")
+        );
+        assert_eq!(
+            by_flag.integrations.tenant_api_keys,
+            vec!["red:file-red", "blue : file-blue"]
+        );
+        assert_eq!(
+            by_flag.integrations.postgres_db_url.as_deref(),
+            Some("postgresql://u:file-pg@db.example:5432/smg")
+        );
+        assert_eq!(
+            by_flag.integrations.secret_sources,
+            SecretSources {
+                api_key: Some(SecretSource::File),
+                tenant_api_keys: Some((SecretSource::File, 2)),
+                postgres_db_url: Some(SecretSource::File),
+                redis_url: None,
+            }
+        );
+        let config = by_flag.to_router_config(vec![], vec![]).expect("builds");
+        assert_eq!(
+            config
+                .tenant_api_keys
+                .iter()
+                .map(|entry| (entry.tenant_id.as_str(), entry.key.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("red", "file-red"), ("blue", "file-blue")]
+        );
+
+        let by_env = resolved(
+            &["--history-backend", "redis"],
+            &[
+                ("SMG_API_KEY_FILE", api_key),
+                ("SMG_TENANT_API_KEYS_FILE", tenants),
+                ("SMG_REDIS_URL_FILE", redis),
+            ],
+        )
+        .expect("resolves");
+        assert_eq!(
+            by_env.integrations.api_key.as_deref(),
+            Some("file-shared-key")
+        );
+        assert_eq!(by_env.integrations.tenant_api_keys.len(), 2);
+        assert_eq!(
+            by_env.integrations.redis_url.as_deref(),
+            Some("redis://:file-redis@cache.example:6379/1")
+        );
+        assert_eq!(
+            by_env.integrations.secret_sources,
+            SecretSources {
+                api_key: Some(SecretSource::File),
+                tenant_api_keys: Some((SecretSource::File, 2)),
+                postgres_db_url: None,
+                redis_url: Some(SecretSource::File),
+            }
+        );
+    }
+
+    /// A value (from the flag or the environment) and a file for the same
+    /// secret are refused, whichever way each is given; the refusal names
+    /// the four sources and carries no value.
+    #[test]
+    fn a_value_and_a_file_for_one_secret_are_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("secret");
+        std::fs::write(&file, "file-secret").unwrap();
+        let file = file.to_str().unwrap();
+        let backend = ["--history-backend", "redis"];
+        /// The command line, the environment and the flag the refusal names.
+        type Case<'a> = (Vec<&'a str>, Vec<(&'a str, &'a str)>, &'a str);
+        let cases: Vec<Case> = vec![
+            (
+                vec!["--api-key", "flag-secret", "--api-key-file", file],
+                vec![],
+                "--api-key",
+            ),
+            (
+                vec!["--api-key", "flag-secret"],
+                vec![("SMG_API_KEY_FILE", file)],
+                "--api-key",
+            ),
+            (
+                vec![],
+                vec![("SMG_API_KEY", "env-secret"), ("SMG_API_KEY_FILE", file)],
+                "--api-key",
+            ),
+            (
+                vec!["--api-key-file", file],
+                vec![("SMG_API_KEY", "env-secret")],
+                "--api-key",
+            ),
+            (
+                vec![
+                    "--tenant-api-key",
+                    "red:flag-secret",
+                    "--tenant-api-keys-file",
+                    file,
+                ],
+                vec![],
+                "--tenant-api-key",
+            ),
+            (
+                vec!["--tenant-api-keys-file", file],
+                vec![("SMG_TENANT_API_KEYS", "red:env-secret")],
+                "--tenant-api-key",
+            ),
+            (
+                vec![
+                    "--history-backend",
+                    "postgres",
+                    "--postgres-db-url",
+                    "postgresql://u:flag-secret@db.example/smg",
+                    "--postgres-db-url-file",
+                    file,
+                ],
+                vec![],
+                "--postgres-db-url",
+            ),
+            (
+                backend.to_vec(),
+                vec![
+                    ("SMG_REDIS_URL", "redis://:env-secret@cache.example/0"),
+                    ("SMG_REDIS_URL_FILE", file),
+                ],
+                "--redis-url",
+            ),
+        ];
+        for (args, vars, flag) in cases {
+            let err = resolved(&args, &vars).expect_err(&format!("{args:?} {vars:?}"));
+            let text = err.to_string();
+            assert!(
+                matches!(err, ConfigError::IncompatibleConfig { .. }),
+                "{args:?}: {text}"
+            );
+            let file_flag = if flag == "--tenant-api-key" {
+                "--tenant-api-keys-file".to_string()
+            } else {
+                format!("{flag}-file")
+            };
+            for named in [flag, file_flag.as_str()] {
+                assert!(
+                    text.contains(named),
+                    "{args:?}: {named} missing from {text}"
+                );
+            }
+            assert!(text.contains("SMG_"), "{args:?}: {text}");
+            for secret in ["flag-secret", "env-secret", "file-secret"] {
+                assert!(!text.contains(secret), "{args:?}: {text}");
+            }
+        }
+    }
+
+    /// A file that is missing, empty, or holds more than one value where
+    /// one is expected, and a tenant key file without an entry, are
+    /// refused under the file flag's name with the path; the content is
+    /// never in the message.
+    #[test]
+    fn secret_files_that_cannot_be_used_are_refused_by_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("missing");
+        let empty = dir.path().join("empty");
+        let two_lines = dir.path().join("two-lines");
+        let comments_only = dir.path().join("comments-only");
+        std::fs::write(&empty, "\n").unwrap();
+        std::fs::write(&two_lines, "first-secret\nsecond-secret\n").unwrap();
+        std::fs::write(&comments_only, "# nothing here\n\n").unwrap();
+        let path = |p: &Path| p.to_str().unwrap().to_string();
+        let cases: Vec<(Vec<String>, &str, &str)> = vec![
+            (
+                vec!["--api-key-file".into(), path(&missing)],
+                "api-key-file",
+                "cannot be read",
+            ),
+            (
+                vec!["--api-key-file".into(), path(&empty)],
+                "api-key-file",
+                "is empty",
+            ),
+            (
+                vec!["--api-key-file".into(), path(&two_lines)],
+                "api-key-file",
+                "more than one line",
+            ),
+            (
+                vec!["--tenant-api-keys-file".into(), path(&comments_only)],
+                "tenant-api-keys-file",
+                "holds no entry",
+            ),
+            (
+                vec!["--tenant-api-keys-file".into(), path(&missing)],
+                "tenant-api-keys-file",
+                "cannot be read",
+            ),
+            (
+                vec![
+                    "--history-backend".into(),
+                    "postgres".into(),
+                    "--postgres-db-url-file".into(),
+                    path(&two_lines),
+                ],
+                "postgres-db-url-file",
+                "more than one line",
+            ),
+            (
+                vec![
+                    "--history-backend".into(),
+                    "redis".into(),
+                    "--redis-url-file".into(),
+                    path(&missing),
+                ],
+                "redis-url-file",
+                "cannot be read",
+            ),
+        ];
+        for (args, field, reason) in cases {
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            let err = resolved(&argv, &[]).expect_err(&args.join(" "));
+            let text = err.to_string();
+            match &err {
+                ConfigError::InvalidValue {
+                    field: named,
+                    value,
+                    reason: why,
+                } => {
+                    assert_eq!(named, field, "{text}");
+                    assert!(value.starts_with(dir.path().to_str().unwrap()), "{text}");
+                    assert!(why.contains(reason), "{text}");
+                }
+                other => panic!("{}: {other}", args.join(" ")),
+            }
+            assert!(!text.contains("first-secret"), "{text}");
+        }
+    }
+
+    /// A tenant source that is set but holds no entry is refused: it was
+    /// meant to close the serving routes. A malformed entry from the
+    /// environment is refused where a flag's is, without an echo.
+    #[test]
+    fn tenant_entries_from_the_environment_are_checked_like_the_flags() {
+        let err = resolved(&[], &[("SMG_TENANT_API_KEYS", " , \n")]).expect_err("no entry");
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { field, .. } if field == "SMG_TENANT_API_KEYS"),
+            "{err}"
+        );
+
+        let cli = resolved(&[], &[("SMG_TENANT_API_KEYS", "no-separator-secret")])
+            .expect("the shape is checked by the parser");
+        let err = cli
+            .to_router_config(vec![], vec![])
+            .expect_err("a tenant entry without ':' is refused");
+        let text = err.to_string();
+        assert!(text.contains("tenant-api-key"), "{text}");
+        assert!(!text.contains("no-separator-secret"), "{text}");
+    }
+
+    /// A store URL source is read for the selected history backend alone:
+    /// a PostgreSQL URL file named in the environment of a start on the
+    /// memory backend is not opened, and the record does not name it.
+    #[test]
+    fn store_urls_are_resolved_for_the_selected_backend_alone() {
+        let vars = [
+            ("SMG_POSTGRES_DB_URL_FILE", "/nonexistent/pg-url"),
+            ("SMG_REDIS_URL_FILE", "/nonexistent/redis-url"),
+        ];
+
+        let cli = resolved(&[], &vars).expect("the memory backend reads no store URL");
+        assert_eq!(cli.integrations.postgres_db_url, None);
+        assert_eq!(cli.integrations.redis_url, None);
+        assert_eq!(cli.integrations.secret_sources, SecretSources::default());
+
+        let err = resolved(&["--history-backend", "postgres"], &vars).expect_err("opened");
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { field, .. } if field == "postgres-db-url-file"),
+            "{err}"
+        );
+        let err = resolved(&["--history-backend", "redis"], &vars).expect_err("opened");
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { field, .. } if field == "redis-url-file"),
+            "{err}"
+        );
+    }
+
+    /// The sources travel into the server configuration, for the start-up
+    /// record.
+    #[test]
+    fn the_secret_sources_reach_the_server_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let api_key = dir.path().join("api-key");
+        std::fs::write(&api_key, "file-shared-key\n").unwrap();
+
+        let cli = resolved(
+            &["--api-key-file", api_key.to_str().unwrap()],
+            &[("SMG_TENANT_API_KEYS", "red:env-red")],
+        )
+        .expect("resolves");
+        let server_config = cli.configure(vec![], vec![]).expect("configures");
+
+        assert_eq!(
+            server_config.secret_sources,
+            SecretSources {
+                api_key: Some(SecretSource::File),
+                tenant_api_keys: Some((SecretSource::Environment, 1)),
+                postgres_db_url: None,
+                redis_url: None,
+            }
+        );
+        assert_eq!(
+            server_config.router_config.api_key.as_deref(),
+            Some("file-shared-key")
+        );
+    }
+
+    /// `--help` names the environment variables and the file flags of the
+    /// secrets, and the variables clap reads itself are declared with their
+    /// values hidden, so a set one never shows. Asserted on the command's
+    /// arguments rather than by setting the variables: the other tests of
+    /// this module parse through clap in parallel and would read them.
+    #[test]
+    fn the_help_names_the_sources_and_hides_the_values() {
+        use clap::CommandFactory;
+
+        let mut command = Cli::command();
+        for id in ["oracle_password", "control_plane_api_keys"] {
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_id().as_str() == id)
+                .unwrap_or_else(|| panic!("{id} is an argument"));
+            assert!(
+                arg.is_hide_env_values_set(),
+                "{id} would show its environment value in the help"
+            );
+        }
+        let help = command.render_long_help().to_string();
+
+        for named in [
+            "SMG_API_KEY",
+            "--api-key-file",
+            "SMG_API_KEY_FILE",
+            "SMG_TENANT_API_KEYS",
+            "--tenant-api-keys-file",
+            "SMG_POSTGRES_DB_URL",
+            "--postgres-db-url-file",
+            "SMG_REDIS_URL",
+            "--redis-url-file",
+            "[env: ATP_PASSWORD]",
+            "[env: CONTROL_PLANE_API_KEYS]",
+        ] {
+            assert!(help.contains(named), "{named} missing from the help");
+        }
+        assert!(!help.contains("hunter2"), "a value in the help:\n{help}");
     }
 }

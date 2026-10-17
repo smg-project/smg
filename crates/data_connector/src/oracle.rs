@@ -24,6 +24,10 @@ use crate::{
     context::current_extra_columns,
     oracle_migrations::ORACLE_HISTORY_MIGRATIONS,
     schema::SchemaConfig,
+    versioning::{
+        bootstrap_oracle_schema, oracle_recorded_version, run_oracle_migrations, Migration,
+        OracleSchemaSteps,
+    },
 };
 
 // ============================================================================
@@ -43,10 +47,14 @@ pub(crate) struct OracleStore {
 }
 
 impl OracleStore {
-    /// Create a connection pool and initialize all schemas.
+    /// Create a connection pool, with the schema brought to this build's
+    /// shape first.
     ///
     /// Accepts a list of schema initializers that run on a single connection
-    /// before the pool is created, ensuring all tables exist.
+    /// before the pool is created, ensuring all tables exist. The database's
+    /// recorded schema version is checked against this build's migrations
+    /// before any of them runs, so a database a newer build migrated forward
+    /// is refused untouched (see [`bootstrap_oracle_schema`]).
     pub fn new(config: &OracleConfig, init_schemas: &[SchemaInitFn]) -> Result<Self, String> {
         // Extract and validate schema config.
         // Oracle folds unquoted identifiers to uppercase, so existing tables
@@ -69,27 +77,18 @@ impl OracleStore {
         )
         .map_err(map_oracle_error)?;
 
-        for init_schema in init_schemas {
-            init_schema(&conn, &schema)?;
-        }
-
-        // Run versioned migrations after table creation
-        let applied = crate::versioning::run_oracle_migrations(
-            &conn,
-            &schema,
+        // The recorded schema version against this build's migrations before
+        // any history table is touched; then the tables, the migrations and
+        // the indexes on the columns they added.
+        bootstrap_oracle_schema(
+            &OracleSchemaSetup {
+                conn: &conn,
+                schema: schema.as_ref(),
+                init_schemas,
+            },
             &ORACLE_HISTORY_MIGRATIONS,
             schema.version,
-            schema.auto_migrate,
         )?;
-
-        // Re-run init_schemas when migrations were applied so that indexes
-        // on newly-added columns (e.g. safety_identifier added by v1) are
-        // created in this startup cycle rather than requiring a restart.
-        if !applied.is_empty() {
-            for init_schema in init_schemas {
-                init_schema(&conn, &schema)?;
-            }
-        }
 
         drop(conn);
 
@@ -134,6 +133,41 @@ impl OracleStore {
         .await
         .map_err(|e| Failure::Storage(format!("Task execution failed: {e}")))?
         .map_err(Failure::Storage)
+    }
+}
+
+/// The start-up steps of [`OracleStore::new`] on its connection, in the order
+/// [`bootstrap_oracle_schema`] runs them.
+struct OracleSchemaSetup<'a> {
+    conn: &'a Connection,
+    schema: &'a SchemaConfig,
+    init_schemas: &'a [SchemaInitFn],
+}
+
+impl OracleSchemaSteps for OracleSchemaSetup<'_> {
+    fn recorded_version(&self) -> Result<Option<u32>, String> {
+        oracle_recorded_version(self.conn, self.schema)
+    }
+
+    fn create_tables(&self) -> Result<(), String> {
+        for init_schema in self.init_schemas {
+            init_schema(self.conn, self.schema)?;
+        }
+        Ok(())
+    }
+
+    fn migrate(
+        &self,
+        migrations: &[Migration],
+        config_version: Option<u32>,
+    ) -> Result<Vec<u32>, String> {
+        run_oracle_migrations(
+            self.conn,
+            self.schema,
+            migrations,
+            config_version,
+            self.schema.auto_migrate,
+        )
     }
 }
 
@@ -1523,6 +1557,14 @@ fn oracle_open_predicate(col_raw: &str) -> String {
     )
 }
 
+/// [`oracle_open_predicate`] over the schema's object column; none when the
+/// schema skips it: there is no status to check, so the conditional store is
+/// a plain update of the row under the id (every backend of this crate
+/// agrees).
+fn oracle_open_predicate_for(s: &crate::schema::TableConfig) -> Option<String> {
+    (!s.is_skipped("raw_response")).then(|| oracle_open_predicate(s.col("raw_response")))
+}
+
 #[async_trait]
 impl ResponseStorage for OracleResponseStorage {
     async fn store_response(
@@ -1658,8 +1700,7 @@ impl ResponseStorage for OracleResponseStorage {
                     columns.push(*name);
                     params.push(val);
                 }
-                let open = (!s.is_skipped("raw_response"))
-                    .then(|| oracle_open_predicate(s.col("raw_response")));
+                let open = oracle_open_predicate_for(s);
                 let (sql, binds) = update_if_open_sql(&table, &columns, open.as_deref());
                 let named: Vec<(&str, &dyn ToSql)> = binds
                     .iter()
@@ -2132,5 +2173,23 @@ mod tests {
              WHEN NOT MATCHED THEN INSERT (id) VALUES (:v1)"
         );
         assert_eq!(binds, ["v1"]);
+    }
+
+    #[test]
+    fn a_schema_without_the_object_column_has_no_open_condition() {
+        let mut s = crate::schema::TableConfig::with_table("responses");
+        s.columns
+            .insert("raw_response".to_string(), "payload".to_string());
+        assert_eq!(
+            oracle_open_predicate_for(&s).as_deref(),
+            Some(oracle_open_predicate("payload").as_str()),
+            "the mapped column is checked"
+        );
+        s.skip_columns.insert("raw_response".to_string());
+        assert_eq!(
+            oracle_open_predicate_for(&s),
+            None,
+            "no object column: the conditional store is a plain update"
+        );
     }
 }

@@ -341,7 +341,7 @@ impl ResponseProcessor {
         tokenizer: &Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<(ChatChoice, u32), String> {
-        let tools = original_request.tools.as_deref().unwrap_or(&[]);
+        let tools = original_request.tools.clone().unwrap_or_default();
         let mut reader =
             Reader::new(assignment, tools)?.first_call_only(original_request.first_tool_call_only);
         let (mut events, stopped) = reader.read(stop_decoder, complete.output_ids())?;
@@ -414,7 +414,7 @@ impl ResponseProcessor {
         request: &MessagesResponseSpec,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<Message, String> {
-        let mut reader = Reader::new(assignment, &request.chat_tools)?
+        let mut reader = Reader::new(assignment, Arc::clone(&request.chat_tools))?
             .first_call_only(request.first_tool_call_only);
         stop_decoder.reset();
         let (mut events, stopped) = reader.read(stop_decoder, complete.output_ids())?;
@@ -433,7 +433,10 @@ impl ResponseProcessor {
             complete.finish_reason()
         };
         events.extend(reader.end(engine_finish(reason))?);
-        let output = adapt::messages::output(&events);
+        let mut output = adapt::messages::output(&events);
+        if !request.thinking_text_returned {
+            utils::message_utils::omit_thinking_text(&mut output.content);
+        }
         let stop_sequence = stop_decoder.matched_stop().map(String::from).or_else(|| {
             complete
                 .matched_stop_json()
@@ -468,6 +471,11 @@ impl ResponseProcessor {
     }
 
     /// Process non-streaming chat response (collects all responses and builds final response)
+    ///
+    /// Returns the response with the engine's counters it was built from:
+    /// the response's usage drops the unbilled prompt tokens and may carry
+    /// the gateway parser's reasoning split; the settlement takes the
+    /// counters.
     pub async fn process_non_streaming_chat_response(
         &self,
         execution_result: ExecutionResult,
@@ -476,7 +484,8 @@ impl ResponseProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
         request_logprobs: bool,
-    ) -> Result<ChatCompletionResponse, axum::response::Response> {
+    ) -> Result<(ChatCompletionResponse, response_formatting::TokenCounts), axum::response::Response>
+    {
         let model = &dispatch.model;
         let reasoning_parser_name = self.parser_resolver.reasoning_parser(model);
         let tool_parser_name = self.parser_resolver.tool_parser(model);
@@ -556,22 +565,22 @@ impl ResponseProcessor {
         // answer builds its usage chunk: with the reasoning tokens the
         // gateway's parser split off when it ran (zero included) and every
         // detail counter present as the OpenAI API sends it.
+        let counts = response_formatting::TokenCounts::of(&all_responses);
         let usage = response_formatting::chat_usage(
-            response_formatting::build_usage(&all_responses),
+            counts.usage(),
             (reasoning_parser_available || chat_request.symphony.is_some())
                 .then_some(parsed_reasoning_tokens),
             chat_request.unbilled_prompt_tokens,
         );
 
         // Build final ChatCompletionResponse
-        Ok(
-            ChatCompletionResponse::builder(&dispatch.request_id, &dispatch.model)
-                .created(dispatch.created)
-                .choices(choices)
-                .usage(usage)
-                .maybe_system_fingerprint(dispatch.weight_version.clone())
-                .build(),
-        )
+        let response = ChatCompletionResponse::builder(&dispatch.request_id, &dispatch.model)
+            .created(dispatch.created)
+            .choices(choices)
+            .usage(usage)
+            .maybe_system_fingerprint(dispatch.weight_version.clone())
+            .build();
+        Ok((response, counts))
     }
 
     /// Parse tool calls using model-specific parser
@@ -768,6 +777,10 @@ impl ResponseProcessor {
     ///
     /// Collects the single response (Messages always has n=1), decodes tokens,
     /// parses reasoning/tool calls, and builds an Anthropic `Message` response.
+    ///
+    /// Returns the message with the engine's counters it was built from: the
+    /// Messages usage reports no cache hits and the greater of the engine's
+    /// and the parser's thinking count; the settlement takes the counters.
     pub async fn process_non_streaming_messages_response(
         &self,
         execution_result: ExecutionResult,
@@ -775,7 +788,7 @@ impl ResponseProcessor {
         dispatch: DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
-    ) -> Result<Message, axum::response::Response> {
+    ) -> Result<(Message, response_formatting::TokenCounts), axum::response::Response> {
         let model = &dispatch.model;
         let reasoning_parser_name = self.parser_resolver.reasoning_parser(model);
         let tool_parser_name = self.parser_resolver.tool_parser(model);
@@ -809,6 +822,8 @@ impl ResponseProcessor {
         }
         #[expect(clippy::unwrap_used, reason = "safe: checked len == 1 above")]
         let complete = all_responses.into_iter().next().unwrap();
+        // The engine's counters, for the settlement, whichever reader builds the message.
+        let counts = response_formatting::TokenCounts::of(std::slice::from_ref(&complete));
         if let Some(assignment) = &messages_request.symphony {
             return Self::read_messages_with_symphony(
                 &dispatch,
@@ -817,6 +832,7 @@ impl ResponseProcessor {
                 &messages_request,
                 stop_decoder,
             )
+            .map(|message| (message, counts))
             .map_err(|e| {
                 error!(function = "process_non_streaming_messages_response", error = %e, "Symphony failed to read the message");
                 error::internal_error("symphony_read_failed", e)
@@ -1043,6 +1059,9 @@ impl ResponseProcessor {
                 });
             }
         }
+        if !messages_request.thinking_text_returned {
+            utils::message_utils::omit_thinking_text(&mut content_blocks);
+        }
 
         // Step 4: Determine stop_reason and stop_sequence (derived from same conditions).
         // A local stop-decoder match takes precedence over the engine's reason
@@ -1088,7 +1107,7 @@ impl ResponseProcessor {
         );
 
         // Step 6: Build Message
-        Ok(Message {
+        let message = Message {
             id: dispatch.request_id,
             message_type: "message".to_string(),
             role: "assistant".to_string(),
@@ -1099,7 +1118,8 @@ impl ResponseProcessor {
             stop_details: None,
             usage,
             container: None,
-        })
+        };
+        Ok((message, counts))
     }
 
     /// Process non-streaming completion response

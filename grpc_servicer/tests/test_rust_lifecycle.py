@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import multiprocessing
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -107,16 +109,40 @@ def _alive(pid: int) -> bool:
         return False  # reaped: before the open (ENOENT), or between it and the read (ESRCH)
 
 
-def _worker_pid(pid_file, deadline_secs: float = 10) -> int:
-    deadline = time.monotonic() + deadline_secs
-    while not pid_file.exists() or not pid_file.read_text().strip():
+# Every wait below is a poll that ends at its event; the bound only catches a
+# hang, so it is generous: a spawn or an exit that is slow on a loaded host
+# must not fail a test whose behaviour is unaffected.
+_PATIENCE_SECS = 60.0
+
+
+def _worker_pid(pid_file, launcher: subprocess.Popen) -> int:
+    """The pid the launcher wrote once it spawned its worker; a launcher that
+    exits before that fails the test at once instead of at the bound."""
+    deadline = time.monotonic() + _PATIENCE_SECS
+    while True:
+        # Polled before the read: an exit seen here wrote all it would, so a
+        # launcher that writes its pid and exits between the two is not
+        # reported as one that never spawned its worker.
+        code = launcher.poll()
+        if pid_file.exists() and pid_file.read_text().strip():
+            return int(pid_file.read_text())
+        assert code is None, f"the launcher exited with {code} before it spawned its worker"
         assert time.monotonic() < deadline, "the launcher never spawned its worker"
         time.sleep(0.05)
-    return int(pid_file.read_text())
 
 
-def _wait_dead(pid: int, what: str, deadline_secs: float = 10) -> None:
-    deadline = time.monotonic() + deadline_secs
+def _exit_when(go_file, code: int) -> str:
+    """The tail of a launcher's command: it exits with ``code`` once the test
+    creates ``go_file``, so the test says when a core goes, not a timer that a
+    loaded host can outrun. The wait ends on its own at the workers' 300 s
+    lifetime, so a test that fails before it creates the file (and every wait
+    in this file gives up at the patience bound, well before) leaves no
+    launcher polling for ever."""
+    return f"until [ -e {go_file} ] || (( SECONDS >= 300 )); do sleep 0.02; done; exit {code}"
+
+
+def _wait_dead(pid: int, what: str) -> None:
+    deadline = time.monotonic() + _PATIENCE_SECS
     while _alive(pid):
         assert time.monotonic() < deadline, f"the {what} outlived the engine cleanup"
         time.sleep(0.05)
@@ -127,28 +153,29 @@ def test_kill_reaches_the_workers_the_engine_spawned(tmp_path):
     everything stays in the launcher's process group."""
     pid_file = tmp_path / "worker.pid"
     launcher = subprocess.Popen(["bash", "-c", f"sleep 300 & echo $! > {pid_file}; wait"])
-    worker_pid = _worker_pid(pid_file)
+    worker_pid = _worker_pid(pid_file, launcher)
     engine = rust_lifecycle.EngineProcess(_PopenAsSpawned(launcher))
     assert os.getpgid(launcher.pid) == os.getpgid(0)
     assert engine.poll() is None  # tracks the worker
 
     engine.kill()
 
-    assert engine.wait(timeout=10) == -signal.SIGKILL
+    assert engine.wait(timeout=_PATIENCE_SECS) == -signal.SIGKILL
     _wait_dead(worker_pid, "worker")
 
 
 def test_cleanup_after_the_engine_exited_kills_the_workers_it_left(tmp_path):
     """An engine that crashed leaves re-parented workers; terminate_engine
     kills the ones it had seen while the engine was alive."""
-    pid_file = tmp_path / "worker.pid"
+    pid_file, go = tmp_path / "worker.pid", tmp_path / "go"
     launcher = subprocess.Popen(
-        ["bash", "-c", f"sleep 300 & echo $! > {pid_file}; sleep 2; exit 3"]
+        ["bash", "-c", f"sleep 300 & echo $! > {pid_file}; {_exit_when(go, 3)}"]
     )
-    worker_pid = _worker_pid(pid_file)
+    worker_pid = _worker_pid(pid_file, launcher)
     engine = rust_lifecycle.EngineProcess(_PopenAsSpawned(launcher))
     assert engine.poll() is None  # tracks the worker while the launcher lives
-    assert engine.wait(timeout=10) == 3
+    go.touch()
+    assert engine.wait(timeout=_PATIENCE_SECS) == 3
     assert _alive(worker_pid)
 
     rust_lifecycle.terminate_engine(engine)
@@ -190,14 +217,14 @@ def test_group_kill_reaches_the_workers_of_every_core(tmp_path):
         subprocess.Popen(["bash", "-c", f"sleep 300 & echo $! > {pid_file}; wait"])
         for pid_file in pid_files
     ]
-    workers = [_worker_pid(pid_file) for pid_file in pid_files]
+    workers = [_worker_pid(pid_file, launcher) for pid_file, launcher in zip(pid_files, launchers)]
     engines = rust_lifecycle.EngineProcessGroup(_ManagerOf(launchers))
     assert engines.pids == [launcher.pid for launcher in launchers]
     assert engines.poll() is None  # tracks every core's workers
 
     engines.kill()
 
-    assert engines.wait(timeout=10) == -signal.SIGKILL
+    assert engines.wait(timeout=_PATIENCE_SECS) == -signal.SIGKILL
     for worker in workers:
         _wait_dead(worker, "worker")
 
@@ -205,21 +232,25 @@ def test_group_kill_reaches_the_workers_of_every_core(tmp_path):
 def test_one_cores_exit_ends_the_group_and_the_cleanup_reaps_every_worker(tmp_path):
     """A core that exits takes the engine down: the manager shuts the other
     cores down and `terminate_engine` kills the workers they left."""
-    pid_files = [tmp_path / "a.pid", tmp_path / "b.pid"]
+    pid_files, go = [tmp_path / "a.pid", tmp_path / "b.pid"], tmp_path / "go"
     launchers = [
-        subprocess.Popen(["bash", "-c", f"sleep 300 & echo $! > {pid_files[0]}; sleep 1; exit 3"]),
+        subprocess.Popen(
+            ["bash", "-c", f"sleep 300 & echo $! > {pid_files[0]}; {_exit_when(go, 3)}"]
+        ),
         subprocess.Popen(["bash", "-c", f"sleep 300 & echo $! > {pid_files[1]}; wait"]),
     ]
-    workers = [_worker_pid(pid_file) for pid_file in pid_files]
+    workers = [_worker_pid(pid_file, launcher) for pid_file, launcher in zip(pid_files, launchers)]
     manager = _ManagerOf(launchers)
     engines = rust_lifecycle.EngineProcessGroup(manager)
     assert engines.poll() is None
-    deadline = time.monotonic() + 10
+    go.touch()
+    deadline = time.monotonic() + _PATIENCE_SECS
     while engines.poll() is None:
         assert time.monotonic() < deadline, "the first core never exited"
         time.sleep(0.05)
     assert engines.poll() == 3 and manager.shutdowns == [None]
-    assert engines.wait(timeout=10) == 3  # the first exit code; the sibling was terminated
+    # The first exit code; the sibling was terminated.
+    assert engines.wait(timeout=_PATIENCE_SECS) == 3
 
     rust_lifecycle.terminate_engine(engines)
 
@@ -709,46 +740,79 @@ def test_a_cancelled_launch_task_still_stops_the_server():
     assert events == ["serving:False", f"stop:{rust_lifecycle.SERVER_STOP_SECS}", "cancelled"]
 
 
+def _port_of(endpoint: str) -> int:
+    assert endpoint.startswith("tcp://*:"), endpoint
+    return int(endpoint.rpartition(":")[2])
+
+
+@contextlib.contextmanager
+def _listener(port: int):
+    """A listener on ``port`` on every interface, bound the way a ZMQ
+    publisher binds (``SO_REUSEADDR``): what an engine another job left
+    behind holds. Yields the port, or ``None`` when another process holds it
+    already, which serves the same purpose."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        try:
+            sock.bind(("", port))
+            sock.listen(1)
+        except OSError:
+            yield None
+        else:
+            yield port
+    finally:
+        sock.close()
+
+
 def test_the_kv_events_default_turns_the_publisher_on_unless_told_otherwise(caplog):
     """The rule the three launchers share: a target without a configuration
-    gets the engine's default, the engine's variable keeps the publisher off,
-    an explicit configuration is kept as given, frozen server args are left
-    alone."""
+    gets the engine's default built for a free port's endpoint, the engine's
+    variable keeps the publisher off, an explicit configuration is kept as
+    given, frozen server args are left alone."""
     apply = rust_lifecycle.apply_kv_events_default
     env = "SMG_TEST_SERVICER_KV_EVENTS"
     built: list[str] = []
 
-    def build():
-        built.append("built")
-        return {"publisher": "zmq"}
+    def build(endpoint: str) -> dict[str, str]:
+        built.append(endpoint)
+        return {"publisher": "zmq", "endpoint": endpoint}
 
-    # Nothing given (no attribute, None, an empty string): the default, as a
-    # value or built on demand.
-    target = types.SimpleNamespace()
-    assert apply(target, "zmq", env_name=env, environ={}) == "zmq"
-    assert target.kv_events_config == "zmq"
+    # Nothing given (no attribute, None, an empty string): the default, built
+    # for an endpoint at a free port of this host.
     for target in (
         types.SimpleNamespace(),
         types.SimpleNamespace(kv_events_config=None),
         types.SimpleNamespace(kv_events_config=""),
     ):
-        assert apply(target, build, env_name=env, environ={}) == {"publisher": "zmq"}
-        assert target.kv_events_config == {"publisher": "zmq"}
-    assert built == ["built"] * 3
+        applied = apply(target, build, env_name=env, environ={})
+        assert applied == {"publisher": "zmq", "endpoint": built[-1]}
+        assert target.kv_events_config is applied
+        assert rust_lifecycle._bindable(_port_of(built[-1]))
+    assert len(built) == 3
     # The opt-out: the engine's variable, case and whitespace aside; nothing is
     # built for a publisher left off. Any other value is not the opt-out.
     for value in ("0", "false", "No", " off "):
         target = types.SimpleNamespace(kv_events_config=None)
         assert apply(target, build, env_name=env, environ={env: value}) is None
         assert target.kv_events_config is None
-    assert apply(types.SimpleNamespace(), "zmq", env_name=env, environ={env: "1"}) == "zmq"
-    assert built == ["built"] * 3
-    # An explicit configuration is kept as given, off and empty included.
-    for given in ('{"publisher": "null"}', {}, types.SimpleNamespace(publisher="null")):
+    assert len(built) == 3
+    assert apply(types.SimpleNamespace(), build, env_name=env, environ={env: "1"}) == {
+        "publisher": "zmq",
+        "endpoint": built[-1],
+    }
+    assert len(built) == 4
+    # An explicit configuration is kept as given: off, empty, and one that
+    # names the engines' fixed default endpoint, which is then the operator's.
+    for given in (
+        '{"publisher": "null"}',
+        {},
+        types.SimpleNamespace(publisher="zmq", endpoint="tcp://*:5557"),
+    ):
         target = types.SimpleNamespace(kv_events_config=given)
         assert apply(target, build, env_name=env, environ={}) is None
         assert target.kv_events_config is given
-    assert built == ["built"] * 3
+    assert len(built) == 4
     # Server args that cannot be written are left alone, with a warning.
 
     class Frozen:
@@ -756,6 +820,104 @@ def test_the_kv_events_default_turns_the_publisher_on_unless_told_otherwise(capl
         kv_events_config = None
 
     with caplog.at_level("WARNING", logger=rust_lifecycle.logger.name):
-        assert apply(Frozen(), "zmq", env_name=env, environ={}) is None
+        assert apply(Frozen(), build, env_name=env, environ={}) is None
     warning = "kv_events_config cannot be set on Frozen; KV event publishing stays as configured"
     assert warning in caplog.text
+
+
+def test_the_default_publisher_port_is_a_free_one_not_the_engines_fixed_default():
+    """Every engine's own configuration defaults its publisher to tcp://*:5557,
+    and an engine started while another process held that port (an engine an
+    earlier job left behind, a second engine on the host) died at its bind
+    with "Address already in use": the lifecycle's endpoint is a port drawn
+    from below the OS's ephemeral range and probed free, so a held default is
+    never chosen, and the ports after it, which a data-parallel engine's other
+    ranks publish on, are free too."""
+    # The bound the draw stays below: the host's, or Linux's default when the
+    # host's leaves no room above the floor (a host tuned for many outbound
+    # connections, whose range starts at or below the floor).
+    low = rust_lifecycle._ephemeral_low()
+    if low - 4 < rust_lifecycle.KV_EVENTS_PORT_FLOOR:
+        low = rust_lifecycle.DEFAULT_EPHEMERAL_LOW
+    with _listener(5557):
+        assert not rust_lifecycle._bindable(5557)
+        port = _port_of(rust_lifecycle.free_kv_events_endpoint())
+        assert port != 5557
+        assert rust_lifecycle._bindable(port)
+        assert rust_lifecycle.KV_EVENTS_PORT_FLOOR <= port < low
+    base = _port_of(rust_lifecycle.free_kv_events_endpoint(ranks=4))
+    assert all(rust_lifecycle._bindable(base + rank) for rank in range(4))
+    assert rust_lifecycle.KV_EVENTS_PORT_FLOOR <= base and base + 3 < low
+
+
+def test_the_ports_are_drawn_from_below_the_ephemeral_range(tmp_path, monkeypatch, caplog):
+    """An outbound connection the engine opens while its model loads draws its
+    source port from the OS's ephemeral range, and could take a port picked
+    there before the engine binds it: the draw stays below the range's low
+    bound as the OS states it, whatever it is (Linux's default when it cannot
+    be read or is garbled), above the well-known ports and the engines' fixed
+    default. A host whose range starts at or below the floor keeps the draw,
+    from the floor up to Linux's default low bound, and says once that it
+    comes from inside the range, naming the knob."""
+    stated = tmp_path / "ip_local_port_range"
+    stated.write_text("20000\t60999\n")
+    assert rust_lifecycle._ephemeral_low(str(stated)) == 20000
+    stated.write_text("1024\t65535\n")
+    assert rust_lifecycle._ephemeral_low(str(stated)) == 1024
+    assert rust_lifecycle._ephemeral_low(str(tmp_path / "missing")) == 32768
+    stated.write_text("garbage\n")
+    assert rust_lifecycle._ephemeral_low(str(stated)) == 32768
+    monkeypatch.setattr(rust_lifecycle, "_ephemeral_low", lambda: 20000)
+    for _ in range(20):
+        port = _port_of(rust_lifecycle.free_kv_events_endpoint(ranks=2))
+        assert rust_lifecycle.KV_EVENTS_PORT_FLOOR <= port and port + 1 < 20000
+    # The range starts at the floor or below: the draw goes on, inside the
+    # range, between the floor and Linux's default low bound; one warning.
+    rust_lifecycle._warn_inside_ephemeral_range.cache_clear()
+    monkeypatch.setattr(rust_lifecycle, "_ephemeral_low", lambda: 1024)
+    with caplog.at_level("WARNING", logger=rust_lifecycle.logger.name):
+        for _ in range(5):
+            port = _port_of(rust_lifecycle.free_kv_events_endpoint(ranks=2))
+            assert rust_lifecycle.KV_EVENTS_PORT_FLOOR <= port and port + 1 < 32768
+    warnings = [r for r in caplog.records if "inside this host's ephemeral port range" in r.message]
+    assert len(warnings) == 1 and "--kv-events-config" in warnings[0].message
+    assert "starts at 1024" in warnings[0].message
+    rust_lifecycle._warn_inside_ephemeral_range.cache_clear()
+
+
+def test_the_probe_sees_what_a_zmq_publisher_holds():
+    """The probe binds the way libzmq binds (``SO_REUSEADDR``), so a port a
+    ZMQ publisher listens on is taken to it, and a port nothing holds is free
+    to it: it answers for the engines' publishers, not for some other kind of
+    socket."""
+    zmq = pytest.importorskip("zmq")
+    context = zmq.Context()
+    publisher = context.socket(zmq.PUB)
+    try:
+        held = publisher.bind_to_random_port("tcp://*")
+        assert not rust_lifecycle._bindable(held)
+    finally:
+        publisher.close(linger=0)
+        context.term()
+    assert rust_lifecycle._bindable(held)
+
+
+def test_a_block_with_a_held_port_is_passed_over_for_another(monkeypatch):
+    """A data-parallel engine's ranks publish on consecutive ports: a block
+    with a held port, its base or a neighbour, is given up for another, and a
+    host that has no such block refuses with the knob that names an endpoint."""
+    probed: list[int] = []
+    real = rust_lifecycle._bindable
+
+    def one_held(port: int) -> bool:
+        probed.append(port)
+        return False if port == probed[0] else real(port)
+
+    monkeypatch.setattr(rust_lifecycle, "_bindable", one_held)
+    base = _port_of(rust_lifecycle.free_kv_events_endpoint(ranks=2))
+    assert len(probed) >= 3 and probed[0] not in (base, base + 1)
+    assert real(base) and real(base + 1)
+
+    monkeypatch.setattr(rust_lifecycle, "_bindable", lambda port: False)
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="--kv-events-config"):
+        rust_lifecycle.free_kv_events_endpoint(ranks=2)

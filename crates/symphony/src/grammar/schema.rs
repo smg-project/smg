@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use serde_json::{json, Value};
 
 use super::Grammar;
+use crate::format::Whitespace;
 
 /// The arguments a tool's schema asks for, as a syntax writes them: `each` property in the
 /// schema's order, each optional unless the schema requires it; `none` for a schema without
@@ -186,6 +187,8 @@ pub(super) fn shape(
     let json = |schema: Value| Grammar::JsonSchema {
         schema,
         style: None,
+        excludes: Vec::new(),
+        whitespace: Whitespace::Free,
     };
     let grammar = match kind {
         "string" => match string_enum(schema, target) {
@@ -432,7 +435,7 @@ const LISTED_SCHEMAS: [&str; 4] = ["anyOf", "oneOf", "allOf", "prefixItems"];
 
 /// `schema` with its annotations dropped at every schema position (a property named
 /// `description` is a name, not an annotation, and stays), as the engine gets it.
-fn without_annotations(schema: &Value) -> Value {
+pub(super) fn without_annotations(schema: &Value) -> Value {
     let Value::Object(map) = schema else {
         return schema.clone();
     };

@@ -1,17 +1,19 @@
 use std::{
     any::Any,
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fmt,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
+    task::{Context, Poll},
     time::Duration,
 };
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
-use axum::body::Body;
+use futures_util::Stream;
 // Re-export protocol types as the canonical types for the gateway
 pub use openai_protocol::worker::{ConnectionMode, ProfileOptions, RuntimeType, WorkerType};
 use openai_protocol::{
@@ -311,6 +313,36 @@ fn context_length_from(models: &WorkerModels, model_id: &str) -> Option<u32> {
         .and_then(|card| card.context_length)
 }
 
+/// The labels that name a worker's running window, in the order the reader
+/// (`Worker::max_running_requests`) prefers them.
+pub(crate) const WINDOW_LABELS: [&str; 2] = ["max_num_seqs", "max_running_requests"];
+
+/// A worker's labels after a merge: `current` (the discovered labels at
+/// registration, the worker's own on a label update) with `by_hand` (the
+/// spec's own labels, the request's) on top. A window the operator set by
+/// hand is the worker's only window: a window under the other name is
+/// dropped, since the reader prefers `max_num_seqs` to `max_running_requests`
+/// and would otherwise take the engine's figure over the operator's, on
+/// every worker, expanded per rank or not. Registration, the admin label
+/// update and its early cap check all merge through here.
+pub(crate) fn merge_labels(
+    current: &std::collections::HashMap<String, String>,
+    by_hand: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    let mut labels = current.clone();
+    if WINDOW_LABELS.iter().any(|key| by_hand.contains_key(*key)) {
+        for key in WINDOW_LABELS {
+            if !by_hand.contains_key(key) {
+                labels.remove(key);
+            }
+        }
+    }
+    for (key, value) in by_hand {
+        labels.insert(key.clone(), value.clone());
+    }
+    labels
+}
+
 /// Core worker abstraction that represents a backend service
 #[async_trait]
 pub trait Worker: Send + Sync + fmt::Debug + 'static {
@@ -533,9 +565,9 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// leg's admission bound.
     fn max_running_requests(&self) -> Option<u16> {
         let labels = &self.metadata().spec.labels;
-        labels
-            .get("max_num_seqs")
-            .or_else(|| labels.get("max_running_requests"))
+        WINDOW_LABELS
+            .iter()
+            .find_map(|key| labels.get(*key))
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|n| *n > 0)
             // A figure wider than the count (an explicit flag above 65535 on
@@ -805,6 +837,17 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         None
     }
 
+    /// Whether the engine behind the worker is on a prompt shape it has not
+    /// shown it runs: a prompt pending on the worker, or one of `tokens`
+    /// about to be dispatched, longer than any the worker has answered since
+    /// the gateway started, on a worker that has answered at least one. A
+    /// worker that has answered nothing has shown no shape to go by, and is
+    /// judged like any other; so is a worker that does not track it
+    /// (`false`).
+    fn prefill_cold_shape(&self, _tokens: u64) -> bool {
+        false
+    }
+
     /// One-shot routing snapshot for the per-request O(workers) selection loops:
     /// reads status, load, processed and the overload veto together so the hot
     /// path takes one `ArcSwap` guard per backing cell per worker instead of one
@@ -1020,6 +1063,14 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Get all models this worker can serve.
     fn models(&self) -> Vec<ModelCard> {
         self.metadata().spec.models.all().to_vec()
+    }
+
+    /// Whether any model card of this worker satisfies `pred`: the same
+    /// cards [`Self::models`] returns, read in place. For a check on the
+    /// request path, which [`Self::models`] would answer by cloning every
+    /// card.
+    fn any_model(&self, pred: &mut dyn FnMut(&ModelCard) -> bool) -> bool {
+        self.metadata().spec.models.all().iter().any(pred)
     }
 
     /// Context window (in tokens) this worker advertises for `model_id`, from
@@ -1613,6 +1664,12 @@ struct PrefillBook {
     /// Gateway clock of the latest first response (or one answer) to a
     /// prompt dispatched here; zero until one.
     last_answer_ms: u64,
+    /// The prompts pending, prompt tokens to how many of that length, for
+    /// the longest of them: the largest shape the engine is on.
+    pending_prompts: BTreeMap<u64, u32>,
+    /// The longest prompt answered with a first token (or one answer): the
+    /// largest shape the engine has shown it runs; zero until one.
+    longest_answered: u64,
 }
 
 impl PrefillBook {
@@ -1621,6 +1678,7 @@ impl PrefillBook {
             return;
         }
         self.pending = self.pending.saturating_add(tokens);
+        *self.pending_prompts.entry(tokens).or_insert(0) += 1;
         if !timed {
             return;
         }
@@ -1632,8 +1690,10 @@ impl PrefillBook {
 
     fn ended(&mut self, tokens: u64, timed: bool, cached: Option<u64>, now_ms: u64) {
         self.pending = self.pending.saturating_sub(tokens);
+        self.forget_prompt(tokens);
         if cached.is_some() {
             self.last_answer_ms = now_ms;
+            self.longest_answered = self.longest_answered.max(tokens);
         }
         if !timed {
             return;
@@ -1711,6 +1771,31 @@ impl PrefillBook {
     fn answered_ago(&self, now_ms: u64) -> Option<Duration> {
         (self.last_answer_ms > 0)
             .then(|| Duration::from_millis(now_ms.saturating_sub(self.last_answer_ms)))
+    }
+
+    /// Whether the engine is on a shape it has not shown it runs: a prompt
+    /// pending here, or one of `extra` tokens about to be dispatched, longer
+    /// than any answered, on a worker that has answered one. A worker that
+    /// has answered nothing has shown no shape to go by.
+    fn cold_shape(&self, extra: u64) -> bool {
+        let longest_pending = self
+            .pending_prompts
+            .keys()
+            .next_back()
+            .copied()
+            .unwrap_or(0);
+        self.longest_answered > 0 && longest_pending.max(extra) > self.longest_answered
+    }
+
+    /// A prompt of `tokens` is no longer pending; one that was never booked
+    /// (a release with tokens no start had) changes nothing.
+    fn forget_prompt(&mut self, tokens: u64) {
+        if let Some(count) = self.pending_prompts.get_mut(&tokens) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.pending_prompts.remove(&tokens);
+            }
+        }
     }
 }
 
@@ -1979,6 +2064,10 @@ impl WorkerRuntime {
     /// [`Self::prefill_answered_ago`] as of `now_ms` on the gateway clock.
     pub fn prefill_answered_ago_at(&self, now_ms: u64) -> Option<Duration> {
         self.prefill.lock().answered_ago(now_ms)
+    }
+
+    pub fn prefill_cold_shape(&self, tokens: u64) -> bool {
+        self.prefill.lock().cold_shape(tokens)
     }
 
     pub fn swap_waiting_reqs(&self, waiting: i64) -> i64 {
@@ -2488,6 +2577,21 @@ impl BasicWorker {
     }
 }
 
+impl BasicWorker {
+    /// The model cards this worker answers for, read in place: the lazily
+    /// discovered list when one was set, the metadata's cards otherwise. The
+    /// one place that chooses, so `models` and `any_model` cannot drift
+    /// apart.
+    fn with_model_cards<R>(&self, read: impl FnOnce(&[ModelCard]) -> R) -> R {
+        let overridden = self.models_override.load();
+        if overridden.is_wildcard() {
+            read(self.metadata.spec.models.all())
+        } else {
+            read(overridden.all())
+        }
+    }
+}
+
 #[async_trait]
 impl Worker for BasicWorker {
     /// [`BasicWorker`] keeps the trait's default `prepare_request`, so the
@@ -2852,6 +2956,10 @@ impl Worker for BasicWorker {
         self.runtime.load().prefill_answered_ago()
     }
 
+    fn prefill_cold_shape(&self, tokens: u64) -> bool {
+        self.runtime.load().prefill_cold_shape(tokens)
+    }
+
     fn note_tracked_started(&self) {
         self.runtime.load().note_tracked_started();
     }
@@ -2945,13 +3053,11 @@ impl Worker for BasicWorker {
     }
 
     fn models(&self) -> Vec<ModelCard> {
-        let overridden = self.models_override.load();
-        let source = if overridden.is_wildcard() {
-            self.metadata.spec.models.all()
-        } else {
-            overridden.all()
-        };
-        source.to_vec()
+        self.with_model_cards(<[ModelCard]>::to_vec)
+    }
+
+    fn any_model(&self, pred: &mut dyn FnMut(&ModelCard) -> bool) -> bool {
+        self.with_model_cards(|cards| cards.iter().any(pred))
     }
 
     fn context_length(&self, model_id: &str) -> Option<u32> {
@@ -3162,10 +3268,10 @@ impl Worker for BasicWorker {
 
 /// RAII guard for worker load management
 ///
-/// Automatically decrements worker load when dropped. Can be attached to
-/// an axum Response to tie the guard's lifetime to the response body,
-/// which is essential for streaming responses where the function returns
-/// immediately but the stream continues in the background.
+/// Automatically decrements worker load when dropped. A streaming handler
+/// returns at once and keeps producing from a task, so it hands the guard
+/// to the response body's own stream ([`GuardedStream`]), which drops it
+/// when the body is dropped: at the stream's end or the client's disconnect.
 pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
     routing_key: Option<String>,
@@ -3247,52 +3353,38 @@ impl Drop for WorkerLoadGuard {
     }
 }
 
-/// Body wrapper that holds an attached value.
+/// A response body's stream that owns an RAII guard.
 ///
-/// When this body is dropped (stream ends or client disconnects),
-/// the attached value is dropped automatically. This is useful for RAII guards
-/// like WorkerLoadGuard that need to be tied to a response body's lifetime.
-pub struct AttachedBody<T> {
-    inner: Body,
-    _attached: T,
+/// A streaming handler returns at once and keeps producing from a task, so
+/// what it holds for the request (the worker's load guard, a rate-limit
+/// reservation's safety net) must live as long as the response body does,
+/// however the body ends: read to its end, dropped when the client leaves,
+/// or consumed by another handler in-process. The guard rides in the body's
+/// own stream and is dropped with it, after the stream. No wrapper goes
+/// over the body for it: a body wrapper is a boxed `poll_frame` more on
+/// every frame out.
+pub struct GuardedStream<S, G> {
+    inner: S,
+    _guard: G,
 }
 
-impl<T> AttachedBody<T> {
-    pub fn new(inner: Body, attached: T) -> Self {
+impl<S, G> GuardedStream<S, G> {
+    pub fn new(inner: S, guard: G) -> Self {
         Self {
             inner,
-            _attached: attached,
+            _guard: guard,
         }
     }
 }
 
-impl<T: Send + Unpin + 'static> AttachedBody<T> {
-    pub fn wrap_response(
-        response: axum::response::Response,
-        attached: T,
-    ) -> axum::response::Response {
-        let (parts, body) = response.into_parts();
-        axum::response::Response::from_parts(parts, Body::new(Self::new(body, attached)))
-    }
-}
+impl<S: Stream + Unpin, G: Unpin> Stream for GuardedStream<S, G> {
+    type Item = S::Item;
 
-impl<T: Send + Unpin + 'static> http_body::Body for AttachedBody<T> {
-    type Data = bytes::Bytes;
-    type Error = axum::Error;
-
-    fn poll_frame(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        let this = self.get_mut();
-        std::pin::Pin::new(&mut this.inner).poll_frame(cx)
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.get_mut().inner).poll_next(cx)
     }
 
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
+    fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
 }
@@ -5065,6 +5157,52 @@ mod tests {
         runtime.note_prefill_ended_at(10_000, true, Some(0), 2_500);
         assert_eq!(runtime.prefill_rate_tps(), 13_333);
         assert_eq!(runtime.prefill_eta(40_000), Duration::from_millis(3_000));
+    }
+
+    #[test]
+    fn a_prompt_longer_than_any_answered_is_a_cold_shape_once_the_worker_has_answered_one() {
+        // The wedge rule's grace for an engine building a kernel at a new
+        // shape reads these books: the longest prompt answered against the
+        // longest pending (or about to be dispatched).
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        // Nothing answered yet: no shape to go by, whatever is pending.
+        runtime.note_prefill_started_at(8_192, true, 1_000);
+        assert!(!runtime.prefill_cold_shape(0));
+        assert!(!runtime.prefill_cold_shape(100_000));
+        runtime.note_prefill_ended_at(8_192, true, Some(0), 2_000);
+        assert!(!runtime.prefill_cold_shape(0), "nothing pending");
+        // 8k answered: a 4k prompt is a shape shown, a 16k one is not,
+        // pending or about to be dispatched.
+        runtime.note_prefill_started_at(4_096, true, 2_000);
+        assert!(!runtime.prefill_cold_shape(0));
+        assert!(
+            !runtime.prefill_cold_shape(8_192),
+            "as long as one answered"
+        );
+        assert!(runtime.prefill_cold_shape(16_384), "about to be dispatched");
+        runtime.note_prefill_started_at(16_384, true, 2_100);
+        runtime.note_prefill_started_at(16_384, true, 2_200);
+        assert!(runtime.prefill_cold_shape(0), "pending");
+        // The 4k prompt's answer shows nothing new; a 16k stream dropped
+        // before its first token shows nothing either, and its twin keeps
+        // the shape cold; the twin's answer shows it, and the next 16k
+        // prompt is a shape run.
+        runtime.note_prefill_ended_at(4_096, true, Some(0), 2_500);
+        assert!(runtime.prefill_cold_shape(0));
+        runtime.note_prefill_ended_at(16_384, true, None, 3_000);
+        assert!(runtime.prefill_cold_shape(0), "the twin is still pending");
+        runtime.note_prefill_ended_at(16_384, true, Some(0), 4_000);
+        assert!(!runtime.prefill_cold_shape(0), "nothing pending");
+        assert!(!runtime.prefill_cold_shape(16_384), "shown");
+        assert!(runtime.prefill_cold_shape(16_385));
+        // A non-streaming generation's one answer shows its shape too.
+        runtime.note_prefill_started_at(32_768, false, 5_000);
+        assert!(runtime.prefill_cold_shape(0));
+        runtime.note_prefill_ended_at(32_768, false, Some(0), 9_000);
+        assert!(!runtime.prefill_cold_shape(32_768));
+        // A release of tokens no start booked changes nothing.
+        runtime.note_prefill_ended_at(1_000_000, true, None, 9_500);
+        assert!(!runtime.prefill_cold_shape(0));
     }
 
     #[test]

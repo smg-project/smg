@@ -822,232 +822,237 @@ impl Pattern {
     /// there; entering a lazy repeat at the end is one too. A lazy repeat
     /// before a literal follows the `regex` module's own rules instead
     /// ([`Pattern::lazy`]).
+    ///
+    /// Each frame on the stack is a thread to resume ([`Self::resume`]); a
+    /// thread runs instruction by instruction ([`Self::exec`]) until it
+    /// fails, when the next frame is tried, or until a step ends the run.
     fn run(&self, hay: &str, pc: usize, start: usize, partial: bool, run: &mut Run) -> Step {
         run.stack.push(Frame::Try(pc, start));
         while let Some(frame) = run.stack.pop() {
-            let (mut pc, mut at) = match frame {
-                Frame::Try(pc, at) => (pc, at),
-                Frame::Restore(slot, old) => {
-                    run.slots[slot] = old;
-                    continue;
-                }
-                // A greedy repeat gives back one more character.
-                Frame::GiveBack { pc, floor, at } => {
-                    if at > floor {
-                        let back = hay[..at].chars().next_back().map_or(0, char::len_utf8);
-                        run.stack.push(Frame::GiveBack {
-                            pc,
-                            floor,
-                            at: at - back,
-                        });
-                    }
-                    (pc + 1, at)
-                }
-                // A lazy repeat takes one more character.
-                Frame::Extend { pc, at } => {
-                    let Inst::Star { set, memo, .. } = &self.prog[pc] else {
-                        continue;
-                    };
-                    let Some(c) = hay[at..].chars().next().filter(|&c| set.matches(c)) else {
-                        continue;
-                    };
-                    let next = at + c.len_utf8();
-                    if !run.visit(*memo, next) {
-                        continue;
-                    }
-                    run.stack.push(Frame::Extend { pc, at: next });
-                    (pc + 1, next)
-                }
-                // A lazy repeat run as the module's takes more characters.
-                Frame::Lazy { pc, pos, count } => {
-                    match self.lazy(hay, pc, pos, count, partial, run) {
-                        Lazy::Partial => {
-                            run.stack.clear();
-                            return Step::Partial;
-                        }
-                        Lazy::Fail => continue,
-                        Lazy::Match(pos, count) => {
-                            self.push_lazy(hay, pc, pos, count, run);
-                            (pc + 1, pos)
-                        }
-                    }
+            let (mut pc, mut at) = match self.resume(hay, frame, partial, run) {
+                Resume::At(pc, at) => (pc, at),
+                Resume::Skip => continue,
+                Resume::Partial => {
+                    run.stack.clear();
+                    return Step::Partial;
                 }
             };
             loop {
-                match &self.prog[pc] {
-                    Inst::Match => {
+                match self.exec(hay, pc, at, partial, run) {
+                    Flow::Next(next_pc, next_at) => (pc, at) = (next_pc, next_at),
+                    Flow::Fail => break,
+                    Flow::Done(step) => {
                         run.stack.clear();
-                        return Step::Match(at, run.slots.clone());
-                    }
-                    Inst::One(set) => match hay[at..].chars().next() {
-                        Some(c) if set.matches(c) => {
-                            at += c.len_utf8();
-                            pc += 1;
-                        }
-                        None if partial => {
-                            run.stack.clear();
-                            return Step::Partial;
-                        }
-                        _ => break,
-                    },
-                    Inst::Star {
-                        set,
-                        greedy: true,
-                        memo,
-                    } => {
-                        if !run.visit(*memo, at) {
-                            break;
-                        }
-                        // Take as many as match, stopping where an earlier
-                        // entry already took over.
-                        let run_end = hay[at..]
-                            .find(|c| !set.matches(c))
-                            .map_or(hay.len(), |k| at + k);
-                        let end = run.claim(*memo, at, run_end, hay);
-                        if partial && end == hay.len() {
-                            run.stack.clear();
-                            return Step::Partial;
-                        }
-                        if end > at && self.gives_back[pc] {
-                            let back = hay[..end].chars().next_back().map_or(0, char::len_utf8);
-                            run.stack.push(Frame::GiveBack {
-                                pc,
-                                floor: at,
-                                at: end - back,
-                            });
-                        }
-                        at = end;
-                        pc += 1;
-                    }
-                    Inst::Star { memo, .. } => {
-                        if partial && at == hay.len() {
-                            run.stack.clear();
-                            return Step::Partial;
-                        }
-                        if !run.visit(*memo, at) {
-                            break;
-                        }
-                        run.stack.push(Frame::Extend { pc, at });
-                        pc += 1;
-                    }
-                    // The module's `count_one` up to the maximum, then giving
-                    // back down to the minimum: reaching the end below the
-                    // maximum is a partial match.
-                    Inst::Count {
-                        set,
-                        min,
-                        max,
-                        memo,
-                    } => {
-                        if !run.visit(*memo, at) {
-                            break;
-                        }
-                        let (mut end, mut count, mut floor) = (at, 0, at);
-                        while max.is_none_or(|max| count < max) {
-                            let Some(c) = hay[end..].chars().next().filter(|&c| set.matches(c))
-                            else {
-                                break;
-                            };
-                            end += c.len_utf8();
-                            count += 1;
-                            if count == *min {
-                                floor = end;
-                            }
-                        }
-                        if partial && end == hay.len() && max.is_none_or(|max| count < max) {
-                            run.stack.clear();
-                            return Step::Partial;
-                        }
-                        if count < *min {
-                            break;
-                        }
-                        if end > floor && self.gives_back[pc] {
-                            let back = hay[..end].chars().next_back().map_or(0, char::len_utf8);
-                            run.stack.push(Frame::GiveBack {
-                                pc,
-                                floor,
-                                at: end - back,
-                            });
-                        }
-                        at = end;
-                        pc += 1;
-                    }
-                    // `count_one` up to the minimum (reaching the end below
-                    // it is a partial match); backtracking takes more
-                    // ([`Pattern::lazy`]).
-                    Inst::Lazy { set, min, body, .. } => {
-                        if !run.visit(*body, at) {
-                            break;
-                        }
-                        let (mut end, mut count) = (at, 0);
-                        while count < *min {
-                            let Some(c) = hay[end..].chars().next().filter(|&c| set.matches(c))
-                            else {
-                                break;
-                            };
-                            end += c.len_utf8();
-                            count += 1;
-                        }
-                        if count < *min {
-                            if partial && end == hay.len() {
-                                run.stack.clear();
-                                return Step::Partial;
-                            }
-                            break;
-                        }
-                        self.push_lazy(hay, pc, end, count, run);
-                        at = end;
-                        pc += 1;
-                    }
-                    Inst::Look(look) if look.at(hay, at) => pc += 1,
-                    Inst::Look(_) => break,
-                    // The body runs with its own stack and memory: whether it
-                    // matches depends only on the position, and once it has
-                    // matched it is not tried again (it sets no groups).
-                    Inst::Ahead { end } => {
-                        let mut body = Run {
-                            slots: Vec::new(),
-                            stack: Vec::new(),
-                            visited: vec![Vec::new(); run.visited.len()],
-                            base: at,
-                        };
-                        match self.run(hay, pc + 1, at, partial, &mut body) {
-                            Step::Match(..) => pc = *end,
-                            Step::Partial => {
-                                run.stack.clear();
-                                return Step::Partial;
-                            }
-                            Step::Fail => break,
-                        }
-                    }
-                    Inst::Split { second, memo } => {
-                        if !run.visit(*memo, at) {
-                            break;
-                        }
-                        run.stack.push(Frame::Try(*second, at));
-                        pc += 1;
-                    }
-                    Inst::Jmp(to) => pc = *to,
-                    Inst::Save(slot) => {
-                        run.stack.push(Frame::Restore(*slot, run.slots[*slot]));
-                        run.slots[*slot] = Some(at);
-                        pc += 1;
-                    }
-                    Inst::Backref(group) => {
-                        let Some((a, b)) = run.slots[2 * group].zip(run.slots[2 * group + 1])
-                        else {
-                            break;
-                        };
-                        if !hay[at..].starts_with(&hay[a..b]) {
-                            break;
-                        }
-                        at += b - a;
-                        pc += 1;
+                        return step;
                     }
                 }
             }
         }
         Step::Fail
+    }
+
+    /// Picks up the thread a frame holds: the position a `Try` recorded, a
+    /// greedy repeat giving one more character back, a lazy repeat taking
+    /// one more, or the module's lazy repeat run on; a `Restore` only puts a
+    /// group's slot back.
+    fn resume(&self, hay: &str, frame: Frame, partial: bool, run: &mut Run) -> Resume {
+        match frame {
+            Frame::Try(pc, at) => Resume::At(pc, at),
+            Frame::Restore(slot, old) => {
+                run.slots[slot] = old;
+                Resume::Skip
+            }
+            // A greedy repeat gives back one more character.
+            Frame::GiveBack { pc, floor, at } => {
+                if at > floor {
+                    let back = hay[..at].chars().next_back().map_or(0, char::len_utf8);
+                    run.stack.push(Frame::GiveBack {
+                        pc,
+                        floor,
+                        at: at - back,
+                    });
+                }
+                Resume::At(pc + 1, at)
+            }
+            // A lazy repeat takes one more character.
+            Frame::Extend { pc, at } => {
+                let Inst::Star { set, memo, .. } = &self.prog[pc] else {
+                    return Resume::Skip;
+                };
+                let Some(c) = hay[at..].chars().next().filter(|&c| set.matches(c)) else {
+                    return Resume::Skip;
+                };
+                let next = at + c.len_utf8();
+                if !run.visit(*memo, next) {
+                    return Resume::Skip;
+                }
+                run.stack.push(Frame::Extend { pc, at: next });
+                Resume::At(pc + 1, next)
+            }
+            // A lazy repeat run as the module's takes more characters.
+            Frame::Lazy { pc, pos, count } => match self.lazy(hay, pc, pos, count, partial, run) {
+                Lazy::Partial => Resume::Partial,
+                Lazy::Fail => Resume::Skip,
+                Lazy::Match(pos, count) => {
+                    self.push_lazy(hay, pc, pos, count, run);
+                    Resume::At(pc + 1, pos)
+                }
+            },
+        }
+    }
+
+    /// Runs the instruction at `pc` for the thread at `at`: where the thread
+    /// goes next, that it fails (the next frame is tried), or the step that
+    /// ends the run (a match, or a partial match in a partial search).
+    fn exec(&self, hay: &str, pc: usize, at: usize, partial: bool, run: &mut Run) -> Flow {
+        match &self.prog[pc] {
+            Inst::Match => Flow::Done(Step::Match(at, run.slots.clone())),
+            Inst::One(set) => match hay[at..].chars().next() {
+                Some(c) if set.matches(c) => Flow::Next(pc + 1, at + c.len_utf8()),
+                None if partial => Flow::Done(Step::Partial),
+                _ => Flow::Fail,
+            },
+            Inst::Star {
+                set,
+                greedy: true,
+                memo,
+            } => {
+                if !run.visit(*memo, at) {
+                    return Flow::Fail;
+                }
+                // Take as many as match, stopping where an earlier
+                // entry already took over.
+                let run_end = hay[at..]
+                    .find(|c| !set.matches(c))
+                    .map_or(hay.len(), |k| at + k);
+                let end = run.claim(*memo, at, run_end, hay);
+                if partial && end == hay.len() {
+                    return Flow::Done(Step::Partial);
+                }
+                if end > at && self.gives_back[pc] {
+                    let back = hay[..end].chars().next_back().map_or(0, char::len_utf8);
+                    run.stack.push(Frame::GiveBack {
+                        pc,
+                        floor: at,
+                        at: end - back,
+                    });
+                }
+                Flow::Next(pc + 1, end)
+            }
+            Inst::Star { memo, .. } => {
+                if partial && at == hay.len() {
+                    return Flow::Done(Step::Partial);
+                }
+                if !run.visit(*memo, at) {
+                    return Flow::Fail;
+                }
+                run.stack.push(Frame::Extend { pc, at });
+                Flow::Next(pc + 1, at)
+            }
+            // The module's `count_one` up to the maximum, then giving
+            // back down to the minimum: reaching the end below the
+            // maximum is a partial match.
+            Inst::Count {
+                set,
+                min,
+                max,
+                memo,
+            } => {
+                if !run.visit(*memo, at) {
+                    return Flow::Fail;
+                }
+                let (mut end, mut count, mut floor) = (at, 0, at);
+                while max.is_none_or(|max| count < max) {
+                    let Some(c) = hay[end..].chars().next().filter(|&c| set.matches(c)) else {
+                        break;
+                    };
+                    end += c.len_utf8();
+                    count += 1;
+                    if count == *min {
+                        floor = end;
+                    }
+                }
+                if partial && end == hay.len() && max.is_none_or(|max| count < max) {
+                    return Flow::Done(Step::Partial);
+                }
+                if count < *min {
+                    return Flow::Fail;
+                }
+                if end > floor && self.gives_back[pc] {
+                    let back = hay[..end].chars().next_back().map_or(0, char::len_utf8);
+                    run.stack.push(Frame::GiveBack {
+                        pc,
+                        floor,
+                        at: end - back,
+                    });
+                }
+                Flow::Next(pc + 1, end)
+            }
+            // `count_one` up to the minimum (reaching the end below
+            // it is a partial match); backtracking takes more
+            // ([`Pattern::lazy`]).
+            Inst::Lazy { set, min, body, .. } => {
+                if !run.visit(*body, at) {
+                    return Flow::Fail;
+                }
+                let (mut end, mut count) = (at, 0);
+                while count < *min {
+                    let Some(c) = hay[end..].chars().next().filter(|&c| set.matches(c)) else {
+                        break;
+                    };
+                    end += c.len_utf8();
+                    count += 1;
+                }
+                if count < *min {
+                    if partial && end == hay.len() {
+                        return Flow::Done(Step::Partial);
+                    }
+                    return Flow::Fail;
+                }
+                self.push_lazy(hay, pc, end, count, run);
+                Flow::Next(pc + 1, end)
+            }
+            Inst::Look(look) if look.at(hay, at) => Flow::Next(pc + 1, at),
+            Inst::Look(_) => Flow::Fail,
+            // The body runs with its own stack and memory: whether it
+            // matches depends only on the position, and once it has
+            // matched it is not tried again (it sets no groups).
+            Inst::Ahead { end } => {
+                let mut body = Run {
+                    slots: Vec::new(),
+                    stack: Vec::new(),
+                    visited: vec![Vec::new(); run.visited.len()],
+                    base: at,
+                };
+                match self.run(hay, pc + 1, at, partial, &mut body) {
+                    Step::Match(..) => Flow::Next(*end, at),
+                    Step::Partial => Flow::Done(Step::Partial),
+                    Step::Fail => Flow::Fail,
+                }
+            }
+            Inst::Split { second, memo } => {
+                if !run.visit(*memo, at) {
+                    return Flow::Fail;
+                }
+                run.stack.push(Frame::Try(*second, at));
+                Flow::Next(pc + 1, at)
+            }
+            Inst::Jmp(to) => Flow::Next(*to, at),
+            Inst::Save(slot) => {
+                run.stack.push(Frame::Restore(*slot, run.slots[*slot]));
+                run.slots[*slot] = Some(at);
+                Flow::Next(pc + 1, at)
+            }
+            Inst::Backref(group) => {
+                let Some((a, b)) = run.slots[2 * group].zip(run.slots[2 * group + 1]) else {
+                    return Flow::Fail;
+                };
+                if !hay[at..].starts_with(&hay[a..b]) {
+                    return Flow::Fail;
+                }
+                Flow::Next(pc + 1, at + (b - a))
+            }
+        }
     }
 
     /// Remember the lazy repeat at `pc`, now at `pos` with `count`
@@ -1158,6 +1163,25 @@ enum Step {
     Match(usize, Vec<Option<usize>>),
     Partial,
     Fail,
+}
+
+/// What a frame popped off the stack does for the run: resumes its thread at
+/// a program counter and a position, has nothing to run (a restore, a lazy
+/// repeat that cannot take another character), or ends the run in a partial
+/// match.
+enum Resume {
+    At(usize, usize),
+    Skip,
+    Partial,
+}
+
+/// What one instruction does to the thread running it: moves it to a program
+/// counter and a position, fails it (the next frame is tried), or ends the
+/// run with a step.
+enum Flow {
+    Next(usize, usize),
+    Fail,
+    Done(Step),
 }
 
 /// Backtracking into a lazy repeat: its tail can be tried at this position

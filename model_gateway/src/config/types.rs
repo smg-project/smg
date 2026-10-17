@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::{collections::HashMap, path::PathBuf};
 
 use openai_protocol::worker::HealthCheckConfig as ProtocolHealthCheckConfig;
 pub use openai_protocol::worker::{MmProcessingMode, TransportMode};
@@ -36,8 +32,9 @@ pub enum ParserChoice {
     Legacy,
     /// Symphony's tables: the one a model's parser names select (its worker labels, else the
     /// `--tool-call-parser` and `--reasoning-parser` flags) when a table answers to the name, its
-    /// own or a legacy parser's that reads its format (`qwen` for `qwen3`, `qwen_xml` for
-    /// `qwen3_tagged`); the registry's for the models it knows when they name nothing, or only a
+    /// own, a legacy parser's that reads its format (`qwen` for `qwen3`, `qwen_xml` for
+    /// `qwen3_tagged`), or a launcher's for a family whose table has no older parser (`muse` for
+    /// `muse_spark`); the registry's for the models it knows when they name nothing, or only a
     /// reasoning parser no table answers to, `passthrough` excepted; any other legacy tool-call
     /// parser's name, `passthrough`, and every other model, keep the legacy parsers.
     Symphony,
@@ -101,10 +98,26 @@ pub struct RouterConfig {
     /// routes always remain available on the main `port` regardless.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check_port: Option<u16>,
+    /// Port of the admin listener. When set, the control-plane routes (the
+    /// admin, worker-registry and RL routes) are served on it, with the probe
+    /// routes, and the data listener answers 404 for them. `None` keeps the
+    /// control plane on the data listener.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_port: Option<u16>,
+    /// Bind host of the admin listener; `None` binds it on `host`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_host: Option<String>,
     /// Explicit async runtime worker-thread count. `None` uses tokio's default
     /// (`available_parallelism()`), which already honors the cgroup CPU quota on
-    /// Rust 1.95+ and is therefore container-aware. `Some` pins a count of at
-    /// least 1: the runtime builder panics on 0, so `ConfigValidator` refuses it.
+    /// Rust 1.95+ and is therefore container-aware. `Some` pins a count from 1
+    /// to [`RUNTIME_WORKER_THREADS_CEILING`](crate::config::RUNTIME_WORKER_THREADS_CEILING),
+    /// the same on every host: the runtime builder panics on 0, and a count
+    /// above the ceiling is a typo or a misread unit, each thread a stack and
+    /// a wake-up for nothing, so `ConfigValidator` refuses both, naming the
+    /// ceiling. A count above
+    /// [`RUNTIME_WORKER_THREADS_PER_CPU`](crate::config::RUNTIME_WORKER_THREADS_PER_CPU)
+    /// x the CPUs available to the process is served with a warning at
+    /// start-up (a worker thread beyond the CPUs only waits for one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_worker_threads: Option<usize>,
     pub max_payload_size: usize,
@@ -140,6 +153,17 @@ pub struct RouterConfig {
     /// connections until the client closes them.
     #[serde(default = "default_idle_connection_timeout_secs")]
     pub idle_connection_timeout_secs: u64,
+    /// Most client connections the data listener holds open at once, counted
+    /// from accept to close (idle keep-alive connections, connections inside
+    /// a TLS handshake and upgraded connections included). A connection
+    /// beyond the bound is closed at once, before any TLS handshake and
+    /// without a response, and counted in
+    /// `smg_http_connections_rejected_total`. The admin listener
+    /// (`admin_port`) and the probe listener (`health_check_port`) are
+    /// outside the bound, so the control plane and the probes stay reachable
+    /// while the data plane is saturated. `0` is no bound.
+    #[serde(default)]
+    pub max_connections: usize,
     pub request_timeout_secs: u64,
     /// Seconds of upstream silence after which an open SSE stream carries a
     /// keep-alive frame (an SSE comment; the `ping` event on the Messages
@@ -260,23 +284,23 @@ pub struct RouterConfig {
     /// between selection and dispatch is part of the same opt-in.
     #[serde(default)]
     pub worker_overload_shed: bool,
-    /// TTL in seconds for entries in the event-driven cache-aware positional
-    /// indexer: entries neither stored to nor read by a query within this
-    /// window are evicted by a periodic background prune. Bounds index growth
-    /// when a backend stops emitting removal events (crash, stream downgrade).
-    /// `None`/`0` disables the TTL pass (default, preserving unbounded growth).
+    /// Deprecated and ignored: the TTL prune of the positional indexer, which
+    /// the chain index replaced. The chain index holds what the engines report
+    /// and shrinks with their removals, so it has no prune. Still accepted so
+    /// that configurations written for the positional indexer load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_indexer_ttl_secs: Option<u64>,
-    /// Capacity ceiling per model for the positional indexer, enforced by the
-    /// same periodic prune: beyond it, oldest-touched entries are evicted down
-    /// to 90% of the ceiling. `None`/`0` disables the ceiling (default).
+    /// Deprecated and ignored: the capacity ceiling of the positional
+    /// indexer's prune; see `kv_indexer_ttl_secs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_indexer_max_entries: Option<usize>,
-    /// Which event-driven KV index cache-aware routing reads: the positional
-    /// indexer (default) or the chain index. The prune bounds above
-    /// apply to the positional indexer only.
-    #[serde(default)]
-    pub kv_index: KvIndexKind,
+    /// Deprecated: the chain index is the only KV index behind cache-aware
+    /// routing, so the one value accepted is `chain`, which changes nothing;
+    /// `positional` names the index that was removed and is refused by
+    /// validation. Still accepted so that configurations written for the
+    /// switch load; the field goes in a later release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_index: Option<String>,
     /// Force `GetLoads` polling for `smg_engine_*` gauges even when no
     /// load-aware routing policy is active. Successful routing-owned polls are
     /// always re-exported without an additional Engine RPC. A worker whose
@@ -331,8 +355,10 @@ pub struct RouterConfig {
     /// When unset, falls back to `SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS`.
     #[serde(default)]
     pub mm_allow_private_media_hosts: bool,
-    /// Listener IP for the RDMA metadata exchange; when unset, falls back to
-    /// `SMG_RDMA_LISTEN_IP`, and without either the lane stays on the inline path.
+    /// Listener IP for the RDMA metadata exchange, a plain IPv4 or IPv6 address
+    /// (the workers connect to it as written, so `ConfigValidator` refuses
+    /// anything else); when unset, falls back to `SMG_RDMA_LISTEN_IP`, and
+    /// without either the lane stays on the inline path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rdma_listen_ip: Option<String>,
     /// Full-TTL override (seconds) for leased RDMA pixel slots; when unset, falls
@@ -364,6 +390,11 @@ pub struct RouterConfig {
     /// console only.
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
+    /// The optional fields of the access-log record, each written once it is
+    /// listed here; empty (the default) keeps the record's fields as they
+    /// have always been, so nothing that reads the log changes.
+    #[serde(default)]
+    pub access_log_fields: Vec<AccessLogField>,
     /// Directory for the heap profiles `POST /heap_profile` writes, on a
     /// build with the `jemalloc-profiling` feature; unset, the route
     /// answers 404.
@@ -580,6 +611,99 @@ impl Default for TenantResolutionConfig {
             trust_tenant_header: false,
             tenant_header_name: DEFAULT_TENANT_HEADER_NAME.to_string(),
         }
+    }
+}
+
+/// An optional field of the access-log record (`access_log_fields`). The
+/// record always carries the request's method, path, version, request id,
+/// status and latency; each field here is written once it is selected, under
+/// the name the variant spells in `snake_case`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessLogField {
+    /// The address the request came in from, `ip:port`: the TCP peer, which
+    /// is a proxy's address when one sits in front of the gateway.
+    ClientAddr,
+    /// The `X-Forwarded-For` header as the request carried it, unverified,
+    /// every field line of it joined with `, ` (a proxy may add a line of
+    /// its own rather than append to the client's): the gateway keeps no
+    /// list of trusted proxies, so it never folds this into `client_addr`;
+    /// the reader decides which hop to believe.
+    ForwardedFor,
+    /// The `User-Agent` header, its first 256 bytes.
+    UserAgent,
+    /// The caller's tenant as the serving path resolved it: `auth:<tenant>`,
+    /// `header:<tenant>`, `ip:<address>` or `anonymous`.
+    Tenant,
+    /// The key the request authenticated with, by its fingerprint (the first
+    /// 16 hex digits of the key's SHA-256), never the key itself.
+    KeyId,
+    /// The bytes of the request body the handler read.
+    RequestBytes,
+    /// The bytes of the response body: `response_bytes` is its length, the
+    /// declared one on the finish line or the count at a streamed body's
+    /// end; a body that ended early (a client that left, a stream that
+    /// failed) has the bytes out so far on that line as
+    /// `response_bytes_sent`, a key of its own, so the length is never
+    /// recorded twice.
+    ResponseBytes,
+    /// The worker the request was routed to.
+    Worker,
+}
+
+impl AccessLogField {
+    /// Every field, in the order the configuration documents them.
+    pub const ALL: [Self; 8] = [
+        Self::ClientAddr,
+        Self::ForwardedFor,
+        Self::UserAgent,
+        Self::Tenant,
+        Self::KeyId,
+        Self::RequestBytes,
+        Self::ResponseBytes,
+        Self::Worker,
+    ];
+
+    /// The field's name: its key in the record and its spelling in the
+    /// configuration.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientAddr => "client_addr",
+            Self::ForwardedFor => "forwarded_for",
+            Self::UserAgent => "user_agent",
+            Self::Tenant => "tenant",
+            Self::KeyId => "key_id",
+            Self::RequestBytes => "request_bytes",
+            Self::ResponseBytes => "response_bytes",
+            Self::Worker => "worker",
+        }
+    }
+
+    /// The field `name` spells (as [`Self::as_str`] spells it).
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|field| field.as_str() == name)
+    }
+}
+
+impl std::fmt::Display for AccessLogField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for AccessLogField {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::parse(name.trim()).ok_or_else(|| {
+            let known: Vec<&str> = Self::ALL.iter().map(|field| field.as_str()).collect();
+            format!(
+                "unknown access log field '{name}' (expected one of {})",
+                known.join(", ")
+            )
+        })
     }
 }
 
@@ -958,55 +1082,6 @@ impl Default for RoutingKeyOverrideConfig {
             max_idle_secs: default_manual_max_idle_secs(),
             assignment_mode: default_override_assignment_mode(),
             headers: default_routing_key_headers(),
-        }
-    }
-}
-
-/// The event-driven KV index behind cache-aware routing (`--kv-index`).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum KvIndexKind {
-    /// The positional indexer: one entry per `(position, content hash)`,
-    /// probed per block of a request (default).
-    #[default]
-    Positional,
-    /// The chain index: chains stored as runs with per-run worker coverage;
-    /// lock-free, store-free lookups, memory proportional to the blocks the
-    /// engines report. `run`, its name before 2026-10-06, is accepted as a
-    /// deprecated alias until the positional indexer is removed.
-    #[serde(alias = "run")]
-    Chain,
-}
-
-/// Whether the deprecated `run` spelling of the chain index was given on the
-/// command line; read once at startup to log the deprecation.
-static DEPRECATED_KV_INDEX_ALIAS: AtomicBool = AtomicBool::new(false);
-
-impl KvIndexKind {
-    /// Parse from a case-insensitive string (`positional` | `chain`, with
-    /// `run` as the deprecated spelling of `chain`).
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "positional" => Some(Self::Positional),
-            "chain" => Some(Self::Chain),
-            "run" => {
-                DEPRECATED_KV_INDEX_ALIAS.store(true, Ordering::Relaxed);
-                Some(Self::Chain)
-            }
-            _ => None,
-        }
-    }
-
-    /// Whether `parse` was given the deprecated `run` spelling.
-    pub fn deprecated_alias_used() -> bool {
-        DEPRECATED_KV_INDEX_ALIAS.load(Ordering::Relaxed)
-    }
-
-    /// Canonical lowercase name.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Positional => "positional",
-            Self::Chain => "chain",
         }
     }
 }
@@ -1678,12 +1753,15 @@ impl Default for RouterConfig {
             host: "0.0.0.0".to_string(),
             port: 3001,
             health_check_port: None,
+            admin_port: None,
+            admin_host: None,
             runtime_worker_threads: None,
             max_payload_size: 536_870_912, // 512MB
             max_buffered_request_bytes: default_max_buffered_request_bytes(),
             stream_body_stall_timeout_secs: default_stream_body_stall_timeout_secs(),
             header_read_timeout_secs: default_header_read_timeout_secs(),
             idle_connection_timeout_secs: default_idle_connection_timeout_secs(),
+            max_connections: 0,
             request_timeout_secs: 1800, // 30 minutes
             sse_keepalive_secs: default_sse_keepalive_secs(),
             upstream_pool_idle_timeout_secs: default_upstream_pool_idle_timeout_secs(),
@@ -1709,7 +1787,7 @@ impl Default for RouterConfig {
             worker_overload_shed: false,
             kv_indexer_ttl_secs: None,
             kv_indexer_max_entries: None,
-            kv_index: KvIndexKind::default(),
+            kv_index: None,
             engine_metrics: false,
             multimodal_tensor_transport: None,
             multimodal_shm_min_bytes: None,
@@ -1732,6 +1810,7 @@ impl Default for RouterConfig {
             trace_config: None,
             log_dir: None,
             log_level: None,
+            access_log_fields: Vec::new(),
             jemalloc_prof_dir: None,
             request_id_headers: None,
             storage_context_headers: HashMap::new(),
@@ -2016,6 +2095,33 @@ mod tests {
     }
 
     #[test]
+    fn test_admin_listener_serde_roundtrip_and_backward_compat() {
+        // Default: no admin listener, and neither key is serialized.
+        let config = RouterConfig::default();
+        assert_eq!(
+            (config.admin_port, config.admin_host.as_deref()),
+            (None, None)
+        );
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("admin_port") && !json.contains("admin_host"));
+
+        // Config files predating the fields deserialize to the default.
+        let without: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!((without.admin_port, without.admin_host), (None, None));
+
+        // When set, both round-trip.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .admin_port(Some(9001))
+            .admin_host(Some("127.0.0.1".to_string()))
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.admin_port, Some(9001));
+        assert_eq!(with.admin_host.as_deref(), Some("127.0.0.1"));
+    }
+
+    #[test]
     fn test_multimodal_settings_serde_roundtrip_and_backward_compat() {
         // Unset by default, and the optional ones stay out of serialized output.
         let config = RouterConfig::default();
@@ -2153,6 +2259,26 @@ mod tests {
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(with.header_read_timeout_secs, 0);
         assert_eq!(with.idle_connection_timeout_secs, 0);
+    }
+
+    #[test]
+    fn test_max_connections_serde_default_and_roundtrip() {
+        // Config files predating the field deserialize to no bound.
+        let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("max_connections")
+            .unwrap();
+        let without: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(without.max_connections, 0);
+
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .max_connections(4096)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.max_connections, 4096);
     }
 
     #[test]

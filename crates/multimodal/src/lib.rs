@@ -15,6 +15,7 @@ mod pixel_convert;
 pub mod registry;
 pub mod tracker;
 pub mod types;
+mod video_seek;
 pub mod vision;
 pub mod webp_native;
 

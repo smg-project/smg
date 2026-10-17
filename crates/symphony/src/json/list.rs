@@ -8,9 +8,11 @@
 //! - `[` opens the list. Each object in it goes to a [`json::Assembler`](super::Assembler) of its
 //!   own, with the next free index, which is spent only when the object starts a call, so an
 //!   object with no name leaves no gap; every call streams as a Qwen3 call does. The `[`, the
-//!   commas between objects, the whitespace around them, the `]` and whitespace after it are the
-//!   template's and come back as `Dropped { Wrapper }`; any other text between objects or after
-//!   the `]` is `Malformed`, one event per run.
+//!   commas between objects, the whitespace around them, the `]` and whitespace that ends the
+//!   output after it are the template's and come back as `Dropped { Wrapper }`; any other text
+//!   between objects is `Malformed`, one event per run, and so is text after the `]`, with the
+//!   whitespace before and between its words: once text follows the list, every byte after the
+//!   `]` is the model's prose, which the template's reference keeps as written.
 //! - Anything else makes the whole output content: that byte and every later one come back as
 //!   `Content`, since the model answered in prose. The whitespace held before it comes back as
 //!   content too. A `[` that is followed by anything but an object or the `]` is prose as well
@@ -18,8 +20,10 @@
 //!
 //! With [`Assembler::object_or_list`] (the `json` table), a `{` at the first byte is one call
 //! alone: the object goes to a [`json::Assembler`](super::Assembler) as a list's object does, and
-//! what follows it is the template's wrapping, whitespace dropped and anything else `Malformed`.
-//! A list reads as before. [`Assembler::new`] (the `xlam` table) keeps a `{` as prose.
+//! what follows it reads as what follows a list's `]`: whitespace that ends the output is the
+//! template's wrapping, dropped; text, with the whitespace before and between its words, is
+//! `Malformed`. A list reads as before. [`Assembler::new`] (the `xlam` table) keeps a `{` as
+//! prose.
 //!
 //! A region with no markers never closes by one, so [`Assembler::close`] is for a table that puts
 //! the list between markers after all; [`Assembler::finish`] is the end of the stream: an object
@@ -35,18 +39,17 @@
 
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
+    ids::CallIds,
     json,
 };
 
-const TEXT_BETWEEN_OBJECTS: &str = "text between a list's calls";
-const TEXT_AFTER_THE_LIST: &str = "text after the list's end";
-const TEXT_AFTER_THE_OBJECT: &str = "text after the call's object";
-const TEXT_IN_PLACE_OF_THE_LIST: &str = "text where the list of calls should be";
-
-/// The events of a JSON list of calls, each call with its own index from `first`.
+/// The events of a JSON list of calls, each call with its own index from `first` and its id from
+/// the engine's [`CallIds`].
 #[derive(Debug)]
 pub struct Assembler {
     next_index: u32,
+    /// Where the calls' ids count from.
+    ids: CallIds,
     stage: Stage,
     /// Bytes no event has accounted for yet; the next event takes them as its source.
     carried: String,
@@ -59,6 +62,10 @@ pub struct Assembler {
     listed: bool,
     /// Whether markers frame the list: text in place of it is malformed, not prose.
     framed: bool,
+    /// Whether text followed the lone object or the list's `]`: from there on every byte,
+    /// whitespace included, is the model's prose after its calls. Before it, whitespace is held,
+    /// the template's wrapping if nothing follows.
+    prose_after: bool,
 }
 
 #[derive(Debug)]
@@ -80,34 +87,36 @@ enum Stage {
 }
 
 impl Assembler {
-    /// An assembler positioned at the output's start, the first call taking index `first`: the
-    /// bare list, where anything but a list is prose.
-    pub fn new(first: u32) -> Self {
+    /// An assembler positioned at the output's start, the first call taking index `first` and the
+    /// ids counting from `ids`: the bare list, where anything but a list is prose.
+    pub fn new(first: u32, ids: CallIds) -> Self {
         Self {
             next_index: first,
+            ids,
             stage: Stage::Deciding,
             carried: String::new(),
             objects: 0,
             lone_object: false,
             listed: false,
             framed: false,
+            prose_after: false,
         }
     }
 
     /// [`Self::new`], also reading a `{` at the first byte as one call alone.
-    pub fn object_or_list(first: u32) -> Self {
+    pub fn object_or_list(first: u32, ids: CallIds) -> Self {
         Self {
             lone_object: true,
-            ..Self::new(first)
+            ..Self::new(first, ids)
         }
     }
 
     /// An assembler positioned after the marker that opens the list's region, the first call
     /// taking index `first`: anything but a list is malformed.
-    pub fn framed(first: u32) -> Self {
+    pub fn framed(first: u32, ids: CallIds) -> Self {
         Self {
             framed: true,
-            ..Self::new(first)
+            ..Self::new(first, ids)
         }
     }
 
@@ -132,13 +141,16 @@ impl Assembler {
                 self.drop_carried(out);
                 object.finish(out);
             }
-            Stage::Deciding | Stage::Content | Stage::After => {
+            Stage::Deciding | Stage::Content => {
                 if !self.carried.is_empty() {
                     out.push(Event::Content(Text::uncounted(std::mem::take(
                         &mut self.carried,
                     ))));
                 }
             }
+            // Whitespace held after the object or the list, with nothing after it: the template's
+            // wrapping.
+            Stage::After => self.drop_carried(out),
             // Every byte was reported as it arrived.
             Stage::Malformed => {}
             Stage::Between => {
@@ -173,10 +185,8 @@ impl Assembler {
                     self.drop_carried(out);
                     let index = self.next_index;
                     self.objects += 1;
-                    self.stage = Stage::Object(Box::new(json::Assembler::new(
-                        index,
-                        format!("call_{index}"),
-                    )));
+                    self.stage =
+                        Stage::Object(Box::new(json::Assembler::new(index, self.ids.id(index))));
                     &text[at..]
                 } else {
                     self.not_a_list(&text[at..], out);
@@ -190,7 +200,7 @@ impl Assembler {
             Stage::Malformed => {
                 out.push(Event::Malformed {
                     text: Text::uncounted(text),
-                    why: MalformedReason::Other(TEXT_IN_PLACE_OF_THE_LIST.to_string()),
+                    why: MalformedReason::TextInPlaceOfTheList,
                 });
                 ""
             }
@@ -210,7 +220,7 @@ impl Assembler {
                         self.objects += 1;
                         self.stage = Stage::Object(Box::new(json::Assembler::new(
                             index,
-                            format!("call_{index}"),
+                            self.ids.id(index),
                         )));
                         &text[at..]
                     }
@@ -235,7 +245,7 @@ impl Assembler {
                         self.drop_carried(out);
                         out.push(Event::Malformed {
                             text: Text::uncounted(&text[at..end]),
-                            why: MalformedReason::Other(TEXT_BETWEEN_OBJECTS.to_string()),
+                            why: MalformedReason::TextBetweenCalls,
                         });
                         &text[end..]
                     }
@@ -257,34 +267,26 @@ impl Assembler {
                 &text[taken..]
             }
             Stage::After => {
-                // As the engine's wrapping: whitespace is the template's, anything else malformed.
-                let mut rest = text;
-                while let Some(first) = rest.chars().next() {
-                    let space = first.is_whitespace();
-                    let length = rest
-                        .char_indices()
-                        .find(|(_, c)| c.is_whitespace() != space)
-                        .map_or(rest.len(), |(i, _)| i);
-                    out.push(if space {
-                        Event::Dropped {
-                            text: Text::uncounted(&rest[..length]),
-                            why: DropReason::Wrapper,
-                        }
-                    } else {
-                        Event::Malformed {
-                            text: Text::uncounted(&rest[..length]),
-                            why: MalformedReason::Other(
-                                if self.listed {
-                                    TEXT_AFTER_THE_LIST
-                                } else {
-                                    TEXT_AFTER_THE_OBJECT
-                                }
-                                .to_string(),
-                            ),
-                        }
-                    });
-                    rest = &rest[length..];
+                // Whitespace after the object or the list is held: the template's wrapping if
+                // nothing follows it, the model's prose if text does. Once text follows, every
+                // byte is prose after the calls, reported malformed with its whitespace, since
+                // the template's reference keeps it as written.
+                if !self.prose_after {
+                    if text.chars().all(char::is_whitespace) {
+                        self.carried.push_str(text);
+                        return "";
+                    }
+                    self.prose_after = true;
                 }
+                self.carried.push_str(text);
+                out.push(Event::Malformed {
+                    text: Text::uncounted(std::mem::take(&mut self.carried)),
+                    why: if self.listed {
+                        MalformedReason::TextAfterTheList
+                    } else {
+                        MalformedReason::TextAfterTheArguments
+                    },
+                });
                 ""
             }
         }
@@ -299,7 +301,7 @@ impl Assembler {
             self.stage = Stage::Malformed;
             out.push(Event::Malformed {
                 text,
-                why: MalformedReason::Other(TEXT_IN_PLACE_OF_THE_LIST.to_string()),
+                why: MalformedReason::TextInPlaceOfTheList,
             });
         } else {
             self.stage = Stage::Content;
@@ -338,13 +340,17 @@ impl crate::engine::CallAssembler for Assembler {
 mod tests {
     use super::*;
 
+    fn ids() -> CallIds {
+        CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
+    }
+
     const LIST: &str = concat!(
         "[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}, ",
         "{\"name\": \"get_stock_price\", \"arguments\": {}}]"
     );
 
     fn run(pieces: &[&str]) -> Vec<Event> {
-        let mut assembler = Assembler::new(0);
+        let mut assembler = Assembler::new(0, ids());
         let mut out = Events::new();
         for piece in pieces {
             assembler.feed(piece, &mut out);
@@ -383,6 +389,32 @@ mod tests {
             }
         }
         calls
+    }
+
+    #[test]
+    fn an_object_without_arguments_is_a_call_with_an_empty_object_in_a_list_and_alone() {
+        // The object's assembler says `{}` for a call whose object has no arguments member, so a
+        // list's object and a lone object read as one written `"arguments": {}`, whole and byte
+        // by byte.
+        let list = "[{\"name\": \"f\"}, {\"name\": \"g\", \"arguments\": {}}]";
+        let per_char: Vec<&str> = list
+            .char_indices()
+            .map(|(i, c)| &list[i..i + c.len_utf8()])
+            .collect();
+        for events in [run(&[list]), run(&per_char)] {
+            assert_eq!(bytes(&events), list);
+            assert_eq!(
+                calls(&events),
+                [
+                    (0, "f".to_string(), "{}".to_string()),
+                    (1, "g".to_string(), "{}".to_string()),
+                ]
+            );
+        }
+        let alone = "{\"name\": \"f\"}";
+        let events = run_alone(&[alone]);
+        assert_eq!(bytes(&events), alone);
+        assert_eq!(calls(&events), [(0, "f".to_string(), "{}".to_string())]);
     }
 
     #[test]
@@ -447,7 +479,8 @@ mod tests {
             event,
             Event::Dropped { text, why: DropReason::Wrapper } if text.text == "\n"
         )));
-        // Text between objects comes back as one run, text after the list too.
+        // Text between objects comes back as one run; text after the list too, with the
+        // whitespace before it, which is the model's once text follows.
         let output =
             "[{\"name\": \"f\", \"arguments\": {}} junk {\"name\": \"g\", \"arguments\": {}}] tail";
         let events = run(&[output]);
@@ -460,7 +493,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(malformed, ["junk", "tail"]);
+        assert_eq!(malformed, ["junk", " tail"]);
     }
 
     #[test]
@@ -484,7 +517,7 @@ mod tests {
     }
 
     fn run_alone(pieces: &[&str]) -> Vec<Event> {
-        let mut assembler = Assembler::object_or_list(0);
+        let mut assembler = Assembler::object_or_list(0, ids());
         let mut out = Events::new();
         for piece in pieces {
             assembler.feed(piece, &mut out);
@@ -515,8 +548,8 @@ mod tests {
         assert_eq!(bytes(&events), output);
         assert!(events.iter().any(|event| matches!(
             event,
-            Event::Malformed { text, why: MalformedReason::Other(why) }
-                if text.text == "tail" && why == TEXT_AFTER_THE_OBJECT
+            Event::Malformed { text, why: MalformedReason::TextAfterTheArguments }
+                if text.text == " tail"
         )));
         // A list reads as before, prose is content, and a cut object closes nothing.
         assert_eq!(calls(&run_alone(&[LIST])).len(), 2);
@@ -537,6 +570,87 @@ mod tests {
         }
     }
 
+    /// The malformed text of `events` under `why`, joined.
+    fn malformed(events: &[Event], why: MalformedReason) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Malformed { text, why: reason } if *reason == why => {
+                    Some(text.text.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn dropped(events: &[Event]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped { text, .. } => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn prose_after_a_lone_object_keeps_its_whitespace_whole_and_in_pieces() {
+        // A JSON answer the model explains: the reference keeps the sentence as written.
+        let output = "{\n \"a\": true\n} \nA baseball game can be described as exciting.";
+        let prose = " \nA baseball game can be described as exciting.";
+        let whole = run_alone(&[output]);
+        assert_eq!(bytes(&whole), output);
+        assert_eq!(
+            malformed(&whole, MalformedReason::TextAfterTheArguments),
+            prose
+        );
+        assert!(dropped(&whole).is_empty(), "{whole:?}");
+        let pieces: Vec<String> = output.chars().map(String::from).collect();
+        let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
+        let cut = run_alone(&refs);
+        assert_eq!(bytes(&cut), output);
+        assert_eq!(
+            malformed(&cut, MalformedReason::TextAfterTheArguments),
+            prose
+        );
+        assert!(dropped(&cut).is_empty(), "{cut:?}");
+        // After a call too, and after a list's `]`.
+        let output = "{\"name\": \"f\", \"arguments\": {}}\n\nDone, see above.";
+        for events in [
+            run_alone(&[output]),
+            run_alone(&[
+                "{\"name\": \"f\", \"arguments\": {}}\n",
+                "\nDone, see above.",
+            ]),
+        ] {
+            assert_eq!(calls(&events).len(), 1);
+            assert_eq!(
+                malformed(&events, MalformedReason::TextAfterTheArguments),
+                "\n\nDone, see above."
+            );
+            assert!(dropped(&events).is_empty(), "{events:?}");
+        }
+        let output = "[{\"name\": \"f\", \"arguments\": {}}] and so on";
+        for events in [
+            run(&[output]),
+            run(&["[{\"name\": \"f\", \"arguments\": {}}]", " ", "and so on"]),
+        ] {
+            assert_eq!(
+                malformed(&events, MalformedReason::TextAfterTheList),
+                " and so on"
+            );
+            assert_eq!(dropped(&events), ["[", "]"]);
+        }
+        // Whitespace alone after the object or the list stays the template's wrapping.
+        for events in [
+            run_alone(&["{\"name\": \"f\", \"arguments\": {}} \n"]),
+            run_alone(&["{\"name\": \"f\", \"arguments\": {}}", " ", "\n"]),
+        ] {
+            assert_eq!(dropped(&events), [" \n"]);
+            assert!(malformed(&events, MalformedReason::TextAfterTheArguments).is_empty());
+        }
+    }
+
     #[test]
     fn between_markers_text_in_place_of_the_list_is_malformed() {
         for output in [
@@ -544,7 +658,7 @@ mod tests {
             "  [Note: draft] ok",
             "{\"name\": \"f\", \"arguments\": {}}",
         ] {
-            let mut assembler = Assembler::framed(0);
+            let mut assembler = Assembler::framed(0, ids());
             let mut out = Events::new();
             assembler.feed(output, &mut out);
             assembler.close(&mut out);
@@ -559,7 +673,7 @@ mod tests {
             );
         }
         // The list itself reads the same between markers.
-        let mut assembler = Assembler::framed(0);
+        let mut assembler = Assembler::framed(0, ids());
         let mut out = Events::new();
         assembler.feed(LIST, &mut out);
         assembler.close(&mut out);

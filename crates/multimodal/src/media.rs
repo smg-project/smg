@@ -30,6 +30,7 @@ use crate::{
     audio::decode_audio_mono_f32,
     fetch_policy::{MediaHostPolicy, MediaHostResolver},
     types::TransparencyPolicy,
+    video_seek::{FrameTable, SeekPlan, SeekSegment},
     vision::{orientation::oriented, transforms::resize_catmull_rom_rgb},
 };
 
@@ -40,6 +41,18 @@ const MAX_REDIRECTS: usize = 10;
 const DEFAULT_IMAGE_MAX_INPUT_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_VIDEO_MAX_INPUT_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_VIDEO_MAX_DECODED_BYTES: usize = 1024 * 1024 * 1024;
+/// Source frames one video decode may run through, by default: a dense
+/// sampling of a clip hours long is refused before any decoder starts
+/// (`SMG_VIDEO_MAX_DECODE_FRAMES`).
+const DEFAULT_VIDEO_MAX_DECODE_FRAMES: usize = 262_144;
+/// A clip is decoded by seeking to its picks only when it is at least this
+/// long, in frames, and holds at least [`SEEK_PLAN_MIN_FRAMES_PER_PICK`]
+/// frames per distinct pick: looking into a plan reads the stream's packet
+/// listing, which a short clip or a dense sampling does not repay. A plan
+/// pays off only where a pick has about a keyframe interval plus two runs'
+/// overhead of frames to itself, so a denser sampling is not looked into.
+const SEEK_PLAN_MIN_FRAMES: usize = 1024;
+const SEEK_PLAN_MIN_FRAMES_PER_PICK: usize = 128;
 const DEFAULT_AUDIO_MAX_INPUT_BYTES: usize = 256 * 1024 * 1024;
 const _: () = assert!(DEFAULT_VIDEO_MAX_INPUT_BYTES < DEFAULT_VIDEO_MAX_DECODED_BYTES);
 static VIDEO_DECODE_BACKEND: OnceLock<Option<String>> = OnceLock::new();
@@ -48,6 +61,7 @@ static VIDEO_PROCESS_TIMEOUT: OnceLock<Duration> = OnceLock::new();
 static IMAGE_MAX_INPUT_BYTES: OnceLock<usize> = OnceLock::new();
 static VIDEO_MAX_INPUT_BYTES: OnceLock<usize> = OnceLock::new();
 static VIDEO_MAX_DECODED_BYTES: OnceLock<usize> = OnceLock::new();
+static VIDEO_MAX_DECODE_FRAMES: OnceLock<usize> = OnceLock::new();
 static AUDIO_MAX_INPUT_BYTES: OnceLock<usize> = OnceLock::new();
 static FFMPEG_PASSTHROUGH_FLAG: OnceLock<[&'static str; 2]> = OnceLock::new();
 static ACTIVE_VIDEO_DECODES: AtomicUsize = AtomicUsize::new(0);
@@ -1917,12 +1931,57 @@ async fn decode_video_with_ffmpeg(
     cfg: VideoFetchConfig,
 ) -> Result<DecodedVideoFrames, MediaConnectorError> {
     let metadata = probe_video_metadata(input_path).await.ok();
-    let Some(selection) =
-        metadata.and_then(|metadata| FrameSelection::from_metadata(metadata, cfg))
-    else {
+    let Some((probed, selection)) = metadata.and_then(|probed| {
+        FrameSelection::from_metadata(probed, cfg).map(|selection| (probed, selection))
+    }) else {
         return decode_video_with_ffmpeg_runners(input_path, input_bytes, cfg, metadata, None)
             .await;
     };
+    // A long clip sampled sparsely is decoded by seeking to its picks where
+    // that is a clear win over running the stream to the last pick. Each run
+    // ends right after its last pick, so a seek that lands elsewhere costs
+    // its own segment and comes back short at once. The sequential decode
+    // answers that, and anything else that goes wrong with the seeks, but a
+    // run past the process budget: the plan is at most half the sequential
+    // decode's work, so that would run past it as well.
+    if let Some(plan) = seek_plan_for(input_path, &selection).await {
+        ensure_decode_work_limit(plan.decoded_frames(), &selection, probed)?;
+        let started = Instant::now();
+        match decode_video_with_ffmpeg_seek(input_path, probed, &selection, &plan).await {
+            Ok(video) => {
+                log_video_decode_backend_timing(
+                    "ffmpeg_seek_file",
+                    started,
+                    input_bytes,
+                    cfg,
+                    None,
+                );
+                return Ok(DecodedVideoFrames::Rgb {
+                    video,
+                    sample_fps: effective_sample_fps(probed.duration_seconds, cfg),
+                    sampling: Some(selection.sampling_info()),
+                });
+            }
+            Err(error) => {
+                log_video_decode_backend_timing(
+                    "ffmpeg_seek_file",
+                    started,
+                    input_bytes,
+                    cfg,
+                    Some(&error),
+                );
+                if is_video_command_timeout(&error) {
+                    return Err(decode_budget_exceeded(
+                        error,
+                        &selection,
+                        probed,
+                        plan.decoded_frames(),
+                    ));
+                }
+            }
+        }
+    }
+    ensure_decode_work_limit(selection.sequential_frames(), &selection, probed)?;
     let selected_error = match decode_video_with_ffmpeg_runners(
         input_path,
         input_bytes,
@@ -1935,14 +1994,23 @@ async fn decode_video_with_ffmpeg(
         Ok(decoded) => return Ok(decoded),
         Err(error) => error,
     };
+    // A decode refused for its size or ended for its time ends here: the
+    // resampling fallback decodes the same stream to as many frames.
+    if is_video_command_timeout(&selected_error) {
+        return Err(decode_budget_exceeded(
+            selected_error,
+            &selection,
+            probed,
+            selection.sequential_frames(),
+        ));
+    }
+    if is_video_budget_error(&selected_error) {
+        return Err(selected_error);
+    }
     // A container claiming more frames than its stream holds leaves the
     // selection short. The engine's loader then sizes the clip by the frames
-    // it can see; the rate-based samplings resample instead. Counting the
-    // frames decodes the stream once more, so a selection that ran past the
-    // command timeout is not counted: the count would time out as well.
-    if matches!(cfg.sampling, FrameSampling::UpTo { .. })
-        && !is_video_command_timeout(&selected_error)
-    {
+    // it can see; the rate-based samplings resample instead.
+    if matches!(cfg.sampling, FrameSampling::UpTo { .. }) {
         if let Some(resized) = probe_decoded_frame_count(input_path)
             .await
             .ok()
@@ -2079,6 +2147,11 @@ async fn decode_video_with_ffmpeg_runners(
                     cfg,
                     Some(&error),
                 );
+                // A decode refused for its size or ended for its time is
+                // final: the raw and PNG runners decode the same stream.
+                if is_video_budget_error(&error) {
+                    return Err(error);
+                }
             }
         }
 
@@ -2100,6 +2173,9 @@ async fn decode_video_with_ffmpeg_runners(
                     cfg,
                     Some(&error),
                 );
+                if is_video_budget_error(&error) {
+                    return Err(error);
+                }
             }
         }
     }
@@ -2206,11 +2282,69 @@ fn video_max_decoded_bytes() -> usize {
     )
 }
 
+/// Source frames one video decode may run through (`SMG_VIDEO_MAX_DECODE_FRAMES`).
+fn video_max_decode_frames() -> usize {
+    env_byte_limit(
+        &VIDEO_MAX_DECODE_FRAMES,
+        "SMG_VIDEO_MAX_DECODE_FRAMES",
+        DEFAULT_VIDEO_MAX_DECODE_FRAMES,
+    )
+}
+
+/// The clip's length as its errors state it.
+fn clip_length(metadata: VideoMetadata) -> String {
+    metadata
+        .duration_seconds
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        .map_or_else(
+            || "a clip of unknown length".to_string(),
+            |seconds| format!("a clip of {seconds:.0} s"),
+        )
+}
+
+/// Refuses, before any decoder starts, a decode that would run through more
+/// source frames than the cap allows: the clip is the client's, and so is the
+/// answer (a shorter clip or a smaller frame budget).
+fn ensure_decode_work_limit(
+    frames: usize,
+    selection: &FrameSelection,
+    metadata: VideoMetadata,
+) -> Result<(), MediaConnectorError> {
+    let limit = video_max_decode_frames();
+    if frames <= limit {
+        return Ok(());
+    }
+    Err(MediaConnectorError::VideoDecode(format!(
+        "sampling {} frames of {} means decoding {frames} of its {} source frames, over SMG_VIDEO_MAX_DECODE_FRAMES={limit}; a shorter clip or a smaller frame budget fits it",
+        selection.frame_indices.len(),
+        clip_length(metadata),
+        selection.total_frames
+    )))
+}
+
+/// The error of a decode that ran past the process budget, in the clip's
+/// terms: what had to be decoded, for how many picks, and what to do about it.
+fn decode_budget_exceeded(
+    error: MediaConnectorError,
+    selection: &FrameSelection,
+    metadata: VideoMetadata,
+    decoded_frames: usize,
+) -> MediaConnectorError {
+    let MediaConnectorError::VideoDecode(message) = error else {
+        return error;
+    };
+    MediaConnectorError::VideoDecode(format!(
+        "{message} while decoding {decoded_frames} source frames of {} to sample {} (SMG_VIDEO_PROCESS_TIMEOUT_SECS sets the budget; a shorter clip or a smaller frame budget fits it)",
+        clip_length(metadata),
+        selection.frame_indices.len()
+    ))
+}
+
 fn ensure_decoded_byte_limit(bytes: usize) -> Result<(), MediaConnectorError> {
     let limit = video_max_decoded_bytes();
     if bytes > limit {
         return Err(MediaConnectorError::VideoDecode(format!(
-            "decoded video RGB payload would be {bytes} bytes, exceeding SMG_VIDEO_MAX_DECODED_BYTES={limit}"
+            "decoded video RGB payload would be {bytes} bytes, exceeding {VIDEO_DECODED_BYTES_KNOB}={limit}"
         )));
     }
     Ok(())
@@ -2235,6 +2369,17 @@ const VIDEO_COMMAND_TIMED_OUT: &str = "timed out after";
 /// `true` for the error of a command that ran past the timeout.
 fn is_video_command_timeout(error: &MediaConnectorError) -> bool {
     matches!(error, MediaConnectorError::VideoDecode(message) if message.contains(VIDEO_COMMAND_TIMED_OUT))
+}
+
+/// What `ensure_decoded_byte_limit` names in the error of a decode refused for its size.
+const VIDEO_DECODED_BYTES_KNOB: &str = "SMG_VIDEO_MAX_DECODED_BYTES";
+
+/// `true` for the error of a decode refused for its size or ended for its
+/// time: a budget no other runner over the same stream, and no resampling of
+/// it, can answer, so it ends the decode instead of starting the next runner.
+fn is_video_budget_error(error: &MediaConnectorError) -> bool {
+    is_video_command_timeout(error)
+        || matches!(error, MediaConnectorError::VideoDecode(message) if message.contains(VIDEO_DECODED_BYTES_KNOB))
 }
 
 /// Runs a decoder command to completion under the video process timeout. A
@@ -2648,6 +2793,171 @@ async fn probe_decoded_frame_count(input_path: &Path) -> Result<usize, MediaConn
         })
 }
 
+/// The stream's frames in presentation order, listed by the probe tool
+/// without decoding anything; `None` when the listing is not one a seek plan
+/// can be built on.
+async fn probe_frame_table(input_path: &Path) -> Result<Option<FrameTable>, MediaConnectorError> {
+    let mut command = Command::new("ffprobe");
+    command
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "packet=pts,flags:stream=time_base:format=start_time",
+            "-of",
+            "csv",
+        ])
+        .arg(input_path);
+    let output = run_video_command_output(command, "ffprobe").await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(MediaConnectorError::VideoDecode(format!(
+            "ffprobe failed: {stderr}"
+        )));
+    }
+
+    Ok(FrameTable::parse(&output.stdout))
+}
+
+/// The seek plan for `selection`, when the clip is long enough and the
+/// sampling sparse enough for one to be worth looking into, the stream's
+/// packet listing can be read, and the plan is a clear win over the
+/// sequential decode.
+async fn seek_plan_for(input_path: &Path, selection: &FrameSelection) -> Option<SeekPlan> {
+    let picks = selection.unique_count();
+    if selection.total_frames < SEEK_PLAN_MIN_FRAMES
+        || selection.total_frames < picks.saturating_mul(SEEK_PLAN_MIN_FRAMES_PER_PICK)
+    {
+        return None;
+    }
+    let table = match probe_frame_table(input_path).await {
+        Ok(table) => table?,
+        Err(error) => {
+            if log_video_decode_timing_enabled() {
+                info!(error = %error, "smg_mm_timing video_frame_table_probe_failed");
+            }
+            return None;
+        }
+    };
+    SeekPlan::build(&table, selection.total_frames, &selection.unique_indices())
+        .filter(SeekPlan::pays_off)
+}
+
+/// The selection's distinct frames decoded by seeking: one decoder run per
+/// segment of the plan, as many at a time as the decode's thread budget
+/// allows and one thread each, their frames in order and then repeated as
+/// the selection repeats them. Each run ends right after its last pick. A
+/// run that comes back short (a seek that did not land where the plan says)
+/// or with frames of another size than the metadata's ends the decode at
+/// once, the other runs with it: errors the caller answers with the
+/// sequential decode.
+async fn decode_video_with_ffmpeg_seek(
+    input_path: &Path,
+    metadata: VideoMetadata,
+    selection: &FrameSelection,
+    plan: &SeekPlan,
+) -> Result<DecodedRgbVideo, MediaConnectorError> {
+    let frame_size = rawvideo_frame_size(metadata.width, metadata.height)?;
+    let expected_bytes = checked_decoded_rgb_bytes(selection.unique_count(), frame_size)?;
+    let active_decode = ActiveVideoDecode::enter_async().await;
+    let parallel = usize::try_from(decoder_threads(active_decode.count()))
+        .unwrap_or(1)
+        .max(1);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(parallel));
+    let passthrough = ffmpeg_passthrough_flag().await;
+    let runs = plan.segments.iter().map(|segment| {
+        let semaphore = Arc::clone(&semaphore);
+        async move {
+            let _permit = semaphore.acquire().await.map_err(|_| {
+                MediaConnectorError::VideoDecode("the seek decode's run limit closed".to_string())
+            })?;
+            let picks = segment.pts.len();
+            let output_limit = checked_decoded_rgb_bytes(picks, frame_size)?
+                .saturating_add(picks.saturating_mul(64))
+                .min(video_max_decoded_bytes());
+            let command = ffmpeg_seek_run_command(input_path, segment, output_limit, passthrough);
+            let output = run_video_command_output(command, "ffmpeg").await?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(MediaConnectorError::VideoDecode(format!(
+                    "ffmpeg failed: {stderr}"
+                )));
+            }
+            // A run that comes back short ends the decode here, before the
+            // other runs finish: its seek did not land where the plan says.
+            let frames = if output.stdout.is_empty() {
+                Vec::new()
+            } else {
+                parse_ppm_frame_layout(&output.stdout)?
+            };
+            if frames.len() != picks {
+                return Err(MediaConnectorError::VideoDecode(format!(
+                    "the seek run from {} s produced {} of its {picks} picks: the seek did not land where the plan says",
+                    segment.seek_seconds,
+                    frames.len()
+                )));
+            }
+            // As the headed sequential runner checks: the decoder's size, or
+            // its transpose for a clip stored with a display rotation.
+            if let Some(frame) = frames.first() {
+                let size = (frame.width, frame.height);
+                if size != (metadata.width, metadata.height)
+                    && size != (metadata.height, metadata.width)
+                {
+                    return Err(MediaConnectorError::VideoDecode(format!(
+                        "{FRAME_SIZE_MISMATCH} {}x{} differs from the stated {}x{} and its transpose",
+                        frame.width, frame.height, metadata.width, metadata.height
+                    )));
+                }
+            }
+            Ok::<_, MediaConnectorError>((output.stdout, frames))
+        }
+    });
+    // The runs together are held to the one process budget a sequential
+    // decode gets; each is held to it on its own as well.
+    let timeout = video_process_timeout();
+    let outputs = match time::timeout(timeout, futures::future::try_join_all(runs)).await {
+        Ok(outputs) => outputs?,
+        Err(_) => {
+            return Err(MediaConnectorError::VideoDecode(format!(
+                "ffmpeg {VIDEO_COMMAND_TIMED_OUT} {:.3} seconds",
+                timeout.as_secs_f64()
+            )))
+        }
+    };
+    drop(active_decode);
+
+    let mut data = Vec::new();
+    data.try_reserve(expected_bytes.saturating_add(selection.unique_count().saturating_mul(64)))
+        .map_err(|e| {
+            MediaConnectorError::VideoDecode(format!(
+                "failed to reserve {expected_bytes} bytes for the decoded video frames: {e}"
+            ))
+        })?;
+    let mut frames = Vec::with_capacity(selection.unique_count());
+    for (stdout, run_frames) in outputs {
+        let base = data.len();
+        for mut frame in run_frames {
+            frame.offset = frame.offset.checked_add(base).ok_or_else(|| {
+                MediaConnectorError::VideoDecode("PPM frame offset overflow".to_string())
+            })?;
+            frames.push(frame);
+        }
+        data.extend_from_slice(&stdout);
+    }
+    let decoded_bytes = frames.iter().try_fold(0usize, |total, frame| {
+        total.checked_add(frame.len).ok_or_else(|| {
+            MediaConnectorError::VideoDecode("PPM decoded byte size overflow".to_string())
+        })
+    })?;
+    ensure_decoded_byte_limit(decoded_bytes)?;
+    let frames = selection.expand(frames)?;
+    Ok(DecodedRgbVideo::new(Bytes::from(data), frames))
+}
+
 fn parse_ffprobe_video_info(stdout: &[u8]) -> Result<ProbedVideoInfo, MediaConnectorError> {
     let probe: serde_json::Value = serde_json::from_slice(stdout).map_err(|error| {
         MediaConnectorError::VideoDecode(format!("failed to parse ffprobe output: {error}"))
@@ -2860,6 +3170,19 @@ impl FrameSelection {
 
     fn unique_count(&self) -> usize {
         self.unique_frames.len()
+    }
+
+    /// Source frames the sequential decode runs through: the first frame to
+    /// the last pick.
+    fn sequential_frames(&self) -> usize {
+        self.unique_frames
+            .last()
+            .map_or(0, |(index, _)| index.saturating_add(1))
+    }
+
+    /// The distinct source indices, ascending.
+    fn unique_indices(&self) -> Vec<usize> {
+        self.unique_frames.iter().map(|(index, _)| *index).collect()
     }
 
     /// `select` over the distinct indices; `\,` keeps the filtergraph parser from splitting.
@@ -3079,6 +3402,47 @@ impl FfmpegFrameArgs {
 /// An ffmpeg decode command whose decoder threads stay within the shared
 /// budget; the caller appends the input path.
 fn ffmpeg_decode_command(threads: i32, autorotate: bool) -> Command {
+    ffmpeg_decode_command_from(threads, autorotate, None)
+}
+
+/// An ffmpeg decode command that enters the input at `seek` seconds from the
+/// container's start (an input seek: the stream is entered at the keyframe
+/// before that position and decoded from there) and keeps the stream's own
+/// timestamps, so the frames can be named by them; the caller appends the
+/// input path.
+fn ffmpeg_seek_decode_command(threads: i32, seek: &str) -> Command {
+    ffmpeg_decode_command_from(threads, true, Some(seek))
+}
+
+/// One run of a seek plan: the stream entered at the segment's keyframe,
+/// trimmed right after its last pick and the picks named by timestamp, as
+/// PPM frames on standard output under `output_limit` bytes.
+fn ffmpeg_seek_run_command(
+    input_path: &Path,
+    segment: &SeekSegment,
+    output_limit: usize,
+    passthrough: [&'static str; 2],
+) -> Command {
+    let mut command = ffmpeg_seek_decode_command(1, &segment.seek_seconds);
+    command.arg(input_path);
+    let filter = format!("{},{RGB_CONVERSION}", segment.frame_filter());
+    command.args(["-vf", &filter, "-frames:v", &segment.pts.len().to_string()]);
+    command.args(passthrough);
+    command.args([
+        "-fs",
+        &output_limit.to_string(),
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "ppm",
+        "-pix_fmt",
+        "rgb24",
+        "pipe:1",
+    ]);
+    command
+}
+
+fn ffmpeg_decode_command_from(threads: i32, autorotate: bool, seek: Option<&str>) -> Command {
     let threads = threads.to_string();
     let mut command = Command::new("ffmpeg");
     command.args([
@@ -3091,6 +3455,9 @@ fn ffmpeg_decode_command(threads: i32, autorotate: bool) -> Command {
     ]);
     if !autorotate {
         command.arg("-noautorotate");
+    }
+    if let Some(seek) = seek {
+        command.args(["-ss", seek, "-copyts"]);
     }
     command.arg("-i");
     command
@@ -6536,5 +6903,328 @@ mod decode_limit_tests {
             .expect("encode");
         let image = decode_image_bytes(&png, None, TransparencyPolicy::KeepAlpha).expect("decode");
         assert_eq!((image.width(), image.height()), (3, 2));
+    }
+}
+
+#[cfg(test)]
+mod seek_decode_tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    fn cfg() -> VideoFetchConfig {
+        VideoFetchConfig {
+            min_frames: 4,
+            max_frames: 8,
+            sample_fps: 2.0,
+            max_long_side_pixel: None,
+            sampling: FrameSampling::Even,
+        }
+    }
+
+    fn long_clip_metadata() -> VideoMetadata {
+        VideoMetadata {
+            width: 64,
+            height: 48,
+            duration_seconds: Some(36_000.0),
+            source_fps: Some(30.0),
+            total_frames: Some(1_080_000),
+            container_frames: Some(1_080_000),
+            from_container: false,
+        }
+    }
+
+    /// 100 s of 64x48 at 30 fps as an mp4, a keyframe every 48 frames with
+    /// two B-frames between references; `false` when ffmpeg is not on PATH.
+    async fn generate_clip(path: &Path) -> bool {
+        Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x48:rate=30:duration=100",
+                "-c:v",
+                "mpeg4",
+                "-g",
+                "48",
+                "-bf",
+                "2",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+            ])
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .is_ok_and(|status| status.success())
+    }
+
+    /// `source` remuxed to start 7 s into its container's timeline.
+    async fn remux_starting_late(source: &Path, path: &Path) -> bool {
+        Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
+            .arg(source)
+            .args(["-c", "copy", "-output_ts_offset", "7", "-y"])
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .is_ok_and(|status| status.success())
+    }
+
+    async fn have_probe_tool() -> bool {
+        Command::new("ffprobe")
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .is_ok_and(|status| status.success())
+    }
+
+    fn frame_bytes(video: &DecodedRgbVideo) -> Vec<(u32, u32, Vec<u8>)> {
+        video
+            .frame_refs()
+            .expect("frame refs")
+            .iter()
+            .map(|frame| (frame.width, frame.height, frame.data.to_vec()))
+            .collect()
+    }
+
+    /// Skipped when ffmpeg or ffprobe is not on PATH.
+    #[tokio::test]
+    async fn a_long_clip_sampled_sparsely_is_decoded_by_seeking_to_the_same_frames() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("clip.mp4");
+        if !(generate_clip(&path).await && have_probe_tool().await) {
+            return;
+        }
+        let input_bytes = fs::read(&path).await.expect("generated clip").len();
+        let metadata = probe_video_metadata(&path).await.expect("metadata");
+        assert_eq!(metadata.total_frames, Some(3000));
+
+        let loader_cfg = VideoFetchConfig {
+            sampling: FrameSampling::UpTo { max_frames: 8 },
+            ..cfg()
+        };
+        for cfg in [cfg(), loader_cfg] {
+            let selection = FrameSelection::from_metadata(metadata, cfg).expect("a selection");
+            assert_eq!(selection.unique_count(), 8);
+            let plan = seek_plan_for(&path, &selection)
+                .await
+                .expect("eight picks over 3000 frames are a clear win");
+            assert_eq!(plan.segments.len(), 8);
+            assert!(
+                plan.decoded_frames() * 4 < 3000,
+                "{} frames decoded",
+                plan.decoded_frames()
+            );
+
+            // The same bytes as the sequential decode, pick for pick.
+            let seeked = decode_video_with_ffmpeg_seek(&path, metadata, &selection, &plan)
+                .await
+                .expect("seek decode");
+            let sequential = decode_video_with_ffmpeg_ppm(&path, cfg, metadata, Some(&selection))
+                .await
+                .expect("sequential decode");
+            assert_eq!(frame_bytes(&seeked), frame_bytes(&sequential));
+            assert_eq!(seeked.frames.len(), selection.frame_indices.len());
+            let distinct: HashSet<Vec<u8>> = frame_bytes(&seeked)
+                .into_iter()
+                .map(|(_, _, data)| data)
+                .collect();
+            assert_eq!(distinct.len(), 8, "eight distinct source frames");
+
+            // The route takes the plan and reports the sampling.
+            match decode_video_with_ffmpeg(&path, input_bytes, cfg)
+                .await
+                .expect("decode")
+            {
+                DecodedVideoFrames::Rgb {
+                    video, sampling, ..
+                } => {
+                    assert_eq!(frame_bytes(&video), frame_bytes(&sequential));
+                    assert_eq!(sampling, Some(selection.sampling_info()));
+                }
+                DecodedVideoFrames::Images { .. } => {
+                    panic!("the headed PNG runner is not the route for this clip")
+                }
+            }
+
+            // A seek that lands past its picks leaves them missing: an error
+            // the sequential decode answers, never another frame.
+            let mut misplaced = plan.clone();
+            misplaced.segments[1].seek_seconds = plan.segments[2].seek_seconds.clone();
+            let error = decode_video_with_ffmpeg_seek(&path, metadata, &selection, &misplaced)
+                .await
+                .expect_err("a missing pick");
+            assert!(!is_video_command_timeout(&error), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("produced 0 of its 1 picks: the seek did not land"),
+                "{error}"
+            );
+        }
+
+        // A container that starts 7 s into its timeline: the seeks are
+        // measured from its start, the picks named by their own timestamps.
+        let late = dir.path().join("late.mp4");
+        assert!(remux_starting_late(&path, &late).await);
+        let metadata = probe_video_metadata(&late).await.expect("metadata");
+        let selection = FrameSelection::from_metadata(metadata, cfg()).expect("a selection");
+        let plan = seek_plan_for(&late, &selection).await.expect("a plan");
+        assert!(plan
+            .segments
+            .iter()
+            .all(|segment| !segment.seek_seconds.starts_with('-')));
+        let seeked = decode_video_with_ffmpeg_seek(&late, metadata, &selection, &plan)
+            .await
+            .expect("seek decode");
+        let sequential = decode_video_with_ffmpeg_ppm(&late, cfg(), metadata, Some(&selection))
+            .await
+            .expect("sequential decode");
+        assert_eq!(frame_bytes(&seeked), frame_bytes(&sequential));
+    }
+
+    /// Skipped when ffmpeg or ffprobe is not on PATH.
+    #[tokio::test]
+    async fn a_short_clip_keeps_the_sequential_decode() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("clip.mp4");
+        if !(generate_clip(&path).await && have_probe_tool().await) {
+            return;
+        }
+        let metadata = probe_video_metadata(&path).await.expect("metadata");
+        // 3000 frames for 200 picks: fifteen frames a pick, no plan is looked into.
+        let selection = FrameSelection::from_metadata(metadata, VideoFetchConfig::default())
+            .expect("a selection");
+        assert_eq!(selection.unique_count(), 200);
+        assert!(seek_plan_for(&path, &selection).await.is_none());
+    }
+
+    #[test]
+    fn a_seek_decode_enters_the_stream_at_the_position_and_keeps_its_timestamps() {
+        let args: Vec<String> = ffmpeg_seek_decode_command(1, "1791.666667")
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-threads",
+                "1",
+                "-ss",
+                "1791.666667",
+                "-copyts",
+                "-i"
+            ]
+        );
+    }
+
+    /// A run is bounded at its last pick: the trim before the `select` ends
+    /// the filter graph, and the run, as soon as the decoder is past it, so a
+    /// pick the seek missed costs the run its segment (the keyframe to the
+    /// last pick) and not the rest of the stream.
+    #[test]
+    fn a_seek_run_ends_right_after_its_last_pick() {
+        let segment = SeekSegment {
+            seek_seconds: "1.600000".to_string(),
+            pts: vec![24_576, 25_088],
+            decoded_frames: 2,
+        };
+        let command = ffmpeg_seek_run_command(
+            Path::new("clip.mp4"),
+            &segment,
+            18_560,
+            FPS_MODE_PASSTHROUGH,
+        );
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let input = args.iter().position(|arg| arg == "-i").expect("an input");
+        assert_eq!(
+            args[input + 1..].to_vec(),
+            [
+                "clip.mp4",
+                "-vf",
+                r"trim=end_pts=25089,select='eq(pts\,24576)+eq(pts\,25088)',format=rgba,format=rgb24",
+                "-frames:v",
+                "2",
+                "-fps_mode",
+                "passthrough",
+                "-fs",
+                "18560",
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "ppm",
+                "-pix_fmt",
+                "rgb24",
+                "pipe:1"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_decode_past_the_work_cap_is_refused_before_it_starts() {
+        let metadata = long_clip_metadata();
+        let selection = FrameSelection::from_metadata(metadata, VideoFetchConfig::default())
+            .expect("a selection");
+        assert_eq!(selection.frame_indices.len(), 768);
+        assert_eq!(selection.sequential_frames(), 1_080_000);
+        let error = ensure_decode_work_limit(selection.sequential_frames(), &selection, metadata)
+            .expect_err("ten hours at 30 fps are over the cap");
+        let text = error.to_string();
+        assert!(
+            text.contains("decoding 1080000 of its 1080000 source frames")
+                && text.contains("SMG_VIDEO_MAX_DECODE_FRAMES")
+                && text.contains("a clip of 36000 s"),
+            "{text}"
+        );
+        assert!(ensure_decode_work_limit(1_000, &selection, metadata).is_ok());
+    }
+
+    #[test]
+    fn a_run_past_the_process_budget_is_reported_in_the_clips_terms() {
+        let metadata = long_clip_metadata();
+        let selection = FrameSelection::from_metadata(metadata, VideoFetchConfig::default())
+            .expect("a selection");
+        let error = decode_budget_exceeded(
+            MediaConnectorError::VideoDecode("ffmpeg timed out after 30.000 seconds".to_string()),
+            &selection,
+            metadata,
+            54_000,
+        );
+        assert!(is_video_command_timeout(&error));
+        let text = error.to_string();
+        assert!(
+            text.contains("decoding 54000 source frames of a clip of 36000 s to sample 768")
+                && text.contains("SMG_VIDEO_PROCESS_TIMEOUT_SECS"),
+            "{text}"
+        );
+        // Any other error is left as it is.
+        let other = MediaConnectorError::PayloadTooLarge {
+            media: "video",
+            limit: 1,
+        };
+        assert!(matches!(
+            decode_budget_exceeded(other, &selection, metadata, 1),
+            MediaConnectorError::PayloadTooLarge { .. }
+        ));
     }
 }

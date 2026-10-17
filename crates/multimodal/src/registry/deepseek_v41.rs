@@ -70,6 +70,13 @@ impl ModelProcessorSpec for DeepseekV41VisionSpec {
         MediaPartOrder::Authored
     }
 
+    /// `<｜deepseek_image｜>` (the config's `image_token_id`) is the single
+    /// token the serving engine's prompt updates target, so a worker can
+    /// expand it itself.
+    fn worker_expandable(&self, modality: Modality) -> bool {
+        matches!(modality, Modality::Image)
+    }
+
     fn placeholder_token(&self, _metadata: &ModelMetadata) -> RegistryResult<String> {
         Ok(DEEPSEEK_V41_IMAGE_PLACEHOLDER.to_string())
     }
@@ -99,17 +106,15 @@ impl ModelProcessorSpec for DeepseekV41VisionSpec {
     ) -> RegistryResult<Vec<PromptReplacement>> {
         let image_token_id = Self::image_token_id(metadata)?;
         let placeholder = self.placeholder_token(metadata)?;
-        Ok(preprocessed
-            .feature_token_counts
-            .iter()
-            .map(|&count| {
-                // Every span position carries image_token_id; the roles live
-                // in `types`. All of them are embed positions (delimiters get
-                // the learned vectors from embed_multimodal, not the embed
-                // table).
-                PromptReplacement::repeated(Modality::Image, &placeholder, image_token_id, count)
-            })
-            .collect())
+        // Every span position carries image_token_id; the roles live in
+        // `types`. All of them are embed positions (delimiters get the
+        // learned vectors from embed_multimodal, not the embed table).
+        Ok(PromptReplacement::repeated_per_item(
+            Modality::Image,
+            &placeholder,
+            image_token_id,
+            &preprocessed.feature_token_counts,
+        ))
     }
 
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
@@ -167,6 +172,19 @@ mod tests {
             span_lens.to_vec(),
             vec![(100, 100); span_lens.len()],
         )
+    }
+
+    /// The image anchor is the one token the serving engine expands, so
+    /// images may be forwarded to a worker that processes media itself.
+    #[test]
+    fn deepseek_v41_images_can_be_expanded_by_a_worker() {
+        assert!(DeepseekV41VisionSpec.worker_expandable(Modality::Image));
+        for modality in [Modality::Video, Modality::Audio, Modality::ImageEmbeds] {
+            assert!(
+                !DeepseekV41VisionSpec.worker_expandable(modality),
+                "{modality}"
+            );
+        }
     }
 
     #[test]

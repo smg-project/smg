@@ -4,6 +4,9 @@ on:
   push:
     branches: [ main ]
     paths:
+      - '.github/workflows/benchmark-request-processing.yml'
+      - '.github/bench-gates/request-processing.toml'
+      - 'scripts/bench_gate.py'
       - 'model_gateway/benches/request_processing.rs'
       - 'model_gateway/src/routers/**'
       - 'model_gateway/src/core/**'
@@ -14,6 +17,9 @@ on:
   pull_request:
     branches: [ main ]
     paths:
+      - '.github/workflows/benchmark-request-processing.yml'
+      - '.github/bench-gates/request-processing.toml'
+      - 'scripts/bench_gate.py'
       - 'model_gateway/benches/request_processing.rs'
       - 'model_gateway/src/routers/**'
       - 'model_gateway/src/core/**'
@@ -49,7 +55,43 @@ jobs:
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
 
+      # A pull request is gated: its bench binary and the base branch's (the merge
+      # commit's first parent) are built in this checkout, run interleaved on this
+      # runner and compared id by id by scripts/bench_gate.py against the thresholds
+      # in .github/bench-gates/request-processing.toml; the job fails on a gated
+      # regression. A push to main keeps the single summary run.
+      - name: Build the pull request's benchmark
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 40
+        run: |
+          source "$HOME/.cargo/env"
+          mkdir -p "$RUNNER_TEMP/bench-gate"
+          cp scripts/bench_gate.py "$RUNNER_TEMP/bench-gate/"
+          python3 scripts/bench_gate.py build --out "$RUNNER_TEMP/bench-gate/pr" -- \
+            cargo bench -p smg --bench request_processing --no-run
+
+      - name: Build the base branch's benchmark
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 40
+        run: |
+          source "$HOME/.cargo/env"
+          head=$(git rev-parse HEAD)
+          git -c advice.detachedHead=false checkout --quiet "$(git rev-parse HEAD^1)"
+          python3 "$RUNNER_TEMP/bench-gate/bench_gate.py" build --out "$RUNNER_TEMP/bench-gate/base" -- \
+            cargo bench -p smg --bench request_processing --no-run
+          git checkout --quiet "$head"
+
+      - name: Run the benchmark gate
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 40
+        run: |
+          set -o pipefail
+          python3 scripts/bench_gate.py run --gates .github/bench-gates/request-processing.toml \
+            --base "$RUNNER_TEMP/bench-gate/base" --pr "$RUNNER_TEMP/bench-gate/pr" \
+            --cwd model_gateway --out bench-gate 2>&1 | tee benchmark_output.txt
+
       - name: Run benchmark
+        if: github.event_name != 'pull_request'
         timeout-minutes: 40
         run: |
           source "$HOME/.cargo/env"
@@ -63,6 +105,7 @@ jobs:
           path: |
             target/criterion/benchmark_summary/
             benchmark_output.txt
+            bench-gate/
           retention-days: 30
 
       - name: Show sccache stats
@@ -70,7 +113,7 @@ jobs:
         run: sccache --show-stats || true
 
       - name: Summary
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         run: |
           echo "## Request Processing Benchmark" >> $GITHUB_STEP_SUMMARY
           if [ -f benchmark_output.txt ]; then

@@ -235,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stream_cut_inside_a_call_closes_the_object_for_the_client_and_ends_the_call() {
+    fn a_stream_cut_inside_a_string_leaves_it_open_says_so_and_ends_the_call() {
         let mut parser = Engine::new(gemma4(), declared());
         let mut out = Events::new();
         parser
@@ -266,9 +266,16 @@ mod tests {
             )
             .expect("end");
         let events = out.drain();
-        assert_eq!(arguments_of(&events, 0), r#"{"artist": "Tay"}"#);
-        assert!(events.iter().any(
-            |event| matches!(event, Event::ToolCallEnd { source, .. } if source.text.is_empty())
+        // Nothing is made up for the string the end cut: the fragments stand, and the one word
+        // of no bytes before the call's end says that the arguments are no whole value.
+        assert_eq!(arguments_of(&events, 0), r#"{"artist": "Tay"#);
+        let ended = events
+            .iter()
+            .position(|event| matches!(event, Event::ToolCallEnd { source, .. } if source.text.is_empty()))
+            .expect("the call ends");
+        assert!(matches!(
+            &events[ended - 1],
+            Event::Malformed { text, .. } if text.text.is_empty()
         ));
     }
 

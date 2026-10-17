@@ -1,15 +1,21 @@
 //! Symphony reading the chat stream: the assignment on the response spec switches the drivers
 //! from the tool and reasoning parsers to one engine per choice, with the same chunks on the wire.
 
-use llm_tokenizer::StopSequenceConfig;
+use std::sync::Arc;
+
+use llm_tokenizer::{
+    encoders::deepseek_v4::{encode_messages, EncodeParams, ThinkingMode},
+    registry::TokenizerRegistry,
+    StopSequenceConfig,
+};
 use openai_protocol::{
-    chat::ChatChoice,
+    chat::{ChatChoice, ChatCompletionRequest},
     common::{ChatLogProbs, StringOrArray},
 };
 use serde_json::{json, Value};
 use smg_grpc_client::{tokenspeed_proto::GenerateComplete, vllm_engine::proto};
 use symphony::{
-    formats::{plain, qwen3},
+    formats::{deepseek_v4, plain, qwen3},
     CallSyntax, Format,
 };
 
@@ -20,15 +26,22 @@ use super::{
     },
     *,
 };
-use crate::routers::grpc::{
-    proto_wrapper::ProtoGenerateComplete,
-    regular::{processor::ResponseProcessor, symphony::Assignment},
+use crate::{
+    config::ParserChoice,
+    routers::grpc::{
+        proto_wrapper::ProtoGenerateComplete,
+        regular::{
+            processor::ResponseProcessor,
+            symphony::{assign, template::Templates, Assignment},
+        },
+        utils::Names,
+    },
 };
 
 /// The spec with Symphony assigned `format`, replaying `prompt`.
 fn assigned(mut spec: ChatResponseSpec, format: Format, prompt: &str) -> ChatResponseSpec {
     spec.symphony = Some(Assignment {
-        format,
+        format: Arc::new(format),
         prompt: prompt.to_string(),
     });
     spec
@@ -117,6 +130,114 @@ async fn symphony_streams_reasoning_content_and_a_tool_call_from_a_qwen3_output(
     assert!(events[1..]
         .iter()
         .all(|event| event["choices"][0]["delta"]["role"].is_null()));
+}
+
+/// A chat request with the conversation of a retry and no tools: the user asked for
+/// `list_skills`, the assistant called it, the tool was unavailable, the user asks again.
+fn retry_request() -> ChatCompletionRequest {
+    serde_json::from_value(json!({
+        "model": "MiniMax-M3", "stream": true, "separate_reasoning": true,
+        "messages": [
+            {"role": "user", "content": "Call the `list_skills` tool once to see what we can do, \
+                                         and reply with nothing else."},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_0", "type": "function",
+                "function": {"name": "list_skills", "arguments": "{}"}
+            }]},
+            {"role": "tool", "tool_call_id": "call_0",
+             "content": "`list_skills` is unavailable for now; call it again later."},
+            {"role": "user", "content": "The cooldown is over. Try again."}
+        ]
+    }))
+    .expect("chat request")
+}
+
+/// The prompt the model's public chat template renders for the retry conversation
+/// ([`retry_request`], thinking adaptive, no `tools`): the earlier call in the history is
+/// written as an invoke with no parameters, and the generation prompt ends at the turn
+/// opener, so the replay starts the output in the content with the thought the model's to
+/// open.
+const RETRY_PROMPT: &str = concat!(
+    "]~!b[]~b]system\n",
+    "Your model version is MiniMax-M3, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n",
+    "\n",
+    "<thinking_instructions>\n",
+    "You have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\n",
+    "Current thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n",
+    "</thinking_instructions>[e~[\n",
+    "]~b]developer\n",
+    "You are a helpful assistant.[e~[\n",
+    "]~b]user\n",
+    "Call the `list_skills` tool once to see what we can do, and reply with nothing else.[e~[\n",
+    "]~b]ai\n",
+    "</mm:think>]<]minimax[>[<tool_call>\n",
+    "]<]minimax[>[<invoke name=\"list_skills\">]<]minimax[>[</invoke>\n",
+    "]<]minimax[>[</tool_call>[e~[\n",
+    "]~b]tool\n",
+    "<response>Tool `list_skills` unavailable for now. Please call it later.</response>[e~[\n",
+    "]~b]user\n",
+    "<system-reminder>The cooldown is over, try again.</system-reminder>[e~[\n",
+    "]~b]ai\n"
+);
+
+#[tokio::test]
+async fn a_call_the_conversation_established_is_a_call_without_a_tool_inventory() {
+    // The request declares no tools and the model's provider reads calls without them, so the
+    // older path runs its tool parser; the assignment keeps the table's calls the same way, and
+    // the block the model writes for the retry comes back as a call, not as content.
+    let request = retry_request();
+    let assignment = assign(
+        ParserChoice::Symphony,
+        &Names::default(),
+        &request,
+        None,
+        RETRY_PROMPT,
+        &Templates::new(Arc::new(TokenizerRegistry::new())),
+    )
+    .expect("no template named")
+    .expect("the registry's table");
+    assert_eq!(
+        assignment.prompt, "]~b]ai\n",
+        "the replay starts at the turn opener"
+    );
+    let mut spec = ChatResponseSpec::from(&request);
+    assert!(
+        spec.tools.as_deref().is_some_and(<[Tool]>::is_empty),
+        "scanned for calls, with no inventory"
+    );
+    spec.symphony = Some(assignment);
+    let output = "<mm:think>The user asks for the tool again.</mm:think>\
+                  <tool_call>\n<invoke name=\"list_skills\"></invoke>\n</tool_call>";
+    let responses = vec![
+        chunk(0, &output[..30]),
+        chunk(0, &output[30..]),
+        complete(0, "stop"),
+    ];
+    let (result, events) = stream_events(responses, false, spec).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        chat_text(&events, 0, "reasoning_content"),
+        "The user asks for the tool again."
+    );
+    assert_eq!(
+        chat_text(&events, 0, "content").trim(),
+        "",
+        "the block is no content"
+    );
+    let calls = tool_call_deltas(&events);
+    assert!(!calls.is_empty(), "{events:#?}");
+    assert_eq!(calls[0]["function"]["name"], "list_skills");
+    let arguments: String = calls
+        .iter()
+        .filter_map(|call| call["function"]["arguments"].as_str())
+        .collect();
+    let arguments: Value = serde_json::from_str(&arguments).expect("the arguments as JSON");
+    assert_eq!(arguments, json!({}));
+    let finish = events
+        .iter()
+        .find_map(|event| event["choices"][0]["finish_reason"].as_str())
+        .expect("a finish chunk");
+    assert_eq!(finish, "tool_calls");
 }
 
 /// [`stream_events`] with tools and a stop sequence the decoder matches.
@@ -343,20 +464,21 @@ fn assigned_message(format: Format, prompt: &str, thinking: bool) -> MessagesRes
     MessagesResponseSpec {
         first_tool_call_only: false,
         thinking_requested: thinking,
+        thinking_text_returned: true,
         reasoning_in_prefill: false,
         tool_choice: None,
         has_tools: true,
         history_tool_calls_count: 0,
-        chat_tools: lookup_tools(),
+        chat_tools: lookup_tools().into(),
         stop_sequences: None,
         symphony: Some(Assignment {
-            format,
+            format: Arc::new(format),
             prompt: prompt.to_string(),
         }),
     }
 }
 
-async fn message_events(
+pub(super) async fn message_events(
     responses: Vec<proto::GenerateResponse>,
     spec: MessagesResponseSpec,
     stop: Option<&str>,
@@ -383,7 +505,7 @@ async fn message_events(
 
 /// The content blocks of a streamed message as `(type, text or name, input JSON)`, rebuilt from
 /// the deltas: blocks must open and close one at a time, with indices in order.
-fn message_blocks(events: &[Value]) -> Vec<(String, String, Value)> {
+pub(super) fn message_blocks(events: &[Value]) -> Vec<(String, String, Value)> {
     let mut blocks: Vec<(String, String, String)> = Vec::new();
     let mut open: Option<u64> = None;
     for event in events {
@@ -474,6 +596,47 @@ async fn symphony_streams_a_message_as_thinking_text_and_tool_use_blocks() {
     assert!(!text.contains("<tool_call>"), "{text:?}");
 }
 
+/// The `tool_use` ids a streamed message opened, in order.
+fn tool_use_ids(events: &[Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|event| {
+            event["type"] == "content_block_start" && event["content_block"]["type"] == "tool_use"
+        })
+        .map(|event| {
+            event["content_block"]["id"]
+                .as_str()
+                .expect("a tool_use id")
+                .to_string()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn two_symphony_messages_never_share_a_tool_use_id() {
+    // A client keeps its tool_use blocks and tool_results by id across a conversation: a second
+    // turn's call must not come back under the first turn's id, and the id has the shape the
+    // older parsers mint (`toolu_` and 24 hex characters).
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+        let responses = vec![chunk(0, QWEN3_OUTPUT), complete(0, "stop")];
+        let (result, events) = message_events(responses, spec, None).await;
+        assert!(result.is_ok(), "{result:?}");
+        let turn = tool_use_ids(&events);
+        assert_eq!(turn.len(), 1, "{turn:?}");
+        ids.extend(turn);
+    }
+    assert_ne!(ids[0], ids[1], "{ids:?}");
+    for id in &ids {
+        let hex = id.strip_prefix("toolu_").unwrap_or_else(|| panic!("{id}"));
+        assert!(
+            hex.len() == 24 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{id}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn symphony_message_stop_reasons_follow_the_finish_and_the_matched_stop() {
     // The token limit.
@@ -503,4 +666,94 @@ async fn symphony_message_stop_reasons_follow_the_finish_and_the_matched_stop() 
         .find(|event| event["type"] == "message_delta")
         .expect("a message_delta");
     assert_eq!(delta["delta"]["stop_sequence"], "END");
+}
+
+/// The Messages body a coding agent's client sends, as recorded: its environment notes as a
+/// system-role message after the user turn, rendered in place. The family's template writes the
+/// turn opener after a user message only, so the prompt opens no turn for the model, which starts
+/// inside its thought: the thought and its close are a thinking block (none when the thought is
+/// empty), never a text block, on the Messages API and on chat completions alike.
+#[tokio::test]
+async fn a_conversation_that_ends_with_a_system_turn_keeps_the_thought_out_of_the_text() {
+    let messages = json!([
+        {
+            "role": "system",
+            "content": "You are a coding assistant working in a Python repository. Use the tools \
+                        to inspect and edit files. Be brief."
+        },
+        {
+            "role": "user",
+            "content": "The test suite (python3 -m pytest -q) has a failing test in \
+                        tests/test_versions.py. Find the bug in the source code under src/ and fix \
+                        it so the whole suite passes. Do not modify anything under tests/."
+        },
+        {
+            "role": "system",
+            "content": "# Environment\nYou have been invoked in the following environment:\n - \
+                        Primary working directory: /work/repo\n - Is a git repository: true\n - \
+                        Platform: linux\n\nToday's date is 2026-10-16."
+        },
+    ]);
+    let prompt = encode_messages(
+        messages.as_array().expect("messages"),
+        ThinkingMode::Thinking,
+        &EncodeParams::default(),
+    )
+    .expect("the rendered prompt");
+    // The template opened no turn: no assistant opener, no `<think>`.
+    assert!(!prompt.contains("<｜Assistant｜>"), "{prompt:?}");
+    assert!(!prompt.contains("<think>"), "{prompt:?}");
+    let call = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"lookup\">\n\n</｜DSML｜invoke>\n\
+                </｜DSML｜tool_calls>";
+    // The thought, its close, the template's spacing and the call, in an engine's pieces.
+    let spec = assigned_message(deepseek_v4(), &prompt, true);
+    let responses = vec![
+        chunk(0, "The date is in the notes."),
+        chunk(0, "</think>"),
+        chunk(0, "\n\n"),
+        chunk(0, call),
+        complete(0, "stop"),
+    ];
+    let (result, events) = message_events(responses, spec, None).await;
+    assert!(result.is_ok(), "{result:?}");
+    let blocks = message_blocks(&events);
+    assert_eq!(blocks.len(), 2, "{blocks:?}");
+    assert_eq!(blocks[0].0, "thinking");
+    assert_eq!(blocks[0].2, "The date is in the notes.");
+    assert_eq!(blocks[1].0, "tool_use");
+    assert_eq!(blocks[1].1, "lookup");
+    assert_eq!(blocks[1].2, json!({}));
+    assert_eq!(message_stop_reason(&events), "tool_use");
+    // An empty thought, its close alone before the call: no thinking block and no text block.
+    let spec = assigned_message(deepseek_v4(), &prompt, true);
+    let responses = vec![
+        chunk(0, "</think>\n\n"),
+        chunk(0, call),
+        complete(0, "stop"),
+    ];
+    let (result, events) = message_events(responses, spec, None).await;
+    assert!(result.is_ok(), "{result:?}");
+    let blocks = message_blocks(&events);
+    assert_eq!(blocks.len(), 1, "{blocks:?}");
+    assert_eq!(blocks[0].0, "tool_use");
+    let text: String = events
+        .iter()
+        .filter_map(|event| event["delta"]["text"].as_str())
+        .collect();
+    assert_eq!(text, "");
+    // Chat completions on the same prompt: the thought is `reasoning_content`, the content empty.
+    let spec = assigned(chat_spec(true), deepseek_v4(), &prompt);
+    let responses = vec![
+        chunk(0, "The date is in the notes.</think>\n\n"),
+        chunk(0, call),
+        complete(0, "stop"),
+    ];
+    let (result, events) = stream_events(responses, true, spec).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        chat_text(&events, 0, "reasoning_content"),
+        "The date is in the notes."
+    );
+    assert_eq!(chat_text(&events, 0, "content").trim(), "");
+    assert!(!tool_call_deltas(&events).is_empty(), "{events:#?}");
 }

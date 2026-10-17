@@ -62,7 +62,19 @@
 //!   tracked requests, never at registration, and the bound is the
 //!   configured threshold or, if longer, the time the engine may still need
 //!   to prefill what is in flight ([`Worker::prefill_backlog`]): a batch that
-//!   is all in prefill streams nothing and is not wedged. A zero threshold
+//!   is all in prefill streams nothing and is not wedged. The bound is the
+//!   cap outright ([`COLD_SHAPE_GRACE`]) while the worker is on a prompt
+//!   longer than any it has answered, once it has answered one
+//!   ([`Worker::prefill_cold_shape`]): an engine meeting a shape it has not
+//!   run may build a kernel for it first, a minute of silence on the engines
+//!   we know, with nothing on any wire to tell it from a freeze (the
+//!   servicer's record flows through both, its health answers through
+//!   both), and the gateway's own books are the one evidence there is. The
+//!   grace arms no veto and lifts none: a worker vetoed before the longer
+//!   prompt reached it is judged as before until it produces; a real wedge
+//!   met on such a prompt is caught at the cap instead of the threshold,
+//!   once per new longest prompt; a worker that has answered nothing is
+//!   judged as before. A zero threshold
 //!   turns the rule off. The same bound, read per request, caps how long a
 //!   disaggregated prefill leg may stay silent ([`prefill_leg_bound`]): a
 //!   leg is not part of any pile, so its request is what fails, over to
@@ -71,7 +83,8 @@
 //!   bound ([`prefill_leg_reprieve`]): a worker that keeps answering other
 //!   legs is backed up (on the parallel dispatch shape a leg's first
 //!   response also waits for the decode side), not frozen, and its leg
-//!   waits on.
+//!   waits on; a leg in flight when the longest prompt yet lands behind
+//!   it is given what is left of the cold-shape grace since its dispatch.
 //!
 //! - **stale records** (an unreachable veto by another rule): a worker whose
 //!   KV-event stream has pushed load records is heard from every few
@@ -123,11 +136,36 @@ const WEDGE_PILE: usize = 4;
 /// rule for good.
 const WEDGE_BOUND_CAP: Duration = Duration::from_secs(120);
 
+/// The wedge bound while a worker is on a prompt longer than any it has
+/// answered ([`Worker::prefill_cold_shape`]): the cap, outright. An engine
+/// meeting a shape it has not run may build a kernel for it first, a minute
+/// of silence with nothing on the wire to tell it from a freeze, so the
+/// gateway gives the shape the most the prefill stretch could, and a real
+/// wedge met there is caught at the cap, once per new longest prompt.
+const COLD_SHAPE_GRACE: Duration = WEDGE_BOUND_CAP;
+
 /// The wedge bound for `worker` now: the configured threshold, or the time
 /// the engine may still need before the first token of its in-flight prompts
-/// is due, whichever is longer.
+/// is due, or the cold-shape grace while one of them is longer than any the
+/// worker has answered, whichever is longest.
 fn wedge_bound(worker: &Arc<dyn Worker>, wedge: Duration) -> Duration {
-    bound_over(wedge, worker.prefill_backlog())
+    wedge_bound_given(worker, wedge, cold_shape_grace(worker, 0))
+}
+
+/// [`wedge_bound`] at the given cold-shape `grace`.
+fn wedge_bound_given(worker: &Arc<dyn Worker>, wedge: Duration, grace: Duration) -> Duration {
+    bound_over(wedge, worker.prefill_backlog().max(grace))
+}
+
+/// The cold-shape grace for `worker` with `extra` more prompt tokens about
+/// to be dispatched: [`COLD_SHAPE_GRACE`] while the worker is on a prompt
+/// longer than any it has answered, zero otherwise.
+fn cold_shape_grace(worker: &Arc<dyn Worker>, extra: u64) -> Duration {
+    if worker.prefill_cold_shape(extra) {
+        COLD_SHAPE_GRACE
+    } else {
+        Duration::ZERO
+    }
 }
 
 /// The wedge rule's bound over an `eta` the engine may still need: the
@@ -141,7 +179,8 @@ fn bound_over(wedge: Duration, eta: Duration) -> Duration {
 /// wedge rule's bound, with the leg's own prompt behind what the worker is
 /// already prefilling ([`Worker::prefill_eta`]), so a long prompt on a busy
 /// worker gets the time its measured rate says it needs, a short one the
-/// configured threshold, and nothing more than the cap. A PD leg joins no
+/// configured threshold, a prompt longer than any the worker has answered
+/// the cold-shape grace, and nothing more than the cap. A PD leg joins no
 /// pile and is never vetoed by one; the request is what the bound ends.
 /// `None` when the rule is off (a zero threshold).
 pub(crate) fn prefill_leg_bound(worker: &Arc<dyn Worker>, prompt_tokens: u64) -> Option<Duration> {
@@ -155,7 +194,10 @@ fn prefill_leg_bound_with(
     prompt_tokens: u64,
     wedge: Duration,
 ) -> Option<Duration> {
-    (!wedge.is_zero()).then(|| bound_over(wedge, worker.prefill_eta(prompt_tokens)))
+    (!wedge.is_zero()).then(|| {
+        let eta = worker.prefill_eta(prompt_tokens);
+        bound_over(wedge, eta.max(cold_shape_grace(worker, prompt_tokens)))
+    })
 }
 
 /// How long a sequential disaggregated decode leg of `prompt_tokens`
@@ -181,10 +223,46 @@ pub(crate) fn decode_leg_bound(prefills: &Arc<dyn Worker>, prompt_tokens: u64) -
 /// another leg a moment ago is backed up, not frozen (on the parallel
 /// dispatch shape a leg's first response also waits for the decode side to
 /// admit it), so the leg waits until a bound has passed since that answer.
-/// `None` when the worker has answered nothing within the bound, or ever:
-/// the verdict.
-pub(crate) fn prefill_leg_reprieve(worker: &Arc<dyn Worker>, bound: Duration) -> Option<Duration> {
-    reprieve(worker.prefill_answered_ago(), bound)
+/// The bound was read at the leg's dispatch, `dispatched_ago` back: a
+/// prompt longer than any the worker has answered that landed behind the
+/// leg since blocks the engine for the leg too while it builds, so while
+/// the worker is on that shape the leg is given what is left of the
+/// cold-shape grace since its dispatch, as a leg dispatched now would be
+/// ([`prefill_leg_bound`]), a bound at a time so the shape's first token
+/// returns it to the rule above. `None` when the worker has answered
+/// nothing within the bound, or ever, and no grace is left: the verdict.
+pub(crate) fn prefill_leg_reprieve(
+    worker: &Arc<dyn Worker>,
+    bound: Duration,
+    dispatched_ago: Duration,
+) -> Option<Duration> {
+    leg_reprieve(
+        cold_shape_grace(worker, 0),
+        worker.prefill_answered_ago(),
+        bound,
+        dispatched_ago,
+    )
+}
+
+/// [`prefill_leg_reprieve`] for a worker under a cold-shape `grace` (zero:
+/// on no such shape) whose latest first response was `answered_ago`
+/// (`None`: never). A grace the leg's own bound already covers (a longer
+/// configured threshold) adds nothing.
+fn leg_reprieve(
+    grace: Duration,
+    answered_ago: Option<Duration>,
+    bound: Duration,
+    dispatched_ago: Duration,
+) -> Option<Duration> {
+    if grace > bound {
+        if let Some(left) = grace
+            .checked_sub(dispatched_ago)
+            .filter(|left| !left.is_zero())
+        {
+            return Some(left.min(bound));
+        }
+    }
+    reprieve(answered_ago, bound)
 }
 
 /// [`prefill_leg_reprieve`] for a worker whose latest first response was
@@ -300,11 +378,24 @@ pub(crate) fn now_ms() -> u64 {
     u64::try_from(EPOCH.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Whether a gRPC status describes the connection rather than the request:
-/// what a dead peer, a reset or a failed keepalive produce. A deadline or an
+/// Whether a gRPC status code is one the connection produces rather than
+/// the request: what a dead peer, a reset, a failed keepalive or an engine
+/// that says it is unavailable end a stream with. A deadline or an
 /// engine-side error says the worker is slow or wrong, not gone, and a slow
 /// worker that still streams tokens must not flap in and out of routing.
-pub(crate) fn is_transport_failure(code: tonic::Code) -> bool {
+///
+/// The code alone decides, because the question is whether the peer is
+/// reachable for work, and every way of being unreachable ends the
+/// monitors' polls and streams with one of these codes; which layer
+/// produced the status does not matter here. The gRPC client's
+/// [`smg_grpc_client::is_transport_failure`] asks a different question of a
+/// status under a call, whether it is the HTTP/2 layer's doing rather than
+/// the worker's answer, and reads the status's source chain because the
+/// code cannot tell those apart. The two are not interchangeable: an
+/// `Unavailable` the worker answered with is a connection code here and no
+/// transport failure there; an `Internal` made of a protocol fault is a
+/// transport failure there and no connection code here.
+pub(crate) fn is_connection_code(code: tonic::Code) -> bool {
     matches!(
         code,
         tonic::Code::Unavailable
@@ -503,12 +594,21 @@ fn on_load_report_with(
     wedge: Duration,
 ) {
     let previous = worker.swap_waiting_reqs(waiting);
-    let bound = wedge_bound(worker, wedge);
+    // The grace of a cold shape arms no veto and lifts none: a worker vetoed
+    // before the longer prompt reached it is judged as before until it
+    // produces, so the grace never reads as the engine producing again.
+    let grace = if worker.stall_reason().is_none() {
+        cold_shape_grace(worker, 0)
+    } else {
+        Duration::ZERO
+    };
+    let bound = wedge_bound_given(worker, wedge, grace);
     let engine_stalled = engine_stalled(
         engine_silence,
         engine_reports_steps,
         wedge,
         silence_allowance(worker, wedge, engine_prefill_pending),
+        grace,
     );
     worker.note_engine_stall(engine_stalled);
     match worker.stall_reason() {
@@ -559,14 +659,16 @@ fn on_load_report_with(
 /// scheduler step (`reports_steps`: the silence is the scheduler's own), or
 /// the `allowance` or longer when it carries token batches only (a long
 /// prefill is silence there; the allowance covers the prefill the servicer
-/// reports in hand, and is `None` when this gateway cannot size it). Off at
-/// a zero threshold; a record without the figure (an idle engine, an older
-/// servicer) says nothing.
+/// reports in hand, and is `None` when this gateway cannot size it), or the
+/// cold-shape `grace` or longer when that is more. Off at a zero threshold;
+/// a record without the figure (an idle engine, an older servicer) says
+/// nothing.
 fn engine_stalled(
     silence: Option<Duration>,
     reports_steps: bool,
     wedge: Duration,
     allowance: Option<Duration>,
+    grace: Duration,
 ) -> bool {
     let allowed = if reports_steps {
         wedge
@@ -575,7 +677,7 @@ fn engine_stalled(
     } else {
         return false;
     };
-    !wedge.is_zero() && silence.is_some_and(|silence| silence >= allowed)
+    !wedge.is_zero() && silence.is_some_and(|silence| silence >= allowed.max(grace))
 }
 
 /// What a token-batch wire may be silent for before its silence counts: the
@@ -688,6 +790,7 @@ fn set(worker: &Arc<dyn Worker>, reason: Option<StallReason>, cause: &'static st
 mod tests {
     use std::thread;
 
+    use smg_grpc_client::{h2, is_transport_failure};
     use tokio::sync::mpsc;
 
     use super::*;
@@ -697,6 +800,106 @@ mod tests {
 
     fn worker() -> Arc<dyn Worker> {
         Arc::new(BasicWorkerBuilder::new("http://w1:8000").build())
+    }
+
+    /// The expectation the three callers share, for every gRPC code: the
+    /// load poll, the KV subscription and the KV stream all mark a worker
+    /// as contact failed when their call or stream ends with a connection
+    /// code, and leave it alone on any other code. Four codes are the
+    /// connection's; the rest describe the request. A `match` with no
+    /// wildcard arm: a code added to tonic is a build error here until it
+    /// has its row.
+    fn expectation(code: tonic::Code) -> (bool, &'static str) {
+        use tonic::Code;
+        match code {
+            Code::Ok => (false, "a clean end is not a failure"),
+            Code::Cancelled => (true, "a reset stream: the peer or the link went away"),
+            Code::Unknown => (
+                true,
+                "an error with no gRPC code: a closed or broken connection",
+            ),
+            Code::InvalidArgument => (false, "the request was wrong, the worker is there"),
+            Code::DeadlineExceeded => (false, "our own deadline: slow, not gone"),
+            Code::NotFound => (false, "the request's"),
+            Code::AlreadyExists => (false, "the request's"),
+            Code::PermissionDenied => (false, "the request's"),
+            Code::ResourceExhausted => (false, "the worker's capacity pushback: busy, not gone"),
+            Code::FailedPrecondition => (false, "the request's"),
+            Code::Aborted => (true, "the worker aborted the stream under us"),
+            Code::OutOfRange => (
+                false,
+                "the KV subscription resyncs on it before asking; never a contact failure",
+            ),
+            Code::Unimplemented => (false, "the request's"),
+            Code::Internal => (
+                false,
+                "the worker's own failure on a request: wrong, not gone",
+            ),
+            Code::Unavailable => (
+                true,
+                "a dead peer, a refused stream or a worker that says it is unavailable",
+            ),
+            Code::DataLoss => (
+                false,
+                "the KV stream resyncs on it before asking; never a contact failure",
+            ),
+            Code::Unauthenticated => (false, "the request's"),
+        }
+    }
+
+    /// Every gRPC code against the callers' expectation. The codes come
+    /// from tonic's own numbering: `from_i32` answers `Unknown` for a
+    /// number tonic has no code for, so the numbers must map back to
+    /// themselves (each a real code, once) and the 17th must not.
+    #[test]
+    fn a_connection_code_is_one_of_four_and_every_other_code_is_the_requests() {
+        use tonic::Code;
+        let codes: Vec<Code> = (0..=16).map(Code::from_i32).collect();
+        assert_eq!(
+            codes
+                .iter()
+                .map(|&code| i32::from(code))
+                .collect::<Vec<_>>(),
+            (0..=16).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            Code::from_i32(17),
+            Code::Unknown,
+            "tonic numbers a 17th code: give it a row"
+        );
+        for &code in &codes {
+            let (expected, why) = expectation(code);
+            assert_eq!(is_connection_code(code), expected, "{code:?}: {why}");
+        }
+        assert_eq!(codes.iter().filter(|&&code| expectation(code).0).count(), 4);
+    }
+
+    /// The gRPC client's `is_transport_failure` answers another question
+    /// (is this status the HTTP/2 layer's doing rather than the worker's
+    /// answer?) from the status's source chain, and the two disagree by
+    /// design in both directions.
+    #[test]
+    fn a_connection_code_and_a_transport_failure_are_different_questions() {
+        // An Unavailable the worker answered with: unreachable for work, yet
+        // not the transport's doing.
+        let answered = tonic::Status::unavailable("shutting down");
+        assert!(is_connection_code(answered.code()));
+        assert!(!is_transport_failure(&answered));
+
+        // An Internal tonic made of a protocol fault: the transport's doing,
+        // yet its code is the one a worker's own failure carries.
+        let fault =
+            tonic::Status::from_error(Box::new(h2::Error::from(h2::Reason::PROTOCOL_ERROR)));
+        assert_eq!(fault.code(), tonic::Code::Internal);
+        assert!(is_transport_failure(&fault));
+        assert!(!is_connection_code(fault.code()));
+
+        // A refused stream is both: an Unavailable with an HTTP/2 cause.
+        let refused =
+            tonic::Status::from_error(Box::new(h2::Error::from(h2::Reason::REFUSED_STREAM)));
+        assert_eq!(refused.code(), tonic::Code::Unavailable);
+        assert!(is_transport_failure(&refused));
+        assert!(is_connection_code(refused.code()));
     }
 
     #[test]
@@ -896,15 +1099,85 @@ mod tests {
         assert_eq!(reprieve(Some(Duration::from_secs(10)), bound), None);
         let w = worker();
         assert_eq!(
-            prefill_leg_reprieve(&w, bound),
+            prefill_leg_reprieve(&w, bound, Duration::ZERO),
             None,
             "a fresh worker has answered nothing"
         );
         w.note_prefill_started(256, true);
         w.note_prefill_ended(256, true, Some(0));
         assert!(
-            prefill_leg_reprieve(&w, bound).is_some_and(|left| left > Duration::from_secs(2)),
+            prefill_leg_reprieve(&w, bound, Duration::ZERO)
+                .is_some_and(|left| left > Duration::from_secs(2)),
             "answered just now: a bound's reprieve, less the moment since"
+        );
+    }
+
+    /// A leg's bound is read at its dispatch; the longest prompt yet
+    /// landing behind it blocks the engine for the leg too while it builds,
+    /// so the leg in flight is given what is left of the grace since its
+    /// dispatch, a bound at a time, and the verdict as before once the
+    /// shape is shown or the grace has passed.
+    #[test]
+    fn a_prefill_leg_in_flight_before_a_longer_prompt_waits_through_the_build() {
+        let bound = DEFAULT_WEDGE;
+        let silent = Some(Duration::from_secs(10));
+        assert_eq!(
+            reprieve(silent, bound),
+            None,
+            "silent for a bound: the verdict"
+        );
+        assert_eq!(
+            leg_reprieve(COLD_SHAPE_GRACE, silent, bound, Duration::from_secs(10)),
+            Some(bound),
+            "on a cold shape: the grace since the dispatch, a bound at a time"
+        );
+        assert_eq!(
+            leg_reprieve(
+                COLD_SHAPE_GRACE,
+                silent,
+                bound,
+                COLD_SHAPE_GRACE - Duration::from_secs(1)
+            ),
+            Some(Duration::from_secs(1)),
+            "what is left of it"
+        );
+        assert_eq!(
+            leg_reprieve(COLD_SHAPE_GRACE, silent, bound, COLD_SHAPE_GRACE),
+            None,
+            "the grace has passed: the verdict"
+        );
+        assert_eq!(
+            leg_reprieve(Duration::ZERO, silent, bound, Duration::from_secs(10)),
+            None,
+            "on no cold shape: the rule above"
+        );
+        let long = Duration::from_secs(600);
+        assert_eq!(
+            leg_reprieve(COLD_SHAPE_GRACE, silent, long, Duration::from_secs(10)),
+            reprieve(silent, long),
+            "a longer configured threshold already covers the grace: the rule above alone"
+        );
+        // The worker: a short leg dispatched, then the longest prompt yet
+        // behind it.
+        let w = worker();
+        w.note_prefill_started(1_024, true);
+        w.note_prefill_ended(1_024, true, Some(0));
+        w.note_prefill_started(512, true);
+        assert!(!w.prefill_cold_shape(0));
+        w.note_prefill_started(8_192, true);
+        assert!(w.prefill_cold_shape(0));
+        let late = COLD_SHAPE_GRACE - Duration::from_secs(1);
+        assert_eq!(
+            prefill_leg_reprieve(&w, bound, late),
+            Some(Duration::from_secs(1)),
+            "the short leg, dispatched before the longer prompt, waits out the grace"
+        );
+        // The shape shown: the leg is judged by the worker's answers again.
+        w.note_prefill_ended(8_192, true, Some(0));
+        assert!(!w.prefill_cold_shape(0));
+        assert!(
+            prefill_leg_reprieve(&w, bound, late).is_some_and(|left| left > Duration::from_secs(2)),
+            "answered just now: a bound's reprieve"
         );
     }
 
@@ -1496,13 +1769,15 @@ mod tests {
             Some(Duration::from_secs(600)),
             true,
             Duration::ZERO,
-            Some(Duration::ZERO)
+            Some(Duration::ZERO),
+            Duration::ZERO
         ));
         assert!(!engine_stalled(
             None,
             true,
             DEFAULT_WEDGE,
-            Some(DEFAULT_WEDGE)
+            Some(DEFAULT_WEDGE),
+            Duration::ZERO
         ));
     }
 
@@ -1538,7 +1813,11 @@ mod tests {
         let with_backlog: Arc<dyn Worker> = Arc::new(with_backlog);
         let idle: Arc<dyn Worker> = Arc::new(idle);
         tracked_pile(&with_backlog, 1);
-        with_backlog.note_prefill_started(16 * 1_152, true);
+        // Sixteen prompts of the length it has answered: a shape it has
+        // shown, no cold-shape grace.
+        for _ in 0..16 {
+            with_backlog.note_prefill_started(1_152, true);
+        }
         let pending = Some(16 * 1_152);
         // 18,432 tokens at 1,536 tokens/s: 12 s of prefill, 24 s allowed.
         assert_eq!(
@@ -1582,7 +1861,9 @@ mod tests {
         // pending) and the veto; with nothing pending the allowance is the
         // threshold again, so a frozen engine on such a wire is vetoed at the
         // threshold like any other, on both gateways.
-        with_backlog.note_prefill_ended(16 * 1_152, true, Some(0));
+        for _ in 0..16 {
+            with_backlog.note_prefill_ended(1_152, true, Some(0));
+        }
         for w in [&with_backlog, &idle] {
             on_token_progress(w);
             assert!(w.stall_reason().is_none());
@@ -1642,13 +1923,165 @@ mod tests {
             Some(Duration::from_secs(60)),
             false,
             DEFAULT_WEDGE,
-            None
+            None,
+            Duration::ZERO
         ));
         // The allowance never exceeds the wedge bound's cap.
         assert_eq!(
             silence_allowance(&idle, DEFAULT_WEDGE, Some(100_000_000)),
             Some(WEDGE_BOUND_CAP)
         );
+    }
+
+    /// A worker that has answered prompts up to a length is silent on a
+    /// longer one: an engine meeting a new shape may be building a kernel
+    /// for it, which no wire tells from a freeze, so every wedge rule's
+    /// bound is the cap for that prompt, once; a real wedge met there is
+    /// caught at the cap.
+    #[test]
+    fn a_prompt_longer_than_any_answered_is_given_the_cap_once() {
+        let w = worker();
+        w.note_prefill_started(1_024, true);
+        w.note_prefill_ended(1_024, true, Some(0));
+        assert_eq!(
+            wedge_bound(&w, DEFAULT_WEDGE),
+            DEFAULT_WEDGE,
+            "nothing pending"
+        );
+        // An 8k prompt, the longest yet, on a step-reporting wire silent
+        // from its dispatch on.
+        tracked_pile(&w, 1);
+        w.note_prefill_started(8_192, true);
+        assert!(w.prefill_cold_shape(0));
+        assert_eq!(wedge_bound(&w, DEFAULT_WEDGE), COLD_SHAPE_GRACE);
+        assert_eq!(
+            prefill_leg_bound_with(&w, 8_192, DEFAULT_WEDGE),
+            Some(COLD_SHAPE_GRACE),
+            "a prefill leg of the new shape"
+        );
+        assert_eq!(
+            prefill_leg_bound_with(&w, 512, DEFAULT_WEDGE),
+            Some(COLD_SHAPE_GRACE),
+            "any leg while the worker is on the new shape"
+        );
+        for secs in [3, 60, 119] {
+            on_load_report_with(
+                &w,
+                0,
+                Some(Duration::from_secs(secs)),
+                true,
+                None,
+                DEFAULT_WEDGE,
+            );
+            assert!(w.stall_reason().is_none(), "{secs} s of silence: building");
+        }
+        // The sweep's own rules read the same bound: a pile behind the
+        // prompt, or a queue, is not a wedge under the cap.
+        let bound = wedge_bound(&w, DEFAULT_WEDGE);
+        assert!(!wedged_by_pile(9, 1, Duration::from_secs(119), bound));
+        assert!(!wedged_by_queue(9, 4, 0, Duration::from_secs(119), bound));
+        assert!(wedged_by_pile(9, 1, COLD_SHAPE_GRACE, bound), "at the cap");
+        // Past the cap it is a wedge like any other.
+        on_load_report_with(&w, 0, Some(COLD_SHAPE_GRACE), true, None, DEFAULT_WEDGE);
+        assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
+        // The first token: progress, and the shape shown; the next 8k prompt
+        // is judged at the threshold.
+        on_token_progress(&w);
+        w.note_prefill_ended(8_192, true, Some(0));
+        assert!(w.stall_reason().is_none());
+        w.note_prefill_started(8_192, true);
+        assert!(!w.prefill_cold_shape(0));
+        assert_eq!(wedge_bound(&w, DEFAULT_WEDGE), DEFAULT_WEDGE);
+        on_load_report_with(&w, 0, Some(DEFAULT_WEDGE), true, None, DEFAULT_WEDGE);
+        assert_eq!(w.stall_reason(), Some(StallReason::Wedged), "once");
+        // A token-batch wire: the grace stands above the allowance too,
+        // and no allowance is still no verdict.
+        let allowance = Some(Duration::from_secs(24));
+        assert!(!engine_stalled(
+            Some(Duration::from_secs(60)),
+            false,
+            DEFAULT_WEDGE,
+            allowance,
+            COLD_SHAPE_GRACE
+        ));
+        assert!(engine_stalled(
+            Some(COLD_SHAPE_GRACE),
+            false,
+            DEFAULT_WEDGE,
+            allowance,
+            COLD_SHAPE_GRACE
+        ));
+        assert!(!engine_stalled(
+            Some(Duration::from_secs(600)),
+            false,
+            DEFAULT_WEDGE,
+            None,
+            COLD_SHAPE_GRACE
+        ));
+        // A longer configured threshold stands above the grace.
+        let long = worker();
+        long.note_prefill_started(1_024, true);
+        long.note_prefill_ended(1_024, true, Some(0));
+        long.note_prefill_started(8_192, true);
+        assert_eq!(
+            wedge_bound(&long, Duration::from_secs(600)),
+            Duration::from_secs(600)
+        );
+    }
+
+    /// The first prompt on a worker is the longest it has seen as well;
+    /// with nothing answered the gateway has no shape to go by and judges
+    /// the worker as before, so an engine frozen from its first request is
+    /// caught at the threshold.
+    #[test]
+    fn a_worker_that_has_answered_nothing_gets_no_grace() {
+        let w = worker();
+        tracked_pile(&w, 1);
+        w.note_prefill_started(8_192, true);
+        assert!(!w.prefill_cold_shape(0));
+        assert_eq!(wedge_bound(&w, DEFAULT_WEDGE), DEFAULT_WEDGE);
+        assert_eq!(
+            prefill_leg_bound_with(&w, 8_192, DEFAULT_WEDGE),
+            Some(DEFAULT_WEDGE)
+        );
+        on_load_report_with(&w, 0, Some(DEFAULT_WEDGE), true, None, DEFAULT_WEDGE);
+        assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
+    }
+
+    /// A frozen engine vetoed on a shape it has shown, and a longer prompt
+    /// lands on it (a veto steers, it never refuses): the grace does not
+    /// re-read the engine's silence as output, and the veto stands until
+    /// the engine produces.
+    #[test]
+    fn the_grace_lifts_no_standing_veto() {
+        let w = worker();
+        w.note_prefill_started(1_024, true);
+        w.note_prefill_ended(1_024, true, Some(0));
+        tracked_pile(&w, 1);
+        w.note_prefill_started(1_024, true);
+        on_load_report_with(&w, 0, Some(DEFAULT_WEDGE), true, None, DEFAULT_WEDGE);
+        assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
+        tracked_pile(&w, 1);
+        w.note_prefill_started(8_192, true);
+        assert!(w.prefill_cold_shape(0));
+        on_load_report_with(
+            &w,
+            0,
+            Some(Duration::from_secs(4)),
+            true,
+            None,
+            DEFAULT_WEDGE,
+        );
+        assert_eq!(
+            w.stall_reason(),
+            Some(StallReason::Wedged),
+            "the grace is no engine output"
+        );
+        assert!(w.engine_stalled());
+        sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, DEFAULT_STALE);
+        assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
+        on_token_progress(&w);
+        assert!(w.stall_reason().is_none(), "progress clears it");
     }
 
     #[test]

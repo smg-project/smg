@@ -20,13 +20,7 @@ import dataclasses
 from functools import cached_property
 from typing import Any
 
-
-def _positive_int(value: Any) -> int | None:
-    """``value`` as a count above zero, else ``None`` (a bool is not a count)."""
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        return None
-    return value
-
+from smg_grpc_servicer.config_view import attr_int, attr_list, attr_str, positive_int
 
 CONSTRAINED_DECODING_POLICIES = ("requested", "always")
 
@@ -80,7 +74,7 @@ class ServerArgsSection:
             weight_version=str(getattr(server_args, "weight_version", "") or ""),
             revision=getattr(server_args, "revision", None),
             reasoning_parser=getattr(server_args, "reasoning_parser", None),
-            attention_dp_size=_positive_int(
+            attention_dp_size=positive_int(
                 getattr(getattr(mapping, "attn", None), "dp_size", None)
             ),
             running_window=int(
@@ -127,12 +121,10 @@ class ModelConfigSection:
         return cls(
             hf_config=hf_config,
             eos_token_ids=eos_token_ids,
-            model_type=str((getattr(hf_config, "model_type", "") or "") if hf_config else ""),
-            architectures=list(
-                (getattr(hf_config, "architectures", []) or []) if hf_config else []
-            ),
-            pad_token_id=int((getattr(hf_config, "pad_token_id", 0) or 0) if hf_config else 0),
-            bos_token_id=int((getattr(hf_config, "bos_token_id", 0) or 0) if hf_config else 0),
+            model_type=attr_str(hf_config, "model_type"),
+            architectures=attr_list(hf_config, "architectures"),
+            pad_token_id=attr_int(hf_config, "pad_token_id"),
+            bos_token_id=attr_int(hf_config, "bos_token_id"),
             context_len=int(getattr(model_config, "context_len", 0) or 0),
             vocab_size=int(model_config.vocab_size),
             dtype=getattr(model_config, "dtype", None),

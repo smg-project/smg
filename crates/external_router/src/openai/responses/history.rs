@@ -67,7 +67,10 @@ pub(crate) async fn load_input_history(
             // only) would break when it goes: no previous response, as for an
             // unstored id.
             Ok(responses)
-                if !responses.is_empty() && !responses.last().is_some_and(is_unstored) =>
+                if !responses.is_empty()
+                    && !responses
+                        .last()
+                        .is_some_and(|response| is_unstored(response)) =>
             {
                 existing_mcp_list_tools_labels.extend(responses.iter().flat_map(|stored| {
                     extract_mcp_list_tools_labels(

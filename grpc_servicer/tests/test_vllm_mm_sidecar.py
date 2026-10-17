@@ -7,7 +7,7 @@ import asyncio
 import sys
 import time
 import types
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 
 import pytest
 
@@ -174,6 +174,41 @@ class TestFingerprintDerivation:
             fp = mm_processor.fingerprint_from_model_config(_ModelConfig(skewed))
             assert fp.namespace() != implicit.namespace(), skewed
 
+    def test_the_fingerprint_reads_the_processor_kwargs_where_the_engine_keeps_them(
+        self, monkeypatch
+    ):
+        _fake_vllm(monkeypatch)
+        plain = _ModelConfig({})
+        assert mm_processor.fingerprint_from_model_config(plain).mm_processor_kwargs == "{}"
+        # The section behind the engine's accessor carries the kwargs.
+        with_kwargs = _ModelConfig({})
+        with_kwargs._mm.mm_processor_kwargs = {"max_pixels": 100_000, "do_resize": False}
+        fp = mm_processor.fingerprint_from_model_config(with_kwargs)
+        assert fp.mm_processor_kwargs == '{"do_resize": false, "max_pixels": 100000}'
+        assert fp.namespace() != mm_processor.fingerprint_from_model_config(plain).namespace()
+        # The engine's own layout: an init-only field moved into the section,
+        # the attribute on the instance reading None.
+
+        @dataclass
+        class _EngineModelConfig:
+            model: str = "m"
+            dtype: str = "torch.bfloat16"
+            mm_processor_kwargs: InitVar[dict | None] = None
+            multimodal_config: _MmConfig | None = None
+
+            def __post_init__(self, mm_processor_kwargs):
+                self.multimodal_config = _MmConfig({})
+                self.multimodal_config.mm_processor_kwargs = mm_processor_kwargs
+
+            def get_multimodal_config(self):
+                return self.multimodal_config
+
+        engine_shaped = _EngineModelConfig(
+            mm_processor_kwargs={"max_pixels": 100_000, "do_resize": False}
+        )
+        assert engine_shaped.mm_processor_kwargs is None
+        assert mm_processor.fingerprint_from_model_config(engine_shaped) == fp
+
     def test_sibling_options_and_extra_modalities_stay_in_the_fingerprint(self):
         limits = {
             "video": _VideoOptions(count=2, num_frames=16),
@@ -320,6 +355,56 @@ class TestNativeAudio:
             )
         ]
         assert result.prompt_token_ids == [258881]
+
+
+class TestShortSideFloor:
+    def test_a_fetched_image_below_the_familys_floor_is_raised_before_the_renderer(self):
+        from smg_grpc_servicer.vllm.short_side_floor import FloorRule
+
+        M3_RULE = FloorRule(floor=112, factor=28, min_pixels=3136, max_pixels=451584)
+
+        class _Image:
+            def __init__(self, width, height):
+                self.size = (width, height)
+
+            def resize(self, size, resample):
+                assert resample == 3  # bicubic
+                return _Image(*size)
+
+        for size, floor, expected in [
+            ((16, 16), M3_RULE, (112, 112)),
+            ((400, 112), M3_RULE, (400, 112)),
+        ]:
+            s = sidecar(FakeRedis())
+            s._short_side_floor = floor
+            fetched = _Image(*size)
+            rendered = []
+
+            async def fetch_image(url, fetched=fetched):
+                return fetched
+
+            async def render(prompt, **kwargs):
+                rendered.append(prompt)
+                return {
+                    "prompt_token_ids": [1, 2, 3],
+                    "mm_kwargs": {},
+                    "mm_hashes": {},
+                    "mm_placeholders": {},
+                }
+
+            s._connector = types.SimpleNamespace(fetch_image_async=fetch_image)
+            s._tokens_prompt = lambda **kwargs: kwargs
+            s._renderer = types.SimpleNamespace(process_for_engine_async=render)
+            s._encoder = None
+            result = run(s.handle(job()))
+            assert result.ok, result
+            (image,) = rendered[0]["multi_modal_data"]["image"]
+            assert image.size == expected
+            if expected == size:
+                assert image is fetched
+
+    def test_a_sidecar_built_without_init_raises_nothing(self):
+        assert sidecar(FakeRedis())._short_side_floor is None
 
 
 class TestClassification:

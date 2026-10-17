@@ -56,7 +56,14 @@ pub fn kimi_k3() -> Format {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::ids::CallIds;
+
+    fn ids() -> CallIds {
+        CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
+    }
     use crate::{
         engine::Engine,
         event::{DropReason, Event, Events, MalformedReason, Text},
@@ -79,7 +86,7 @@ mod tests {
     );
 
     fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
-        let mut parser = Engine::new(kimi_k3(), Declared::default());
+        let mut parser = Engine::with_call_ids(Arc::new(kimi_k3()), Declared::default(), ids());
         let mut out = Events::new();
         parser
             .feed(
@@ -186,7 +193,7 @@ mod tests {
             events[7],
             Event::ToolCallStart {
                 index: 0,
-                id: "call_0".into(),
+                id: ids().id(0),
                 name: "ChaDri_change_drink".into(),
                 source: Text::uncounted("ChaDri_change_drink\" index=\"1\"<|sep|>"),
             }
@@ -300,8 +307,17 @@ mod tests {
         assert_eq!(starts, [(0, "f"), (1, "g"), (2, "h")]);
         assert_eq!(arguments_of(&events, 0), r#"{"a": true}"#);
         assert_eq!(arguments_of(&events, 1), "{}");
-        // The block's close cut `h` inside a string: the string and the object are closed.
-        assert_eq!(arguments_of(&events, 2), r#"{"b": "x"}"#);
+        // The block's close cut `h` inside a string: nothing is closed for a value the model
+        // never closed, and the one word of no bytes before the end says so.
+        assert_eq!(arguments_of(&events, 2), r#"{"b": "x"#);
+        let ended = events
+            .iter()
+            .position(|event| matches!(event, Event::ToolCallEnd { index: 2, .. }))
+            .expect("the third call ends");
+        assert!(matches!(
+            &events[ended - 1],
+            Event::Malformed { text, .. } if text.text.is_empty()
+        ));
         assert_eq!(ends(&events), [Tags::XTML.invoke_close, "", ""]);
         assert!(matches!(
             events.last(),
@@ -419,7 +435,7 @@ mod tests {
         assert!(events.contains(&dropped("\n")));
         assert!(events.iter().any(|event| matches!(
             event,
-            Event::Malformed { text, why: MalformedReason::Other(_) } if text.text == "Hello"
+            Event::Malformed { text, why: MalformedReason::TextBetweenCalls } if text.text == "Hello"
         )));
     }
 

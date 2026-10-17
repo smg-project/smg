@@ -816,13 +816,23 @@ mod tests {
         );
     }
 
+    /// Template replacement keeps native capabilities and media preprocessing intact.
     #[test]
     fn v41_reports_its_renderer_capabilities() {
-        let (_tmp, tokenizer) = v41_tokenizer();
+        let (_tmp, mut tokenizer) = v41_tokenizer();
         let caps = tokenizer.renderer_capabilities();
         assert!(caps.enable_thinking_alias, "{caps:?}");
         assert!(caps.native_assistant_continuation, "{caps:?}");
         assert!(caps.raw_tool_call_arguments, "{caps:?}");
+        assert_eq!(
+            caps.media_handling,
+            llm_tokenizer::traits::MediaHandling::Preprocess
+        );
+        // Replacing a Jinja template must not override the native renderer's profile.
+        tokenizer
+            .set_chat_template(include_str!("fixtures/glm53/chat_template.jinja").into())
+            .unwrap();
+        assert_eq!(tokenizer.renderer_capabilities(), caps);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use openai_protocol::worker::MmProcessingMode;
 use tracing::warn;
 
-use crate::config::RouterConfig;
+use crate::config::{parse_listen_ip, RouterConfig};
 
 /// Which of the three layers supplied a setting's value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,14 +149,15 @@ impl MultimodalSettings {
             rdma_listen_ip: resolve(
                 config
                     .rdma_listen_ip
-                    .clone()
-                    .filter(|ip| !ip.trim().is_empty())
-                    .map(Some),
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|ip| !ip.is_empty())
+                    .map(|ip| Some(ip.to_string())),
                 env_nonempty(ENV_RDMA_LISTEN_IP),
                 ENV_RDMA_LISTEN_IP,
                 Some("--rdma-listen-ip"),
                 defaults.rdma_listen_ip,
-                |ip| Some(Some(ip.to_string())),
+                |ip| listen_ip(ip, ENV_RDMA_LISTEN_IP, "the lane stays on the inline path"),
             ),
             rdma_slot_ttl_s: resolve(
                 config.rdma_slot_ttl_s.map(Some),
@@ -259,6 +260,20 @@ fn number<N: FromStr>(raw: &str, env_name: &str, consequence: &str) -> Option<N>
         warn!(value = %raw, "{env_name} is not a number; {consequence}");
     }
     parsed
+}
+
+/// An env listener address, read by the rule the validator applies to the
+/// flag ([`parse_listen_ip`]); one that is not an IP address is logged with
+/// its consequence and left unused, like a numeric value that is not a
+/// number.
+fn listen_ip(raw: &str, env_name: &str, consequence: &str) -> Option<Option<String>> {
+    match parse_listen_ip(raw) {
+        Ok(_) => Some(Some(raw.to_string())),
+        Err(_) => {
+            warn!(value = %raw, "{env_name} is not an IP address; {consequence}");
+            None
+        }
+    }
 }
 
 fn deprecated(env_name: &str, flag_name: &str) {
@@ -497,6 +512,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(settings, MultimodalSettings::default());
+    }
+
+    /// The env listener address keeps the lenient reading of the other env
+    /// knobs: one that is not an IP address is left unused (the lane stays
+    /// inline) where the flag's value is refused at validation; a readable
+    /// one is kept trimmed, as a flag value is.
+    #[test]
+    fn an_env_listen_ip_that_is_not_an_address_falls_back() {
+        let settings = MultimodalSettings::resolve_with(
+            &RouterConfig::default(),
+            env(&[("SMG_RDMA_LISTEN_IP", "999.1.1.1")]),
+        )
+        .unwrap();
+        assert_eq!(settings.rdma_listen_ip, Setting::from_default(None));
+
+        let settings = MultimodalSettings::resolve_with(
+            &RouterConfig::default(),
+            env(&[("SMG_RDMA_LISTEN_IP", " fd00::1 ")]),
+        )
+        .unwrap();
+        assert_eq!(
+            settings.rdma_listen_ip,
+            from_env(Some("fd00::1".to_string()))
+        );
+
+        let config = RouterConfig {
+            rdma_listen_ip: Some(" 10.0.0.7 ".to_string()),
+            ..RouterConfig::default()
+        };
+        let settings = MultimodalSettings::resolve_with(&config, no_env).unwrap();
+        assert_eq!(settings.rdma_listen_ip, flag(Some("10.0.0.7".to_string())));
     }
 
     /// The three env switches read one set of spellings: `1`, `true`, `yes`

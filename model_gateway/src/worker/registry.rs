@@ -262,6 +262,16 @@ struct HashRingTestHooks {
     after_snapshot: Option<(test_mpsc::Sender<()>, test_mpsc::Receiver<()>)>,
 }
 
+/// Pauses the next status transition after whatever its caller did outside
+/// the worker's mutation lock and before the lock is taken: the transition
+/// reports in, then waits to be let go. The interleaving proofs place
+/// another writer's transition in that window.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TransitionTestHooks {
+    before_lock: Option<(test_mpsc::Sender<()>, test_mpsc::Receiver<()>)>,
+}
+
 /// Worker registry with model-based indexing
 #[derive(Debug)]
 pub struct WorkerRegistry {
@@ -320,6 +330,9 @@ pub struct WorkerRegistry {
 
     #[cfg(test)]
     hash_ring_test_hooks: parking_lot::Mutex<HashRingTestHooks>,
+
+    #[cfg(test)]
+    transition_test_hooks: parking_lot::Mutex<TransitionTestHooks>,
 
     /// Workers indexed by worker type
     type_workers: Arc<DashMap<WorkerType, Vec<WorkerId>>>,
@@ -407,6 +420,8 @@ impl WorkerRegistry {
             hash_ring_update: parking_lot::Mutex::new(()),
             #[cfg(test)]
             hash_ring_test_hooks: parking_lot::Mutex::new(HashRingTestHooks::default()),
+            #[cfg(test)]
+            transition_test_hooks: parking_lot::Mutex::new(TransitionTestHooks::default()),
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
@@ -1217,6 +1232,47 @@ impl WorkerRegistry {
     // Manual publish at each call site is intentional — there are only a
     // handful of mutation methods, and the simplicity beats a generic
     // helper layer.
+    //
+    // Status. A registered worker's status is written under the worker's
+    // mutation lock by two primitives. `transition_under_lock` is the one
+    // transition: it looks the worker up, checks the revision when the
+    // caller names one, writes a status that differs from the current one,
+    // runs `on_status_changed` and publishes `StatusChanged`, so no two
+    // writers interleave and no subscriber sees one worker's events out of
+    // order. `demote_before_removal` is the one other write, the removal's
+    // silent NotReady over Ready, a step of `remove_inner` under the same
+    // lock; it publishes nothing. The registry has no opinion on which
+    // edges are legal: the callers own the rules (the registry enforces
+    // none). A rule that depends on the worker's current status is decided
+    // in the primitive's closure, under the lock, so the status it reads is
+    // the one the write lands on; decided outside, another writer's status
+    // landing between the read and the write was written over (a probe's
+    // `Failed` by the mesh hint's `Ready`, a probe's `NotReady` by the drain
+    // step's `Draining`). A writer whose target does not depend on the
+    // current status names it outright. This table is the whole set of
+    // them:
+    //
+    //   writer                     edge(s)                          through
+    //   health probes              Pending/NotReady/Failed -> Ready `apply_if_revision`
+    //   (WorkerManager)            Pending/NotReady -> Failed       (decided under the lock)
+    //                              Ready -> NotReady
+    //   connect signal             any -> Ready                     `transition_status_if_revision`
+    //   (WorkerManager)
+    //   mesh health hint           Pending/NotReady -> Ready        `transition_under_lock`
+    //   (`on_remote_worker_state`) Ready -> NotReady                (decided under the lock)
+    //   drain step                 Ready -> Draining                `apply_if_revision`
+    //   (removal workflow)                                          (decided under the lock)
+    //   activation step            not Ready -> Ready               `transition_status`
+    //   (registration workflow)
+    //   property update that       any -> Ready                     `transition_status`
+    //   turns health checks off
+    //   removal (`remove_inner`)   Ready -> NotReady, no event      `demote_before_removal`
+    //
+    // Two status writes are not transitions and stay outside: a mesh
+    // import's status is set at its construction, before registration, and
+    // the activation step writes directly to a worker the registry no
+    // longer holds. The revision-checked writers discard an outcome that
+    // lost a race with a same-URL `replace()`.
     // ───────────────────────────────────────────────────────────────────
 
     /// Register a new worker (create-only).
@@ -1541,9 +1597,13 @@ impl WorkerRegistry {
     /// and optionally emit a `StatusChanged` event under the same lock.
     ///
     /// Used by `WorkerManager` so counter mutation and revision-checked
-    /// status transitions cannot race a same-URL `replace()`. The closure
-    /// returns `(result, Option<new_status>)`; a transition is emitted
-    /// only when the candidate status differs from the current one.
+    /// status transitions cannot race a same-URL `replace()`, and by the
+    /// drain step, whose Ready check is the closure's. The closure returns
+    /// `(result, Option<new_status>)`; a transition is emitted only when
+    /// the candidate status differs from the current one. A caller whose
+    /// target depends on the current status reads it in the closure: that
+    /// read is under the lock, so no other writer lands between it and the
+    /// write.
     ///
     /// Returns `None` when the worker is gone or the revision no longer
     /// matches. Otherwise returns `Some((result, transition))` where
@@ -1562,15 +1622,51 @@ impl WorkerRegistry {
     where
         F: FnOnce(&Arc<dyn Worker>) -> (T, Option<WorkerStatus>),
     {
+        self.transition_under_lock(worker_id, Some(expected_revision), f)
+    }
+
+    /// The one place a registered worker's status transitions. Under the
+    /// worker's mutation lock: the worker is looked up (gone -> `None`), its
+    /// revision checked when the caller names one (moved on -> `None`), `f`
+    /// runs with the worker and answers a result and the status it wants;
+    /// a status that differs from the current one is written, followed by
+    /// [`Self::on_status_changed`] and one `StatusChanged` event, all before
+    /// the lock is released. Returns the result and the transition, if any.
+    /// A caller whose target depends on the current status reads it in
+    /// `f`, under the lock, never before the call: a status read outside
+    /// the lock may be gone by the time the write lands.
+    /// The removal's [`Self::demote_before_removal`] is the only other
+    /// status write on a registered worker; it publishes nothing.
+    fn transition_under_lock<T, F>(
+        &self,
+        worker_id: &WorkerId,
+        expected_revision: Option<u64>,
+        f: F,
+    ) -> Option<(T, Option<(WorkerStatus, WorkerStatus)>)>
+    where
+        F: FnOnce(&Arc<dyn Worker>) -> (T, Option<WorkerStatus>),
+    {
         let lock = self
             .worker_mutation_locks
             .entry(worker_id.clone())
             .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
             .clone();
+
+        #[cfg(test)]
+        {
+            let pause = self.transition_test_hooks.lock().before_lock.take();
+            if let Some((reached, resume)) = pause {
+                reached.send(()).expect("transition observer is listening");
+                resume
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("test releases the paused transition");
+            }
+        }
+
         let _guard = lock.lock();
 
         let worker = self.workers.get(worker_id)?.clone();
-        if worker.revision() != expected_revision {
+        if expected_revision.is_some_and(|revision| worker.revision() != revision) {
             return None;
         }
 
@@ -1592,6 +1688,18 @@ impl WorkerRegistry {
         };
 
         Some((result, transition))
+    }
+
+    /// The removal's demotion, under the worker's mutation lock in
+    /// `remove_inner`: a Ready worker about to leave `self.workers` is made
+    /// ineligible first, so routing snapshots that still hold it see it so
+    /// by the time the removal becomes visible. No event: the `Removed`
+    /// event that follows is the one subscribers act on, and a
+    /// `StatusChanged` beside it would be a second notice of the same exit.
+    fn demote_before_removal(worker: &Arc<dyn Worker>) {
+        if worker.status() == WorkerStatus::Ready {
+            worker.set_status(WorkerStatus::NotReady);
+        }
     }
 
     // ───────────────────────────────────────────────────────────────────
@@ -1689,9 +1797,7 @@ impl WorkerRegistry {
             let worker = Arc::clone(entry.value());
             drop(entry);
             self.set_worker_overloaded(&worker, false);
-            if worker.status() == WorkerStatus::Ready {
-                worker.set_status(WorkerStatus::NotReady);
-            }
+            Self::demote_before_removal(&worker);
         }
 
         // The membership-order read guard keeps the rebuild scan from
@@ -2375,10 +2481,10 @@ impl WorkerRegistry {
         })
     }
 
-    /// What goes with a status change besides the status. Shared by
-    /// [`Self::transition_status_inner`] (connect signals, admin paths) and
-    /// [`Self::apply_if_revision`] (the health probes), so a worker comes
-    /// back the same way whichever of the two promoted it.
+    /// What goes with a status change besides the status. Run by
+    /// [`Self::transition_under_lock`] for every write, so a worker comes
+    /// back the same way whichever path promoted it (a connect signal, an
+    /// admin path, a health probe).
     fn on_status_changed(worker: &Arc<dyn Worker>, new_status: WorkerStatus) {
         if new_status != WorkerStatus::Ready {
             return;
@@ -2401,42 +2507,50 @@ impl WorkerRegistry {
     }
 
     /// Shared backend for [`Self::transition_status`] and
-    /// [`Self::transition_status_if_revision`]. Holds the per-worker
-    /// mutation lock for the full read-modify-emit sequence.
+    /// [`Self::transition_status_if_revision`]: the write of
+    /// [`Self::transition_under_lock`] with a fixed target status.
     fn transition_status_inner(
         &self,
         worker_id: &WorkerId,
         expected_revision: Option<u64>,
         new_status: WorkerStatus,
     ) -> Option<(WorkerStatus, WorkerStatus)> {
-        let lock = self
-            .worker_mutation_locks
-            .entry(worker_id.clone())
-            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
-            .clone();
-        let _guard = lock.lock();
+        self.transition_under_lock(worker_id, expected_revision, |_| ((), Some(new_status)))?
+            .1
+    }
+}
 
-        let worker = self.workers.get(worker_id)?.clone();
-        if expected_revision.is_some_and(|revision| worker.revision() != revision) {
-            return None;
-        }
+#[cfg(test)]
+impl WorkerRegistry {
+    /// Test support for the interleaving proofs. Runs `transition` on its
+    /// own thread and pauses it at the next status transition's seam: after
+    /// whatever the caller did outside the worker's mutation lock, before
+    /// the lock is taken. `other_write` then runs on this thread (another
+    /// writer's transition, through the registry, so it lands under the
+    /// lock), after which `transition` is let go and its result returned.
+    /// No sleep determines the ordering.
+    pub(crate) fn with_another_write_before_the_lock<R: Send>(
+        &self,
+        transition: impl FnOnce(&WorkerRegistry) -> R + Send,
+        other_write: impl FnOnce(&WorkerRegistry),
+    ) -> R {
+        use std::time::Duration;
 
-        let old_status = worker.status();
-        if old_status == new_status {
-            return None;
-        }
+        let (reached_tx, reached_rx) = test_mpsc::channel();
+        let (resume_tx, resume_rx) = test_mpsc::channel();
+        self.transition_test_hooks.lock().before_lock = Some((reached_tx, resume_rx));
 
-        worker.set_status(new_status);
-        Self::on_status_changed(&worker, new_status);
-
-        let _ = self.event_tx.send(WorkerEvent::StatusChanged {
-            worker_id: worker_id.clone(),
-            worker: worker.clone(),
-            old_status,
-            new_status,
-        });
-
-        Some((old_status, new_status))
+        std::thread::scope(|scope| {
+            let paused = scope.spawn(|| transition(self));
+            reached_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the transition reaches the lock");
+            other_write(self);
+            resume_tx
+                .send(())
+                .expect("the paused transition is waiting");
+            paused.join().expect("the transition did not panic")
+        })
     }
 }
 
@@ -2493,15 +2607,32 @@ impl WorkerRegistry {
                 );
                 return;
             }
-            if let Some(existing) = self.get(&existing_id) {
-                let status = existing.status();
-                if state.health {
-                    if matches!(status, WorkerStatus::Pending | WorkerStatus::NotReady) {
-                        self.transition_status(&existing_id, WorkerStatus::Ready);
-                    }
-                } else if status == WorkerStatus::Ready {
-                    self.transition_status(&existing_id, WorkerStatus::NotReady);
+            // The status is read and the write decided under the worker's
+            // mutation lock, in one step with the write: decided outside
+            // it, a probe's `Failed` (or the drain step's `Draining`)
+            // landing between the read and the write was written over
+            // with the hint's `Ready` (or `NotReady`). The origin is read
+            // again under the lock: a local registration claiming the URL
+            // in between (`register_or_replace`) replaces the worker and
+            // promotes its origin under this same lock, and the hint must
+            // not write the replacement's status either. A worker that is
+            // gone by the time the lock is taken (`None`) is imported anew
+            // below, as before.
+            let health = state.health;
+            let outcome = self.transition_under_lock(&existing_id, None, |existing| {
+                if self.origin_of(&existing_id) == Some(WorkerOrigin::Local) {
+                    return ((), None);
                 }
+                let target = match (health, existing.status()) {
+                    (true, WorkerStatus::Pending | WorkerStatus::NotReady) => {
+                        Some(WorkerStatus::Ready)
+                    }
+                    (false, WorkerStatus::Ready) => Some(WorkerStatus::NotReady),
+                    _ => None,
+                };
+                ((), target)
+            });
+            if outcome.is_some() {
                 tracing::debug!(
                     url = %state.url,
                     healthy = state.health,
@@ -3218,6 +3349,138 @@ mod tests {
             registry.get_by_url("http://remote:8080").unwrap().status(),
             WorkerStatus::Ready
         );
+    }
+
+    /// One mesh health hint against one status written in between. The
+    /// import is registered healthy or not (`imported_healthy`), the hint
+    /// says `hint_health`, and `written_between` lands through the registry
+    /// after the hint looked at the import and before it writes. The hint
+    /// reads the status and decides under the worker's mutation lock, in
+    /// one step with its write, so the status written in between stands
+    /// and the only event is its own.
+    fn mesh_hint_keeps_the_status_written_in_between(
+        hint_health: bool,
+        imported_healthy: bool,
+        written_between: WorkerStatus,
+    ) {
+        let url = "http://remote:8080";
+        let registry = WorkerRegistry::new();
+        registry.on_remote_worker_state(&remote_state("peer-w1", url, imported_healthy, vec![]));
+        let worker = registry.get_by_url(url).expect("imported");
+        let worker_id = registry.get_id_by_url(url).expect("imported");
+        let found = worker.status();
+        assert_eq!(
+            found,
+            if imported_healthy {
+                WorkerStatus::Ready
+            } else {
+                WorkerStatus::NotReady
+            }
+        );
+        let revision = worker.revision();
+        let mut rx = registry.subscribe_events();
+
+        let hint = remote_state("peer-w1", url, hint_health, vec![]);
+        registry.with_another_write_before_the_lock(
+            |registry| registry.on_remote_worker_state(&hint),
+            |registry| {
+                let ((), transition) = registry
+                    .apply_if_revision(&worker_id, revision, |_| ((), Some(written_between)))
+                    .expect("the import is there and current");
+                assert_eq!(transition, Some((found, written_between)));
+            },
+        );
+
+        assert_eq!(
+            worker.status(),
+            written_between,
+            "the status written in between stands"
+        );
+        match rx.try_recv() {
+            Ok(WorkerEvent::StatusChanged {
+                old_status,
+                new_status,
+                ..
+            }) => assert_eq!(
+                (old_status, new_status),
+                (found, written_between),
+                "the in-between write's event"
+            ),
+            other => panic!("expected the in-between write's StatusChanged, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "the hint published nothing");
+    }
+
+    /// A `health=true` hint that found a mesh import NotReady does not write
+    /// `Ready` over the `Failed` a probe reached in between, and publishes
+    /// nothing. Decided outside the lock, the hint wrote `Failed -> Ready`
+    /// here: a probe-failed import came back into rotation on a stale hint.
+    #[test]
+    fn mesh_hint_keeps_a_probe_failure_written_between_its_read_and_its_write() {
+        mesh_hint_keeps_the_status_written_in_between(true, false, WorkerStatus::Failed);
+    }
+
+    /// A `health=false` hint that found a mesh import Ready does not write
+    /// `NotReady` over the `Draining` the drain step wrote in between, and
+    /// publishes nothing. Decided outside the lock, the hint wrote
+    /// `Draining -> NotReady` here.
+    #[test]
+    fn mesh_hint_keeps_a_drain_written_between_its_read_and_its_write() {
+        mesh_hint_keeps_the_status_written_in_between(false, true, WorkerStatus::Draining);
+    }
+
+    /// A `health=true` hint that found a mesh import `NotReady` does not
+    /// write `Ready` over the local worker a `register_or_replace` installed
+    /// at the URL in between: the claim replaces the worker under the same
+    /// mutation lock and promotes its origin to `Local`, which the hint reads
+    /// again under the lock and stands down. Checked before the lock alone,
+    /// the hint promoted a locally-owned worker no local probe had passed.
+    #[test]
+    fn mesh_hint_stands_down_for_a_local_claim_landed_between_its_read_and_its_write() {
+        let url = "http://remote:8080";
+        let registry = WorkerRegistry::new();
+        registry.on_remote_worker_state(&remote_state("peer-w1", url, false, vec![]));
+        let worker_id = registry.get_id_by_url(url).expect("imported");
+        assert_eq!(registry.origin_of(&worker_id), Some(WorkerOrigin::Mesh));
+        let mut rx = registry.subscribe_events();
+
+        let hint = remote_state("peer-w1", url, true, vec![]);
+        // The status the claim leaves the local worker with: not `Ready`
+        // (its own prober promotes it), so the hint would promote it if it
+        // still looked.
+        let after_claim = std::cell::Cell::new(None);
+        registry.with_another_write_before_the_lock(
+            |registry| registry.on_remote_worker_state(&hint),
+            |registry| {
+                let local: Arc<dyn Worker> = Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .worker_type(WorkerType::Regular)
+                        .build(),
+                );
+                assert_eq!(
+                    registry.register_or_replace(local),
+                    worker_id,
+                    "the claim keeps the URL's id"
+                );
+                assert_eq!(registry.origin_of(&worker_id), Some(WorkerOrigin::Local));
+                let status = registry.get_by_url(url).expect("the local worker").status();
+                assert_ne!(status, WorkerStatus::Ready, "the local prober promotes it");
+                after_claim.set(Some(status));
+            },
+        );
+
+        assert_eq!(registry.origin_of(&worker_id), Some(WorkerOrigin::Local));
+        assert_eq!(
+            Some(registry.get_by_url(url).expect("the local worker").status()),
+            after_claim.get(),
+            "the hint did not promote the locally-owned worker"
+        );
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(event, WorkerEvent::StatusChanged { .. }),
+                "the hint published nothing; the events are the claim's own: {event:?}"
+            );
+        }
     }
 
     #[test]
@@ -3956,6 +4219,180 @@ mod tests {
                 assert_eq!(new_status, WorkerStatus::Draining);
             }
             other => panic!("expected StatusChanged, got {other:?}"),
+        }
+    }
+
+    /// The primitives section's transition table, walked through the one
+    /// write. Whichever public path carries it (`transition_status`, the
+    /// revision-checked `transition_status_if_revision`, a probe's
+    /// `apply_if_revision`), an edge between two different statuses lands
+    /// as one status write and one `StatusChanged` naming it, for every
+    /// pair of statuses: the registry has no opinion on which edges a
+    /// writer may take. The same status again is no write and no event. A
+    /// stale revision or a worker that is gone is no write and no event,
+    /// and a stale probe's closure does not run. The removal's demotion
+    /// writes NotReady over Ready, nothing over any other status, and
+    /// publishes nothing beside `Removed`.
+    #[test]
+    fn every_status_edge_lands_as_one_write_and_one_event_through_any_path() {
+        use WorkerStatus::{Draining, Failed, NotReady, Pending, Ready};
+        const STATUSES: [WorkerStatus; 5] = [Pending, Ready, NotReady, Failed, Draining];
+
+        #[derive(Clone, Copy, Debug)]
+        enum Path {
+            Plain,
+            IfRevision,
+            Probe,
+        }
+
+        fn fresh() -> (
+            WorkerRegistry,
+            broadcast::Receiver<WorkerEvent>,
+            Arc<dyn Worker>,
+            WorkerId,
+        ) {
+            let registry = WorkerRegistry::new();
+            let mut rx = registry.subscribe_events();
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new("http://w1:8080")
+                    .worker_type(WorkerType::Regular)
+                    .health_config(no_health_check())
+                    .build(),
+            );
+            let worker_id = registry.register(worker.clone()).unwrap();
+            assert!(matches!(rx.try_recv(), Ok(WorkerEvent::Registered { .. })));
+            (registry, rx, worker, worker_id)
+        }
+
+        fn write(
+            registry: &WorkerRegistry,
+            path: Path,
+            worker_id: &WorkerId,
+            revision: u64,
+            to: WorkerStatus,
+        ) -> Option<(WorkerStatus, WorkerStatus)> {
+            match path {
+                Path::Plain => registry.transition_status(worker_id, to),
+                Path::IfRevision => registry.transition_status_if_revision(worker_id, revision, to),
+                Path::Probe => {
+                    let (tag, transition) = registry
+                        .apply_if_revision(worker_id, revision, |_| ("probe", Some(to)))
+                        .expect("the worker is there and current");
+                    assert_eq!(tag, "probe", "the probe's own result comes back");
+                    transition
+                }
+            }
+        }
+
+        // Every edge, through every path.
+        for path in [Path::Plain, Path::IfRevision, Path::Probe] {
+            for from in STATUSES {
+                for to in STATUSES {
+                    let (registry, mut rx, worker, worker_id) = fresh();
+                    worker.set_status(from);
+                    let case = format!("{path:?} {from:?} -> {to:?}");
+
+                    let transition = write(&registry, path, &worker_id, worker.revision(), to);
+
+                    assert_eq!(worker.status(), to, "{case}: the status is written");
+                    if from == to {
+                        assert_eq!(transition, None, "{case}: the same status is no transition");
+                        assert!(rx.try_recv().is_err(), "{case}: and no event");
+                        continue;
+                    }
+                    assert_eq!(transition, Some((from, to)), "{case}");
+                    match rx.try_recv() {
+                        Ok(WorkerEvent::StatusChanged {
+                            worker_id: id,
+                            old_status,
+                            new_status,
+                            ..
+                        }) => {
+                            assert_eq!(id, worker_id, "{case}");
+                            assert_eq!(
+                                (old_status, new_status),
+                                (from, to),
+                                "{case}: the event names the edge"
+                            );
+                        }
+                        other => panic!("{case}: expected one StatusChanged, got {other:?}"),
+                    }
+                    assert!(rx.try_recv().is_err(), "{case}: exactly one event");
+                }
+            }
+        }
+
+        // A probe that declines to move the status: its result, no write, no
+        // event.
+        {
+            let (registry, mut rx, worker, worker_id) = fresh();
+            let before = worker.status();
+            let outcome = registry.apply_if_revision(&worker_id, worker.revision(), |_| (7, None));
+            assert_eq!(outcome, Some((7, None)));
+            assert_eq!(worker.status(), before);
+            assert!(rx.try_recv().is_err());
+        }
+
+        // A stale revision: no write, no event, and the probe's closure does
+        // not run.
+        {
+            let (registry, mut rx, worker, worker_id) = fresh();
+            let before = worker.status();
+            let stale = worker.revision().wrapping_add(1);
+            assert_eq!(
+                registry.transition_status_if_revision(&worker_id, stale, Failed),
+                None
+            );
+            let ran = std::cell::Cell::new(false);
+            let outcome = registry.apply_if_revision(&worker_id, stale, |_| {
+                ran.set(true);
+                ((), Some(Failed))
+            });
+            assert_eq!(outcome, None);
+            assert!(!ran.get(), "a stale probe's closure does not run");
+            assert_eq!(worker.status(), before, "no write");
+            assert!(rx.try_recv().is_err(), "no event");
+        }
+
+        // A worker that is gone: no write, no event, through any path.
+        {
+            let (registry, mut rx, worker, worker_id) = fresh();
+            let revision = worker.revision();
+            assert!(registry.remove(&worker_id).is_some());
+            assert!(matches!(rx.try_recv(), Ok(WorkerEvent::Removed { .. })));
+            assert_eq!(registry.transition_status(&worker_id, Failed), None);
+            assert_eq!(
+                registry.transition_status_if_revision(&worker_id, revision, Failed),
+                None
+            );
+            assert_eq!(
+                registry.apply_if_revision(&worker_id, revision, |_| ((), Some(Failed))),
+                None
+            );
+            assert!(rx.try_recv().is_err(), "a worker that is gone: no event");
+        }
+
+        // The removal's demotion: Ready becomes NotReady on the way out, any
+        // other status stays, and the only event is `Removed`.
+        for from in STATUSES {
+            let (registry, mut rx, worker, worker_id) = fresh();
+            worker.set_status(from);
+            let removed = registry.remove(&worker_id).expect("registered");
+            assert!(Arc::ptr_eq(&removed, &worker));
+            let after = if from == Ready { NotReady } else { from };
+            assert_eq!(
+                worker.status(),
+                after,
+                "removal from {from:?}: Ready alone is demoted"
+            );
+            match rx.try_recv() {
+                Ok(WorkerEvent::Removed { worker_id: id, .. }) => assert_eq!(id, worker_id),
+                other => panic!("removal from {from:?}: expected Removed alone, got {other:?}"),
+            }
+            assert!(
+                rx.try_recv().is_err(),
+                "removal from {from:?}: no StatusChanged beside Removed"
+            );
         }
     }
 

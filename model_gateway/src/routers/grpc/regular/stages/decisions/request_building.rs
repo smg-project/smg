@@ -9,8 +9,8 @@ use crate::routers::{
         client::GrpcClient,
         common::stages::{helpers, BuildStage},
         context::{
-            AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, ExecutionPlanKind,
-            PreparationOutput, RequestContext,
+            stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan,
+            ExecutionPlanKind, PreparationOutput, RequestContext,
         },
         proto_wrapper::ProtoGenerateRequest,
         spec::{DecisionQuestionSpec, DecisionsResponseSpec, ResponseSpec},
@@ -33,7 +33,10 @@ impl BuildStage for DecisionsRequestBuildingStage {
                 "Decisions scoring requires a regular SGLang gRPC worker",
             ));
         }
-        let Some(PreparationOutput::Decisions { items, scoring }) = ctx.state.preparation.take()
+        let PreparationOutput::Decisions { items, scoring } = stage_output(
+            ctx.state.preparation.take(),
+            "DecisionsRequestBuildingStage::build",
+        )?
         else {
             return Err(error::internal_error(
                 "preparation_not_completed",

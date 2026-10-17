@@ -4,8 +4,8 @@ use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use smg_mcp::McpConfig;
 
 use super::{
-    CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind, MemoryConfig,
+    AccessLogField, CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult,
+    DiscoveryConfig, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig,
     MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PolicyConfig, PostgresConfig,
     RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
     TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
@@ -205,6 +205,19 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// The admin listener's port; `None` keeps the control plane on the
+    /// data listener.
+    pub fn admin_port(mut self, admin_port: Option<u16>) -> Self {
+        self.config.admin_port = admin_port;
+        self
+    }
+
+    /// The admin listener's bind host; `None` binds it on the server host.
+    pub fn admin_host(mut self, admin_host: Option<String>) -> Self {
+        self.config.admin_host = admin_host;
+        self
+    }
+
     pub fn runtime_worker_threads(mut self, threads: Option<usize>) -> Self {
         self.config.runtime_worker_threads = threads;
         self
@@ -234,6 +247,13 @@ impl RouterConfigBuilder {
 
     pub fn idle_connection_timeout_secs(mut self, secs: u64) -> Self {
         self.config.idle_connection_timeout_secs = secs;
+        self
+    }
+
+    /// Most client connections the HTTP listener holds open at once; `0` is
+    /// no bound.
+    pub fn max_connections(mut self, max_connections: usize) -> Self {
+        self.config.max_connections = max_connections;
         self
     }
 
@@ -353,7 +373,9 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn kv_index(mut self, kind: KvIndexKind) -> Self {
+    /// Deprecated: the chain index is the only KV index; `chain` is accepted
+    /// and changes nothing, `positional` fails validation.
+    pub fn kv_index(mut self, kind: Option<String>) -> Self {
         self.config.kv_index = kind;
         self
     }
@@ -634,6 +656,12 @@ impl RouterConfigBuilder {
 
     pub fn log_level<S: Into<String>>(mut self, level: S) -> Self {
         self.config.log_level = Some(level.into());
+        self
+    }
+
+    /// The optional fields of the access-log record (none by default).
+    pub fn access_log_fields(mut self, fields: Vec<AccessLogField>) -> Self {
+        self.config.access_log_fields = fields;
         self
     }
 

@@ -8,12 +8,21 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use std::time::Duration;
+
+use criterion::{
+    criterion_group, criterion_main,
+    measurement::{Measurement, ValueFormatter},
+    BenchmarkGroup, BenchmarkId, Criterion, Throughput,
+};
 use image::{imageops::FilterType, DynamicImage, RgbImage};
-use llm_multimodal::vision::{
-    preprocessor_config::PreProcessorConfig,
-    processors::{Llama4VisionProcessor, Qwen2VLProcessor, Qwen3VLProcessor},
-    transforms, VisionPreProcessor,
+use llm_multimodal::{
+    encoder_inputs::EncoderDtype,
+    vision::{
+        preprocessor_config::PreProcessorConfig,
+        processors::{Llama4VisionProcessor, Qwen2VLProcessor, Qwen3VLProcessor},
+        transforms, VisionPreProcessor,
+    },
 };
 
 /// Create a synthetic RGB image with some variation (not all zeros).
@@ -282,7 +291,12 @@ criterion_group!(
     bench_to_rgb8,
     bench_resize_detailed,
 );
-criterion_main!(benches);
+criterion_group!(
+    name = wire_benches;
+    config = Criterion::default().with_measurement(CpuTime);
+    targets = bench_wire_write
+);
+criterion_main!(benches, wire_benches);
 
 fn bench_fused_to_tensor_normalize(c: &mut Criterion) {
     let sizes: &[(u32, u32)] = &[(640, 480), (1024, 768), (1920, 1080)];
@@ -362,6 +376,238 @@ fn bench_resize_detailed(c: &mut Criterion) {
                 b.iter(|| img.resize_exact(tw as u32, th as u32, FilterType::Triangle));
             },
         );
+    }
+    group.finish();
+}
+
+// ── The wire write: two passes against one ───────────────────────
+
+/// The process's CPU time as the measurement of the wire groups. On a loaded
+/// host the wall clock counts the other tenants' slices of the core; the CPU
+/// clock counts this process's work alone, on every thread it ran on (the
+/// preprocessing pool's included), which is also the cost the gateway pays
+/// per image. Pinned to one core it is the wall time of the work.
+struct CpuTime;
+
+fn process_cpu_time() -> Duration {
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::ProcessCPUTime);
+    Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
+}
+
+impl Measurement for CpuTime {
+    type Intermediate = Duration;
+    type Value = Duration;
+
+    fn start(&self) -> Duration {
+        process_cpu_time()
+    }
+
+    fn end(&self, start: Duration) -> Duration {
+        process_cpu_time().saturating_sub(start)
+    }
+
+    fn add(&self, v1: &Duration, v2: &Duration) -> Duration {
+        *v1 + *v2
+    }
+
+    fn zero(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    fn to_f64(&self, value: &Duration) -> f64 {
+        value.as_nanos() as f64
+    }
+
+    fn formatter(&self) -> &dyn ValueFormatter {
+        &CpuTimeFormatter
+    }
+}
+
+/// Nanoseconds of CPU time in the unit of their magnitude.
+struct CpuTimeFormatter;
+
+impl ValueFormatter for CpuTimeFormatter {
+    fn scale_values(&self, typical: f64, values: &mut [f64]) -> &'static str {
+        let (factor, unit) = if typical < 1e3 {
+            (1.0, "cpu-ns")
+        } else if typical < 1e6 {
+            (1e-3, "cpu-µs")
+        } else if typical < 1e9 {
+            (1e-6, "cpu-ms")
+        } else {
+            (1e-9, "cpu-s")
+        };
+        for value in values {
+            *value *= factor;
+        }
+        unit
+    }
+
+    fn scale_throughputs(
+        &self,
+        typical: f64,
+        throughput: &Throughput,
+        values: &mut [f64],
+    ) -> &'static str {
+        // Bytes (or elements) per CPU-second, scaled by the typical rate.
+        let (count, what) = match *throughput {
+            Throughput::Bytes(bytes) | Throughput::BytesDecimal(bytes) => (bytes as f64, "B"),
+            Throughput::Bits(bits) => (bits as f64, "bit"),
+            Throughput::Elements(elements) | Throughput::ElementsAndBytes { elements, .. } => {
+                (elements as f64, "elem")
+            }
+        };
+        let per_second = count * 1e9 / typical;
+        let (factor, unit) = match (per_second, what) {
+            (rate, "B") if rate >= 1e9 => (1e-9, "GB/cpu-s"),
+            (rate, "B") if rate >= 1e6 => (1e-6, "MB/cpu-s"),
+            (_, "B") => (1e-3, "KB/cpu-s"),
+            (rate, "bit") if rate >= 1e9 => (1e-9, "Gbit/cpu-s"),
+            (rate, "bit") if rate >= 1e6 => (1e-6, "Mbit/cpu-s"),
+            (_, "bit") => (1e-3, "Kbit/cpu-s"),
+            (rate, _) if rate >= 1e9 => (1e-9, "Gelem/cpu-s"),
+            (rate, _) if rate >= 1e6 => (1e-6, "Melem/cpu-s"),
+            (_, _) => (1e-3, "Kelem/cpu-s"),
+        };
+        for value in values {
+            *value = count * 1e9 / *value * factor;
+        }
+        unit
+    }
+
+    fn scale_for_machines(&self, _values: &mut [f64]) -> &'static str {
+        "cpu-ns"
+    }
+}
+
+/// The wire dtypes the arms are measured in: the half-width float the
+/// vector formula writes, the single, and (on the classes the table below
+/// marks) the half the tables write.
+const WIRE_DTYPES: [EncoderDtype; 2] = [EncoderDtype::BFloat16, EncoderDtype::Float32];
+
+/// One image class through both arms, per wire dtype: the two passes
+/// (`preprocess` to the patch bytes, then the write in the wire's dtype, as
+/// assembly performs it) and the one pass (`preprocess_wire`). Both arms end
+/// with the owned wire bytes; the bytes are the same.
+fn bench_wire_arms<P: VisionPreProcessor>(
+    group: &mut BenchmarkGroup<'_, CpuTime>,
+    processor: &P,
+    config: &PreProcessorConfig,
+    class: &str,
+    images: &[DynamicImage],
+    with_float16: bool,
+) {
+    let mut dtypes = WIRE_DTYPES.to_vec();
+    if with_float16 {
+        dtypes.push(EncoderDtype::Float16);
+    }
+    for dtype in dtypes {
+        let short = match dtype {
+            EncoderDtype::BFloat16 => "bf16",
+            EncoderDtype::Float16 => "f16",
+            EncoderDtype::Float32 => "f32",
+            EncoderDtype::Uint8 => "u8",
+        };
+        group.bench_with_input(
+            BenchmarkId::new(format!("two_pass_{short}"), class),
+            images,
+            |b, imgs| {
+                b.iter(|| {
+                    processor
+                        .preprocess(imgs, config)
+                        .unwrap()
+                        .encoder_input
+                        .into_bytes_as(dtype)
+                        .unwrap()
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new(format!("one_pass_{short}"), class),
+            images,
+            |b, imgs| {
+                b.iter(|| {
+                    processor
+                        .preprocess_wire(imgs, config, dtype)
+                        .expect("the pixel-byte processors write wires")
+                        .unwrap()
+                        .encoder_input
+                        .into_bytes_as(dtype)
+                        .unwrap()
+                });
+            },
+        );
+    }
+}
+
+/// The class label of a source size: the size alone when the size rule
+/// leaves it (the arms then differ by the patch layout and the write alone),
+/// else the size and its target (a resize in both arms first, as most
+/// images have).
+fn wire_class(w: u32, h: u32, target: (usize, usize)) -> String {
+    let (th, tw) = target;
+    if (tw as u32, th as u32) == (w, h) {
+        format!("{w}x{h}")
+    } else {
+        format!("{w}x{h}-to-{tw}x{th}")
+    }
+}
+
+/// The processors that emit pixel bytes write the wire in two passes or in
+/// one; this group is the speed of each per image class and wire dtype on
+/// the sizes of the groups above (the plain sizes, the extremes) and the
+/// sizes just off a target that resize to it.
+fn bench_wire_write(c: &mut Criterion<CpuTime>) {
+    let config = PreProcessorConfig::from_json(
+        r#"{"do_resize": true, "size": {"shortest_edge": 3136, "longest_edge": 12845056}}"#,
+    )
+    .unwrap();
+
+    let qwen3 = Qwen3VLProcessor::new();
+    // (width, height, measured in float16 too)
+    let qwen3_classes: &[(u32, u32, bool)] = &[
+        (320, 256, false),
+        (640, 480, true),
+        (648, 486, false),
+        (1280, 960, true),
+        (1296, 972, false),
+        (1920, 1080, false),
+        (3840, 2160, false),
+        (32, 32, false),
+        (100, 2000, false),
+        (2000, 100, false),
+        (4096, 4096, false),
+    ];
+    let mut group = c.benchmark_group("qwen3_vl_wire");
+    group
+        .sample_size(20)
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(2));
+    for &(w, h, with_float16) in qwen3_classes {
+        let target = qwen3.smart_resize(h as usize, w as usize).unwrap();
+        let class = wire_class(w, h, target);
+        let images = [make_test_image(w, h)];
+        bench_wire_arms(&mut group, &qwen3, &config, &class, &images, with_float16);
+    }
+    group.finish();
+
+    let qwen2 = Qwen2VLProcessor::new();
+    let qwen2_classes: &[(u32, u32, bool)] = &[
+        (644, 476, true),
+        (640, 480, false),
+        (1288, 952, false),
+        (1920, 1080, false),
+    ];
+    let mut group = c.benchmark_group("qwen2_vl_wire");
+    group
+        .sample_size(20)
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(2));
+    for &(w, h, with_float16) in qwen2_classes {
+        let target = qwen2.smart_resize(h as usize, w as usize).unwrap();
+        let class = wire_class(w, h, target);
+        let images = [make_test_image(w, h)];
+        bench_wire_arms(&mut group, &qwen2, &config, &class, &images, with_float16);
     }
     group.finish();
 }

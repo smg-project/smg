@@ -1,6 +1,6 @@
 //! Common helper functions shared across stages
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use axum::response::Response;
 use engine_zmq_adapter::stops::encode_single_token_stops;
@@ -11,23 +11,31 @@ use smg_grpc_client::{
     sglang_proto::{self, DisaggregatedParams},
     tokenspeed_proto, vllm_proto,
 };
-use tool_parser::ParserFactory as ToolParserFactory;
+use tool_parser::{GrammarStart, ParserFactory as ToolParserFactory};
 use tracing::{debug, error, warn};
 
 use super::pd_protocol::{DpPlacement, PdProtocol, PdRendezvous};
 use crate::{
     middleware::{RequestId, TenantRequestMeta},
-    rate_limit::{ReservationAttachment, SharedReservationHandle},
     routers::{
         error,
         grpc::{
-            context::{AttemptStamp, ExecutionPlan, LoadGuards, RequestType, WorkerSelection},
-            proto_wrapper::ProtoGenerateRequest,
+            backend_client::BackendClient,
+            context::{
+                stage_output, AttemptStamp, ClientSelection, ExecutionPlan, RequestContext,
+                RequestType, WorkerSelection,
+            },
+            multimodal::{
+                assemble_media_refs, assemble_multimodal_data,
+                assemble_multimodal_data_after_encode, assembly_error_response,
+                reserve_multimodal_inflight,
+            },
+            proto_wrapper::{MultimodalData, ProtoGenerateRequest},
             utils,
         },
     },
     worker::{
-        sampling_defaults::SamplingDefaults, AttachedBody, Worker, DEFAULT_BOOTSTRAP_PORT,
+        sampling_defaults::SamplingDefaults, Worker, DEFAULT_BOOTSTRAP_PORT,
         DEFAULT_SAMPLING_PARAMS_LABEL,
     },
 };
@@ -100,28 +108,6 @@ impl SamplingDefaultsMask {
 
     fn any(self) -> bool {
         self.temperature || self.top_p || self.top_k || self.min_p || self.repetition_penalty
-    }
-}
-
-/// Attach load guards and/or a rate-limit reservation to a streaming
-/// response body so each survives (and, for the reservation, resolves via
-/// `ReservationAttachment`'s `Drop`) exactly as long as the body does,
-/// regardless of how the client disconnects. A no-op returning `response`
-/// unchanged when both are `None`.
-pub(crate) fn attach_response_guards(
-    response: Response,
-    guards: Option<LoadGuards>,
-    reservation: Option<Arc<SharedReservationHandle>>,
-) -> Response {
-    match (guards, reservation) {
-        (Some(guards), Some(handle)) => {
-            AttachedBody::wrap_response(response, (guards, ReservationAttachment::new(handle)))
-        }
-        (Some(guards), None) => AttachedBody::wrap_response(response, guards),
-        (None, Some(handle)) => {
-            AttachedBody::wrap_response(response, ReservationAttachment::new(handle))
-        }
-        (None, None) => response,
     }
 }
 
@@ -390,18 +376,38 @@ impl SamplingBaseline {
     }
 }
 
-/// A forced tool call's constraint as preparation built it, with the name of
-/// the tool parser that shapes it. Request building gives the first attempt's
-/// worker the shape its engine needs (`utils::tool_constraints_for_worker`);
-/// a retry gives the worker it selects the same treatment from this unshaped
-/// form, since a tag already shaped for one engine cannot be shaped for
-/// another.
+/// A structural tag the table derives for where a worker's engine starts the
+/// grammar (`regular::symphony::AutoTag`): the attempt stamp asks it for the
+/// worker each retry takes, as request building asked it for the first.
+pub(crate) trait TagForStart: fmt::Debug + Send + Sync {
+    /// The tag for an engine whose grammar starts at `start`, or `None` where
+    /// the table gives that engine no tag.
+    fn tag_for(&self, start: GrammarStart) -> Result<Option<String>, String>;
+}
+
+/// A request's tool constraint as each attempt's worker must take it. Request
+/// building gives the first attempt's worker the shape its engine needs; a
+/// retry gives the worker it selects the same treatment, since a tag already
+/// shaped for one engine cannot be shaped for another: the registry's tags
+/// from the unshaped form preparation produced, the table's from what derives
+/// them for a start.
 #[derive(Clone, Debug)]
-pub(crate) struct ToolConstraintStamp {
-    /// The `(kind, value)` pair preparation produced, before any worker shaped it.
-    constraint: (String, String),
-    /// The configured tool parser the shaping reads its reasoning prefix from.
-    parser: Option<String>,
+pub(crate) enum ToolConstraintStamp {
+    /// A forced tool call's constraint as preparation built it, with the name
+    /// of the tool parser that shapes it (`utils::tool_constraints_for_worker`).
+    Registry {
+        /// The `(kind, value)` pair preparation produced, before any worker shaped it.
+        constraint: (String, String),
+        /// The configured tool parser the shaping reads its reasoning prefix from.
+        parser: Option<String>,
+    },
+    /// The table's `auto` tag the selected worker's policy chose, shaped for
+    /// where that worker's engine starts the grammar; the retry's worker gets
+    /// it derived again for its own start, or no tag where the table gives
+    /// its engine none. Captured only where the first worker got a tag: a
+    /// plan built without one carries no stamp, so a retry's worker the table
+    /// would give one goes without it too.
+    Table(Arc<dyn TagForStart>),
 }
 
 impl ToolConstraintStamp {
@@ -417,27 +423,34 @@ impl ToolConstraintStamp {
     ) -> Option<Self> {
         let constraint = unshaped.filter(|(kind, _)| kind == "structural_tag")?;
         request.structural_tag()?;
-        Some(Self {
+        Some(Self::Registry {
             constraint,
             parser: parser.map(str::to_string),
         })
     }
 
+    /// Capture the stamp for a built request that carries the table's `auto`
+    /// tag, with what derives the tag for a worker's start. Nothing is
+    /// captured when the backend's builder let the request's `response_format`
+    /// outrank the tag, as for [`Self::capture`].
+    pub(crate) fn capture_table(
+        tag: Arc<dyn TagForStart>,
+        request: &ProtoGenerateRequest,
+    ) -> Option<Self> {
+        request.structural_tag()?;
+        Some(Self::Table(tag))
+    }
+
     /// Write the constraint, shaped for `workers`, over the request's
-    /// structural tag.
+    /// structural tag; a table's tag the retry's worker gets none of leaves
+    /// the request unconstrained, as a first attempt on that worker would be.
     fn restamp(
         &self,
         request: &mut ProtoGenerateRequest,
         workers: &WorkerSelection,
         tool_parser_factory: &ToolParserFactory,
     ) -> Result<(), Response> {
-        let shaped = utils::tool_constraints_for_worker(
-            tool_parser_factory,
-            self.parser.as_deref(),
-            Some(self.constraint.clone()),
-            Some(workers),
-        )
-        .map_err(|e| {
+        let failed = |e: String| {
             error!(
                 function = "restamp_plan_for_attempt",
                 error = %e,
@@ -447,9 +460,27 @@ impl ToolConstraintStamp {
                 "invalid_tool_constraint",
                 format!("Invalid tool constraint: {e}"),
             )
-        })?;
-        if let Some((_, tag)) = shaped {
-            request.set_structural_tag(tag);
+        };
+        match self {
+            Self::Registry { constraint, parser } => {
+                let shaped = utils::tool_constraints_for_worker(
+                    tool_parser_factory,
+                    parser.as_deref(),
+                    Some(constraint.clone()),
+                    Some(workers),
+                )
+                .map_err(failed)?;
+                if let Some((_, tag)) = shaped {
+                    request.set_structural_tag(tag);
+                }
+            }
+            Self::Table(tag) => {
+                let start = utils::WorkerDecoding::of(Some(workers)).start;
+                match tag.tag_for(start).map_err(failed)? {
+                    Some(tag) => request.restore_structural_tag(tag),
+                    None => request.clear_structural_tag(),
+                }
+            }
         }
         Ok(())
     }
@@ -457,9 +488,9 @@ impl ToolConstraintStamp {
 
 /// Re-stamp the retained plan for a retry attempt's newly selected workers:
 /// fresh engine ids per [`IdStamp`], the new worker's sampling defaults
-/// (re-applied over the build-time baseline), a forced tool call's
-/// constraint in the shape the new worker's engine needs
-/// ([`ToolConstraintStamp`]), and fresh PD bootstrap/rendezvous rooms. EPD
+/// (re-applied over the build-time baseline), the tool constraint in the
+/// shape the new worker's engine needs ([`ToolConstraintStamp`]), and fresh
+/// PD bootstrap/rendezvous rooms. EPD
 /// encode bootstrap info is deliberately untouched — those rooms are the
 /// rendezvous with encode jobs the first dispatch already launched.
 pub(crate) fn restamp_plan_for_attempt(
@@ -816,6 +847,103 @@ pub(crate) fn maybe_inject_pd_rendezvous(
     if protocol.rendezvous == PdRendezvous::KvBootstrapRoom {
         inject_kv_bootstrap_room(request, prefill, protocol.dp_placement);
     }
+}
+
+/// The client that builds the request, from the clients a stage acquired, or
+/// the failure a stage reports when that stage has not run.
+fn builder_client<'a>(
+    clients: Option<&'a ClientSelection>,
+    function: &'static str,
+) -> Result<&'a BackendClient, Response> {
+    stage_output(clients, function).map(ClientSelection::builder)
+}
+
+/// The request's media, assembled for the engine that builds the request now
+/// that the worker is known: `None` for a request without media; otherwise
+/// the intermediate is taken (the prefill serialization needs it here), the
+/// pixel-drop assembly runs when an encode stage did, the plain one else, a
+/// failure is answered as the media error it is, and the request's share of
+/// the in-flight media budget is reserved for the inline bytes. The builder is
+/// resolved here rather than passed in, so a caller's borrow of the clients
+/// does not pin the whole context across the call.
+pub(crate) async fn assemble_prompt_media(
+    ctx: &mut RequestContext,
+    function: &'static str,
+) -> Result<Option<MultimodalData>, Response> {
+    let Some(intermediate) = ctx.state.multimodal_intermediate.take() else {
+        return Ok(None);
+    };
+    let builder = builder_client(ctx.state.clients.as_ref(), function)?;
+    // `encode_outputs` set by EncodeStage selects the pixel-drop assembly path.
+    let assembled = if ctx.state.encode_outputs.is_some() {
+        assemble_multimodal_data_after_encode(intermediate, builder, ctx.state.workers.as_ref())
+            .await
+    } else {
+        assemble_multimodal_data(intermediate, builder, ctx.state.workers.as_ref()).await
+    };
+    let data = assembled.map_err(|e| {
+        error!(function = function, error = %e, "Failed to assemble multimodal request");
+        assembly_error_response(&e)
+    })?;
+    ctx.state.multimodal_inflight = reserve_multimodal_inflight(
+        ctx.components
+            .multimodal
+            .as_ref()
+            .and_then(|multimodal| multimodal.inflight.as_deref()),
+        data.inline_bytes(),
+    )
+    .await?;
+    Ok(Some(data))
+}
+
+/// What a built generate request gets before it is planned, in the order the
+/// dispatch needs: the string `stop`s its engine cannot match resolved by the
+/// client, which reports the router's residual trim obligations; the PD
+/// metadata when the stage injects it; an EPD request's per-item encode
+/// bootstrap info (the dispatch plan stays on `encode_outputs` for request
+/// execution to take); the prefill->decode KV rendezvous for the backends
+/// that carry it in the request; and, for worker-side multimodal processing,
+/// the media references now that the wire is known. The last two land before
+/// the disaggregated dispatch clones the request, so both legs carry them.
+pub(crate) fn finish_generate_request(
+    ctx: &mut RequestContext,
+    proto_request: &mut ProtoGenerateRequest,
+    inject_pd_metadata: bool,
+    function: &'static str,
+) -> Result<(), Response> {
+    let builder = builder_client(ctx.state.clients.as_ref(), function)?;
+    ctx.state.response.router_stop_obligations =
+        builder.finalize_generate_request(proto_request, ctx.tokenizer_arc().as_ref());
+
+    if inject_pd_metadata {
+        if let Some(workers) = ctx.state.workers.as_ref() {
+            maybe_inject_pd_metadata(proto_request, workers);
+        }
+    }
+
+    if let Some(outputs) = ctx.state.encode_outputs.as_mut() {
+        proto_request.set_encode_bootstrap_info(std::mem::take(&mut outputs.bootstrap_info));
+    }
+
+    if let Some(workers) = ctx.state.workers.as_ref() {
+        maybe_inject_pd_rendezvous(proto_request, workers);
+    }
+
+    if let Some(plan) = ctx.state.multimodal_refs.take() {
+        if builder.is_zmq() {
+            return Err(error::bad_request(
+                "multimodal_not_supported",
+                "media references require a gRPC vLLM worker",
+            ));
+        }
+        let refs =
+            assemble_media_refs(plan).map_err(|e| error::bad_request(e.code(), e.to_string()))?;
+        proto_request
+            .set_vllm_media_refs(refs)
+            .map_err(|e| error::bad_request("multimodal_not_supported", e))?;
+        ctx.state.media_refs_forwarded = true;
+    }
+    Ok(())
 }
 
 /// Inject the KV bootstrap host/port/room into a generate request.
@@ -1684,6 +1812,7 @@ mod tool_constraint_restamp_tests {
 
         request.set_structural_tag("{}".to_string());
         assert_eq!(request.structural_tag(), None);
+        request.clear_structural_tag();
         let ProtoGenerateRequest::Sglang(req) = &request else {
             panic!("the request was built for SGLang");
         };
@@ -1693,6 +1822,100 @@ mod tool_constraint_restamp_tests {
                 schema
             ))
         );
+    }
+
+    /// A table's `auto` tag as a test derives it per start: the shape for an
+    /// engine starting after its reasoning parser, another for one starting
+    /// at the first token, and none for an engine that does not say.
+    #[derive(Debug)]
+    struct TableTag;
+
+    impl TagForStart for TableTag {
+        fn tag_for(&self, start: GrammarStart) -> Result<Option<String>, String> {
+            Ok(match start {
+                GrammarStart::AfterReasoning => Some(BARE_TABLE_TAG.to_string()),
+                GrammarStart::FirstToken => Some(THOUGHT_TABLE_TAG.to_string()),
+                GrammarStart::Unknown => None,
+            })
+        }
+    }
+
+    const BARE_TABLE_TAG: &str = r#"{"format":{"type":"const_string","value":"<call>"}}"#;
+    const THOUGHT_TABLE_TAG: &str = r#"{"format":{"type":"sequence","elements":[{"type":"tag","begin":"","content":{"type":"any_text","excludes":[]},"end":"</think>"},{"type":"const_string","value":"<call>"}]}}"#;
+
+    /// The table's `auto` tag, shaped at build for the selected worker's
+    /// start, reaches a retry's worker derived again for that worker's own
+    /// start: the other shape on an engine that starts the grammar elsewhere,
+    /// and no tag at all, the request left unconstrained, on a worker whose
+    /// engine the table gives none. On every backend that carries a
+    /// structural tag; a backend whose builder let the request's
+    /// `response_format` outrank the tag captures nothing.
+    #[test]
+    fn retry_derives_the_tables_auto_tag_for_its_own_workers_start() {
+        let factory = ToolParserFactory::new();
+        let after_reasoning = worker(&[("constrained_decoding_start", "after_reasoning")]);
+        let first_token = worker(&[("constrained_decoding_start", "first_token")]);
+        let silent = worker(&[]);
+        let tag: Arc<dyn TagForStart> = Arc::new(TableTag);
+
+        for (backend, request) in requests_with_tag(BARE_TABLE_TAG) {
+            let stamp = AttemptStamp {
+                id: IdStamp::Exact,
+                sampling_mask: None,
+                sampling_baseline: None,
+                inject_pd_metadata: false,
+                tool_constraint: ToolConstraintStamp::capture_table(Arc::clone(&tag), &request),
+            };
+            assert!(
+                matches!(stamp.tool_constraint, Some(ToolConstraintStamp::Table(_))),
+                "{backend}: the built request carries the table's tag"
+            );
+            let mut plan = ExecutionPlan::generate(ExecutionPlanKind::Single, request);
+
+            restamp_plan_for_attempt(&mut plan, &stamp, &first_token, &factory).unwrap();
+            assert_eq!(
+                plan_tag(&plan),
+                THOUGHT_TABLE_TAG,
+                "{backend}: a retry on an engine that starts the grammar at the first token"
+            );
+
+            restamp_plan_for_attempt(&mut plan, &stamp, &after_reasoning, &factory).unwrap();
+            assert_eq!(
+                plan_tag(&plan),
+                BARE_TABLE_TAG,
+                "{backend}: a retry back on an engine that starts it after the reasoning"
+            );
+
+            restamp_plan_for_attempt(&mut plan, &stamp, &silent, &factory).unwrap();
+            let ExecutionPlan::Single(ProtoRequest::Generate(request)) = &plan else {
+                panic!("expected a single generate plan");
+            };
+            assert_eq!(
+                request.structural_tag(),
+                None,
+                "{backend}: a worker the table gives no tag goes unconstrained"
+            );
+
+            // And back: the tag returns on the next worker the table shapes one for.
+            restamp_plan_for_attempt(&mut plan, &stamp, &after_reasoning, &factory).unwrap();
+            assert_eq!(
+                plan_tag(&plan),
+                BARE_TABLE_TAG,
+                "{backend}: a retry after an unconstrained attempt takes the tag again"
+            );
+        }
+
+        let schema = r#"{"type":"object"}"#.to_string();
+        let outranked = ProtoGenerateRequest::Sglang(Box::new(sglang_proto::GenerateRequest {
+            sampling_params: Some(sglang_proto::SamplingParams {
+                constraint: Some(sglang_proto::sampling_params::Constraint::JsonSchema(
+                    schema,
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        assert!(ToolConstraintStamp::capture_table(tag, &outranked).is_none());
     }
 }
 
@@ -1812,5 +2035,138 @@ mod wire_prompt_text_tests {
             wire_prompt_text("<|user|><|image|>describe".to_string(), true),
             "<|user|><|image|>describe"
         );
+    }
+}
+
+#[cfg(test)]
+mod shared_pieces_tests {
+    use std::sync::Arc;
+
+    use llm_multimodal::MediaContentPart;
+    use llm_tokenizer::TokenizerRegistry;
+    use openai_protocol::generate::GenerateRequest;
+    use smg_grpc_client::VllmEngineClient;
+    use tokio::task::JoinHandle;
+
+    use super::*;
+    use crate::{
+        routers::grpc::{
+            client::GrpcClient, context::SharedComponents, multimodal::MediaPlan,
+            regular::symphony::template::Templates, test_engine::mock_engine,
+        },
+        worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, WorkerRegistry, WorkerType},
+    };
+
+    /// A request context after worker selection and client acquisition: one
+    /// selected worker, a builder client on the mock engine, and the media
+    /// references of worker-side processing waiting to be attached.
+    async fn context_with_media_refs() -> (RequestContext, JoinHandle<()>) {
+        let (url, server) = mock_engine("test-model").await;
+        let client = VllmEngineClient::connect(&url)
+            .await
+            .expect("connect mock worker");
+        let components = Arc::new(SharedComponents {
+            templates: Arc::new(Templates::new(Arc::new(TokenizerRegistry::new()))),
+            tokenizer_registry: Arc::new(TokenizerRegistry::new()),
+            worker_registry: Arc::new(WorkerRegistry::new()),
+            tool_parser_factory: Default::default(),
+            reasoning_parser_factory: Default::default(),
+            parser_resolver: utils::ParserResolver::disabled(),
+            multimodal: None,
+            tokenizer_autoload: true,
+            tokenizer_load_failures: Arc::default(),
+            parser: crate::config::ParserChoice::Legacy,
+        });
+        let request: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "text": "Hello"
+        }))
+        .expect("a generate request");
+        let mut ctx = RequestContext::for_generate(
+            Arc::new(request),
+            None,
+            "test-model".to_string(),
+            components,
+        );
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url.replace("http://", "grpc://"))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .model(ModelCard::new("test-model"))
+                .build(),
+        );
+        ctx.state.workers = Some(WorkerSelection::Single { worker });
+        ctx.state.clients = Some(ClientSelection::Single {
+            client: BackendClient::Grpc(GrpcClient::Vllm(client)),
+        });
+        ctx.state.multimodal_refs = Some(MediaPlan::new([MediaContentPart::ImageUrl {
+            url: "data:image/png;base64,AAAA".to_string(),
+            detail: None,
+            uuid: None,
+            max_long_side_pixel: None,
+        }]));
+        (ctx, server)
+    }
+
+    /// The media references are attached by the finishing every request
+    /// builder shares, once: the request built first carries them and the
+    /// context records the forwarding; the plan is taken, so a request
+    /// finished after it carries none.
+    #[tokio::test]
+    async fn finishing_attaches_the_media_references_once() {
+        let (mut ctx, server) = context_with_media_refs().await;
+
+        let mut request = ProtoGenerateRequest::Vllm(Box::default());
+        finish_generate_request(&mut ctx, &mut request, false, "a_builder").expect("finished");
+        assert!(
+            request.has_vllm_media_refs(),
+            "the first request carries the references"
+        );
+        assert!(ctx.state.media_refs_forwarded);
+        assert!(ctx.state.multimodal_refs.is_none(), "the plan is taken");
+
+        let mut again = ProtoGenerateRequest::Vllm(Box::default());
+        finish_generate_request(&mut ctx, &mut again, false, "a_builder").expect("finished");
+        assert!(!again.has_vllm_media_refs(), "attached once");
+        server.abort();
+    }
+
+    /// A request whose preparation left no multimodal intermediate assembles
+    /// nothing: the helper answers before it needs the builder client or the
+    /// budget behind it, so it answers the same with the clients taken away.
+    /// (The media references the fixture carries are worker-side work for the
+    /// finishing, not an intermediate.)
+    #[tokio::test]
+    async fn without_an_intermediate_nothing_is_assembled() {
+        let (mut ctx, server) = context_with_media_refs().await;
+        ctx.state.clients = None;
+        let assembled = assemble_prompt_media(&mut ctx, "a_builder")
+            .await
+            .expect("assembled");
+        assert!(assembled.is_none());
+        server.abort();
+    }
+
+    /// Before the clients are acquired, the finishing answers the one failure
+    /// of a missing client selection, a 500 under its code.
+    #[tokio::test]
+    async fn without_acquired_clients_the_finishing_reports_the_missing_stage() {
+        let (mut ctx, server) = context_with_media_refs().await;
+        ctx.state.clients = None;
+        let mut request = ProtoGenerateRequest::Vllm(Box::default());
+        let failure = match finish_generate_request(&mut ctx, &mut request, false, "a_builder") {
+            Ok(()) => panic!("finished without clients"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(failure.into_body(), usize::MAX)
+            .await
+            .expect("drain body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+        assert_eq!(
+            body["error"]["code"], "client_acquisition_not_completed",
+            "{body}"
+        );
+        server.abort();
     }
 }

@@ -46,7 +46,7 @@ from tokenspeed.runtime.pd.kv_events import KVEventBatch
 
 from smg_grpc_servicer.kv_events import endpoint_for_rank, stream_kv_events
 from smg_grpc_servicer.mm_rdma import RdmaPixelPuller
-from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
+from smg_grpc_servicer.tokenizer_bundle import build_tokenizer_zip, tokenizer_chunks
 from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
@@ -443,12 +443,25 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         tic = time.time()
 
         async def _drive_probe() -> bool:
+            # Held so the finally can close it, as Generate holds its own: the
+            # return at the first output leaves the engine's iterator suspended
+            # at that yield, and the close runs the engine's exit now, in the
+            # probe's own task, not in asyncio's generator finalizer later.
+            engine_outputs = self.async_llm.generate_request(probe)
             try:
-                async for _ in self.async_llm.generate_request(probe):
+                async for _ in engine_outputs:
                     return True
             except Exception as e:  # noqa: BLE001 — the probe is best-effort.
                 logger.warning("Health probe failed: %s", e)
                 return False
+            finally:
+                # Best-effort like the probe itself: an error the engine's exit
+                # raises is logged, not raised over the probe's verdict (an
+                # exception out of a finally would replace the return).
+                try:
+                    await engine_outputs.aclose()
+                except Exception as e:  # noqa: BLE001 — the probe is best-effort.
+                    logger.warning("Health probe close failed: %s", e)
             return False
 
         task = asyncio.create_task(_drive_probe())
@@ -1137,19 +1150,10 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
         zip_data = zip_buffer.getbuffer()
         sha256 = hashlib.sha256(zip_data).hexdigest()
-        total = len(zip_data)
-        logger.info("Streaming tokenizer bundle: %d bytes, sha256=%s", total, sha256)
+        logger.info("Streaming tokenizer bundle: %d bytes, sha256=%s", len(zip_data), sha256)
 
-        # Stream chunks; SHA-256 rides only on the final chunk.
-        offset = 0
-        while offset < total:
-            end = min(offset + CHUNK_SIZE, total)
-            is_last = end == total
-            yield common_pb2.GetTokenizerChunk(
-                data=bytes(zip_data[offset:end]),
-                sha256=sha256 if is_last else "",
-            )
-            offset = end
+        for chunk in tokenizer_chunks(zip_data, sha256):
+            yield chunk
 
     # ------------------------------------------------------------------
     # Helpers

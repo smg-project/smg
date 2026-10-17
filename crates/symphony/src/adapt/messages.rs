@@ -293,7 +293,12 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::event::{DropReason, MalformedReason, Text};
+    use crate::{
+        event::{DropReason, MalformedReason, Text},
+        formats::qwen3,
+        ids::is_minted,
+        CallSyntax, Declared, Engine, EngineFinish, Events, Input, Parser,
+    };
 
     fn call(index: u32, name: &str) -> Event {
         Event::ToolCallStart {
@@ -907,5 +912,79 @@ mod tests {
         let folded = output(&events);
         assert_eq!(Value::Array(blocks), wire(&folded.content));
         assert_eq!(stop, folded.stop_reason);
+    }
+
+    /// The events of `output` read by the Qwen3 table through an engine of its own, as the gateway
+    /// reads each request.
+    fn parsed(output: &str) -> Vec<Event> {
+        let mut engine = Engine::new(qwen3(CallSyntax::Json), Declared::default());
+        let mut out = Events::new();
+        engine
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: output,
+                    spans: &[],
+                },
+                &mut out,
+            )
+            .expect("a delta");
+        engine
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("the end");
+        out.drain()
+    }
+
+    /// Two calls of Qwen3's syntax in one output.
+    const TWO_CALLS: &str = concat!(
+        "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>\n",
+        "<tool_call>\n{\"name\": \"get_time\", \"arguments\": {\"zone\": \"CET\"}}\n</tool_call>"
+    );
+
+    #[test]
+    fn two_turns_of_two_calls_carry_four_distinct_tool_use_ids_the_stream_and_the_fold_agree_on() {
+        // A client keeps its `tool_use` blocks and `tool_result`s by id across the conversation:
+        // no id of one turn may come back in the next, and the stream must name the block as the
+        // folded message does.
+        let mut seen: Vec<String> = Vec::new();
+        for turn in 0..2 {
+            let events = parsed(TWO_CALLS);
+            let folded: Vec<String> = wire(&output(&events).content)
+                .as_array()
+                .expect("blocks")
+                .iter()
+                .filter(|block| block["type"] == "tool_use")
+                .map(|block| block["id"].as_str().expect("an id").to_string())
+                .collect();
+            let (out, _) = stream(&events);
+            let streamed: Vec<String> = out
+                .iter()
+                .map(event_wire)
+                .filter(|event| event["content_block"]["type"] == "tool_use")
+                .map(|event| {
+                    event["content_block"]["id"]
+                        .as_str()
+                        .expect("an id")
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(folded.len(), 2, "turn {turn}: {folded:?}");
+            assert_eq!(streamed, folded, "turn {turn}");
+            for id in &folded {
+                let hex = id
+                    .strip_prefix("toolu_")
+                    .unwrap_or_else(|| panic!("turn {turn}: {id}"));
+                assert!(is_minted(&format!("call_{hex}")), "turn {turn}: {id}");
+            }
+            seen.extend(folded);
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 4, "{seen:?}");
     }
 }

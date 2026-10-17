@@ -39,6 +39,104 @@ struct StepTracker {
     waiting_until: HashMap<usize, std::time::Instant>,
 }
 
+/// What the scheduler reads off the tracker at the top of an iteration.
+struct ReadyScan {
+    /// Steps whose wait is over.
+    wait_ready: Vec<usize>,
+    /// Steps whose dependencies are satisfied, from the pending checks.
+    deps_ready: Vec<usize>,
+    total_processed: usize,
+    running: usize,
+    waiting: usize,
+}
+
+/// Phase 1: the steps ready to run or wait, and the counts the blocked verdict
+/// reads, under one read of the tracker.
+fn scan_ready<D: WorkflowData>(
+    t: &StepTracker,
+    definition: &WorkflowDefinition<D>,
+    pending_check: &mut VecDeque<usize>,
+) -> ReadyScan {
+    // O(w) iteration over waiting_until keys instead of O(n) over all steps
+    let wait_ready: Vec<usize> = t.get_ready_waiting_indices();
+
+    // Check pending_check for dependency-satisfied steps
+    let deps_ready: Vec<usize> = pending_check
+        .drain(..)
+        .filter(|&idx| {
+            let step = &definition.steps[idx];
+            t.is_step_processable(&step.id, idx)
+                && t.are_dependencies_satisfied(&step.depends_on)
+                && t.is_any_dependency_satisfied(&step.depends_on_any)
+                && !t.has_failed_dependency(&step.depends_on)
+                && !t.have_all_any_deps_failed(&step.depends_on_any)
+        })
+        .collect();
+
+    ReadyScan {
+        wait_ready,
+        deps_ready,
+        total_processed: t.total_processed(),
+        running: t.running.len(),
+        waiting: t.waiting_until.len(),
+    }
+}
+
+/// Take every completion the channel holds and put up for a check what each
+/// one unblocks. Whether anything came.
+fn drain_completions<D: WorkflowData>(
+    rx: &mut mpsc::Receiver<(StepId, StepResult)>,
+    definition: &WorkflowDefinition<D>,
+    pending_check: &mut VecDeque<usize>,
+    when: &'static str,
+) -> bool {
+    let mut drained = false;
+    while let Ok((step_id, result)) = rx.try_recv() {
+        drained = true;
+        tracing::debug!(
+            step_id = %step_id,
+            result = ?result,
+            when,
+            "Step completed"
+        );
+        enqueue_dependents(definition, &step_id, result, pending_check);
+    }
+    drained
+}
+
+/// A step that succeeded or was skipped puts its dependents up for a check; a
+/// failed one leaves them where they are. The one rule for a completion,
+/// whichever way it arrived.
+fn enqueue_dependents<D: WorkflowData>(
+    definition: &WorkflowDefinition<D>,
+    step_id: &StepId,
+    result: StepResult,
+    pending_check: &mut VecDeque<usize>,
+) {
+    if matches!(result, StepResult::Success | StepResult::Skip) {
+        for &dep_idx in definition.get_dependent_indices(step_id) {
+            pending_check.push_back(dep_idx);
+        }
+    }
+}
+
+/// How long until the soonest waiting step is ready; a short tick when every
+/// wait is already over.
+fn time_to_next_wait(t: &StepTracker) -> Duration {
+    let now = std::time::Instant::now();
+    t.waiting_until
+        .values()
+        .filter_map(|&ready_at| {
+            if ready_at > now {
+                Some(ready_at - now)
+            } else {
+                None
+            }
+        })
+        .min()
+        .unwrap_or(Duration::from_millis(10))
+}
+
 impl StepTracker {
     fn total_processed(&self) -> usize {
         self.completed.len() + self.failed.len() + self.skipped.len()
@@ -502,101 +600,15 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             }
 
             // Phase 0: Drain any pending completion signals to ensure dependents are added
-            while let Ok((step_id, result)) = rx.try_recv() {
-                tracing::debug!(
-                    step_id = %step_id,
-                    result = ?result,
-                    "Step completed (startup drain)"
-                );
-                if matches!(result, StepResult::Success | StepResult::Skip) {
-                    for &dep_idx in definition.get_dependent_indices(&step_id) {
-                        pending_check.push_back(dep_idx);
-                    }
-                }
-            }
+            drain_completions(&mut rx, &definition, &mut pending_check, "startup drain");
 
             // Phase 1: Check waiting steps + deps-ready steps + blocked detection
-            let (
-                newly_ready_from_wait,
-                deps_ready_indices,
-                total_processed,
-                current_running,
-                current_waiting,
-            ) = {
-                let t = tracker.read();
-
-                // O(w) iteration over waiting_until keys instead of O(n) over all steps
-                let wait_ready: Vec<usize> = t.get_ready_waiting_indices();
-
-                // Check pending_check for dependency-satisfied steps
-                let deps_ready: Vec<usize> = pending_check
-                    .drain(..)
-                    .filter(|&idx| {
-                        let step = &definition.steps[idx];
-                        t.is_step_processable(&step.id, idx)
-                            && t.are_dependencies_satisfied(&step.depends_on)
-                            && t.is_any_dependency_satisfied(&step.depends_on_any)
-                            && !t.has_failed_dependency(&step.depends_on)
-                            && !t.have_all_any_deps_failed(&step.depends_on_any)
-                    })
-                    .collect();
-
-                (
-                    wait_ready,
-                    deps_ready,
-                    t.total_processed(),
-                    t.running.len(),
-                    t.waiting_until.len(),
-                )
-            };
-
+            let scan = scan_ready(&tracker.read(), &definition, &mut pending_check);
             // Phase 2: Process waiting and deps-ready steps, update waiting_until
-            // Returns (ready_to_launch, steps_added_to_waiting)
-            let (ready_to_launch, steps_added_to_waiting) = {
-                let now = std::time::Instant::now();
-                let mut t = tracker.write();
-                let mut added_to_waiting = 0usize;
-
-                // Clear waiting status for ready steps
-                for &idx in &newly_ready_from_wait {
-                    t.clear_waiting(idx);
-                }
-
-                // Deduplicate: a depends_on_any step can appear once per satisfied
-                // dependency but must only launch once.
-                let mut seen = HashSet::new();
-                let mut ready: Vec<usize> = Vec::new();
-                for idx in newly_ready_from_wait {
-                    if seen.insert(idx) {
-                        ready.push(idx);
-                    }
-                }
-
-                for idx in deps_ready_indices {
-                    let step = &definition.steps[idx];
-                    let wait_duration = Self::calculate_wait_duration(step);
-
-                    if let Some(duration) = wait_duration {
-                        if duration > Duration::ZERO {
-                            // Step needs to wait - add to waiting_until
-                            let ready_at = now + duration;
-                            tracing::debug!(
-                                step_id = %step.id,
-                                wait_ms = duration.as_millis(),
-                                "Step waiting for delay/schedule"
-                            );
-                            t.set_waiting(idx, ready_at);
-                            added_to_waiting += 1;
-                            continue;
-                        }
-                    }
-                    if seen.insert(idx) {
-                        ready.push(idx);
-                    }
-                }
-
-                (ready, added_to_waiting)
-            };
+            let (ready_to_launch, steps_added_to_waiting) =
+                Self::schedule_ready(&mut tracker.write(), &definition, &scan);
+            let (total_processed, current_running, current_waiting) =
+                (scan.total_processed, scan.running, scan.waiting);
 
             if total_processed == step_count {
                 break;
@@ -617,46 +629,16 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 // added to `pending_check`. Re-drain before declaring deadlock;
                 // instant-completing steps (e.g. ZMQ connection detection) hit this
                 // window routinely.
-                let mut drained_completion = false;
-                while let Ok((step_id, result)) = rx.try_recv() {
-                    drained_completion = true;
-                    tracing::debug!(
-                        step_id = %step_id,
-                        result = ?result,
-                        "Step completed (deadlock-check drain)"
-                    );
-                    if matches!(result, StepResult::Success | StepResult::Skip) {
-                        for &dep_idx in definition.get_dependent_indices(&step_id) {
-                            pending_check.push_back(dep_idx);
-                        }
-                    }
-                }
-                if drained_completion {
+                if drain_completions(
+                    &mut rx,
+                    &definition,
+                    &mut pending_check,
+                    "deadlock-check drain",
+                ) {
                     continue;
                 }
 
-                let failed_step = tracker.read().failed.iter().next().cloned();
-                // Use &'static str to avoid allocation in common error paths
-                let error_message: &'static str = if failed_step.is_some() {
-                    "Workflow failed due to step dependency failure"
-                } else {
-                    "Workflow deadlocked: no steps ready and none running"
-                };
-
-                self.state_store
-                    .update(instance_id, |s| {
-                        s.status = WorkflowStatus::Failed;
-                    })
-                    .await?;
-                self.event_bus
-                    .publish(WorkflowEvent::WorkflowFailed {
-                        instance_id,
-                        failed_step: failed_step
-                            .unwrap_or_else(|| StepId::new("internal_scheduler")),
-                        error: error_message.to_string(),
-                    })
-                    .await;
-                return Ok(());
+                return self.fail_blocked(instance_id, &tracker).await;
             }
 
             let tasks_launched = ready_to_launch.len();
@@ -668,10 +650,8 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             }
 
             for step_idx in ready_to_launch {
-                let step = &definition.steps[step_idx];
                 let engine = self.clone_for_execution();
                 let def = Arc::clone(&definition);
-                let step_id = step.id.clone();
                 let tx = tx.clone();
                 let tracker = Arc::clone(&tracker);
 
@@ -680,147 +660,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     reason = "parallel step execution; results sent back via channel tx"
                 )]
                 tokio::spawn(async move {
-                    let step = &def.steps[step_idx];
-
-                    // Evaluate run_if condition if present
-                    if let Some(ref condition) = step.run_if {
-                        match engine.state_store.get_context(instance_id).await {
-                            Ok(ctx) => {
-                                if !condition(&ctx) {
-                                    // Condition is false - skip this step
-                                    tracing::debug!(
-                                        step_id = %step_id,
-                                        "Step skipped due to run_if condition"
-                                    );
-
-                                    // Remove from running and send the skip signal in one
-                                    // lock scope so the deadlock re-drain never sees
-                                    // running == 0 with the completion still unsent.
-                                    {
-                                        let mut t = tracker.write();
-                                        t.running.remove(&step_id);
-                                        t.skipped.insert(step_id.clone());
-                                        let _ = tx.try_send((step_id.clone(), StepResult::Skip));
-                                    }
-
-                                    // Update state store
-                                    let _ = engine
-                                        .state_store
-                                        .update(instance_id, |s| {
-                                            if let Some(step_state) =
-                                                s.step_states.get_mut(&step_id)
-                                            {
-                                                step_state.status = StepStatus::Skipped;
-                                            }
-                                        })
-                                        .await;
-                                    return;
-                                }
-                            }
-                            Err(e) => {
-                                // Failed to get context - fail the step rather than proceeding blindly
-                                tracing::error!(
-                                    step_id = %step_id,
-                                    error = ?e,
-                                    "Failed to get context for run_if evaluation, failing step"
-                                );
-
-                                // Remove from running and send the failure signal in one
-                                // lock scope so the deadlock re-drain never sees
-                                // running == 0 with the completion still unsent.
-                                {
-                                    let mut t = tracker.write();
-                                    t.running.remove(&step_id);
-                                    t.failed.insert(step_id.clone());
-                                    let _ = tx.try_send((step_id.clone(), StepResult::Failure));
-                                }
-
-                                // Update state store
-                                let _ = engine
-                                    .state_store
-                                    .update(instance_id, |s| {
-                                        if let Some(step_state) = s.step_states.get_mut(&step_id) {
-                                            step_state.status = StepStatus::Failed;
-                                            step_state.last_error =
-                                                Some(format!("run_if context error: {e}"));
-                                        }
-                                    })
-                                    .await;
-                                return;
-                            }
-                        }
-                    }
-
-                    let result = engine
-                        .execute_step_with_retry(instance_id, step, &def)
+                    engine
+                        .run_step(def, step_idx, instance_id, tx, tracker)
                         .await;
-
-                    // Track whether we need to update state to Skipped after releasing lock
-                    let needs_skip_update = {
-                        let mut t = tracker.write();
-                        t.running.remove(&step_id);
-
-                        let (sig, needs_update) = match result {
-                            Ok(StepResult::Success) => {
-                                t.completed.insert(step_id.clone());
-                                (StepResult::Success, false)
-                            }
-                            Ok(StepResult::Skip) => {
-                                t.skipped.insert(step_id.clone());
-                                (StepResult::Skip, false)
-                            }
-                            Ok(StepResult::Failure) | Err(_) => match step.on_failure {
-                                FailureAction::FailWorkflow | FailureAction::RetryIndefinitely => {
-                                    t.failed.insert(step_id.clone());
-                                    (StepResult::Failure, false)
-                                }
-                                FailureAction::ContinueNextStep => {
-                                    t.skipped.insert(step_id.clone());
-                                    // Signal as Skip so dependents get scheduled
-                                    (StepResult::Skip, true)
-                                }
-                            },
-                        };
-
-                        if let Err(e) = tx.try_send((step_id.clone(), sig)) {
-                            use mpsc::error::TrySendError;
-                            match e {
-                                TrySendError::Full(_) => {
-                                    tracing::error!(
-                                        step_id = %step_id,
-                                        "Channel full when sending step completion - this is a bug"
-                                    );
-                                }
-                                TrySendError::Closed(_) => {
-                                    tracing::debug!(
-                                        step_id = %step_id,
-                                        "Channel closed, workflow likely cancelled"
-                                    );
-                                }
-                            }
-                        }
-
-                        needs_update
-                    };
-
-                    // Perform async state update after releasing the tracker lock
-                    if needs_skip_update {
-                        if let Err(e) = engine
-                            .state_store
-                            .update(instance_id, |s| {
-                                if let Some(step_state) = s.step_states.get_mut(&step_id) {
-                                    step_state.status = StepStatus::Skipped;
-                                }
-                            })
-                            .await
-                        {
-                            tracing::warn!(
-                                step_id = %step_id,
-                                error = ?e,
-                                "Failed to update step state to Skipped"
-                            );
-                        }
-                    }
                 });
             }
 
@@ -839,33 +681,12 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                         result = ?result,
                         "Step completed"
                     );
-
-                    // Add dependents of completed step to pending_check (O(1) lookup)
-                    // Only if the step succeeded or was skipped (not failed)
-                    if matches!(result, StepResult::Success | StepResult::Skip) {
-                        for &dep_idx in definition.get_dependent_indices(&completed_step_id) {
-                            pending_check.push_back(dep_idx);
-                        }
-                    }
+                    enqueue_dependents(&definition, &completed_step_id, result, &mut pending_check);
                 }
             } else if has_waiting {
                 // No running tasks, but some steps are waiting for their delay/schedule
                 // Calculate how long to sleep based on the soonest waiting step
-                let sleep_duration = {
-                    let t = tracker.read();
-                    let now = std::time::Instant::now();
-                    t.waiting_until
-                        .values()
-                        .filter_map(|&ready_at| {
-                            if ready_at > now {
-                                Some(ready_at - now)
-                            } else {
-                                None
-                            }
-                        })
-                        .min()
-                        .unwrap_or(Duration::from_millis(10))
-                };
+                let sleep_duration = time_to_next_wait(&tracker.read());
 
                 // Sleep until the next step is ready (with a cap to allow cancellation checks)
                 let capped_sleep = sleep_duration.min(Duration::from_millis(100));
@@ -873,6 +694,252 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             }
         }
 
+        self.finish(instance_id, &tracker, start_time).await
+    }
+
+    /// The blocked verdict: no step ready, none running or waiting, work left.
+    /// A failed step is the cause when there is one, a deadlock otherwise.
+    async fn fail_blocked(
+        &self,
+        instance_id: WorkflowInstanceId,
+        tracker: &Arc<RwLock<StepTracker>>,
+    ) -> WorkflowResult<()> {
+        let failed_step = tracker.read().failed.iter().next().cloned();
+        // Use &'static str to avoid allocation in common error paths
+        let error_message: &'static str = if failed_step.is_some() {
+            "Workflow failed due to step dependency failure"
+        } else {
+            "Workflow deadlocked: no steps ready and none running"
+        };
+
+        self.state_store
+            .update(instance_id, |s| {
+                s.status = WorkflowStatus::Failed;
+            })
+            .await?;
+        self.event_bus
+            .publish(WorkflowEvent::WorkflowFailed {
+                instance_id,
+                failed_step: failed_step.unwrap_or_else(|| StepId::new("internal_scheduler")),
+                error: error_message.to_string(),
+            })
+            .await;
+        Ok(())
+    }
+
+    /// One launched step, on its own task: the `run_if` condition, the step
+    /// with its retries, and the completion into the tracker and the channel.
+    async fn run_step(
+        self,
+        def: Arc<WorkflowDefinition<D>>,
+        step_idx: usize,
+        instance_id: WorkflowInstanceId,
+        tx: mpsc::Sender<(StepId, StepResult)>,
+        tracker: Arc<RwLock<StepTracker>>,
+    ) {
+        let engine = self;
+        let step_id = def.steps[step_idx].id.clone();
+
+        let step = &def.steps[step_idx];
+
+        // Evaluate run_if condition if present
+        if let Some(ref condition) = step.run_if {
+            match engine.state_store.get_context(instance_id).await {
+                Ok(ctx) => {
+                    if !condition(&ctx) {
+                        // Condition is false - skip this step
+                        tracing::debug!(
+                            step_id = %step_id,
+                            "Step skipped due to run_if condition"
+                        );
+
+                        // Remove from running and send the skip signal in one
+                        // lock scope so the deadlock re-drain never sees
+                        // running == 0 with the completion still unsent.
+                        {
+                            let mut t = tracker.write();
+                            t.running.remove(&step_id);
+                            t.skipped.insert(step_id.clone());
+                            let _ = tx.try_send((step_id.clone(), StepResult::Skip));
+                        }
+
+                        // Update state store
+                        let _ = engine
+                            .state_store
+                            .update(instance_id, |s| {
+                                if let Some(step_state) = s.step_states.get_mut(&step_id) {
+                                    step_state.status = StepStatus::Skipped;
+                                }
+                            })
+                            .await;
+                        return;
+                    }
+                }
+                Err(e) => {
+                    // Failed to get context - fail the step rather than proceeding blindly
+                    tracing::error!(
+                        step_id = %step_id,
+                        error = ?e,
+                        "Failed to get context for run_if evaluation, failing step"
+                    );
+
+                    // Remove from running and send the failure signal in one
+                    // lock scope so the deadlock re-drain never sees
+                    // running == 0 with the completion still unsent.
+                    {
+                        let mut t = tracker.write();
+                        t.running.remove(&step_id);
+                        t.failed.insert(step_id.clone());
+                        let _ = tx.try_send((step_id.clone(), StepResult::Failure));
+                    }
+
+                    // Update state store
+                    let _ = engine
+                        .state_store
+                        .update(instance_id, |s| {
+                            if let Some(step_state) = s.step_states.get_mut(&step_id) {
+                                step_state.status = StepStatus::Failed;
+                                step_state.last_error = Some(format!("run_if context error: {e}"));
+                            }
+                        })
+                        .await;
+                    return;
+                }
+            }
+        }
+
+        let result = engine
+            .execute_step_with_retry(instance_id, step, &def)
+            .await;
+
+        // Track whether we need to update state to Skipped after releasing lock
+        let needs_skip_update = {
+            let mut t = tracker.write();
+            t.running.remove(&step_id);
+
+            let (sig, needs_update) = match result {
+                Ok(StepResult::Success) => {
+                    t.completed.insert(step_id.clone());
+                    (StepResult::Success, false)
+                }
+                Ok(StepResult::Skip) => {
+                    t.skipped.insert(step_id.clone());
+                    (StepResult::Skip, false)
+                }
+                Ok(StepResult::Failure) | Err(_) => match step.on_failure {
+                    FailureAction::FailWorkflow | FailureAction::RetryIndefinitely => {
+                        t.failed.insert(step_id.clone());
+                        (StepResult::Failure, false)
+                    }
+                    FailureAction::ContinueNextStep => {
+                        t.skipped.insert(step_id.clone());
+                        // Signal as Skip so dependents get scheduled
+                        (StepResult::Skip, true)
+                    }
+                },
+            };
+
+            if let Err(e) = tx.try_send((step_id.clone(), sig)) {
+                use mpsc::error::TrySendError;
+                match e {
+                    TrySendError::Full(_) => {
+                        tracing::error!(
+                            step_id = %step_id,
+                            "Channel full when sending step completion - this is a bug"
+                        );
+                    }
+                    TrySendError::Closed(_) => {
+                        tracing::debug!(
+                            step_id = %step_id,
+                            "Channel closed, workflow likely cancelled"
+                        );
+                    }
+                }
+            }
+
+            needs_update
+        };
+
+        // Perform async state update after releasing the tracker lock
+        if needs_skip_update {
+            if let Err(e) = engine
+                .state_store
+                .update(instance_id, |s| {
+                    if let Some(step_state) = s.step_states.get_mut(&step_id) {
+                        step_state.status = StepStatus::Skipped;
+                    }
+                })
+                .await
+            {
+                tracing::warn!(
+                    step_id = %step_id,
+                    error = ?e,
+                    "Failed to update step state to Skipped"
+                );
+            }
+        }
+    }
+
+    /// Phase 2: the steps that launch now, and how many went to wait for their
+    /// delay or schedule instead; a `depends_on_any` step appears once however
+    /// many of its dependencies were satisfied.
+    fn schedule_ready(
+        t: &mut StepTracker,
+        definition: &WorkflowDefinition<D>,
+        scan: &ReadyScan,
+    ) -> (Vec<usize>, usize) {
+        let now = std::time::Instant::now();
+        let mut added_to_waiting = 0usize;
+
+        // Clear waiting status for ready steps
+        for &idx in &scan.wait_ready {
+            t.clear_waiting(idx);
+        }
+
+        // Deduplicate: a depends_on_any step can appear once per satisfied
+        // dependency but must only launch once.
+        let mut seen = HashSet::new();
+        let mut ready: Vec<usize> = Vec::new();
+        for &idx in &scan.wait_ready {
+            if seen.insert(idx) {
+                ready.push(idx);
+            }
+        }
+
+        for &idx in &scan.deps_ready {
+            let step = &definition.steps[idx];
+            let wait_duration = Self::calculate_wait_duration(step);
+
+            if let Some(duration) = wait_duration {
+                if duration > Duration::ZERO {
+                    // Step needs to wait - add to waiting_until
+                    let ready_at = now + duration;
+                    tracing::debug!(
+                        step_id = %step.id,
+                        wait_ms = duration.as_millis(),
+                        "Step waiting for delay/schedule"
+                    );
+                    t.set_waiting(idx, ready_at);
+                    added_to_waiting += 1;
+                    continue;
+                }
+            }
+            if seen.insert(idx) {
+                ready.push(idx);
+            }
+        }
+
+        (ready, added_to_waiting)
+    }
+
+    /// The end of the workflow: failed when a step failed, completed otherwise,
+    /// each with its event.
+    async fn finish(
+        &self,
+        instance_id: WorkflowInstanceId,
+        tracker: &Arc<RwLock<StepTracker>>,
+        start_time: std::time::Instant,
+    ) -> WorkflowResult<()> {
         let failed_step = {
             let t = tracker.read();
             t.failed.iter().next().cloned()
@@ -1264,5 +1331,177 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> std::fmt::Debug for WorkflowEn
         f.debug_struct("WorkflowEngine")
             .field("definitions_count", &self.definitions.read().len())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    //! The scheduler's phases over a three-step definition: `a`, `b` after
+    //! `a`, and `c` after either of them.
+
+    use serde::{Deserialize, Serialize};
+
+    use super::*;
+    use crate::executor::StepExecutor;
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    struct Data;
+
+    impl WorkflowData for Data {
+        fn workflow_type() -> &'static str {
+            "scheduler-test"
+        }
+    }
+
+    struct Noop;
+
+    #[async_trait::async_trait]
+    impl StepExecutor<Data> for Noop {
+        async fn execute(
+            &self,
+            _context: &mut WorkflowContext<Data>,
+        ) -> WorkflowResult<StepResult> {
+            Ok(StepResult::Success)
+        }
+    }
+
+    fn step(id: &str) -> StepDefinition<Data> {
+        StepDefinition::new(id, id, Arc::new(Noop))
+    }
+
+    /// `a`; `b` after `a`; `c` after `a` or `b`; `c` delayed when `delay_c`.
+    fn three_steps(delay_c: Option<Duration>) -> WorkflowDefinition<Data> {
+        let mut c = step("c").depends_on_any(&["a", "b"]);
+        if let Some(delay) = delay_c {
+            c = c.with_delay(delay);
+        }
+        let mut definition = WorkflowDefinition::new("wf", "wf")
+            .add_step(step("a"))
+            .add_step(step("b").depends_on(&["a"]))
+            .add_step(c);
+        definition.validate().expect("a valid definition");
+        definition
+    }
+
+    #[test]
+    fn the_drain_puts_the_dependents_of_a_finished_step_up_for_a_check_and_says_whether_any_came() {
+        let definition = three_steps(None);
+        let (tx, mut rx) = mpsc::channel::<(StepId, StepResult)>(8);
+        let mut pending = VecDeque::new();
+
+        assert!(!drain_completions(&mut rx, &definition, &mut pending, "t"));
+        assert!(pending.is_empty());
+
+        tx.try_send((StepId::new("a"), StepResult::Success))
+            .unwrap();
+        assert!(drain_completions(&mut rx, &definition, &mut pending, "t"));
+        assert_eq!(
+            pending.iter().copied().collect::<Vec<_>>(),
+            [1, 2],
+            "b and c follow a"
+        );
+
+        pending.clear();
+        tx.try_send((StepId::new("b"), StepResult::Failure))
+            .unwrap();
+        tx.try_send((StepId::new("a"), StepResult::Skip)).unwrap();
+        assert!(drain_completions(&mut rx, &definition, &mut pending, "t"));
+        assert_eq!(
+            pending.iter().copied().collect::<Vec<_>>(),
+            [1, 2],
+            "a failed step's dependents are not put up; a skipped step's are"
+        );
+    }
+
+    #[test]
+    fn a_completion_puts_dependents_up_for_a_check_only_when_its_step_succeeded_or_was_skipped() {
+        let definition = three_steps(None);
+        let a = StepId::new("a");
+        let dependents_of_a: Vec<usize> = definition.get_dependent_indices(&a).to_vec();
+        assert!(
+            !dependents_of_a.is_empty(),
+            "the fixture gives `a` a dependent"
+        );
+
+        let mut pending = VecDeque::new();
+        enqueue_dependents(&definition, &a, StepResult::Failure, &mut pending);
+        assert!(pending.is_empty(), "a failed step unblocks nothing");
+
+        enqueue_dependents(&definition, &a, StepResult::Skip, &mut pending);
+        assert_eq!(Vec::from(pending.clone()), dependents_of_a);
+
+        pending.clear();
+        enqueue_dependents(&definition, &a, StepResult::Success, &mut pending);
+        assert_eq!(Vec::from(pending), dependents_of_a);
+    }
+
+    #[test]
+    fn the_scan_finds_the_steps_whose_dependencies_are_satisfied() {
+        let definition = three_steps(None);
+        let mut tracker = StepTracker::default();
+        tracker.completed.insert(StepId::new("a"));
+        let mut pending: VecDeque<usize> = [1, 2].into_iter().collect();
+
+        let scan = scan_ready(&tracker, &definition, &mut pending);
+        assert_eq!(scan.deps_ready, [1, 2], "b after a, c after any of a or b");
+        assert!(scan.wait_ready.is_empty());
+        assert_eq!(
+            (scan.total_processed, scan.running, scan.waiting),
+            (1, 0, 0)
+        );
+        assert!(pending.is_empty(), "the checks are consumed");
+    }
+
+    #[test]
+    fn scheduling_launches_an_any_step_once_and_defers_a_delayed_step_to_its_wait() {
+        let scan = |deps_ready: Vec<usize>| ReadyScan {
+            wait_ready: Vec::new(),
+            deps_ready,
+            total_processed: 1,
+            running: 0,
+            waiting: 0,
+        };
+        type Engine = WorkflowEngine<Data, InMemoryStore<Data>>;
+
+        // c satisfied twice (by a and by b) launches once.
+        let definition = three_steps(None);
+        let mut tracker = StepTracker::default();
+        let (ready, waiting) =
+            Engine::schedule_ready(&mut tracker, &definition, &scan(vec![1, 2, 2]));
+        assert_eq!((ready, waiting), (vec![1, 2], 0));
+
+        // A delayed c goes to wait instead, and a wait that is over launches.
+        let definition = three_steps(Some(Duration::from_secs(60)));
+        let mut tracker = StepTracker::default();
+        let (ready, waiting) = Engine::schedule_ready(&mut tracker, &definition, &scan(vec![1, 2]));
+        assert_eq!((ready, waiting), (vec![1], 1));
+        assert!(tracker.waiting_until.contains_key(&2));
+        let over = ReadyScan {
+            wait_ready: vec![2],
+            deps_ready: Vec::new(),
+            total_processed: 2,
+            running: 0,
+            waiting: 1,
+        };
+        let (ready, waiting) = Engine::schedule_ready(&mut tracker, &definition, &over);
+        assert_eq!((ready, waiting), (vec![2], 0));
+        assert!(!tracker.waiting_until.contains_key(&2));
+    }
+
+    #[test]
+    fn the_wait_is_until_the_soonest_delayed_step_and_a_short_tick_once_every_wait_is_over() {
+        let now = std::time::Instant::now();
+        let mut tracker = StepTracker::default();
+        tracker.set_waiting(1, now + Duration::from_secs(50));
+        tracker.set_waiting(2, now + Duration::from_secs(5));
+        let wait = time_to_next_wait(&tracker);
+        assert!(
+            wait > Duration::from_secs(4) && wait <= Duration::from_secs(5),
+            "{wait:?}"
+        );
+
+        let mut tracker = StepTracker::default();
+        tracker.set_waiting(1, now - Duration::from_secs(1));
+        assert_eq!(time_to_next_wait(&tracker), Duration::from_millis(10));
     }
 }

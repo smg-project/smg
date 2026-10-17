@@ -78,6 +78,7 @@ async fn streamed_events(frames: Vec<proto::GenerateResponse>, choices: u32) -> 
             dispatch,
             Vec::new(),
             None,
+            None,
             source,
         )
         .await;

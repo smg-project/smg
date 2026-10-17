@@ -4,6 +4,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::{Display, Formatter, Write},
+    sync::Arc,
 };
 
 use async_trait::async_trait;
@@ -149,9 +150,9 @@ pub fn tenant_scope_allows(record: Option<&str>, caller: Option<&str>) -> bool {
 /// would at a missing record. Empty when the chain's head itself is not
 /// visible.
 pub fn visible_chain(
-    mut responses: Vec<StoredResponse>,
+    mut responses: Vec<Arc<StoredResponse>>,
     tenant: Option<&str>,
-) -> Vec<StoredResponse> {
+) -> Vec<Arc<StoredResponse>> {
     let hidden_up_to = responses
         .iter()
         .rposition(|response| !response.is_visible_to(tenant))
@@ -584,11 +585,14 @@ pub enum ConditionalStore {
     Missing,
 }
 
-/// Response chain - a sequence of related responses
+/// Response chain - a sequence of related responses. The records are shared
+/// (`Arc`): a backend that holds them in memory hands out the ones it holds,
+/// and a caller that rebuilds a conversation from a chain reads them in place
+/// rather than taking a copy of every record, with its items, on every turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseChain {
     /// The responses in chronological order
-    pub responses: Vec<StoredResponse>,
+    pub responses: Vec<Arc<StoredResponse>>,
 
     /// Metadata about the chain
     pub metadata: HashMap<String, Value>,
@@ -610,6 +614,11 @@ impl ResponseChain {
 
     /// Add a response to the chain
     pub fn add_response(&mut self, response: StoredResponse) {
+        self.responses.push(Arc::new(response));
+    }
+
+    /// Add a response the backend holds shared, without copying it.
+    pub fn add_shared(&mut self, response: Arc<StoredResponse>) {
         self.responses.push(response);
     }
 }
@@ -949,7 +958,7 @@ pub trait ResponseStorage: Send + Sync {
             match fetched {
                 Some(response) => {
                     current_id.clone_from(&response.previous_response_id);
-                    chain.responses.push(response);
+                    chain.add_response(response);
                 }
                 None => break,
             }
@@ -1356,12 +1365,12 @@ mod tests {
             let mut stored = StoredResponse::new(None);
             stored.id = ResponseId::from(id);
             stored.tenant = tenant.map(str::to_string);
-            stored
+            Arc::new(stored)
         };
-        let ids = |chain: Vec<StoredResponse>| {
+        let ids = |chain: Vec<Arc<StoredResponse>>| {
             chain
-                .into_iter()
-                .map(|stored| stored.id.0)
+                .iter()
+                .map(|stored| stored.id.0.clone())
                 .collect::<Vec<_>>()
         };
         let a = Some("header:a");
@@ -1526,5 +1535,148 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         let second = stamps.next_added_at();
         assert!(second - first >= chrono::TimeDelta::milliseconds(1));
+    }
+
+    /// A store that overrides neither conditional write runs the trait's
+    /// read-then-write defaults: a record that cannot be read is an error to
+    /// the caller, never an open record, and nothing is written; a closed
+    /// record is handed back and left as it is; a missing one takes nothing;
+    /// an open one takes the write.
+    #[tokio::test]
+    async fn the_default_conditional_writes_write_nothing_over_a_record_they_cannot_read() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use parking_lot::Mutex;
+
+        enum Read {
+            Fails,
+            Answers(Option<Box<StoredResponse>>),
+        }
+
+        struct PlainStore {
+            read: Mutex<Read>,
+            stores: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl ResponseStorage for PlainStore {
+            async fn store_response(&self, response: StoredResponse) -> ResponseResult<ResponseId> {
+                self.stores.fetch_add(1, Ordering::SeqCst);
+                Ok(response.id)
+            }
+
+            async fn get_response(
+                &self,
+                _response_id: &ResponseId,
+            ) -> ResponseResult<Option<StoredResponse>> {
+                match &*self.read.lock() {
+                    Read::Fails => Err(ResponseStorageError::Timeout("read timed out".to_string())),
+                    Read::Answers(record) => Ok(record.as_deref().cloned()),
+                }
+            }
+
+            async fn delete_response(&self, _response_id: &ResponseId) -> ResponseResult<()> {
+                Ok(())
+            }
+
+            async fn list_identifier_responses(
+                &self,
+                _identifier: &str,
+                _tenant: Option<&str>,
+                _limit: Option<usize>,
+            ) -> ResponseResult<Vec<StoredResponse>> {
+                Ok(Vec::new())
+            }
+
+            async fn delete_identifier_responses(
+                &self,
+                _identifier: &str,
+                _tenant: Option<&str>,
+            ) -> ResponseResult<usize> {
+                Ok(0)
+            }
+        }
+
+        let record = |status: &str| {
+            let mut response = StoredResponse::new(None);
+            response.id = ResponseId::from("resp_1");
+            response.raw_response = serde_json::json!({"id": "resp_1", "status": status});
+            response
+        };
+        let moved = serde_json::json!({"id": "resp_1", "status": "in_progress"});
+        let store = PlainStore {
+            read: Mutex::new(Read::Fails),
+            stores: AtomicUsize::new(0),
+        };
+        let stores = || store.stores.load(Ordering::SeqCst);
+
+        assert!(
+            store
+                .store_response_if_open(record("completed"))
+                .await
+                .is_err(),
+            "a failed read is the caller's error, not an open record"
+        );
+        assert!(store
+            .update_response_object_if_open(&ResponseId::from("resp_1"), moved.clone())
+            .await
+            .is_err());
+        assert_eq!(
+            stores(),
+            0,
+            "nothing is written while the record's state is unknown"
+        );
+
+        *store.read.lock() = Read::Answers(Some(Box::new(record("cancelled"))));
+        let ConditionalStore::Closed(current) = store
+            .store_response_if_open(record("completed"))
+            .await
+            .unwrap()
+        else {
+            panic!("a cancelled record is closed");
+        };
+        assert_eq!(current.raw_response["status"], "cancelled");
+        assert!(matches!(
+            store
+                .update_response_object_if_open(&ResponseId::from("resp_1"), moved.clone())
+                .await
+                .unwrap(),
+            ConditionalStore::Closed(_)
+        ));
+        assert_eq!(stores(), 0, "a closed record is left as it is");
+
+        *store.read.lock() = Read::Answers(None);
+        assert!(matches!(
+            store
+                .store_response_if_open(record("completed"))
+                .await
+                .unwrap(),
+            ConditionalStore::Missing
+        ));
+        assert!(matches!(
+            store
+                .update_response_object_if_open(&ResponseId::from("resp_1"), moved.clone())
+                .await
+                .unwrap(),
+            ConditionalStore::Missing
+        ));
+        assert_eq!(stores(), 0, "nothing is written under a missing id");
+
+        *store.read.lock() = Read::Answers(Some(Box::new(record("queued"))));
+        assert!(matches!(
+            store
+                .store_response_if_open(record("completed"))
+                .await
+                .unwrap(),
+            ConditionalStore::Stored
+        ));
+        assert!(matches!(
+            store
+                .update_response_object_if_open(&ResponseId::from("resp_1"), moved)
+                .await
+                .unwrap(),
+            ConditionalStore::Stored
+        ));
+        assert_eq!(stores(), 2, "an open record takes both writes");
     }
 }

@@ -14,13 +14,42 @@
 //! whose parameter tags name their key in an attribute (MiniMax M2, dots3, MiniCPM5, typed by the
 //! request's tools; DeepSeek's DSML, typed by the tag's `string` attribute; Kimi K3's XTML, typed
 //! by the tag's `type` attribute); and [`xml`] for one MiniMax M3 invoke, whose arguments are an
-//! XML tree, typed by the request's tools at every depth.
+//! XML tree, typed by the request's tools at every depth. `object` is the arguments object the
+//! keyed and attributed assemblers write: the carried bytes, the separators and the close, and the
+//! three ways a member is written.
 
 pub mod assembler;
 pub mod attributed;
 pub mod keyed;
+mod object;
 pub mod value;
 pub mod xml;
 
 pub use assembler::{Assembler, Placement, Spelling};
 pub use value::{json, Declared, Kind};
+
+use crate::event::{Event, Events, MalformedReason, Text};
+
+/// The end of a started call that was cut, for the four assemblers of this module: by the end of
+/// the stream, whatever stage the cut found, or by the call's closing marker (the region's, or the
+/// next call's opener) inside a streamed string. Each writes the arguments object itself and
+/// closes it only at the call's own end, so the fragments sent are no whole JSON value: a string
+/// left open, a value held for its close, or no member yet. The fragments stand, since a fragment
+/// passed on cannot be taken back, nothing is made up for what the model never finished (no
+/// closing quote, no closing brace), and one `Malformed` event before the call's end says that
+/// the arguments are no whole value, as the JSON assembler says it: it carries the bytes still
+/// held (the start of a tag, a value's text, the template's newline), or none when the cut fell
+/// between events, so that a client that reads the arguments as JSON is told rather than left to
+/// find out. The reason is `UnterminatedRegion`, which the engine keeps for a region the end of
+/// the stream cut and renames for one a marker closed; `terminal` is the marker's bytes when they
+/// are the call's own end, and nothing when they are the region's or the stream ended.
+pub(crate) fn end_cut_call(index: u32, held: String, terminal: &str, out: &mut Events) {
+    out.push(Event::Malformed {
+        text: Text::uncounted(held),
+        why: MalformedReason::UnterminatedRegion,
+    });
+    out.push(Event::ToolCallEnd {
+        index,
+        source: Text::uncounted(terminal),
+    });
+}

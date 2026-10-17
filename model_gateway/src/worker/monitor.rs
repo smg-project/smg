@@ -424,8 +424,13 @@ fn keep_telemetry(
 /// `age_ms`: the servicer-to-gateway one-way latency.
 const PUSHED_ONE_WAY_MARGIN: Duration = Duration::from_millis(20);
 /// Pushed reports are published into the shared snapshot in one rebuild per
-/// window: the rebuild is O(fleet), the records arrive per scheduler step.
-const PUSHED_PUBLISH_WINDOW: Duration = Duration::from_millis(100);
+/// window: the rebuild is O(fleet) pointer work, the records arrive per
+/// scheduler step from every engine. Routing reads the snapshot, so a record
+/// steers within a window of its receipt; the policies' dispatch credit
+/// covers the gap. Twenty milliseconds is about one scheduler step, and at
+/// fifty rebuilds a second a thousand-worker fleet spends well under a
+/// percent of a core here.
+const PUSHED_PUBLISH_WINDOW: Duration = Duration::from_millis(20);
 
 /// Debounce window for batching worker evictions into one snapshot rebuild.
 /// Registry churn (a rollout, a scale-down) emits removals as a gradual
@@ -519,10 +524,10 @@ impl WorkerMonitor {
     /// the servicer's `GetLoads` figures for `dp_rank`, received at
     /// `received_at`): the same input as a poll of that worker. It replaces
     /// the rank's entry in the worker's report, goes to the overload verdict,
-    /// the wedged rule, the load-aware policies and the `smg_engine_*` gauges
-    /// at once, and into the shared snapshot in the next coalesced publish.
+    /// the wedged rule and the `smg_engine_*` gauges at once, and into the
+    /// shared snapshot, which routing reads, in the next coalesced publish.
     /// The report's `sampled_at` is the receipt less the record's age and
-    /// the one-way margin, what a policy resets its in-flight tally against.
+    /// the one-way margin, what a policy releases its dispatch credit against.
     pub fn apply_pushed_load(
         self: &Arc<Self>,
         worker: &Arc<dyn Worker>,
@@ -580,11 +585,6 @@ impl WorkerMonitor {
             record.engine_reports_steps.unwrap_or(false),
             record.prefill_pending_tokens.map(u64::from),
         );
-        let single: HashMap<String, WorkerLoadResponse> =
-            HashMap::from([(url.clone(), (*response).clone())]);
-        for policy in self.policy_registry.get_all_load_aware_policies() {
-            policy.update_loads(&single);
-        }
         Metrics::record_engine_load(&url, worker.model_id(), &response);
         // The DP-rank token cache takes a report with absolute token counts,
         // as it takes a poll; a core-only record leaves its last-known-good
@@ -1166,7 +1166,7 @@ impl WorkerMonitor {
             }
             Ok(Err(e)) => {
                 debug!("backend GetLoads failed for {}: {e}", worker.url());
-                if liveness::is_transport_failure(e.code()) {
+                if liveness::is_connection_code(e.code()) {
                     liveness::on_contact_failed(worker, "load poll");
                 }
                 None
@@ -1417,9 +1417,8 @@ async fn poll_group_once(
     // conditional gate: a load-aware policy, engine-metrics re-export, or
     // overload protection on any group member still forces the poll —
     // never "never poll".
-    let load_aware_policies = monitor.policy_registry.get_all_load_aware_policies();
     if monitor.conditional_polling {
-        let routing_needs_load = !load_aware_policies.is_empty()
+        let routing_needs_load = monitor.policy_registry.needs_backend_loads()
             || monitor.policy_registry.get_dp_rank_policy().is_some();
         let overload_needs_load = workers.iter().any(|w| w.metadata().overload.is_enabled());
         if !routing_needs_load && !monitor.engine_metrics && !overload_needs_load {
@@ -1539,9 +1538,6 @@ async fn poll_group_once(
         polled.len()
     );
 
-    for policy in &load_aware_policies {
-        policy.update_loads(&group_loads);
-    }
     monitor.worker_load_manager.update_dp_loads(&group_dp_loads);
 
     if !dp_evict.is_empty() {
@@ -1562,8 +1558,8 @@ async fn poll_group_once(
     // paired with the worker that produced it so the incarnation fence
     // can drop reports that raced a removal or replacement. Workers that
     // failed this tick get their stale entries pruned along with the
-    // rest. The responses move (no deep clones): the policy push and the
-    // metrics pass above already took their references.
+    // rest. The responses move (no deep clones): the metrics pass above
+    // took its references.
     let worker_by_url: HashMap<&str, &Arc<dyn Worker>> =
         polled.iter().map(|w| (w.url(), w)).collect();
     let fresh: Vec<(Arc<dyn Worker>, Arc<WorkerLoadResponse>)> = group_loads

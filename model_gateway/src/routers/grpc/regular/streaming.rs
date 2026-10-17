@@ -51,7 +51,9 @@ use crate::{
                 response_formatting::{
                     chat_usage, effective_weight_version, CompletionTokenTracker, TokenCounts,
                 },
-                responses::{build_sse_response, build_sse_response_from_stream},
+                responses::{
+                    body_guards, build_sse_response_from_stream, build_sse_response_guarded,
+                },
             },
             context,
             proto_wrapper::{
@@ -66,7 +68,7 @@ use crate::{
             utils::message_utils,
         },
     },
-    worker::PrefillLoadGuard,
+    worker::{GuardedStream, PrefillLoadGuard},
 };
 
 /// One backend stream of a `/v1/completions` request. Batched requests fan
@@ -215,8 +217,9 @@ impl StreamingProcessor {
     /// - Background task spawning
     /// - SSE response building
     ///
-    /// Note: Caller should attach load guards to the returned response using
-    /// `WorkerLoadGuard::attach_to_response()` for proper RAII lifecycle management.
+    /// The `load_guards` (and the reservation's safety net) ride in the
+    /// response body, released when it is dropped: at the stream's end or
+    /// the client's disconnect.
     #[expect(clippy::too_many_arguments)]
     pub async fn process_streaming_response(
         self: Arc<Self>,
@@ -226,9 +229,11 @@ impl StreamingProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         skip_special_tokens: bool,
         reservation: Option<Arc<SharedReservationHandle>>,
+        load_guards: Option<context::LoadGuards>,
         source: utils::StreamSource,
     ) -> Response {
         let source = source.with_backend(self.backend_type);
+        let guards = body_guards(load_guards, reservation.as_ref());
         use bytes::Bytes;
 
         let stop_params = (
@@ -335,11 +340,15 @@ impl StreamingProcessor {
             }
         }
 
-        // Return SSE response
+        // Return SSE response; its body holds the guards for as long as it lives.
+        let stream = GuardedStream::new(ReceiverStream::new(rx), guards);
         if rechunk {
-            build_sse_response_from_stream(sse_rechunk::rechunk_stream(ReceiverStream::new(rx)))
+            build_sse_response_from_stream(sse_rechunk::rechunk_stream(
+                stream,
+                sse_rechunk::NoopObserver,
+            ))
         } else {
-            build_sse_response(rx)
+            build_sse_response_from_stream(stream)
         }
     }
 
@@ -371,6 +380,10 @@ impl StreamingProcessor {
     /// Inner implementation shared by single-mode and PD prefill/decode streaming.
     /// `pd_timing` is `Some` only in PD mode and yields honest PD TTFT
     /// (prefill start to first decode token).
+    ///
+    /// The stream is a [`ChatStream`]: its set-up, the loop over the engine's
+    /// messages, the parser flush, the finish chunks, the usage chunk and the
+    /// settlement are its methods, run here in that order.
     #[expect(clippy::too_many_arguments)]
     async fn process_streaming_chunks_inner(
         &self,
@@ -383,891 +396,28 @@ impl StreamingProcessor {
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
-        // Metrics timing
-        let start_time = Instant::now();
-        let mut first_token_time: Option<Instant> = None;
-
-        // Extract request parameters
-        let separate_reasoning = original_request.separate_reasoning;
-        let tool_choice = &original_request.tool_choice;
-        let tools = &original_request.tools;
-        let history_tool_calls_count = original_request.history_tool_calls_count;
-        let stream_options = &original_request.stream_options;
-        // DeepSeek always reports aggregate usage on the final finish chunk.
-        // include_usage controls null placeholders on earlier chunks only.
-        let deepseek_usage = original_request.provider == ProviderProfile::DeepSeek;
-        let include_usage = stream_options
-            .as_ref()
-            .is_some_and(|opts| opts.include_usage.unwrap_or(false));
-        let emit_usage_null = deepseek_usage && include_usage;
-        let mut continuous_usage = stream_options
-            .as_ref()
-            .filter(|opts| {
-                !deepseek_usage
-                    && opts.include_usage.unwrap_or(false)
-                    && opts.continuous_usage_stats.unwrap_or(false)
-            })
-            .map(|_| ChatStreamUsage::default());
-
-        // Phase 1: Initialize state tracking (per-index for n>1 support)
-        let mut is_firsts: HashMap<u32, bool> = HashMap::new();
-        let mut finish_reasons: HashMap<u32, String> = HashMap::new();
-        let mut matched_stops: HashMap<u32, Option<Value>> = HashMap::new();
-        // Indices whose local stop decoder fired: their finish reason is pinned
-        // to "stop" and later engine output for the index is ignored.
-        let mut stopped_indices: HashSet<u32> = HashSet::new();
-        let mut prompt_tokens: HashMap<u32, u32> = HashMap::new();
-        let mut completion_tokens = CompletionTokenTracker::new();
-        let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
-        let mut reasoning_tokens: HashMap<u32, u32> = HashMap::new();
-        // Tokens the gateway's reasoning parser routed to reasoning, and
-        // tokens of chunks that decoded to no text yet (counted with the
-        // chunk that releases their text).
-        let mut parsed_reasoning_tokens: HashMap<u32, u32> = HashMap::new();
-        let mut held_tokens: HashMap<u32, u32> = HashMap::new();
-        let mut spec_accepted: HashMap<u32, u32> = HashMap::new();
-        let mut spec_drafted: HashMap<u32, u32> = HashMap::new();
-
-        // Parser state (lazy initialization per index); the parsers are this
-        // loop's own, nothing else reaches them.
-        let mut reasoning_parsers: HashMap<u32, Box<dyn ReasoningParser>> = HashMap::new();
-        let mut tool_parsers: HashMap<u32, Box<dyn ToolParser>> = HashMap::new();
-        let mut has_tool_calls: HashMap<u32, bool> = HashMap::new();
-
-        // Per-index stop decoders (each index needs its own state for n>1 support)
-        let mut stop_decoders: HashMap<u32, StopSequenceDecoder> = HashMap::new();
-
-        // Reusable SSE encoder for the post-loop flush / tool / finish / usage
-        // chunks, which previously each did `to_string` + `format!`.
-        let mut sse_encoder = SseEncoder::new();
-
-        // Use dispatch metadata for consistent response fields
-        let request_id = &dispatch.request_id;
-        let model = &dispatch.model;
-        let created = dispatch.created;
-        let system_fingerprint = dispatch.weight_version.as_deref();
-
-        // The per-chunk SSE frames: the invariant head of every chunk of this
-        // stream is serialized once here; per chunk only its choice (and usage)
-        // is serialized into `sse_buffer`, whose written bytes are split off
-        // for the channel instead of being copied.
-        let chunk_frame = ChatChunkFrame::new(request_id, model, created, system_fingerprint);
-        let mut sse_buffer = BytesMut::with_capacity(4096);
-
-        // Per-request effective parser names (model-card override → configured).
-        let reasoning_parser_name = self.parser_resolver.reasoning_parser(model);
-        let tool_parser_name = self.parser_resolver.tool_parser(model);
-
-        // Check parser availability once upfront (log warning only once per request)
-        let reasoning_parser_available = separate_reasoning
-            && utils::check_reasoning_parser_availability(
-                &self.reasoning_parser_factory,
-                reasoning_parser_name.as_deref(),
-                model,
-            );
-
-        if let Some(usage) = &mut continuous_usage {
-            usage.reasoning_parsed =
-                reasoning_parser_available || original_request.symphony.is_some();
-        }
-
-        // Request building decided whether the rendered prompt ends inside the
-        // model's thinking block; the parsers then start in reasoning mode.
-        let thinking_override = original_request.reasoning_in_prefill;
-        let think_in_prefill = tokenizer.think_in_prefill();
-
-        // Check if JSON schema constraint was used (specific function or required mode)
-        let native_tool_format = self
-            .tool_parser_factory
-            .registry()
-            .uses_native_tool_format(tool_parser_name.as_deref());
-        let used_json_schema = if native_tool_format {
-            false
-        } else {
-            tool_choice.as_ref().is_some_and(ToolChoice::forces_call)
-        };
-
-        // Check if this is the specific function case (LLM generates parameters only, no name field).
-        // Only applies when json_schema is used — native formats include framing tokens
-        // that the parser must handle.
-        let is_specific_function =
-            used_json_schema && matches!(tool_choice, Some(ToolChoice::Function { .. }));
-
-        // The first delta's shape: a forced tool call opens as the public API
-        // opens a tool-call stream; anything else as a text stream.
-        let opens_tool_call = forces_tool_call(&original_request);
-
-        let tool_parser_available = tools.is_some()
-            && utils::check_tool_parser_availability(
-                &self.tool_parser_factory,
-                tool_parser_name.as_deref(),
-                model,
-            );
-
-        if separate_reasoning && !reasoning_parser_available {
-            debug!(
-                "No reasoning parser found for model '{}', skipping reasoning parsing",
-                model
-            );
-        }
-
-        if tools.is_some() && !tool_parser_available {
-            debug!(
-                "No tool parser found for model '{}', skipping tool call parsing",
-                model
-            );
-        }
-
-        // Symphony reads this response when request building assigned it a table
-        // (see `regular::symphony`): one engine per choice in place of both parsers,
-        // seeded with the prompt it replays. The role chunk, the stop decoder, the
-        // finish chunks and the usage are the ones above and below; only the reading
-        // of the tokens differs.
-        let assignment = original_request.symphony.as_ref();
-        let mut readers: HashMap<u32, Reader> = HashMap::new();
-
-        // Phase 2: Main streaming loop
-        let mut final_indices: Option<Vec<(u32, bool)>> = None;
-        loop {
-            let response = if final_indices.is_none() {
-                // The chunks written so far leave as a frame before the
-                // engine is polled, so every engine message reaches the
-                // client as its own frame as soon as it is processed; the
-                // engine stream is polled once per message.
-                Self::flush_chunks(tx, &mut sse_buffer).await?;
-                let item = grpc_stream.next().await;
-                match item.transpose() {
-                    Ok(response) => response,
-                    Err(e) => {
-                        // What was produced before the failure still goes out.
-                        Self::flush_chunks(tx, &mut sse_buffer).await?;
-                        return Err(utils::StreamFailure::upstream(
-                            e,
-                            completion_tokens.delivered(),
-                        ));
-                    }
-                }
-            } else {
-                None
-            };
-            let mut final_chunk = response.is_none();
-
-            // Text the stop decoder produced for this response, if any. Per-chunk
-            // text and the end-of-stream flush both funnel into the shared emission
-            // below, so neither can reach the client without being parsed.
-            let pending: Option<(u32, String, Option<ChatLogProbs>, u32)> = match response
-                .map(|response| response.into_response())
-            {
-                Some(ProtoResponseVariant::Chunk(chunk)) => {
-                    // Track TTFT immediately on first chunk received from backend
-                    if first_token_time.is_none() {
-                        first_token_time = Some(Instant::now());
-                        if let Some(timing) = &pd_timing {
-                            timing.record_first_decode_token(self.backend_type, model);
-                        }
-                    }
-
-                    let index = chunk.index();
-
-                    // Once the local stop decoder has fired for an index, ignore
-                    // any further engine output the backend emits for it.
-                    if stopped_indices.contains(&index) {
-                        continue;
-                    }
-
-                    completion_tokens.record_chunk(&chunk);
-                    if let Some(usage) = &mut continuous_usage {
-                        usage.record_chunk(&chunk);
-                    }
-
-                    // The engine's first output opens the choice with the
-                    // role chunk, as the engine's own server does, whether or
-                    // not that output decodes to visible text (a special
-                    // token the decoder skips, a partial UTF-8 sequence): a
-                    // client timing its first chunk otherwise waits for the
-                    // next step's text.
-                    if is_firsts.get(&index).copied().unwrap_or(true) {
-                        let usage = continuous_usage.as_ref().map(|tracker| {
-                            tracker.snapshot(original_request.unbilled_prompt_tokens)
-                        });
-                        Self::send_role_chunk(
-                            tx,
-                            &mut sse_buffer,
-                            &chunk_frame,
-                            index,
-                            opens_tool_call,
-                            usage.as_ref(),
-                            emit_usage_null,
-                        )
-                        .await?;
-                        is_firsts.insert(index, false);
-                    }
-
-                    // Get or create stop decoder for this index
-                    let stop_decoder = stop_decoders.entry(index).or_insert_with(|| {
-                        let (
-                            ref stop,
-                            ref stop_token_ids,
-                            skip_special_tokens,
-                            no_stop_trim,
-                            ignore_eos,
-                        ) = stop_params;
-                        utils::create_stop_decoder(
-                            &tokenizer,
-                            stop.as_ref(),
-                            stop_token_ids.as_ref(),
-                            skip_special_tokens,
-                            no_stop_trim,
-                            ignore_eos,
-                        )
-                    });
-
-                    // Process tokens through stop decoder: Symphony's reader takes
-                    // them with their spans and gives events, the older path the text.
-                    let symphony_events = match assignment {
-                        Some(assignment) => {
-                            let reader = match readers.entry(index) {
-                                Entry::Occupied(reader) => reader.into_mut(),
-                                Entry::Vacant(slot) => slot.insert(
-                                    Reader::new(assignment, tools.as_deref().unwrap_or(&[]))?
-                                        .first_call_only(original_request.first_tool_call_only),
-                                ),
-                            };
-                            Some(reader.read(stop_decoder, chunk.token_ids())?)
-                        }
-                        None => None,
-                    };
-                    let (chunk_text, should_stop) = match &symphony_events {
-                        Some((_, stopped)) => (String::new(), *stopped),
-                        None => Self::process_chunk_tokens(stop_decoder, chunk.token_ids())?,
-                    };
-
-                    if should_stop {
-                        // Stop-decoder match takes precedence: pin "stop" even if
-                        // the backend's eventual Complete carries "length" (the
-                        // local stop sequence fired first). Any pre-stop text in
-                        // `chunk_text` is still emitted below before the finish
-                        // reason is flushed in Phase 4.
-                        finish_reasons
-                            .entry(index)
-                            .or_insert_with(|| "stop".to_string());
-                        matched_stops.entry(index).or_insert_with(|| {
-                            stop_decoder
-                                .matched_stop()
-                                .map(|s| Value::String(s.to_string()))
-                        });
-                        stopped_indices.insert(index);
-                    }
-
-                    if let Some((events, _)) = symphony_events {
-                        // Recorded before the usage is snapshotted, so a continuous
-                        // usage counts the reasoning text it rides with.
-                        let chunk_reasoning_tokens = reasoning_text_tokens(&events);
-                        if chunk_reasoning_tokens > 0 {
-                            *parsed_reasoning_tokens.entry(index).or_default() +=
-                                chunk_reasoning_tokens;
-                            if let Some(tracker) = &mut continuous_usage {
-                                tracker.record_reasoning(index, chunk_reasoning_tokens);
-                            }
-                        }
-                        let usage = continuous_usage.as_ref().map(|tracker| {
-                            tracker.snapshot(original_request.unbilled_prompt_tokens)
-                        });
-                        let choice_logprobs = chunk.output_logprobs().map(|ref proto_logprobs| {
-                            utils::convert_proto_to_openai_logprobs(
-                                proto_logprobs,
-                                &tokenizer,
-                                original_request.top_logprobs,
-                            )
-                        });
-                        Self::push_events(
-                            tx,
-                            &mut sse_buffer,
-                            &chunk_frame,
-                            index,
-                            &events,
-                            choice_logprobs,
-                            usage.as_ref(),
-                            emit_usage_null,
-                        )
-                        .await?;
-                        continue;
-                    }
-
-                    if chunk_text.is_empty() {
-                        *held_tokens.entry(index).or_default() += chunk.token_ids().len() as u32;
-                        continue;
-                    }
-
-                    // Process logprobs if present
-                    let choice_logprobs = chunk.output_logprobs().map(|ref proto_logprobs| {
-                        utils::convert_proto_to_openai_logprobs(
-                            proto_logprobs,
-                            &tokenizer,
-                            original_request.top_logprobs,
-                        )
-                    });
-
-                    let chunk_tokens =
-                        chunk.token_ids().len() as u32 + held_tokens.remove(&index).unwrap_or(0);
-                    Some((index, chunk_text, choice_logprobs, chunk_tokens))
-                }
-                Some(ProtoResponseVariant::Complete(complete)) => {
-                    let index = complete.index();
-
-                    // Complete byte decoding before routing held text through the
-                    // same reasoning/tool parsers as ordinary chunks.
-                    let flushed = match stop_decoders.get_mut(&index) {
-                        Some(decoder) => {
-                            let tail = decoder.finish().map_err(|e| e.to_string())?;
-                            utils::warn_detokenize_recoveries(request_id, index, decoder);
-                            if decoder.is_stopped() {
-                                stopped_indices.insert(index);
-                                finish_reasons.insert(index, "stop".to_string());
-                                matched_stops.insert(
-                                    index,
-                                    decoder.matched_stop().map(|s| Value::String(s.to_string())),
-                                );
-                            }
-                            match tail {
-                                SequenceDecoderOutput::Text(text)
-                                | SequenceDecoderOutput::StoppedWithText(text)
-                                    if !text.is_empty() =>
-                                {
-                                    Some(text)
-                                }
-                                _ => None,
-                            }
-                        }
-                        None => None,
-                    };
-
-                    // Store metadata
-                    prompt_tokens.insert(index, complete.prompt_tokens());
-
-                    completion_tokens.record_complete(&complete);
-                    if let Some(usage) = &mut continuous_usage {
-                        usage.record_complete(&complete);
-                    }
-
-                    // A choice's first engine output may be its Complete (a
-                    // completion with no tokens: a finish that carries none
-                    // comes without a Chunk). It opens the choice as a first
-                    // Chunk does, the role chunk before the finish chunk, and
-                    // records the stream's first-token time; its usage, as a
-                    // first Chunk's, counts the output it rides on.
-                    if first_token_time.is_none() {
-                        first_token_time = Some(Instant::now());
-                        if let Some(timing) = &pd_timing {
-                            timing.record_first_decode_token(self.backend_type, model);
-                        }
-                    }
-                    if is_firsts.get(&index).copied().unwrap_or(true) {
-                        let usage = continuous_usage.as_ref().map(|tracker| {
-                            tracker.snapshot(original_request.unbilled_prompt_tokens)
-                        });
-                        Self::send_role_chunk(
-                            tx,
-                            &mut sse_buffer,
-                            &chunk_frame,
-                            index,
-                            opens_tool_call,
-                            usage.as_ref(),
-                            emit_usage_null,
-                        )
-                        .await?;
-                        is_firsts.insert(index, false);
-                    }
-
-                    cached_tokens.insert(index, complete.cached_tokens());
-                    reasoning_tokens.insert(index, complete.reasoning_tokens());
-                    spec_accepted.insert(index, complete.spec_accepted_tokens());
-                    spec_drafted.insert(index, complete.spec_draft_tokens());
-
-                    // A local stop-decoder match already pinned "stop" for this
-                    // index; don't let the engine's finish reason overwrite it.
-                    if !stopped_indices.contains(&index) {
-                        finish_reasons.insert(index, complete.finish_reason().to_string());
-                        matched_stops.insert(index, complete.matched_stop_json());
-                    }
-
-                    // Symphony ends the choice's output here: the decoder's last
-                    // text, then the engine's finish. The finish chunk is Phase 4's,
-                    // with the matched stop; the `Finish` event gives it the calls
-                    // made, and the usage the reasoning tokens.
-                    if let Some(reader) = readers.get_mut(&index) {
-                        let reason = finish_reasons.get(&index).map_or("stop", String::as_str);
-                        let mut events = match &flushed {
-                            Some(text) => reader.tail(text)?,
-                            None => Vec::new(),
-                        };
-                        events.extend(reader.end(engine_finish(reason))?);
-                        if let Some(finished) = finished(&events) {
-                            has_tool_calls.insert(index, finished.tool_calls > 0);
-                            parsed_reasoning_tokens.insert(index, finished.reasoning_tokens);
-                        }
-                        let usage = continuous_usage.as_ref().map(|tracker| {
-                            tracker.snapshot(original_request.unbilled_prompt_tokens)
-                        });
-                        Self::push_events(
-                            tx,
-                            &mut sse_buffer,
-                            &chunk_frame,
-                            index,
-                            &events,
-                            None,
-                            usage.as_ref(),
-                            emit_usage_null,
-                        )
-                        .await?;
-                        continue;
-                    }
-
-                    // Don't break - continue reading all Complete messages for n>1
-                    // Text the decoder held for a partial stop match: the
-                    // tokens that produced it were counted as held.
-                    flushed.map(|text| (index, text, None, held_tokens.remove(&index).unwrap_or(0)))
-                }
-                Some(ProtoResponseVariant::None) => continue,
-                None => {
-                    // A choice Symphony reads whose Complete never came: the decoder's
-                    // last text is the reader's, then the output ends as an abort so
-                    // what the engine holds goes out, as the older parsers' flush
-                    // below sends theirs. Those indices are not the loop's below.
-                    let mut unended: Vec<u32> = readers
-                        .iter()
-                        .filter(|(_, reader)| !reader.ended())
-                        .map(|(index, _)| *index)
-                        .collect();
-                    unended.sort_unstable();
-                    for index in unended {
-                        let Some(reader) = readers.get_mut(&index) else {
-                            continue;
-                        };
-                        let mut events = Vec::new();
-                        if let Some(decoder) = stop_decoders.get_mut(&index) {
-                            let tail = decoder.finish().map_err(|e| e.to_string())?;
-                            utils::warn_detokenize_recoveries(request_id, index, decoder);
-                            if decoder.is_stopped() {
-                                stopped_indices.insert(index);
-                                finish_reasons.insert(index, "stop".to_string());
-                                matched_stops.insert(
-                                    index,
-                                    decoder.matched_stop().map(|s| Value::String(s.to_string())),
-                                );
-                            }
-                            if let SequenceDecoderOutput::Text(text)
-                            | SequenceDecoderOutput::StoppedWithText(text) = tail
-                            {
-                                events.extend(reader.tail(&text)?);
-                            }
-                        }
-                        events.extend(reader.end(EngineFinish::Abort)?);
-                        // The `Finish` event says what the Complete frame would have:
-                        // the calls made, for the finish reason, and the reasoning
-                        // tokens, for the usage.
-                        if let Some(finished) = finished(&events) {
-                            has_tool_calls.insert(index, finished.tool_calls > 0);
-                            parsed_reasoning_tokens.insert(index, finished.reasoning_tokens);
-                        }
-                        let usage = continuous_usage.as_ref().map(|tracker| {
-                            tracker.snapshot(original_request.unbilled_prompt_tokens)
-                        });
-                        Self::push_events(
-                            tx,
-                            &mut sse_buffer,
-                            &chunk_frame,
-                            index,
-                            &events,
-                            None,
-                            usage.as_ref(),
-                            emit_usage_null,
-                        )
-                        .await?;
-                    }
-
-                    // Finish decoder text before sending EOF to the parsers. A
-                    // clean transport EOF does not supply Complete metadata.
-                    let indices = final_indices.get_or_insert_with(|| {
-                        let mut indices: Vec<_> = stop_decoders
-                            .keys()
-                            .chain(reasoning_parsers.keys())
-                            .copied()
-                            .filter(|index| !readers.contains_key(index))
-                            .collect();
-                        indices.sort_unstable();
-                        indices.dedup();
-                        indices
-                            .into_iter()
-                            .flat_map(|index| [(index, true), (index, false)])
-                            .collect()
-                    });
-                    let Some((index, parser_eof)) = indices.pop() else {
-                        break;
-                    };
-                    final_chunk = parser_eof;
-                    let text = if parser_eof {
-                        String::new()
-                    } else {
-                        match stop_decoders.get_mut(&index) {
-                            Some(decoder) => {
-                                let tail = decoder.finish().map_err(|e| e.to_string())?;
-                                utils::warn_detokenize_recoveries(request_id, index, decoder);
-                                if decoder.is_stopped() {
-                                    stopped_indices.insert(index);
-                                    finish_reasons.insert(index, "stop".to_string());
-                                    matched_stops.insert(
-                                        index,
-                                        decoder
-                                            .matched_stop()
-                                            .map(|s| Value::String(s.to_string())),
-                                    );
-                                }
-                                match tail {
-                                    SequenceDecoderOutput::Text(text)
-                                    | SequenceDecoderOutput::StoppedWithText(text) => text,
-                                    _ => String::new(),
-                                }
-                            }
-                            None => String::new(),
-                        }
-                    };
-                    if !parser_eof && text.is_empty() {
-                        continue;
-                    }
-                    Some((index, text, None, held_tokens.remove(&index).unwrap_or(0)))
-                }
-            };
-
-            let mut usage = continuous_usage
-                .as_ref()
-                .map(|tracker| tracker.snapshot(original_request.unbilled_prompt_tokens));
-            let Some((index, text, mut choice_logprobs, chunk_tokens)) = pending else {
-                continue;
-            };
-
-            // Text that reaches here without an engine chunk before it (a
-            // decoder flush on the terminal frame) still opens its choice.
-            if is_firsts.get(&index).copied().unwrap_or(true) {
-                Self::send_role_chunk(
-                    tx,
-                    &mut sse_buffer,
-                    &chunk_frame,
-                    index,
-                    opens_tool_call,
-                    usage.as_ref(),
-                    emit_usage_null,
-                )
-                .await?;
-                is_firsts.insert(index, false);
-            }
-
-            // Calculate delta
-            let mut delta = text;
-
-            // Reasoning content handling
-            let in_reasoning = if separate_reasoning && reasoning_parser_available {
-                let (normal_text, reasoning_choice, in_reasoning, chunk_reasoning_tokens) = self
-                    .process_reasoning_stream(
-                        (!final_chunk).then_some(delta.as_str()),
-                        chunk_tokens,
-                        index,
-                        &mut reasoning_parsers,
-                        thinking_override,
-                        think_in_prefill,
-                        reasoning_parser_name.as_deref(),
-                        model,
-                    );
-                // Recorded before this frame's usage is snapshotted again, so
-                // a continuous usage counts the reasoning text it rides with,
-                // and the content or tool chunks that follow in the frame
-                // agree with it.
-                if chunk_reasoning_tokens > 0 {
-                    *parsed_reasoning_tokens.entry(index).or_default() += chunk_reasoning_tokens;
-                    if let Some(tracker) = &mut continuous_usage {
-                        tracker.record_reasoning(index, chunk_reasoning_tokens);
-                        usage = Some(tracker.snapshot(original_request.unbilled_prompt_tokens));
-                    }
-                }
-                if let Some(mut choice) = reasoning_choice {
-                    // The chunk's token logprobs ride on its reasoning delta when
-                    // none of its text is content, as on a content delta.
-                    if normal_text.is_empty() {
-                        choice.logprobs = choice_logprobs.take();
-                    }
-                    Self::push_chunk(
-                        tx,
-                        &mut sse_buffer,
-                        &chunk_frame,
-                        &choice,
-                        usage.as_ref(),
-                        emit_usage_null,
-                    )
-                    .await
-                    .map_err(|()| "Failed to send reasoning chunk".to_string())?;
-                }
-                delta = normal_text;
-                in_reasoning
-            } else {
-                false
-            };
-
-            if final_chunk && delta.is_empty() {
-                continue;
-            }
-
-            // Tool call handling
-            let tool_choice_enabled =
-                !matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)));
-
-            if let Some(tools_ref) = tools.as_ref() {
-                if !in_reasoning
-                    && tool_choice_enabled
-                    && (tool_parser_available || used_json_schema)
-                {
-                    let tool_choices = if is_specific_function {
-                        // Handle specific function case - emit tool call deltas with arguments
-                        Self::process_specific_function_stream(
-                            &delta,
-                            index,
-                            &mut has_tool_calls,
-                            tool_choice.as_ref(),
-                            model,
-                            history_tool_calls_count,
-                        )
-                    } else {
-                        // Use incremental parser for regular/required modes
-                        self.process_tool_calls_stream(
-                            &delta,
-                            index,
-                            &mut tool_parsers,
-                            &mut has_tool_calls,
-                            tools_ref,
-                            tool_parser_name.as_deref(),
-                            model,
-                            history_tool_calls_count,
-                            used_json_schema,
-                            original_request.first_tool_call_only,
-                        )
-                        .await
-                    };
-
-                    for choice in &tool_choices {
-                        Self::push_chunk(
-                            tx,
-                            &mut sse_buffer,
-                            &chunk_frame,
-                            choice,
-                            usage.as_ref(),
-                            emit_usage_null,
-                        )
-                        .await
-                        .map_err(|()| "Failed to send tool call chunk".to_string())?;
-                    }
-
-                    // Always skip regular content when tool parsing is active
-                    // Parser either emitted chunks or buffered content
-                    continue;
-                }
-            }
-
-            // Regular content emission
-            if !delta.is_empty() {
-                let mut choice = assistant_choice(index, Some(delta), None, None);
-                choice.logprobs = choice_logprobs;
-                Self::push_chunk(
-                    tx,
-                    &mut sse_buffer,
-                    &chunk_frame,
-                    &choice,
-                    usage.as_ref(),
-                    emit_usage_null,
-                )
-                .await
-                .map_err(|()| "Failed to send content chunk".to_string())?;
-            }
-        }
-
-        Self::flush_chunks(tx, &mut sse_buffer).await?;
-
-        let usage = continuous_usage
-            .as_ref()
-            .map(|tracker| tracker.snapshot(original_request.unbilled_prompt_tokens));
-
-        // Phase 3: End-of-stream parser flush: first any text still buffered
-        // as a prospective tool call that never materialized (dropping it
-        // produced fully-empty streams), then any parsed-but-unstreamed tool
-        // arguments.
-        for (index, parser_guard) in &mut tool_parsers {
-            let leftover_text = parser_guard.take_unstreamed_normal_text();
-            if !leftover_text.is_empty() {
-                let content_chunk = ChatCompletionStreamResponse::builder(request_id, model)
-                    .created(created)
-                    .add_choice_content_with_logprobs(*index, leftover_text, None)
-                    .maybe_system_fingerprint(system_fingerprint)
-                    .maybe_usage(usage.clone())
-                    .build();
-
-                let sse_chunk = sse_encoder
-                    .encode_data(&ChatChunkWithUsage::new(&content_chunk, emit_usage_null))
-                    .map_err(|e| format!("Failed to serialize content chunk: {e}"))?;
-                tx.send(Ok(sse_chunk))
-                    .await
-                    .map_err(|_| "Failed to send flushed content chunk".to_string())?;
-            }
-
-            if let Some(mut unstreamed_items) = parser_guard.get_unstreamed_tool_args() {
-                if original_request.first_tool_call_only {
-                    utils::keep_first_tool_call_items(&mut unstreamed_items);
-                }
-                for tool_call_item in unstreamed_items {
-                    let tool_call_delta = ToolCallDelta {
-                        index: tool_call_item.tool_index as u32,
-                        id: None,
-                        tool_type: None,
-                        function: Some(FunctionCallDelta {
-                            name: None,
-                            arguments: if tool_call_item.parameters.is_empty() {
-                                None
-                            } else {
-                                Some(tool_call_item.parameters)
-                            },
-                        }),
-                    };
-
-                    let tool_chunk = ChatCompletionStreamResponse::builder(request_id, model)
-                        .created(created)
-                        .add_choice_tool_call_delta(*index, tool_call_delta)
-                        .maybe_system_fingerprint(system_fingerprint)
-                        .maybe_usage(usage.clone())
-                        .build();
-
-                    let sse_chunk = sse_encoder
-                        .encode_data(&ChatChunkWithUsage::new(&tool_chunk, emit_usage_null))
-                        .map_err(|e| format!("Failed to serialize tool chunk: {e}"))?;
-                    tx.send(Ok(sse_chunk))
-                        .await
-                        .map_err(|_| "Failed to send unstreamed tool args".to_string())?;
-                }
-            }
-        }
-
-        // Every choice shares one prompt, so prompt/cache counts take max;
-        // completion and reasoning counts sum across choices. Built by the
-        // non-streamed answer's builder: the usage chunk carries the usage
-        // object that answer carries.
-        let final_usage = (deepseek_usage || include_usage).then(|| {
-            let counts = TokenCounts {
-                prompt: prompt_tokens.values().copied().max().unwrap_or(0),
-                completion: completion_tokens.total(),
-                cached: cached_tokens.values().copied().max().unwrap_or(0),
-                reasoning: reasoning_tokens.values().sum(),
-                spec_accepted: spec_accepted.values().sum(),
-                spec_drafted: spec_drafted.values().sum(),
-            };
-            chat_usage(
-                counts.usage(),
-                (reasoning_parser_available || assignment.is_some())
-                    .then(|| parsed_reasoning_tokens.values().sum()),
-                original_request.unbilled_prompt_tokens,
-            )
-        });
-
-        // Phase 4: Finish reason chunks. Do not advertise partial counters as
-        // a final aggregate if the backend omitted a choice's Complete frame.
-        let complete_usage = prompt_tokens.len() as u32 >= original_request.expected_choices;
-        for (position, (index, finish_reason)) in finish_reasons.iter().enumerate() {
-            let final_finish_reason =
-                if has_tool_calls.get(index).copied().unwrap_or(false) && finish_reason == "stop" {
-                    "tool_calls".to_string()
-                } else {
-                    finish_reason.clone()
-                };
-
-            let matched_stop_value = matched_stops.get(index).and_then(|v| v.clone());
-
-            let finish_usage =
-                if deepseek_usage && complete_usage && position + 1 == finish_reasons.len() {
-                    final_usage.clone()
-                } else {
-                    usage.clone()
-                };
-            let finish_chunk = ChatCompletionStreamResponse::builder(request_id, model)
-                .created(created)
-                .add_choice_finish_reason(*index, final_finish_reason, matched_stop_value)
-                .maybe_system_fingerprint(system_fingerprint)
-                .maybe_usage(finish_usage)
-                .build();
-
-            let sse_chunk = sse_encoder
-                .encode_data(&ChatChunkWithUsage::new(&finish_chunk, emit_usage_null))
-                .map_err(|e| format!("Failed to serialize finish chunk: {e}"))?;
-            tx.send(Ok(sse_chunk))
-                .await
-                .map_err(|_| "Failed to send finish chunk".to_string())?;
-        }
-
-        // Phase 5: The OpenAI dialect keeps its opt-in, usage-only chunk.
-        if !deepseek_usage {
-            if let Some(final_usage) = final_usage {
-                let usage_chunk = ChatCompletionStreamResponse::builder(request_id, model)
-                    .created(created)
-                    .usage(final_usage)
-                    .maybe_system_fingerprint(system_fingerprint)
-                    .build();
-                let sse_chunk = sse_encoder
-                    .encode_data(&usage_chunk)
-                    .map_err(|e| format!("Failed to serialize usage chunk: {e}"))?;
-                tx.send(Ok(sse_chunk))
-                    .await
-                    .map_err(|_| "Failed to send usage chunk".to_string())?;
-            }
-        }
+        let mut stream = ChatStream::open(
+            self,
+            &dispatch,
+            tokenizer,
+            stop_params,
+            &original_request,
+            tx,
+            pd_timing,
+        );
+        stream.read_engine(&mut grpc_stream).await?;
+        let usage = stream.usage_snapshot();
+        stream.flush_parsers(usage.as_ref()).await?;
+        let final_usage = stream.final_usage();
+        stream
+            .send_finish_chunks(final_usage.as_ref(), usage.as_ref())
+            .await?;
+        stream.send_usage_chunk(final_usage).await?;
 
         // Mark stream as completed successfully to prevent abort on drop
         grpc_stream.mark_completed();
 
-        // Record streaming metrics
-        let total_prompt: u32 = prompt_tokens.values().copied().max().unwrap_or(0);
-        let total_completion: u32 = completion_tokens.total();
-        if let Some(handle) = reservation {
-            // `prompt_tokens` is only ever populated from a `Complete` message
-            // (line ~573 above), one entry per index. A clean EOF that didn't
-            // produce one for every expected `n>1` choice has only partial
-            // usage -- settling with that would understate the real cost.
-            // Keep the reserved amount as final instead.
-            let expected_choices = original_request.expected_choices;
-            if (prompt_tokens.len() as u32) < expected_choices {
-                handle.close_reserved_only().await;
-            } else {
-                handle
-                    .settle_success(UsageSettlement {
-                        actual_input_tokens: total_prompt,
-                        completion_tokens: total_completion,
-                    })
-                    .await;
-            }
-        }
-        // In PD mode this task only starts once the decode stream exists —
-        // for sequential PD that is after prefill completes, with the first
-        // decode chunk already buffered — so `start_time` would report a
-        // near-zero TTFT. Anchor at the prefill dispatch instant instead;
-        // generation duration must share the base or TPOT underflows.
-        let stream_base = pd_timing
-            .as_ref()
-            .map(|timing| timing.prefill_start)
-            .unwrap_or(start_time);
-        Metrics::record_streaming_metrics(StreamingMetricsParams {
-            router_type: metrics_labels::ROUTER_GRPC,
-            backend_type: self.backend_type,
-            model_id: model,
-            endpoint: metrics_labels::ENDPOINT_CHAT,
-            ttft: first_token_time.map(|t| t.duration_since(stream_base)),
-            generation_duration: stream_base.elapsed(),
-            input_tokens: Some(total_prompt as u64),
-            output_tokens: total_completion as u64,
-        });
-
+        stream.settle_and_record(reservation).await;
         Ok(())
     }
 
@@ -1324,8 +474,10 @@ impl StreamingProcessor {
     ///
     /// Simpler than chat - no tool/reasoning parsing, just text accumulation
     ///
-    /// Note: Caller should attach load guards to the returned response using
-    /// `WorkerLoadGuard::attach_to_response()` for proper RAII lifecycle management.
+    /// The `load_guards` (and the reservation's safety net) ride in the
+    /// response body, released when it is dropped: at the stream's end or
+    /// the client's disconnect.
+    #[expect(clippy::too_many_arguments)]
     pub async fn process_streaming_generate(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
@@ -1333,9 +485,11 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         reservation: Option<Arc<SharedReservationHandle>>,
+        load_guards: Option<context::LoadGuards>,
         source: utils::StreamSource,
     ) -> Response {
         let source = source.with_backend(self.backend_type);
+        let guards = body_guards(load_guards, reservation.as_ref());
         // Create SSE channel
         let (tx, rx) = sse_channel();
 
@@ -1428,7 +582,7 @@ impl StreamingProcessor {
         }
 
         // Return SSE response
-        build_sse_response(rx)
+        build_sse_response_guarded(rx, guards)
     }
 
     /// Process streaming chunks for generate endpoint (no tool/reasoning parsing)
@@ -1448,6 +602,10 @@ impl StreamingProcessor {
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
         // Same prompt for every index; the last Complete's value is as good as any.
         let mut prompt_tokens: u32 = 0;
+        // The cache hit is a property of that shared prompt too (max, not sum);
+        // reasoning is each choice's own, one entry per index.
+        let mut cached_tokens: u32 = 0;
+        let mut reasoning_tokens_map: HashMap<u32, u32> = HashMap::new();
         // Indices that received a `Complete` message -- the only source of
         // authoritative usage. Chunks alone (tracked in `completion_tokens_map`)
         // don't count: an index can start generating and never finish.
@@ -1517,6 +675,8 @@ impl StreamingProcessor {
                     let index_id = format!("{}-{}", ctx.request_id, index);
                     let e2e_latency = start_time.elapsed().as_secs_f64();
                     prompt_tokens = complete.prompt_tokens();
+                    cached_tokens = cached_tokens.max(complete.cached_tokens());
+                    reasoning_tokens_map.insert(index, complete.reasoning_tokens());
                     completed_indices.insert(index);
 
                     // Send final chunk with finish_reason
@@ -1560,6 +720,8 @@ impl StreamingProcessor {
                     .settle_success(UsageSettlement {
                         actual_input_tokens: prompt_tokens,
                         completion_tokens: total_completion,
+                        cached_input_tokens: cached_tokens,
+                        reasoning_tokens: reasoning_tokens_map.values().sum(),
                     })
                     .await;
             } else {
@@ -1654,6 +816,10 @@ impl StreamingProcessor {
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
         // Same prompt for every index; the last Complete's value is as good as any.
         let mut prompt_tokens: u32 = 0;
+        // The cache hit is a property of that shared prompt too (max, not sum);
+        // reasoning is each choice's own, one entry per index.
+        let mut cached_tokens: u32 = 0;
+        let mut reasoning_tokens_map: HashMap<u32, u32> = HashMap::new();
         // Indices that received a `Complete` message -- the only source of
         // authoritative usage. Chunks alone (tracked in `completion_tokens_map`)
         // don't count: an index can start generating and never finish.
@@ -1757,6 +923,8 @@ impl StreamingProcessor {
                     let index_id = format!("{}-{}", ctx.request_id, index);
                     let e2e_latency = start_time.elapsed().as_secs_f64();
                     prompt_tokens = complete.prompt_tokens();
+                    cached_tokens = cached_tokens.max(complete.cached_tokens());
+                    reasoning_tokens_map.insert(index, complete.reasoning_tokens());
                     completed_indices.insert(index);
 
                     // Parse finish_reason
@@ -1808,6 +976,8 @@ impl StreamingProcessor {
                     .settle_success(UsageSettlement {
                         actual_input_tokens: prompt_tokens,
                         completion_tokens: total_completion,
+                        cached_input_tokens: cached_tokens,
+                        reasoning_tokens: reasoning_tokens_map.values().sum(),
                     })
                     .await;
             } else {
@@ -2176,13 +1346,13 @@ impl StreamingProcessor {
         buffer: &mut BytesMut,
         frame: &ChatChunkFrame,
         index: u32,
-        events: &[Event],
+        events: Vec<Event>,
         mut logprobs: Option<ChatLogProbs>,
         usage: Option<&Usage>,
         emit_usage_null: bool,
     ) -> Result<(), String> {
         for event in events {
-            let Some(mut choice) = adapt::chat::delta(index, event) else {
+            let Some(mut choice) = adapt::chat::into_delta(index, event) else {
                 continue;
             };
             if choice.finish_reason.is_some() {
@@ -2265,14 +1435,15 @@ impl StreamingProcessor {
     }
 
     /// Ends Symphony's reading of the message: `flushed`, the text the decoder released last,
-    /// then the engine's `finish`; the events go through the machine ([`Self::send_symphony_blocks`])
-    /// and the reasoning tokens they cost are added to `thinking_tokens`.
+    /// then the engine's `finish`; the events go through the machine ([`Self::send_symphony_blocks`],
+    /// `thinking_text` as there) and the reasoning tokens they cost are added to `thinking_tokens`.
     async fn end_symphony_message(
         tx: &SseSender,
         buffer: &mut Vec<u8>,
         (reader, machine): (&mut Reader, &mut adapt::messages::Stream),
         flushed: Option<&str>,
         finish: EngineFinish,
+        thinking_text: bool,
         thinking_tokens: &mut u32,
     ) -> Result<Option<messages::StopReason>, utils::StreamFailure> {
         let mut events = match flushed {
@@ -2281,16 +1452,19 @@ impl StreamingProcessor {
         };
         events.extend(reader.end(finish)?);
         *thinking_tokens += reasoning_text_tokens(&events);
-        Self::send_symphony_blocks(tx, buffer, machine, &events).await
+        Self::send_symphony_blocks(tx, buffer, machine, &events, thinking_text).await
     }
 
     /// Feeds Symphony's `events` to the content-block `machine` and sends the stream events it
-    /// gives, in order; the stop reason when a `Finish` was among the events.
+    /// gives, in order, the `thinking_delta`s only when `thinking_text` (a `thinking.display` of
+    /// `omitted` keeps the thinking block, its start and its stop, and no text); the stop reason
+    /// when a `Finish` was among the events.
     async fn send_symphony_blocks(
         tx: &SseSender,
         buffer: &mut Vec<u8>,
         machine: &mut adapt::messages::Stream,
         events: &[Event],
+        thinking_text: bool,
     ) -> Result<Option<messages::StopReason>, utils::StreamFailure> {
         let mut stop = None;
         let mut blocks = Vec::new();
@@ -2298,6 +1472,16 @@ impl StreamingProcessor {
             stop = machine.feed(event, &mut blocks).or(stop);
         }
         for block in &blocks {
+            let thinking_delta = matches!(
+                block,
+                MessageStreamEvent::ContentBlockDelta {
+                    delta: ContentBlockDelta::ThinkingDelta { .. },
+                    ..
+                }
+            );
+            if thinking_delta && !thinking_text {
+                continue;
+            }
             Self::send_messages_event(tx, buffer, block).await?;
         }
         Ok(stop)
@@ -2418,7 +1602,9 @@ impl StreamingProcessor {
     /// Process streaming Messages API response and return SSE response.
     ///
     /// Parallel to [`Self::process_streaming_response`] for chat, but emits
-    /// Anthropic SSE format (`event: {type}\ndata: {json}\n\n`).
+    /// Anthropic SSE format (`event: {type}\ndata: {json}\n\n`). The
+    /// `load_guards` (and the reservation's safety net) ride in the response
+    /// body, released when it is dropped.
     #[expect(clippy::too_many_arguments)]
     pub async fn process_messages_streaming_response(
         self: Arc<Self>,
@@ -2428,9 +1614,11 @@ impl StreamingProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         skip_special_tokens: bool,
         reservation: Option<Arc<SharedReservationHandle>>,
+        load_guards: Option<context::LoadGuards>,
         source: utils::StreamSource,
     ) -> Response {
         let source = source.with_backend(self.backend_type);
+        let guards = body_guards(load_guards, reservation.as_ref());
         // The stream's decoder takes the spec's stop sequences; nothing reads
         // them from the spec after this.
         let stop_params = (
@@ -2543,7 +1731,7 @@ impl StreamingProcessor {
             }
         }
 
-        build_sse_response(rx)
+        build_sse_response_guarded(rx, guards)
     }
 
     /// Process Messages API streaming chunks from a single stream.
@@ -2571,6 +1759,9 @@ impl StreamingProcessor {
         let model = &dispatch.model;
 
         let has_tools = original_request.has_tools;
+        // Whether the thinking deltas leave: `thinking.display: "omitted"`
+        // keeps the thinking block, its start and its stop, and no text.
+        let thinking_text_returned = original_request.thinking_text_returned;
 
         // Content block state machine
         let mut current_block_index: u32 = 0;
@@ -2692,7 +1883,7 @@ impl StreamingProcessor {
             .symphony
             .as_ref()
             .map(|assignment| {
-                Reader::new(assignment, chat_tools)
+                Reader::new(assignment, Arc::clone(&original_request.chat_tools))
                     .map(|reader| reader.first_call_only(original_request.first_tool_call_only))
             })
             .transpose()?
@@ -2717,6 +1908,9 @@ impl StreamingProcessor {
         let thinking_requested = original_request.thinking_requested;
         let mut parsed_thinking_tokens: u32 = 0;
         let mut engine_thinking_tokens: u32 = 0;
+        // The engine's cache hit on the prompt, for the settlement: the
+        // Messages usage reports none.
+        let mut cached_tokens: u32 = 0;
         let mut was_in_reasoning = false;
         let mut held_tokens: u32 = 0;
         Self::send_messages_event(
@@ -2772,10 +1966,15 @@ impl StreamingProcessor {
                                 .map(|s| Value::String(s.to_string()));
                         }
                         parsed_thinking_tokens += reasoning_text_tokens(&events);
-                        symphony_stop =
-                            Self::send_symphony_blocks(tx, &mut sse_buffer, machine, &events)
-                                .await?
-                                .or(symphony_stop);
+                        symphony_stop = Self::send_symphony_blocks(
+                            tx,
+                            &mut sse_buffer,
+                            machine,
+                            &events,
+                            thinking_text_returned,
+                        )
+                        .await?
+                        .or(symphony_stop);
                         continue;
                     }
 
@@ -2826,6 +2025,7 @@ impl StreamingProcessor {
                     saw_complete = true;
                     completion_tokens.record_complete(&complete);
                     engine_thinking_tokens = complete.reasoning_tokens();
+                    cached_tokens = complete.cached_tokens();
                     // A local stop-decoder match already pinned "stop"; don't let
                     // the engine's finish reason overwrite it.
                     if !stopped {
@@ -2842,6 +2042,7 @@ impl StreamingProcessor {
                             (reader, machine),
                             flushed.as_deref(),
                             engine_finish(&finish_reason_str),
+                            thinking_text_returned,
                             &mut parsed_thinking_tokens,
                         )
                         .await?
@@ -2891,6 +2092,7 @@ impl StreamingProcessor {
                             (reader, machine),
                             flushed.as_deref(),
                             finish,
+                            thinking_text_returned,
                             &mut parsed_thinking_tokens,
                         )
                         .await?
@@ -2968,17 +2170,19 @@ impl StreamingProcessor {
                     .await?;
                     thinking_block_open = true;
                 }
-                Self::send_messages_event(
-                    tx,
-                    &mut sse_buffer,
-                    &MessageStreamEvent::ContentBlockDelta {
-                        index: current_block_index,
-                        delta: ContentBlockDelta::ThinkingDelta {
-                            thinking: reasoning_chunk_text,
+                if thinking_text_returned {
+                    Self::send_messages_event(
+                        tx,
+                        &mut sse_buffer,
+                        &MessageStreamEvent::ContentBlockDelta {
+                            index: current_block_index,
+                            delta: ContentBlockDelta::ThinkingDelta {
+                                thinking: reasoning_chunk_text,
+                            },
                         },
-                    },
-                )
-                .await?;
+                    )
+                    .await?;
+                }
             }
 
             if final_chunk && normal_text.is_empty() {
@@ -3430,6 +2634,8 @@ impl StreamingProcessor {
                     .settle_success(UsageSettlement {
                         actual_input_tokens: prompt_tokens,
                         completion_tokens: completion_tokens.total(),
+                        cached_input_tokens: cached_tokens,
+                        reasoning_tokens: engine_thinking_tokens,
                     })
                     .await;
             } else {
@@ -3505,7 +2711,9 @@ impl StreamingProcessor {
     /// Batched requests fan out into one stream unit per prompt; all units
     /// write typed SSE events (with prompt-major index offsets) into one
     /// channel, and the coordinator emits the single aggregated usage chunk,
-    /// metrics record, and `[DONE]`.
+    /// metrics record, and `[DONE]`. The `load_guards` (and the reservation's
+    /// safety net) ride in the response body, released when it is dropped.
+    #[expect(clippy::too_many_arguments)]
     pub async fn process_completion_streaming_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
@@ -3513,9 +2721,11 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         reservation: Option<Arc<SharedReservationHandle>>,
+        load_guards: Option<context::LoadGuards>,
         source: utils::StreamSource,
     ) -> Response {
         let source = source.with_backend(self.backend_type);
+        let guards = body_guards(load_guards, reservation.as_ref());
         let (tx, rx) = sse_channel();
 
         let units = match Self::completion_stream_units(execution_result) {
@@ -3523,7 +2733,7 @@ impl StreamingProcessor {
             Err(message) => {
                 utils::send_error_sse(&tx, message, "invalid_request_error").await;
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
-                return build_sse_response(rx);
+                return build_sse_response_guarded(rx, guards);
             }
         };
 
@@ -3650,6 +2860,8 @@ impl StreamingProcessor {
                                 .settle_success(UsageSettlement {
                                     actual_input_tokens: total_prompt,
                                     completion_tokens: total_completion,
+                                    cached_input_tokens: total_cached,
+                                    reasoning_tokens: total_reasoning,
                                 })
                                 .await;
                         } else {
@@ -3698,7 +2910,7 @@ impl StreamingProcessor {
             let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
         });
 
-        build_sse_response(rx)
+        build_sse_response_guarded(rx, guards)
     }
 
     /// Split an execution result into per-prompt stream units, in prompt order.
@@ -4204,6 +3416,1089 @@ impl<'a> ChatChunkWithUsage<'a> {
     }
 }
 
+/// Text a choice's decoder released for one engine message, on its way to
+/// the parsers and the client: the choice index, the text, the logprobs that
+/// ride with it, and the tokens it stands for (held ones included).
+type PendingText = (u32, String, Option<ChatLogProbs>, u32);
+
+/// What one pass of the loop over the engine's end yields.
+enum StreamEnd {
+    /// Every choice's decoder and parsers have had their turn; the loop ends.
+    Finished,
+    /// This pass released nothing to emit.
+    Nothing,
+    /// Text to emit, and whether it is the parsers' EOF turn for its choice.
+    Text(PendingText, bool),
+}
+
+/// One chat completion's SSE stream being read off the engine: what the
+/// spec and the dispatch decide for the whole stream, the per-choice
+/// trackers, decoders, parsers and readers the loop keeps, and the frame,
+/// encoder and buffer the chunks leave through. Each phase of the stream is
+/// a method; `StreamingProcessor::process_streaming_chunks_inner` runs them
+/// in order.
+struct ChatStream<'a> {
+    processor: &'a StreamingProcessor,
+    spec: &'a ChatResponseSpec,
+    /// Dispatch metadata, for consistent response fields.
+    dispatch: &'a context::DispatchMetadata,
+    tx: &'a SseSender,
+    tokenizer: Arc<dyn Tokenizer>,
+    stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
+    pd_timing: Option<context::PdTiming>,
+
+    // Metrics timing
+    start_time: Instant,
+    first_token_time: Option<Instant>,
+
+    /// DeepSeek always reports aggregate usage on the final finish chunk;
+    /// `include_usage` controls null placeholders on earlier chunks only.
+    deepseek_usage: bool,
+    include_usage: bool,
+    emit_usage_null: bool,
+    continuous_usage: Option<ChatStreamUsage>,
+
+    /// Per-request effective parser names (model-card override -> configured),
+    /// and whether each parser is there (checked once upfront, so the warning
+    /// is logged once per request).
+    reasoning_parser_name: Option<String>,
+    tool_parser_name: Option<String>,
+    reasoning_parser_available: bool,
+    tool_parser_available: bool,
+    /// Request building decided whether the rendered prompt ends inside the
+    /// model's thinking block; the parsers then start in reasoning mode.
+    thinking_override: bool,
+    think_in_prefill: bool,
+    /// Whether a JSON schema constraint was used (specific function or
+    /// required mode), and whether it is the specific-function case (the
+    /// model generates the parameters only, no name field; native formats
+    /// include framing tokens the parser must handle).
+    used_json_schema: bool,
+    is_specific_function: bool,
+    /// The first delta's shape: a forced tool call opens as the public API
+    /// opens a tool-call stream; anything else as a text stream.
+    opens_tool_call: bool,
+
+    // Per-choice state (per index, for n>1 support)
+    is_firsts: HashMap<u32, bool>,
+    finish_reasons: HashMap<u32, String>,
+    matched_stops: HashMap<u32, Option<Value>>,
+    /// Indices whose local stop decoder fired: their finish reason is pinned
+    /// to "stop" and later engine output for the index is ignored.
+    stopped_indices: HashSet<u32>,
+    prompt_tokens: HashMap<u32, u32>,
+    completion_tokens: CompletionTokenTracker,
+    cached_tokens: HashMap<u32, u32>,
+    reasoning_tokens: HashMap<u32, u32>,
+    /// Tokens the gateway's reasoning parser routed to reasoning, and tokens
+    /// of chunks that decoded to no text yet (counted with the chunk that
+    /// releases their text).
+    parsed_reasoning_tokens: HashMap<u32, u32>,
+    held_tokens: HashMap<u32, u32>,
+    spec_accepted: HashMap<u32, u32>,
+    spec_drafted: HashMap<u32, u32>,
+    /// Parser state (lazy initialization per index); the parsers are this
+    /// stream's own, nothing else reaches them.
+    reasoning_parsers: HashMap<u32, Box<dyn ReasoningParser>>,
+    tool_parsers: HashMap<u32, Box<dyn ToolParser>>,
+    has_tool_calls: HashMap<u32, bool>,
+    /// Per-index stop decoders (each index needs its own state for n>1 support).
+    stop_decoders: HashMap<u32, StopSequenceDecoder>,
+    /// Symphony reads this response when request building assigned it a table
+    /// (see `regular::symphony`): one reader per choice in place of both
+    /// parsers, seeded with the prompt it replays. The role chunk, the stop
+    /// decoder, the finish chunks and the usage are the same; only the
+    /// reading of the tokens differs.
+    readers: HashMap<u32, Reader>,
+    /// After the engine's end: the (index, parser-EOF) turns still to take,
+    /// one per pass of the loop.
+    final_indices: Option<Vec<(u32, bool)>>,
+
+    /// Reusable SSE encoder for the post-loop flush / tool / finish / usage
+    /// chunks.
+    sse_encoder: SseEncoder,
+    /// The per-chunk SSE frames: the invariant head of every chunk of this
+    /// stream is serialized once; per chunk only its choice (and usage) is
+    /// serialized into `sse_buffer`, whose written bytes are split off for
+    /// the channel instead of being copied.
+    chunk_frame: ChatChunkFrame,
+    sse_buffer: BytesMut,
+}
+
+impl<'a> ChatStream<'a> {
+    /// Phase 1: what the spec, the dispatch and the tokenizer decide for the
+    /// whole stream, and the empty per-choice state.
+    fn open(
+        processor: &'a StreamingProcessor,
+        dispatch: &'a context::DispatchMetadata,
+        tokenizer: Arc<dyn Tokenizer>,
+        stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
+        spec: &'a ChatResponseSpec,
+        tx: &'a SseSender,
+        pd_timing: Option<context::PdTiming>,
+    ) -> Self {
+        let start_time = Instant::now();
+        let model = &dispatch.model;
+
+        let deepseek_usage = spec.provider == ProviderProfile::DeepSeek;
+        let include_usage = spec
+            .stream_options
+            .as_ref()
+            .is_some_and(|opts| opts.include_usage.unwrap_or(false));
+        let emit_usage_null = deepseek_usage && include_usage;
+        let mut continuous_usage = spec
+            .stream_options
+            .as_ref()
+            .filter(|opts| {
+                !deepseek_usage
+                    && opts.include_usage.unwrap_or(false)
+                    && opts.continuous_usage_stats.unwrap_or(false)
+            })
+            .map(|_| ChatStreamUsage::default());
+
+        let reasoning_parser_name = processor.parser_resolver.reasoning_parser(model);
+        let tool_parser_name = processor.parser_resolver.tool_parser(model);
+
+        let reasoning_parser_available = spec.separate_reasoning
+            && utils::check_reasoning_parser_availability(
+                &processor.reasoning_parser_factory,
+                reasoning_parser_name.as_deref(),
+                model,
+            );
+
+        if let Some(usage) = &mut continuous_usage {
+            usage.reasoning_parsed = reasoning_parser_available || spec.symphony.is_some();
+        }
+
+        let native_tool_format = processor
+            .tool_parser_factory
+            .registry()
+            .uses_native_tool_format(tool_parser_name.as_deref());
+        let used_json_schema = if native_tool_format {
+            false
+        } else {
+            spec.tool_choice
+                .as_ref()
+                .is_some_and(ToolChoice::forces_call)
+        };
+        let is_specific_function =
+            used_json_schema && matches!(spec.tool_choice, Some(ToolChoice::Function { .. }));
+
+        let tool_parser_available = spec.tools.is_some()
+            && utils::check_tool_parser_availability(
+                &processor.tool_parser_factory,
+                tool_parser_name.as_deref(),
+                model,
+            );
+
+        if spec.separate_reasoning && !reasoning_parser_available {
+            debug!(
+                "No reasoning parser found for model '{}', skipping reasoning parsing",
+                model
+            );
+        }
+
+        if spec.tools.is_some() && !tool_parser_available {
+            debug!(
+                "No tool parser found for model '{}', skipping tool call parsing",
+                model
+            );
+        }
+
+        let chunk_frame = ChatChunkFrame::new(
+            &dispatch.request_id,
+            model,
+            dispatch.created,
+            dispatch.weight_version.as_deref(),
+        );
+
+        Self {
+            processor,
+            spec,
+            dispatch,
+            tx,
+            think_in_prefill: tokenizer.think_in_prefill(),
+            tokenizer,
+            stop_params,
+            pd_timing,
+            start_time,
+            first_token_time: None,
+            deepseek_usage,
+            include_usage,
+            emit_usage_null,
+            continuous_usage,
+            reasoning_parser_name,
+            tool_parser_name,
+            reasoning_parser_available,
+            tool_parser_available,
+            thinking_override: spec.reasoning_in_prefill,
+            used_json_schema,
+            is_specific_function,
+            opens_tool_call: forces_tool_call(spec),
+            is_firsts: HashMap::new(),
+            finish_reasons: HashMap::new(),
+            matched_stops: HashMap::new(),
+            stopped_indices: HashSet::new(),
+            prompt_tokens: HashMap::new(),
+            completion_tokens: CompletionTokenTracker::new(),
+            cached_tokens: HashMap::new(),
+            reasoning_tokens: HashMap::new(),
+            parsed_reasoning_tokens: HashMap::new(),
+            held_tokens: HashMap::new(),
+            spec_accepted: HashMap::new(),
+            spec_drafted: HashMap::new(),
+            reasoning_parsers: HashMap::new(),
+            tool_parsers: HashMap::new(),
+            has_tool_calls: HashMap::new(),
+            stop_decoders: HashMap::new(),
+            readers: HashMap::new(),
+            final_indices: None,
+            sse_encoder: SseEncoder::new(),
+            chunk_frame,
+            sse_buffer: BytesMut::with_capacity(4096),
+        }
+    }
+
+    /// The usage a chunk carries when the client asked for continuous usage.
+    fn usage_snapshot(&self) -> Option<Usage> {
+        self.continuous_usage
+            .as_ref()
+            .map(|tracker| tracker.snapshot(self.spec.unbilled_prompt_tokens))
+    }
+
+    /// The stream's first engine output, for the TTFT.
+    fn note_first_token(&mut self) {
+        if self.first_token_time.is_none() {
+            self.first_token_time = Some(Instant::now());
+            if let Some(timing) = &self.pd_timing {
+                timing.record_first_decode_token(self.processor.backend_type, &self.dispatch.model);
+            }
+        }
+    }
+
+    /// A choice's first output opens it with the role chunk, as the engine's
+    /// own server does, whether or not that output decodes to visible text (a
+    /// special token the decoder skips, a partial UTF-8 sequence): a client
+    /// timing its first chunk otherwise waits for the next step's text.
+    async fn open_choice(&mut self, index: u32) -> Result<(), String> {
+        if self.is_firsts.get(&index).copied().unwrap_or(true) {
+            let usage = self.usage_snapshot();
+            StreamingProcessor::send_role_chunk(
+                self.tx,
+                &mut self.sse_buffer,
+                &self.chunk_frame,
+                index,
+                self.opens_tool_call,
+                usage.as_ref(),
+                self.emit_usage_null,
+            )
+            .await?;
+            self.is_firsts.insert(index, false);
+        }
+        Ok(())
+    }
+
+    /// The logprobs of an engine chunk, in the public API's shape.
+    fn logprobs_of(&self, chunk: &ProtoGenerateStreamChunk) -> Option<ChatLogProbs> {
+        chunk.output_logprobs().map(|ref proto_logprobs| {
+            utils::convert_proto_to_openai_logprobs(
+                proto_logprobs,
+                &self.tokenizer,
+                self.spec.top_logprobs,
+            )
+        })
+    }
+
+    /// Phase 2: the main loop. The engine stream is polled once per message
+    /// and every message reaches the client as its own frame as soon as it is
+    /// processed; the text a message releases goes through the one emission
+    /// below, so nothing reaches the client without being parsed. After the
+    /// engine's end the loop keeps turning until every choice's decoder and
+    /// parsers have flushed.
+    async fn read_engine(
+        &mut self,
+        grpc_stream: &mut ProtoStream,
+    ) -> Result<(), utils::StreamFailure> {
+        loop {
+            let response = if self.final_indices.is_none() {
+                // The chunks written so far leave as a frame before the
+                // engine is polled, so every engine message reaches the
+                // client as its own frame as soon as it is processed; the
+                // engine stream is polled once per message.
+                StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
+                let item = grpc_stream.next().await;
+                match item.transpose() {
+                    Ok(response) => response,
+                    Err(e) => {
+                        // What was produced before the failure still goes out.
+                        StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
+                        return Err(utils::StreamFailure::upstream(
+                            e,
+                            self.completion_tokens.delivered(),
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+            let mut final_chunk = response.is_none();
+
+            // Text the stop decoder produced for this response, if any. Per-chunk
+            // text and the end-of-stream flush both funnel into the shared emission
+            // below, so neither can reach the client without being parsed.
+            let pending = match response.map(|response| response.into_response()) {
+                Some(ProtoResponseVariant::Chunk(chunk)) => self.read_chunk(chunk).await?,
+                Some(ProtoResponseVariant::Complete(complete)) => {
+                    self.read_complete(complete).await?
+                }
+                Some(ProtoResponseVariant::None) => continue,
+                None => match self.read_end().await? {
+                    StreamEnd::Finished => break,
+                    StreamEnd::Nothing => continue,
+                    StreamEnd::Text(pending, parser_eof) => {
+                        final_chunk = parser_eof;
+                        Some(pending)
+                    }
+                },
+            };
+            let Some(pending) = pending else {
+                continue;
+            };
+            self.emit(pending, final_chunk).await?;
+        }
+
+        StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
+        Ok(())
+    }
+
+    /// An engine chunk: the choice's tokens through its stop decoder (or
+    /// Symphony's reader, which emits its events here) into the text the
+    /// emission parses, with the tokens of chunks that decoded to nothing
+    /// yet counted with it.
+    async fn read_chunk(
+        &mut self,
+        chunk: ProtoGenerateStreamChunk,
+    ) -> Result<Option<PendingText>, utils::StreamFailure> {
+        // Track TTFT immediately on first chunk received from backend
+        self.note_first_token();
+
+        let index = chunk.index();
+
+        // Once the local stop decoder has fired for an index, ignore
+        // any further engine output the backend emits for it.
+        if self.stopped_indices.contains(&index) {
+            return Ok(None);
+        }
+
+        self.completion_tokens.record_chunk(&chunk);
+        if let Some(usage) = &mut self.continuous_usage {
+            usage.record_chunk(&chunk);
+        }
+
+        self.open_choice(index).await?;
+
+        // Get or create stop decoder for this index
+        let stop_decoder = self.stop_decoders.entry(index).or_insert_with(|| {
+            let (ref stop, ref stop_token_ids, skip_special_tokens, no_stop_trim, ignore_eos) =
+                self.stop_params;
+            utils::create_stop_decoder(
+                &self.tokenizer,
+                stop.as_ref(),
+                stop_token_ids.as_ref(),
+                skip_special_tokens,
+                no_stop_trim,
+                ignore_eos,
+            )
+        });
+
+        // Process tokens through stop decoder: Symphony's reader takes
+        // them with their spans and gives events, the older path the text.
+        let symphony_events = match self.spec.symphony.as_ref() {
+            Some(assignment) => {
+                let reader = match self.readers.entry(index) {
+                    Entry::Occupied(reader) => reader.into_mut(),
+                    Entry::Vacant(slot) => slot.insert(
+                        Reader::new(assignment, self.spec.tools.clone().unwrap_or_default())?
+                            .first_call_only(self.spec.first_tool_call_only),
+                    ),
+                };
+                Some(reader.read(stop_decoder, chunk.token_ids())?)
+            }
+            None => None,
+        };
+        let (chunk_text, should_stop) = match &symphony_events {
+            Some((_, stopped)) => (String::new(), *stopped),
+            None => StreamingProcessor::process_chunk_tokens(stop_decoder, chunk.token_ids())?,
+        };
+
+        if should_stop {
+            // Stop-decoder match takes precedence: pin "stop" even if
+            // the backend's eventual Complete carries "length" (the
+            // local stop sequence fired first). Any pre-stop text in
+            // `chunk_text` is still emitted by `emit` before the finish
+            // reason is flushed in Phase 4.
+            self.finish_reasons
+                .entry(index)
+                .or_insert_with(|| "stop".to_string());
+            self.matched_stops.entry(index).or_insert_with(|| {
+                stop_decoder
+                    .matched_stop()
+                    .map(|s| Value::String(s.to_string()))
+            });
+            self.stopped_indices.insert(index);
+        }
+
+        if let Some((events, _)) = symphony_events {
+            // Recorded before the usage is snapshotted, so a continuous
+            // usage counts the reasoning text it rides with.
+            let chunk_reasoning_tokens = reasoning_text_tokens(&events);
+            if chunk_reasoning_tokens > 0 {
+                *self.parsed_reasoning_tokens.entry(index).or_default() += chunk_reasoning_tokens;
+                if let Some(tracker) = &mut self.continuous_usage {
+                    tracker.record_reasoning(index, chunk_reasoning_tokens);
+                }
+            }
+            let usage = self.usage_snapshot();
+            let choice_logprobs = self.logprobs_of(&chunk);
+            StreamingProcessor::push_events(
+                self.tx,
+                &mut self.sse_buffer,
+                &self.chunk_frame,
+                index,
+                events,
+                choice_logprobs,
+                usage.as_ref(),
+                self.emit_usage_null,
+            )
+            .await?;
+            return Ok(None);
+        }
+
+        if chunk_text.is_empty() {
+            *self.held_tokens.entry(index).or_default() += chunk.token_ids().len() as u32;
+            return Ok(None);
+        }
+
+        // Process logprobs if present
+        let choice_logprobs = self.logprobs_of(&chunk);
+
+        let chunk_tokens =
+            chunk.token_ids().len() as u32 + self.held_tokens.remove(&index).unwrap_or(0);
+        Ok(Some((index, chunk_text, choice_logprobs, chunk_tokens)))
+    }
+
+    /// A choice's Complete: its decoder finished, its counts and finish
+    /// reason recorded (a local stop match keeps precedence), and, for a
+    /// choice Symphony reads, its output ended here; otherwise the text the
+    /// decoder still held goes to the emission.
+    async fn read_complete(
+        &mut self,
+        complete: ProtoGenerateComplete,
+    ) -> Result<Option<PendingText>, utils::StreamFailure> {
+        let index = complete.index();
+        let request_id = &self.dispatch.request_id;
+
+        // Complete byte decoding before routing held text through the
+        // same reasoning/tool parsers as ordinary chunks.
+        let flushed = match self.stop_decoders.get_mut(&index) {
+            Some(decoder) => {
+                let tail = decoder.finish().map_err(|e| e.to_string())?;
+                utils::warn_detokenize_recoveries(request_id, index, decoder);
+                if decoder.is_stopped() {
+                    self.stopped_indices.insert(index);
+                    self.finish_reasons.insert(index, "stop".to_string());
+                    self.matched_stops.insert(
+                        index,
+                        decoder.matched_stop().map(|s| Value::String(s.to_string())),
+                    );
+                }
+                match tail {
+                    SequenceDecoderOutput::Text(text)
+                    | SequenceDecoderOutput::StoppedWithText(text)
+                        if !text.is_empty() =>
+                    {
+                        Some(text)
+                    }
+                    _ => None,
+                }
+            }
+            None => None,
+        };
+
+        // Store metadata
+        self.prompt_tokens.insert(index, complete.prompt_tokens());
+
+        self.completion_tokens.record_complete(&complete);
+        if let Some(usage) = &mut self.continuous_usage {
+            usage.record_complete(&complete);
+        }
+
+        // A choice's first engine output may be its Complete (a
+        // completion with no tokens: a finish that carries none
+        // comes without a Chunk). It opens the choice as a first
+        // Chunk does, the role chunk before the finish chunk, and
+        // records the stream's first-token time; its usage, as a
+        // first Chunk's, counts the output it rides on.
+        self.note_first_token();
+        self.open_choice(index).await?;
+
+        self.cached_tokens.insert(index, complete.cached_tokens());
+        self.reasoning_tokens
+            .insert(index, complete.reasoning_tokens());
+        self.spec_accepted
+            .insert(index, complete.spec_accepted_tokens());
+        self.spec_drafted
+            .insert(index, complete.spec_draft_tokens());
+
+        // A local stop-decoder match already pinned "stop" for this
+        // index; don't let the engine's finish reason overwrite it.
+        if !self.stopped_indices.contains(&index) {
+            self.finish_reasons
+                .insert(index, complete.finish_reason().to_string());
+            self.matched_stops
+                .insert(index, complete.matched_stop_json());
+        }
+
+        // Symphony ends the choice's output here: the decoder's last
+        // text, then the engine's finish. The finish chunk is Phase 4's,
+        // with the matched stop; the `Finish` event gives it the calls
+        // made, and the usage the reasoning tokens.
+        if let Some(reader) = self.readers.get_mut(&index) {
+            let reason = self
+                .finish_reasons
+                .get(&index)
+                .map_or("stop", String::as_str);
+            let mut events = match &flushed {
+                Some(text) => reader.tail(text)?,
+                None => Vec::new(),
+            };
+            events.extend(reader.end(engine_finish(reason))?);
+            if let Some(finished) = finished(&events) {
+                self.has_tool_calls.insert(index, finished.tool_calls > 0);
+                self.parsed_reasoning_tokens
+                    .insert(index, finished.reasoning_tokens);
+            }
+            let usage = self.usage_snapshot();
+            StreamingProcessor::push_events(
+                self.tx,
+                &mut self.sse_buffer,
+                &self.chunk_frame,
+                index,
+                events,
+                None,
+                usage.as_ref(),
+                self.emit_usage_null,
+            )
+            .await?;
+            return Ok(None);
+        }
+
+        // Don't break - continue reading all Complete messages for n>1
+        // Text the decoder held for a partial stop match: the
+        // tokens that produced it were counted as held.
+        Ok(flushed.map(|text| {
+            (
+                index,
+                text,
+                None,
+                self.held_tokens.remove(&index).unwrap_or(0),
+            )
+        }))
+    }
+
+    /// The engine's end, one pass per call: first the choices Symphony reads
+    /// whose Complete never came are ended as aborts, then every remaining
+    /// choice's decoder and parsers get their turn, one (index, EOF) turn
+    /// per pass, until none is left.
+    async fn read_end(&mut self) -> Result<StreamEnd, utils::StreamFailure> {
+        let request_id = &self.dispatch.request_id;
+
+        // A choice Symphony reads whose Complete never came: the decoder's
+        // last text is the reader's, then the output ends as an abort so
+        // what the engine holds goes out, as the older parsers' flush
+        // below sends theirs. Those indices are not the loop's below.
+        let mut unended: Vec<u32> = self
+            .readers
+            .iter()
+            .filter(|(_, reader)| !reader.ended())
+            .map(|(index, _)| *index)
+            .collect();
+        unended.sort_unstable();
+        for index in unended {
+            let Some(reader) = self.readers.get_mut(&index) else {
+                continue;
+            };
+            let mut events = Vec::new();
+            if let Some(decoder) = self.stop_decoders.get_mut(&index) {
+                let tail = decoder.finish().map_err(|e| e.to_string())?;
+                utils::warn_detokenize_recoveries(request_id, index, decoder);
+                if decoder.is_stopped() {
+                    self.stopped_indices.insert(index);
+                    self.finish_reasons.insert(index, "stop".to_string());
+                    self.matched_stops.insert(
+                        index,
+                        decoder.matched_stop().map(|s| Value::String(s.to_string())),
+                    );
+                }
+                if let SequenceDecoderOutput::Text(text)
+                | SequenceDecoderOutput::StoppedWithText(text) = tail
+                {
+                    events.extend(reader.tail(&text)?);
+                }
+            }
+            events.extend(reader.end(EngineFinish::Abort)?);
+            // The `Finish` event says what the Complete frame would have:
+            // the calls made, for the finish reason, and the reasoning
+            // tokens, for the usage.
+            if let Some(finished) = finished(&events) {
+                self.has_tool_calls.insert(index, finished.tool_calls > 0);
+                self.parsed_reasoning_tokens
+                    .insert(index, finished.reasoning_tokens);
+            }
+            let usage = self.usage_snapshot();
+            StreamingProcessor::push_events(
+                self.tx,
+                &mut self.sse_buffer,
+                &self.chunk_frame,
+                index,
+                events,
+                None,
+                usage.as_ref(),
+                self.emit_usage_null,
+            )
+            .await?;
+        }
+
+        // Finish decoder text before sending EOF to the parsers. A
+        // clean transport EOF does not supply Complete metadata.
+        let indices = self.final_indices.get_or_insert_with(|| {
+            let mut indices: Vec<_> = self
+                .stop_decoders
+                .keys()
+                .chain(self.reasoning_parsers.keys())
+                .copied()
+                .filter(|index| !self.readers.contains_key(index))
+                .collect();
+            indices.sort_unstable();
+            indices.dedup();
+            indices
+                .into_iter()
+                .flat_map(|index| [(index, true), (index, false)])
+                .collect()
+        });
+        let Some((index, parser_eof)) = indices.pop() else {
+            return Ok(StreamEnd::Finished);
+        };
+        let text = if parser_eof {
+            String::new()
+        } else {
+            match self.stop_decoders.get_mut(&index) {
+                Some(decoder) => {
+                    let tail = decoder.finish().map_err(|e| e.to_string())?;
+                    utils::warn_detokenize_recoveries(request_id, index, decoder);
+                    if decoder.is_stopped() {
+                        self.stopped_indices.insert(index);
+                        self.finish_reasons.insert(index, "stop".to_string());
+                        self.matched_stops.insert(
+                            index,
+                            decoder.matched_stop().map(|s| Value::String(s.to_string())),
+                        );
+                    }
+                    match tail {
+                        SequenceDecoderOutput::Text(text)
+                        | SequenceDecoderOutput::StoppedWithText(text) => text,
+                        _ => String::new(),
+                    }
+                }
+                None => String::new(),
+            }
+        };
+        if !parser_eof && text.is_empty() {
+            return Ok(StreamEnd::Nothing);
+        }
+        Ok(StreamEnd::Text(
+            (
+                index,
+                text,
+                None,
+                self.held_tokens.remove(&index).unwrap_or(0),
+            ),
+            parser_eof,
+        ))
+    }
+
+    /// The one emission: text a message released goes through the reasoning
+    /// parser, then the tool parsers, then out as content, each as the chunks
+    /// the public API streams; `final_chunk` is the parsers' EOF turn.
+    async fn emit(
+        &mut self,
+        pending: PendingText,
+        final_chunk: bool,
+    ) -> Result<(), utils::StreamFailure> {
+        let (index, text, mut choice_logprobs, chunk_tokens) = pending;
+        let model = &self.dispatch.model;
+        let mut usage = self.usage_snapshot();
+
+        // Text that reaches here without an engine chunk before it (a
+        // decoder flush on the terminal frame) still opens its choice.
+        self.open_choice(index).await?;
+
+        // Calculate delta
+        let mut delta = text;
+
+        // Reasoning content handling
+        let in_reasoning = if self.spec.separate_reasoning && self.reasoning_parser_available {
+            let (normal_text, reasoning_choice, in_reasoning, chunk_reasoning_tokens) =
+                self.processor.process_reasoning_stream(
+                    (!final_chunk).then_some(delta.as_str()),
+                    chunk_tokens,
+                    index,
+                    &mut self.reasoning_parsers,
+                    self.thinking_override,
+                    self.think_in_prefill,
+                    self.reasoning_parser_name.as_deref(),
+                    model,
+                );
+            // Recorded before this frame's usage is snapshotted again, so
+            // a continuous usage counts the reasoning text it rides with,
+            // and the content or tool chunks that follow in the frame
+            // agree with it.
+            if chunk_reasoning_tokens > 0 {
+                *self.parsed_reasoning_tokens.entry(index).or_default() += chunk_reasoning_tokens;
+                if let Some(tracker) = &mut self.continuous_usage {
+                    tracker.record_reasoning(index, chunk_reasoning_tokens);
+                    usage = Some(tracker.snapshot(self.spec.unbilled_prompt_tokens));
+                }
+            }
+            if let Some(mut choice) = reasoning_choice {
+                // The chunk's token logprobs ride on its reasoning delta when
+                // none of its text is content, as on a content delta.
+                if normal_text.is_empty() {
+                    choice.logprobs = choice_logprobs.take();
+                }
+                StreamingProcessor::push_chunk(
+                    self.tx,
+                    &mut self.sse_buffer,
+                    &self.chunk_frame,
+                    &choice,
+                    usage.as_ref(),
+                    self.emit_usage_null,
+                )
+                .await
+                .map_err(|()| "Failed to send reasoning chunk".to_string())?;
+            }
+            delta = normal_text;
+            in_reasoning
+        } else {
+            false
+        };
+
+        if final_chunk && delta.is_empty() {
+            return Ok(());
+        }
+
+        // Tool call handling
+        let tool_choice_enabled = !matches!(
+            self.spec.tool_choice,
+            Some(ToolChoice::Value(ToolChoiceValue::None))
+        );
+
+        if let Some(tools_ref) = self.spec.tools.as_ref() {
+            if !in_reasoning
+                && tool_choice_enabled
+                && (self.tool_parser_available || self.used_json_schema)
+            {
+                let tool_choices = if self.is_specific_function {
+                    // Handle specific function case - emit tool call deltas with arguments
+                    StreamingProcessor::process_specific_function_stream(
+                        &delta,
+                        index,
+                        &mut self.has_tool_calls,
+                        self.spec.tool_choice.as_ref(),
+                        model,
+                        self.spec.history_tool_calls_count,
+                    )
+                } else {
+                    // Use incremental parser for regular/required modes
+                    self.processor
+                        .process_tool_calls_stream(
+                            &delta,
+                            index,
+                            &mut self.tool_parsers,
+                            &mut self.has_tool_calls,
+                            tools_ref,
+                            self.tool_parser_name.as_deref(),
+                            model,
+                            self.spec.history_tool_calls_count,
+                            self.used_json_schema,
+                            self.spec.first_tool_call_only,
+                        )
+                        .await
+                };
+
+                for choice in &tool_choices {
+                    StreamingProcessor::push_chunk(
+                        self.tx,
+                        &mut self.sse_buffer,
+                        &self.chunk_frame,
+                        choice,
+                        usage.as_ref(),
+                        self.emit_usage_null,
+                    )
+                    .await
+                    .map_err(|()| "Failed to send tool call chunk".to_string())?;
+                }
+
+                // Always skip regular content when tool parsing is active
+                // Parser either emitted chunks or buffered content
+                return Ok(());
+            }
+        }
+
+        // Regular content emission
+        if !delta.is_empty() {
+            let mut choice = assistant_choice(index, Some(delta), None, None);
+            choice.logprobs = choice_logprobs;
+            StreamingProcessor::push_chunk(
+                self.tx,
+                &mut self.sse_buffer,
+                &self.chunk_frame,
+                &choice,
+                usage.as_ref(),
+                self.emit_usage_null,
+            )
+            .await
+            .map_err(|()| "Failed to send content chunk".to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Phase 3: the end-of-stream parser flush: first any text still buffered
+    /// as a prospective tool call that never materialized (dropping it
+    /// produced fully-empty streams), then any parsed-but-unstreamed tool
+    /// arguments.
+    async fn flush_parsers(&mut self, usage: Option<&Usage>) -> Result<(), utils::StreamFailure> {
+        let request_id = &self.dispatch.request_id;
+        let model = &self.dispatch.model;
+        let created = self.dispatch.created;
+        let system_fingerprint = self.dispatch.weight_version.as_deref();
+
+        for (index, parser_guard) in &mut self.tool_parsers {
+            let leftover_text = parser_guard.take_unstreamed_normal_text();
+            if !leftover_text.is_empty() {
+                let content_chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                    .created(created)
+                    .add_choice_content_with_logprobs(*index, leftover_text, None)
+                    .maybe_system_fingerprint(system_fingerprint)
+                    .maybe_usage(usage.cloned())
+                    .build();
+
+                let sse_chunk = self
+                    .sse_encoder
+                    .encode_data(&ChatChunkWithUsage::new(
+                        &content_chunk,
+                        self.emit_usage_null,
+                    ))
+                    .map_err(|e| format!("Failed to serialize content chunk: {e}"))?;
+                self.tx
+                    .send(Ok(sse_chunk))
+                    .await
+                    .map_err(|_| "Failed to send flushed content chunk".to_string())?;
+            }
+
+            if let Some(mut unstreamed_items) = parser_guard.get_unstreamed_tool_args() {
+                if self.spec.first_tool_call_only {
+                    utils::keep_first_tool_call_items(&mut unstreamed_items);
+                }
+                for tool_call_item in unstreamed_items {
+                    let tool_call_delta = ToolCallDelta {
+                        index: tool_call_item.tool_index as u32,
+                        id: None,
+                        tool_type: None,
+                        function: Some(FunctionCallDelta {
+                            name: None,
+                            arguments: if tool_call_item.parameters.is_empty() {
+                                None
+                            } else {
+                                Some(tool_call_item.parameters)
+                            },
+                        }),
+                    };
+
+                    let tool_chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                        .created(created)
+                        .add_choice_tool_call_delta(*index, tool_call_delta)
+                        .maybe_system_fingerprint(system_fingerprint)
+                        .maybe_usage(usage.cloned())
+                        .build();
+
+                    let sse_chunk = self
+                        .sse_encoder
+                        .encode_data(&ChatChunkWithUsage::new(&tool_chunk, self.emit_usage_null))
+                        .map_err(|e| format!("Failed to serialize tool chunk: {e}"))?;
+                    self.tx
+                        .send(Ok(sse_chunk))
+                        .await
+                        .map_err(|_| "Failed to send unstreamed tool args".to_string())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The counters once, for the usage chunk, the settlement and the
+    /// metrics: every choice shares one prompt, so prompt/cache counts take
+    /// max; completion and reasoning counts sum across choices.
+    fn counts(&self) -> TokenCounts {
+        TokenCounts {
+            prompt: self.prompt_tokens.values().copied().max().unwrap_or(0),
+            completion: self.completion_tokens.total(),
+            cached: self.cached_tokens.values().copied().max().unwrap_or(0),
+            reasoning: self.reasoning_tokens.values().sum(),
+            spec_accepted: self.spec_accepted.values().sum(),
+            spec_drafted: self.spec_drafted.values().sum(),
+        }
+    }
+
+    /// The stream's usage when the client asked for one, from
+    /// [`Self::counts`]. Built by the non-streamed answer's builder: the
+    /// usage chunk carries the usage object that answer carries.
+    fn final_usage(&self) -> Option<Usage> {
+        (self.deepseek_usage || self.include_usage).then(|| {
+            chat_usage(
+                self.counts().usage(),
+                (self.reasoning_parser_available || self.spec.symphony.is_some())
+                    .then(|| self.parsed_reasoning_tokens.values().sum()),
+                self.spec.unbilled_prompt_tokens,
+            )
+        })
+    }
+
+    /// Phase 4: the finish reason chunks. Partial counters are not advertised
+    /// as a final aggregate if the backend omitted a choice's Complete frame.
+    async fn send_finish_chunks(
+        &mut self,
+        final_usage: Option<&Usage>,
+        usage: Option<&Usage>,
+    ) -> Result<(), utils::StreamFailure> {
+        let request_id = &self.dispatch.request_id;
+        let model = &self.dispatch.model;
+        let created = self.dispatch.created;
+        let system_fingerprint = self.dispatch.weight_version.as_deref();
+
+        let complete_usage = self.prompt_tokens.len() as u32 >= self.spec.expected_choices;
+        for (position, (index, finish_reason)) in self.finish_reasons.iter().enumerate() {
+            let final_finish_reason = if self.has_tool_calls.get(index).copied().unwrap_or(false)
+                && finish_reason == "stop"
+            {
+                "tool_calls".to_string()
+            } else {
+                finish_reason.clone()
+            };
+
+            let matched_stop_value = self.matched_stops.get(index).and_then(|v| v.clone());
+
+            let finish_usage = if self.deepseek_usage
+                && complete_usage
+                && position + 1 == self.finish_reasons.len()
+            {
+                final_usage.cloned()
+            } else {
+                usage.cloned()
+            };
+            let finish_chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                .created(created)
+                .add_choice_finish_reason(*index, final_finish_reason, matched_stop_value)
+                .maybe_system_fingerprint(system_fingerprint)
+                .maybe_usage(finish_usage)
+                .build();
+
+            let sse_chunk = self
+                .sse_encoder
+                .encode_data(&ChatChunkWithUsage::new(
+                    &finish_chunk,
+                    self.emit_usage_null,
+                ))
+                .map_err(|e| format!("Failed to serialize finish chunk: {e}"))?;
+            self.tx
+                .send(Ok(sse_chunk))
+                .await
+                .map_err(|_| "Failed to send finish chunk".to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Phase 5: the OpenAI dialect keeps its opt-in, usage-only chunk.
+    async fn send_usage_chunk(
+        &mut self,
+        final_usage: Option<Usage>,
+    ) -> Result<(), utils::StreamFailure> {
+        if !self.deepseek_usage {
+            if let Some(final_usage) = final_usage {
+                let usage_chunk = ChatCompletionStreamResponse::builder(
+                    &self.dispatch.request_id,
+                    &self.dispatch.model,
+                )
+                .created(self.dispatch.created)
+                .usage(final_usage)
+                .maybe_system_fingerprint(self.dispatch.weight_version.as_deref())
+                .build();
+                let sse_chunk = self
+                    .sse_encoder
+                    .encode_data(&usage_chunk)
+                    .map_err(|e| format!("Failed to serialize usage chunk: {e}"))?;
+                self.tx
+                    .send(Ok(sse_chunk))
+                    .await
+                    .map_err(|_| "Failed to send usage chunk".to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The end: the reservation settled with what the stream used
+    /// ([`Self::counts`], the engine's counts as they are), and the
+    /// streaming metrics recorded.
+    async fn settle_and_record(self, reservation: Option<Arc<SharedReservationHandle>>) {
+        let model = &self.dispatch.model;
+        let counts = self.counts();
+        let (total_prompt, total_completion) = (counts.prompt, counts.completion);
+        if let Some(handle) = reservation {
+            // `prompt_tokens` is only ever populated from a `Complete` message,
+            // one entry per index. A clean EOF that didn't produce one for
+            // every expected `n>1` choice has only partial usage -- settling
+            // with that would understate the real cost. Keep the reserved
+            // amount as final instead.
+            let expected_choices = self.spec.expected_choices;
+            if (self.prompt_tokens.len() as u32) < expected_choices {
+                handle.close_reserved_only().await;
+            } else {
+                handle.settle_success(counts.settlement()).await;
+            }
+        }
+        // In PD mode this task only starts once the decode stream exists --
+        // for sequential PD that is after prefill completes, with the first
+        // decode chunk already buffered -- so `start_time` would report a
+        // near-zero TTFT. Anchor at the prefill dispatch instant instead;
+        // generation duration must share the base or TPOT underflows.
+        let stream_base = self
+            .pd_timing
+            .as_ref()
+            .map(|timing| timing.prefill_start)
+            .unwrap_or(self.start_time);
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: self.processor.backend_type,
+            model_id: model,
+            endpoint: metrics_labels::ENDPOINT_CHAT,
+            ttft: self.first_token_time.map(|t| t.duration_since(stream_base)),
+            generation_duration: stream_base.elapsed(),
+            input_tokens: Some(total_prompt as u64),
+            output_tokens: total_completion as u64,
+        });
+    }
+}
+
 /// Buffered chat chunks are flushed to the response channel at this size even
 /// while the engine keeps more ready, so one frame stays a bounded burst.
 const CHUNK_FLUSH_BYTES: usize = 16 * 1024;
@@ -4430,6 +4725,8 @@ mod failure_tests;
 mod pd_usage_tests;
 #[cfg(test)]
 mod symphony_tests;
+#[cfg(test)]
+mod thinking_display_tests;
 #[cfg(test)]
 mod usage_chunk_tests;
 

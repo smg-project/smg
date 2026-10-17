@@ -23,16 +23,11 @@ process manager's inputs, on a config missing any one of them.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from functools import cached_property
 from typing import Any
 
-
-def _positive_int(value: Any) -> int | None:
-    """``value`` as a count above zero, else ``None`` (a bool is not a count)."""
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        return None
-    return value
+from smg_grpc_servicer.config_view import attr_int, attr_str, positive_int
 
 
 def token_ids(value: Any) -> list[int]:
@@ -55,6 +50,42 @@ def hf_eos_token_ids(model_config: Any) -> list[int]:
 def uses_mrope(model_config: Any) -> bool:
     """Whether the model positions tokens with M-RoPE (its media carry grids)."""
     return bool(getattr(model_config, "uses_mrope", False))
+
+
+def multimodal_config(model_config: Any) -> Any | None:
+    """``ModelConfig.multimodal_config`` as given, else what the accessor
+    ``get_multimodal_config()`` answers (a config that keeps the section behind
+    the accessor alone); ``None`` on a text model, where the engine's accessor
+    raises. The one lookup of the section: :class:`MultimodalSection` and the
+    Rust launcher's readers of it resolve the section here."""
+    mm_config = getattr(model_config, "multimodal_config", None)
+    if mm_config is not None:
+        return mm_config
+    accessor = getattr(model_config, "get_multimodal_config", None)
+    if not callable(accessor):
+        return None
+    try:
+        return accessor()
+    except ValueError:  # the engine's answer on a text model
+        return None
+
+
+def mm_processor_kwargs(model_config: Any) -> dict[str, Any]:
+    """The engine's ``--mm-processor-kwargs`` as its config carries them once
+    built: ``multimodal_config.mm_processor_kwargs``, a copy; ``{}`` when there
+    are none (a text model, a section without the field, a value that is not a
+    mapping).
+
+    ``ModelConfig`` declares ``mm_processor_kwargs`` init-only (a dataclass
+    ``InitVar``): ``__post_init__`` moves the value into the multimodal section
+    and the attribute on the instance reads as the class default, ``None``,
+    whatever the launcher was given. So the section is the one place to read
+    them; a reader of the instance attribute saw no kwargs on any engine, and a
+    stub that set the attribute hid that. Every reader of the kwargs (the
+    worker-side pipeline's options, the sidecar fingerprint) goes through here.
+    """
+    kwargs = getattr(multimodal_config(model_config), "mm_processor_kwargs", None)
+    return dict(kwargs) if isinstance(kwargs, Mapping) else {}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -91,10 +122,10 @@ class ModelSection:
             max_model_len=int(model_config.max_model_len),
             vocab_size=int(model_config.get_vocab_size()),
             architectures=[str(a) for a in (getattr(model_config, "architectures", None) or [])],
-            model_type=str(getattr(hf_config, "model_type", None) or ""),
+            model_type=attr_str(hf_config, "model_type"),
             hf_eos_token_ids=hf_eos_token_ids(model_config),
-            pad_token_id=int(getattr(hf_config, "pad_token_id", None) or 0),
-            bos_token_id=int(getattr(hf_config, "bos_token_id", None) or 0),
+            pad_token_id=attr_int(hf_config, "pad_token_id"),
+            bos_token_id=attr_int(hf_config, "bos_token_id"),
             tokenizer_revision=getattr(model_config, "tokenizer_revision", None)
             or getattr(model_config, "revision", None),
         )
@@ -102,10 +133,10 @@ class ModelSection:
 
 @dataclasses.dataclass(frozen=True)
 class MultimodalSection:
-    """``ModelConfig.multimodal_config``, for a multimodal model: whether the
-    engine normalizes pixels on device, and its per-prompt limit accessor
-    (``get_limit_per_prompt``), ``None`` on a text model or a config without
-    the accessor."""
+    """``ModelConfig.multimodal_config`` (resolved by :func:`multimodal_config`),
+    for a multimodal model: whether the engine normalizes pixels on device, and
+    its per-prompt limit accessor (``get_limit_per_prompt``), ``None`` on a text
+    model or a config without the accessor."""
 
     is_multimodal: bool
     device_do_normalize: bool
@@ -115,7 +146,7 @@ class MultimodalSection:
     def read(cls, model_config: Any) -> MultimodalSection:
         if not getattr(model_config, "is_multimodal_model", False):
             return cls(is_multimodal=False, device_do_normalize=False, limit_per_prompt=None)
-        mm_config = getattr(model_config, "multimodal_config", None)
+        mm_config = multimodal_config(model_config)
         get_limit = getattr(mm_config, "get_limit_per_prompt", None)
         return cls(
             is_multimodal=True,
@@ -141,8 +172,8 @@ class ParallelSection:
     def read(cls, vllm_config: Any) -> ParallelSection:
         parallel = getattr(vllm_config, "parallel_config", None)
         return cls(
-            data_parallel_size=_positive_int(getattr(parallel, "data_parallel_size", None)),
-            data_parallel_rank=_positive_int(getattr(parallel, "data_parallel_rank", 0)) or 0,
+            data_parallel_size=positive_int(getattr(parallel, "data_parallel_size", None)),
+            data_parallel_rank=positive_int(getattr(parallel, "data_parallel_rank", 0)) or 0,
             node_rank_within_dp=getattr(parallel, "node_rank_within_dp", 0),
             data_parallel_backend=getattr(parallel, "data_parallel_backend", "mp"),
         )
@@ -187,8 +218,8 @@ class CacheSection:
         dtype = getattr(cache, "cache_dtype", None)
         return cls(
             cache_dtype=str(dtype) if dtype else None,
-            block_size=_positive_int(getattr(cache, "block_size", None)),
-            num_gpu_blocks=_positive_int(getattr(cache, "num_gpu_blocks", None)),
+            block_size=positive_int(getattr(cache, "block_size", None)),
+            num_gpu_blocks=positive_int(getattr(cache, "num_gpu_blocks", None)),
         )
 
 
@@ -328,7 +359,7 @@ class EngineConfigView:
         """The scheduler's running window (``--max-num-seqs``); 0 when the
         config does not carry a count."""
         scheduler = getattr(self._config, "scheduler_config", None)
-        return _positive_int(getattr(scheduler, "max_num_seqs", None)) or 0
+        return positive_int(getattr(scheduler, "max_num_seqs", None)) or 0
 
     @cached_property
     def cache(self) -> CacheSection:

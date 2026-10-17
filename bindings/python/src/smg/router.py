@@ -133,6 +133,7 @@ def build_control_plane_auth_config(
             audience=jwt_audience,
             jwks_uri=args_dict.get("jwt_jwks_uri"),
             role_mapping=args_dict.get("jwt_role_mapping", {}),
+            role_claim=args_dict.get("jwt_role_claim", "roles"),
         )
 
     return PyControlPlaneAuthConfig(
@@ -239,6 +240,10 @@ class Router:
         log_dir: Directory to store log files. If None, logs are only output to
             console. Default: None
         log_level: Logging level. Options: 'debug', 'info', 'warn', 'error'.
+        access_log_fields: Optional fields of the access-log record, each written
+            once listed: 'client_addr', 'forwarded_for', 'user_agent', 'tenant',
+            'key_id', 'request_bytes', 'response_bytes', 'worker'. An empty list
+            keeps the record's fields as they have always been. Default: []
         service_discovery: Enable Kubernetes service discovery. When enabled, the
             router will automatically discover worker pods based on the selector.
             Default: False
@@ -483,6 +488,7 @@ class Router:
             "jwt_audience",
             "jwt_jwks_uri",
             "jwt_role_mapping",
+            "jwt_role_claim",
         ]
         for field in fields_to_remove:
             args_dict.pop(field, None)

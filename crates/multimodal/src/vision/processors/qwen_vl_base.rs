@@ -1386,9 +1386,11 @@ impl QwenVLProcessorBase {
 
     /// [`patchify_image_rgb_into`](Self::patchify_image_rgb_into) writing
     /// `writer`'s words instead of the bytes: the same blocks, the same
-    /// order, each source row split into its channel runs once and each run
-    /// converted straight into its place in the patch layout (and its
-    /// temporal copies).
+    /// order. A sub-patch's source rows are split once into its three
+    /// channel planes (the vector loads of the byte layout), each plane is
+    /// converted in one run into its first temporal copy, and the other
+    /// copies repeat the converted words; nothing is converted per row or
+    /// per temporal copy.
     fn patchify_image_rgb_wire_into(
         &self,
         image: &DynamicImage,
@@ -1464,10 +1466,20 @@ impl QwenVLProcessorBase {
         writer: &WireWriter,
     ) {
         let element_size = writer.element_size();
-        // One sub-patch's channel block: `[temporal, patch_h, patch_w]`.
-        let channel = temporal_patch_size * patch_size * patch_size;
+        // One sub-patch's channel plane, `[patch_h, patch_w]`; its channel
+        // block is the plane's temporal copies, `[temporal, patch_h,
+        // patch_w]`.
+        let plane = patch_size * patch_size;
+        let channel = temporal_patch_size * plane;
+        let plane_bytes = plane * element_size;
         let block_bytes = merge_size * merge_size * 3 * channel * element_size;
-        let mut runs = vec![0u8; 3 * patch_size];
+        let splitter = rgb_runs::RgbSplitter::detect();
+        // One sub-patch's three channel planes as pixel bytes: the source
+        // rows split into their channel runs with the vector loads of the
+        // byte layout, then each plane converted in one run (not a row's
+        // worth at a time) into its first temporal copy, which the other
+        // copies repeat.
+        let mut planes = vec![0u8; 3 * plane];
         for (bi, chunk) in band.chunks_mut(block_bytes).enumerate() {
             let blk = block_start + bi;
             let pr = blk / pc_blocks;
@@ -1476,39 +1488,29 @@ impl QwenVLProcessorBase {
             let x0 = pc * merged_patch;
             for mh in 0..merge_size {
                 for mw in 0..merge_size {
-                    let base = (mh * merge_size + mw) * 3 * channel;
-                    for py in 0..patch_size {
-                        let row = (y0 + mh * patch_size + py) * width + x0 + mw * patch_size;
-                        let pixels = &raw[row * 3..(row + patch_size) * 3];
-                        // The row's three channel runs, then each run to its
-                        // places (the temporal copies repeat it).
-                        let (red, rest) = runs.split_at_mut(patch_size);
-                        let (green, blue) = rest.split_at_mut(patch_size);
-                        for (((pixel, r), g), b) in pixels
-                            .as_chunks::<3>()
-                            .0
-                            .iter()
-                            .zip(red.iter_mut())
-                            .zip(green.iter_mut())
-                            .zip(blue.iter_mut())
-                        {
-                            *r = pixel[0];
-                            *g = pixel[1];
-                            *b = pixel[2];
+                    {
+                        let (red, rest) = planes.split_at_mut(plane);
+                        let (green, blue) = rest.split_at_mut(plane);
+                        for py in 0..patch_size {
+                            let row = (y0 + mh * patch_size + py) * width + x0 + mw * patch_size;
+                            let pixels = &raw[row * 3..(row + patch_size) * 3];
+                            let at = py * patch_size;
+                            splitter.split(
+                                pixels,
+                                &mut red[at..at + patch_size],
+                                &mut green[at..at + patch_size],
+                                &mut blue[at..at + patch_size],
+                            );
                         }
-                        for (c, run) in [&*red, &*green, &*blue].into_iter().enumerate() {
-                            for tp in 0..temporal_patch_size {
-                                let at = (base
-                                    + c * channel
-                                    + tp * patch_size * patch_size
-                                    + py * patch_size)
-                                    * element_size;
-                                writer.write_run(
-                                    &mut chunk[at..at + patch_size * element_size],
-                                    run,
-                                    c,
-                                );
-                            }
+                    }
+                    let base = (mh * merge_size + mw) * 3 * channel;
+                    for (c, source) in planes.chunks(plane).enumerate() {
+                        let start = (base + c * channel) * element_size;
+                        let (first, copies) =
+                            chunk[start..start + channel * element_size].split_at_mut(plane_bytes);
+                        writer.write_run(first, source, c);
+                        for copy in copies.chunks_mut(plane_bytes) {
+                            copy.copy_from_slice(first);
                         }
                     }
                 }

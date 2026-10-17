@@ -19,7 +19,10 @@ use tool_parser::{
 };
 use tracing::warn;
 
-use crate::{routers::grpc::context::WorkerSelection, worker::WorkerRegistry};
+use crate::{
+    routers::grpc::context::WorkerSelection,
+    worker::{Worker, WorkerRegistry, WorkerType},
+};
 
 /// Per-request parser-name resolution.
 ///
@@ -369,37 +372,69 @@ pub fn messages_reasoning_starts_in_prefill(
 }
 
 /// Where the selected worker's engine starts a request's grammar on a prompt
-/// that ends inside the model's thinking block, from its
-/// `constrained_decoding_start` label (the servicers advertise it off the
-/// engine's config); under PD the decode worker's, whose engine generates the
-/// tokens the grammar constrains. Unknown without a selection or a label.
+/// that ends inside the model's thinking block ([`WorkerDecoding::start`]).
 pub fn grammar_start_for(workers: Option<&WorkerSelection>) -> GrammarStart {
-    let worker = match workers {
-        Some(WorkerSelection::Single { worker }) => worker,
-        Some(WorkerSelection::Disaggregated { decode, .. }) => decode,
-        None => return GrammarStart::Unknown,
-    };
-    GrammarStart::from_label(
-        worker
-            .metadata()
-            .spec
-            .labels
-            .get(GrammarStart::LABEL)
-            .map(String::as_str),
-    )
+    WorkerDecoding::of(workers).start
 }
 
-/// Whether the selected worker's engine takes a grammar on every turn or only
-/// when the request asks, from its spec or its `constrained_decoding` label
-/// ([`ConstrainedDecoding::of`]); under PD the decode worker's, whose engine
-/// generates the tokens the grammar constrains. `Requested` without a selection.
-pub fn constrained_decoding_for(workers: Option<&WorkerSelection>) -> ConstrainedDecoding {
-    let worker = match workers {
-        Some(WorkerSelection::Single { worker }) => worker,
-        Some(WorkerSelection::Disaggregated { decode, .. }) => decode,
-        None => return ConstrainedDecoding::Requested,
-    };
-    ConstrainedDecoding::of(&worker.metadata().spec)
+/// The selected worker's constrained decoding; under PD the decode worker's,
+/// whose engine generates the tokens the grammar constrains. Request building
+/// decides a request's constraint on it (`regular::symphony::worker_constraint`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkerDecoding {
+    /// Whether the engine takes a grammar on every turn or only when the
+    /// request asks, from the worker's spec or its `constrained_decoding`
+    /// label ([`ConstrainedDecoding::of`]); `requested` without a selection.
+    pub policy: ConstrainedDecoding,
+    /// Where the engine starts a grammar on a prompt that ends inside the
+    /// model's thinking block, from the worker's `constrained_decoding_start`
+    /// label (the servicers advertise it off the engine's config); unknown
+    /// without a selection or a label.
+    pub start: GrammarStart,
+}
+
+impl WorkerDecoding {
+    pub fn of(workers: Option<&WorkerSelection>) -> Self {
+        match workers {
+            Some(WorkerSelection::Single { worker }) => Self::of_worker(worker.as_ref()),
+            Some(WorkerSelection::Disaggregated { decode, .. }) => Self::of_worker(decode.as_ref()),
+            None => Self {
+                policy: ConstrainedDecoding::Requested,
+                start: GrammarStart::Unknown,
+            },
+        }
+    }
+
+    fn of_worker(worker: &dyn Worker) -> Self {
+        let spec = &worker.metadata().spec;
+        Self {
+            policy: ConstrainedDecoding::of(spec),
+            start: GrammarStart::from_label(
+                spec.labels.get(GrammarStart::LABEL).map(String::as_str),
+            ),
+        }
+    }
+
+    /// The whole turn's grammar applies: the engine takes a grammar on every
+    /// turn and starts it at the first token.
+    pub fn takes_the_whole_turn(self) -> bool {
+        self.policy == ConstrainedDecoding::Always && self.start == GrammarStart::FirstToken
+    }
+
+    /// Whether `worker` decides a request's constraint as this one does: the
+    /// same policy, and the whole turn's grammar on both or on neither. A plan
+    /// whose constraint the policy chose holds a retry to such workers, since
+    /// the decision reads the request, which is gone once the plan is built;
+    /// the attempt stamp shapes a tag for the start of the worker the retry
+    /// takes (`helpers::ToolConstraintStamp`). A prefill worker generates no
+    /// token a grammar constrains.
+    pub fn decides_alike(self, worker: &dyn Worker) -> bool {
+        if *worker.worker_type() == WorkerType::Prefill {
+            return true;
+        }
+        let other = Self::of_worker(worker);
+        other.policy == self.policy && other.takes_the_whole_turn() == self.takes_the_whole_turn()
+    }
 }
 
 /// The request's tool constraint, shaped for the worker that will run it. A
@@ -671,19 +706,19 @@ mod tests {
     #[test]
     fn constrained_decoding_follows_the_spec_then_the_label_of_the_decode_worker() {
         assert_eq!(
-            constrained_decoding_for(None),
+            WorkerDecoding::of(None).policy,
             ConstrainedDecoding::Requested
         );
         assert_eq!(
-            constrained_decoding_for(Some(&worker(&[("constrained_decoding", "always")]))),
+            WorkerDecoding::of(Some(&worker(&[("constrained_decoding", "always")]))).policy,
             ConstrainedDecoding::Always
         );
         assert_eq!(
-            constrained_decoding_for(Some(&worker(&[("constrained_decoding", "sometimes")]))),
+            WorkerDecoding::of(Some(&worker(&[("constrained_decoding", "sometimes")]))).policy,
             ConstrainedDecoding::Requested
         );
         assert_eq!(
-            constrained_decoding_for(Some(&worker(&[]))),
+            WorkerDecoding::of(Some(&worker(&[]))).policy,
             ConstrainedDecoding::Requested
         );
         let spec_wins = BasicWorkerBuilder::new("grpc://engine:50051")
@@ -692,9 +727,10 @@ mod tests {
             .constrained_decoding(ConstrainedDecoding::Always)
             .build();
         assert_eq!(
-            constrained_decoding_for(Some(&WorkerSelection::Single {
+            WorkerDecoding::of(Some(&WorkerSelection::Single {
                 worker: Arc::new(spec_wins),
-            })),
+            }))
+            .policy,
             ConstrainedDecoding::Always
         );
         let prefill = Arc::new(
@@ -709,14 +745,52 @@ mod tests {
                 .build(),
         );
         assert_eq!(
-            constrained_decoding_for(Some(&WorkerSelection::Disaggregated {
+            WorkerDecoding::of(Some(&WorkerSelection::Disaggregated {
                 encode_assignments: None,
                 prefill,
                 decode,
                 runtime_type: openai_protocol::worker::RuntimeType::TokenSpeed,
-            })),
+            }))
+            .policy,
             ConstrainedDecoding::Requested
         );
+    }
+
+    /// A retry takes only workers that decide a request's constraint as the
+    /// first attempt's did: under `requested` whatever the start, under
+    /// `always` the whole turn's grammar on both or on neither; and any
+    /// prefill worker, which generates no token a grammar constrains.
+    #[test]
+    fn a_retry_takes_only_workers_that_decide_the_constraint_alike() {
+        let always = ("constrained_decoding", "always");
+        let labels: [&[(&str, &str)]; 5] = [
+            &[],
+            &[("constrained_decoding_start", "first_token")],
+            &[always, ("constrained_decoding_start", "first_token")],
+            &[always, ("constrained_decoding_start", "after_reasoning")],
+            &[always],
+        ];
+        // The workers alike: both `requested` ones; the whole turn's alone;
+        // the two `always` ones that start the grammar later or do not say.
+        let alike = [0, 0, 1, 2, 2];
+        let engine = |labels: &[(&str, &str)]| match worker(labels) {
+            WorkerSelection::Single { worker } => worker,
+            WorkerSelection::Disaggregated { .. } => panic!("expected one worker"),
+        };
+        let prefill = BasicWorkerBuilder::new("grpc://prefill:50051")
+            .worker_type(WorkerType::Prefill)
+            .build();
+        for (first, first_labels) in labels.iter().enumerate() {
+            let decided_on = WorkerDecoding::of(Some(&worker(first_labels)));
+            for (other, other_labels) in labels.iter().enumerate() {
+                assert_eq!(
+                    decided_on.decides_alike(engine(other_labels).as_ref()),
+                    alike[first] == alike[other],
+                    "decided on {first_labels:?}, retried on {other_labels:?}"
+                );
+            }
+            assert!(decided_on.decides_alike(&prefill));
+        }
     }
 
     /// The worker's `constrained_decoding_start` label names where its engine
@@ -981,10 +1055,12 @@ mod tests {
             .with_thinking_key_name(ThinkingKeyName::Thinking)
             .with_native_reasoning_effort_values(&["low", "high", "xhigh", "max"])
             .with_renderer_capabilities(llm_tokenizer::traits::RendererCapabilities {
+                media_handling: llm_tokenizer::traits::MediaHandling::Preprocess,
                 enable_thinking_alias: true,
                 native_assistant_continuation: true,
                 raw_tool_call_arguments: true,
                 declares_tools_under_tool_choice_none: false,
+                leading_system_only: false,
             })
     }
 

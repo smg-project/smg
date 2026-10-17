@@ -5,11 +5,14 @@
 //! merge of the Nano write this. The Super template has the thought: `/no_think` in the system
 //! prompt makes it close one in the prompt (`<think>\n\n</think>\n\n`), the request's
 //! `enable_thinking` changes nothing, and an assistant message's content is rendered from its
-//! `</think>` on. The Nano and DLER templates have no thought. Nemotron Ultra keeps Llama 3.1's
-//! own template, a bare `{"name": …, "parameters": …}` object, and Nemotron 3 writes
-//! Qwen3-Coder's tags: other syntaxes, other tables. Recorded as
-//! `llama-3-3-nemotron-super-49b-v1-5`, `llama-3.1-nemotron-nano-8b-v1` and
-//! `dler-llama-nemotron-8b-merge-research`.
+//! `</think>` on. The Nano and DLER templates have no thought. The Super 49B v1 and Ultra 253B v1
+//! templates render no call and no thought at all (an assistant message is kept from its
+//! `</think>` on): the model writes `<think>` itself, and the vendor's tool parser for both reads
+//! this list, so they read with this table. The Ultra's CPT checkpoint keeps Llama 3.1's own
+//! template, a bare `{"name": …, "parameters": …}` object, and Nemotron 3 writes Qwen3-Coder's
+//! tags: other syntaxes, other tables. Recorded as `llama-3-3-nemotron-super-49b-v1-5`,
+//! `llama-3.1-nemotron-nano-8b-v1`, `dler-llama-nemotron-8b-merge-research` and, content alone,
+//! `llama-3-1-nemotron-ultra-253b-v1`.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
@@ -289,11 +292,10 @@ mod tests {
             "<TOOLCALL>[{\"name\": \"get_stock_price\", \"arguments\": {}}] tail</TOOLCALL>",
         );
         assert_eq!(calls(&events).len(), 1);
-        assert_eq!(malformed(&events), ["tail"]);
-        assert_eq!(
-            dropped(&events),
-            ["<TOOLCALL>", "[", "]", " ", "</TOOLCALL>"]
-        );
+        // The text after the list takes the whitespace before it: once text follows, every byte
+        // after the `]` is the model's.
+        assert_eq!(malformed(&events), [" tail"]);
+        assert_eq!(dropped(&events), ["<TOOLCALL>", "[", "]", "</TOOLCALL>"]);
     }
 
     #[test]

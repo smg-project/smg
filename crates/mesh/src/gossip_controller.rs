@@ -17,12 +17,14 @@
 //!    every outgoing stream (in either direction) consumes.
 //! 4. **Periodic housekeeping**: chunk-assembler GC, retry-manager pruning.
 //!
-//! Per-peer outbound sender tasks also live here. They are spawned by
+//! Per-peer outbound stream tasks also live here. They are spawned by
 //! [`GossipController::event_loop`] when this node initiates a stream to a
 //! peer. The peer's name is captured as a `String` at task-spawn time, so
 //! these senders never need to learn peer identity at runtime — contrast
 //! with the inbound senders in `gossip_service.rs`, which must learn the
-//! counterparty from the first inbound frame.
+//! counterparty from the first inbound frame. What both ends do with an open
+//! stream (the sender's round, the inbound frames) is
+//! [`transport::peer_stream`](crate::transport::peer_stream).
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -47,8 +49,8 @@ use super::{
     service::{
         broadcast_node_states,
         gossip::{
-            gossip_client::GossipClient, gossip_message, stream_message::Payload as StreamPayload,
-            NodeState, NodeStatus, Ping, PingReq, StateSync, StreamMessage, StreamMessageType,
+            gossip_client::GossipClient, gossip_message, NodeState, NodeStatus, Ping, PingReq,
+            StateSync, StreamMessage,
         },
         try_ping, ClusterState,
     },
@@ -57,14 +59,9 @@ use crate::{
     crdt_kv::CrdtWatermark,
     metrics,
     transport::{
-        crdt_batch::{
-            build_crdt_batches, crdt_ack_to_watermark, dispatch_crdt_batch, wrap_crdt_ack,
-            wrap_crdt_batch,
-        },
-        limits::{MAX_MESSAGE_SIZE, MAX_STREAM_CHUNK_BYTES, STREAM_IDLE_TIMEOUT},
-        sync_stream::{
-            build_heartbeat, build_peer_stream_batches, dispatch_stream_batch, wrap_stream_batch,
-        },
+        limits::MAX_MESSAGE_SIZE,
+        peer_stream::{handle_frame, next_frame, send_round, Frame, RoundOutcome, SenderState},
+        sync_stream::build_heartbeat,
     },
 };
 
@@ -440,8 +437,6 @@ impl GossipController {
         #[expect(clippy::disallowed_methods, reason = "handle is returned to caller (spawn_sync_stream_handler) and stored in sync_connections map for lifecycle tracking")]
         tokio::spawn(
             async move {
-                use tokio_stream::StreamExt;
-
                 // Log active connection count at handler start
                 let active_connections = sync_connections.lock().await.len();
                 log::debug!(
@@ -450,11 +445,12 @@ impl GossipController {
                     "Sync stream handler started"
                 );
 
+                // This end's frame counter: every frame sent or received
+                // advances it.
                 let sequence = Arc::new(AtomicU64::new(0));
 
                 // Per-peer CRDT send watermark (per-key acked versions). The
-                // incremental sender filters by it; the inbound loop advances it
-                // on CrdtAck and emits acks for received batches.
+                // sender filters by it; the inbound loop advances it on CrdtAck.
                 let acked: Arc<RwLock<CrdtWatermark>> =
                     Arc::new(RwLock::new(CrdtWatermark::new()));
 
@@ -466,7 +462,9 @@ impl GossipController {
                     return;
                 }
 
-                // Spawn a task to periodically broadcast v2 stream batches.
+                // The periodic sender: the shared round every second, with
+                // this end's round metrics around it. The peer is known from
+                // the start, so every round can carry its targeted entries.
                 let incremental_sender_handle = {
                     let tx_incremental = tx.clone();
                     let self_name_incremental = self_name.clone();
@@ -478,95 +476,28 @@ impl GossipController {
                     #[expect(clippy::disallowed_methods, reason = "incremental sender handle is stored and aborted when the parent sync_stream handler exits")]
                     tokio::spawn(async move {
                         let mut interval = tokio::time::interval(Duration::from_secs(1));
-                        // Skip re-emission of an unchanged stream batch (main
-                        // loop hasn't collected a new one since last tick).
-                        let mut last_stream_batch: Option<Arc<crate::kv::RoundBatch>> = None;
+                        let mut sender = SenderState::default();
 
                         loop {
                             interval.tick().await;
 
                             let round_start = Instant::now();
-
-                            // Stream batches: drain-portion (broadcast) +
-                            // targeted entries addressed to this peer. On
-                            // channel full, the round's stream traffic for
-                            // this peer is dropped — no retry (at-most-once).
-                            // Application regenerates on its own retry cycle.
                             let stream_batch = stream_batch_handle.read().clone();
-                            let fresh_batch = last_stream_batch
-                                .as_ref()
-                                .is_none_or(|last| !Arc::ptr_eq(last, &stream_batch));
-                            if fresh_batch {
-                                last_stream_batch = Some(stream_batch.clone());
-                                for batch in build_peer_stream_batches(
-                                    &stream_batch,
-                                    &peer_name_incremental,
-                                ) {
-                                    let msg = wrap_stream_batch(
-                                        batch,
-                                        shared_sequence.fetch_add(1, Ordering::Relaxed),
-                                        &self_name_incremental,
-                                    );
-                                    match tx_incremental.try_send(msg) {
-                                        Ok(()) => {}
-                                        Err(mpsc::error::TrySendError::Full(_)) => {
-                                            log::debug!(
-                                                peer = %peer_name_incremental,
-                                                "stream batch dropped on backpressure"
-                                            );
-                                            // TODO(metrics): bump
-                                            // stream_dropped_on_backpressure
-                                            break;
-                                        }
-                                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                                            log::warn!(
-                                                peer = %peer_name_incremental,
-                                                "stream sender: channel closed, stopping"
-                                            );
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-
-                            // CRDT op-log: evaluated every tick (acks shrink the
-                            // delta even when the stream batch is unchanged).
-                            // Send only ops this peer has not acked; the
-                            // watermark advances solely on CrdtAck, so unacked
-                            // keys retry next round.
-                            let crdt_ops: Vec<_> = {
-                                let acked = acked_incremental.read();
-                                stream_batch
-                                    .crdt_ops
-                                    .operations()
-                                    .iter()
-                                    .filter(|op| acked.allows(op))
-                                    .cloned()
-                                    .collect()
-                            };
-                            for crdt_batch in build_crdt_batches(&crdt_ops, MAX_STREAM_CHUNK_BYTES) {
-                                let msg = wrap_crdt_batch(
-                                    crdt_batch,
-                                    shared_sequence.fetch_add(1, Ordering::Relaxed),
-                                    &self_name_incremental,
+                            let outcome = send_round(
+                                &mut sender,
+                                &stream_batch,
+                                Some(&peer_name_incremental),
+                                &acked_incremental,
+                                &self_name_incremental,
+                                &mut || shared_sequence.fetch_add(1, Ordering::Relaxed),
+                                &tx_incremental,
+                            );
+                            if outcome == RoundOutcome::Closed {
+                                log::warn!(
+                                    peer = %peer_name_incremental,
+                                    "stream sender: channel closed, stopping"
                                 );
-                                match tx_incremental.try_send(msg) {
-                                    Ok(()) => {}
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        log::debug!(
-                                            peer = %peer_name_incremental,
-                                            "crdt batch dropped on backpressure"
-                                        );
-                                        break;
-                                    }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                                        log::warn!(
-                                            peer = %peer_name_incremental,
-                                            "crdt sender: channel closed, stopping"
-                                        );
-                                        return;
-                                    }
-                                }
+                                return;
                             }
 
                             let round_elapsed = round_start.elapsed();
@@ -586,98 +517,27 @@ impl GossipController {
                 };
 
                 // Handle incoming messages
-                loop {
-                    match tokio::time::timeout(STREAM_IDLE_TIMEOUT, incoming_stream.next()).await {
-                        Ok(Some(Ok(msg))) => {
-                            sequence.fetch_add(1, Ordering::Relaxed);
-
-                            match msg.message_type() {
-                                StreamMessageType::Heartbeat => {
-                                    log::trace!("Received heartbeat from {}", peer_name);
-                                    let heartbeat = build_heartbeat(
-                                        sequence.fetch_add(1, Ordering::Relaxed),
-                                        &self_name,
-                                    );
-                                    if tx.send(heartbeat).await.is_err() {
-                                        log::warn!("Failed to send heartbeat to {}", peer_name);
-                                        break;
-                                    }
-                                }
-                                StreamMessageType::Ack => {
-                                    log::trace!(
-                                        "Received ACK from {} (seq: {})",
-                                        peer_name,
-                                        msg.sequence
-                                    );
-                                }
-                                StreamMessageType::Nack => {
-                                    log::warn!(
-                                        "Received NACK from {} (seq: {})",
-                                        peer_name,
-                                        msg.sequence
-                                    );
-                                }
-                                StreamMessageType::IncrementalUpdate
-                                | StreamMessageType::SnapshotRequest
-                                | StreamMessageType::SnapshotChunk
-                                | StreamMessageType::SnapshotComplete => {
-                                    log::debug!(
-                                        peer = %peer_name,
-                                        message_type = ?msg.message_type(),
-                                        "ignoring v1 wire message (state-sync removed)",
-                                    );
-                                }
-                                StreamMessageType::StreamBatch => {
-                                    if let Some(mesh_kv) = &mesh_kv {
-                                        if let Some(StreamPayload::StreamBatch(batch)) =
-                                            msg.payload
-                                        {
-                                            dispatch_stream_batch(
-                                                mesh_kv,
-                                                &msg.peer_id,
-                                                batch.entries,
-                                            );
-                                        }
-                                    }
-                                }
-                                StreamMessageType::CrdtBatch => {
-                                    if let Some(mesh_kv) = &mesh_kv {
-                                        if let Some(StreamPayload::CrdtBatch(batch)) = msg.payload {
-                                            // Merge, then ack the per-key
-                                            // versions so the peer can advance
-                                            // its send watermark. Ack loss is
-                                            // fine (peer resends), so drop on a
-                                            // full channel rather than block.
-                                            let ack = dispatch_crdt_batch(mesh_kv, batch);
-                                            if !ack.is_empty() {
-                                                let _ = tx.try_send(wrap_crdt_ack(
-                                                    &ack,
-                                                    sequence.fetch_add(1, Ordering::Relaxed),
-                                                    &self_name,
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-                                // CRDT delivery ack: advance this peer's send watermark.
-                                StreamMessageType::CrdtAck => {
-                                    if let Some(StreamPayload::CrdtAck(ack)) = msg.payload {
-                                        acked.write().merge_max(&crdt_ack_to_watermark(ack));
-                                    }
-                                }
-                            }
+                while let Some(msg) = next_frame(&mut incoming_stream, &peer_name).await {
+                    sequence.fetch_add(1, Ordering::Relaxed);
+                    let frame = handle_frame(
+                        msg,
+                        &peer_name,
+                        &self_name,
+                        mesh_kv.as_deref(),
+                        &acked,
+                        &mut || sequence.fetch_add(1, Ordering::Relaxed),
+                        &tx,
+                    )
+                    .await;
+                    match frame {
+                        Frame::Continue => {}
+                        Frame::Ack { sequence, .. } => {
+                            log::trace!("Received ACK from {} (seq: {})", peer_name, sequence);
                         }
-                        Ok(Some(Err(e))) => {
-                            log::error!("Error receiving from sync_stream with {}: {}", peer_name, e);
-                            break;
+                        Frame::Nack { sequence } => {
+                            log::warn!("Received NACK from {} (seq: {})", peer_name, sequence);
                         }
-                        Ok(None) => break,
-                        Err(_) => {
-                            log::warn!(
-                                "sync_stream to {peer_name} idle timeout ({STREAM_IDLE_TIMEOUT:?}) — closing"
-                            );
-                            break;
-                        }
+                        Frame::Closed => break,
                     }
                 }
 

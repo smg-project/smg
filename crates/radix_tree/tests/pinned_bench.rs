@@ -139,8 +139,7 @@ const FLEET: Profile = Profile {
 /// The pinned shape with heavy interior fragmentation: 2% of every
 /// instance's interior blocks removed at random positions, so a 512-block
 /// shared prefix carries ~10 holes. Measures how much the query walk
-/// pays per extra segment (the oracle's positional map is nearly
-/// indifferent to holes; the chain walk is not).
+/// pays per extra segment.
 const FRAGMENTED: Profile = Profile {
     name: "fragmented",
     gaps: Gaps::BlockShare(2),

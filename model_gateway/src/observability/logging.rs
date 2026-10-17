@@ -9,9 +9,14 @@
 //! pressure, which with a synchronous `std::io::stdout()` writer parked a
 //! runtime worker, and every connection it was driving, once per access-log
 //! line.
+//!
+//! The writer threads write in batches ([`Batched`]): the first line after a
+//! quiet moment opens a short window, and the lines queued within it leave
+//! in one write. Nothing but the writer thread waits for the window; a line
+//! is visible a few milliseconds later at most.
 
 use std::{
-    io::Write,
+    io::{self, Write},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -121,11 +126,105 @@ static CLOSED: AtomicBool = AtomicBool::new(false);
 /// How often the dropped-line counts are published.
 const DROPPED_LINES_REPORT_SECS: u64 = 30;
 
-/// Move `sink` to its own writer thread held for the process, and return
-/// the writer for a subscriber layer. The thread is counted among the
-/// sinks whose dropped lines the reporter publishes.
+/// How long a writer thread waits, from the first line after a quiet moment,
+/// for more lines before it writes: the lines logged within the window leave
+/// in one write, and the threads that log them wake nobody. A line is visible
+/// this much later at most, and a process that dies without [`close_logging`]
+/// loses at most this window of lines (on top of what sat in its queue).
+const BATCH_WINDOW: Duration = Duration::from_millis(5);
+
+/// A batch is written as soon as it holds this many bytes, window or not: a
+/// backlog (a burst, or a sink that stalled and recovered) drains at full
+/// speed in writes of this size, and the buffer stays this small.
+const BATCH_BYTES: usize = 64 * 1024;
+
+/// A sink that takes the writer thread's lines in batches.
+///
+/// [`tracing_appender`]'s writer thread hands its sink one whole line per
+/// `write`, drains its queue until the queue is empty and calls `flush`
+/// then. On a steady access-log stream the queue is empty again after every
+/// line, so each line cost one `write(2)` on the sink and, with the thread
+/// parked between lines, one wake-up paid by the thread that logged. This
+/// adapter opens a window on the first line after a flush: the writer thread
+/// sleeps for [`BATCH_WINDOW`] (the lines logged meanwhile queue up, with
+/// nobody to wake), then drains them into one buffer, and the `flush` that
+/// ends the drain writes the buffer in one call. Only whole lines enter and
+/// leave the buffer, in the order received; a batch that reaches
+/// [`BATCH_BYTES`] is written at once and the drain goes on without another
+/// wait; the flush at shutdown (the worker guard's drop in
+/// [`close_logging`]) writes whatever is buffered, so a clean exit loses
+/// nothing.
+struct Batched<W> {
+    sink: W,
+    buf: Vec<u8>,
+    window: Duration,
+    cap: usize,
+    /// A window is open: the next line does not wait for one again.
+    open: bool,
+}
+
+impl<W: Write> Batched<W> {
+    fn new(sink: W) -> Self {
+        Self::with(sink, BATCH_WINDOW, BATCH_BYTES)
+    }
+
+    fn with(sink: W, window: Duration, cap: usize) -> Self {
+        Self {
+            sink,
+            buf: Vec::with_capacity(cap),
+            window,
+            cap,
+            open: false,
+        }
+    }
+
+    /// Write the buffered lines in one call. On an error the batch is gone,
+    /// as a line whose write failed was before; nothing is written twice.
+    fn write_batch(&mut self) -> io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let written = self.sink.write_all(&self.buf);
+        self.buf.clear();
+        // A line longer than the cap grew the buffer; let that go again.
+        if self.buf.capacity() > 2 * self.cap {
+            self.buf.shrink_to(self.cap);
+        }
+        written
+    }
+}
+
+impl<W: Write> Write for Batched<W> {
+    fn write(&mut self, line: &[u8]) -> io::Result<usize> {
+        if !self.open {
+            self.open = true;
+            if !self.window.is_zero() {
+                std::thread::sleep(self.window);
+            }
+        }
+        self.buf.extend_from_slice(line);
+        if self.buf.len() >= self.cap {
+            self.write_batch()?;
+        }
+        Ok(line.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.open = false;
+        // The worker discards a flush error, and an `Err` from the flush that
+        // ends the shutdown drain skips its rendezvous with the guard (which
+        // then waits out its full second): the batch is gone either way, as
+        // a line whose own write failed was before.
+        let _ = self.write_batch();
+        self.sink.flush()
+    }
+}
+
+/// Move `sink` to its own writer thread held for the process, writing in
+/// batches, and return the writer for a subscriber layer. The thread is
+/// counted among the sinks whose dropped lines the reporter publishes.
 fn install<W: Write + Send + 'static>(sink: W, name: &'static str) -> NonBlocking {
-    let (writer, guard) = non_blocking(sink, name);
+    let (writer, guard) = non_blocking(Batched::new(sink), name);
     let mut sinks = SINKS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -196,9 +295,10 @@ fn report_dropped_lines() -> Vec<(&'static str, usize, usize)> {
     reports
 }
 
-/// Flush and stop the writer threads: the last lines queued are written
-/// before the process exits. Called once, at the end of `main`; nothing logs
-/// through the stopped writers afterwards.
+/// Flush and stop the writer threads: the last lines queued, and the batch a
+/// writer is still gathering, are written before the process exits. Called
+/// once, at the end of `main`; nothing logs through the stopped writers
+/// afterwards.
 pub fn close_logging() {
     CLOSED.store(true, Ordering::Relaxed);
     let sinks = std::mem::take(
@@ -364,7 +464,7 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
     // `std::io::stdout()` itself is a line-buffered writer that performs one
     // synchronous `write(2)` per event on the emitting thread; keep that
     // syscall, and whatever the kernel makes of it, off the runtime threads.
-    let stdout_writer = install(std::io::stdout(), "smg-log-stdout");
+    let stdout_writer = install(io::stdout(), "smg-log-stdout");
 
     let stdout_layer = tracing_subscriber::fmt::layer()
         .with_ansi(config.colorize)
@@ -468,7 +568,15 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
 
 #[cfg(test)]
 mod writer_tests {
-    use std::{io, sync::mpsc, thread, time::Duration};
+    use std::{
+        io,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc, Arc, Mutex,
+        },
+        thread,
+        time::{Duration, Instant},
+    };
 
     use tracing_appender::non_blocking::DEFAULT_BUFFERED_LINES_LIMIT;
 
@@ -508,6 +616,64 @@ mod writer_tests {
         }
     }
 
+    /// A sink that keeps every write as it was given: a test reads the write
+    /// boundaries as well as the bytes.
+    #[derive(Clone, Default)]
+    struct RecordingSink(Arc<Mutex<Vec<Vec<u8>>>>);
+
+    impl RecordingSink {
+        fn writes(&self) -> Vec<Vec<u8>> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        /// The writes once they hold `len` bytes, or after ten seconds.
+        fn writes_of(&self, len: usize) -> Vec<Vec<u8>> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let writes = self.writes();
+                if writes.iter().map(Vec::len).sum::<usize>() >= len || Instant::now() > deadline {
+                    return writes;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    impl Write for RecordingSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(buf.to_vec());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn numbered_lines(count: usize) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|i| format!("{i:06} finished processing request\n").into_bytes())
+            .collect()
+    }
+
+    /// Every write ends at a line boundary, and the writes in their order are
+    /// exactly `lines`: no line split, lost, repeated or reordered.
+    fn assert_whole_lines_in_order(writes: &[Vec<u8>], lines: &[Vec<u8>]) {
+        assert!(
+            writes.iter().all(|write| write.ends_with(b"\n")),
+            "every write ends at a line boundary"
+        );
+        let (written, given) = (writes.concat(), lines.concat());
+        assert_eq!(written.len(), given.len(), "every byte given is written");
+        assert!(written == given, "the lines are written as given, in order");
+    }
+
     /// The writer threads belong to the process, not to the value
     /// `init_logging` returns: a router started after the first in one
     /// process logs through the same subscriber, whose writer must still be
@@ -534,9 +700,13 @@ mod writer_tests {
     fn dropped_lines_are_counted_and_reported_per_sink() {
         let (release, gate) = mpsc::channel();
         let mut writer = install(StalledSink { gate: Some(gate) }, "test-log-dropped");
-        for _ in 0..DEFAULT_BUFFERED_LINES_LIMIT + 1_000 {
+        // More lines than the queue and the writer's batch hold together: the
+        // batch takes `BATCH_BYTES / LINE.len() + 1` lines at most before its
+        // write stalls on the sink.
+        const LINE: &[u8] = b"finished processing request\n";
+        for _ in 0..DEFAULT_BUFFERED_LINES_LIMIT + BATCH_BYTES / LINE.len() + 1_000 {
             writer
-                .write_all(b"finished processing request\n")
+                .write_all(LINE)
                 .expect("a lossy writer reports every line as written");
         }
         let counted = dropped_lines()
@@ -583,6 +753,215 @@ mod writer_tests {
             "the queue is bounded: overflow is dropped, never waited for"
         );
         drop(guard);
+    }
+
+    /// Lines that arrive within the window leave in one write, whole and in
+    /// order: the write and the wake-up per line are gone.
+    #[test]
+    fn lines_within_the_window_leave_in_one_write() {
+        let sink = RecordingSink::default();
+        let (mut writer, guard) = non_blocking(
+            Batched::with(sink.clone(), Duration::from_millis(50), BATCH_BYTES),
+            "test-log-batched-window",
+        );
+        let lines = numbered_lines(1_000);
+        for line in &lines {
+            writer
+                .write_all(line)
+                .expect("a lossy writer reports every line as written");
+        }
+        assert_eq!(writer.error_counter().dropped_lines(), 0);
+        drop(guard);
+        let writes = sink.writes_of(lines.concat().len());
+        assert_whole_lines_in_order(&writes, &lines);
+        assert!(
+            writes.len() <= lines.len() / 100,
+            "{} writes for {} lines",
+            writes.len(),
+            lines.len()
+        );
+    }
+
+    /// A line with no company still leaves, once the window has passed.
+    #[test]
+    fn a_lone_line_leaves_after_the_window() {
+        let sink = RecordingSink::default();
+        let (mut writer, guard) = non_blocking(
+            Batched::with(sink.clone(), Duration::from_millis(5), BATCH_BYTES),
+            "test-log-batched-lone",
+        );
+        let line = b"a line on its own\n".to_vec();
+        writer
+            .write_all(&line)
+            .expect("a lossy writer reports every line as written");
+        assert_eq!(sink.writes_of(line.len()), vec![line]);
+        drop(guard);
+    }
+
+    /// A batch that reaches the byte cap is written inside the window, and the
+    /// rest of the backlog follows without another wait.
+    #[test]
+    fn the_byte_cap_writes_a_batch_inside_the_window() {
+        let cap = 1_024;
+        let sink = RecordingSink::default();
+        let (mut writer, guard) = non_blocking(
+            Batched::with(sink.clone(), Duration::from_millis(200), cap),
+            "test-log-batched-cap",
+        );
+        // 36 KB in all: some 35 batches of the cap.
+        let lines = numbered_lines(1_000);
+        let started = Instant::now();
+        for line in &lines {
+            writer
+                .write_all(line)
+                .expect("a lossy writer reports every line as written");
+        }
+        drop(guard);
+        let writes = sink.writes_of(lines.concat().len());
+        let drained_in = started.elapsed();
+        assert_whole_lines_in_order(&writes, &lines);
+        let longest = writes.iter().map(Vec::len).max().unwrap_or(0);
+        assert!(
+            longest < cap + lines[0].len(),
+            "a batch is written once it reaches the cap, not later: {longest} bytes"
+        );
+        assert!(writes.len() >= 30, "{} writes", writes.len());
+        assert!(
+            drained_in < Duration::from_secs(4),
+            "the backlog drained without a window per batch: {drained_in:?}"
+        );
+    }
+
+    /// The flush at shutdown writes the lines still in the window: a clean
+    /// exit loses nothing.
+    #[test]
+    fn shutdown_writes_the_lines_still_in_the_window() {
+        let sink = RecordingSink::default();
+        let (mut writer, guard) = non_blocking(
+            Batched::with(sink.clone(), Duration::from_millis(20), BATCH_BYTES),
+            "test-log-batched-shutdown",
+        );
+        let lines = numbered_lines(10);
+        for line in &lines {
+            writer
+                .write_all(line)
+                .expect("a lossy writer reports every line as written");
+        }
+        // The writer is inside its window; the guard's drop waits for the flush.
+        drop(guard);
+        assert_whole_lines_in_order(&sink.writes(), &lines);
+    }
+
+    /// A sink that fails its writes (a closed stdout pipe, a full disk) does
+    /// not break the shutdown handshake: the writer thread takes the shutdown
+    /// message, meets the guard and ends, instead of blocking on its queue for
+    /// good while the guard waits out its rendezvous timeout; the batch is
+    /// gone, as a line whose own write failed was before.
+    #[test]
+    fn a_failing_sink_does_not_break_the_shutdown_handshake() {
+        /// Refuses every write; sets `ended` when it is dropped, which is when
+        /// the writer thread that owns it has ended.
+        struct FailingSink {
+            ended: Arc<AtomicBool>,
+        }
+
+        impl Write for FailingSink {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl Drop for FailingSink {
+            fn drop(&mut self) {
+                self.ended.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let ended = Arc::new(AtomicBool::new(false));
+        let sink = FailingSink {
+            ended: ended.clone(),
+        };
+        // A window: the writer thread sleeps inside its first `write` while
+        // the guard's drop queues the shutdown message, so the flush that
+        // fails is the one that ends the shutdown drain, every time (with no
+        // window the worker may drain the line alone, fail its flush before
+        // the shutdown message is queued, and pass against the old flush).
+        let (mut writer, guard) = non_blocking(
+            Batched::with(sink, Duration::from_millis(50), BATCH_BYTES),
+            "test-log-batched-failing",
+        );
+        writer
+            .write_all(b"a line the sink refuses\n")
+            .expect("a lossy writer reports every line as written");
+        let started = Instant::now();
+        drop(guard);
+        let dropped_in = started.elapsed();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ended.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            ended.load(Ordering::SeqCst),
+            "the writer thread ended after the guard dropped (the drop took {dropped_in:?})"
+        );
+    }
+
+    /// Writes per line on a steady stream, with the batching and without: a
+    /// measurement (`--ignored --nocapture`), not a check.
+    #[test]
+    #[ignore = "a timing, not a check"]
+    #[expect(clippy::print_stdout, reason = "the measurement is the output")]
+    fn writes_per_line_on_a_steady_stream() {
+        const LINES: usize = 20_000;
+        const INTERVAL: Duration = Duration::from_micros(250);
+        fn stream<W: Write + Send + 'static>(
+            sink: W,
+            recording: &RecordingSink,
+            name: &str,
+        ) -> (usize, Duration) {
+            let (mut writer, guard) = non_blocking(sink, name);
+            let lines = numbered_lines(LINES);
+            let started = Instant::now();
+            let mut due = started;
+            for line in &lines {
+                due += INTERVAL;
+                if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                    thread::sleep(wait);
+                }
+                writer
+                    .write_all(line)
+                    .expect("a lossy writer reports every line as written");
+            }
+            let elapsed = started.elapsed();
+            drop(guard);
+            let writes = recording.writes_of(lines.concat().len());
+            assert_whole_lines_in_order(&writes, &lines);
+            (writes.len(), elapsed)
+        }
+        let plain = RecordingSink::default();
+        let (writes, elapsed) = stream(plain.clone(), &plain, "test-log-stream-plain");
+        println!(
+            "plain: {LINES} lines in {elapsed:?} ({:.0} lines/s), {writes} writes, \
+             {:.3} writes per line",
+            LINES as f64 / elapsed.as_secs_f64(),
+            writes as f64 / LINES as f64
+        );
+        let batched = RecordingSink::default();
+        let (writes, elapsed) = stream(
+            Batched::new(batched.clone()),
+            &batched,
+            "test-log-stream-batched",
+        );
+        println!(
+            "batched: {LINES} lines in {elapsed:?} ({:.0} lines/s), {writes} writes, \
+             {:.3} writes per line",
+            LINES as f64 / elapsed.as_secs_f64(),
+            writes as f64 / LINES as f64
+        );
     }
 }
 

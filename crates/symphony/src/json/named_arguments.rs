@@ -14,32 +14,31 @@
 //! bytes before the marker are the tool's name, as the template writes it and the only place it
 //! is written: `ToolCallStart` carries them with the marker as its source once the marker has
 //! arrived. The object after the marker is the arguments, every byte of it a fragment for as long
-//! as the bytes keep it a JSON prefix ([`Prefix`]), and `Malformed { InvalidArguments }` from the
+//! as the bytes keep it a JSON prefix ([`Prefix`](super::Prefix)), and `Malformed { InvalidArguments }` from the
 //! first byte that does not; its close, found by the outline's scanner ([`Scanner`]), is the call's
 //! end, and bytes after it are not taken, so the engine routes what follows the object.
 //!
 //! What the syntax does not check: the name before the marker is taken as written, spaces
 //! included, since the template writes it without any; and a value that is not an object is
 //! streamed for as long as it is a JSON prefix and ends with the region, since the outline finds
-//! no close for it. The template writes neither.
+//! no close for it, a word among them held until it is spelled or refused, so that the pieces say
+//! of it what the whole says. The template writes neither.
 //!
 //! [`formats::mistral_v13`]: crate::formats::mistral_v13()
 
+use super::header::{Found, Header};
 use crate::{
     event::{Event, Events, MalformedReason, Text},
-    json::{outline::Scanner, prefix::Prefix},
+    json::{fragments::Fragments, is_complete, outline::Scanner},
 };
-
-const NAME_WITHOUT_ARGUMENTS: &str = "a call that names a tool and writes no arguments";
 
 /// The events of one call, from the bytes after the call's opener.
 #[derive(Clone, Debug)]
 pub struct Assembler {
     index: u32,
     id: String,
-    marker: &'static str,
     /// The bytes before the marker, held until it arrives or the region ends.
-    header: String,
+    header: Header,
     /// The arguments, once the marker has arrived.
     arguments: Option<Arguments>,
 }
@@ -51,14 +50,8 @@ struct Arguments {
     text: String,
     /// The outline of `text`, read as it grows: its close is the object's.
     scanner: Scanner,
-    /// Bytes accounted for so far, as fragments or as malformed text.
-    emitted: usize,
-    /// Bytes the prefix has judged so far.
-    judged: usize,
-    /// Whether the bytes are still a JSON prefix, judged as they arrive.
-    prefix: Prefix,
-    /// The byte from which the arguments stopped being a valid JSON prefix, if they did.
-    invalid_from: Option<usize>,
+    /// The bytes, sent, held or reported as they arrive.
+    fragments: Fragments,
     done: bool,
 }
 
@@ -69,8 +62,7 @@ impl Assembler {
         Self {
             index,
             id: id.into(),
-            marker,
-            header: String::new(),
+            header: Header::new(marker),
             arguments: None,
         }
     }
@@ -87,21 +79,9 @@ impl Assembler {
         if let Some(arguments) = &mut self.arguments {
             return arguments.feed(bytes, out);
         }
-        // The marker can only end inside the new bytes, so the search starts `marker.len() - 1`
-        // bytes before them (at a character boundary).
-        let before = self.header.len();
-        self.header.push_str(bytes);
-        let from = before.saturating_sub(self.marker.len() - 1);
-        let from = (0..=from)
-            .rev()
-            .find(|&at| self.header.is_char_boundary(at))
-            .unwrap_or(0);
-        let Some(at) = self.header[from..].find(self.marker).map(|at| from + at) else {
+        let Some(Found { framing, at, after }) = self.header.push(bytes) else {
             return bytes.len();
         };
-        // The marker ends inside this piece, so what follows it is this piece's too.
-        let after = self.header.split_off(at + self.marker.len());
-        let framing = std::mem::take(&mut self.header);
         out.push(Event::ToolCallStart {
             index: self.index,
             id: self.id.clone(),
@@ -120,11 +100,9 @@ impl Assembler {
     pub fn close(self, out: &mut Events) {
         match self.arguments {
             Some(arguments) => arguments.finish(out),
-            None if !self.header.is_empty() => out.push(Event::Malformed {
-                text: Text::uncounted(self.header),
-                why: MalformedReason::Other(NAME_WITHOUT_ARGUMENTS.to_string()),
-            }),
-            None => {}
+            None => self
+                .header
+                .ended(MalformedReason::NameWithoutArguments, out),
         }
     }
 
@@ -133,11 +111,7 @@ impl Assembler {
     pub fn finish(self, out: &mut Events) {
         match self.arguments {
             Some(arguments) => arguments.finish(out),
-            None if !self.header.is_empty() => out.push(Event::Malformed {
-                text: Text::uncounted(self.header),
-                why: MalformedReason::UnterminatedRegion,
-            }),
-            None => {}
+            None => self.header.ended(MalformedReason::UnterminatedRegion, out),
         }
     }
 }
@@ -148,10 +122,7 @@ impl Arguments {
             index,
             text: String::new(),
             scanner: Scanner::default(),
-            emitted: 0,
-            judged: 0,
-            prefix: Prefix::default(),
-            invalid_from: None,
+            fragments: Fragments::default(),
             done: false,
         }
     }
@@ -174,7 +145,7 @@ impl Arguments {
             }
             None => bytes.len(),
         };
-        self.emit_new_bytes(out);
+        self.emit_new_bytes(close.is_none(), out);
         if close.is_some() {
             out.push(Event::ToolCallEnd {
                 index: self.index,
@@ -186,10 +157,20 @@ impl Arguments {
     }
 
     /// No more bytes will come: a closed object has said everything; one that never closed ends
-    /// with what arrived, every byte of it already a fragment or malformed text.
-    fn finish(self, out: &mut Events) {
+    /// with what arrived, every byte of it already a fragment or malformed text but for a word it
+    /// still held, which goes first, as the prefix it is, and a `Malformed` event of no bytes
+    /// before the end says that the arguments are no whole value, unless the bytes happen to be
+    /// one (a value that is no object, which the template never writes).
+    fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
+        }
+        self.fragments.send_held(&self.text, self.index, out);
+        if !self.fragments.refused() && !is_complete(&self.text) {
+            out.push(Event::Malformed {
+                text: Text::default(),
+                why: MalformedReason::UnterminatedRegion,
+            });
         }
         out.push(Event::ToolCallEnd {
             index: self.index,
@@ -198,36 +179,17 @@ impl Arguments {
     }
 
     /// The bytes that arrived since the last call: a fragment for the part that keeps the
-    /// arguments a valid JSON prefix, malformed text for the rest, once the prefix has broken.
-    fn emit_new_bytes(&mut self, out: &mut Events) {
-        if self.text.len() <= self.emitted {
-            return;
-        }
-        // Only the bytes that arrived are judged; the prefix keeps its place between pieces.
-        let verdict = self.prefix.feed(&self.text[self.judged..]);
-        self.judged = self.text.len();
-        let valid_end = match self.invalid_from {
-            Some(from) => from,
-            None => match verdict {
-                None => self.text.len(),
-                Some(from) => *self.invalid_from.insert(from.max(self.emitted)),
-            },
-        };
-        if self.emitted < valid_end {
-            let fresh = &self.text[self.emitted..valid_end];
-            out.push(Event::ToolCallArguments {
-                index: self.index,
-                json: fresh.to_string(),
-                source: Text::uncounted(fresh),
-            });
-            self.emitted = valid_end;
-        }
-        if self.emitted < self.text.len() {
-            out.push(Event::Malformed {
-                text: Text::uncounted(&self.text[self.emitted..]),
-                why: MalformedReason::InvalidArguments,
-            });
-            self.emitted = self.text.len();
+    /// arguments a valid JSON prefix, malformed text for the rest, once the prefix has broken,
+    /// and the bytes the judge may still go back to held while the object is `open`
+    /// ([`Fragments::send`]); they go with the object's close, or when no more bytes can come
+    /// ([`Self::finish`]).
+    fn emit_new_bytes(&mut self, open: bool, out: &mut Events) {
+        if self
+            .fragments
+            .send(&self.text, open, self.index, out)
+            .is_some()
+        {
+            self.fragments.send_malformed(&self.text, out);
         }
     }
 }
@@ -295,6 +257,62 @@ mod tests {
             .collect()
     }
 
+    /// The malformed text of the events, joined.
+    fn malformed(events: &[Event]) -> String {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Malformed { text, .. } => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_word_under_way_is_held_so_the_pieces_say_of_it_what_the_whole_says() {
+        // A word that is no literal is refused from its first letter and nothing of it is sent
+        // as arguments however the bytes were cut; a literal, whole or cut short at the end, is
+        // sent once it is spelled or once nothing more can come; a number streams as far as it
+        // is one. The region ends with the stream (cut) or at the next opener (closed).
+        let cases = [
+            ("nosuch", "", "nosuch"),
+            ("trash", "", "trash"),
+            ("nul", "nul", ""),
+            ("null", "null", ""),
+            ("1x", "1", "x"),
+            ("{\"a\": nosuch}", "{\"a\": ", "nosuch}"),
+            ("{\"a\": null}", "{\"a\": null}", ""),
+            ("{\"e\": \"\\ud83c\\x\"}", "{\"e\": \"\\ud83c", "\\x\"}"),
+            ("\"ab\\ud83c\\ude00 c\"", "\"ab\\ud83c\\ude00 c\"", ""),
+            ("\tnosuch", "", "\tnosuch"),
+            (" null", " null", ""),
+        ];
+        for (value, expected_arguments, expected_malformed) in cases {
+            for cut in [true, false] {
+                let call = format!("f[ARGS]{value}");
+                let (whole, _) = run(&[&call], cut);
+                let per_char: Vec<&str> = call
+                    .char_indices()
+                    .map(|(i, c)| &call[i..i + c.len_utf8()])
+                    .collect();
+                let (streamed, _) = run(&per_char, cut);
+                for (how, events) in [("whole", &whole), ("per character", &streamed)] {
+                    assert_eq!(
+                        arguments(events),
+                        expected_arguments,
+                        "{call:?} cut={cut} {how}: arguments"
+                    );
+                    assert_eq!(
+                        malformed(events),
+                        expected_malformed,
+                        "{call:?} cut={cut} {how}: malformed"
+                    );
+                    assert_eq!(bytes(events), call, "{call:?} cut={cut} {how}: every byte");
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_call_names_its_tool_before_the_marker_and_streams_the_object_as_its_arguments() {
         let (events, taken) = run(&[CALL], false);
@@ -351,7 +369,7 @@ mod tests {
             events,
             vec![Event::Malformed {
                 text: Text::uncounted("get_weather"),
-                why: MalformedReason::Other(NAME_WITHOUT_ARGUMENTS.to_string()),
+                why: MalformedReason::NameWithoutArguments,
             }]
         );
         let (events, _) = run(&["get_wea"], true);

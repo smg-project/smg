@@ -5,11 +5,9 @@
 
 use std::{fmt::Debug, sync::Arc};
 
-use openai_protocol::worker::WorkerLoadResponse;
-
 use crate::{
     config::CacheIndexKind,
-    worker::{HashRing, Worker},
+    worker::{load_state::LoadReceiver, HashRing, Worker},
 };
 
 mod bucket;
@@ -77,27 +75,36 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         false // Default: most policies don't need request text
     }
 
-    /// Update worker load information
-    ///
-    /// This is called periodically with current load information for load-aware policies.
-    fn update_loads(&self, _loads: &std::collections::HashMap<String, WorkerLoadResponse>) {
-        // Default: no-op for policies that don't use load information
+    /// Whether this policy reads the request text when the request's token
+    /// ids are available as well. A policy that routes on the ids and falls
+    /// back to the text only without them answers `false`, so a tokenized
+    /// request's selection snapshot carries the ids alone instead of a copy
+    /// of the whole rendered prompt next to them. Defaults to
+    /// [`Self::needs_request_text`].
+    fn needs_request_text_with_tokens(&self) -> bool {
+        self.needs_request_text()
     }
 
-    /// Whether routing consumes backend load snapshots, pushed via
-    /// [`Self::update_loads`] or read from the monitor's watch feed. The
-    /// `WorkerMonitor` skips backend load polling while no policy needs it.
+    /// Hand the policy the worker monitor's load feed: the shared snapshot
+    /// of every worker's latest load report, published per poll tick and
+    /// per window of pushed records. A policy that scores on backend load
+    /// keeps the receiver and reads the current snapshot per decision (one
+    /// `Arc` clone, no copy); the default ignores it.
+    fn set_load_receiver(&self, _rx: Option<LoadReceiver>) {}
+
+    /// Whether routing reads the load feed. With load monitoring disabled,
+    /// the `WorkerMonitor` polls a group only while something needs the
+    /// data. A policy's answer is a constant for its lifetime.
     fn needs_backend_loads(&self) -> bool {
         false
     }
 
-    /// Drop any cached per-worker state for a removed worker.
-    ///
-    /// Called when a worker leaves the registry so load-aware policies don't
-    /// accumulate stale load reports under worker churn (autoscaling, rolling
-    /// updates). Default is a no-op for stateless policies.
+    /// Drop the state this policy keeps on a removed worker (a load-aware
+    /// policy's dispatch tally), so it does not accumulate under worker
+    /// churn (autoscaling, rolling updates). Default is a no-op for
+    /// stateless policies.
     fn remove_worker(&self, _url: &str) {
-        // Default: no-op for policies that don't cache per-worker state
+        // Default: no-op for policies that don't keep per-worker state
     }
 
     /// Reconcile the state this policy booked on `worker_url` against the

@@ -15,7 +15,7 @@ pub mod kv_event_monitor;
 mod kv_event_recovery;
 pub mod kv_index_backend;
 pub(crate) mod liveness;
-pub(crate) mod load_state;
+pub mod load_state;
 pub mod manager;
 pub mod metrics_aggregator;
 pub mod monitor;
@@ -72,7 +72,7 @@ pub use sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL;
 pub use service::WorkerService;
 pub(crate) use worker::ConnectionModeExt;
 pub use worker::{
-    AttachedBody, BasicWorker, ConnectionMode, RequestCompletionSink, RuntimeType, Worker,
+    BasicWorker, ConnectionMode, GuardedStream, RequestCompletionSink, RuntimeType, Worker,
     WorkerLoadGuard, WorkerType, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, MORIIO_CONNECTOR,
     MORIIO_MODE_LABEL, NIXL_CONNECTOR,
 };

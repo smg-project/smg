@@ -38,16 +38,27 @@ use smg_response_template::{
 use symphony::Format;
 use tracing::info;
 
-/// The tables the registered tokenizers' response templates compile into, by model.
+/// The tables the registered tokenizers' response templates compile into, by model; and, by
+/// model, whether a table's markers are hidden by the model's decoder, decided once.
 pub(crate) struct Templates {
     tokenizers: Arc<TokenizerRegistry>,
     compiled: RwLock<HashMap<String, Entry>>,
+    hidden: RwLock<HashMap<String, Hidden>>,
 }
 
-/// What a model's tokenizer compiled into, bound to that tokenizer.
+/// What a model's tokenizer compiled into, bound to that tokenizer: the table, shared with every
+/// request and engine that reads with it.
 struct Entry {
     tokenizer: Weak<dyn Tokenizer>,
-    table: Result<Format, String>,
+    table: Result<Arc<Format>, String>,
+}
+
+/// Whether a table's markers are hidden by a model's decoder, bound to the tokenizer that decided
+/// it and to the markers it decided for.
+struct Hidden {
+    tokenizer: Weak<dyn Tokenizer>,
+    markers: Vec<String>,
+    hidden: bool,
 }
 
 impl Templates {
@@ -55,12 +66,49 @@ impl Templates {
         Self {
             tokenizers,
             compiled: RwLock::default(),
+            hidden: RwLock::default(),
         }
+    }
+
+    /// Whether `format`'s markers lose text when `tokenizer`, `model`'s, decodes them with the
+    /// special tokens dropped, as `decide` works it out: decided once per model, for the
+    /// tokenizer and the markers it was decided for, since deciding encodes and decodes every
+    /// marker and the answer depends on nothing else. A model whose tokenizer or whose table's
+    /// markers changed is decided again.
+    pub(crate) fn markers_hidden(
+        &self,
+        model: &str,
+        format: &Format,
+        tokenizer: &Arc<dyn Tokenizer>,
+        decide: impl FnOnce() -> bool,
+    ) -> bool {
+        let current = Arc::downgrade(tokenizer);
+        if let Some(entry) = self.hidden.read().get(model) {
+            if entry.tokenizer.ptr_eq(&current)
+                && entry
+                    .markers
+                    .iter()
+                    .map(String::as_str)
+                    .eq(format.terminal_texts())
+            {
+                return entry.hidden;
+            }
+        }
+        let hidden = decide();
+        self.hidden.write().insert(
+            model.to_string(),
+            Hidden {
+                tokenizer: current,
+                markers: format.terminal_texts().map(str::to_string).collect(),
+                hidden,
+            },
+        );
+        hidden
     }
 
     /// The table `model`'s response template compiles into, or why it has none: no tokenizer, no
     /// template, a template the crate does not read, or one the compile refuses.
-    pub(crate) fn format(&self, model: &str) -> Result<Format, String> {
+    pub(crate) fn format(&self, model: &str) -> Result<Arc<Format>, String> {
         let Some(tokenizer) = self.tokenizers.get(model) else {
             return Err(format!("no tokenizer is registered for model '{model}'"));
         };
@@ -70,7 +118,7 @@ impl Templates {
                 return entry.table.clone();
             }
         }
-        let table = compile(model, tokenizer.as_ref());
+        let table = compile(model, tokenizer.as_ref()).map(Arc::new);
         match &table {
             Ok(format) => info!(
                 model,

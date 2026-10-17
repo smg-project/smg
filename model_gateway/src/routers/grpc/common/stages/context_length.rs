@@ -7,8 +7,9 @@
 //! path that rejection comes back as `500 prefill_worker_failed_to_start`: a
 //! server error for a client mistake, blamed on a healthy worker (#2380).
 //!
-//! Runs once at ingress, after worker selection (the window is a property of
-//! the chosen worker's model card) and before any client is acquired.
+//! Regular gRPC and PD selection share these checks to exclude workers whose
+//! advertised windows cannot hold the request. The post-selection guard runs
+//! at ingress before any client is acquired, including on other pipeline modes.
 
 use std::sync::Arc;
 
@@ -21,12 +22,77 @@ use crate::{
         error,
         grpc::context::{PreparationOutput, RequestType, WorkerSelection},
     },
-    worker::Worker,
+    worker::{ConnectionMode, Worker},
 };
 
 /// Error code for an input that does not fit the model's window; matches the
 /// OpenAI API's code for the same condition.
 pub(crate) const CONTEXT_LENGTH_EXCEEDED: &str = "context_length_exceeded";
+
+/// The existing gateway checks, retained through retries. Input and output
+/// are independent bounds: adding them would change SGLang's clamping policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ContextRequirements {
+    input_tokens: usize,
+    scoring_position: bool,
+    output_tokens: Option<u32>,
+}
+
+impl ContextRequirements {
+    /// Capture exact preparation counts and the provider's output-budget rule.
+    pub(crate) fn new(prep: &PreparationOutput, request: &RequestType) -> Self {
+        Self {
+            input_tokens: prep.max_input_token_count(),
+            scoring_position: matches!(prep, PreparationOutput::Decisions { .. }),
+            output_tokens: output_budget(request),
+        }
+    }
+
+    /// Unknown windows remain eligible; no character estimate or token sum is used.
+    /// Direct-ZMQ workers in the shared pipeline retain post-selection validation.
+    pub(crate) fn admits(self, worker: &dyn Worker, model_id: &str) -> bool {
+        if !matches!(worker.connection_mode(), ConnectionMode::Grpc) {
+            return true;
+        }
+        worker.context_length(model_id).is_none_or(|limit| {
+            input_fits(self.input_tokens, limit, self.scoring_position)
+                && self.output_tokens.is_none_or(|tokens| tokens <= limit)
+        })
+    }
+
+    /// Preserve the existing 400 and diagnostic for a known insufficient window.
+    pub(crate) fn enforce(self, limit: u32, model_id: &str) -> Result<(), Response> {
+        enforce_input(self.input_tokens, limit, self.scoring_position, model_id)?;
+        enforce_output(self.output_tokens, limit, model_id)
+    }
+}
+
+/// Whether the input fits, reserving the scoring position without arithmetic
+/// that can overflow even for a synthetic `usize::MAX` token count.
+fn input_fits(input_tokens: usize, limit: u32, scoring_position: bool) -> bool {
+    if scoring_position {
+        input_tokens < limit as usize
+    } else {
+        input_tokens <= limit as usize
+    }
+}
+
+/// The shared input check used by selection and the post-selection guard.
+fn enforce_input(
+    input_tokens: usize,
+    limit: u32,
+    scoring_position: bool,
+    model_id: &str,
+) -> Result<(), Response> {
+    if input_fits(input_tokens, limit, scoring_position) {
+        return Ok(());
+    }
+    if scoring_position {
+        return Err(error::bad_request(CONTEXT_LENGTH_EXCEEDED,
+            format!("Decision prompt has {input_tokens} tokens and cannot fit the {limit}-token context window with its scoring position intact")));
+    }
+    Err(context_length_exceeded(input_tokens, limit, model_id))
+}
 
 /// Reject the request when its longest input exceeds the context window the
 /// selected worker(s) advertise for `model_id`.
@@ -47,11 +113,7 @@ pub(crate) fn enforce_context_length(
     let Some(limit) = selection_context_length(workers, model_id) else {
         return Ok(());
     };
-    let input_tokens = prep.max_input_token_count();
-    if input_tokens <= limit as usize {
-        return Ok(());
-    }
-    Err(context_length_exceeded(input_tokens, limit, model_id))
+    enforce_input(prep.max_input_token_count(), limit, false, model_id)
 }
 
 /// The refusal for an input of `input_tokens` tokens that does not fit a
@@ -93,11 +155,7 @@ pub(crate) fn enforce_decisions_context_length(
     let Some(limit) = selection_context_length(workers, model_id) else {
         return Ok(());
     };
-    if input_tokens < limit as usize {
-        return Ok(());
-    }
-    Err(error::bad_request(CONTEXT_LENGTH_EXCEEDED,
-        format!("Decision prompt has {input_tokens} tokens and cannot fit the {limit}-token context window with its scoring position intact")))
+    enforce_input(input_tokens, limit, true, model_id)
 }
 
 /// Reject a chat completion budget the model's window could never hold.
@@ -113,17 +171,32 @@ pub(crate) fn enforce_output_budget(
     workers: &WorkerSelection,
     model_id: &str,
 ) -> Result<(), Response> {
-    let RequestType::Chat(request) = request_type else {
+    let Some(max_tokens) = output_budget(request_type) else {
         return Ok(());
     };
-    if ProviderProfile::for_model(&request.model) != ProviderProfile::Zai {
-        return Ok(());
-    }
     let Some(limit) = selection_context_length(workers, model_id) else {
         return Ok(());
     };
+    enforce_output(Some(max_tokens), limit, model_id)
+}
+
+/// Only the z.ai chat profile imposes an engine-independent output bound.
+fn output_budget(request_type: &RequestType) -> Option<u32> {
+    let RequestType::Chat(request) = request_type else {
+        return None;
+    };
+    if ProviderProfile::for_model(&request.model) != ProviderProfile::Zai {
+        return None;
+    }
     #[expect(deprecated, reason = "the request may predate normalization")]
-    let Some(max_tokens) = request.max_completion_tokens.or(request.max_tokens) else {
+    {
+        request.max_completion_tokens.or(request.max_tokens)
+    }
+}
+
+/// The shared output check; absent and zero budgets retain their old meaning.
+fn enforce_output(max_tokens: Option<u32>, limit: u32, model_id: &str) -> Result<(), Response> {
+    let Some(max_tokens) = max_tokens else {
         return Ok(());
     };
     if max_tokens <= limit {
@@ -154,13 +227,23 @@ fn selection_context_length(workers: &WorkerSelection, model_id: &str) -> Option
         WorkerSelection::Single { worker } => worker.context_length(model_id),
         WorkerSelection::Disaggregated {
             prefill, decode, ..
-        } => match (
-            prefill.context_length(model_id),
-            decode.context_length(model_id),
-        ) {
-            (Some(prefill), Some(decode)) => Some(prefill.min(decode)),
-            (prefill, decode) => prefill.or(decode),
-        },
+        } => pair_context_length(prefill.as_ref(), decode.as_ref(), model_id),
+    }
+}
+
+/// Tightest known bound of two token-processing legs. An unknown leg adds no
+/// bound, but cannot erase the known constraint on its partner.
+pub(super) fn pair_context_length(
+    prefill: &dyn Worker,
+    decode: &dyn Worker,
+    model_id: &str,
+) -> Option<u32> {
+    match (
+        prefill.context_length(model_id),
+        decode.context_length(model_id),
+    ) {
+        (Some(prefill), Some(decode)) => Some(prefill.min(decode)),
+        (prefill, decode) => prefill.or(decode),
     }
 }
 
@@ -243,6 +326,30 @@ mod tests {
         RequestType::Chat(Arc::new(
             serde_json::from_value(body).expect("chat request deserializes"),
         ))
+    }
+
+    /// Selection shares both provider budget semantics and the overflow-safe
+    /// scoring boundary with the existing post-selection checks.
+    #[test]
+    fn context_requirements_preserve_budget_and_scoring_boundaries() {
+        for budget in [None, Some(0), Some(16), Some(u32::MAX)] {
+            let request = chat("ordinary-model", budget);
+            let requirement = ContextRequirements::new(&input(16), &request);
+            assert!(requirement.enforce(16, MODEL).is_ok());
+        }
+        let requirement = ContextRequirements {
+            input_tokens: usize::MAX,
+            scoring_position: true,
+            output_tokens: Some(u32::MAX),
+        };
+        assert_rejected(requirement.enforce(u32::MAX, MODEL));
+        let requirement = ContextRequirements {
+            input_tokens: 16,
+            scoring_position: true,
+            output_tokens: None,
+        };
+        assert_rejected(requirement.enforce(16, MODEL));
+        assert!(requirement.enforce(17, MODEL).is_ok());
     }
 
     #[test]

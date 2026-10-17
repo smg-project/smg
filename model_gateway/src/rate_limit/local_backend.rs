@@ -237,6 +237,7 @@ mod tests {
                 UsageSettlement {
                     actual_input_tokens: 60,
                     completion_tokens: 0,
+                    ..UsageSettlement::default()
                 },
             )
             .await;
@@ -260,6 +261,7 @@ mod tests {
                 UsageSettlement {
                     actual_input_tokens: 50,
                     completion_tokens: 60,
+                    ..UsageSettlement::default()
                 },
             )
             .await;
@@ -267,6 +269,38 @@ mod tests {
         // 100 capacity - 50 reserved - 60 extra from settlement = -10 (debt).
         let next = backend.reserve(request("auth:team-red", 1)).await;
         assert!(matches!(next, ReserveOutcome::Denied { .. }));
+    }
+
+    /// The cached and reasoning split of a settlement is carried, not
+    /// charged: the true-up reads the input and completion counts alone.
+    #[tokio::test]
+    async fn settle_charges_the_counts_and_not_their_split() {
+        let backend = LocalRateLimitBackend::new(policy_set(100, 5));
+        let req = request("auth:team-red", 50);
+        let charge_id = req.request_charge_id;
+        assert_eq!(backend.reserve(req).await, ReserveOutcome::Admitted);
+
+        backend
+            .settle_success(
+                charge_id,
+                UsageSettlement {
+                    actual_input_tokens: 50,
+                    completion_tokens: 10,
+                    cached_input_tokens: 40,
+                    reasoning_tokens: 8,
+                },
+            )
+            .await;
+
+        // 100 - 60 = 40 remain: the split neither charges twice nor refunds.
+        assert_eq!(
+            backend.reserve(request("auth:team-red", 40)).await,
+            ReserveOutcome::Admitted
+        );
+        assert!(matches!(
+            backend.reserve(request("auth:team-red", 1)).await,
+            ReserveOutcome::Denied { .. }
+        ));
     }
 
     #[tokio::test]
@@ -286,6 +320,7 @@ mod tests {
                 UsageSettlement {
                     actual_input_tokens: 2,
                     completion_tokens: 500,
+                    ..UsageSettlement::default()
                 },
             )
             .await;

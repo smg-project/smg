@@ -5,6 +5,7 @@ use std::{
 
 use axum::http::{HeaderName, HeaderValue, Uri};
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 
 use super::*;
 use crate::{middleware::scheduler, policies::cost as selection_cost};
@@ -37,11 +38,13 @@ pub fn validate_mesh_listener_port(
     port: u16,
     metrics_port: Option<u16>,
     health_check_port: Option<u16>,
+    admin_port: Option<u16>,
 ) -> ConfigResult<()> {
     let listeners = [
         Some(("port", "--port", port)),
         metrics_port.map(|port| ("metrics.port", "--prometheus-port", port)),
         health_check_port.map(|port| ("health_check_port", "--health-check-port", port)),
+        admin_port.map(|port| ("admin_port", "--admin-port", port)),
         Some(("mesh_port", "--mesh-port", mesh_port)),
     ];
     let listeners: Vec<_> = listeners.into_iter().flatten().collect();
@@ -277,6 +280,57 @@ pub fn bind_socket_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
     parse_bind_host(host).map(|ip| SocketAddr::new(ip, port))
 }
 
+/// The listener address of the RDMA pixel lane's metadata exchange
+/// (`--rdma-listen-ip`, `SMG_RDMA_LISTEN_IP`): a plain IPv4 or IPv6 address,
+/// surrounding whitespace aside. The workers connect to the address as it is
+/// written, so a hostname, a port or the brackets of a `host:port` string are
+/// refused with everything else that is not an IP address; `999.1.1.1` used
+/// to pass and fail only when the lane came up, far from the flag.
+pub(crate) fn parse_listen_ip(value: &str) -> Result<IpAddr, String> {
+    value.trim().parse::<IpAddr>().map_err(|_| {
+        format!("invalid listen IP '{value}': expected an IP address such as 10.0.0.7 or fd00::1")
+    })
+}
+
+/// The most worker threads an explicit `runtime_worker_threads` may ask
+/// for, on every host alike: the counts that are a typo or a misread unit
+/// (10,000; 100,000), each of which is a stack and a thread the scheduler
+/// wakes for nothing, are refused without reading the host, so a
+/// configuration that validates on one host validates on another (a pod
+/// under a cgroup CPU quota included). A few times the CPUs of the largest
+/// hosts, not a budget.
+pub const RUNTIME_WORKER_THREADS_CEILING: usize = 4096;
+
+/// Worker threads per CPU available to the process above which an explicit
+/// count is an oversubscription worth a warning: a worker thread beyond the
+/// CPUs only waits for one. Advice at start-up, not a refusal: a runtime
+/// deliberately oversubscribed (handlers that block a worker) is the
+/// operator's choice, which the host's quota must not veto.
+pub const RUNTIME_WORKER_THREADS_PER_CPU: usize = 4;
+
+/// The warning for an explicit `runtime_worker_threads` above
+/// [`RUNTIME_WORKER_THREADS_PER_CPU`] x the `cpus` available to the process
+/// (never under one CPU's worth: a parallelism that cannot be read counts as
+/// one), `None` within it. Pure over the CPU count so the rule is testable;
+/// start-up logs it where it logs the runtime's size.
+pub fn runtime_worker_threads_oversubscription(threads: usize, cpus: usize) -> Option<String> {
+    let advised = cpus.max(1).saturating_mul(RUNTIME_WORKER_THREADS_PER_CPU);
+    (threads > advised).then(|| {
+        format!(
+            "runtime_worker_threads {threads} is above {advised}, \
+             {RUNTIME_WORKER_THREADS_PER_CPU} x the {cpus} CPUs available to this process: a \
+             worker thread beyond the CPUs only waits for one and costs its stack"
+        )
+    })
+}
+
+/// The CPUs available to this process, as the runtime's own default reads
+/// them (the affinity mask and the cgroup quota included); 1 when the count
+/// cannot be read.
+pub fn available_cpus() -> usize {
+    std::thread::available_parallelism().map_or(1, usize::from)
+}
+
 /// Configuration validator
 pub(crate) struct ConfigValidator;
 impl ConfigValidator {
@@ -289,6 +343,7 @@ impl ConfigValidator {
         Self::validate_cors_allowed_origins(config)?;
         Self::validate_value_shapes(config)?;
         Self::validate_log_dir(config)?;
+        Self::validate_access_log_fields(config)?;
         Self::validate_storage_context_headers(config)?;
         Self::validate_routing_key_headers(config)?;
         Self::validate_tenant_resolution(config)?;
@@ -296,6 +351,7 @@ impl ConfigValidator {
         Self::validate_memory_history(config)?;
         Self::validate_model_aliases(config)?;
         Self::validate_rl(config)?;
+        Self::validate_kv_index(config)?;
         Self::validate_prefill_admission(config)?;
         Self::validate_priority_scheduler(config)?;
         if let Some(discovery) = &config.discovery {
@@ -532,6 +588,24 @@ impl ConfigValidator {
             memory
                 .validate()
                 .map_err(|reason| ConfigError::ValidationFailed { reason })?;
+        }
+        Ok(())
+    }
+
+    /// `access_log_fields` names each optional field of the access-log
+    /// record once: a field listed twice is a slip in the configuration, not
+    /// a request for a second column, and is refused by name.
+    fn validate_access_log_fields(config: &RouterConfig) -> ConfigResult<()> {
+        let mut seen: Vec<AccessLogField> = Vec::with_capacity(config.access_log_fields.len());
+        for field in &config.access_log_fields {
+            if seen.contains(field) {
+                return Err(ConfigError::InvalidValue {
+                    field: "access_log_fields".to_string(),
+                    value: field.to_string(),
+                    reason: "listed twice".to_string(),
+                });
+            }
+            seen.push(*field);
         }
         Ok(())
     }
@@ -1082,6 +1156,23 @@ impl ConfigValidator {
             });
         }
 
+        // The RDMA pixel lane's listener: an IP address or nothing (blank is
+        // unset, as the lane reads it). Anything else used to pass here and
+        // fail when the lane came up, far from the flag that caused it.
+        if let Some(ip) = config
+            .rdma_listen_ip
+            .as_deref()
+            .filter(|ip| !ip.trim().is_empty())
+        {
+            if let Err(reason) = parse_listen_ip(ip) {
+                return Err(ConfigError::InvalidValue {
+                    field: "rdma_listen_ip".to_string(),
+                    value: ip.to_string(),
+                    reason,
+                });
+            }
+        }
+
         if config.port == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "port".to_string(),
@@ -1104,6 +1195,36 @@ impl ConfigValidator {
             });
         }
 
+        // The admin listener: a port of 0 would be an unstable ephemeral one
+        // (as for the probe listener), a host without a port names a listener
+        // that does not exist, and the host must be a bind host.
+        if config.admin_port == Some(0) {
+            return Err(ConfigError::InvalidValue {
+                field: "admin_port".to_string(),
+                value: "0".to_string(),
+                reason: "Port must be > 0 (0 would request an unstable OS-ephemeral port)"
+                    .to_string(),
+            });
+        }
+        if let Some(admin_host) = &config.admin_host {
+            if config.admin_port.is_none() {
+                return Err(ConfigError::InvalidValue {
+                    field: "admin_host".to_string(),
+                    value: admin_host.clone(),
+                    reason: "--admin-host needs --admin-port: the admin listener exists only \
+                             with a port"
+                        .to_string(),
+                });
+            }
+            if let Err(reason) = parse_bind_host(admin_host) {
+                return Err(ConfigError::InvalidValue {
+                    field: "admin_host".to_string(),
+                    value: admin_host.clone(),
+                    reason,
+                });
+            }
+        }
+
         // Each listener needs its own port. Two of them on one port used to
         // bind the first, answer, and die at the second bind with a raw
         // AddrInUse that named no flag: a partial start an operator's
@@ -1117,6 +1238,9 @@ impl ConfigValidator {
             config
                 .health_check_port
                 .map(|port| ("health_check_port", "--health-check-port", port)),
+            config
+                .admin_port
+                .map(|port| ("admin_port", "--admin-port", port)),
         ];
         let listeners: Vec<_> = listeners.into_iter().flatten().collect();
         validate_distinct_listener_ports(&listeners)?;
@@ -1138,13 +1262,34 @@ impl ConfigValidator {
         }
 
         // The async runtime builder panics on zero worker threads; refuse it
-        // here like every other count that must be positive.
-        if config.runtime_worker_threads == Some(0) {
-            return Err(ConfigError::InvalidValue {
-                field: "runtime_worker_threads".to_string(),
-                value: "0".to_string(),
-                reason: "Must be >= 1".to_string(),
-            });
+        // here like every other count that must be positive. Above the
+        // ceiling every worker thread is one more stack and one more thread
+        // the scheduler wakes for nothing: a count of 100,000 used to pass,
+        // build its threads for over a minute and hold gigabytes before the
+        // first bind. Both are refused here, before the command line builds
+        // the runtime, so a refused count costs no thread. The ceiling reads
+        // nothing of the host, so the verdict is the same on every host; an
+        // oversubscription of the host's CPUs is a warning at start-up.
+        match config.runtime_worker_threads {
+            Some(0) => {
+                return Err(ConfigError::InvalidValue {
+                    field: "runtime_worker_threads".to_string(),
+                    value: "0".to_string(),
+                    reason: "Must be >= 1".to_string(),
+                });
+            }
+            Some(threads) if threads > RUNTIME_WORKER_THREADS_CEILING => {
+                return Err(ConfigError::InvalidValue {
+                    field: "runtime_worker_threads".to_string(),
+                    value: threads.to_string(),
+                    reason: format!(
+                        "Must be at most {RUNTIME_WORKER_THREADS_CEILING} (a worker thread is a \
+                         stack and a thread the scheduler wakes; a count this size is a typo or \
+                         a misread unit)"
+                    ),
+                });
+            }
+            Some(_) | None => {}
         }
 
         // A zero-capacity job channel panics at construction and a
@@ -1194,6 +1339,18 @@ impl ConfigValidator {
                 field: "request_timeout_secs".to_string(),
                 value: config.request_timeout_secs.to_string(),
                 reason: "Must be > 0".to_string(),
+            });
+        }
+
+        // The connection limit is a semaphore's permit count, and the
+        // runtime refuses more than its maximum at construction (a panic):
+        // a named configuration error here instead, for the config-file and
+        // bindings paths as much as the CLI.
+        if config.max_connections > Semaphore::MAX_PERMITS {
+            return Err(ConfigError::InvalidValue {
+                field: "max_connections".to_string(),
+                value: config.max_connections.to_string(),
+                reason: format!("Must be at most {} (0 = no bound)", Semaphore::MAX_PERMITS),
             });
         }
 
@@ -1378,6 +1535,33 @@ impl ConfigValidator {
             ));
         }
         Ok(ancestor)
+    }
+
+    /// The deprecated `kv_index` field: the chain index is the only KV index,
+    /// so `chain` (in any case) is the one value accepted; `positional` names
+    /// the index that was removed and is refused with the reason, as is any
+    /// other value.
+    fn validate_kv_index(config: &RouterConfig) -> ConfigResult<()> {
+        let Some(value) = config.kv_index.as_deref() else {
+            return Ok(());
+        };
+        match value.trim().to_ascii_lowercase().as_str() {
+            "chain" => Ok(()),
+            "positional" => Err(ConfigError::InvalidValue {
+                field: "kv_index".to_string(),
+                value: value.to_string(),
+                reason: "the positional KV index was removed (kv-index 2.0.0): the chain index \
+                         is the only KV index, drop kv_index"
+                    .to_string(),
+            }),
+            _ => Err(ConfigError::InvalidValue {
+                field: "kv_index".to_string(),
+                value: value.to_string(),
+                reason: "the chain index is the only KV index, so kv_index takes chain only \
+                         (and is deprecated)"
+                    .to_string(),
+            }),
+        }
     }
 
     fn validate_rl(config: &RouterConfig) -> ConfigResult<()> {
@@ -2135,6 +2319,39 @@ mod tests {
         assert!(ConfigValidator::validate(&config).is_ok());
     }
 
+    /// The deprecated `kv_index` field, as a config file or a binding sets
+    /// it: `chain` in any case is accepted, the removed `positional` index
+    /// is refused with the removal in the reason, any other value is refused.
+    #[test]
+    fn kv_index_takes_chain_only() {
+        for value in ["chain", "Chain", " CHAIN "] {
+            let config = RouterConfig {
+                kv_index: Some(value.to_string()),
+                ..Default::default()
+            };
+            assert!(ConfigValidator::validate(&config).is_ok(), "{value:?}");
+        }
+
+        let config = RouterConfig {
+            kv_index: Some("positional".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, ref reason, .. })
+                if field == "kv_index" && reason.contains("positional KV index was removed")
+        ));
+
+        let config = RouterConfig {
+            kv_index: Some("run".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "kv_index"
+        ));
+    }
+
     /// A `RouterConfig` built directly, as a language binding or a library
     /// caller builds one: the validator refuses each malformed shape by its
     /// field, and accepts the well-formed values.
@@ -2388,6 +2605,161 @@ mod tests {
             ..Default::default()
         };
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// The ceiling on the count reads nothing of the host: 1, the host's CPU
+    /// count, a deliberate oversubscription of it and the ceiling itself pass
+    /// on every host, while one more and the 100,000 that a typo once got
+    /// through with are refused naming the ceiling.
+    #[test]
+    fn runtime_worker_threads_above_the_ceiling_are_rejected_on_every_host_alike() {
+        let cpus = available_cpus();
+        assert!(cpus >= 1);
+        let with = |threads: usize| RouterConfig {
+            runtime_worker_threads: Some(threads),
+            ..Default::default()
+        };
+        // The host's counts clamped to the ceiling: the test passes on a host
+        // with more CPUs than the ceiling allows for, as the rule does.
+        for ok in [
+            1,
+            cpus.min(RUNTIME_WORKER_THREADS_CEILING),
+            cpus.saturating_mul(RUNTIME_WORKER_THREADS_PER_CPU + 4)
+                .min(RUNTIME_WORKER_THREADS_CEILING),
+            RUNTIME_WORKER_THREADS_CEILING,
+        ] {
+            assert!(
+                ConfigValidator::validate(&with(ok)).is_ok(),
+                "{ok} worker threads, at most {RUNTIME_WORKER_THREADS_CEILING}"
+            );
+        }
+        for bad in [RUNTIME_WORKER_THREADS_CEILING + 1, 100_000] {
+            match ConfigValidator::validate(&with(bad)) {
+                Err(ConfigError::InvalidValue {
+                    field,
+                    value,
+                    reason,
+                }) => {
+                    assert_eq!(field, "runtime_worker_threads", "{bad}");
+                    assert_eq!(value, bad.to_string());
+                    assert!(
+                        reason.contains(&format!("at most {RUNTIME_WORKER_THREADS_CEILING}")),
+                        "{bad}: {reason}"
+                    );
+                }
+                other => panic!("{bad} worker threads: expected a refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// A count above a small multiple of the CPUs available to the process
+    /// is a warning, not a refusal: the pure rule names the advised count
+    /// and the CPUs, says nothing within it, counts an unreadable
+    /// parallelism as one CPU, and the validator passes such a count.
+    #[test]
+    fn runtime_worker_threads_above_four_per_cpu_warn_without_a_refusal() {
+        assert_eq!(runtime_worker_threads_oversubscription(8, 2), None);
+        assert_eq!(runtime_worker_threads_oversubscription(1, 0), None);
+        let warning = runtime_worker_threads_oversubscription(16, 2).expect("a warning");
+        assert!(
+            warning.contains("runtime_worker_threads 16 is above 8")
+                && warning.contains("2 CPUs available"),
+            "{warning}"
+        );
+        let warning = runtime_worker_threads_oversubscription(5, 0).expect("a warning");
+        assert!(warning.contains("is above 4"), "{warning}");
+
+        let config = RouterConfig {
+            runtime_worker_threads: Some(
+                available_cpus()
+                    .saturating_mul(16)
+                    .min(RUNTIME_WORKER_THREADS_CEILING),
+            ),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// The RDMA lane's listener address is an IP address or nothing: a plain
+    /// IPv4 or IPv6 literal passes (padding aside; blank is unset, as the lane
+    /// reads it), while a non-address, a hostname, a port or brackets are
+    /// refused naming the field, before the lane comes up.
+    #[test]
+    fn rdma_listen_ip_must_be_an_ip_address_when_set() {
+        for ok in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("10.0.0.7"),
+            Some(" 10.0.0.7 "),
+            Some("0.0.0.0"),
+            Some("fd00::1"),
+            Some("::1"),
+        ] {
+            let config = RouterConfig {
+                rdma_listen_ip: ok.map(str::to_string),
+                ..Default::default()
+            };
+            assert!(ConfigValidator::validate(&config).is_ok(), "{ok:?}");
+        }
+        for bad in [
+            "999.1.1.1",
+            "10.0.0",
+            "gateway.example",
+            "10.0.0.7:18515",
+            "[fd00::1]",
+            "fd00::1%eth0",
+            "::1/128",
+        ] {
+            let config = RouterConfig {
+                rdma_listen_ip: Some(bad.to_string()),
+                ..Default::default()
+            };
+            match ConfigValidator::validate(&config) {
+                Err(ConfigError::InvalidValue {
+                    field,
+                    value,
+                    reason,
+                }) => {
+                    assert_eq!(field, "rdma_listen_ip", "{bad}");
+                    assert_eq!(value, bad);
+                    assert!(reason.contains("expected an IP address"), "{bad}: {reason}");
+                }
+                other => panic!("{bad}: expected a refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// Each optional field of the access-log record is listed once; a field
+    /// listed twice is refused by name, the rest of the list is accepted.
+    #[test]
+    fn an_access_log_field_listed_twice_is_a_configuration_error() {
+        let accepted = RouterConfig {
+            access_log_fields: AccessLogField::ALL.to_vec(),
+            ..Default::default()
+        };
+        ConfigValidator::validate(&accepted).expect("every field once is accepted");
+
+        let twice = RouterConfig {
+            access_log_fields: vec![
+                AccessLogField::Tenant,
+                AccessLogField::Worker,
+                AccessLogField::Tenant,
+            ],
+            ..Default::default()
+        };
+        match ConfigValidator::validate(&twice) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) => {
+                assert_eq!(field, "access_log_fields");
+                assert_eq!(value, "tenant");
+                assert_eq!(reason, "listed twice");
+            }
+            other => panic!("expected an access_log_fields error, got {other:?}"),
+        }
     }
 
     fn log_dir_config(log_dir: &str) -> RouterConfig {
@@ -4130,8 +4502,9 @@ mod tests {
             ("--port", 30001),
             ("--prometheus-port", 30002),
             ("--health-check-port", 30003),
+            ("--admin-port", 30004),
         ] {
-            match validate_mesh_listener_port(taken, 30001, Some(30002), Some(30003)) {
+            match validate_mesh_listener_port(taken, 30001, Some(30002), Some(30003), Some(30004)) {
                 Err(ConfigError::InvalidValue {
                     field,
                     value,
@@ -4147,8 +4520,95 @@ mod tests {
                 other => panic!("--mesh-port equal to {flag} must be rejected, got {other:?}"),
             }
         }
-        assert!(validate_mesh_listener_port(30004, 30001, Some(30002), Some(30003)).is_ok());
-        assert!(validate_mesh_listener_port(30002, 30001, None, None).is_ok());
+        assert!(
+            validate_mesh_listener_port(30005, 30001, Some(30002), Some(30003), Some(30004))
+                .is_ok()
+        );
+        assert!(validate_mesh_listener_port(30002, 30001, None, None, None).is_ok());
+    }
+
+    /// The admin listener's settings: a port of 0 is refused (an ephemeral
+    /// port is no stable control-plane address), a host without a port names
+    /// a listener that does not exist, the host must be a bind host, and the
+    /// port must differ from the other listeners'; a port alone, or with a
+    /// bind host, passes.
+    #[test]
+    fn admin_listener_settings_are_validated() {
+        let config = |admin_port: Option<u16>, admin_host: Option<&str>| RouterConfig {
+            port: 30001,
+            metrics: Some(MetricsConfig {
+                port: 30002,
+                host: "127.0.0.1".to_string(),
+            }),
+            health_check_port: Some(30003),
+            admin_port,
+            admin_host: admin_host.map(str::to_string),
+            mode: RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            ..Default::default()
+        };
+        let refused = |config: &RouterConfig| match ConfigValidator::validate(config) {
+            Err(ConfigError::InvalidValue { field, reason, .. }) => (field, reason),
+            other => panic!("expected an InvalidValue, got {other:?}"),
+        };
+        for (admin_port, admin_host) in [
+            (None, None),
+            (Some(30004), None),
+            (Some(30004), Some("[::1]")),
+        ] {
+            ConfigValidator::validate(&config(admin_port, admin_host))
+                .unwrap_or_else(|e| panic!("{admin_port:?} {admin_host:?}: {e}"));
+        }
+
+        let (field, _) = refused(&config(Some(0), None));
+        assert_eq!(field, "admin_port");
+        let (field, reason) = refused(&config(None, Some("127.0.0.1")));
+        assert_eq!(field, "admin_host");
+        assert!(reason.contains("--admin-port"), "{reason}");
+        let (field, _) = refused(&config(Some(30004), Some("localhost")));
+        assert_eq!(field, "admin_host");
+        for (taken, flag) in [
+            (30001, "--port"),
+            (30002, "--prometheus-port"),
+            (30003, "--health-check-port"),
+        ] {
+            let (field, reason) = refused(&config(Some(taken), None));
+            assert_eq!(field, "admin_port");
+            assert!(
+                reason.contains("--admin-port") && reason.contains(flag),
+                "{reason}"
+            );
+        }
+    }
+
+    /// A connection limit above the runtime's permit maximum is refused by
+    /// name; no bound (0) and ordinary counts pass.
+    #[test]
+    fn a_connection_limit_above_the_permit_maximum_is_rejected() {
+        let config = |max_connections: usize| RouterConfig {
+            max_connections,
+            mode: RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            ..Default::default()
+        };
+        for accepted in [0, 1, 4096, Semaphore::MAX_PERMITS] {
+            ConfigValidator::validate(&config(accepted))
+                .unwrap_or_else(|e| panic!("max_connections {accepted}: {e}"));
+        }
+        match ConfigValidator::validate(&config(Semaphore::MAX_PERMITS + 1)) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) => {
+                assert_eq!(field, "max_connections");
+                assert_eq!(value, (Semaphore::MAX_PERMITS + 1).to_string());
+                assert!(reason.contains("0 = no bound"), "{reason}");
+            }
+            other => panic!("expected an invalid max_connections, got {other:?}"),
+        }
     }
 
     #[test]

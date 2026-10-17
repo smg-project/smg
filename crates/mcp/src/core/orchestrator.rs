@@ -458,12 +458,8 @@ impl McpOrchestrator {
         info!("Connecting to static server '{}'", config.name);
 
         let handler = Arc::new(
-            SmgClientHandler::new(
-                &config.name,
-                Arc::clone(&self.approval_manager),
-                Arc::clone(&self.tool_inventory),
-            )
-            .with_refresh_channel(self.refresh_tx.clone()),
+            SmgClientHandler::new(&config.name, Arc::clone(&self.approval_manager))
+                .with_refresh_channel(self.refresh_tx.clone()),
         );
 
         let client = self.connect_server_impl(config, (*handler).clone()).await?;
@@ -1760,7 +1756,6 @@ impl<'a> McpRequestContext<'a> {
         let handler = SmgClientHandler::new(
             &config.name,
             Arc::clone(&self.orchestrator.approval_manager),
-            Arc::clone(&self.orchestrator.tool_inventory),
         );
 
         let client = self

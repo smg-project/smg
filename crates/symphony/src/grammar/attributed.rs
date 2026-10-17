@@ -20,11 +20,11 @@
 use openai_protocol::common::Tool;
 use serde_json::Value;
 
-use super::{
-    schema::{self, shape, Definitions},
-    CallMarkers, Count, Grammar, Tag,
+use super::{calls, CallMarkers, Count, Grammar, Tag};
+use crate::{
+    format::Whitespace,
+    tagged::attributed::{Tags, Typing},
 };
-use crate::tagged::attributed::{Tags, Typing};
 
 /// The calls for `tools`, in the family's spelling: in the table's one block, in a block each, or
 /// with no block at all, as many as `count` lets the model write. `None` for a syntax that
@@ -118,6 +118,8 @@ fn string_attribute_calls(
                     Grammar::JsonSchema {
                         schema: Value::Bool(true),
                         style: None,
+                        excludes: Vec::new(),
+                        whitespace: Whitespace::Free,
                     },
                 ]),
             ]),
@@ -160,14 +162,12 @@ impl Ends<'_> {
 /// The arguments the tool's schema asks for: one pair per property, in the schema's order, each
 /// optional unless required; any pairs at all for a schema without properties.
 fn arguments(tags: &Tags, ends: &Ends<'_>, parameters: &Value) -> Grammar {
-    let pair = |key: &str, property: &Value, definitions: Definitions<'_>| {
-        let value = shape(property, definitions, || ends.text())
-            .map_or_else(|| ends.text(), |(_, value)| value);
-        argument(tags, Grammar::ConstString(key.to_string()), value)
-    };
-    schema::arguments(parameters, pair, || {
-        Grammar::Star(Box::new(any_argument(tags, ends)))
-    })
+    calls::arguments(
+        parameters,
+        || ends.text(),
+        |key, value| argument(tags, key, value),
+        || any_argument(tags, ends),
+    )
 }
 
 /// One pair: the opening tag up to the name's quote, the key, `">`, the value, the closing tag;

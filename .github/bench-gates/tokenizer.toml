@@ -1,0 +1,69 @@
+# Regression gate for `cargo bench -p smg --features tokenizers-v1 --bench tokenizer_benchmark`,
+# run by .github/workflows/benchmark-tokenizer.yml on pull requests through scripts/bench_gate.py.
+#
+# The gate runs the single-threaded gateway-path groups: the native encoder (encode_throughput,
+# latency/encode_*), DecodeStream::step (latency/decode_token, decode_performance/decode_stream),
+# the one-shot decode and Sequence::append_token (decode_performance/direct_decode,
+# sequence_decode) and the stop-sequence decoder (stop_sequences). batch_encode runs on a thread
+# pool and measures the runner's free cores, streaming_100k is a fixed 500 ms loop by
+# construction, and the concurrent / multithreaded / scaling / memory / l1_cache groups do not
+# fit the time budget: a push to main keeps running the whole file, the pull-request gate does
+# not run them.
+#
+# How a threshold was chosen. Two measurements of the repeat spread, (max - min) / median of the
+# per-run criterion medians, the gated groups only, the bench pinned to one core:
+#   - identical build: ten runs of one build of main on a busy shared build host, five "base" and
+#     five "pull request" runs of the same binary through this gate (the null case; it passed);
+#   - across builds: three interleaved runs of each of three builds on a quiet machine (the
+#     tokenizer speed matrix behind this gate), which also carries what code layout and allocator
+#     placement do to a benchmark between two binaries.
+# The threshold is the smallest multiple of 5 % that is at least twice the identical-build spread
+# and at least 1.5 x the across-build spread, never under 10 % (the hosted runner is noisier than
+# either machine). On top of the threshold the gate fails an id only when every pull-request run
+# is slower than every base run (scripts/bench_gate.py), so one slow run cannot fail the job.
+#
+#   group                               identical build   across builds   threshold
+#   encode_throughput/*                 0.8 - 2.6 %       1.4 - 5.3 %     10 %
+#   latency/encode_*                    2.4 - 3.3 %       1.5 - 2.4 %     10 %
+#   latency/decode_token                3.7 %             2.5 %           10 %
+#   decode_performance/decode_stream    2.7 %             3.7 %           10 %
+#   decode_performance/direct_decode    3.3 %             12.6 %          20 %
+#   decode_performance/sequence_decode  4.8 %             13.4 %          25 %
+#   stop_sequences/no_stops             6.7 %             15.7 %          25 %
+#   stop_sequences/with_stops           2.0 %             7.3 %           15 %
+#
+# Every job uploads bench-gate/results.json with the raw per-run medians of both sides; the hosted
+# runner's own spread can be read from those and the thresholds tightened once it is known.
+
+repeats = 3
+filter = "^(encode_throughput|latency|decode_performance|stop_sequences)/"
+
+[[gate]]
+pattern = "^(encode_throughput|latency)/"
+threshold = 0.10
+note = "identical build 0.8 - 3.7 %, across builds 1.4 - 5.3 %"
+
+[[gate]]
+pattern = "^decode_performance/decode_stream$"
+threshold = 0.10
+note = "identical build 2.7 %, across builds 3.7 %"
+
+[[gate]]
+pattern = "^decode_performance/direct_decode$"
+threshold = 0.20
+note = "identical build 3.3 %, across builds 12.6 %"
+
+[[gate]]
+pattern = "^decode_performance/sequence_decode$"
+threshold = 0.25
+note = "identical build 4.8 %, across builds 13.4 %"
+
+[[gate]]
+pattern = "^stop_sequences/no_stops$"
+threshold = 0.25
+note = "identical build 6.7 %, across builds 15.7 %"
+
+[[gate]]
+pattern = "^stop_sequences/with_stops$"
+threshold = 0.15
+note = "identical build 2.0 %, across builds 7.3 %"

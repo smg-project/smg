@@ -138,14 +138,17 @@ def _gateway_readiness_timeout(
 
     gRPC/HTTP workers are health-checked (model fully loaded) by the pool
     before the gateway starts, so the gateway only has to connect — the short
-    router timeout suffices. ZMQ engines instead spawn and return immediately;
+    router timeout suffices on a warm host. On a cold one, the gateway's own
+    health check of an SGLang worker generates a token, the worker's first,
+    which may still be compiling kernels, so ``E2E_STARTUP_TIMEOUT`` floors this
+    wait too. ZMQ engines instead spawn and return immediately;
     their model load happens *inside* the gateway's readiness gate, so that gate
     must cover model load too. Use the model's ``startup_timeout`` (what the
     worker gate would have applied), never shrinking an explicitly larger
     gateway timeout.
     """
     if connection_mode != ConnectionMode.ZMQ:
-        return base_timeout
+        return effective_startup_timeout(base_timeout)
     startup_timeout = effective_startup_timeout(
         get_model_spec(model_id).get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
     )

@@ -1,7 +1,6 @@
 //! Priority-aware admission scheduler.
 
 pub mod admission;
-pub mod body;
 pub mod class;
 pub mod config;
 pub mod engine;
@@ -15,7 +14,6 @@ pub mod slots;
 pub mod state;
 
 pub use admission::priority_admission_middleware;
-pub use body::SchedulerGuardBody;
 pub use class::{Class, UnknownClassName, PRIORITY_HEADER};
 pub use config::{
     ClassConfig, ClassRuntimeConfig, PrioritySchedulerYaml, SchedulerSettings,

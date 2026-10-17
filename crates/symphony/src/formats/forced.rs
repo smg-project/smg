@@ -134,7 +134,7 @@ mod tests {
         assert!(events.iter().any(|event| matches!(
             event,
             Event::Malformed {
-                why: MalformedReason::Other(_),
+                why: MalformedReason::NoForcedFunction,
                 ..
             }
         )));

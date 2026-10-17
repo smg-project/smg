@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::{
     chat_template::{ChatTemplateContentFormat, ThinkingKeyName, ThinkingToggle},
-    traits::RendererCapabilities,
+    traits::{MediaHandling, RendererCapabilities},
 };
 
 mod deepseek_common;
@@ -63,10 +63,12 @@ pub(crate) struct RendererProfile {
 impl RendererProfile {
     /// The behaviours no native renderer has unless its table says so.
     pub(crate) const NO_CAPABILITIES: RendererCapabilities = RendererCapabilities {
+        media_handling: MediaHandling::Preprocess,
         enable_thinking_alias: false,
         native_assistant_continuation: false,
         raw_tool_call_arguments: false,
         declares_tools_under_tool_choice_none: false,
+        leading_system_only: false,
     };
 
     /// The behaviours of a renderer without a profile: the Jinja template,

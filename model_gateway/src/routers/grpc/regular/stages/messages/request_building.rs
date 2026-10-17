@@ -1,8 +1,9 @@
 //! Message request building stage: Build proto GenerateRequest for message requests
 
+use std::{borrow::Cow, sync::Arc};
+
 use async_trait::async_trait;
 use axum::response::Response;
-use openai_protocol::worker::ConstrainedDecoding;
 use tracing::error;
 
 use crate::{
@@ -11,15 +12,13 @@ use crate::{
         error,
         grpc::{
             client::GenerateRequestBuildOptions,
-            common::stages::{helpers, BuildStage},
-            context::{
-                AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, ExecutionPlanKind,
-                PreparationOutput, RequestContext,
+            common::stages::{
+                helpers::{self, TagForStart},
+                BuildStage,
             },
-            multimodal::{
-                assemble_media_refs, assemble_multimodal_data,
-                assemble_multimodal_data_after_encode, assembly_error_response,
-                reserve_multimodal_inflight,
+            context::{
+                stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan,
+                ExecutionPlanKind, PreparationOutput, RequestContext,
             },
             regular::symphony,
             spec::ResponseSpec,
@@ -49,33 +48,23 @@ impl MessageRequestBuildingStage {
 #[async_trait]
 impl BuildStage for MessageRequestBuildingStage {
     async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
-        // Take preparation state (last consumer — worker_selection already ran)
-        let prep = ctx.state.preparation.take().ok_or_else(|| {
-            error!(
-                function = "MessageRequestBuildingStage::build",
-                "Preparation not completed"
-            );
-            error::internal_error("preparation_not_completed", "Preparation not completed")
-        })?;
+        let multimodal_data =
+            helpers::assemble_prompt_media(ctx, "MessageRequestBuildingStage::build").await?;
 
-        let clients = ctx.state.clients.as_ref().ok_or_else(|| {
-            error!(
-                function = "MessageRequestBuildingStage::build",
-                "Client acquisition not completed"
-            );
-            error::internal_error(
-                "client_acquisition_not_completed",
-                "Client acquisition not completed",
-            )
-        })?;
+        // Take preparation state (last consumer — worker_selection already ran)
+        let prep = stage_output(
+            ctx.state.preparation.take(),
+            "MessageRequestBuildingStage::build",
+        )?;
+
+        let clients = stage_output(
+            ctx.state.clients.as_ref(),
+            "MessageRequestBuildingStage::build",
+        )?;
 
         let messages_request = ctx.messages_request_arc();
 
-        // Get client for building request (use prefill client in disaggregated mode)
-        let builder_client = match clients {
-            ClientSelection::Single { client } => client,
-            ClientSelection::Disaggregated { prefill, .. } => prefill,
-        };
+        let builder_client = clients.builder();
 
         let PreparationOutput::Messages {
             token_ids,
@@ -100,42 +89,6 @@ impl BuildStage for MessageRequestBuildingStage {
             disaggregated,
         );
 
-        // `encode_outputs` set by EncodeStage selects the pixel-drop assembly path.
-        let is_encode_routed = ctx.state.encode_outputs.is_some();
-
-        // Assemble backend-specific multimodal data now that the backend is known;
-        // take the intermediate here for the prefill serialization. When
-        // encode-routed, drop the prefill pixels.
-        let multimodal_data = if let Some(intermediate) = ctx.state.multimodal_intermediate.take() {
-            let assembled = if is_encode_routed {
-                assemble_multimodal_data_after_encode(
-                    intermediate,
-                    builder_client,
-                    ctx.state.workers.as_ref(),
-                )
-                .await
-            } else {
-                assemble_multimodal_data(intermediate, builder_client, ctx.state.workers.as_ref())
-                    .await
-            };
-            Some(assembled.map_err(|e| {
-                error!(function = "MessageRequestBuildingStage::build", error = %e, "Failed to assemble multimodal request");
-                assembly_error_response(&e)
-            })?)
-        } else {
-            None
-        };
-        if let Some(data) = multimodal_data.as_ref() {
-            ctx.state.multimodal_inflight = reserve_multimodal_inflight(
-                ctx.components
-                    .multimodal
-                    .as_ref()
-                    .and_then(|multimodal| multimodal.inflight.as_deref()),
-                data.inline_bytes(),
-            )
-            .await?;
-        }
-
         let continued_final_message = processed_messages.continued_final_message;
         // Whether the rendered prompt leaves the model inside its thought:
         // native Gemma4 channels follow the rendered prompt when that parser
@@ -158,55 +111,96 @@ impl BuildStage for MessageRequestBuildingStage {
                     tokenizer.as_ref(),
                 )
             })
-        });
+        })
+            // Where a Symphony table reads the message, its replay of the
+            // prompt: a turn the prompt leaves unopened starts inside the
+            // thought whatever the switch says (`regular::symphony::reasoning_open`).
+            || symphony::reasoning_open(
+                ctx.state.parser.unwrap_or_default(),
+                &ctx.components.parser_resolver.names(&messages_request.model),
+                &messages_request.model,
+                &ctx.components.templates,
+                &processed_messages.text,
+            );
 
         // Now that the worker is known, a forced call's grammar takes the
         // shape its engine needs: the bare calls behind a reasoning parser's
         // gate, the thought and then the calls from the first token (the
         // worker's `constrained_decoding_start` label; see
         // `utils::tool_constraints_for_worker`).
-        // The unshaped constraint stays on the attempt stamp: a retry gives
-        // the worker it selects the same shaping (`helpers::ToolConstraintStamp`).
+        // The unshaped constraint stays on the attempt stamp, or what derives
+        // the table's `auto` tag for a start: a retry gives the worker it
+        // selects the same shaping (`helpers::ToolConstraintStamp`).
         let tool_parser = ctx
             .components
             .parser_resolver
             .tool_parser(&messages_request.model);
-        // A worker whose engine takes a grammar on every turn gets the table's
-        // tag for the calls the request allows under `auto`, when the request
-        // asked for no constraint of its own (`regular::symphony::auto_constraint_messages`).
-        // The policy is read once, for the first attempt's worker: the attempt
-        // stamp carries the tag unshaped like a forced call's, so a retry's
-        // worker shapes it again but is not asked for its own policy.
-        let tool_constraints = match tool_constraints {
-            None if utils::constrained_decoding_for(ctx.state.workers.as_ref())
-                == ConstrainedDecoding::Always =>
-            {
-                let tools = ctx
+        let names = ctx
+            .components
+            .parser_resolver
+            .names(&messages_request.model);
+        let parser = ctx.state.parser.unwrap_or_default();
+        // What constrains the output is decided here, on the worker selected
+        // for the request (`regular::symphony::worker_constraint`): the whole
+        // turn's grammar on a worker whose engine takes one on every turn from
+        // its first token; else what preparation found, and on a worker that
+        // takes a grammar on every turn the table's tag for the calls the
+        // request allows under `auto`. When the worker's policy chose the
+        // constraint, a retry re-selects only workers that decide alike
+        // (`utils::WorkerDecoding::decides_alike`); what the request asked for
+        // suits any worker. The attempt stamp carries what derives the `auto`
+        // tag for a worker's start, so the retry's worker gets it shaped for
+        // where its own engine starts the grammar.
+        let decoding = utils::WorkerDecoding::of(ctx.state.workers.as_ref());
+        let decided = symphony::worker_constraint(
+            decoding,
+            tool_constraints,
+            || {
+                symphony::turn_constraint_messages(
+                    parser,
+                    &names,
+                    &messages_request,
+                    &spec.chat_tools,
+                    &processed_messages.text,
+                    messages_request.continues_final_assistant(),
+                    &ctx.components.templates,
+                )
+            },
+            || {
+                // The tag shares the spec's tools where `tool_choice` narrows
+                // nothing (the common case): no copy of the schemas on the
+                // first attempt; a narrowed list is the one the narrowing owns.
+                let tools: Arc<[_]> = ctx
                     .tokenizer_arc()
                     .map(|tokenizer| {
-                        utils::template_tools(
+                        match utils::template_tools(
                             &spec.chat_tools,
                             messages_request.tool_choice.as_ref(),
                             tokenizer.renderer_capabilities(),
-                        )
+                        ) {
+                            Cow::Owned(narrowed) => Arc::from(narrowed),
+                            Cow::Borrowed([]) => Arc::default(),
+                            Cow::Borrowed(_) => Arc::clone(&spec.chat_tools),
+                        }
                     })
                     .unwrap_or_default();
-                symphony::auto_constraint_messages(
-                    ctx.state.parser.unwrap_or_default(),
-                    &ctx.components
-                        .parser_resolver
-                        .names(&messages_request.model),
-                    &messages_request,
-                    &tools,
-                    require_reasoning,
-                    continued_final_message,
-                    &ctx.components.templates,
-                )
-                .map_err(|why| error::bad_request("invalid_parser_configuration", why))?
-                .map(|constraint| constraint.to_tuple())
-            }
-            other => other,
-        };
+                symphony::AutoTag::Messages {
+                    parser,
+                    names: names.clone(),
+                    request: Arc::clone(&messages_request),
+                    tools,
+                    reasoning_open: require_reasoning,
+                    continues: continued_final_message,
+                    templates: Arc::clone(&ctx.components.templates),
+                }
+            },
+        )
+        .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
+        if decided.by_policy {
+            ctx.state.constraint_decided_on = Some(decoding);
+        }
+        let auto_tag = decided.auto.map(|auto| -> Arc<dyn TagForStart> { auto });
+        let tool_constraints = decided.constraint.map(|constraint| constraint.to_tuple());
         let unshaped_tool_constraints = tool_constraints.clone();
         let tool_constraints = utils::tool_constraints_for_worker(
             &ctx.components.tool_parser_factory,
@@ -224,12 +218,8 @@ impl BuildStage for MessageRequestBuildingStage {
         // Symphony's assignment, taken while the rendered prompt is still here (see
         // `regular::symphony`): the response spec carries it to the drivers, and the state
         // records which parser reads the message for the response's header.
-        let names = ctx
-            .components
-            .parser_resolver
-            .names(&messages_request.model);
         let assignment = symphony::assign_messages(
-            ctx.state.parser.unwrap_or_default(),
+            parser,
             &names,
             messages_request.as_ref(),
             tool_constraints.as_ref(),
@@ -267,53 +257,21 @@ impl BuildStage for MessageRequestBuildingStage {
             ctx.state.workers.as_ref(),
         );
 
-        // The client resolves string `stop`s its engine can't match and
-        // reports the router's residual trim obligation; no transport
-        // knowledge needed here.
-        ctx.state.response.router_stop_obligations = builder_client
-            .finalize_generate_request(&mut proto_request, ctx.tokenizer_arc().as_ref());
+        helpers::finish_generate_request(
+            ctx,
+            &mut proto_request,
+            self.inject_pd_metadata,
+            "MessageRequestBuildingStage::build",
+        )?;
 
-        if self.inject_pd_metadata {
-            if let Some(workers) = ctx.state.workers.as_ref() {
-                helpers::maybe_inject_pd_metadata(&mut proto_request, workers);
-            }
-        }
-
-        // EPD: inject the per-item encode bootstrap info into the prefill
-        // request; the dispatch plan stays on `encode_outputs` for request
-        // execution to take.
-        if let Some(outputs) = ctx.state.encode_outputs.as_mut() {
-            proto_request.set_encode_bootstrap_info(std::mem::take(&mut outputs.bootstrap_info));
-        }
-
-        // EPD: inject the prefill->decode KV rendezvous (mirrors the chat path).
-        // No-op unless the backend carries it in the request.
-        if let Some(workers) = ctx.state.workers.as_ref() {
-            helpers::maybe_inject_pd_rendezvous(&mut proto_request, workers);
-        }
-
-        // Worker-side multimodal processing: attach the media references now
-        // that the wire is known, before the PD clone so both legs carry them.
-        if let Some(plan) = ctx.state.multimodal_refs.take() {
-            if builder_client.is_zmq() {
-                return Err(error::bad_request(
-                    "multimodal_not_supported",
-                    "media references require a gRPC vLLM worker",
-                ));
-            }
-            let refs = assemble_media_refs(plan)
-                .map_err(|e| error::bad_request(e.code(), e.to_string()))?;
-            proto_request
-                .set_vllm_media_refs(refs)
-                .map_err(|e| error::bad_request("multimodal_not_supported", e))?;
-            ctx.state.media_refs_forwarded = true;
-        }
-
-        let tool_constraint = helpers::ToolConstraintStamp::capture(
-            unshaped_tool_constraints,
-            tool_parser.as_deref(),
-            &proto_request,
-        );
+        let tool_constraint = match auto_tag {
+            Some(auto_tag) => helpers::ToolConstraintStamp::capture_table(auto_tag, &proto_request),
+            None => helpers::ToolConstraintStamp::capture(
+                unshaped_tool_constraints,
+                tool_parser.as_deref(),
+                &proto_request,
+            ),
+        };
         spec.reasoning_in_prefill = require_reasoning;
         spec.symphony = assignment;
         Ok(BuildOutput {

@@ -7,7 +7,10 @@
 //! [`adapt::chat::message`], and compares it with the reference: whole, character by character,
 //! on thirty seeded byte plans, and on the token-level chunk plans bellwether recorded with the
 //! case, each delta carrying its tokens' ids and pieces. Every replay also has to conserve the
-//! output's bytes across its events and agree with the whole one. An output of at most 256 bytes
+//! output's bytes across its events and agree with the whole one, and a streamed replay's content
+//! deltas have to carry the whole answer's content and nothing else: the template's spacing
+//! before a call, shown as content before the call arrived, is what a client of the stream would
+//! see and a client of the whole answer would not. An output of at most 256 bytes
 //! also replays at every two-way split; past that the set is linear in the output's length, so
 //! a case of any size replays forty-odd times.
 //!
@@ -52,6 +55,15 @@
 //! plans, each delta carrying its tokens' pieces as bellwether records them in `output_pieces`, and
 //! checks that every token is counted once, in the event that carries its first byte.
 //!
+//! A fourth test corrupts the recorded outputs: three seeded corruptions of every sampled case of
+//! every recorded model (a span deleted or doubled, one of the table's own markers or a cut one
+//! inserted, the tail cut, a character swapped), each read through the model's table after its
+//! prompt tail, whole, on two seeded plans and, up to 512 bytes, a character at a time. Nothing
+//! may panic, every byte must land in exactly one event with `Finish` last, and the message the
+//! chat adapter folds from the events must be the same however the output was cut; a panic is
+//! caught per output, so one run reports every breach with the case, the round and the corrupted
+//! output that replay it. The sample switch applies as above.
+//!
 //! What a replay prints, per model: the cases that differ from the reference and nothing allows
 //! (`DIFFERS`, up to [`SHOWN`] of them) and the summary line of its sets. The per-case report, one
 //! verdict line per case with the reason of a listed one, followed by the failures, goes to a file
@@ -59,6 +71,10 @@
 //! not set, and the run says where. `BELLWETHER_VERBOSE=1` prints the per-case report on stdout
 //! too, as the run did before it went to a file.
 
+#[expect(
+    dead_code,
+    reason = "the integration tests share these helpers, and this one keeps an id by its number, not its shape"
+)]
 mod common;
 
 use std::{
@@ -396,8 +412,14 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::KimiK3,
         GenerationPrompt::AlwaysOpensTheThought,
     ),
-    // Muse Spark: the generation prompt ends at the turn's opener, and the model writes the
-    // thought's message itself.
+    // Muse Spark and Muse Glimmer: the generation prompt ends at the turn's opener, and the model
+    // writes the thought's message itself. Glimmer's template writes the same messages (to self,
+    // to the tool, to the user) and the same block; its recorded set reads with the Spark table.
+    (
+        "muse-glimmer-30b",
+        Family::MuseSpark,
+        GenerationPrompt::ModelDecides,
+    ),
     (
         "muse-spark-open-816b-a42b",
         Family::MuseSpark,
@@ -435,6 +457,25 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
     // MiMo writes Qwen 3.5's tags with the value between them directly, and its own `<think>`.
     (
         "mimo-v2.5",
+        Family::MiMo,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    // The V2.6 line writes the same tags with no newline between them; the generation prompt
+    // leaves the model to write `<think>`, as V2.5's does, and thinking off closes it in the prompt
+    // as `<think></think>` (no newlines, where the shared tail writes them: the state after the
+    // replay is content either way).
+    (
+        "mimo-v2.6-flash-rl",
+        Family::MiMo,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "mimo-v2.6-pro-rl",
+        Family::MiMo,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "mimo-v2.6-distill-qwen-9b",
         Family::MiMo,
         GenerationPrompt::ModelWritesTheThought,
     ),
@@ -500,6 +541,11 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
     ),
     (
         "phi-4-mini-instruct",
+        Family::Plain,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "phi-4-multimodal-instruct",
         Family::Plain,
         GenerationPrompt::Plain,
     ),
@@ -791,6 +837,15 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
     ),
     (
         "llama-3.1-nemotron-nano-8b-v1",
+        Family::LlamaNemotron,
+        GenerationPrompt::Plain,
+    ),
+    // The Ultra 253B v1 template (not the CPT checkpoint's, which keeps Llama 3.1's own) renders
+    // neither a call nor a thought and keeps an assistant message from its `</think>` on: the set
+    // holds content alone, the reasoning probe was refused at record time, and the model writes
+    // `<think>` itself under its "detailed thinking on" system prompt, as the Nano does.
+    (
+        "llama-3-1-nemotron-ultra-253b-v1",
         Family::LlamaNemotron,
         GenerationPrompt::Plain,
     ),
@@ -1981,7 +2036,7 @@ fn parity(
     let mut shown = Shown::default();
     let (mut bitwise, mut separators_only, mut respelled, mut listed, mut allowed_count) =
         (0, 0, 0, 0, 0);
-    let (mut token_plans_run, mut without_pieces) = (0, 0);
+    let (mut token_plans_run, mut without_pieces, mut content_off_whole) = (0, 0, 0);
     for fixture in fixtures {
         let text = fixture.reference.text.as_str();
         let expected = Said::of_reference(&fixture.reference);
@@ -2006,13 +2061,26 @@ fn parity(
             &replay_text(&plans[0].1, "whole"),
             &mut failures,
         );
-        for (plan, cuts) in plans.iter().skip(1) {
-            if checked(fixture, plan, &replay_text(cuts, plan), &mut failures) != said {
+        // What a client of the stream receives as content is every content delta, one per
+        // content or malformed event; the whole answer's content is the message's, absent when
+        // it is only whitespace. A streamed replay whose deltas carry other content than the
+        // whole answer (the template's spacing before a call, shown before the call arrived)
+        // is counted once per case, with the first plan that showed it.
+        let whole_content = said.content.clone().unwrap_or_default();
+        let mut off_whole: Option<String> = None;
+        let mut streamed = |plan: &str, events: &[Event], failures: &mut Vec<String>| {
+            if checked(fixture, plan, events, failures) != said {
                 failures.push(format!(
                     "{}: the {plan} replay disagrees with the whole one",
                     fixture.id
                 ));
             }
+            if off_whole.is_none() && delivered_content(events) != whole_content {
+                off_whole = Some(plan.to_string());
+            }
+        };
+        for (plan, cuts) in plans.iter().skip(1) {
+            streamed(plan, &replay_text(cuts, plan), &mut failures);
         }
         // The token plans need the pieces bellwether records with the case: one per id, giving
         // back the text. A case that lacks them is counted, and one whose pieces are wrong is a
@@ -2056,13 +2124,15 @@ fn parity(
                     &finish,
                 )
                 .unwrap_or_else(|e| panic!("{}: {plan} replay: {e}", fixture.id));
-                if checked(fixture, &plan, &events, &mut failures) != said {
-                    failures.push(format!(
-                        "{}: the {plan} replay disagrees with the whole one",
-                        fixture.id
-                    ));
-                }
+                streamed(&plan, &events, &mut failures);
             }
+        }
+        if let Some(plan) = off_whole {
+            content_off_whole += 1;
+            failures.push(format!(
+                "{}: the {plan} replay's content deltas differ from the whole answer's content",
+                fixture.id
+            ));
         }
         let verdict = if said == expected {
             bitwise += 1;
@@ -2135,7 +2205,8 @@ fn parity(
     let totals = format!(
         "{} cases{sample}: {bitwise} bitwise, {separators_only} separators only, {respelled} \
          respelled, {listed} listed, {allowed_count} allowed for the corpus; {token_plans_run} \
-         token plans replayed, {without_pieces} cases without output_pieces\n",
+         token plans replayed, {without_pieces} cases without output_pieces, \
+         {content_off_whole} cases whose streamed content differs from the whole answer's\n",
         fixtures.len()
     );
     out.push_str(&totals);
@@ -2547,9 +2618,13 @@ fn checked(fixture: &Fixture, plan: &str, events: &[Event], failures: &mut Vec<S
         ));
     }
     let mut index = 0;
+    let mut first = None;
     for event in events {
         if let Event::ToolCallStart { index: i, id, .. } = event {
-            if *i != index || *id != format!("call_{index}") {
+            // The ids count from a nonce of the engine's own, `call_` and 24 hex characters.
+            let number = common::minted_id(id);
+            let origin = *first.get_or_insert(number);
+            if *i != index || number.is_none() || number != origin.map(|f| f + u128::from(index)) {
                 failures.push(format!(
                     "{}: call index {i} / id {id} on the {plan} replay",
                     fixture.id
@@ -2559,6 +2634,18 @@ fn checked(fixture: &Fixture, plan: &str, events: &[Event], failures: &mut Vec<S
         }
     }
     Said::of(events)
+}
+
+/// The content a client of the stream receives: the text of every content and malformed event in
+/// order, as the gateway writes one content delta per event.
+fn delivered_content(events: &[Event]) -> String {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Content(text) | Event::Malformed { text, .. } => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Feed the output token by token as the plan `sizes` groups them, each delta carrying its tokens'
@@ -2709,6 +2796,387 @@ fn read_fixtures(dir: &std::path::Path) -> Result<Cases, String> {
         }
     }
     Ok(Cases { fixtures, ids })
+}
+
+/// A seeded generator for the corruptions, the same sequence for a seed every run.
+struct Scramble(u64);
+
+impl Scramble {
+    fn new(seed: u64) -> Self {
+        Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+    }
+
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        self.0 >> 33
+    }
+
+    /// A number below `n`; zero when `n` is.
+    fn below(&mut self, n: usize) -> usize {
+        if n == 0 {
+            0
+        } else {
+            (self.next() as usize) % n
+        }
+    }
+}
+
+/// The seed of a case's corruption round: a hash of the case's id and the round, so that a case is
+/// corrupted the same way every run, whatever the sample around it.
+fn corruption_seed(id: &str, round: u64) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in id.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash ^ round.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+/// The pieces a corruption puts into a recorded output: the table's own terminals and the tags
+/// of its call syntax, each whole and cut short at either end and in the middle, and the
+/// delimiters every syntax has a use for.
+fn markers_of(format: &symphony::Format) -> Vec<String> {
+    let mut markers: Vec<String> = format.terminal_texts().map(str::to_string).collect();
+    if let Some(syntax) = format.call_syntax() {
+        markers.extend(syntax.tag_texts().into_iter().map(str::to_string));
+    }
+    let mut pieces = markers.clone();
+    for marker in &markers {
+        let chars: Vec<char> = marker.chars().collect();
+        if chars.len() >= 2 {
+            pieces.push(chars[..chars.len() / 2].iter().collect());
+            pieces.push(chars[..chars.len() - 1].iter().collect());
+            pieces.push(chars[1..].iter().collect());
+        }
+    }
+    pieces.extend(
+        [
+            "{", "}", "[", "]", "\"", "\\", ",", ":", "<", ">", "/", "\n", " ",
+        ]
+        .iter()
+        .map(|piece| piece.to_string()),
+    );
+    pieces
+}
+
+/// `recorded` with one to three seeded corruptions, each on character boundaries: a span deleted,
+/// a span doubled, a piece inserted, the tail cut, or a span swapped for one character. Every
+/// corruption changes the text it is given and none gives the recorded text back (a draw that
+/// would, an empty span, a cut at the end, a round that undoes the one before, is drawn again,
+/// and an empty text takes an insertion), so a counted output is never the recorded one.
+fn corrupted(random: &mut Scramble, recorded: &str, pieces: &[String]) -> String {
+    let mut text = recorded.to_string();
+    for _ in 0..1 + random.below(3) {
+        let before = std::mem::take(&mut text);
+        text = (0..8)
+            .map(|_| corrupted_once(random, &before, pieces))
+            .find(|after| *after != before && after != recorded)
+            .unwrap_or_else(|| inserted(random, &before, 0, pieces));
+    }
+    if text == recorded {
+        // The fallback insertion undid the round before it: one more
+        // insertion (a piece is never empty) leaves the recorded text for good.
+        text = inserted(random, &text, 0, pieces);
+    }
+    text
+}
+
+/// `text` with `piece`, drawn from `pieces`, inserted at the character boundary `at`.
+fn inserted(random: &mut Scramble, text: &str, at: usize, pieces: &[String]) -> String {
+    format!(
+        "{}{}{}",
+        &text[..at],
+        pieces[random.below(pieces.len())],
+        &text[at..]
+    )
+}
+
+/// One seeded corruption of `text`; it may draw a span that changes nothing (see [`corrupted`]).
+fn corrupted_once(random: &mut Scramble, text: &str, pieces: &[String]) -> String {
+    if text.is_empty() {
+        return inserted(random, text, 0, pieces);
+    }
+    let bounds: Vec<usize> = text
+        .char_indices()
+        .map(|(at, _)| at)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let (a, b) = (
+        bounds[random.below(bounds.len())],
+        bounds[random.below(bounds.len())],
+    );
+    let (from, to) = (a.min(b), a.max(b));
+    match random.below(5) {
+        0 => format!("{}{}", &text[..from], &text[to..]),
+        1 => format!("{}{}{}", &text[..to], &text[from..to], &text[to..]),
+        2 => inserted(random, text, from, pieces),
+        3 => text[..to].to_string(),
+        _ => {
+            let swapped = ['<', '>', '"', '\n', ' ', 'x', '}', ']', 'é', '🌧'];
+            format!(
+                "{}{}{}",
+                &text[..from],
+                swapped[random.below(swapped.len())],
+                &text[to..]
+            )
+        }
+    }
+}
+
+/// A seeded plan of cuts into `text`, each piece one to eight characters.
+fn seeded_cuts(random: &mut Scramble, text: &str) -> Vec<usize> {
+    let starts: Vec<usize> = text.char_indices().map(|(at, _)| at).collect();
+    let mut cuts = Vec::new();
+    let mut at = 0;
+    while at < starts.len() {
+        at += 1 + random.below(8);
+        if at < starts.len() {
+            cuts.push(starts[at]);
+        }
+    }
+    cuts
+}
+
+/// Whether the events carry every byte of `text` in order, with exactly one `Finish`, last.
+fn conserved(text: &str, events: &[Event]) -> Result<(), String> {
+    let carried: String = events.iter().map(bytes_of).collect();
+    if carried != text {
+        return Err(format!("the events carry {carried:?}"));
+    }
+    let finishes = events
+        .iter()
+        .filter(|event| matches!(event, Event::Finish { .. }))
+        .count();
+    if finishes != 1 || !matches!(events.last(), Some(Event::Finish { .. })) {
+        return Err(format!(
+            "{finishes} Finish events, where one must come last"
+        ));
+    }
+    Ok(())
+}
+
+/// One replay of `text` cut at `cuts`, with a panic inside the parser caught and named by the
+/// plan, so a breach says which replay broke.
+fn replay_plan(
+    name: &str,
+    new_engine: &dyn Fn() -> Engine,
+    tail: &str,
+    text: &str,
+    cuts: &[usize],
+    finish: &EngineFinish,
+) -> Result<Vec<Event>, String> {
+    let replayed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        replay_after(&mut new_engine(), tail, text, cuts, finish, false)
+    }));
+    match replayed {
+        Ok(Ok(events)) => Ok(events),
+        Ok(Err(e)) => Err(format!("{name}: {e}")),
+        Err(payload) => Err(format!("{name}: PANIC: {}", panic_message(payload))),
+    }
+}
+
+/// One corrupted output through a fresh engine from `new_engine`, after the prompt's `tail`:
+/// whole, on two seeded plans and, up to 512 bytes, a character at a time; the first breach of
+/// conservation, or of the message the chat adapter folds from the events, if any, named by its
+/// plan.
+fn check_corrupted(
+    new_engine: &dyn Fn() -> Engine,
+    tail: &str,
+    text: &str,
+    finish: &EngineFinish,
+    random: &mut Scramble,
+) -> Result<(), String> {
+    let whole = replay_plan("whole", new_engine, tail, text, &[], finish)?;
+    conserved(text, &whole).map_err(|e| format!("whole: {e}"))?;
+    let expected = Said::of(&whole);
+    let mut plans = vec![
+        ("seeded plan 1", seeded_cuts(random, text)),
+        ("seeded plan 2", seeded_cuts(random, text)),
+    ];
+    if text.len() <= 512 {
+        plans.push((
+            "character by character",
+            text.char_indices().map(|(at, _)| at).skip(1).collect(),
+        ));
+    }
+    for (name, cuts) in plans {
+        let events = replay_plan(name, new_engine, tail, text, &cuts, finish)?;
+        // The plan is named, not spelled out: the seeded plans are rebuilt from the case's id and
+        // round, and the character plan from the text.
+        conserved(text, &events).map_err(|e| format!("{name}: {e}"))?;
+        let said = Said::of(&events);
+        if said != expected {
+            return Err(format!(
+                "{name} says something else:\n    whole: {expected:?}\n    cut:   {said:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The first `chars` characters of `text`, with a note of how much was left out; the report file
+/// has it whole.
+fn window(text: &str, chars: usize) -> String {
+    match text.char_indices().nth(chars) {
+        Some((at, _)) => format!(
+            "{}... ({} bytes in all; the report file has it whole)",
+            &text[..at],
+            text.len()
+        ),
+        None => text.to_string(),
+    }
+}
+
+/// The message of a panic, as `panic!` formatted it.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_else(|| "a panic without a message".to_string())
+}
+
+/// What corrupting the recorded outputs of one of [`MODELS`] gave.
+enum Corrupted {
+    Skipped(String),
+    Done {
+        slug: &'static str,
+        cases: usize,
+        outputs: usize,
+        failures: Vec<String>,
+    },
+}
+
+/// Three seeded corruptions of every sampled output of `slug`'s parse sets, each replayed through
+/// the model's table after its prompt tail ([`check_corrupted`]), a panic caught per output.
+#[expect(
+    clippy::panic,
+    reason = "a set that cannot be read ends the test with its path"
+)]
+fn corrupt_model(
+    root: &std::path::Path,
+    slug: &'static str,
+    family: Family,
+    prompt: GenerationPrompt,
+) -> Corrupted {
+    let dir = root.join(slug).join("parse");
+    if !dir.is_dir() {
+        return Corrupted::Skipped(format!(
+            "skipping {slug}: bellwether has not recorded its parse sets yet"
+        ));
+    }
+    let Cases { fixtures, .. } = read_fixtures(&dir).unwrap_or_else(|e| panic!("{e}"));
+    let pieces = markers_of(&family.table(slug));
+    let mut failures = Vec::new();
+    let mut outputs = 0;
+    for fixture in &fixtures {
+        let tail = prompt.tail(fixture, family);
+        let finish = engine_finish(&fixture.reference.finish_reason);
+        for round in 0..3u64 {
+            let mut random = Scramble::new(corruption_seed(&fixture.id, round));
+            let text = corrupted(&mut random, &fixture.reference.text, &pieces);
+            outputs += 1;
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                check_corrupted(
+                    &|| family.engine(slug, fixture),
+                    &tail,
+                    &text,
+                    &finish,
+                    &mut random,
+                )
+            }));
+            let failure = match outcome {
+                Ok(Ok(())) => continue,
+                Ok(Err(breach)) => breach,
+                Err(payload) => format!("PANIC: {}", panic_message(payload)),
+            };
+            // The breach and its plan first, the output last: a window on the
+            // message keeps what names the failure.
+            failures.push(format!(
+                "{} round {round} ({family:?}, prompt tail {tail:?}, finish {finish:?}):\n  \
+                 {failure}\n  corrupted output {text:?}",
+                fixture.id
+            ));
+        }
+    }
+    Corrupted::Done {
+        slug,
+        cases: fixtures.len(),
+        outputs,
+        failures,
+    }
+}
+
+#[test]
+#[expect(
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "the skip notices and the per-model counts are test diagnostic output"
+)]
+fn corrupted_recorded_outputs_never_panic_and_keep_the_contract() {
+    let Some(root) = std::env::var_os(FIXTURES_ENV).map(PathBuf::from) else {
+        eprintln!(
+            "skipping: {FIXTURES_ENV} is not set; \
+             point it at the fixtures/ directory of a bellwether checkout"
+        );
+        return;
+    };
+    let (mut cases, mut outputs, mut recorded) = (0, 0, 0);
+    let mut failures = Vec::new();
+    let mut file = ReportFile::create("bellwether_parse_fixtures-corrupted.txt")
+        .unwrap_or_else(|e| panic!("{e}"));
+    in_order(
+        MODELS,
+        |&(slug, family, prompt)| corrupt_model(&root, slug, family, prompt),
+        |outcome| match outcome {
+            Corrupted::Skipped(notice) => eprintln!("{notice}"),
+            Corrupted::Done {
+                slug,
+                cases: of_model,
+                outputs: of_outputs,
+                failures: of_model_failures,
+            } => {
+                let line = format!(
+                    "{slug}: {of_outputs} corrupted outputs of {of_model} cases, {} breaches\n",
+                    of_model_failures.len()
+                );
+                print!("{line}");
+                file.write(&line);
+                cases += of_model;
+                outputs += of_outputs;
+                recorded += 1;
+                failures.extend(of_model_failures);
+            }
+        },
+    );
+    if recorded == 0 {
+        eprintln!(
+            "skipping: none of the table's slugs is recorded under {}",
+            root.display()
+        );
+    }
+    println!(
+        "{outputs} corrupted outputs of {cases} recorded cases of {recorded} models replayed{}",
+        sample_note(sample_every())
+    );
+    let path = file.finish(&failures).unwrap_or_else(|e| panic!("{e}"));
+    println!("per-model report and every breach: {}", path.display());
+    assert!(
+        failures.is_empty(),
+        "{} corrupted outputs broke the contract or panicked; the first {} (every one in {}):\n{}",
+        failures.len(),
+        failures.len().min(SHOWN),
+        path.display(),
+        failures
+            .iter()
+            .take(SHOWN)
+            .map(|failure| window(failure, 2_048))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }
 
 #[test]
