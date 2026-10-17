@@ -78,10 +78,13 @@ STARTUP_CEILING_SECS_ENV = "SMG_TOKENSPEED_SERVICER_STARTUP_CEILING_SECS"
 # Set to 0/false/no/off to keep TokenSpeed's KV event publisher off when the
 # launcher was given no --kv-events-config (see `default_kv_events_config`).
 KV_EVENTS_ENV = "SMG_TOKENSPEED_SERVICER_KV_EVENTS"
-# What a launcher without --kv-events-config gets under the Rust servicer:
-# the ZMQ publisher, with TokenSpeed's own defaults for the rest (the
-# endpoint, the topic).
-DEFAULT_KV_EVENTS_CONFIG = '{"enable_kv_cache_events": true, "publisher": "zmq"}'
+
+
+def default_kv_events_json(endpoint: str) -> str:
+    """What a launcher without --kv-events-config gets under the Rust servicer,
+    as TokenSpeed's server args carry it (JSON text): the ZMQ publisher at
+    ``endpoint``, with TokenSpeed's own defaults for the rest (the topic)."""
+    return json.dumps({"enable_kv_cache_events": True, "publisher": "zmq", "endpoint": endpoint})
 
 
 def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
@@ -263,10 +266,16 @@ def default_kv_events_config(
     """Turn TokenSpeed's KV event publisher on when the launcher was given no
     ``--kv-events-config``; returns the configuration applied, or None: the
     shared rule (``rust_lifecycle.apply_kv_events_default``) with
-    ``DEFAULT_KV_EVENTS_CONFIG``, applied to the server args before the facts
-    and the headless scheduler are built from them."""
+    :func:`default_kv_events_json` at a free port of this host, one per
+    attention-DP rank (each publishes at the port after its predecessor's),
+    applied to the server args before the facts and the schedulers are built
+    from them."""
     return apply_kv_events_default(
-        server_args, DEFAULT_KV_EVENTS_CONFIG, env_name=KV_EVENTS_ENV, environ=environ
+        server_args,
+        default_kv_events_json,
+        env_name=KV_EVENTS_ENV,
+        environ=environ,
+        ranks=EngineConfigView(server_args).server_args.attention_dp_size or 1,
     )
 
 

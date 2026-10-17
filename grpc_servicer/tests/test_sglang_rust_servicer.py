@@ -388,29 +388,50 @@ def test_server_facts_refuse_non_finite_floats():
 def test_kv_event_publishing_is_on_by_default_under_the_rust_servicer():
     """A launcher without --kv-events-config left SGLang publishing nothing and
     the router's cache-aware routing blind (smg-lab #1): the Rust path turns
-    the ZMQ publisher on itself unless told otherwise."""
-    expected = '{"publisher": "zmq"}'
-    # Nothing given: SGLang's own defaults behind the ZMQ publisher.
+    the ZMQ publisher on itself unless told otherwise, at a free port of this
+    host (one per scheduler) rather than SGLang's fixed default."""
+
+    def published_at(args) -> int:
+        """The publisher's port, from the JSON the server args carry: on, at
+        a free port of this host, never the fixed default; SGLang's own
+        defaults for the rest."""
+        config = json.loads(args.kv_events_config)
+        assert config == {"publisher": "zmq", "endpoint": config["endpoint"]}
+        endpoint = config["endpoint"]
+        assert endpoint.startswith("tcp://*:") and endpoint != "tcp://*:5557"
+        port = int(endpoint.rpartition(":")[2])
+        assert rust_lifecycle._bindable(port)
+        return port
+
+    # Nothing given: the ZMQ publisher at a free port, and the relay is told
+    # the same endpoint.
     args = _server_args()
-    assert rust.default_kv_events_config(args, environ={}) == expected
-    assert args.kv_events_config == expected
-    assert rust.kv_events_publisher(args) == ("tcp://*:5557", "", "")
-    args = _server_args(kv_events_config=None)
-    assert rust.default_kv_events_config(args, environ={}) == expected
-    args = _server_args(kv_events_config="")
-    assert rust.default_kv_events_config(args, environ={}) == expected
+    assert rust.default_kv_events_config(args, environ={}) == args.kv_events_config
+    port = published_at(args)
+    assert rust.kv_events_publisher(args) == (f"tcp://*:{port}", "", "")
+    for args in (_server_args(kv_events_config=None), _server_args(kv_events_config="")):
+        assert rust.default_kv_events_config(args, environ={}) == args.kv_events_config
+        published_at(args)
+    # Four schedulers (two data-parallel, two attention-DP each) publish on
+    # four consecutive ports: all free.
+    args = _server_args(dp_size=2, attn_dp_size=2, enable_dp_attention=False)
+    rust.default_kv_events_config(args, environ={})
+    base = published_at(args)
+    assert all(rust_lifecycle._bindable(base + rank) for rank in range(4))
     # The opt-out.
     for value in ("0", "false", "No", " off "):
         args = _server_args(kv_events_config=None)
         assert rust.default_kv_events_config(args, environ={rust.KV_EVENTS_ENV: value}) is None
         assert args.kv_events_config is None
     args = _server_args()
-    assert rust.default_kv_events_config(args, environ={rust.KV_EVENTS_ENV: "1"}) == expected
-    # An explicit configuration is kept as given, off included.
+    assert rust.default_kv_events_config(args, environ={rust.KV_EVENTS_ENV: "1"}) is not None
+    published_at(args)
+    # An explicit configuration is kept as given, its endpoint and off included.
     for given in ('{"publisher": "null"}', '{"publisher": "zmq", "endpoint": "tcp://*:6100"}'):
         args = _server_args(kv_events_config=given)
         assert rust.default_kv_events_config(args, environ={}) is None
         assert args.kv_events_config == given
+    assert rust.kv_events_publisher(args) == ("tcp://*:6100", "", "")
     # Server args that cannot be written are left alone.
 
     class Frozen:
@@ -725,8 +746,11 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
     assert created["engine_count"] == 1 and created["tokenizer_dir"] == "/tok"
     assert created["model_path"] == "org/model" and created["sglang_version"] == "x"
     assert launched == {"args": args, "port": 24321}
-    # No --kv-events-config was given: the headless scheduler publishes.
-    assert args.kv_events_config == '{"publisher": "zmq"}'
+    # No --kv-events-config was given: the headless scheduler publishes, at a
+    # free port of this host.
+    published = json.loads(args.kv_events_config)
+    assert published == {"publisher": "zmq", "endpoint": published["endpoint"]}
+    assert published["endpoint"].startswith("tcp://*:") and published["endpoint"] != "tcp://*:5557"
 
 
 def _run_serve_rust(monkeypatch, tmp_path, *, real_facts: bool = False) -> dict:

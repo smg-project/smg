@@ -158,23 +158,30 @@ def default_kv_events_config(
     The shared rule (``rust_lifecycle.apply_kv_events_default``) with vLLM's
     default, applied to the namespace before the engine args and the engine
     cores are built from it: the typed ``KVEventsConfig`` once ``vllm.config``
-    is importable, else the JSON form the launcher's parser takes; vLLM's own
-    defaults for the rest (the ZMQ endpoint and its port, the topic).
+    is importable, else the JSON form the launcher's parser takes; the ZMQ
+    endpoint at a free port of this host, one per data-parallel engine (each
+    publishes at the port after its predecessor's); vLLM's own defaults for
+    the rest (the topic).
     """
     return apply_kv_events_default(
-        args, _zmq_publisher_config, env_name=KV_EVENTS_ENV, environ=environ
+        args,
+        _zmq_publisher_config,
+        env_name=KV_EVENTS_ENV,
+        environ=environ,
+        ranks=int(getattr(args, "data_parallel_size", None) or 1),
     )
 
 
-def _zmq_publisher_config() -> Any:
-    """vLLM's configuration of its ZMQ KV event publisher: the typed form once
-    ``vllm.config`` is importable, else as the launcher's parser takes it."""
+def _zmq_publisher_config(endpoint: str) -> Any:
+    """vLLM's configuration of its ZMQ KV event publisher at ``endpoint``: the
+    typed form once ``vllm.config`` is importable, else as the launcher's
+    parser takes it."""
     try:
         from vllm.config import KVEventsConfig
 
-        return KVEventsConfig(enable_kv_cache_events=True, publisher="zmq")
+        return KVEventsConfig(enable_kv_cache_events=True, publisher="zmq", endpoint=endpoint)
     except ImportError:  # the launcher's parser hands the config over as JSON too
-        return {"enable_kv_cache_events": True, "publisher": "zmq"}
+        return {"enable_kv_cache_events": True, "publisher": "zmq", "endpoint": endpoint}
 
 
 def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[str, Any] | None:

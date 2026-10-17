@@ -1,8 +1,9 @@
 """The Python-owned lifecycle around a Rust servicer, shared by the engine
 launchers: the servicer switch (which implementation serves the process, from
 the launcher's flag or the engine's variable), the launcher's knobs, the
-KV-events default (the engine's publisher on unless the launcher or its
-variable says otherwise), a free port and socket directory for the handshake,
+KV-events default (the engine's publisher on, at a free port, unless the
+launcher or its variable says otherwise), a free port and socket directory
+for the handshake,
 the engine as a ``Popen``-shaped handle (one spawned headless engine, the
 engine cores a manager started from this process, or the scheduler processes
 this process started itself), its termination, the supervision loop that
@@ -323,14 +324,64 @@ def servicer_switch(
 # that keep the engine's KV event publisher off when the launcher was given no
 # --kv-events-config.
 KV_EVENTS_OFF_VALUES = ("0", "false", "no", "off")
+# How many base ports the OS is asked for before the servicer gives up on a
+# block of consecutive free ports for a data-parallel engine's publishers.
+KV_EVENTS_PORT_ATTEMPTS = 32
+
+
+def _bindable(port: int) -> bool:
+    """Whether a listener could bind ``port`` on every interface right now, the
+    way the engines' ZMQ publishers bind theirs (``SO_REUSEADDR`` set, as
+    libzmq sets it): a port another listener holds is not."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("", port))
+        except OSError:
+            return False
+    return True
+
+
+def free_kv_events_endpoint(ranks: int = 1) -> str:
+    """``tcp://*:<port>`` for the engine's default KV-event publisher: a port
+    the OS hands out as free on every interface, with the ``ranks - 1`` ports
+    after it free as well (rank ``r`` of a data-parallel engine publishes on
+    ``port + r``, and the relay dials the same), asked for again on another
+    base port until they are.
+
+    Every engine's own configuration defaults the endpoint to the same fixed
+    port, so two engines on one host, or an engine started next to a publisher
+    an earlier job left behind, failed at the engine's bind with "Address
+    already in use". A port the OS hands out is one nothing holds at that
+    moment, and the OS hands no second asker the same one while the first
+    still holds it. The engine binds the port later, after its model loaded;
+    what else binds it in between is caught where it was before, at the
+    engine's bind, which names the port.
+    """
+    ranks = max(int(ranks), 1)
+    for _ in range(KV_EVENTS_PORT_ATTEMPTS):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("", 0))
+            base = int(sock.getsockname()[1])
+            # The base is held while its neighbours are probed, so no probe of
+            # a second servicer starting at the same moment gets it as a base.
+            if base + ranks - 1 <= 65535 and all(
+                _bindable(base + rank) for rank in range(1, ranks)
+            ):
+                return f"tcp://*:{base}"
+    raise ServicerConfigError(
+        f"no block of {ranks} consecutive free ports for the KV event publishers after "
+        f"{KV_EVENTS_PORT_ATTEMPTS} attempts; pass --kv-events-config with an endpoint"
+    )
 
 
 def apply_kv_events_default(
     target: Any,
-    default: Any,
+    default: Callable[[str], Any],
     *,
     env_name: str,
     environ: Mapping[str, str] | None = None,
+    ranks: int = 1,
 ) -> Any | None:
     """Turn the engine's KV event publisher on when the launcher was given no
     ``--kv-events-config``; returns the configuration applied, or ``None``.
@@ -340,13 +391,18 @@ def apply_kv_events_default(
     names its ZMQ publisher: a launcher without it got a router that routed
     blind, with one WARN per worker as the only trace. Under the Rust servicer
     ``target`` (the parsed launcher namespace or the engine's server args,
-    whichever the engine builds its configuration from) gets ``default`` (the
-    engine's ZMQ-publisher configuration, or a callable building it) as its
-    ``kv_events_config`` before the facts and the engine are built from it, so
-    publisher and relay agree. An explicit configuration, anything but ``None``
-    or an empty string, is kept as given, off included; ``env_name`` set to
-    one of ``KV_EVENTS_OFF_VALUES`` keeps the publisher off without one; a
-    ``target`` that cannot be written (frozen server args) is left as it is,
+    whichever the engine builds its configuration from) gets the configuration
+    ``default`` builds for the publisher's endpoint (``default(endpoint)``: the
+    engine's ZMQ-publisher configuration, in whichever form the engine takes
+    it) as its ``kv_events_config`` before the facts and the engine are built
+    from it, so publisher and relay agree. The endpoint is a free port's
+    (:func:`free_kv_events_endpoint`, one port per data-parallel rank of the
+    ``ranks``), never the engines' shared fixed default: a second engine on
+    the host, or a publisher another process left behind, no longer costs the
+    engine its start. An explicit configuration, anything but ``None`` or an
+    empty string, is kept as given, its endpoint and off included; ``env_name``
+    set to one of ``KV_EVENTS_OFF_VALUES`` keeps the publisher off without one;
+    a ``target`` that cannot be written (frozen server args) is left as it is,
     with a warning.
     """
     source = os.environ if environ is None else environ
@@ -355,7 +411,7 @@ def apply_kv_events_default(
         return None
     if str(source.get(env_name, "")).strip().lower() in KV_EVENTS_OFF_VALUES:
         return None
-    config = default() if callable(default) else default
+    config = default(free_kv_events_endpoint(ranks))
     try:
         target.kv_events_config = config
     except AttributeError:  # frozen server args: left as they are
@@ -1031,8 +1087,8 @@ class RustLauncher:
         if self.kv_events_default(args) is not None:
             logger.info(
                 "KV event publishing enabled: no --kv-events-config was given, so %s's ZMQ "
-                "publisher is on with its default endpoint and SubscribeKvEvents relays it; pass "
-                "--kv-events-config to configure it, or set %s=0 to leave it off",
+                "publisher is on at a port found free on this host and SubscribeKvEvents relays "
+                "it; pass --kv-events-config to name the endpoint, or set %s=0 to leave it off",
                 self.engine,
                 self.kv_events_env,
             )

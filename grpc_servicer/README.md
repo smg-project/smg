@@ -264,9 +264,11 @@ contract the Python servicer serves: text generation, PD disaggregation
 below), `Embed`, `FlushCache`, `GetTokenizer` (which answers
 FAILED_PRECONDITION when the launcher could not resolve a local tokenizer
 directory) and `SubscribeKvEvents` (vLLM's ZMQ publisher, which Rust mode
-turns on by itself when the launcher is given no `--kv-events-config`; an
-explicit one is kept as given, and `SMG_VLLM_SERVICER_KV_EVENTS=0` leaves the
-publisher off). Tuning: `SMG_VLLM_SERVICER_HANDSHAKE_PORT` (default: a free port),
+turns on by itself when the launcher is given no `--kv-events-config`, at a
+port found free on the host rather than vLLM's fixed default, so two engines
+on one host do not collide; an explicit one is kept as given, its endpoint
+included, and `SMG_VLLM_SERVICER_KV_EVENTS=0` leaves the publisher off).
+Tuning: `SMG_VLLM_SERVICER_HANDSHAKE_PORT` (default: a free port),
 `SMG_VLLM_SERVICER_DRAIN_SECS` (default 5),
 `SMG_VLLM_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800: how long the servicer
 waits for a sign of life from the engine during its handshake; the launcher
@@ -485,8 +487,10 @@ implementation, as do the RL control-plane extras (the `rl.*` advertisement,
 the live `weight_version` on generate responses, `is_paused`); the Rust server
 redacts credentials from `server_args` the same way. `SubscribeKvEvents` relays
 TokenSpeed's ZMQ KV-event publisher, which Rust mode turns on by itself when
-the launcher is given no `--kv-events-config` (an explicit one is kept as
-given; `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0` leaves the publisher off). Tuning:
+the launcher is given no `--kv-events-config`, at a port found free on the
+host rather than TokenSpeed's fixed default (an explicit one is kept as given,
+its endpoint included; `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0` leaves the
+publisher off). Tuning:
 `SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT` (default: a
 free port), `SMG_TOKENSPEED_SERVICER_DRAIN_SECS` (default 5),
 `SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800) and
@@ -653,9 +657,10 @@ hidden states are refused, PD/EPD disaggregation stays with the Python
 implementation (the worker refuses to start on the Rust path in those modes),
 and LoRA loading answers UNIMPLEMENTED, as it does on the Python servicer.
 `SubscribeKvEvents` relays SGLang's ZMQ KV-event publisher, which Rust mode
-turns on by itself when the launcher is given no `--kv-events-config` (an
-explicit one is kept as given; `SMG_SGLANG_SERVICER_KV_EVENTS=0` leaves the
-publisher off). SGLang's HTTP sidecar (metrics and profiling endpoints) is not
+turns on by itself when the launcher is given no `--kv-events-config`, at a
+port found free on the host rather than SGLang's fixed default (an explicit
+one is kept as given, its endpoint included; `SMG_SGLANG_SERVICER_KV_EVENTS=0`
+leaves the publisher off). SGLang's HTTP sidecar (metrics and profiling endpoints) is not
 started on this path. Tuning: `SMG_SGLANG_SERVICER_HANDSHAKE_PORT` (default: a
 free port), `SMG_SGLANG_SERVICER_DRAIN_SECS` (default 5),
 `SMG_SGLANG_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800) and

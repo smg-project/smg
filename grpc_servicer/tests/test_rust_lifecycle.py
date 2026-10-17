@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import multiprocessing
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -738,46 +740,79 @@ def test_a_cancelled_launch_task_still_stops_the_server():
     assert events == ["serving:False", f"stop:{rust_lifecycle.SERVER_STOP_SECS}", "cancelled"]
 
 
+def _port_of(endpoint: str) -> int:
+    assert endpoint.startswith("tcp://*:"), endpoint
+    return int(endpoint.rpartition(":")[2])
+
+
+@contextlib.contextmanager
+def _listener(port: int):
+    """A listener on ``port`` on every interface, bound the way a ZMQ
+    publisher binds (``SO_REUSEADDR``): what an engine another job left
+    behind holds. Yields the port, or ``None`` when another process holds it
+    already, which serves the same purpose."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        try:
+            sock.bind(("", port))
+            sock.listen(1)
+        except OSError:
+            yield None
+        else:
+            yield port
+    finally:
+        sock.close()
+
+
 def test_the_kv_events_default_turns_the_publisher_on_unless_told_otherwise(caplog):
     """The rule the three launchers share: a target without a configuration
-    gets the engine's default, the engine's variable keeps the publisher off,
-    an explicit configuration is kept as given, frozen server args are left
-    alone."""
+    gets the engine's default built for a free port's endpoint, the engine's
+    variable keeps the publisher off, an explicit configuration is kept as
+    given, frozen server args are left alone."""
     apply = rust_lifecycle.apply_kv_events_default
     env = "SMG_TEST_SERVICER_KV_EVENTS"
     built: list[str] = []
 
-    def build():
-        built.append("built")
-        return {"publisher": "zmq"}
+    def build(endpoint: str) -> dict[str, str]:
+        built.append(endpoint)
+        return {"publisher": "zmq", "endpoint": endpoint}
 
-    # Nothing given (no attribute, None, an empty string): the default, as a
-    # value or built on demand.
-    target = types.SimpleNamespace()
-    assert apply(target, "zmq", env_name=env, environ={}) == "zmq"
-    assert target.kv_events_config == "zmq"
+    # Nothing given (no attribute, None, an empty string): the default, built
+    # for an endpoint at a free port of this host.
     for target in (
         types.SimpleNamespace(),
         types.SimpleNamespace(kv_events_config=None),
         types.SimpleNamespace(kv_events_config=""),
     ):
-        assert apply(target, build, env_name=env, environ={}) == {"publisher": "zmq"}
-        assert target.kv_events_config == {"publisher": "zmq"}
-    assert built == ["built"] * 3
+        applied = apply(target, build, env_name=env, environ={})
+        assert applied == {"publisher": "zmq", "endpoint": built[-1]}
+        assert target.kv_events_config is applied
+        assert rust_lifecycle._bindable(_port_of(built[-1]))
+    assert len(built) == 3
     # The opt-out: the engine's variable, case and whitespace aside; nothing is
     # built for a publisher left off. Any other value is not the opt-out.
     for value in ("0", "false", "No", " off "):
         target = types.SimpleNamespace(kv_events_config=None)
         assert apply(target, build, env_name=env, environ={env: value}) is None
         assert target.kv_events_config is None
-    assert apply(types.SimpleNamespace(), "zmq", env_name=env, environ={env: "1"}) == "zmq"
-    assert built == ["built"] * 3
-    # An explicit configuration is kept as given, off and empty included.
-    for given in ('{"publisher": "null"}', {}, types.SimpleNamespace(publisher="null")):
+    assert len(built) == 3
+    assert apply(types.SimpleNamespace(), build, env_name=env, environ={env: "1"}) == {
+        "publisher": "zmq",
+        "endpoint": built[-1],
+    }
+    assert len(built) == 4
+    # An explicit configuration is kept as given: off, empty, and one that
+    # names the engines' fixed default endpoint, which is then the operator's.
+    for given in (
+        '{"publisher": "null"}',
+        {},
+        types.SimpleNamespace(publisher="zmq", endpoint="tcp://*:5557"),
+    ):
         target = types.SimpleNamespace(kv_events_config=given)
         assert apply(target, build, env_name=env, environ={}) is None
         assert target.kv_events_config is given
-    assert built == ["built"] * 3
+    assert len(built) == 4
     # Server args that cannot be written are left alone, with a warning.
 
     class Frozen:
@@ -785,6 +820,60 @@ def test_the_kv_events_default_turns_the_publisher_on_unless_told_otherwise(capl
         kv_events_config = None
 
     with caplog.at_level("WARNING", logger=rust_lifecycle.logger.name):
-        assert apply(Frozen(), "zmq", env_name=env, environ={}) is None
+        assert apply(Frozen(), build, env_name=env, environ={}) is None
     warning = "kv_events_config cannot be set on Frozen; KV event publishing stays as configured"
     assert warning in caplog.text
+
+
+def test_the_default_publisher_port_is_a_free_one_not_the_engines_fixed_default():
+    """Every engine's own configuration defaults its publisher to tcp://*:5557,
+    and an engine started while another process held that port (an engine an
+    earlier job left behind, a second engine on the host) died at its bind
+    with "Address already in use": the lifecycle's endpoint is a port the OS
+    hands out as free, so a held default is never chosen, and the ports after
+    it, which a data-parallel engine's other ranks publish on, are free too."""
+    with _listener(5557):
+        assert not rust_lifecycle._bindable(5557)
+        port = _port_of(rust_lifecycle.free_kv_events_endpoint())
+        assert port != 5557
+        assert rust_lifecycle._bindable(port)
+    base = _port_of(rust_lifecycle.free_kv_events_endpoint(ranks=4))
+    assert all(rust_lifecycle._bindable(base + rank) for rank in range(4))
+
+
+def test_the_probe_sees_what_a_zmq_publisher_holds():
+    """The probe binds the way libzmq binds (``SO_REUSEADDR``), so a port a
+    ZMQ publisher listens on is taken to it, and a port nothing holds is free
+    to it: it answers for the engines' publishers, not for some other kind of
+    socket."""
+    zmq = pytest.importorskip("zmq")
+    context = zmq.Context()
+    publisher = context.socket(zmq.PUB)
+    try:
+        held = publisher.bind_to_random_port("tcp://*")
+        assert not rust_lifecycle._bindable(held)
+    finally:
+        publisher.close(linger=0)
+        context.term()
+    assert rust_lifecycle._bindable(held)
+
+
+def test_a_block_with_a_held_neighbour_is_passed_over_for_another(monkeypatch):
+    """A data-parallel engine's ranks publish on consecutive ports: a base
+    whose neighbour is held is given up for another base, and a host that
+    has no such block refuses with the knob that names an endpoint."""
+    probed: list[int] = []
+    real = rust_lifecycle._bindable
+
+    def neighbour_held(port: int) -> bool:
+        probed.append(port)
+        return False if port == probed[0] else real(port)
+
+    monkeypatch.setattr(rust_lifecycle, "_bindable", neighbour_held)
+    base = _port_of(rust_lifecycle.free_kv_events_endpoint(ranks=2))
+    assert len(probed) >= 2 and base + 1 != probed[0]
+    assert real(base) and real(base + 1)
+
+    monkeypatch.setattr(rust_lifecycle, "_bindable", lambda port: False)
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="--kv-events-config"):
+        rust_lifecycle.free_kv_events_endpoint(ranks=2)
