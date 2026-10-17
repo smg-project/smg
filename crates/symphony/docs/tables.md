@@ -127,16 +127,15 @@ Beyond that:
   terminals, byte for byte otherwise.
 
 The module's tests pin the turns the encoder renders where this table reads them its own way,
-each read as the encoder's own parser reads it: one call with a string and a number value, a
-thought and an answer, a calls block inside the thought, a closing tag inside a string value,
-the turn after a tool result in thinking and in chat mode, and every cut of each. The other
-shapes of a tool-calling conversation (two calls in one block, a call after content, a call
-with no parameters, every kind of value, non-ASCII text) are hand-written cases of bellwether's
-sets, which its recorder renders through the encoder once the group has a manifest there; the
-corpus harness replays them from the fixture pin, and until then nothing in this repository
-checks what they parse to.
-the README row says awaiting fixtures until the pin holds it. What the table leaves open: the
-recorded set, and the live reading against the engine's own server.
+each read as the encoder's own parser reads it: one call with a string and a number value, at
+every cut, and once each a thought and an answer, a calls block inside the thought, a closing tag
+inside a string value, and the turn after a tool result in thinking and in chat mode. The other
+shapes of a tool-calling conversation (two calls in one block, a call after content, a call with
+no parameters, every kind of value, non-ASCII text) are hand-written cases of bellwether's sets,
+which its recorder renders through the encoder once the group has a manifest there; the corpus
+harness replays them from the fixture pin, and until then nothing in this repository checks what
+they parse to; the README row says awaiting fixtures until the pin holds it. What the table
+leaves open: the recorded set, and the live reading against the engine's own server.
 
 ## GLM 4.5 and 4.6 (`glm4`)
 
