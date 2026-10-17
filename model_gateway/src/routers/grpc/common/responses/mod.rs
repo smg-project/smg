@@ -8,7 +8,9 @@ pub(crate) mod streaming;
 pub(crate) mod utils;
 
 // Re-export commonly used items
-pub(crate) use background::{spawn_unstored_sweeper, BackgroundResponses, BackgroundStream};
+pub(crate) use background::{
+    spawn_reaper, spawn_unstored_sweeper, BackgroundResponses, BackgroundStream,
+};
 pub(crate) use context::ResponsesContext;
 pub(crate) use history::load_history;
 pub(crate) use streaming::{

@@ -460,7 +460,7 @@ pub async fn persist_conversation_items(
 
 /// [`persist_conversation_items`] for a response whose record may have been
 /// closed while it ran (a background response: cancelled on any gateway
-/// sharing the store): the response is stored with
+/// sharing the store, or failed by the reaper): the response is stored with
 /// one conditional write, refused once the record is closed or gone, and
 /// nothing is linked then. `Ok(true)` when it was stored, or when the record
 /// already held this persist's object (the same status and output items: an

@@ -439,6 +439,7 @@ struct Router {
     api_key: Option<String>,
     assignment_mode: Option<String>,
     backend: BackendType,
+    background_lease_ttl_secs: u64,
     balance_abs_threshold: usize,
     balance_rel_threshold: f32,
     balance_token_usage_threshold: f32,
@@ -1182,6 +1183,7 @@ impl Router {
             .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
             .max_background_responses(self.max_background_responses)
             .sse_keepalive_secs(self.sse_keepalive_secs)
+            .background_lease_ttl_secs(self.background_lease_ttl_secs)
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
@@ -1264,6 +1266,7 @@ impl Router {
         api_key = None,
         assignment_mode = None,
         backend = BackendType::Sglang,
+        background_lease_ttl_secs = 30,
         balance_abs_threshold = 64,
         balance_rel_threshold = 1.5,
         balance_token_usage_threshold = 1.0,
@@ -1470,6 +1473,7 @@ impl Router {
         api_key: Option<String>,
         assignment_mode: Option<String>,
         backend: BackendType,
+        background_lease_ttl_secs: u64,
         balance_abs_threshold: usize,
         balance_rel_threshold: f32,
         balance_token_usage_threshold: f32,
@@ -1706,6 +1710,7 @@ impl Router {
             api_key,
             assignment_mode,
             backend,
+            background_lease_ttl_secs,
             balance_abs_threshold,
             balance_rel_threshold,
             balance_token_usage_threshold,

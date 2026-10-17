@@ -825,6 +825,19 @@ impl RedisResponseStorage {
         }
     }
 
+    /// The set of the ids of the background responses still in flight: a
+    /// record stored `queued` or `in_progress` with `background: true` joins
+    /// it, its terminal store or its deletion removes it (a hash cannot be
+    /// searched by a field of its JSON payload short of scanning every
+    /// response). The listing behind the gateway's reaper of abandoned
+    /// background responses reads it.
+    fn open_background_key(&self) -> String {
+        match &self.store.schema.owner {
+            Some(owner) => format!("{owner}:background:open"),
+            None => "background:open".to_string(),
+        }
+    }
+
     /// The output-item keys pointing at the responses stored under `keys`,
     /// read from each hash's `raw_response` (before the hashes go).
     async fn output_item_keys_of_many(
@@ -912,8 +925,9 @@ impl RedisResponseStorage {
     }
 
     /// The writes that go with a stored response besides its hash: one key
-    /// per output item id (with the response's retention) and the hash's
-    /// expiry.
+    /// per output item id (with the response's retention), the set of the
+    /// open background responses (joined while the record is open, left with
+    /// its terminal store), and the hash's expiry.
     fn index_writes(&self, pipe: &mut redis::Pipeline, key: &str, response: &StoredResponse) {
         let sr = &self.store.schema.responses;
         let response_id_str = response.id.0.as_str();
@@ -930,9 +944,53 @@ impl RedisResponseStorage {
                     }
                 }
             }
+            self.open_set_writes(pipe, response);
         }
         if let Some(seconds) = retention {
             pipe.expire(key, seconds as i64);
+        }
+    }
+
+    /// Queues the change of the set of the open background responses that
+    /// goes with a write of `response`: joined while the record is open, left
+    /// with its terminal store; nothing for a response that is not a
+    /// background one, or under a schema without the object field (the set is
+    /// read against the stored object). `true` when a command was queued.
+    fn open_set_writes(&self, pipe: &mut redis::Pipeline, response: &StoredResponse) -> bool {
+        if self.store.schema.responses.is_skipped("raw_response") {
+            return false;
+        }
+        let response_id_str = response.id.0.as_str();
+        if response.is_open_background() {
+            pipe.sadd(self.open_background_key(), response_id_str);
+            true
+        } else if response.raw_response["background"].as_bool() == Some(true) {
+            pipe.srem(self.open_background_key(), response_id_str);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The open set's change for a conditional write that was stored: the
+    /// script's run wrote the hash, the output-item keys and the expiry, and
+    /// the set follows here (the unconditional store queues the same change
+    /// in [`Self::index_writes`]). A failure is logged, never returned: the
+    /// write landed with the script's answer, and the set loses nothing to
+    /// a missed command (a queued record joined it through its first store,
+    /// every renewal joins it again, and the listing drops a member whose
+    /// record it finds closed).
+    async fn follow_open_set(&self, conn: &mut Connection, response: &StoredResponse) {
+        let mut pipe = redis::pipe();
+        if !self.open_set_writes(&mut pipe, response) {
+            return;
+        }
+        if let Err(e) = pipe.query_async::<()>(conn).await {
+            tracing::debug!(
+                response_id = %response.id.0,
+                error = %e,
+                "Failed to update the set of open background responses after a stored conditional write"
+            );
         }
     }
 
@@ -1178,10 +1236,20 @@ impl ResponseStorage for RedisResponseStorage {
             .await?;
         match outcome.as_str() {
             "stored" => {
+                // The open set follows the object (the output-item keys and
+                // the expiry were written in the script's run).
+                self.follow_open_set(&mut conn, &response).await;
                 // A repeat of the entry the record's first store made (the
                 // identifier does not change between the writes of one
-                // response), so a failure here loses nothing.
-                self.index_by_identifier(&mut conn, &response).await?;
+                // response), so a failure here loses nothing and does not
+                // turn the stored write into an error.
+                if let Err(e) = self.index_by_identifier(&mut conn, &response).await {
+                    tracing::debug!(
+                        response_id = %response.id.0,
+                        error = %e,
+                        "Failed to repeat the identifier index entry after a stored conditional write"
+                    );
+                }
                 Ok(ConditionalStore::Stored)
             }
             "closed" => {
@@ -1226,7 +1294,15 @@ impl ResponseStorage for RedisResponseStorage {
             )
             .await?;
         match outcome.as_str() {
-            "stored" => Ok(ConditionalStore::Stored),
+            "stored" => {
+                // The open set follows the object (the output-item keys and
+                // the expiry were written in the script's run).
+                let mut moved = StoredResponse::new(None);
+                moved.id = id.clone();
+                moved.raw_response = raw_response;
+                self.follow_open_set(&mut conn, &moved).await;
+                Ok(ConditionalStore::Stored)
+            }
             "closed" => {
                 drop(conn);
                 Ok(match self.get_response(id).await? {
@@ -1330,6 +1406,9 @@ impl ResponseStorage for RedisResponseStorage {
                 .await
                 .map_err(ResponseStorageError::from_redis)?;
         }
+        conn.srem::<_, _, ()>(self.open_background_key(), id)
+            .await
+            .map_err(ResponseStorageError::from_redis)?;
 
         Ok(())
     }
@@ -1363,6 +1442,81 @@ impl ResponseStorage for RedisResponseStorage {
             .await
             .map_err(ResponseStorageError::from_redis)?;
         Ok(())
+    }
+
+    async fn list_open_background_responses(
+        &self,
+        limit: usize,
+    ) -> ResponseResult<Vec<StoredResponse>> {
+        let sr = &self.store.schema.responses;
+        if sr.is_skipped("raw_response") || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let open_key = self.open_background_key();
+        let mut conn = self
+            .store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let ids: Vec<String> = conn
+            .smembers(&open_key)
+            .await
+            .map_err(ResponseStorageError::from_redis)?;
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Two fields per member, not the whole hash (whose input can run to
+        // megabytes): the object and when it was created; the record builder
+        // reads a missing input as empty, and the reaper re-reads the whole
+        // record of the few it closes.
+        let fields = [sr.col("raw_response"), sr.col("created_at")];
+        let mut pipe = redis::pipe();
+        for id in &ids {
+            pipe.cmd("HMGET")
+                .arg(self.response_key(id))
+                .arg(&fields[..]);
+        }
+        let values: Vec<Vec<Option<String>>> = pipe
+            .query_async(&mut conn)
+            .await
+            .map_err(ResponseStorageError::from_redis)?;
+
+        // A member whose record is gone (expired, or deleted by an older
+        // build) or closed by one that did not maintain the set leaves it.
+        let mut open = Vec::new();
+        let mut stale = Vec::new();
+        for (id, got) in ids.iter().zip(values) {
+            let map: HashMap<String, String> = fields
+                .iter()
+                .zip(got)
+                .filter_map(|(field, value)| value.map(|value| (field.to_string(), value)))
+                .collect();
+            if !map.contains_key(sr.col("raw_response")) {
+                stale.push(id.clone());
+                continue;
+            }
+            let response = self.build_response_from_map(map, id)?;
+            if response.is_open_background() {
+                open.push(response);
+            } else {
+                stale.push(id.clone());
+            }
+        }
+        if !stale.is_empty() {
+            conn.srem::<_, _, ()>(&open_key, stale)
+                .await
+                .map_err(ResponseStorageError::from_redis)?;
+        }
+        open.sort_by_key(|response| {
+            (
+                response.background_lease_expires_at().unwrap_or(i64::MAX),
+                response.created_at,
+            )
+        });
+        open.truncate(limit);
+        Ok(open)
     }
 
     async fn list_identifier_responses(
@@ -1465,6 +1619,7 @@ impl ResponseStorage for RedisResponseStorage {
         // An index left empty goes with its last member.
         let mut leaving = visible_ids;
         leaving.extend(gone);
+        pipe.srem(self.open_background_key(), &leaving);
         pipe.zrem(&key, &leaving);
 
         pipe.query_async::<()>(&mut conn)

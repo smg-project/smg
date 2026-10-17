@@ -13,7 +13,8 @@ use super::core::{
     ConversationItem, ConversationItemId, ConversationItemStorage, ConversationItemStorageError,
     ConversationMetadata, ConversationStorage, ConversationStorageError, Failure, ListParams,
     NewConversation, NewConversationItem, ResponseId, ResponseStorage, ResponseStorageError,
-    SortOrder, StoredResponse, TERMINAL_RESPONSE_STATUSES,
+    SortOrder, StoredResponse, BACKGROUND_LEASE_KEY, OPEN_RESPONSE_STATUSES,
+    TERMINAL_RESPONSE_STATUSES,
 };
 use crate::{
     common::{
@@ -1179,6 +1180,47 @@ fn find_by_output_item_sql(schema: &SchemaConfig, select_base: &str) -> Option<S
     ))
 }
 
+/// The object's status over the open records only (NULL, hence absent from
+/// a B-tree, for the rest): the key of the `_OPEN_BG_IDX` index built with
+/// the table, and the predicate of the listing it serves, spelled the same
+/// so the optimizer matches the two (as `unstored_status_expr` and the
+/// sweep).
+fn open_status_expr(col_raw: &str) -> String {
+    format!(
+        "CASE WHEN JSON_VALUE({col_raw}, '$.status') IN ({}) THEN JSON_VALUE({col_raw}, '$.status') END",
+        sql_string_list(&OPEN_RESPONSE_STATUSES)
+    )
+}
+
+/// The query behind `list_open_background_responses`: the rows whose
+/// `raw_response` carries a status the response still leaves (through
+/// [`open_status_expr`], the key of the index over the open records),
+/// `background: true` and a lease (`JSON_VALUE` and `JSON_EXISTS` over the
+/// JSON text), the lease that runs out first ahead (its expiry read as a
+/// number; a lease without one is NULL and sorts last), then the oldest, at
+/// most `limit` of them. `None` when the schema skips the column.
+fn open_background_sql(schema: &SchemaConfig, select_base: &str, limit: usize) -> Option<String> {
+    let s = &schema.responses;
+    if s.is_skipped("raw_response") {
+        return None;
+    }
+    let col_raw = s.col("raw_response");
+    let mut order = format!(
+        " ORDER BY JSON_VALUE({col_raw}, '$.{BACKGROUND_LEASE_KEY}.expires_at' RETURNING NUMBER) ASC"
+    );
+    if !s.is_skipped("created_at") {
+        order.push_str(&format!(", {} ASC", s.col("created_at")));
+    }
+    Some(format!(
+        "SELECT * FROM ({select_base} WHERE {} IN ({}) \
+         AND JSON_VALUE({col_raw}, '$.background') = 'true' \
+         AND JSON_EXISTS({col_raw}, '$.{BACKGROUND_LEASE_KEY}'){order}) \
+         WHERE ROWNUM <= {limit}",
+        open_status_expr(col_raw),
+        sql_string_list(&OPEN_RESPONSE_STATUSES)
+    ))
+}
+
 impl OracleResponseStorage {
     pub fn new(store: OracleStore) -> Self {
         let select_base = build_response_select_base(&store.schema);
@@ -1246,6 +1288,27 @@ impl OracleResponseStorage {
                 ) {
                     tracing::warn!(
                         "unstored response index not created (the sweep of unstored background records scans the table): {e}"
+                    );
+                }
+
+                // The index behind `list_open_background_responses`: the
+                // object's status over the open records only, so the listing
+                // every gateway's reaper runs reads the few open rows rather
+                // than the table. The same policy as the unstored index: built
+                // with the table, an existing table gets it from its operator,
+                // a failed build leaves the listing a scan.
+                let open_idx = format!("{}_OPEN_BG_IDX", s.table);
+                if let Err(e) = create_index_if_missing(
+                    conn,
+                    &s.table,
+                    &open_idx,
+                    &format!(
+                        "CREATE INDEX {open_idx} ON {table}({})",
+                        open_status_expr(col_raw)
+                    ),
+                ) {
+                    tracing::warn!(
+                        "open background response index not created (the listing of open background records scans the table): {e}"
                     );
                 }
             }
@@ -1811,6 +1874,30 @@ impl ResponseStorage for OracleResponseStorage {
             .map_err(ResponseStorageError::from_failure)
     }
 
+    async fn list_open_background_responses(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
+        let schema = self.store.schema.clone();
+        let Some(sql) = open_background_sql(&schema, &self.select_base, limit) else {
+            return Ok(Vec::new());
+        };
+
+        self.store
+            .execute(move |conn| {
+                let mut stmt = conn.statement(&sql).build().map_err(map_oracle_error)?;
+                let mut rows = stmt.query(&[]).map_err(map_oracle_error)?;
+                let mut results = Vec::new();
+                for row in &mut rows {
+                    let row = row.map_err(map_oracle_error)?;
+                    results.push(Self::build_response_from_row(&row, &schema)?);
+                }
+                Ok(results)
+            })
+            .await
+            .map_err(ResponseStorageError::from_failure)
+    }
+
     async fn delete_response(&self, response_id: &ResponseId) -> Result<(), ResponseStorageError> {
         let id = response_id.0.clone();
         let schema = self.store.schema.clone();
@@ -2127,6 +2214,32 @@ mod tests {
                 ("c".to_string(), t(4)),
             ]
         );
+    }
+
+    #[test]
+    fn open_background_lookup_reads_the_status_through_the_index_expression_and_orders_by_the_lease(
+    ) {
+        let schema = SchemaConfig::default();
+        let sql = open_background_sql(&schema, "SELECT id FROM responses", 64).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM (SELECT id FROM responses WHERE \
+             CASE WHEN JSON_VALUE(raw_response, '$.status') IN ('queued', 'in_progress') \
+             THEN JSON_VALUE(raw_response, '$.status') END IN ('queued', 'in_progress') \
+             AND JSON_VALUE(raw_response, '$.background') = 'true' \
+             AND JSON_EXISTS(raw_response, '$._lease') \
+             ORDER BY JSON_VALUE(raw_response, '$._lease.expires_at' RETURNING NUMBER) ASC, \
+             created_at ASC) WHERE ROWNUM <= 64"
+        );
+        // The listing's predicate is the index's key, spelled the same.
+        assert!(sql.contains(&open_status_expr("raw_response")));
+
+        let mut skipped = SchemaConfig::default();
+        skipped
+            .responses
+            .skip_columns
+            .insert("raw_response".to_string());
+        assert!(open_background_sql(&skipped, "SELECT id FROM responses", 64).is_none());
     }
 
     #[test]

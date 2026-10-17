@@ -425,6 +425,18 @@ pub struct RouterConfig {
     /// requests then run in the foreground, as every other request does.
     #[serde(default = "default_max_background_responses")]
     pub max_background_responses: usize,
+    /// How long the lease a gateway holds on a background response it runs
+    /// stays valid without a renewal, in seconds. A record whose lease has
+    /// expired (its gateway stopped) is closed as `failed` by any gateway
+    /// sharing the response store, within one and a half times this value.
+    /// The gateways sharing a store compare their clocks through the lease
+    /// (the lease is renewed every third of this value and holds for the
+    /// whole of it): keep them within a third of this value of each other;
+    /// a gateway running ahead by more than two thirds of it closes live
+    /// responses as lost. 0 writes no lease and runs no reaper; a value
+    /// under [`MIN_BACKGROUND_LEASE_TTL_SECS`] is a configuration error.
+    #[serde(default = "default_background_lease_ttl_secs")]
+    pub background_lease_ttl_secs: u64,
     /// Enable the priority-aware admission scheduler. When false (default),
     /// the legacy concurrency-limit middleware stays wired — zero behavior
     /// change for existing deployments.
@@ -782,6 +794,16 @@ const fn default_disabled_limit() -> i32 {
 const fn default_max_background_responses() -> usize {
     1024
 }
+
+const fn default_background_lease_ttl_secs() -> u64 {
+    30
+}
+
+/// The shortest lease `background_lease_ttl_secs` accepts besides 0: the
+/// lease is renewed on the runner's 2 s status watch and expires on a whole
+/// second, so a shorter one is reaped (by its owner's own reaper too) before
+/// it can be renewed.
+pub const MIN_BACKGROUND_LEASE_TTL_SECS: u64 = 6;
 
 pub const DEFAULT_PREFILL_QUEUE_SIZE: usize = 100;
 pub const DEFAULT_PREFILL_QUEUE_TIMEOUT_SECS: u64 = 60;
@@ -1811,6 +1833,7 @@ impl Default for RouterConfig {
             prefill_queue_timeout_secs: None,
             rate_limit_tokens_per_second: None,
             max_background_responses: default_max_background_responses(),
+            background_lease_ttl_secs: default_background_lease_ttl_secs(),
             priority_scheduler_enabled: false,
             priority_scheduler_default_max_class: default_priority_scheduler_max_class(),
             priority_scheduler_config: None,

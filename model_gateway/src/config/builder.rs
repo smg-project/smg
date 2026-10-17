@@ -502,6 +502,13 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// How long the lease on a background response this gateway runs stays
+    /// valid without a renewal, in seconds (0 = no lease, no reaper).
+    pub fn background_lease_ttl_secs(mut self, secs: u64) -> Self {
+        self.config.background_lease_ttl_secs = secs;
+        self
+    }
+
     // ==================== Priority Scheduler ====================
 
     pub fn priority_scheduler_enabled(mut self, enabled: bool) -> Self {

@@ -479,18 +479,114 @@ async fn responses_and_conversations_keep_their_tenant_and_the_identifier_querie
 
 #[tokio::test]
 #[ignore = "requires a live Redis server; set DATA_CONNECTOR_TEST_REDIS_URL and run with -- --ignored"]
-async fn a_conditional_store_replaces_an_open_record_and_refuses_a_closed_or_missing_one() {
+async fn open_background_responses_are_listed_until_they_close_or_go() {
     let Some(url) = test_redis_url() else {
         return;
     };
     let bundle = redis_bundle(&url).await.expect("create storage");
     let storage = bundle.response_storage;
 
+    let record = |status: &str, background: bool| {
+        let mut stored = StoredResponse::new(None);
+        let mut raw = json!({"id": stored.id.0, "status": status, "output": []});
+        if background {
+            raw["background"] = json!(true);
+            raw["_lease"] = json!({"owner": "gw_test", "expires_at": 1_700_000_000});
+        }
+        stored.raw_response = raw;
+        stored
+    };
+    let open = record("queued", true);
+    let other = record("in_progress", true);
+    let closed = record("cancelled", true);
+    let foreground = record("in_progress", false);
+    let mut no_lease = record("queued", true);
+    no_lease
+        .raw_response
+        .as_object_mut()
+        .expect("object")
+        .remove("_lease");
+    for stored in [&open, &other, &closed, &foreground, &no_lease] {
+        storage.store_response(stored.clone()).await.expect("store");
+    }
+
+    let listed_ids =
+        |responses: Vec<StoredResponse>| responses.into_iter().map(|r| r.id.0).collect::<Vec<_>>();
+    let ids = listed_ids(
+        storage
+            .list_open_background_responses(10_000)
+            .await
+            .expect("list"),
+    );
+    assert!(ids.contains(&open.id.0), "{ids:?}");
+    assert!(ids.contains(&other.id.0), "{ids:?}");
+    assert!(!ids.contains(&closed.id.0), "a closed record is not listed");
+    assert!(
+        !ids.contains(&no_lease.id.0),
+        "a record without a lease is not listed"
+    );
+    assert!(
+        !ids.contains(&foreground.id.0),
+        "a foreground record is not listed"
+    );
+
+    // A terminal store takes a record out of the set; a deletion too.
+    let mut done = open.clone();
+    done.raw_response["status"] = json!("completed");
+    storage.store_response(done).await.expect("store");
+    storage.delete_response(&other.id).await.expect("delete");
+    let ids = listed_ids(
+        storage
+            .list_open_background_responses(10_000)
+            .await
+            .expect("list"),
+    );
+    assert!(!ids.contains(&open.id.0), "{ids:?}");
+    assert!(!ids.contains(&other.id.0), "{ids:?}");
+
+    for stored in [&open, &closed, &foreground, &no_lease] {
+        storage.delete_response(&stored.id).await.expect("delete");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis server; set DATA_CONNECTOR_TEST_REDIS_URL and run with -- --ignored"]
+async fn a_conditional_store_replaces_an_open_record_and_refuses_a_closed_or_missing_one() {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let bundle = redis_bundle(&url).await.expect("create storage");
+    let storage = bundle.response_storage;
+    // The set of open background ids, read directly: the listing drops a
+    // member whose record it finds closed, so it alone cannot tell whether
+    // the conditional writes maintain the set.
+    let raw = redis::Client::open(url.as_str())
+        .expect("client")
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connection");
+    let in_open_set = |id: String| {
+        let mut raw = raw.clone();
+        async move {
+            redis::cmd("SISMEMBER")
+                .arg("background:open")
+                .arg(id)
+                .query_async::<i64>(&mut raw)
+                .await
+                .expect("SISMEMBER")
+                == 1
+        }
+    };
+
     let base = StoredResponse::new(None);
     let record = |status: &str| {
         let mut stored = base.clone();
-        stored.raw_response =
+        let mut raw =
             json!({"id": stored.id.0, "background": true, "status": status, "output": []});
+        if matches!(status, "queued" | "in_progress") {
+            raw["_lease"] = json!({"owner": "gw_test", "expires_at": 1_700_000_000});
+        }
+        stored.raw_response = raw;
         stored
     };
     // Missing: nothing is written.
@@ -508,6 +604,10 @@ async fn a_conditional_store_replaces_an_open_record_and_refuses_a_closed_or_mis
         .store_response(record("queued"))
         .await
         .expect("store");
+    assert!(
+        in_open_set(base.id.0.clone()).await,
+        "a queued leased record joins the open set"
+    );
     assert!(matches!(
         storage
             .store_response_if_open(record("in_progress"))
@@ -521,6 +621,10 @@ async fn a_conditional_store_replaces_an_open_record_and_refuses_a_closed_or_mis
         .expect("get")
         .expect("stored");
     assert_eq!(stored.raw_response["status"], "in_progress");
+    assert!(
+        in_open_set(base.id.0.clone()).await,
+        "a conditional write that keeps the record open keeps it in the set"
+    );
     assert!(matches!(
         storage
             .store_response_if_open(record("cancelled"))
@@ -528,6 +632,10 @@ async fn a_conditional_store_replaces_an_open_record_and_refuses_a_closed_or_mis
             .expect("conditional store"),
         ConditionalStore::Stored
     ));
+    assert!(
+        !in_open_set(base.id.0.clone()).await,
+        "the conditional store that closed the record took it out of the set"
+    );
 
     // Closed: refused, the record handed back as it is.
     let ConditionalStore::Closed(current) = storage
@@ -544,7 +652,46 @@ async fn a_conditional_store_replaces_an_open_record_and_refuses_a_closed_or_mis
         .expect("get")
         .expect("stored");
     assert_eq!(stored.raw_response["status"], "cancelled");
+    assert!(
+        storage
+            .list_open_background_responses(10_000)
+            .await
+            .expect("list")
+            .iter()
+            .all(|r| r.id != base.id),
+        "a closed record is not among the open ones"
+    );
     storage.delete_response(&base.id).await.expect("delete");
+
+    // The reaper's path: the object alone moves to a terminal status, and
+    // the set follows that write too.
+    let reaped = StoredResponse::new(None);
+    let mut open = reaped.clone();
+    open.raw_response = json!({
+        "id": reaped.id.0, "background": true, "status": "in_progress", "output": [],
+        "_lease": {"owner": "gw_lost", "expires_at": 1},
+    });
+    storage.store_response(open).await.expect("store");
+    assert!(in_open_set(reaped.id.0.clone()).await);
+    let mut failed = storage
+        .get_response(&reaped.id)
+        .await
+        .expect("get")
+        .expect("stored")
+        .raw_response;
+    failed["status"] = json!("failed");
+    assert!(matches!(
+        storage
+            .update_response_object_if_open(&reaped.id, failed)
+            .await
+            .expect("conditional update"),
+        ConditionalStore::Stored
+    ));
+    assert!(
+        !in_open_set(reaped.id.0.clone()).await,
+        "the conditional object update that closed the record took it out of the set"
+    );
+    storage.delete_response(&reaped.id).await.expect("delete");
 }
 
 /// Under a schema that skips the object column there is no status to check:

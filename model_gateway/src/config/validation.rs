@@ -1252,6 +1252,21 @@ impl ConfigValidator {
             });
         }
 
+        // The lease on a background response is renewed on the status
+        // watch's 2 s tick and expires on a whole second: a shorter lease is
+        // reaped, by the owner's own reaper too, before it can be renewed.
+        if config.background_lease_ttl_secs != 0
+            && config.background_lease_ttl_secs < MIN_BACKGROUND_LEASE_TTL_SECS
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "background_lease_ttl_secs".to_string(),
+                value: config.background_lease_ttl_secs.to_string(),
+                reason: format!(
+                    "Must be 0 (no lease, no reaper) or at least {MIN_BACKGROUND_LEASE_TTL_SECS} seconds"
+                ),
+            });
+        }
+
         if config.mm_per_request_image_limit == Some(0) {
             return Err(ConfigError::InvalidValue {
                 field: "mm_per_request_image_limit".to_string(),
@@ -2121,6 +2136,27 @@ impl ConfigValidator {
 mod tests {
     use super::*;
     use crate::worker::ConnectionMode;
+
+    /// A lease shorter than the status watch's renewal can keep up with is a
+    /// configuration error, not a response reaped by its own gateway.
+    #[test]
+    fn background_lease_ttl_is_zero_or_at_least_the_minimum() {
+        let with_ttl = |secs: u64| RouterConfig {
+            background_lease_ttl_secs: secs,
+            ..RouterConfig::default()
+        };
+        for ok in [0, MIN_BACKGROUND_LEASE_TTL_SECS, 30, 3600] {
+            ConfigValidator::validate_server_settings(&with_ttl(ok))
+                .unwrap_or_else(|e| panic!("{ok} should validate: {e}"));
+        }
+        for bad in [1, 2, 5] {
+            let err = ConfigValidator::validate_server_settings(&with_ttl(bad)).unwrap_err();
+            assert!(
+                err.to_string().contains("background_lease_ttl_secs"),
+                "{bad}: {err}"
+            );
+        }
+    }
 
     /// The OTLP endpoint is validated as the URL the exporter dials, so an
     /// unbracketed IPv6 literal is a configuration error with the bracketed
