@@ -348,9 +348,13 @@ What the syntax says, and what the assembler does with it:
 - **Two endings.** `Assembler::close` is the region's closing marker (or the next opener):
   a call still open is closed for the client, an open argument's bytes and a name that never
   got its `(` come back as `Malformed`, and the list's wrapping before any call is dropped.
-  `Assembler::finish` is a stream that was cut: nothing is closed, what was held comes back
-  as `Malformed { UnterminatedRegion }`, and a call that started still ends, with no bytes of
-  its own, as every assembler ends one.
+  `Assembler::finish` is a stream that was cut: nothing is closed, and a call that started
+  still ends, with no bytes of its own, as every assembler ends one, after the one `Malformed {
+  UnterminatedRegion }` event that says its arguments are no whole value
+  (`tagged::end_cut_call`): it carries what was held, a key, a value or a separator cut short,
+  or no bytes when the cut came right after the `(`, so that a call the end cut before its `)`
+  is never handed over as finished without a word. Outside a call, what was held, a name that
+  never got its `(` or the list's wrapping, comes back as `Malformed { UnterminatedRegion }` too.
 - **Python's whitespace is allowed** between a name and its `(`, around the `=`, and around a
   value, as the old parser's regular expression allowed it; a name or a key is the text less
   that whitespace.

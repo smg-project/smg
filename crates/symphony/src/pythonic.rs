@@ -22,7 +22,10 @@
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
     ids::CallIds,
-    tagged::value::{json, python_literal},
+    tagged::{
+        end_cut_call,
+        value::{json, python_literal},
+    },
 };
 
 /// How a template frames the calls of one turn, which the grammar derived from the table writes
@@ -183,22 +186,24 @@ impl Assembler {
     }
 
     /// The stream was cut: nothing is closed, so arguments cut short never look complete to a
-    /// client; what was held comes back as `Malformed { UnterminatedRegion }`, and a call that
-    /// started still ends, with no bytes of its own, as every assembler ends one.
+    /// client. A call that started still ends, with no bytes of its own, as every assembler ends
+    /// one, after the one `Malformed { UnterminatedRegion }` event that says its arguments are no
+    /// whole value ([`end_cut_call`]): it carries what was held, a key, a value or a separator
+    /// cut short, or no bytes when the cut came right after the `(`, so that a call the end cut
+    /// before its `)` is never handed over as finished without a word. Outside a call, what was
+    /// held, a name that never got its `(` or the list's wrapping, comes back as `Malformed {
+    /// UnterminatedRegion }` too.
     pub fn finish(mut self, out: &mut Events) {
-        if !self.carried.is_empty() {
-            out.push(Event::Malformed {
-                text: Text::uncounted(std::mem::take(&mut self.carried)),
-                why: MalformedReason::UnterminatedRegion,
-            });
-        }
+        let held = std::mem::take(&mut self.carried);
         if matches!(
             self.stage,
             Stage::Arguments | Stage::Key { .. } | Stage::Value { .. }
         ) {
-            out.push(Event::ToolCallEnd {
-                index: self.index,
-                source: Text::default(),
+            end_cut_call(self.index, held, "", out);
+        } else if !held.is_empty() {
+            out.push(Event::Malformed {
+                text: Text::uncounted(held),
+                why: MalformedReason::UnterminatedRegion,
             });
         }
     }
@@ -572,5 +577,190 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    /// The stream's end after `pieces`: nothing is closed, as the engine ends a cut stream.
+    fn cut(pieces: &[&str]) -> Vec<Event> {
+        let mut assembler = Assembler::new(0, ids());
+        let mut out = Events::new();
+        for piece in pieces {
+            assembler.feed(piece, &mut out);
+        }
+        assembler.finish(&mut out);
+        out.drain()
+    }
+
+    fn by_the_character(text: &str) -> Vec<String> {
+        text.chars().map(String::from).collect()
+    }
+
+    /// The words the end said: the text of every `Malformed { UnterminatedRegion }` event.
+    fn said(events: &[Event]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Malformed {
+                    text,
+                    why: MalformedReason::UnterminatedRegion,
+                } => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_call_the_streams_end_cuts_right_after_its_parenthesis_says_so_before_its_end() {
+        let start = |index: u32, name: &str| Event::ToolCallStart {
+            index,
+            id: ids().id(index),
+            name: name.to_string(),
+            source: Text::uncounted(format!("{name}(")),
+        };
+        let word = Event::Malformed {
+            text: Text::uncounted(""),
+            why: MalformedReason::UnterminatedRegion,
+        };
+        let end = |index: u32| Event::ToolCallEnd {
+            index,
+            source: Text::uncounted(""),
+        };
+        assert_eq!(
+            cut(&["[get_weather("]),
+            [
+                Event::Dropped {
+                    text: Text::uncounted("["),
+                    why: DropReason::Wrapper,
+                },
+                start(0, "get_weather"),
+                word.clone(),
+                end(0),
+            ]
+        );
+        // The same by the character, for a second call the end cuts there: the first stands whole.
+        let text = "[get_weather(city='Paris'), get_stock_price(";
+        let pieces = by_the_character(text);
+        let events = cut(&pieces.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(bytes(&events), text);
+        assert_eq!(
+            calls(&events),
+            [
+                (
+                    0,
+                    "get_weather".to_string(),
+                    r#"{"city": "Paris"}"#.to_string()
+                ),
+                (1, "get_stock_price".to_string(), String::new()),
+            ]
+        );
+        assert_eq!(
+            events[events.len() - 3..],
+            [start(1, "get_stock_price"), word, end(1)]
+        );
+    }
+
+    #[test]
+    fn the_streams_end_says_so_wherever_it_cuts_a_call_and_carries_what_was_held() {
+        // Where the end cuts, what the one word carries, and whether a call was open at the cut.
+        let cuts: &[(&str, &str, bool)] = &[
+            ("[get_weather", "get_weather", false),
+            ("[get_weather(", "", true),
+            ("[get_weather( ", " ", true),
+            ("[get_weather(ci", "ci", true),
+            ("[get_weather(city ", "city ", true),
+            ("[get_weather(city=", "city=", true),
+            ("[get_weather(city='Par", "city='Par", true),
+            ("[get_weather(city='Paris'", "city='Paris'", true),
+            ("[get_weather(city='Paris',", ",", true),
+            ("[get_weather(city='Paris', ", ", ", true),
+            ("[get_weather(city='Paris', da", ", da", true),
+            ("[get_weather(prefs={'a': [1, ", "prefs={'a': [1, ", true),
+            ("[get_weather(city='Paris')", "", false),
+            ("[get_weather(city='Paris'), ", ", ", false),
+            ("[get_weather(city='Paris'), get_stock_price(", "", true),
+        ];
+        for (text, held, open) in cuts {
+            let pieces = by_the_character(text);
+            let whole = cut(&[text]);
+            let by_the_character = cut(&pieces.iter().map(String::as_str).collect::<Vec<_>>());
+            for events in [whole, by_the_character] {
+                assert_eq!(bytes(&events), *text);
+                let starts = events
+                    .iter()
+                    .filter(|event| matches!(event, Event::ToolCallStart { .. }))
+                    .count();
+                let ends = events
+                    .iter()
+                    .filter(|event| matches!(event, Event::ToolCallEnd { .. }))
+                    .count();
+                assert_eq!(starts, ends, "{text:?}: every call that started ends");
+                if *open {
+                    assert_eq!(
+                        said(&events),
+                        [*held],
+                        "{text:?}: one word, with what was held"
+                    );
+                    assert!(
+                        matches!(
+                            &events[events.len() - 2..],
+                            [Event::Malformed { .. }, Event::ToolCallEnd { .. }]
+                        ),
+                        "{text:?}: the word comes right before the end"
+                    );
+                    // Nothing is made up: a cut call's fragments never close its object.
+                    assert!(
+                        calls(&events)
+                            .last()
+                            .is_some_and(|(_, _, arguments)| !arguments.ends_with('}')),
+                        "{text:?}: the cut call's arguments stay open"
+                    );
+                } else if held.is_empty() {
+                    assert!(said(&events).is_empty(), "{text:?}: whole calls, no word");
+                } else {
+                    assert_eq!(
+                        said(&events),
+                        [*held],
+                        "{text:?}: what was held, no call open"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_call_the_streams_end_cuts_anywhere_keeps_the_fragments_it_sent_and_nothing_more() {
+        let whole = calls(&run(&[LFM]));
+        for at in 1..LFM.len() {
+            if !LFM.is_char_boundary(at) {
+                continue;
+            }
+            let text = &LFM[..at];
+            let events = cut(&[text]);
+            assert_eq!(bytes(&events), text, "cut at {at}");
+            for (index, name, arguments) in calls(&events) {
+                let (_, whole_name, whole_arguments) = &whole[index as usize];
+                assert_eq!(&name, whole_name, "cut at {at}");
+                // A call's fragments are a prefix of what the whole call gives, and the one word
+                // stands between a cut call's start and its end, never inside a whole one.
+                assert!(
+                    whole_arguments.starts_with(&arguments),
+                    "cut at {at}: {arguments:?} is no prefix of {whole_arguments:?}"
+                );
+                let start = events
+                    .iter()
+                    .position(|event| matches!(event, Event::ToolCallStart { index: i, .. } if *i == index))
+                    .unwrap_or_else(|| panic!("cut at {at}: call {index} has no start"));
+                let end = events
+                    .iter()
+                    .position(
+                        |event| matches!(event, Event::ToolCallEnd { index: i, .. } if *i == index),
+                    )
+                    .unwrap_or_else(|| panic!("cut at {at}: call {index} has no end"));
+                assert_eq!(
+                    said(&events[start..end]).len(),
+                    usize::from(&arguments != whole_arguments),
+                    "cut at {at}: a cut call says so once, a whole one not at all"
+                );
+            }
+        }
     }
 }
