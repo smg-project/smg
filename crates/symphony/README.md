@@ -139,7 +139,11 @@ A Symphony change carries a throughput row measured from this bench, not from a 
 three interleaved repeats on one pinned core, against `main` built the same way.
 
 1. Build the bench on `main` and on the change, each in its own checkout and target directory:
-   `cargo bench -p smg-symphony --bench throughput --no-run` prints the binary's path.
+   `cargo bench -p smg-symphony --bench throughput --no-run` prints the binary's path. The two
+   binaries must carry the same rows: where `main`'s bench lacks a group the change measures (the
+   `slice` and `adapt` groups are this harness's), copy the change's `crates/symphony/benches/`
+   and `crates/symphony/tests/fixtures/slices/` into the `main` checkout before building there,
+   so each binary reads its own crate through one harness.
 2. Run the two binaries interleaved, three repeats each, pinned to one core, saving one baseline
    per repeat, with the directory the baselines go to named outright (a bench binary run on its
    own, outside `cargo bench`, writes to `./target/criterion` of the current directory otherwise):

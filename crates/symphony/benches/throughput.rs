@@ -267,12 +267,23 @@ fn tokens<'a>(text: &'a str, terminals: &[String]) -> Vec<&'a str> {
 }
 
 /// The events `slice` produces through `table` read in token pieces: the stream an adapter
-/// renders.
+/// renders, the prompt's own events first (a prompt that opens the thought starts the stream
+/// with its reasoning event, which the adapters render before any delta).
 fn events_of(table: Table, slice: &Slice, declared: &Declared) -> Vec<Event> {
     let terminals = terminals(table);
-    let mut engine = engine(table, &slice.prompt, declared);
+    let mut engine = Engine::new(table.format(), declared.clone());
     let mut out = Events::new();
     let mut events = Vec::new();
+    engine
+        .feed(
+            Input::Prompt {
+                token_ids: &[],
+                text: &slice.prompt,
+            },
+            &mut out,
+        )
+        .expect("prompt");
+    events.extend(out.drain());
     for piece in tokens(&slice.output, &terminals) {
         engine
             .feed(
