@@ -87,9 +87,10 @@ impl Assembler {
     pub fn close(self, out: &mut Events) {
         match self.object {
             Some(object) => object.finish(out),
-            None => self
-                .header
-                .ended(MalformedReason::Other(NAME_WITHOUT_A_CALL.to_string()), out),
+            None => self.header.ended(
+                || MalformedReason::Other(NAME_WITHOUT_A_CALL.to_string()),
+                out,
+            ),
         }
     }
 
@@ -98,7 +99,9 @@ impl Assembler {
     pub fn finish(self, out: &mut Events) {
         match self.object {
             Some(object) => object.finish(out),
-            None => self.header.ended(MalformedReason::UnterminatedRegion, out),
+            None => self
+                .header
+                .ended(|| MalformedReason::UnterminatedRegion, out),
         }
     }
 }
