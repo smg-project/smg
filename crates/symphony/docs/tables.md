@@ -87,6 +87,47 @@ V4.1's, and the registry reads each checkpoint with its own. Beyond that:
   one block, a call after content, and an invoke with no parameters, which the encoder writes with
   an empty line inside and the table reads as `{}`.
 
+## DeepSeek V3.2 (`deepseek_v3.2`)
+
+DSML as V4 spells it, with `function_calls` for the block's name: the table is V4's with the block's
+two terminals changed and the same `Tags::DSML_V4` for the invoke and parameter tags, so everything
+the V4 section says holds here (a calls block ends the thought; the two newlines before the block
+are the content's where text precedes them and the template's spacing, dropped, where none does;
+the prompt ends with `<think>` or `</think>` right after `<｜Assistant｜>`). One consequence of
+the stay rule shows here and not under V4's fixtures: after a tool result in chat mode the content
+stay began in the prompt (`</function_results>`, two newlines, `</think>` are its text), so the two
+newlines the model then writes before its block are content, where at the turn's start they are
+dropped; the thinking-mode turn opens a new stay at `</think>` and drops them. The fixture records
+both readings; whether a stay should begin at the output's first byte is a question for the
+engine, not this table.
+Beyond that:
+
+- **The checkpoint ships an encoder, not a chat template.** The repository's `encoding` module
+  renders the prompt and reads a completion, and the gateway's own renderer for the family is a
+  port of it. After a tool result the encoder writes `<function_results>` blocks inside the same
+  assistant turn and opens the thought again (`</function_results>`, two newlines, `<think>`; or
+  `</think>` in chat mode), so the replay walks the turn's earlier block from its `<｜Assistant｜>`
+  and the output starts inside the thought, or in the content, as the tail says.
+- **Each DSML checkpoint reads with its own table.** The V4 block name and the V4.1 spaced tags are
+  content under this table and this block is content under theirs; the registry reads V3.2 and
+  V3.2-Speciale here, V3.2-Exp with the V3.1 table (it writes the earlier spelling) and the V4
+  checkpoints with theirs, and the `deepseek32` alias takes a deployment that names the older
+  parser to this table.
+- **A string value that holds a closing tag is two parameters.** DSML writes a string raw, so a
+  value holding `</｜DSML｜parameter>` and another parameter's opening tag reads as two parameters,
+  to the encoder's own parser (it splits at the first closing tag) and to this table alike; the
+  format has no escape for it.
+- **The forced-call tag writes this block**: the V4 tag with `function_calls` in the block's two
+  terminals, byte for byte otherwise.
+
+The table is pinned against the turns the encoder renders for a tool-calling conversation, each
+read as the encoder's own parser reads it (`tests/fixtures/rendered/deepseek_v3_2.json`, written by
+`scripts/render_deepseek_v3_2_turns.py`, replayed at every cut by `tests/rendered_fixtures.rs`):
+an answer, a thought and an answer, one call, two, a call after content, a call with no
+parameters, every kind of value, non-ASCII text, and the turn after a tool result, in thinking and
+in chat mode; bellwether has not recorded the group's set. What the table leaves open: the
+recorded set, and the live reading against the engine's own server.
+
 ## GLM 4.5 and 4.6 (`glm4`)
 
 The template writes a newline before the thought, before the content and before every call, and

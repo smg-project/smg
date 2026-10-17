@@ -1800,6 +1800,11 @@ mod tests {
             named_table(&pair(Some("glm47_moe"), Some("glm45"))),
             Some(Table::Glm)
         );
+        // The older DSML parser for the V3.2 checkpoints reads with their table.
+        assert_eq!(
+            named_table(&names(Some("deepseek32"), None)),
+            Some(Table::DeepSeekV3_2)
+        );
         // The reasoning name counts only without a tool-call name.
         assert_eq!(named_table(&pair(None, Some("hy_v4"))), Some(Table::Hy4));
         assert_eq!(

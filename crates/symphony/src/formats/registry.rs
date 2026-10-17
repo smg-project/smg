@@ -23,9 +23,9 @@
 use std::sync::{Arc, LazyLock, OnceLock};
 
 use super::{
-    deepseek_v4, deepseek_v4_1, dots3, function_gemma, gemma4, glm, glm4, hy4, inkling, iquest,
-    json, k2_horizon, kimi_k2, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2,
-    minimax_m3, mistral_v13, muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+    deepseek_v3_2, deepseek_v4, deepseek_v4_1, dots3, function_gemma, gemma4, glm, glm4, hy4,
+    inkling, iquest, json, k2_horizon, kimi_k2, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5,
+    minimax_m2, minimax_m3, mistral_v13, muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
 };
 use crate::{
     format::{CallSyntax, Format},
@@ -121,6 +121,8 @@ tables! {
     MuseSpark => "muse_spark", muse_spark;
     /// [`plain()`].
     Plain => "plain", plain;
+    /// [`deepseek_v3_2()`].
+    DeepSeekV3_2 => "deepseek_v3.2", deepseek_v3_2;
     /// [`kimi_k2()`].
     KimiK2 => "kimi_k2", kimi_k2;
 }
@@ -195,7 +197,7 @@ impl Table {
     /// among them, which leaves its channel as written, which no table reads for. A row may also be
     /// the name a downstream launcher passes for a model family whose table has no older parser
     /// (`muse` for `muse_spark`), so that the launcher's flags read with the table.
-    pub const ALIASES: [(&str, Table); 13] = [
+    pub const ALIASES: [(&str, Table); 14] = [
         ("qwen", Table::Qwen3),
         ("qwen_xml", Table::Qwen3Tagged),
         ("qwen_coder", Table::Qwen3Tagged),
@@ -203,6 +205,7 @@ impl Table {
         ("glm47_moe", Table::Glm),
         ("glm45_moe", Table::Glm4),
         ("hy_v4", Table::Hy4),
+        ("deepseek32", Table::DeepSeekV3_2),
         ("deepseek_v41", Table::DeepSeekV4_1),
         ("minimax", Table::MinimaxM2),
         ("muse", Table::MuseSpark),
@@ -220,7 +223,7 @@ impl Table {
     /// the next source decides: after a worker's labels the registry's table for a model it
     /// knows, else the gateway's flags, else the legacy parsers (`passthrough` excepted, which
     /// keeps the legacy parsers either way).
-    pub const UNANSWERED: [(&str, &str); 18] = [
+    pub const UNANSWERED: [(&str, &str); 17] = [
         (
             "passthrough",
             "leaves its channel as written, which no table reads for: the way back to the \
@@ -266,11 +269,6 @@ impl Table {
             "deepseek_r1",
             "DeepSeek R1's thought; the R1 line reads with DeepSeek V3's table, which does not \
              exist yet and takes the name",
-        ),
-        (
-            "deepseek32",
-            "DeepSeek V3.2's dialect of DSML, which no table reads yet; the table that does \
-             takes the name",
         ),
         (
             "llama",
