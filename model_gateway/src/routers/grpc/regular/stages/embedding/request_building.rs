@@ -10,7 +10,9 @@ use crate::routers::{
         backend_client::BackendClient,
         client::GrpcClient,
         common::stages::{helpers, BuildStage},
-        context::{AttemptStamp, BuildOutput, ExecutionPlan, RequestContext, RequestType},
+        context::{
+            stage_output, AttemptStamp, BuildOutput, ExecutionPlan, RequestContext, RequestType,
+        },
         proto_wrapper::ProtoEmbedRequest,
         spec::ResponseSpec,
     },
@@ -35,13 +37,10 @@ impl Default for EmbeddingRequestBuildingStage {
 impl BuildStage for EmbeddingRequestBuildingStage {
     async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
         // Preparation output should have tokenized input
-        let prep_output = ctx.state.preparation.as_ref().ok_or_else(|| {
-            error!(
-                function = "EmbeddingRequestBuildingStage::build",
-                "Preparation output missing"
-            );
-            error::internal_error("preparation_missing", "Preparation output missing")
-        })?;
+        let prep_output = stage_output(
+            ctx.state.preparation.as_ref(),
+            "EmbeddingRequestBuildingStage::build",
+        )?;
 
         // Extract client
         let client = ctx
