@@ -79,11 +79,26 @@ packages_of() {
     esac
 }
 
-# The workspace's package metadata, read once per invocation.
+# The workspace's package metadata, read once per invocation: the dispatcher
+# at the end fills it (load_metadata) before a mode that expands it. The
+# callers read it on the left side of a pipeline, a subshell, so a fill made
+# there would not outlive the call; the fallback below only covers a caller
+# the dispatcher did not foresee.
 METADATA=
+load_metadata() {
+    METADATA=$(cargo metadata --no-deps --format-version 1 --locked)
+}
 metadata() {
-    [ -n "$METADATA" ] || METADATA=$(cargo metadata --no-deps --format-version 1 --locked)
+    [ -n "$METADATA" ] || load_metadata
     printf '%s' "$METADATA"
+}
+
+# The shards whose commands expand the metadata (test binaries dealt by name).
+metadata_shard() {
+    case "$1" in
+        gateway-[0-9]*|kv) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 # The integration test targets of a package, sorted, one per line.
@@ -99,16 +114,21 @@ for p in json.load(sys.stdin)["packages"]:
 }
 
 # `--test a --test b ...` for every n-th target of a package: shard i of n.
+# The target list is assigned before it is used, here and at the call sites:
+# a command substitution inside another command's arguments loses its exit
+# status, and a failed metadata read must fail the shard, not shrink it.
 test_selectors() {
-    local pkg=$1 index=$2 count=$3
-    test_targets "$pkg" | awk -v i="$index" -v n="$count" 'NR % n == i % n { printf " --test %s", $1 }'
+    local pkg=$1 index=$2 count=$3 targets
+    targets=$(test_targets "$pkg")
+    printf '%s\n' "$targets" | awk -v i="$index" -v n="$count" 'NR % n == i % n { printf " --test %s", $1 }'
 }
 
 # `--test ...` for every integration test target of a package but the ones named.
 test_selectors_except() {
     local pkg=$1; shift
-    local target skip
-    for target in $(test_targets "$pkg"); do
+    local target skip targets
+    targets=$(test_targets "$pkg")
+    for target in $targets; do
         skip=
         for excluded in "$@"; do [ "$target" = "$excluded" ] && skip=1; done
         [ -n "$skip" ] || printf ' --test %s' "$target"
@@ -123,9 +143,10 @@ commands_of() {
             echo "-p smg --lib --bins"
             echo "-p smg --doc" ;;
         gateway-[0-9]*)
-            local index=${shard#gateway-}
+            local index=${shard#gateway-} selectors
             [ "$index" -ge 1 ] && [ "$index" -le "$GATEWAY_SHARDS" ] || { echo "no gateway shard $index" >&2; exit 2; }
-            echo "-p smg$(test_selectors smg "$index" "$GATEWAY_SHARDS")" ;;
+            selectors=$(test_selectors smg "$index" "$GATEWAY_SHARDS")
+            echo "-p smg$selectors" ;;
         bindings)
             echo "-p smg-python -p smg-golang" ;;
         tokenizer)
@@ -134,8 +155,9 @@ commands_of() {
         multimodal)
             echo "-p llm-multimodal" ;;
         symphony)
-            echo "-p smg-symphony -p tool-parser -p reasoning-parser -p smg-response-template --features smg-response-template/symphony"
-            echo "-p smg-response-template --features symphony" ;;
+            # Nothing else in the shard depends on the template crate, so its feature set here is exactly
+            # its symphony feature: a second invocation of it alone would build and run the same units again.
+            echo "-p smg-symphony -p tool-parser -p reasoning-parser -p smg-response-template --features smg-response-template/symphony" ;;
         agentic)
             echo "-p data-connector -p smg-mcp -p smg-wasm -p wfaas --features smg-wasm/storage-hooks"
             # Opt-in (#[ignore]) cases against the database the workflow creates for the job.
@@ -145,9 +167,11 @@ commands_of() {
         engine)
             echo "-p smg-grpc-client -p engine-zmq-client -p engine-zmq-adapter -p engine-servicer -p mock-worker --features engine-zmq-client/mock-engine" ;;
         kv)
+            local selectors
             echo "-p kv-index -p smg-mesh -p smg-mm-rdma"
             # The radix tree without its fuzz binary (the radix-fuzz shard); --doc cannot share an invocation with --test.
-            echo "-p smg-radix-tree --lib$(test_selectors_except smg-radix-tree fuzz_differential)"
+            selectors=$(test_selectors_except smg-radix-tree fuzz_differential)
+            echo "-p smg-radix-tree --lib$selectors"
             echo "-p smg-radix-tree --doc" ;;
         radix-fuzz)
             echo "-p smg-radix-tree --test fuzz_differential" ;;
@@ -156,8 +180,11 @@ commands_of() {
 }
 
 run_commands() {
-    local shard=$1 mode=$2 line cargo_args test_args
+    local shard=$1 mode=$2 line cargo_args test_args commands
+    # Assigned first: a process substitution would hide a failure of commands_of.
+    commands=$(commands_of "$shard")
     while IFS= read -r line; do
+        [ -n "$line" ] || continue
         cargo_args=${line%% :: *}
         test_args=
         [ "$line" != "$cargo_args" ] && test_args=${line#* :: }
@@ -173,7 +200,7 @@ run_commands() {
             # shellcheck disable=SC2086
             (set -x; cargo test $cargo_args)
         fi
-    done < <(commands_of "$shard")
+    done <<< "$commands"
 }
 
 lint() {
@@ -211,11 +238,15 @@ print(json.dumps(rows, separators=(",", ":")))
 }
 
 check() {
-    local shard status=0
+    local shard status=0 members gateway radix
     {
-        echo "members $(metadata | python3 -c 'import json,sys; print(" ".join(sorted(p["name"] for p in json.load(sys.stdin)["packages"])))')"
-        echo "gateway-targets $(test_targets smg | tr '\n' ' ')"
-        echo "radix-targets $(test_targets smg-radix-tree | tr '\n' ' ')"
+        # Assigned before use, so a failed read fails the check instead of emptying a list.
+        members=$(metadata | python3 -c 'import json,sys; print(" ".join(sorted(p["name"] for p in json.load(sys.stdin)["packages"])))')
+        gateway=$(test_targets smg | tr '\n' ' ')
+        radix=$(test_targets smg-radix-tree | tr '\n' ' ')
+        echo "members $members"
+        echo "gateway-targets $gateway"
+        echo "radix-targets $radix"
         for shard in $(shard_table | awk '{print $1}'); do
             echo "packages $shard $(packages_of "$shard")"
             commands_of "$shard" | sed "s/^/command $shard /"
@@ -271,11 +302,11 @@ case "$mode" in
     list)     shard_table ;;
     matrix)   matrix "${2:-[]}" "${3:-false}" ;;
     packages) shard_row "$2" >/dev/null; packages_of "$2" ;;
-    commands) shard_row "$2" >/dev/null; commands_of "$2" ;;
-    build)    shard_row "$2" >/dev/null; run_commands "$2" build ;;
-    run)      shard_row "$2" >/dev/null; run_commands "$2" run ;;
+    commands) shard_row "$2" >/dev/null; ! metadata_shard "$2" || load_metadata; commands_of "$2" ;;
+    build)    shard_row "$2" >/dev/null; ! metadata_shard "$2" || load_metadata; run_commands "$2" build ;;
+    run)      shard_row "$2" >/dev/null; ! metadata_shard "$2" || load_metadata; run_commands "$2" run ;;
     lint)     lint "${2:-}" ;;
-    check)    check ;;
+    check)    load_metadata; check ;;
     *)
         sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
         exit 2 ;;
