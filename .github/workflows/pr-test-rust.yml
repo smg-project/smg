@@ -234,11 +234,10 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Download wheel artifact
-        uses: actions/download-artifact@v8
+      - name: Download build artifacts
+        uses: ./.github/actions/download-build-artifacts
         with:
-          name: smg-wheel
-          path: dist/
+          wheel-path: dist/
 
       - name: Install wheel
         run: pip install dist/*.whl
@@ -542,24 +541,11 @@ jobs:
       - name: Setup SGLang backend
         uses: ./.github/actions/setup-sglang
 
-      - name: Download wheel artifact
-        uses: actions/download-artifact@v8
+      - name: Download build artifacts
+        uses: ./.github/actions/download-build-artifacts
         with:
-          name: smg-wheel
-          path: wheel/
-
-      - name: Download WASM test fixtures
-        uses: actions/download-artifact@v8
-        with:
-          name: wasm-test-fixtures
-          path: crates/wasm/tests/fixtures/
-        continue-on-error: true
-
-      - name: Download Python client types
-        uses: actions/download-artifact@v8
-        with:
-          name: python-client-types
-          path: clients/python/smg_client/types/
+          wasm-fixtures: 'true'
+          client-types: 'true'
 
       - name: Install wheel and test dependencies
         run: |
@@ -1511,24 +1497,11 @@ jobs:
         if: matrix.setup_agentic_deps
         run: bash scripts/ci_agentic_svc_deps.sh check --oracle oracle-db --brave brave-search-mcp
 
-      - name: Download wheel artifact
-        uses: actions/download-artifact@v8
+      - name: Download build artifacts
+        uses: ./.github/actions/download-build-artifacts
         with:
-          name: smg-wheel
-          path: wheel/
-
-      - name: Download WASM test fixtures
-        uses: actions/download-artifact@v8
-        with:
-          name: wasm-test-fixtures
-          path: crates/wasm/tests/fixtures/
-        continue-on-error: true
-
-      - name: Download Python client types
-        uses: actions/download-artifact@v8
-        with:
-          name: python-client-types
-          path: clients/python/smg_client/types/
+          wasm-fixtures: 'true'
+          client-types: 'true'
 
       - name: Install wheel and test dependencies
         run: |
@@ -1596,14 +1569,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential
 
-      - name: Download Go FFI library
-        uses: actions/download-artifact@v8
+      - name: Download build artifacts
+        uses: ./.github/actions/download-build-artifacts
         with:
-          name: go-ffi-library
-          path: bindings/golang/target/release/
-
-      - name: Verify Go FFI library
-        run: ls -la bindings/golang/target/release/libsmg_go.*
+          wheel: 'false'
+          go-ffi-library: 'true'
 
       - name: Run Go unit tests
         run: |
@@ -1648,26 +1618,11 @@ jobs:
           cache: true
           cache-dependency-path: bindings/golang/go.sum
 
-      - name: Download Go FFI library
-        uses: actions/download-artifact@v8
+      - name: Download build artifacts
+        uses: ./.github/actions/download-build-artifacts
         with:
-          name: go-ffi-library
-          path: bindings/golang/target/release/
-
-      - name: Verify Go FFI library
-        run: ls -la bindings/golang/target/release/libsmg_go.*
-
-      - name: Download wheel artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: smg-wheel
-          path: wheel/
-
-      - name: Download Python client types
-        uses: actions/download-artifact@v8
-        with:
-          name: python-client-types
-          path: clients/python/smg_client/types/
+          go-ffi-library: 'true'
+          client-types: 'true'
 
       - name: Install wheel and test dependencies
         run: |
@@ -1720,20 +1675,10 @@ jobs:
           cache: true
           cache-dependency-path: bindings/golang/go.sum
 
-      - name: Download Go FFI library
-        uses: actions/download-artifact@v8
+      - name: Download build artifacts
+        uses: ./.github/actions/download-build-artifacts
         with:
-          name: go-ffi-library
-          path: bindings/golang/target/release/
-
-      - name: Verify Go FFI library
-        run: ls -la bindings/golang/target/release/libsmg_go.*
-
-      - name: Download wheel artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: smg-wheel
-          path: wheel/
+          go-ffi-library: 'true'
 
       - name: Install wheel
         run: |

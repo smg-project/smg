@@ -172,25 +172,11 @@ jobs:
         if: inputs.engine == 'tokenspeed'
         uses: ./.github/actions/setup-tokenspeed
 
-      # Artifact downloads
-      - name: Download wheel artifact
-        uses: actions/download-artifact@v8
+      - name: Download build artifacts
+        uses: ./.github/actions/download-build-artifacts
         with:
-          name: smg-wheel
-          path: wheel/
-
-      - name: Download WASM test fixtures
-        uses: actions/download-artifact@v8
-        with:
-          name: wasm-test-fixtures
-          path: crates/wasm/tests/fixtures/
-        continue-on-error: true
-
-      - name: Download Python client types
-        uses: actions/download-artifact@v8
-        with:
-          name: python-client-types
-          path: clients/python/smg_client/types/
+          wasm-fixtures: 'true'
+          client-types: 'true'
 
       # Agentic service dependencies (Oracle DB, Brave MCP)
       - name: Check shared services
