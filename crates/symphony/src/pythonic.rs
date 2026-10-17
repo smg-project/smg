@@ -804,30 +804,31 @@ mod tests {
             }
             let text = &LFM[..at];
             let events = ending.run(&[text]);
-            assert_eq!(bytes(&events), text, "{ending:?} at {at}");
+            let place = format!("{ending:?} at {at}");
+            assert_eq!(bytes(&events), text, "{place}");
             for (index, name, arguments) in calls(&events) {
                 let (_, whole_name, whole_arguments) = &whole[index as usize];
-                assert_eq!(&name, whole_name, "cut at {at}");
+                assert_eq!(&name, whole_name, "{place}");
                 // A call's fragments are a prefix of what the whole call gives, and the one word
                 // stands between a cut call's start and its end, never inside a whole one.
                 assert!(
                     whole_arguments.starts_with(&arguments),
-                    "cut at {at}: {arguments:?} is no prefix of {whole_arguments:?}"
+                    "{place}: {arguments:?} is no prefix of {whole_arguments:?}"
                 );
                 let start = events
                     .iter()
                     .position(|event| matches!(event, Event::ToolCallStart { index: i, .. } if *i == index))
-                    .unwrap_or_else(|| panic!("cut at {at}: call {index} has no start"));
+                    .unwrap_or_else(|| panic!("{place}: call {index} has no start"));
                 let end = events
                     .iter()
                     .position(
                         |event| matches!(event, Event::ToolCallEnd { index: i, .. } if *i == index),
                     )
-                    .unwrap_or_else(|| panic!("cut at {at}: call {index} has no end"));
+                    .unwrap_or_else(|| panic!("{place}: call {index} has no end"));
                 assert_eq!(
                     said(&events[start..end]).len(),
                     usize::from(&arguments != whole_arguments),
-                    "cut at {at}: a cut call says so once, a whole one not at all"
+                    "{place}: a cut call says so once, a whole one not at all"
                 );
             }
         }
