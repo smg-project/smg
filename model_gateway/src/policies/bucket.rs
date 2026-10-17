@@ -1674,4 +1674,54 @@ mod tests {
         // A normal drain is not worth a warning per request.
         assert!(!logs_contain("randomly selecting"));
     }
+
+    /// The adjustment walks the size histogram and every bound it writes is
+    /// a size: four workers over four equally frequent sizes own the first
+    /// three classes, the fourth class, nothing, and the open end (the last
+    /// worker's, as after the first split); the third worker owns no range
+    /// until the next adjustment. No bound is a load sum.
+    #[test]
+    fn an_adjusted_partitions_bounds_are_sizes_once_the_classes_run_out() {
+        let url = |n: usize| format!("http://w{n}:8000");
+        let mut bucket = Bucket::new(3_600_000);
+        bucket.init_prefill_worker_urls((1..=4).map(url).collect());
+        for _ in 0..10 {
+            for size in [101, 2001, 3001, 4001] {
+                let owner = bucket.find_boundary(size).expect("every size has an owner");
+                bucket.post_process_request(size, owner);
+            }
+        }
+        bucket.adjust_boundary();
+        assert_eq!(
+            bucket_ranges(&bucket),
+            [
+                (url(1), [0, 3001]),
+                (url(2), [3002, 4001]),
+                (url(4), [4002, usize::MAX]),
+            ]
+        );
+    }
+
+    /// A size class goes whole to one worker: the worker after it starts at
+    /// the next size, its range is never widened by a load share. Three
+    /// workers over the sizes 33, 34 and 34 (a share of 33) own [0, 33],
+    /// [34, 34] and the open end.
+    #[test]
+    fn a_size_class_that_crosses_the_share_goes_whole_to_one_worker() {
+        let url = |n: usize| format!("http://w{n}:8000");
+        let mut bucket = Bucket::new(3_600_000);
+        bucket.init_prefill_worker_urls((1..=3).map(url).collect());
+        for size in [33, 34, 34] {
+            bucket.post_process_request(size, url(1));
+        }
+        bucket.adjust_boundary();
+        assert_eq!(
+            bucket_ranges(&bucket),
+            [
+                (url(1), [0, 33]),
+                (url(2), [34, 34]),
+                (url(3), [35, usize::MAX]),
+            ]
+        );
+    }
 }
