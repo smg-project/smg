@@ -1,6 +1,6 @@
 //! What the reader records about an output: the counters per table, and one sampled line per
-//! output that is not clean, written under the request span so a tracing exporter keeps it as a
-//! span event as well.
+//! output with a malformed run, written under the request span (the log line carries the span's
+//! request id; the trace exporter's own filter does not take this target).
 //!
 //! The classes, from the crate's events (`symphony::Event`):
 //!
@@ -269,7 +269,7 @@ impl Tally {
             "Symphony did not read the whole output as content, reasoning and calls"
         );
         // The run's text is model output: a debug event beside the line, not the line itself,
-        // which the default level and the trace exporters see.
+        // which the default level sees.
         debug!(
             target: "smg::symphony",
             request_id = who.request_id,
