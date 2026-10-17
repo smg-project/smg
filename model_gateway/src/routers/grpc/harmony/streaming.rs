@@ -254,8 +254,10 @@ impl HarmonyStreamingProcessor {
         )
         .await?;
 
-        // Mark prefill stream completed AFTER decode succeeds
-        // This ensures that if client disconnects during decode, BOTH streams send abort
+        // The prefill stream is marked completed after the decode's read ended
+        // well: a decode that failed leaves both streams to abort on drop; a
+        // client that left ends the read with `Ok` too, its decode stream
+        // aborting the request on drop, the prefill's own request complete.
         prefill_stream.mark_completed();
         Ok(())
     }
@@ -589,7 +591,12 @@ impl HarmonyStreamingProcessor {
             .await?;
         }
 
-        // Record streaming metrics
+        // The read ended with the client's leaving, not with the engine's end:
+        // no terminal router metric for it, as the HTTP router has none for a
+        // disconnect (neither a completed request nor a failure).
+        if decode_stream.client_left() {
+            return Ok(());
+        }
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: metrics_labels::BACKEND_HARMONY,

@@ -3736,6 +3736,14 @@ impl ProtoStream {
         }))
     }
 
+    /// Whether the end this stream's reader met was the client's leaving
+    /// (see [`Self::until_client_gone`]), not the engine's end: the
+    /// generation did not complete, and nothing accounts it as one. `false`
+    /// for a stream that is not watched.
+    pub fn client_left(&self) -> bool {
+        matches!(self, Self::Watched(watched) if watched.inner.is_none())
+    }
+
     /// Get next item from stream
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
         let Self::Watched(watched) = self else {
@@ -5230,15 +5238,18 @@ mod no_progress_tests {
 
 #[cfg(test)]
 mod watched_tests {
-    use std::time::{Duration, Instant};
+    use std::{sync::Arc, time::Duration};
 
     use smg_grpc_client::vllm_proto as vllm;
     use tokio::sync::oneshot;
 
     use super::ProtoStream;
-    use crate::routers::{
-        common::sse::{sse_channel, SseReceiver},
-        grpc::regular::streaming::eof_tests::{chunk, complete, gated_stream},
+    use crate::{
+        routers::{
+            common::sse::{sse_channel, SseReceiver},
+            grpc::regular::streaming::eof_tests::{chunk, complete, gated_stream},
+        },
+        worker::{BasicWorkerBuilder, Worker},
     };
 
     /// A stream whose `first` frames come at once and whose `rest` wait for
@@ -5263,12 +5274,23 @@ mod watched_tests {
     /// and nothing after it.
     #[tokio::test]
     async fn a_client_that_leaves_while_the_stream_is_parked_ends_it_at_once() {
-        let (mut stream, _gate, rx) = watched(vec![chunk(0, "a")], vec![complete(0, "stop")]).await;
+        // A tracked layer under the watch: its worker and its load pile show
+        // the inner stream going with the client.
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w1:8000").build());
+        let (_gate_tx, gate_rx) = oneshot::channel();
+        let (stream, _server) =
+            gated_stream(vec![chunk(0, "a")], gate_rx, vec![complete(0, "stop")], "0").await;
+        let (client, rx) = sse_channel();
+        let mut stream = stream
+            .tracked(Arc::clone(&worker), 0, true)
+            .until_client_gone(&client, "req-watched");
+        assert!(stream.worker().is_some(), "tracked under the watch");
+        assert_eq!(worker.tracked_load(), 1);
         assert!(
             matches!(stream.next().await, Some(Ok(_))),
             "the first response is read"
         );
-        let started = Instant::now();
+        assert!(!stream.client_left());
         let (item, ()) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(stream.next(), async {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -5278,15 +5300,16 @@ mod watched_tests {
         .await
         .expect("the gate never opens; the client's leaving ends the wait");
         assert!(item.is_none(), "the client's leaving is the end");
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the wait ended with the client, not with the engine"
-        );
+        assert!(stream.client_left(), "the end was the client's leaving");
         assert!(
             stream.next().await.is_none(),
             "nothing after the client left"
         );
-        assert!(stream.worker().is_none());
+        assert!(
+            stream.worker().is_none(),
+            "the inner stream went with the client"
+        );
+        assert_eq!(worker.tracked_load(), 0, "its load released with it");
     }
 
     /// A client that left before the stream was first polled reads nothing:
