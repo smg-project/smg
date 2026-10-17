@@ -1434,7 +1434,13 @@ mod tests {
                 "{policy}"
             );
         }
-        assert!(TextBesideIds.needs_request_text_with_tokens());
+        // A per-model policy that reads text beside the ids makes the
+        // registry ask for it, under the same hint rule.
+        let reg = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        reg.model_policies
+            .insert("llama-text".to_string(), Arc::new(TextBesideIds));
+        assert!(reg.any_policy_needs_request_text_with_tokens(None));
+        assert!(!reg.any_policy_needs_request_text_with_tokens(Some(&headers_with_tokens("1,2,3"))));
     }
 
     #[test]
