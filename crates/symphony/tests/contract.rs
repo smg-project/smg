@@ -1764,6 +1764,9 @@ const GEMMA4_OUTPUTS: &[&str] = &[
     "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days: }<tool_call|>",
     "<|tool_call>call:f{a:{x:},b:[1,,2]}<tool_call|>",
     "<|tool_call>call:f{:{:1},a:<|\"|><|\"|>}<tool_call|>",
+    // Nesting past the prefix parser's bound, closed and cut.
+    "<|tool_call>call:get_weather{days:[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}<tool_call|>",
+    "<|tool_call>call:get_weather{days:[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[",
 ];
 
 /// The outputs bellwether's common set records for Inkling, and one cut short.
