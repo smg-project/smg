@@ -379,6 +379,28 @@ mod tests {
         assert_eq!(other, r#"{"other":"content_filter"}"#);
     }
 
+    /// A malformed region's reason is one string on the wire, whether the crate borrowed a fixed
+    /// text or built one; what is read back equals what was written.
+    #[test]
+    fn a_malformed_reason_is_its_text_on_the_wire_borrowed_or_owned() {
+        let malformed = Event::Malformed {
+            text: Text::uncounted("x"),
+            why: MalformedReason::Other("text between a call's tags".into()),
+        };
+        let json = serde_json::to_string(&malformed).expect("serializes");
+        assert_eq!(
+            json,
+            r#"{"kind":"malformed","text":{"text":"x","tokens":null},"why":{"other":"text between a call's tags"}}"#
+        );
+        let back: Event = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back, malformed, "read back owned, equal by its text");
+        let owned = MalformedReason::Other(String::from("built for the occasion").into());
+        assert_eq!(
+            serde_json::to_string(&owned).expect("serializes"),
+            r#"{"other":"built for the occasion"}"#
+        );
+    }
+
     #[test]
     fn runs_alternate_whitespace_and_the_rest_on_character_boundaries_and_join_back() {
         assert_eq!(runs("").count(), 0);
