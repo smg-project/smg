@@ -68,7 +68,8 @@ mod tests {
 
     /// The generation prompt's tail: the turn's opener and nothing more.
     const PROMPT: &str = "<｜Assistant｜>";
-    /// The tail of a checkpoint that opens the thought in the prompt (R1-0528's spelling).
+    /// The tail of a checkpoint whose template opens the thought in the prompt (the original R1
+    /// and its distills). R1-0528 ends its prompt at the opener and writes `<think>` itself.
     const THINKING: &str = "<｜Assistant｜><think>\n";
 
     fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
@@ -193,8 +194,8 @@ mod tests {
     /// The turns the template renders for the shapes a tool-calling conversation takes: one call,
     /// three calls in one block (a newline before each call after the first), a call after
     /// content, a call with no arguments, nested and non-ASCII values, and content alone; then a
-    /// call and content after a thought the prompt opens, as the checkpoints that share the
-    /// spelling and write a thought (R1-0528) have it.
+    /// call and content after a thought the prompt opens (the original R1 and its distills), and
+    /// after a thought the model opens itself, the prompt ending at the opener (R1-0528).
     const RENDERED_TURNS: &[RenderedTurn] = &[
         RenderedTurn {
             tail: PROMPT,
@@ -264,6 +265,20 @@ mod tests {
             output: "97 is not divisible by 2, 3, 5 or 7.</think>Yes, 97 is prime.",
             reasoning: "97 is not divisible by 2, 3, 5 or 7.",
             content: "Yes, 97 is prime.",
+            calls: &[],
+        },
+        RenderedTurn {
+            tail: PROMPT,
+            output: "<think>\nThe user asks about Paris.\n</think>\n\n<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Paris\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+            reasoning: "\nThe user asks about Paris.\n",
+            content: "",
+            calls: &[("get_weather", "{\"city\": \"Paris\"}")],
+        },
+        RenderedTurn {
+            tail: PROMPT,
+            output: "<think>\n97 is not divisible by 2, 3, 5 or 7.\n</think>\n\nYes, 97 is prime.",
+            reasoning: "\n97 is not divisible by 2, 3, 5 or 7.\n",
+            content: "\n\nYes, 97 is prime.",
             calls: &[],
         },
     ];
