@@ -414,6 +414,13 @@ pub(crate) const NO_AVAILABLE_WORKERS_RETRY_AFTER_SECS: u32 = 1;
 /// downstream recognise the refusal by.
 pub(crate) const NO_AVAILABLE_WORKERS_CODE: &str = "no_available_workers";
 
+/// The client-visible code of the refusal for a model whose registered
+/// workers include none that processes media references, under a placement
+/// that forwards a request's media to the worker: preparation's verdict over
+/// the pool (`multimodal::resolve_mm_processing`) and worker selection's
+/// backstop of it answer under this code.
+pub(crate) const NO_MEDIA_REF_CAPABLE_WORKER_CODE: &str = "no_media_ref_capable_worker";
+
 /// The 503 for a pool whose every worker is unavailable (unhealthy or its
 /// circuit breaker open). Terminal for the retry layer: the verdict clears at
 /// the health interval or the breaker timeout, never inside a backoff window,
@@ -446,6 +453,22 @@ pub(crate) fn no_available_workers_because(
         RETRY_AFTER,
         HeaderValue::from(NO_AVAILABLE_WORKERS_RETRY_AFTER_SECS),
     );
+    response
+}
+
+/// The 503 for a model whose registered workers include none that processes
+/// media references, under worker-side media placement. A capability
+/// verdict, not a pool state: terminal for the retry layer (what a worker
+/// advertises does not change within a backoff window) and without a
+/// `Retry-After` (a client's pacing fixes nothing here; the deployment's
+/// configuration does). The message is the caller's; the line's reason is
+/// the verdict.
+pub(crate) fn no_media_ref_capable_worker(message: impl Into<String>) -> Response {
+    let mut response = error::service_unavailable(NO_MEDIA_REF_CAPABLE_WORKER_CODE, message.into());
+    response.extensions_mut().insert(RefusalReason(
+        "no worker of the model processes media references".to_string(),
+    ));
+    mark_non_retryable(&mut response);
     response
 }
 
@@ -503,8 +526,10 @@ pub(crate) const MODEL_NOT_FOUND_CODE: &str = "model_not_found";
 struct RefusalReason(String);
 
 /// Lines per second the gateway writes for each refusal it answers on its
-/// own: a model whose workers are all unavailable (`no_available_workers`)
-/// and a model nobody serves (`model_not_found`). One line per refusal, with
+/// own: a model whose workers are all unavailable (`no_available_workers`),
+/// a model nobody serves (`model_not_found`) and a model none of whose
+/// workers processes the media references forwarded to it
+/// (`no_media_ref_capable_worker`). One line per refusal, with
 /// the request id, the model and the pool's state, shows the condition and
 /// whom it hits; past this rate the lines are counted and the next one
 /// carries the count, while `smg_router_request_errors_total` keeps the
@@ -529,6 +554,12 @@ static MODEL_NOT_FOUND_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
     REFUSAL_LOG_MODELS,
 );
 
+static NO_MEDIA_REF_CAPABLE_WORKER_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
+    REFUSAL_LINES_PER_SECOND,
+    Duration::from_secs(1),
+    REFUSAL_LOG_MODELS,
+);
+
 /// The router answering a refusal, as its line names it.
 #[derive(Clone, Copy)]
 pub(crate) struct RefusalSite<'a> {
@@ -546,6 +577,11 @@ pub(crate) struct RefusalSite<'a> {
 enum Refusal {
     NoAvailableWorkers,
     ModelNotFound,
+    /// The model's workers process no media references, under a placement
+    /// that forwards them ([`no_media_ref_capable_worker`]): a configuration
+    /// verdict that holds until a capable worker registers, so it is keyed
+    /// and capped like the pool's 503.
+    NoMediaRefCapableWorker,
 }
 
 impl Refusal {
@@ -553,6 +589,7 @@ impl Refusal {
         match error::extract_error_code_from_response(response) {
             NO_AVAILABLE_WORKERS_CODE => Some(Self::NoAvailableWorkers),
             MODEL_NOT_FOUND_CODE => Some(Self::ModelNotFound),
+            NO_MEDIA_REF_CAPABLE_WORKER_CODE => Some(Self::NoMediaRefCapableWorker),
             _ => None,
         }
     }
@@ -561,6 +598,7 @@ impl Refusal {
         match self {
             Self::NoAvailableWorkers => &NO_AVAILABLE_WORKERS_LOG,
             Self::ModelNotFound => &MODEL_NOT_FOUND_LOG,
+            Self::NoMediaRefCapableWorker => &NO_MEDIA_REF_CAPABLE_WORKER_LOG,
         }
     }
 
@@ -568,6 +606,7 @@ impl Refusal {
         match self {
             Self::NoAvailableWorkers => "No available workers for model",
             Self::ModelNotFound => "No worker serves model",
+            Self::NoMediaRefCapableWorker => "No worker processes media references for model",
         }
     }
 
@@ -583,19 +622,21 @@ impl Refusal {
     /// shares one allowance with every other such name, for the same reason.
     fn key(self, model_id: &str, registered: bool) -> &str {
         match self {
-            Self::NoAvailableWorkers if registered => model_id,
-            Self::NoAvailableWorkers | Self::ModelNotFound => "",
+            Self::NoAvailableWorkers | Self::NoMediaRefCapableWorker if registered => model_id,
+            Self::NoAvailableWorkers | Self::NoMediaRefCapableWorker | Self::ModelNotFound => "",
         }
     }
 }
 
 /// The log line of a refusal the gateway answers on its own, and its marker.
 ///
-/// A `no_available_workers` 503 or a `model_not_found` 404 gets one WARN
-/// with the request id, the model and the state of the pools `site` draws
-/// from, and the reason the refusal names when it has one (the leg that is
-/// down, the policy that declined), capped at [`REFUSAL_LINES_PER_SECOND`]
-/// per model with workers for the 503 and for all unknown names together
+/// A `no_available_workers` 503, a `no_media_ref_capable_worker` 503 or a
+/// `model_not_found` 404 gets one WARN with the request id, the model and
+/// the state of the pools `site` draws from, and the reason the refusal
+/// names when it has one (the leg that is down, the policy that declined,
+/// the media references no worker processes), capped at
+/// [`REFUSAL_LINES_PER_SECOND`] per model with workers for the 503s and for
+/// all unknown names together
 /// (the 404, and a 503 for a name with no workers at all; see
 /// [`Refusal::key`]); a line past the cap is counted and the next
 /// admitted line of its key carries the count as `suppressed`. The response
@@ -645,11 +686,13 @@ pub(crate) fn report_refusal_under(
     refusal.extensions_mut().insert(ReportedRefusal);
     // Whether some leg has workers for the model (see `Refusal::key`): one
     // pool lookup per leg, no walk over the workers; the 404 needs none.
-    let registered = matches!(kind, Refusal::NoAvailableWorkers)
-        && site
-            .legs
-            .iter()
-            .any(|(_, pool)| !registry.get_routing_pool(model_id, *pool).is_empty());
+    let registered = matches!(
+        kind,
+        Refusal::NoAvailableWorkers | Refusal::NoMediaRefCapableWorker
+    ) && site
+        .legs
+        .iter()
+        .any(|(_, pool)| !registry.get_routing_pool(model_id, *pool).is_empty());
     if let Some(admitted) = throttle.admit(kind.key(model_id, registered)) {
         let pool = PoolState::of(registry, model_id, site.legs);
         let reason = refusal_reason(&refusal);

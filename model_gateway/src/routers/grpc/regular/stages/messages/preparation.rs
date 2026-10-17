@@ -171,7 +171,7 @@ impl MessagePreparationStage {
                 &media_plan,
                 &placeholders,
             )
-            .map_err(|e| error::bad_request(e.code(), e.to_string()))?;
+            .map_err(multimodal::MmRefsError::into_response)?;
             if processing == multimodal::MmProcessing::Worker {
                 debug!(
                     function = "MessagePreparationStage::execute",
