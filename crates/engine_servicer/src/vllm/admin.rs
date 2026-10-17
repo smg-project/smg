@@ -10,6 +10,7 @@ use tonic::{metadata::MetadataMap, Code, Request, Status};
 use tracing::warn;
 
 use super::State;
+use crate::admin::flush_timeout;
 
 /// Bounds the single attempt of `timeout_s == 0`, so an engine that never
 /// answers cannot hang the RPC.
@@ -21,12 +22,7 @@ pub(super) async fn flush_cache(
     state: &State,
     request: Request<common::FlushCacheRequest>,
 ) -> Result<common::FlushCacheResponse, Status> {
-    let timeout_s = request.get_ref().timeout_s;
-    if !timeout_s.is_finite() || timeout_s < 0.0 {
-        return Err(Status::invalid_argument(
-            "timeout_s must be finite and non-negative",
-        ));
-    }
+    let timeout_s = flush_timeout(request.get_ref().timeout_s)?;
     let engine = state.engine()?;
     let started = Instant::now();
     let immediate = timeout_s == 0.0;

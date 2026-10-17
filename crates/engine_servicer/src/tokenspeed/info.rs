@@ -8,7 +8,7 @@ use smg_grpc_client::tokenspeed_proto as ts;
 use tonic::Status;
 
 use super::State;
-use crate::proto_json::{number, struct_from_json};
+use crate::proto_json::{insert_capacity, struct_from_json};
 
 /// `HealthCheck`: SERVING only with the engine link up and no drain announced.
 pub(super) fn health_check(state: &State) -> ts::HealthCheckResponse {
@@ -98,17 +98,11 @@ pub(super) fn server_info(state: &State) -> ts::GetServerInfoResponse {
                 )),
             },
         );
-        scheduler_info.fields.insert(
-            "max_total_num_tokens".to_string(),
-            number(max_total_num_tokens),
-        );
-        scheduler_info.fields.insert(
-            "page_size".to_string(),
-            number(i32::try_from(ready.block_size).unwrap_or(i32::MAX)),
-        );
-        scheduler_info.fields.insert(
-            "max_running_requests".to_string(),
-            number(max_running_requests(state)),
+        insert_capacity(
+            &mut scheduler_info,
+            max_total_num_tokens,
+            ready.block_size,
+            max_running_requests(state),
         );
     }
     let version = Some(model.tokenspeed_version.clone())

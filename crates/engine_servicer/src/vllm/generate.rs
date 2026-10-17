@@ -4,8 +4,8 @@
 //! `Abort` RPC can end.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
-    future::Future,
+    collections::BTreeMap,
+    ops::ControlFlow,
     pin::Pin,
     sync::{atomic::Ordering, Arc},
     task::{Context, Poll},
@@ -18,13 +18,13 @@ use engine_zmq_adapter::{
 use futures::{stream::SelectAll, Stream};
 use llm_tokenizer::stop::StopSequenceDecoder;
 use smg_grpc_client::vllm_proto as vllm;
-use tokio::sync::oneshot;
 use tonic::Status;
 
 use super::{media::process_media_refs, State};
 use crate::{
-    requests::{settle_shutdown, CancelReason, HeldTerminal, Registration},
+    requests::HeldTerminal,
     stop_match::{stop_decoder, StopMatcher},
+    stream::{poll_engine_item, Choice, RequestStream},
     BoxStream,
 };
 
@@ -209,14 +209,9 @@ async fn submit(
             request_id.clone(),
         ));
     }
-    Ok(Box::pin(GenerateStream {
-        choices,
-        cancel,
-        aborted: None,
-        cut: None,
-        _registration: registration,
-        _loads: loads,
-    }))
+    Ok(Box::pin(
+        RequestStream::new(choices, cancel, registration).holding(loads),
+    ))
 }
 
 /// Takes the request out of the load tracker's queue when the stream ends,
@@ -299,19 +294,6 @@ impl ChoiceStream {
         self.prompt_counted = true;
     }
 
-    /// End this choice on an abort: the `Complete` it was about to yield, the
-    /// engine's parked one, or a synthesized `abort` one; `None` once it has
-    /// already ended. Dropping the engine stream aborts the engine side.
-    fn abort(&mut self) -> Option<vllm::GenerateResponse> {
-        if let Some(complete) = self.pending.take() {
-            self.inner = None;
-            return Some(self.stamped(complete));
-        }
-        let mut inner = self.inner.take()?;
-        let complete = inner.complete_aborted();
-        Some(self.stamped(complete))
-    }
-
     /// A terminal response with the request's media identity on it, when
     /// there is one; anything else passes through.
     fn stamped(&self, mut response: vllm::GenerateResponse) -> vllm::GenerateResponse {
@@ -353,6 +335,21 @@ impl HeldTerminal for ChoiceStream {
     }
 }
 
+impl Choice for ChoiceStream {
+    /// End this choice on an abort: the `Complete` it was about to yield, the
+    /// engine's parked one, or a synthesized `abort` one; `None` once it has
+    /// already ended. Dropping the engine stream aborts the engine side.
+    fn abort(&mut self) -> Option<vllm::GenerateResponse> {
+        if let Some(complete) = self.pending.take() {
+            self.inner = None;
+            return Some(self.stamped(complete));
+        }
+        let mut inner = self.inner.take()?;
+        let complete = inner.complete_aborted();
+        Some(self.stamped(complete))
+    }
+}
+
 type ChoiceItem = Result<vllm::GenerateResponse, Status>;
 
 impl Stream for ChoiceStream {
@@ -367,20 +364,9 @@ impl Stream for ChoiceStream {
                 this.inner = None;
                 return Poll::Ready(Some(Ok(this.stamped(complete))));
             }
-            let Some(inner) = this.inner.as_mut() else {
-                return Poll::Ready(None);
-            };
-            let item = match Pin::new(inner).poll_next(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => {
-                    this.inner = None;
-                    return Poll::Ready(None);
-                }
-                Poll::Ready(Some(Err(status))) => {
-                    this.inner = None;
-                    return Poll::Ready(Some(Err(status)));
-                }
-                Poll::Ready(Some(Ok(item))) => item,
+            let item = match poll_engine_item(&mut this.inner, cx) {
+                ControlFlow::Continue(item) => item,
+                ControlFlow::Break(poll) => return poll,
             };
             let Some(vllm::generate_response::Response::Chunk(chunk)) = item.response.as_ref()
             else {
@@ -442,73 +428,6 @@ impl Stream for ChoiceStream {
                 continue;
             }
             return Poll::Ready(Some(Ok(item)));
-        }
-    }
-}
-
-/// The merged response stream of one generate request: its choices polled
-/// together (interleaved, each tagged with its `index`), ended early by the
-/// `Abort` RPC.
-struct GenerateStream {
-    choices: SelectAll<ChoiceStream>,
-    cancel: oneshot::Receiver<CancelReason>,
-    /// Set once aborted: the terminal `Complete` of every choice still open
-    /// at that point, yielded before the stream ends.
-    aborted: Option<VecDeque<vllm::GenerateResponse>>,
-    /// The status a shutdown ends the stream with once `aborted` is drained,
-    /// when it cut a choice still open; `None` ends it plainly.
-    cut: Option<Status>,
-    _registration: Registration,
-    _loads: LoadsGuard,
-}
-
-impl Stream for GenerateStream {
-    type Item = ChoiceItem;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        loop {
-            if let Some(aborted) = this.aborted.as_mut() {
-                if let Some(response) = aborted.pop_front() {
-                    return Poll::Ready(Some(Ok(response)));
-                }
-                // The completions the choices already held went out; a
-                // shutdown that cut a choice still open ends the stream with
-                // its status, a plain abort just ends it.
-                return Poll::Ready(this.cut.take().map(Err));
-            }
-            // The cancellation names its cause. An `Abort` RPC is the caller's
-            // own abort: the request ends as the Python servicer ends it, with
-            // each open choice's `Complete(finish_reason = "abort")`. A
-            // shutdown with the request still open is its engine side going
-            // away under it (the lifecycle owner stopping the pair after the
-            // engine exited, a drain whose grace ran out): no completion the
-            // caller could read as a short answer, so the stream ends with
-            // UNAVAILABLE, which the Router classes as the worker's failure.
-            // Either way dropping the choices aborts the engine side.
-            if let Poll::Ready(reason) = Pin::new(&mut this.cancel).poll(cx) {
-                if reason == Ok(CancelReason::Shutdown) {
-                    // A choice the engine (or a stop string) finished before
-                    // this poll keeps its completion; only a choice still
-                    // open is cut, and only then does the stream end with the
-                    // status (see `settle_shutdown`).
-                    let (finished, cut) = settle_shutdown(&mut this.choices);
-                    this.aborted = Some(finished);
-                    this.cut = cut.then(|| Status::unavailable(crate::requests::SHUTDOWN_MESSAGE));
-                    continue;
-                }
-                // The abort, or a sender dropped without a word (the registry
-                // entry went away): the completion it always was.
-                let aborted = this
-                    .choices
-                    .iter_mut()
-                    .filter_map(ChoiceStream::abort)
-                    .collect();
-                this.choices.clear();
-                this.aborted = Some(aborted);
-                continue;
-            }
-            return Pin::new(&mut this.choices).poll_next(cx);
         }
     }
 }
