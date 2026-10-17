@@ -2286,9 +2286,11 @@ class RouterArgs:
             help="Which parser reads a chat completion's reasoning and tool calls: the per-model "
             "parsers (legacy, the default) or Symphony. With Symphony, a model's worker labels decide, "
             "else Symphony's registry for a model it knows, else --tool-call-parser and --reasoning-parser: "
-            "a Symphony table's name reads with that table, a legacy parser's keeps the legacy parsers, "
-            "and no name leaves the legacy parsers to detect. A request's X-SMG-Parser header overrides "
-            "the flag for that request.",
+            "a Symphony table's name reads with that table, and so does a legacy parser's name whose format "
+            "a table reads (qwen for qwen3, qwen_xml for qwen3_tagged: the table's aliases, so existing flags "
+            "keep a working parser); any other legacy parser's name keeps the legacy parsers (the Symphony "
+            "crate lists each with the reason, passthrough among them), and no name leaves the legacy parsers "
+            "to detect. A request's X-SMG-Parser header overrides the flag for that request.",
         )
         tokenizer_group.add_argument(
             f"--{prefix}tokenizer-cache-enable-l0",
