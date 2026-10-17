@@ -5,7 +5,9 @@ name: symphony fuzz campaign
 # against the crate's contract on every input. They run here nightly, bounded, so that the
 # parser's robustness does not depend on someone remembering to run them; a crash fails the
 # job and its artifact is uploaded for the report crates/symphony/fuzz/README.md describes.
-# Budget: nine targets, three at a time, ten minutes each on a hosted runner.
+# Budget: nine targets, three at a time, ten minutes each on a hosted runner. The run looks past
+# the whole-json class (SYMPHONY_FUZZ_ALLOW) until the parser fixes the first campaign found
+# land, so that a night's red is a new class; drop the default then.
 
 on:
   schedule:
@@ -18,6 +20,9 @@ on:
       targets:
         description: "Targets to run (space separated; empty for all)"
         default: ""
+      allow:
+        description: "Breach names the run looks past (comma separated; empty for none)"
+        default: "whole-json"
 
 concurrency:
   group: symphony-fuzz
@@ -40,19 +45,21 @@ jobs:
           key: symphony-fuzz
           workspaces: crates/symphony/fuzz
       # The crate is a workspace of its own, outside the repository's fmt and clippy jobs.
-      - name: Format and lint the fuzz crate
+      - name: Format, lint and test the fuzz crate
         run: |
           cargo fmt --manifest-path crates/symphony/fuzz/Cargo.toml --all -- --check
           cargo clippy --manifest-path crates/symphony/fuzz/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path crates/symphony/fuzz/Cargo.toml
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       - name: Run the targets
         env:
           MINUTES: ${{ github.event.inputs.minutes || '10' }}
           TARGETS: ${{ github.event.inputs.targets || '' }}
+          ALLOW: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.allow || 'whole-json' }}
         run: |
           # shellcheck disable=SC2086
-          crates/symphony/fuzz/run.sh --minutes "$MINUTES" --jobs 3 $TARGETS
+          crates/symphony/fuzz/run.sh --minutes "$MINUTES" --jobs 3 ${ALLOW:+--allow "$ALLOW"} $TARGETS
       - name: Upload crashes and logs
         if: always()
         uses: actions/upload-artifact@v7

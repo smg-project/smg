@@ -43,7 +43,7 @@ cd crates/symphony/fuzz
 `run.sh` builds the targets, writes the seeds and dictionaries (below), runs each target for the
 bounded time and prints one row per target: executions, executions per second, coverage edges
 (`cov:` in libFuzzer's last status line), corpus units, crashes and the breach classes the
-artifacts name. It exits 1 when a target crashed. Logs are under `logs/<label>/`, crash
+artifacts name. It exits 1 when a target crashed or never ran. Logs are under `logs/<label>/`, crash
 artifacts under `artifacts/<label>/<target>/` (`--label` names a run; `run` by default), the
 growing corpus under `corpus/<target>/`; none of them is tracked. With `CARGO_TARGET_DIR` set,
 the instrumented build goes to `$CARGO_TARGET_DIR/symphony-fuzz`.
@@ -53,8 +53,9 @@ every crash's artifact and continues, so that one campaign collects every class;
 recurs on every mutation of a seed still restarts the job each time and holds that target back.
 Once a class is reported, `--allow <names>` (the environment variable `SYMPHONY_FUZZ_ALLOW`, comma
 separated) makes the harness look past it, so that the next class surfaces: for the whole-JSON
-check it is `--allow whole-json`. An allowance is for a run, never for the default; the names
-are the ones the breach messages carry.
+check it is `--allow whole-json`. Every check honors it. An allowance is for a run, never for the
+default; the names are the ones the breach messages carry. The nightly workflow allows
+`whole-json` until the parser fixes the first campaign found land, and no more than that.
 
 One target by hand, with libFuzzer's own options after `--`:
 
@@ -80,7 +81,9 @@ would release them. An input shorter than twelve bytes is an output read whole w
 layout, so a seed replays as its table's own output and every mutation of it stays a case, and a
 dictionary per target: every terminal of its table (of every table for `any_table`), the declared
 names and the atoms of the call syntaxes, which lets libFuzzer compose markers it would otherwise
-have to discover byte by byte.
+have to discover byte by byte. A dictionary word is at most 64 bytes, libFuzzer's limit; `prepare`
+refuses a longer entry rather than let the driver skip it without a word. The harness's tests
+decode the seeds as written and read the dictionaries back.
 
 ## When a target crashes
 

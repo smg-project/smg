@@ -27,7 +27,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::{fs, path::Path, sync::OnceLock};
+use std::{fs, io::Write, path::Path, sync::OnceLock};
 
 /// The macro a target is written with, so that the targets and the harness share one dependency.
 pub use libfuzzer_sys::fuzz_target;
@@ -58,9 +58,8 @@ pub const TARGETS: &[(&str, Option<Table>)] = &[
 ];
 
 /// Whether the breach named `name` is allowed for this run: `SYMPHONY_FUZZ_ALLOW` lists, comma
-/// separated, the names of the invariants a run looks past, so that a class already reported does
-/// not stop the fuzzer from finding the next one. Only `whole-json` honors it; the others are
-/// not known to be broken.
+/// separated, the names the breach messages carry, so that a class already reported does not stop
+/// the fuzzer from finding the next one. Every check honors it, through [`breach`].
 pub fn allowed(name: &str) -> bool {
     static ALLOWED: OnceLock<Vec<String>> = OnceLock::new();
     ALLOWED
@@ -71,6 +70,14 @@ pub fn allowed(name: &str) -> bool {
         })
         .iter()
         .any(|allowed| allowed == name)
+}
+
+/// The check named `name`: a panic whose message starts with `breach <name>:` unless `holds`, or
+/// the run allows the breach. `message` is built only when the panic is.
+fn breach(name: &str, holds: bool, message: impl FnOnce() -> String) {
+    if !holds && !allowed(name) {
+        panic!("breach {name}: {}", message());
+    }
 }
 
 /// The table the target named `target` fuzzes: `Some(None)` for the target whose input picks the
@@ -202,25 +209,32 @@ pub fn check(case: &Case) {
     let pieces = replay(case, &case.cuts);
     for (which, replayed) in [("whole", &whole), ("pieces", &pieces)] {
         let conserved: String = replayed.events.iter().map(bytes_of).collect();
-        assert_eq!(
-            conserved,
-            case.output,
-            "breach conservation: {}: the {which} replay does not conserve the output",
-            describe(case)
-        );
-        assert!(
+        breach("conservation", conserved == case.output, || {
+            format!(
+                "{}: the {which} replay does not conserve the output; its events carry {conserved:?}",
+                describe(case)
+            )
+        });
+        breach(
+            "finish-last",
             matches!(replayed.events.last(), Some(Event::Finish { .. })),
-            "breach finish-last: {}: the {which} replay does not end with Finish",
-            describe(case)
+            || {
+                format!(
+                    "{}: the {which} replay does not end with Finish",
+                    describe(case)
+                )
+            },
         );
         check_well_formed(case, which, replayed);
     }
-    assert_eq!(
-        Said::of(&whole.events),
-        Said::of(&pieces.events),
-        "breach chunking: {}: the pieces say something else than the whole",
-        describe(case)
-    );
+    let whole_said = Said::of(&whole.events);
+    let pieces_said = Said::of(&pieces.events);
+    breach("chunking", whole_said == pieces_said, || {
+        format!(
+            "{}: the pieces say something else than the whole: whole {whole_said:?}, pieces {pieces_said:?}",
+            describe(case)
+        )
+    });
     check_adapters(case, &whole.events, &pieces.events);
 }
 
@@ -301,6 +315,110 @@ pub fn slices(dir: &Path) -> Result<Vec<(Table, String, Slice)>, String> {
     Ok(out)
 }
 
+/// What a run starts from, as [`prepare`] counts it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Prepared {
+    pub dictionaries: usize,
+    pub seeds: usize,
+}
+
+/// libFuzzer's longest dictionary word, in bytes: a longer entry it skips without a word.
+pub const DICTIONARY_WORD_MAX: usize = 64;
+
+/// Writes what a run starts from under `out`: `dict/<target>.dict`, a dictionary per target in
+/// libFuzzer's syntax (every terminal of its table, of every table for `any_table`, the declared
+/// names and the atoms of the call syntaxes), and `seeds/<table>/<family>`, a seed per recorded
+/// slice under `fixtures`, each the case that replays the slice ([`encode`]).
+pub fn prepare(fixtures: &Path, out: &Path) -> Result<Prepared, String> {
+    let dict = out.join("dict");
+    fs::create_dir_all(&dict).map_err(|e| format!("{}: {e}", dict.display()))?;
+    for (target, table) in TARGETS {
+        let tables: Vec<Table> = match table {
+            Some(table) => vec![*table],
+            None => Table::ALL.to_vec(),
+        };
+        let path = dict.join(format!("{target}.dict"));
+        let mut file = fs::File::create(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut entries: Vec<String> = Vec::new();
+        for table in tables {
+            let format = table.format();
+            entries.extend(format.terminal_texts().map(str::to_owned));
+        }
+        entries.extend(declared_names().into_iter().map(str::to_owned));
+        entries.extend(ATOMS.iter().map(|atom| (*atom).to_owned()));
+        entries.sort();
+        entries.dedup();
+        for entry in entries {
+            if entry.len() > DICTIONARY_WORD_MAX {
+                return Err(format!(
+                    "{}: {entry:?} is {} bytes; a dictionary word is at most {DICTIONARY_WORD_MAX}",
+                    path.display(),
+                    entry.len()
+                ));
+            }
+            writeln!(file, "{}", quoted(&entry)).map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+    }
+    let mut seeds = 0;
+    for (table, family, slice) in slices(fixtures)? {
+        let dir = out.join("seeds").join(table.name());
+        fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let path = dir.join(family);
+        let seed = encode(table, &slice.prompt, &slice.output)?;
+        fs::write(&path, seed).map_err(|e| format!("{}: {e}", path.display()))?;
+        seeds += 1;
+    }
+    Ok(Prepared {
+        dictionaries: TARGETS.len(),
+        seeds,
+    })
+}
+
+/// Pieces of the call syntaxes a mutation composes markers with, each within a dictionary word.
+const ATOMS: &[&str] = &[
+    "{\"name\": \"get_weather\", \"arguments\": ",
+    "{\"city\": \"Paris\", \"days\": 3}}",
+    "\"arguments\"",
+    "\"name\"",
+    "city",
+    "days",
+    "Paris",
+    "<arg_key>",
+    "</arg_key>",
+    "<arg_value>",
+    "</arg_value>",
+    "<function=",
+    "<parameter=",
+    "</parameter>",
+    "</function>",
+    " name=\"",
+    " string=\"true\"",
+    " key=\"",
+    " type=\"string\"",
+    " index=\"1\"",
+    "call:",
+    "<|\"|>",
+    "[get_weather(city='Paris')]",
+    "\\u00e9",
+    "\\\"",
+    "\u{fffd}",
+];
+
+/// `entry` in libFuzzer's dictionary syntax: quoted, with every byte outside printable ASCII, the
+/// quote and the backslash escaped as `\xNN`.
+fn quoted(entry: &str) -> String {
+    let mut out = String::from("\"");
+    for byte in entry.bytes() {
+        match byte {
+            b'"' | b'\\' => out.push_str(&format!("\\x{byte:02x}")),
+            0x20..=0x7e => out.push(byte as char),
+            _ => out.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// The events of one replay and how many of them came before the end of the stream.
 struct Replayed {
     events: Vec<Event>,
@@ -371,10 +489,10 @@ fn feed(
     out: &mut Events,
     events: &mut Vec<Event>,
 ) {
-    let step = format!("{input:?}");
+    let step = input.clone();
     if let Err(why) = engine.feed(input, out) {
         panic!(
-            "breach feed-failed: {}: feed of {step} failed: {why}",
+            "breach feed-failed: {}: feed of {step:?} failed: {why}",
             describe(case)
         );
     }
@@ -421,66 +539,57 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
     let mut finished = false;
     for (at, event) in replayed.events.iter().enumerate() {
         let place = || format!("{} ({which}), event {at}: {event:?}", describe(case));
-        assert!(
-            !finished,
-            "breach after-finish: {}: an event after Finish",
-            place()
-        );
+        breach("after-finish", !finished, || {
+            format!("{}: an event after Finish", place())
+        });
         match event {
             Event::ToolCallStart { index, .. } => {
-                assert!(
-                    !started.contains(index),
-                    "breach second-start: {}: a second start",
-                    place()
-                );
+                breach("second-start", !started.contains(index), || {
+                    format!("{}: a second start", place())
+                });
                 started.push(*index);
                 arguments.push((*index, String::new()));
             }
             Event::ToolCallArguments { index, json, .. } => {
-                assert!(
-                    started.contains(index),
-                    "breach arguments-before-start: {}: arguments before the call's start",
-                    place()
-                );
-                assert!(
-                    !ended.contains(index),
-                    "breach arguments-after-end: {}: arguments after the call's end",
-                    place()
-                );
+                breach("arguments-before-start", started.contains(index), || {
+                    format!("{}: arguments before the call's start", place())
+                });
+                breach("arguments-after-end", !ended.contains(index), || {
+                    format!("{}: arguments after the call's end", place())
+                });
                 if let Some((_, so_far)) = arguments.iter_mut().find(|(i, _)| i == index) {
                     so_far.push_str(json);
-                    assert!(
-                        valid_json_prefix(so_far),
-                        "breach json-prefix: {}: the arguments so far, {so_far:?}, are no valid JSON prefix",
-                        place()
-                    );
+                    breach("json-prefix", valid_json_prefix(so_far), || {
+                        format!(
+                            "{}: the arguments so far, {so_far:?}, are no valid JSON prefix",
+                            place()
+                        )
+                    });
                 }
             }
             Event::ToolCallEnd { index, .. } => {
-                assert!(
-                    started.contains(index),
-                    "breach end-before-start: {}: an end before the call's start",
-                    place()
-                );
-                assert!(
-                    !ended.contains(index),
-                    "breach second-end: {}: a second end",
-                    place()
-                );
+                breach("end-before-start", started.contains(index), || {
+                    format!("{}: an end before the call's start", place())
+                });
+                breach("second-end", !ended.contains(index), || {
+                    format!("{}: a second end", place())
+                });
                 ended.push(*index);
-                if at < replayed.before_end
-                    && !malformed_inside.contains(index)
-                    && !allowed("whole-json")
-                {
+                if at < replayed.before_end && !malformed_inside.contains(index) {
                     let so_far = arguments
                         .iter()
                         .find(|(i, _)| i == index)
                         .map(|(_, so_far)| so_far.as_str())
                         .unwrap_or_default();
-                    assert!(
+                    breach(
+                        "whole-json",
                         serde_json::from_str::<Value>(so_far).is_ok(),
-                        "breach whole-json: {}: the call closed with arguments that are no whole JSON: {so_far:?}",
-                        place()
+                        || {
+                            format!(
+                                "{}: the call closed with arguments that are no whole JSON: {so_far:?}",
+                                place()
+                            )
+                        },
                     );
                 }
             }
@@ -492,34 +601,33 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                 }
             }
             Event::ReasoningStart => {
-                assert!(
-                    !reasoning_open,
-                    "breach reasoning-reopened: {}: reasoning already open",
-                    place()
-                );
+                breach("reasoning-reopened", !reasoning_open, || {
+                    format!("{}: reasoning already open", place())
+                });
                 reasoning_open = true;
             }
             Event::Reasoning(_) => {
-                assert!(
-                    reasoning_open,
-                    "breach reasoning-outside: {}: reasoning outside a region",
-                    place()
-                );
+                breach("reasoning-outside", reasoning_open, || {
+                    format!("{}: reasoning outside a region", place())
+                });
             }
             Event::ReasoningEnd => {
-                assert!(
-                    reasoning_open,
-                    "breach reasoning-closed-twice: {}: no reasoning open",
-                    place()
-                );
+                breach("reasoning-closed-twice", reasoning_open, || {
+                    format!("{}: no reasoning open", place())
+                });
                 reasoning_open = false;
             }
             Event::Finish { tool_calls, .. } => {
-                assert_eq!(
-                    *tool_calls as usize,
-                    started.len(),
-                    "breach finish-count: {}: the finish does not count the calls that started",
-                    place()
+                breach(
+                    "finish-count",
+                    *tool_calls as usize == started.len(),
+                    || {
+                        format!(
+                            "{}: the finish counts {tool_calls} calls, {} started",
+                            place(),
+                            started.len()
+                        )
+                    },
                 );
                 finished = true;
             }
@@ -527,16 +635,17 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
         }
     }
     let place = format!("{} ({which})", describe(case));
-    assert!(finished, "breach no-finish: {place}: no Finish");
-    assert!(
-        !reasoning_open,
-        "breach reasoning-left-open: {place}: reasoning left open"
-    );
-    assert_eq!(
-        started.len(),
-        ended.len(),
-        "breach call-without-end: {place}: a call without an end"
-    );
+    breach("no-finish", finished, || format!("{place}: no Finish"));
+    breach("reasoning-left-open", !reasoning_open, || {
+        format!("{place}: reasoning left open")
+    });
+    breach("call-without-end", started.len() == ended.len(), || {
+        format!(
+            "{place}: {} calls started, {} ended",
+            started.len(),
+            ended.len()
+        )
+    });
 }
 
 /// What the parser has said, as the streams a client would assemble.
@@ -641,22 +750,24 @@ fn check_adapters(case: &Case, whole: &[Event], pieces: &[Event]) {
     if content.trim().is_empty() {
         content.clear();
     }
-    assert_eq!(
-        message.message.content.clone().unwrap_or_default(),
-        content,
-        "breach chat-content: {}: the chat stream's content is not the message's",
-        describe(case)
-    );
-    assert_eq!(
-        message
-            .message
-            .reasoning_content
-            .clone()
-            .unwrap_or_default(),
-        reasoning,
-        "breach chat-reasoning: {}: the chat stream's reasoning is not the message's",
-        describe(case)
-    );
+    let message_content = message.message.content.clone().unwrap_or_default();
+    breach("chat-content", message_content == content, || {
+        format!(
+            "{}: the chat stream's content {content:?} is not the message's {message_content:?}",
+            describe(case)
+        )
+    });
+    let message_reasoning = message
+        .message
+        .reasoning_content
+        .clone()
+        .unwrap_or_default();
+    breach("chat-reasoning", message_reasoning == reasoning, || {
+        format!(
+            "{}: the chat stream's reasoning {reasoning:?} is not the message's {message_reasoning:?}",
+            describe(case)
+        )
+    });
     let message_calls: Vec<(u32, Option<String>, String)> = message
         .message
         .tool_calls
@@ -671,12 +782,12 @@ fn check_adapters(case: &Case, whole: &[Event], pieces: &[Event]) {
             )
         })
         .collect();
-    assert_eq!(
-        message_calls,
-        calls,
-        "breach chat-calls: {}: the chat stream's calls are not the message's",
-        describe(case)
-    );
+    breach("chat-calls", message_calls == calls, || {
+        format!(
+            "{}: the chat stream's calls {calls:?} are not the message's {message_calls:?}",
+            describe(case)
+        )
+    });
 
     let mut stream = messages::Stream::new();
     let mut out = Vec::new();
@@ -688,12 +799,14 @@ fn check_adapters(case: &Case, whole: &[Event], pieces: &[Event]) {
     }
     stream.close(&mut out);
     let output = messages::output(whole);
-    assert_eq!(
-        serde_json::to_string(&output.stop_reason).ok(),
-        serde_json::to_string(&stop).ok(),
-        "breach messages-stop: {}: the Messages stream's stop reason is not the output's",
-        describe(case)
-    );
+    let output_stop = serde_json::to_string(&output.stop_reason).ok();
+    let stream_stop = serde_json::to_string(&stop).ok();
+    breach("messages-stop", output_stop == stream_stop, || {
+        format!(
+            "{}: the Messages stream's stop reason {stream_stop:?} is not the output's {output_stop:?}",
+            describe(case)
+        )
+    });
 
     let mut stream = responses::Stream::new("resp");
     let mut out = Vec::new();
@@ -726,6 +839,60 @@ mod tests {
             check(&case);
             check(&decode(&data, Some(*table)));
         }
+        Ok(())
+    }
+
+    /// The byte length of a dictionary line once libFuzzer reads it: the quotes off, `\xNN` one byte.
+    fn word_len(line: &str) -> usize {
+        let inner = line.trim_matches('"');
+        inner
+            .split("\\x")
+            .enumerate()
+            .map(|(i, part)| {
+                if i == 0 {
+                    part.len()
+                } else {
+                    1 + part.len().saturating_sub(2)
+                }
+            })
+            .sum()
+    }
+
+    #[test]
+    fn the_seeds_prepare_writes_decode_as_the_slices_and_its_words_fit() -> Result<(), String> {
+        let out =
+            std::env::temp_dir().join(format!("symphony-fuzz-prepare-{}", std::process::id()));
+        let prepared = prepare(&fixtures(), &out)?;
+        assert_eq!(
+            prepared,
+            Prepared {
+                dictionaries: TARGETS.len(),
+                seeds: 40
+            }
+        );
+        for (table, family, slice) in slices(&fixtures())? {
+            let path = out.join("seeds").join(table.name()).join(&family);
+            let data = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            for case in [decode(&data, None), decode(&data, Some(table))] {
+                assert_eq!(case.table, table, "{family}");
+                assert_eq!(case.prompt, slice.prompt, "{family}");
+                assert_eq!(case.output, slice.output, "{family}");
+                assert_eq!(case.finish, EngineFinish::Stop, "{family}");
+                assert!(!case.cuts.is_empty(), "{family}: a seed replays in pieces");
+            }
+        }
+        for (target, _) in TARGETS {
+            let path = out.join("dict").join(format!("{target}.dict"));
+            let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            assert!(text.lines().count() > 1, "{target}: an empty dictionary");
+            for line in text.lines() {
+                assert!(
+                    word_len(line) <= DICTIONARY_WORD_MAX,
+                    "{target}: {line} is longer than a dictionary word"
+                );
+            }
+        }
+        fs::remove_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
         Ok(())
     }
 

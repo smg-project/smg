@@ -2,7 +2,8 @@
 # Runs the fuzz targets for a bounded time each, seeded from the crate's recorded output slices
 # and guided by a dictionary of the table's markers, and prints one row per target: executions,
 # executions per second, coverage edges, corpus units and crashes. Exits 1 when any target found
-# a crash; its artifact is under artifacts/<target>/ and the log under logs/<target>.log.
+# a crash, or never ran; a crash's artifact is under artifacts/<target>/ and the log under
+# logs/<target>.log.
 #
 #   run.sh [--minutes N] [--jobs J] [--sanitizer none|address] [--max-len BYTES] [--keep-going]
 #          [--allow NAMES] [--label NAME] [--summary-only] [target ...]
@@ -76,7 +77,8 @@ run_one() {
   mkdir -p "corpus/$target" "$artifacts/$target"
   # A seed's name is its family; two tables' slices of one family would collide, so name by table.
   for seed in prepared/seeds/*/*; do
-    cp -n "$seed" "corpus/$target/$(basename "$(dirname "$seed")")-$(basename "$seed")"
+    dest="corpus/$target/$(basename "$(dirname "$seed")")-$(basename "$seed")"
+    [ -e "$dest" ] || cp "$seed" "$dest"
   done
   cargo +nightly fuzz run --sanitizer "$sanitizer" "${target_dir[@]}" "$target" "corpus/$target" -- \
     -max_total_time=$((minutes * 60)) -max_len="$max_len" -timeout=10 \
@@ -109,7 +111,7 @@ if [ -z "$summary_only" ]; then
   wait
 fi
 
-crashed=0
+failed=0
 echo
 echo "run $label: $minutes min per target, sanitizer $sanitizer, max_len $max_len${keep_going[0]:+, keep going}${SYMPHONY_FUZZ_ALLOW:+, allowed: $SYMPHONY_FUZZ_ALLOW}"
 echo
@@ -117,18 +119,23 @@ echo "| target | minutes | executions | exec/s | edges | corpus units | crashes 
 echo "|---|---|---|---|---|---|---|---|"
 for target in "${targets[@]}"; do
   log="$logs/$target.log"
-  # The last status line carries the executions (`#N`, cumulative in fork mode too) and the
-  # edges (`cov:`); the rate is over the whole run.
+  # The last status line carries the executions (`#N`, cumulative in fork mode too), the rate
+  # (`exec/s`, over the time the target ran: less than its budget when it stopped at a crash) and
+  # the edges (`cov:`). No execution count means the target never ran (a flag or a dictionary
+  # libFuzzer refused, a missing binary): that fails the run as a crash does.
   executions=$(grep -oE '^#[0-9]+' "$log" | tail -1 | tr -d '#' || true)
-  per_second=$(( ${executions:-0} / (minutes * 60) ))
+  per_second=$(grep -oE 'exec/s:? *[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$' || true)
   edges=$(grep -o 'cov: [0-9]*' "$log" | tail -1 | awk '{print $2}' || true)
   units=$(find "corpus/$target" -type f | wc -l | tr -d ' ')
   crashes=$(find "$artifacts/$target" -type f | wc -l | tr -d ' ')
   classes=none
-  if [ "$crashes" -gt 0 ]; then
-    crashed=1
+  if [ -z "$executions" ]; then
+    failed=1
+    classes="never ran"
+  elif [ "$crashes" -gt 0 ]; then
+    failed=1
     classes=$(classes_of "$target")
   fi
-  echo "| $target | $minutes | ${executions:-?} | $per_second | ${edges:-?} | $units | $crashes | $classes |"
+  echo "| $target | $minutes | ${executions:-?} | ${per_second:-?} | ${edges:-?} | $units | $crashes | $classes |"
 done
-exit $crashed
+exit $failed
