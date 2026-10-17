@@ -270,7 +270,7 @@ mod tests {
             },
             Event::Malformed {
                 text: Text::uncounted("junk"),
-                why: MalformedReason::Other("why".to_string()),
+                why: MalformedReason::Other("why".into()),
             },
             Event::Finish {
                 reason: FinishReason::Stop,
