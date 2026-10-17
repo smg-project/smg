@@ -788,6 +788,17 @@ mod seed_resolution_tests {
     use super::*;
 
     #[test]
+    fn plain_sampling_seed_is_forwarded() {
+        let params = GenerateSamplingParams {
+            sampling_seed: Some(7),
+            ..Default::default()
+        };
+        let sampling =
+            TokenSpeedSchedulerClient::build_sampling_params_from_plain(Some(&params)).unwrap();
+        assert_eq!(sampling.sampling_seed, Some(7));
+    }
+
+    #[test]
     fn native_sampling_seed_wins_over_legacy_seed() {
         let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(Some(7), Some(42))
             .expect("native seed should resolve");

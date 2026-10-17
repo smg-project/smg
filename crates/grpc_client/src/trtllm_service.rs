@@ -171,12 +171,22 @@ impl TrtllmServiceClient {
         clippy::unused_self,
         reason = "method receiver kept for consistent public API across gRPC backends"
     )]
+    pub fn build_plain_generate_request(
+        &self,
+        request_id: String,
+        body: &GenerateRequest,
+        original_text: Option<String>,
+        token_ids: Vec<u32>,
+    ) -> Result<proto::GenerateRequest, String> {
+        Self::build_plain_generate_request_parts(request_id, body, original_text, token_ids)
+    }
+
+    /// [`Self::build_plain_generate_request`] without a receiver.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "returns Result for API consistency with sglang/vllm backends which can fail"
     )]
-    pub fn build_plain_generate_request(
-        &self,
+    pub fn build_plain_generate_request_parts(
         request_id: String,
         body: &GenerateRequest,
         original_text: Option<String>,
@@ -219,7 +229,7 @@ impl TrtllmServiceClient {
             max_tokens,
             streaming: body.stream,
             stop: plain.stop,
-            stop_token_ids: vec![],
+            stop_token_ids: plain.stop_token_ids,
             ignore_eos: plain.ignore_eos,
             bad: vec![],
             bad_token_ids: vec![],
@@ -668,7 +678,7 @@ impl TrtllmServiceClient {
             top_p_min: None,
             top_p_reset_ids: None,
             top_p_decay: None,
-            seed: None,
+            seed: plain.sampling_seed,
             temperature: Some(plain.temperature),
             min_tokens: plain.min_new_tokens,
             beam_search_diversity_rate: None,
@@ -713,6 +723,24 @@ impl TrtllmServiceClient {
 mod tests {
     use super::*;
     use crate::channel::testing::refused_endpoint;
+
+    #[test]
+    fn plain_sampling_seed_and_stop_token_ids_reach_the_request() {
+        let body: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "text": "hi",
+            "sampling_params": {"sampling_seed": 7, "stop_token_ids": [1, 2]}
+        }))
+        .unwrap();
+        let request = TrtllmServiceClient::build_plain_generate_request_parts(
+            "r".into(),
+            &body,
+            None,
+            vec![3],
+        )
+        .unwrap();
+        assert_eq!(request.sampling_config.unwrap().seed, Some(7));
+        assert_eq!(request.stop_token_ids, vec![1, 2]);
+    }
 
     #[test]
     fn test_proto_types_compilation() {

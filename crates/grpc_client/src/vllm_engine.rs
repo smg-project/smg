@@ -602,8 +602,12 @@ impl VllmEngineClient {
             spaces_between_special_tokens: true,
             ignore_eos: plain.ignore_eos,
             n: plain.n,
-            // no_stop_trim has no field in this proto; the plain sampling_seed is not
-            // forwarded to `seed` here (as before)
+            // The proto seed is i32; the plain seed is u64. Fold the high half into
+            // the low so distinct seeds stay distinct (a saturating cast would send
+            // every seed >= 2^31 to one value). no_stop_trim has no field in this proto.
+            seed: plain
+                .sampling_seed
+                .map(|seed| ((seed ^ (seed >> 32)) as u32) as i32),
             constraint: match params {
                 Some(p) => Self::build_single_constraint_from_plain(p)?,
                 None => None,
@@ -761,6 +765,23 @@ mod tests {
             request_ids: vec!["req-456".to_string(), "req-789".to_string()],
         };
         assert_eq!(abort_req.request_ids, vec!["req-456", "req-789"]);
+    }
+
+    #[test]
+    fn plain_sampling_seed_reaches_the_proto_seed_folded() {
+        let seeded = |seed| GenerateSamplingParams {
+            sampling_seed: seed,
+            ..Default::default()
+        };
+        let seed = |params| {
+            VllmEngineClient::build_sampling_params_from_plain(Some(&params))
+                .unwrap()
+                .seed
+        };
+        assert_eq!(seed(seeded(Some(7))), Some(7));
+        assert_eq!(seed(seeded(Some(1 << 32))), Some(1));
+        assert_eq!(seed(seeded(Some(u64::MAX))), Some(0));
+        assert_eq!(seed(seeded(None)), None);
     }
 
     #[test]
