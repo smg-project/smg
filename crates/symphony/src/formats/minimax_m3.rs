@@ -48,10 +48,9 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, Events, MalformedReason, Text},
-        input::{EngineFinish, Input},
-        parser::Parser,
+        event::{DropReason, Event, MalformedReason, Text},
         tagged::Declared,
+        testing::{arguments_of, bytes, content, drive, names, reasoning},
     };
 
     const SEP: &str = "]<]minimax[>[";
@@ -96,38 +95,7 @@ mod tests {
     }
 
     fn run_with(declared: Declared, prompt: &str, pieces: &[&str]) -> Vec<Event> {
-        let mut parser = Engine::new(minimax_m3(), declared);
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        for piece in pieces {
-            parser
-                .feed(
-                    Input::Delta {
-                        token_ids: &[],
-                        text: piece,
-                        spans: &[],
-                    },
-                    &mut out,
-                )
-                .expect("delta");
-        }
-        parser
-            .feed(
-                Input::End {
-                    finish: EngineFinish::Stop,
-                },
-                &mut out,
-            )
-            .expect("end");
-        out.drain()
+        drive(&mut Engine::new(minimax_m3(), declared), prompt, pieces)
     }
 
     /// One function with `parameters`, as a request declares it.
@@ -158,32 +126,6 @@ mod tests {
         run_with(Declared::default(), prompt, pieces)
     }
 
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
-    }
-
-    fn arguments_of(events: &[Event], call: u32) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallArguments { index, json, .. } if *index == call => {
-                    Some(json.as_str())
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
     fn fragments_of(events: &[Event], call: u32) -> Vec<&str> {
         events
             .iter()
@@ -191,36 +133,6 @@ mod tests {
                 Event::ToolCallArguments { index, json, .. } if *index == call => {
                     Some(json.as_str())
                 }
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn names(events: &[Event]) -> Vec<&str> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallStart { name, .. } => Some(name.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn reasoning(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
                 _ => None,
             })
             .collect()

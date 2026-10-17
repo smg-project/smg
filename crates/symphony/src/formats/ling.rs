@@ -43,6 +43,7 @@ mod tests {
         input::{EngineFinish, Input},
         parser::Parser,
         tagged::Declared,
+        testing::{bytes, drive},
     };
 
     fn declared() -> Declared {
@@ -69,50 +70,7 @@ mod tests {
     );
 
     fn run(prompt: &str, output: &str) -> Vec<Event> {
-        let mut parser = Engine::new(ling(), declared());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        parser
-            .feed(
-                Input::Delta {
-                    token_ids: &[],
-                    text: output,
-                    spans: &[],
-                },
-                &mut out,
-            )
-            .expect("delta");
-        parser
-            .feed(
-                Input::End {
-                    finish: EngineFinish::Stop,
-                },
-                &mut out,
-            )
-            .expect("end");
-        out.drain()
-    }
-
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
+        drive(&mut Engine::new(ling(), declared()), prompt, &[output])
     }
 
     fn arguments(events: &[Event]) -> Vec<(String, String)> {

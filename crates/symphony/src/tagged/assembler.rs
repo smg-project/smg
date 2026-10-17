@@ -691,6 +691,7 @@ mod tests {
     use serde_json::{json as value, Value};
 
     use super::*;
+    use crate::testing::bytes;
 
     /// A tool `f` with a string `city`, an integer `limit`, a nullable string `note` and nothing
     /// declared for `extra`.
@@ -758,15 +759,6 @@ mod tests {
                 _ => None,
             })
             .collect()
-    }
-
-    /// Every byte the events account for, in order.
-    fn bytes(events: &[Event]) -> String {
-        let mut list = Events::new();
-        for event in events {
-            list.push(event.clone());
-        }
-        list.text()
     }
 
     fn name_of(events: &[Event]) -> Option<&str> {

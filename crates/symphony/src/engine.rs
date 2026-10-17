@@ -1154,6 +1154,7 @@ mod tests {
         formats::{glm, inkling, qwen3, xlam},
         input::TokenSpan,
         tagged::{Placement, Spelling},
+        testing::bytes,
     };
 
     fn declared() -> Declared {
@@ -1242,14 +1243,6 @@ mod tests {
             }
         }
         calls
-    }
-
-    fn bytes(events: &[Event]) -> String {
-        let mut list = Events::new();
-        for event in events {
-            list.push(event.clone());
-        }
-        list.text()
     }
 
     #[test]

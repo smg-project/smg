@@ -131,10 +131,10 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, Events, FinishReason},
-        input::{EngineFinish, Input},
-        parser::Parser,
+        event::{DropReason, Event, FinishReason},
+        input::EngineFinish,
         tagged::Declared,
+        testing::{bytes, calls, content, drive, drive_to, reasoning},
     };
 
     /// The generation prompt's tail as K2 Instruct and K2 Thinking end it: the user's message and
@@ -167,64 +167,20 @@ mod tests {
     );
 
     fn run_with(prompt: &str, pieces: &[&str], finish: EngineFinish) -> Vec<Event> {
-        let mut parser = Engine::new(kimi_k2(), Declared::default());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        for piece in pieces {
-            parser
-                .feed(
-                    Input::Delta {
-                        token_ids: &[],
-                        text: piece,
-                        spans: &[],
-                    },
-                    &mut out,
-                )
-                .expect("delta");
-        }
-        parser.feed(Input::End { finish }, &mut out).expect("end");
-        out.drain()
+        drive_to(
+            &mut Engine::new(kimi_k2(), Declared::default()),
+            prompt,
+            pieces,
+            finish,
+        )
     }
 
     fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
-        run_with(prompt, pieces, EngineFinish::Stop)
-    }
-
-    /// Every byte the events carry, in order: the output, when the engine accounts for all of it.
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|event| match event {
-                Event::Content(text) | Event::Reasoning(text) => text.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
-    }
-
-    fn calls(events: &[Event]) -> Vec<(String, String)> {
-        let mut calls: Vec<(String, String)> = Vec::new();
-        for event in events {
-            match event {
-                Event::ToolCallStart { name, .. } => calls.push((name.clone(), String::new())),
-                Event::ToolCallArguments { json, .. } => {
-                    calls.last_mut().expect("a call started").1.push_str(json);
-                }
-                _ => {}
-            }
-        }
-        calls
+        drive(
+            &mut Engine::new(kimi_k2(), Declared::default()),
+            prompt,
+            pieces,
+        )
     }
 
     /// The calls' ids, in order.
@@ -258,26 +214,6 @@ mod tests {
             .iter()
             .filter_map(|event| match event {
                 Event::ToolCallEnd { source, .. } => Some(source.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn reasoning(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
                 _ => None,
             })
             .collect()
