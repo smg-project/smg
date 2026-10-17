@@ -26,6 +26,7 @@ pub(crate) const REASON_ROUTING_KEY_OVERRIDE: &str = "routing_key_override";
 pub(crate) const REASON_POLICY_NEEDS_TEXT: &str = "policy_needs_text";
 pub(crate) const REASON_MODEL_AMBIGUOUS: &str = "model_ambiguous";
 pub(crate) const REASON_WORKER_MUTATES_BODY: &str = "worker_mutates_body";
+pub(crate) const REASON_PROVIDER_PROFILE: &str = "provider_profile";
 pub(crate) const REASON_WASM_REQUEST_HOOK: &str = "wasm_request_hook";
 pub(crate) const REASON_NO_CONTENT_LENGTH: &str = "no_content_length";
 pub(crate) const REASON_NO_AVAILABLE_WORKER: &str = "no_available_worker";
@@ -40,6 +41,10 @@ pub(crate) struct BodyPathInputs {
     pub policy_needs_text: bool,
     pub model_ambiguous: bool,
     pub worker_mutates_body: bool,
+    /// The route's typed request is shaped by the served model's provider
+    /// profile (a chat completion to a vendor model: the profile's contract
+    /// defaults and merges exist only on a typed request).
+    pub profile_normalizes_body: bool,
     pub wasm_request_hooks: bool,
     pub content_length: Option<u64>,
     pub retries_enabled: bool,
@@ -51,7 +56,9 @@ pub(crate) struct BodyPathInputs {
 /// the fallback key), a text-routing policy without a valid hint-header
 /// waiver, a registry serving more than one model (content-blind selection
 /// could land the request on the wrong model's worker), a body-mutating
-/// worker, a WASM request hook, or a missing/invalid Content-Length.
+/// worker, a provider profile that shapes the route's request (the raw
+/// bytes would reach the upstream without the profile's defaults), a WASM
+/// request hook, or a missing/invalid Content-Length.
 /// Otherwise, with router retries enabled, buffer up to
 /// `max_buffered_request_bytes` to keep the request replayable — a larger
 /// body streams and forfeits router retries. Otherwise stream, at any size.
@@ -67,6 +74,9 @@ pub(crate) fn decide_body_path(inputs: &BodyPathInputs) -> BodyPath {
     }
     if inputs.worker_mutates_body {
         return BodyPath::Buffer(REASON_WORKER_MUTATES_BODY);
+    }
+    if inputs.profile_normalizes_body {
+        return BodyPath::Buffer(REASON_PROVIDER_PROFILE);
     }
     if inputs.wasm_request_hooks {
         return BodyPath::Buffer(REASON_WASM_REQUEST_HOOK);
@@ -93,6 +103,7 @@ mod tests {
             policy_needs_text: false,
             model_ambiguous: false,
             worker_mutates_body: false,
+            profile_normalizes_body: false,
             wasm_request_hooks: false,
             content_length: Some(content_length),
             retries_enabled: true,
@@ -107,6 +118,7 @@ mod tests {
             policy_needs_text: true,
             model_ambiguous: true,
             worker_mutates_body: true,
+            profile_normalizes_body: true,
             wasm_request_hooks: true,
             content_length: None,
             ..eligible(0)
@@ -147,6 +159,13 @@ mod tests {
             ),
             (
                 BodyPathInputs {
+                    profile_normalizes_body: true,
+                    ..eligible(64)
+                },
+                REASON_PROVIDER_PROFILE,
+            ),
+            (
+                BodyPathInputs {
                     wasm_request_hooks: true,
                     ..eligible(64)
                 },
@@ -174,6 +193,26 @@ mod tests {
             decide_body_path(&eligible(1025)),
             BodyPath::Stream(REASON_RETRY_FORFEITED)
         );
+    }
+
+    /// The profile's shaping outranks every size and retry arm: with retries
+    /// on or off, under or past the cap, the body is typed.
+    #[test]
+    fn a_shaping_profile_buffers_at_any_size_with_or_without_retries() {
+        for retries_enabled in [true, false] {
+            for len in [1, 1024, 1025, u64::MAX] {
+                let inputs = BodyPathInputs {
+                    profile_normalizes_body: true,
+                    retries_enabled,
+                    ..eligible(len)
+                };
+                assert_eq!(
+                    decide_body_path(&inputs),
+                    BodyPath::Buffer(REASON_PROVIDER_PROFILE),
+                    "retries_enabled={retries_enabled} len={len}"
+                );
+            }
+        }
     }
 
     #[test]

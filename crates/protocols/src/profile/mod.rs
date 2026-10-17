@@ -233,17 +233,29 @@ impl ProviderProfile {
         ProviderProfile::Generic
     }
 
+    /// Whether [`Self::normalize_chat`] shapes a chat request under this
+    /// profile beyond the foreign-extension drop every profile runs: the
+    /// vendor contracts fill their defaults (a stream's usage chunk,
+    /// sampling, thinking) and MiniMax merges root messages, so a request to
+    /// one of their models has to be typed before dispatch. The default and
+    /// OpenAI profiles rewrite nothing of their own, so a relay may forward
+    /// their requests as the client wrote them.
+    pub fn normalizes_chat(self) -> bool {
+        self.is_vendor_contract()
+    }
+
     /// Shape the request for dispatch under this profile: the provider's own
     /// normalization first (MiniMax merges the root messages into one
     /// leading root), then every message drops the extension struct that
     /// belongs to another provider, so a foreign field never reaches a
     /// backend or a chat template. Runs from `Normalizable::normalize`, so it
-    /// covers every request that enters through `ValidatedJson`; the HTTP
-    /// router's streamed pass-through forwards the raw body and skips it.
-    /// Only message-level extension structs
-    /// are covered; see the module docs. Dropped extensions are logged once
-    /// per request. The profile then applies its contract defaults to fields
-    /// the client omitted.
+    /// covers every request that enters through `ValidatedJson`. The HTTP
+    /// router's streamed pass-through forwards the raw body and skips it,
+    /// which is why it hands a chat request to a model whose profile
+    /// [`Self::normalizes_chat`] back to the typed path. Only message-level
+    /// extension structs are covered; see the module docs. Dropped
+    /// extensions are logged once per request. The profile then applies its
+    /// contract defaults to fields the client omitted.
     pub fn normalize_chat(self, req: &mut ChatCompletionRequest) {
         match self {
             ProviderProfile::Minimax => minimax::normalize_chat(req),
@@ -427,6 +439,42 @@ fn reject_root(req: &ChatCompletionRequest) -> Result<(), validator::ValidationE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `normalizes_chat` is the body-blind form of `normalize_chat`: a profile
+    /// claims to shape requests exactly when its normalization changes a
+    /// plain streamed request the client sent without the fields the profile
+    /// fills, and the two profiles that claim nothing leave it as sent.
+    #[test]
+    fn normalizes_chat_agrees_with_what_normalize_chat_does() {
+        let cases = [
+            ("kimi-k2", ProviderProfile::Kimi),
+            ("MiniMax-M3", ProviderProfile::Minimax),
+            ("glm-5", ProviderProfile::Zai),
+            ("deepseek-v4-pro", ProviderProfile::DeepSeek),
+            ("gpt-4o", ProviderProfile::OpenAi),
+            ("self-hosted-model", ProviderProfile::Generic),
+        ];
+        for (model, expected) in cases {
+            let profile = ProviderProfile::for_model(model);
+            assert_eq!(profile, expected, "{model}");
+            let mut request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true,
+            }))
+            .expect("request deserializes");
+            let as_sent = serde_json::to_value(&request).expect("request serializes");
+            profile.normalize_chat(&mut request);
+            let shaped = serde_json::to_value(&request).expect("request serializes");
+            assert_eq!(
+                shaped != as_sent,
+                profile.normalizes_chat(),
+                "{model}: normalize_chat changed the request ({}) but normalizes_chat says {}",
+                shaped != as_sent,
+                profile.normalizes_chat()
+            );
+        }
+    }
 
     #[test]
     fn only_the_kimi_profile_exposes_message_declared_tools() {

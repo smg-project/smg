@@ -3,8 +3,9 @@
 //! An eligible request larger than the retry-buffer cap must flow to the
 //! worker as a chunked stream, byte-for-byte; with retries disabled it must
 //! stream at any size. Under the cap with retries enabled, without a
-//! Content-Length, under a text-needing policy, or in a registry serving
-//! more than one model, the buffered typed path (which re-serializes and
+//! Content-Length, under a text-needing policy, in a registry serving more
+//! than one model, or for a chat completion to a served model whose provider
+//! profile shapes requests, the buffered typed path (which re-serializes and
 //! sends a Content-Length) must be used instead.
 
 use std::sync::Arc;
@@ -120,7 +121,17 @@ async fn streaming_app(
 
 async fn streaming_app_with_config(
     policy: PolicyConfig,
+    config: RouterConfig,
+) -> (axum::Router, Captured, AppTestContext) {
+    streaming_app_serving(policy, config, "mock-model").await
+}
+
+/// The same app, the capture stub registered as the one worker serving
+/// `model`.
+async fn streaming_app_serving(
+    policy: PolicyConfig,
     mut config: RouterConfig,
+    model: &str,
 ) -> (axum::Router, Captured, AppTestContext) {
     let (worker_url, captured) = spawn_capture_worker().await;
 
@@ -132,7 +143,7 @@ async fn streaming_app_with_config(
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new(&worker_url)
             .worker_type(WorkerType::Regular)
-            .models(vec![ModelCard::new("mock-model")])
+            .models(vec![ModelCard::new(model)])
             .health_config(openai_protocol::worker::HealthCheckConfig {
                 disable_health_check: true,
                 ..Default::default()
@@ -273,6 +284,82 @@ async fn retries_disabled_streams_a_small_body() {
     );
     drop(captured);
     ctx.shutdown().await;
+}
+
+/// A served model whose provider profile shapes chat requests (here the
+/// stream usage default a vendor's clients read token counts from) must take
+/// the buffered typed path under every pass-through condition: retries off,
+/// and retries on past the buffer cap. The upstream then receives the
+/// request as the profile normalized it, a fixed-length body asking for the
+/// usage chunk, while the fleet's other routes still stream verbatim.
+#[tokio::test]
+async fn profile_shaped_chat_takes_the_typed_path_under_every_pass_through_condition() {
+    let retries_off = {
+        let mut config = base_config(64 * 1024 * 1024);
+        config.disable_retries = true;
+        config
+    };
+    let retries_on_past_the_cap = {
+        let mut config = base_config(64 * 1024 * 1024);
+        config.max_buffered_request_bytes = 1024;
+        config
+    };
+    for (config, filler, condition) in [
+        (retries_off, 1usize, "retries off"),
+        (
+            retries_on_past_the_cap,
+            16 * 1024,
+            "retries on past the cap",
+        ),
+    ] {
+        let (app, captured, ctx) =
+            streaming_app_serving(least_load_policy(), config, "MiniMax-M3").await;
+
+        let payload = serde_json::to_vec(&json!({
+            "model": "MiniMax-M3",
+            "messages": [{"role": "user", "content": "y".repeat(filler)}],
+            "stream": true,
+        }))
+        .unwrap();
+        let req = chunked_json_request(
+            "/v1/chat/completions",
+            payload.clone(),
+            Some(payload.len() as u64),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{condition}");
+        {
+            let captured = captured.lock().await;
+            let (headers, body) = captured.first().unwrap();
+            assert!(
+                headers.get(CONTENT_LENGTH).is_some(),
+                "{condition}: a profile-shaped chat must take the buffered typed path"
+            );
+            let body: Value = serde_json::from_slice(body).unwrap();
+            assert_eq!(
+                body["stream_options"]["include_usage"],
+                json!(true),
+                "{condition}: the upstream receives the profile's stream usage default"
+            );
+            assert_eq!(body["messages"][0]["content"], json!("y".repeat(filler)));
+        }
+
+        // The fleet's other routes keep the pass-through.
+        let app = ctx.create_app();
+        let generate = generate_payload(filler);
+        let req = chunked_json_request("/generate", generate.clone(), Some(generate.len() as u64));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{condition}");
+        let captured = captured.lock().await;
+        let (headers, body) = captured.last().unwrap();
+        assert_eq!(body.as_ref(), generate.as_slice(), "{condition}");
+        assert!(
+            headers.get(CONTENT_LENGTH).is_none(),
+            "{condition}: a generate request to the same fleet still streams verbatim"
+        );
+        drop(captured);
+        ctx.shutdown().await;
+    }
 }
 
 #[tokio::test]
