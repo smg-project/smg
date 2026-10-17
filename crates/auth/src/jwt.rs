@@ -620,9 +620,10 @@ mod tests {
     use jsonwebtoken::errors::ErrorKind;
 
     use super::{
-        test_support::{now, token, validator},
+        test_support::{now, token, validator, ISSUER},
         *,
     };
+    use crate::jwks::test_support::discovery_server;
 
     #[test]
     fn test_audience_contains() {
@@ -672,5 +673,25 @@ mod tests {
             assert_eq!(validated.subject, "alice");
             assert_eq!(validated.role, Role::Admin);
         }
+    }
+
+    #[tokio::test]
+    async fn no_validator_is_built_on_a_discovery_document_for_another_issuer() {
+        // The document at the configured issuer's discovery endpoint names another
+        // issuer: the key set provider refuses it, so no validator comes to be.
+        let origin = discovery_server(|_| ISSUER.to_string()).await;
+
+        let Err(err) = JwtValidator::from_config(JwtConfig::new(&origin, "smg")).await else {
+            panic!("no validator may be built on a discovery document for another issuer");
+        };
+
+        assert!(
+            matches!(
+                &err,
+                JwtValidatorError::KeyError(JwksError::IssuerMismatch { configured, discovered })
+                    if configured == &origin && discovered == ISSUER
+            ),
+            "{err:?}"
+        );
     }
 }

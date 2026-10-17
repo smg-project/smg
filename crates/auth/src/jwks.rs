@@ -40,6 +40,12 @@ pub enum JwksError {
     #[error("Failed to parse OIDC discovery document: {0}")]
     DiscoveryParse(String),
 
+    #[error("OIDC discovery document is for the issuer {discovered:?}, not the configured issuer {configured:?} (OpenID Connect Discovery 1.0 requires the two to be identical)")]
+    IssuerMismatch {
+        configured: String,
+        discovered: String,
+    },
+
     #[error("JWKS URI not found in discovery document")]
     JwksUriNotFound,
 
@@ -197,12 +203,9 @@ pub(crate) fn validate_url(url_str: &str) -> Result<Url, JwksError> {
 #[derive(Debug, serde::Deserialize)]
 struct OidcDiscovery {
     jwks_uri: String,
-    /// Required of the document (OIDC Discovery 1.0 lists it as such), so a
-    /// document without it is refused at the parse as before; its value is
-    /// read nowhere yet. Checking it against the configured issuer is a
-    /// separate change.
-    #[serde(rename = "issuer")]
-    _issuer: String,
+    /// The issuer the document is for: identical to the issuer the document
+    /// was requested for, or the document is refused (Discovery 1.0, section 4.3).
+    issuer: String,
 }
 
 /// Cached JWKS with expiration tracking.
@@ -281,11 +284,17 @@ impl JwksProvider {
     }
 
     /// Create a new JWKS provider using OIDC discovery.
-    /// Both issuer and discovered JWKS URI are validated for SSRF protection.
+    /// Both issuer and discovered JWKS URI are validated for SSRF protection,
+    /// and the document is taken only when its `issuer` is identical to the
+    /// configured issuer (OpenID Connect Discovery 1.0, section 4.3).
     pub async fn from_issuer(issuer: &str, ttl: Duration) -> Result<Self, JwksError> {
-        // Normalize and validate issuer URL
-        let issuer = issuer.trim_end_matches('/');
-        let discovery_url = format!("{issuer}/.well-known/openid-configuration");
+        // The discovery URL is the issuer without its terminating slash plus the
+        // well-known path (Discovery 1.0, section 4.1); the document's issuer is
+        // compared with the issuer as configured.
+        let discovery_url = format!(
+            "{}/.well-known/openid-configuration",
+            issuer.trim_end_matches('/')
+        );
 
         // Validate discovery URL for SSRF protection
         validate_url(&discovery_url)?;
@@ -321,6 +330,19 @@ impl JwksProvider {
             .json()
             .await
             .map_err(|e| JwksError::DiscoveryParse(e.to_string()))?;
+
+        // The document's issuer must be identical to the issuer it was requested
+        // for (Discovery 1.0, section 4.3): a document for another issuer names
+        // another issuer's key set. The comparison is exact, as the one of a
+        // token's `iss` claim against the configured issuer is, so a document
+        // whose issuer differs only in a terminating slash is refused here as
+        // its tokens would be.
+        if discovery.issuer != issuer {
+            return Err(JwksError::IssuerMismatch {
+                configured: issuer.to_string(),
+                discovered: discovery.issuer,
+            });
+        }
 
         // Validate discovered JWKS URI for SSRF protection
         validate_url(&discovery.jwks_uri)?;
@@ -460,6 +482,41 @@ impl JwksProvider {
     }
 }
 
+/// A loopback OIDC discovery endpoint for the tests of the provider and of
+/// the validator built on it.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use axum::{routing::get, Json, Router};
+    use serde_json::json;
+    use tokio::net::TcpListener;
+
+    /// An OIDC discovery endpoint over loopback. Returns the server's origin,
+    /// the issuer a document served there is requested for; the document names
+    /// `document_issuer(origin)` as its issuer and the origin's `/jwks.json` as
+    /// its key set.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the server lives exactly as long as the test"
+    )]
+    pub(crate) async fn discovery_server(document_issuer: impl FnOnce(&str) -> String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let document = json!({
+            "issuer": document_issuer(&origin),
+            "jwks_uri": format!("{origin}/jwks.json"),
+        });
+        let app = Router::new().route(
+            "/.well-known/openid-configuration",
+            get(move || {
+                let document = document.clone();
+                async move { Json(document) }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        origin
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -471,7 +528,7 @@ mod tests {
     use serde_json::{json, Value};
     use tokio::net::TcpListener;
 
-    use super::*;
+    use super::{test_support::discovery_server, *};
 
     #[test]
     fn test_cached_jwks_expiration() {
@@ -744,5 +801,59 @@ mod tests {
             Err(JwksError::KeyNotFound(_))
         ));
         assert_eq!(server.hits(), 2);
+    }
+
+    const TTL: Duration = Duration::from_secs(3600);
+
+    #[tokio::test]
+    async fn a_discovery_document_for_another_issuer_is_refused() {
+        let origin = discovery_server(|origin| format!("{origin}/another-tenant")).await;
+        let other = format!("{origin}/another-tenant");
+
+        let Err(err) = JwksProvider::from_issuer(&origin, TTL).await else {
+            panic!("a discovery document for another issuer must be refused");
+        };
+
+        assert!(
+            matches!(
+                &err,
+                JwksError::IssuerMismatch { configured, discovered }
+                    if configured == &origin && discovered == &other
+            ),
+            "{err:?}"
+        );
+        // The error names both issuers.
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("{other:?}")) && message.contains(&format!("{origin:?}")),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_discovery_document_for_the_configured_issuer_is_accepted() {
+        let origin = discovery_server(str::to_string).await;
+
+        let provider = JwksProvider::from_issuer(&origin, TTL).await.unwrap();
+
+        assert_eq!(provider.jwks_uri, format!("{origin}/jwks.json"));
+    }
+
+    #[tokio::test]
+    async fn an_issuer_with_a_terminating_slash_is_compared_as_configured() {
+        // The discovery URL carries one slash before the well-known path, and the
+        // document must name the issuer with its slash, as the tokens' `iss` does.
+        let origin = discovery_server(|origin| format!("{origin}/")).await;
+
+        let provider = JwksProvider::from_issuer(&format!("{origin}/"), TTL)
+            .await
+            .unwrap();
+        assert_eq!(provider.jwks_uri, format!("{origin}/jwks.json"));
+
+        // The same document is not for the issuer without the slash.
+        let Err(err) = JwksProvider::from_issuer(&origin, TTL).await else {
+            panic!("a document naming the issuer with a slash is not for the issuer without it");
+        };
+        assert!(matches!(err, JwksError::IssuerMismatch { .. }), "{err:?}");
     }
 }
