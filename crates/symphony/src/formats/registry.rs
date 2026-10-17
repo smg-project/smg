@@ -453,6 +453,10 @@ mod tests {
             table_for("thinkingmachines/Inkling-NVFP4"),
             Some(Table::Inkling)
         );
+        assert_eq!(
+            table_for("deepseek-ai/DeepSeek-V4.1-Flash-1017"),
+            Some(Table::DeepSeekV4_1)
+        );
         for mimo in [
             "XiaomiMiMo/MiMo-V2.6-Flash-RL",
             "XiaomiMiMo/MiMo-V2.6-Pro-RL",

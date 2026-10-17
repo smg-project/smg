@@ -208,7 +208,7 @@ with Symphony (a quantized or renamed checkpoint is not listed, and keeps the ol
 its group names it); whether the flags stay as aliases is an open question of the design.
 
 <!-- models: begin -->
-205 groups, 349 checkpoints, newest first.
+205 groups, 350 checkpoints, newest first.
 12 ready, 134 replaying a recorded set, 3 on main awaiting fixtures, 56 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
@@ -223,7 +223,7 @@ its group names it); whether the flags stay as aliases is an open question of th
 | 2026-09-21 | [mimo-v2.6-flash-rl](https://github.com/smg-project/bellwether/tree/main/fixtures/mimo-v2.6-flash-rl) | XiaomiMiMo/MiMo-V2.6-Flash-RL |  | `qwen3`, tagged calls, the value between the tags | 589,298 | replaying the set | none |
 | 2026-09-21 | [mimo-v2.6-pro-rl](https://github.com/smg-project/bellwether/tree/main/fixtures/mimo-v2.6-pro-rl) | XiaomiMiMo/MiMo-V2.6-Pro-RL | MiMo-V2.6-Flash-MOPD, MiMo-V2.6-Pro-MOPD | `qwen3`, tagged calls, the value between the tags | 589,298 | replaying the set | none |
 | 2026-09-11 | [atria-dawn-preview](https://github.com/smg-project/bellwether/tree/main/fixtures/atria-dawn-preview) | internlm/Atria-Dawn-Preview | Atria-Dawn-Preview-Ascend-w8a8 | `glm` | 503,273 | replaying the set | none |
-| 2026-09-10 | [deepseek-v4.1-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v4.1-flash) | deepseek-ai/DeepSeek-V4.1-Flash |  | `deepseek_v4.1` | 589,659 | replaying the set | `deepseek_v41`, `deepseek_v41` |
+| 2026-09-10 | [deepseek-v4.1-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v4.1-flash) | deepseek-ai/DeepSeek-V4.1-Flash | DeepSeek-V4.1-Flash-1017 | `deepseek_v4.1` | 589,659 | replaying the set | `deepseek_v41`, `deepseek_v41` |
 | 2026-09-06 | [minicpm5-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/minicpm5-2b) | openbmb/MiniCPM5-2B |  | `minicpm5` | 589,277 | replaying the set | none |
 | 2026-09-01 | [k2-horizon-36b](https://github.com/smg-project/bellwether/tree/main/fixtures/k2-horizon-36b) | IFM/K2-Horizon-36B | K2-Horizon-32B, K2-Horizon-375B-A23B | `k2_horizon` | 12,814 | replaying the set | none |
 | 2026-09-01 | [nvidia-nemotronlabs-ai-for-media-sports-tennis](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotronlabs-ai-for-media-sports-tennis) | nvidia/NVIDIA-NemotronLabs-AI-for-Media-Sports-Tennis |  | — | 12,825 | pending | none |

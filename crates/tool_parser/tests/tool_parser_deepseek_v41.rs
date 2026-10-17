@@ -321,6 +321,7 @@ fn factory_maps_v41_names_ahead_of_v4_and_registers_a_structural_tag() {
     assert!(!registry.has_structural_tag("deepseek_v4"));
     for model in [
         "deepseek-ai/DeepSeek-V4.1-Flash",
+        "deepseek-ai/DeepSeek-V4.1-Flash-1017",
         "deepseek-ai/DeepSeek-V41-Flash",
         "deepseek-v4.1-flash",
         "DeepSeek_V41",
