@@ -1260,7 +1260,7 @@ impl ChatDecode {
             Some(u64::from(
                 prompt_tokens.values().copied().max().unwrap_or(0),
             )),
-            u64::from(self.completion_tokens.total()),
+            u64::from(self.completion_tokens.delivered()),
         );
         cached_tokens
             .entry(index)

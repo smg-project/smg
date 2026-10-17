@@ -2932,7 +2932,7 @@ impl<'a> ChatStream<'a> {
                     .unwrap_or(0)
                     .saturating_sub(self.spec.unbilled_prompt_tokens),
             )),
-            u64::from(self.completion_tokens.total()),
+            u64::from(self.completion_tokens.delivered()),
         );
         if let Some(usage) = &mut self.continuous_usage {
             usage.record_complete(&complete);
@@ -3391,7 +3391,8 @@ impl<'a> ChatStream<'a> {
     /// Settle the stream's usage guard with the completion count as it
     /// stands (the prompt count stays what the last Complete set).
     fn settle_usage_so_far(&self) {
-        self.usage.settle(None, u64::from(self.counts().completion));
+        self.usage
+            .settle(None, u64::from(self.completion_tokens.delivered()));
     }
 
     /// The counters once, for the usage chunk, the settlement and the
@@ -4106,7 +4107,7 @@ impl<'a> MessagesStream<'a> {
         // client that stops reading from here on is booked with them.
         self.usage.settle(
             Some(u64::from(self.prompt_tokens)),
-            u64::from(self.completion_tokens.total()),
+            u64::from(self.completion_tokens.delivered()),
         );
         self.engine_thinking_tokens = complete.reasoning_tokens();
         self.cached_tokens = complete.cached_tokens();
@@ -4481,7 +4482,7 @@ impl<'a> MessagesStream<'a> {
     fn settle_usage_so_far(&self) {
         self.usage.settle(
             self.saw_complete.then_some(u64::from(self.prompt_tokens)),
-            u64::from(self.completion_tokens.total()),
+            u64::from(self.completion_tokens.delivered()),
         );
     }
 
