@@ -2876,15 +2876,30 @@ fn check_corrupted(
     for (name, cuts) in plans {
         let events = replay_after(&mut new_engine(), tail, text, &cuts, finish, false)
             .map_err(|e| format!("{name}: {e}"))?;
-        conserved(text, &events).map_err(|e| format!("{name} {cuts:?}: {e}"))?;
+        // The plan is named, not spelled out: the seeded plans are rebuilt from the case's id and
+        // round, and the character plan from the text.
+        conserved(text, &events).map_err(|e| format!("{name}: {e}"))?;
         let said = Said::of(&events);
         if said != expected {
             return Err(format!(
-                "{name} {cuts:?} says something else:\n    whole: {expected:?}\n    cut:   {said:?}"
+                "{name} says something else:\n    whole: {expected:?}\n    cut:   {said:?}"
             ));
         }
     }
     Ok(())
+}
+
+/// The first `chars` characters of `text`, with a note of how much was left out; the report file
+/// has it whole.
+fn window(text: &str, chars: usize) -> String {
+    match text.char_indices().nth(chars) {
+        Some((at, _)) => format!(
+            "{}... ({} bytes in all; the report file has it whole)",
+            &text[..at],
+            text.len()
+        ),
+        None => text.to_string(),
+    }
 }
 
 /// The message of a panic, as `panic!` formatted it.
@@ -2969,9 +2984,7 @@ fn corrupt_model(
 #[expect(
     clippy::print_stderr,
     clippy::print_stdout,
-    clippy::panic,
-    reason = "the skip notices and the per-model counts are test diagnostic output; a report that \
-              cannot be written ends the test with its path"
+    reason = "the skip notices and the per-model counts are test diagnostic output"
 )]
 fn corrupted_recorded_outputs_never_panic_and_keep_the_contract() {
     let Some(root) = std::env::var_os(FIXTURES_ENV).map(PathBuf::from) else {
@@ -3030,7 +3043,7 @@ fn corrupted_recorded_outputs_never_panic_and_keep_the_contract() {
         failures
             .iter()
             .take(SHOWN)
-            .cloned()
+            .map(|failure| window(failure, 2_048))
             .collect::<Vec<_>>()
             .join("\n")
     );
