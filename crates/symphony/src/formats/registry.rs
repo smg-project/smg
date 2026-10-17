@@ -194,7 +194,7 @@ impl Table {
     /// whose table has no older parser (`muse` for `muse_spark`), so that the launcher's flags
     /// read with the table, or an engine's exact name for a table (`llama4_pythonic` for
     /// `llama4`), beside the generic legacy name.
-    pub const ALIASES: [(&str, Table); 12] = [
+    pub const ALIASES: [(&str, Table); 13] = [
         ("qwen", Table::Qwen3),
         ("qwen_xml", Table::Qwen3Tagged),
         ("qwen_coder", Table::Qwen3Tagged),
@@ -205,6 +205,7 @@ impl Table {
         ("deepseek_v41", Table::DeepSeekV4_1),
         ("pythonic", Table::Llama4),
         ("llama4_pythonic", Table::Llama4),
+        ("llama", Table::Json),
         ("minimax", Table::MinimaxM2),
         ("muse", Table::MuseSpark),
     ];
@@ -517,7 +518,7 @@ mod tests {
                 "{alias}"
             );
         }
-        assert_eq!(Table::answering_to("llama"), None);
+        assert_eq!(Table::answering_to("cohere"), None);
         assert_eq!(Table::answering_to("passthrough"), None);
         // A launcher's name for a family whose table has no older parser answers for the table.
         assert_eq!(Table::answering_to("muse"), Some(Table::MuseSpark));

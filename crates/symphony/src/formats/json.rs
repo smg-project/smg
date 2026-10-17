@@ -1,7 +1,13 @@
 //! JSON calls alone in the turn: the whole output is one call object, `{"name": …, "arguments":
-//! {…}}`, or a list of them, or content. The format the gateway's older `json` parser reads for a
-//! model that names it. No recorded group writes it as its own format, so the table stands on its
-//! unit tests until one does.
+//! {…}}` (`parameters` naming the arguments under Llama's templates), or a list of them, or
+//! content. The format Llama 3.1's and Llama 3.2's own templates write (one call alone,
+//! `{"name": "get_weather", "parameters": {"city": "Paris"}}`), which the gateway's older `json`
+//! and `llama` parsers read; the Llama 3.2 model may write `<|python_tag|>` before the object,
+//! which the table drops wherever it stands: the object reads as the call when the tag opens the
+//! output, and an object after prose is content, tag or no tag, as prose before JSON is on this
+//! table (the gateway's older `llama` parser splits the output at the tag instead). Recorded as
+//! `llama-3.2-1b-instruct` and `llama-3.2-11b-vision-instruct`, and as the six Nemotron groups
+//! that keep Llama 3.1's template.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 use crate::format::{CallSyntax, Emits, Format};
@@ -9,6 +15,7 @@ use crate::format::{CallSyntax, Emits, Format};
 /// The JSON table.
 pub fn json() -> Format {
     Format::new("json")
+        .ignores("python_tag", "<|python_tag|>")
         .state("calls", Emits::Arguments)
         .calls(CallSyntax::JsonAlone)
 }
@@ -100,6 +107,59 @@ mod tests {
             events.last(),
             Some(Event::Finish { tool_calls: 0, .. })
         ));
+    }
+
+    #[test]
+    fn the_python_tag_is_wrapping_wherever_the_model_puts_it() {
+        // Llama 3.2 may write the tag before the object; the template writes the object alone.
+        let output =
+            "<|python_tag|>{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}";
+        let whole = run(&[output]);
+        assert_eq!(
+            calls(&whole),
+            [(
+                "get_weather".to_string(),
+                r#"{"city": "Paris"}"#.to_string()
+            )]
+        );
+        assert!(whole.iter().any(|event| matches!(
+            event,
+            Event::Dropped { text, why: DropReason::Wrapper } if text.text == "<|python_tag|>"
+        )));
+        for cut in 1..output.len() {
+            let events = run(&[&output[..cut], &output[cut..]]);
+            assert_eq!(calls(&events), calls(&whole), "cut at {cut}");
+        }
+        // Prose stays prose around it, and the tag is still wrapping.
+        let content = |events: &[Event]| -> String {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Content(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let events = run(&["Sure.<|python_tag|> I mean no."]);
+        assert!(calls(&events).is_empty());
+        assert_eq!(content(&events), "Sure. I mean no.");
+        // An object after prose is content with the prose, as it is with no tag: the tag opens
+        // no call on this table (the family's older parser splits the output at it).
+        let after_prose =
+            "Let me check.<|python_tag|>{\"name\": \"get_weather\", \"parameters\": {}}";
+        let events = run(&[after_prose]);
+        assert!(calls(&events).is_empty(), "{events:?}");
+        assert_eq!(
+            content(&events),
+            "Let me check.{\"name\": \"get_weather\", \"parameters\": {}}"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Dropped { text, why: DropReason::Wrapper } if text.text == "<|python_tag|>"
+        )));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, Event::Malformed { .. })));
     }
 
     #[test]

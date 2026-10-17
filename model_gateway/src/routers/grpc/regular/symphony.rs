@@ -1772,8 +1772,10 @@ mod tests {
             named_table(&pair(Some("kimi_k3"), Some("qwen3"))),
             Some(Table::KimiK3)
         );
-        assert_eq!(named_table(&pair(Some("llama"), None)), None);
-        assert_eq!(named_table(&pair(Some("llama"), Some("qwen3"))), None);
+        assert_eq!(named_table(&pair(Some("cohere"), None)), None);
+        assert_eq!(named_table(&pair(Some("cohere"), Some("qwen3"))), None);
+        // The older `llama` parser's family (Llama 3.2) reads with the json table.
+        assert_eq!(named_table(&pair(Some("llama"), None)), Some(Table::Json));
         // The older `pythonic` parser's family reads with the Llama 4 table.
         assert_eq!(
             named_table(&pair(Some("pythonic"), None)),
@@ -1895,7 +1897,7 @@ mod tests {
             PROMPT,
         );
         assert_eq!(assigned.expect("assigned").format.name(), "qwen3");
-        let legacy = names(Some("llama"), Some("deepseek_r1"));
+        let legacy = names(Some("cohere"), Some("deepseek_r1"));
         assert!(assign(
             ParserChoice::Symphony,
             &legacy,
@@ -3854,7 +3856,7 @@ mod tests {
             table("mistral_v13")
         );
         assert_eq!(
-            read(&labeled(pair(Some("llama"), None), &v13), known),
+            read(&labeled(pair(Some("cohere"), None), &v13), known),
             Ok(None)
         );
         assert_eq!(
