@@ -178,9 +178,10 @@ impl std::fmt::Display for MmRefsError {
                 "the selected worker does not fetch '{scheme}' URLs (accepts: {accepted}); \
                  file:// needs --allowed-local-media-path on the worker"
             ),
-            Self::EncodeNotSupported => {
-                f.write_str("media references cannot be routed through encode workers")
-            }
+            Self::EncodeNotSupported => f.write_str(
+                "media references cannot be routed through encode workers (encode-prefill-decode \
+                 pipeline); run the router with --mm-processing auto or router",
+            ),
             Self::WorkerNotCapable => f.write_str(
                 "the selected worker does not advertise worker-side multimodal processing",
             ),
@@ -271,13 +272,43 @@ pub(crate) fn vision_worker_without_media_processing(worker: &dyn Worker) -> boo
         && !worker_accepts_media_refs(worker)
 }
 
+/// Whether `workers` hold an encode worker, so their model runs the
+/// encode-prefill-decode pipeline: media references never travel on it,
+/// whatever its workers advertise, and selection refuses them with the
+/// request's own 400 (`EncodeNotSupported`), which names the fix that applies
+/// there (`--mm-processing auto` or `router`). Such a model is neither refused
+/// in preparation nor named as waiting for a media-capable worker (readiness,
+/// the registration warning): a capable worker changes nothing for it.
+pub(crate) fn pool_has_encode_worker<'a>(
+    workers: impl IntoIterator<Item = &'a Arc<dyn Worker>>,
+) -> bool {
+    workers
+        .into_iter()
+        .any(|worker| matches!(worker.worker_type(), WorkerType::Encode))
+}
+
+/// Whether registering `worker` under worker-side placement is said in the
+/// log: a vision worker that does not process media references
+/// ([`vision_worker_without_media_processing`]) of a model that is not on the
+/// encode-prefill-decode pipeline (`pool`: the model's registered workers and
+/// the ones registering with it, see [`pool_has_encode_worker`]).
+pub(crate) fn registration_lacks_media_processing<'a>(
+    worker: &dyn Worker,
+    pool: impl IntoIterator<Item = &'a Arc<dyn Worker>>,
+) -> bool {
+    vision_worker_without_media_processing(worker) && !pool_has_encode_worker(pool)
+}
+
 /// The models among `workers` whose multimodal requests worker-side placement
 /// cannot serve: a model with a worker that reports a vision encoder and no
 /// worker that processes media references, judged over every registered
 /// worker (healthy or not: the capability is configuration). What `/readiness`
 /// names in its ready body, sorted for a stable line and body. Empty under any
 /// other placement: `auto` processes such a model's media on the router,
-/// `router` always does.
+/// `router` always does. A model with an encode worker is never named: on the
+/// encode-prefill-decode pipeline references are refused whatever its workers
+/// advertise ([`pool_has_encode_worker`]), so a capable worker would change
+/// nothing for it.
 pub(crate) fn models_without_media_processing(
     processing: MmProcessingMode,
     workers: &[Arc<dyn Worker>],
@@ -287,8 +318,11 @@ pub(crate) fn models_without_media_processing(
     }
     let mut vision_only = BTreeSet::new();
     let mut capable = HashSet::new();
+    let mut encode_prefill_decode = HashSet::new();
     for worker in workers {
-        if worker_accepts_media_refs(worker.as_ref()) {
+        if matches!(worker.worker_type(), WorkerType::Encode) {
+            encode_prefill_decode.insert(worker.model_id());
+        } else if worker_accepts_media_refs(worker.as_ref()) {
             capable.insert(worker.model_id());
         } else if vision_worker_without_media_processing(worker.as_ref()) {
             vision_only.insert(worker.model_id());
@@ -296,7 +330,7 @@ pub(crate) fn models_without_media_processing(
     }
     vision_only
         .into_iter()
-        .filter(|model| !capable.contains(model))
+        .filter(|model| !capable.contains(model) && !encode_prefill_decode.contains(model))
         .map(str::to_string)
         .collect()
 }
@@ -393,10 +427,10 @@ fn ensure_fleet_processes_media_refs(
 ) -> Result<(), MmRefsError> {
     let workers = registry.get_by_model(model_id);
     if workers.is_empty()
-        || workers.iter().any(|worker| {
-            matches!(worker.worker_type(), WorkerType::Encode)
-                || worker_accepts_media_refs(worker.as_ref())
-        })
+        || pool_has_encode_worker(workers.iter())
+        || workers
+            .iter()
+            .any(|worker| worker_accepts_media_refs(worker.as_ref()))
     {
         return Ok(());
     }
@@ -1074,17 +1108,24 @@ mod tests {
         );
     }
 
-    /// What readiness is held on: under worker-side placement, a model with
-    /// a worker that reports a vision encoder and no worker that processes
+    /// What readiness names: under worker-side placement, a model with a
+    /// worker that reports a vision encoder and no worker that processes
     /// media references. A pool without the label (unknown) or with a
-    /// `false` (a text-only engine) is not it, one capable worker lifts it
-    /// for the model, and the other placements never hold readiness.
+    /// `false` (a text-only engine) is not it, one capable worker takes the
+    /// model off the list, a model with an encode worker is never on it (nor
+    /// is its registration warned about), and the other placements name
+    /// nothing.
     #[test]
     fn models_without_media_processing_names_vision_pools_with_no_capable_worker() {
-        fn worker_of(model: &str, url: &str, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
+        fn typed_worker_of(
+            model: &str,
+            url: &str,
+            labels: &[(&str, &str)],
+            worker_type: WorkerType,
+        ) -> Arc<dyn Worker> {
             let mut builder = BasicWorkerBuilder::new(url)
                 .model(ModelCard::new(model))
-                .worker_type(WorkerType::Regular)
+                .worker_type(worker_type)
                 .runtime_type(RuntimeType::Vllm)
                 .connection_mode(ConnectionMode::Grpc)
                 .health_config(HealthCheckConfig {
@@ -1095,6 +1136,9 @@ mod tests {
                 builder = builder.label(*key, *value);
             }
             Arc::new(builder.build())
+        }
+        fn worker_of(model: &str, url: &str, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
+            typed_worker_of(model, url, labels, WorkerType::Regular)
         }
         let vision = [(SUPPORTS_VISION_LABEL, "true")];
         let vision_capable = [
@@ -1113,11 +1157,50 @@ mod tests {
             // Text-only and unlabeled pools say nothing about media.
             worker_of("text", "grpc://127.0.0.1:9904", &text_only),
             worker_of("legacy", "grpc://127.0.0.1:9905", &[]),
+            // An encode-prefill-decode pool: references never travel on it,
+            // so its vision legs without a processor are not what readiness
+            // waits on.
+            typed_worker_of(
+                "vl-epd",
+                "grpc://127.0.0.1:9906",
+                &vision,
+                WorkerType::Prefill,
+            ),
+            typed_worker_of(
+                "vl-epd",
+                "grpc://127.0.0.1:9907",
+                &vision,
+                WorkerType::Decode,
+            ),
+            typed_worker_of("vl-epd", "grpc://127.0.0.1:9908", &[], WorkerType::Encode),
         ];
         assert_eq!(
             models_without_media_processing(MmProcessingMode::Worker, &workers),
             vec!["vl-b".to_string()]
         );
+        // The registration warning follows the same line: vl-b's worker is
+        // said, the encode-prefill-decode pool's vision leg is not, and a
+        // capable worker beside a plain one is not either.
+        let pool_of = |model: &str| {
+            workers
+                .iter()
+                .filter(move |worker| worker.model_id() == model)
+                .collect::<Vec<_>>()
+        };
+        assert!(registration_lacks_media_processing(
+            workers[0].as_ref(),
+            pool_of("vl-b").into_iter()
+        ));
+        assert!(!registration_lacks_media_processing(
+            workers[6].as_ref(),
+            pool_of("vl-epd").into_iter()
+        ));
+        assert!(!registration_lacks_media_processing(
+            workers[3].as_ref(),
+            pool_of("vl-a").into_iter()
+        ));
+        assert!(pool_has_encode_worker(pool_of("vl-epd").into_iter()));
+        assert!(!pool_has_encode_worker(pool_of("vl-a").into_iter()));
         for placement in [MmProcessingMode::Auto, MmProcessingMode::Router] {
             assert!(models_without_media_processing(placement, &workers).is_empty());
         }

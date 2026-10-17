@@ -15,7 +15,7 @@ use super::discover_dp::DpInfo;
 use crate::{
     config::ParserChoice,
     routers::grpc::{
-        multimodal::{mm_settings, vision_worker_without_media_processing, SUPPORTS_VISION_LABEL},
+        multimodal::{mm_settings, registration_lacks_media_processing, SUPPORTS_VISION_LABEL},
         regular::symphony::{check_names, labels_select_nothing, set_aside_by_the_registry},
         utils::Names,
         zmq_client::zmq_handshake_address,
@@ -322,12 +322,18 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         // requests are refused (`no_media_ref_capable_worker`) and `/readiness`
         // names the model while no worker of it processes references; a
         // capable worker beside it lifts both, so this warns and does not
-        // refuse the registration.
+        // refuse the registration. A model on the encode-prefill-decode
+        // pipeline (an encode worker among its registered workers or these)
+        // is not warned about: references never travel on it, and selection
+        // answers with the fix that applies there.
         if mm_settings().processing.value == MmProcessingMode::Worker {
-            for worker in workers
-                .iter()
-                .filter(|worker| vision_worker_without_media_processing(worker.as_ref()))
-            {
+            for worker in workers.iter().filter(|worker| {
+                let registered = app_context.worker_registry.get_by_model(worker.model_id());
+                registration_lacks_media_processing(
+                    worker.as_ref(),
+                    workers.iter().chain(registered.iter()),
+                )
+            }) {
                 warn!(
                     url = %worker.url(),
                     model = %worker.model_id(),
