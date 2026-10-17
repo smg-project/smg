@@ -269,7 +269,7 @@ async fn execute_mcp_tool_loop_streaming(
 
         // Execute pipeline and get stream + load guards
         let startup_pending = startup.is_some();
-        let (execution_result, _load_guards) = match ctx
+        let (execution_result, _load_guards, usage_booking) = match ctx
             .pipeline
             .execute_harmony_responses_streaming(
                 &current_request,
@@ -313,6 +313,9 @@ async fn execute_mcp_tool_loop_streaming(
                 return;
             }
         };
+        // One booking per engine round trip, as the buffered loop books each
+        // of its iterations.
+        usage_booking.book(iteration_result.usage());
 
         // Handle iteration result (tool calls or completion)
         match iteration_result {
@@ -544,7 +547,7 @@ async fn execute_without_mcp_streaming(
 
     // Execute pipeline and get stream + load guards
     let startup_pending = startup.is_some();
-    let (execution_result, _load_guards) = match ctx
+    let (execution_result, _load_guards, usage_booking) = match ctx
         .pipeline
         .execute_harmony_responses_streaming(
             current_request,
@@ -589,6 +592,7 @@ async fn execute_without_mcp_streaming(
         }
     };
     // _load_guards dropped here after iteration completes
+    usage_booking.book(iteration_result.usage());
 
     // Extract usage from iteration result
     let usage = match iteration_result {

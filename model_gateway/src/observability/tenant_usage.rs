@@ -21,6 +21,11 @@
 //! atomic adds; no label is interned and no exporter series is touched per
 //! request. The scrape walks the table, which is why the families are
 //! rendered here rather than recorded through the exporter.
+//!
+//! A request is one engine round trip: a Responses call whose tool loop runs
+//! several iterations books each of them, buffered or streamed, so the token
+//! sums match what the engine served and the `requests` count says how many
+//! times it was asked.
 
 use std::{
     collections::HashMap,
@@ -246,6 +251,13 @@ impl TenantUsage {
 
     /// Book one finished request. A tenant seen for the first time takes a
     /// row while rows remain, and is booked under [`OTHER_TENANT`] after.
+    ///
+    /// The count of rows is exact under concurrency (the slot claim below);
+    /// the attribution of a request is exact but for one window: the first
+    /// requests of a tenant arriving together while the last rows go, where
+    /// a request that lost the claim is booked under `other` unless its
+    /// tenant's row is already in place when it looks again. The totals
+    /// across the rows and `other` are exact either way.
     pub fn record(&self, tenant: &str, model: &str, usage: RequestUsage) {
         if let Some(entry) = self.tenants.get(tenant) {
             entry.record(model, usage);
@@ -258,7 +270,13 @@ impl TenantUsage {
             })
             .is_ok();
         if !claimed {
-            self.other.record(model, usage);
+            // The table filled between the lookup and the claim: a tenant
+            // whose other request took the last row meanwhile is booked to
+            // that row, not under `other`.
+            match self.tenants.get(tenant) {
+                Some(entry) => entry.record(model, usage),
+                None => self.other.record(model, usage),
+            }
             return;
         }
         match self.tenants.entry(Arc::from(tenant)) {

@@ -734,7 +734,14 @@ impl StreamingProcessor {
                 handle.close_reserved_only().await;
             }
         }
-        Self::record_generate_metrics(start_time, first_token_time, total_completion, None, &ctx);
+        Self::record_generate_metrics(
+            start_time,
+            first_token_time,
+            prompt_tokens,
+            total_completion,
+            None,
+            &ctx,
+        );
 
         Ok(())
     }
@@ -993,6 +1000,7 @@ impl StreamingProcessor {
         Self::record_generate_metrics(
             start_time,
             first_token_time,
+            prompt_tokens,
             total_completion,
             pd_timing.as_ref(),
             &ctx,
@@ -1005,10 +1013,13 @@ impl StreamingProcessor {
     // Helper Methods
     // ========================================================================
 
-    /// Record streaming metrics for generate endpoint
+    /// Record streaming metrics for generate endpoint. `prompt_tokens` is the
+    /// count the `Complete` message carried (0 when the stream ended without
+    /// one), the same count the client reads in `meta_info.prompt_tokens`.
     fn record_generate_metrics(
         start_time: Instant,
         first_token_time: Option<Instant>,
+        prompt_tokens: u32,
         total_completion: u32,
         pd_timing: Option<&context::PdTiming>,
         ctx: &GenerateStreamContext,
@@ -1027,7 +1038,7 @@ impl StreamingProcessor {
             endpoint: metrics_labels::ENDPOINT_GENERATE,
             ttft: first_token_time.map(|t| t.duration_since(stream_base)),
             generation_duration: stream_base.elapsed(),
-            input_tokens: None, // generate endpoint doesn't expose prompt tokens in streaming
+            input_tokens: Some(u64::from(prompt_tokens)),
             output_tokens: total_completion as u64,
             tenant: context::usage_tenant(ctx.tenant_key.as_ref()),
         });
