@@ -1,0 +1,18 @@
+name: 'Export API key from pod env'
+description: >-
+  Takes the Anthropic API key the runner pod carries in its environment into the
+  job's environment, masked in the logs; the job fails here, with a clear
+  message, when the pod has none.
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Export API key from pod env
+      shell: bash
+      run: |
+        if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+          echo "::error::ANTHROPIC_API_KEY is not present in the runner pod environment"
+          exit 1
+        fi
+        echo "::add-mask::${ANTHROPIC_API_KEY}"
+        echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" >> "$GITHUB_ENV"

@@ -39,19 +39,10 @@ jobs:
           fetch-depth: 0
 
       - name: Export API key from pod env
-        run: |
-          echo "::add-mask::${ANTHROPIC_API_KEY}"
-          echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" >> "$GITHUB_ENV"
+        uses: ./.github/actions/export-pod-api-key
 
       - name: Install gh CLI
-        run: |
-          if ! command -v gh &>/dev/null; then
-            mkdir -p "$HOME/.local/bin"
-            GH_VERSION="2.74.0"
-            curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
-              | tar xz --strip-components=2 -C "$HOME/.local/bin" "gh_${GH_VERSION}_linux_amd64/bin/gh"
-            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          fi
+        uses: ./.github/actions/setup-gh
 
       - name: Record run start time
         id: run-start
@@ -315,19 +306,10 @@ jobs:
           fetch-depth: 0
 
       - name: Export API key from pod env
-        run: |
-          echo "::add-mask::${ANTHROPIC_API_KEY}"
-          echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" >> "$GITHUB_ENV"
+        uses: ./.github/actions/export-pod-api-key
 
       - name: Install gh CLI
-        run: |
-          if ! command -v gh &>/dev/null; then
-            mkdir -p "$HOME/.local/bin"
-            GH_VERSION="2.74.0"
-            curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
-              | tar xz --strip-components=2 -C "$HOME/.local/bin" "gh_${GH_VERSION}_linux_amd64/bin/gh"
-            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          fi
+        uses: ./.github/actions/setup-gh
 
       - uses: anthropics/claude-code-action@v1
         with:
