@@ -598,6 +598,9 @@ struct Router {
     tenant_header_name: String,
     tenant_rate_limit_config: Option<String>,
     tenant_rate_limit_enabled: bool,
+    token_dump_dir: Option<String>,
+    token_dump_max_mb: u64,
+    token_dump_on_start: bool,
     tokenizer_cache_enable_l0: bool,
     tokenizer_cache_enable_l1: bool,
     tokenizer_cache_l0_max_entries: usize,
@@ -1143,6 +1146,9 @@ impl Router {
             .maybe_trace(trace_config)
             .maybe_log_dir(self.log_dir.as_ref())
             .maybe_jemalloc_prof_dir(self.jemalloc_prof_dir.as_ref())
+            .maybe_token_dump_dir(self.token_dump_dir.as_ref())
+            .token_dump_on_start(self.token_dump_on_start)
+            .token_dump_max_mb(self.token_dump_max_mb)
             .maybe_log_level(self.log_level.as_ref())
             .maybe_request_id_headers(self.request_id_headers.clone())
             .trust_tenant_header(self.trust_tenant_header)
@@ -1393,6 +1399,9 @@ impl Router {
         tenant_header_name = String::from("x-smg-tenant-id"),
         tenant_rate_limit_config = None,
         tenant_rate_limit_enabled = false,
+        token_dump_dir = None,
+        token_dump_max_mb = 1024,
+        token_dump_on_start = false,
         tokenizer_cache_enable_l0 = false,
         tokenizer_cache_enable_l1 = false,
         tokenizer_cache_l0_max_entries = 10000,
@@ -1594,6 +1603,9 @@ impl Router {
         tenant_header_name: String,
         tenant_rate_limit_config: Option<String>,
         tenant_rate_limit_enabled: bool,
+        token_dump_dir: Option<String>,
+        token_dump_max_mb: u64,
+        token_dump_on_start: bool,
         tokenizer_cache_enable_l0: bool,
         tokenizer_cache_enable_l1: bool,
         tokenizer_cache_l0_max_entries: usize,
@@ -1825,6 +1837,9 @@ impl Router {
             tenant_header_name,
             tenant_rate_limit_config,
             tenant_rate_limit_enabled,
+            token_dump_dir,
+            token_dump_max_mb,
+            token_dump_on_start,
             tokenizer_cache_enable_l0,
             tokenizer_cache_enable_l1,
             tokenizer_cache_l0_max_entries,

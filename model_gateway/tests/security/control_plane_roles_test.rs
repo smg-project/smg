@@ -37,6 +37,8 @@ const WRITE_ROUTES: &[(&str, &str)] = &[
     ("POST", "/v1/tokenizers"),
     ("POST", "/stop_profile"),
     ("POST", "/heap_profile"),
+    ("POST", "/start_token_dump"),
+    ("POST", "/stop_token_dump"),
 ];
 
 fn control_plane_auth() -> ControlPlaneAuthState {

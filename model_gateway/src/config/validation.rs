@@ -343,6 +343,7 @@ impl ConfigValidator {
         Self::validate_value_shapes(config)?;
         Self::validate_log_dir(config)?;
         Self::validate_access_log_fields(config)?;
+        Self::validate_token_dump(config)?;
         Self::validate_storage_context_headers(config)?;
         Self::validate_routing_key_headers(config)?;
         Self::validate_tenant_resolution(config)?;
@@ -1384,6 +1385,22 @@ impl ConfigValidator {
             });
         }
 
+        Ok(())
+    }
+
+    fn validate_token_dump(config: &RouterConfig) -> ConfigResult<()> {
+        if config.token_dump_on_start && config.token_dump_dir.is_none() {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "--token-dump-on-start needs --token-dump-dir".to_string(),
+            });
+        }
+        if config.token_dump_max_mb == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "token_dump_max_mb".to_string(),
+                value: "0".to_string(),
+                reason: "a token dump file needs at least 1 MiB".to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -3096,6 +3113,27 @@ mod tests {
                 Err(ConfigError::InvalidValue { ref field, .. }) if field == "model_aliases"
             ));
         }
+    }
+
+    #[test]
+    fn test_validate_token_dump() {
+        let mut config = regular_mode_config();
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config.token_dump_on_start = true;
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::IncompatibleConfig { .. })
+        ));
+
+        config.token_dump_dir = Some("/tmp/smg-token-dumps".to_string());
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config.token_dump_max_mb = 0;
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "token_dump_max_mb"
+        ));
     }
 
     fn regular_mode_config() -> RouterConfig {

@@ -1110,6 +1110,21 @@ struct ServingArgs {
     #[arg(long, help_heading = "Profiling")]
     jemalloc_prof_dir: Option<String>,
 
+    // ==================== Token dump ====================
+    /// Directory where token dumps are written: `POST /start_token_dump` (an
+    /// admin route) and `--token-dump-on-start` record every gRPC engine call
+    /// there, one JSON line per event; unset, the routes answer 404
+    #[arg(long, help_heading = "Token Dump")]
+    token_dump_dir: Option<String>,
+
+    /// Record every engine call from startup until shutdown (needs --token-dump-dir)
+    #[arg(long, default_value_t = false, help_heading = "Token Dump")]
+    token_dump_on_start: bool,
+
+    /// Size cap of one token dump file, in MiB; lines past it are dropped and counted
+    #[arg(long, default_value_t = 1024, help_heading = "Token Dump")]
+    token_dump_max_mb: u64,
+
     // ==================== Request Handling ====================
     /// Custom HTTP headers to check for request IDs. The first one present
     /// is honoured when its value is 1 to 128 visible-ASCII characters;
@@ -3193,6 +3208,9 @@ impl CliArgs {
             .maybe_trace(trace_config)
             .maybe_log_dir(self.serving.log_dir.as_ref())
             .maybe_jemalloc_prof_dir(self.serving.jemalloc_prof_dir.as_ref())
+            .maybe_token_dump_dir(self.serving.token_dump_dir.as_ref())
+            .token_dump_on_start(self.serving.token_dump_on_start)
+            .token_dump_max_mb(self.serving.token_dump_max_mb)
             .maybe_request_id_headers(
                 (!self.serving.request_id_headers.is_empty())
                     .then(|| self.serving.request_id_headers.clone()),

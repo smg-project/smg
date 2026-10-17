@@ -20,7 +20,10 @@ use tracing::{debug, info, warn};
 use crate::{
     config::{ParserChoice, RouterConfig},
     middleware::{AuthConfig, TokenBucket},
-    observability::inflight_tracker::InFlightRequestTracker,
+    observability::{
+        inflight_tracker::InFlightRequestTracker,
+        token_dump::{DumpTap, TokenDump},
+    },
     policies::PolicyRegistry,
     rate_limit::RateLimitManager,
     routers::{
@@ -108,6 +111,8 @@ pub struct AppContext {
     pub webrtc_bind_addr: Option<std::net::IpAddr>,
     /// STUN server for ICE candidate gathering. Defaults to `stun.l.google.com:19302`; `"none"` to disable.
     pub webrtc_stun_server: Option<String>,
+    /// The token dump `--token-dump-dir` enables; `None` without it.
+    pub token_dump: Option<Arc<TokenDump>>,
 }
 
 impl std::fmt::Debug for AppContext {
@@ -518,6 +523,17 @@ impl AppContextBuilder {
             &router_config,
         );
 
+        let token_dump =
+            TokenDump::from_config(&router_config).map_err(AppContextBuildError::InvalidConfig)?;
+        if let Some(dump) = &token_dump {
+            // The dump records the engine clients' calls; the tap is
+            // process-wide, like the gateway's one dump.
+            smg_grpc_client::set_call_tap(Some(Arc::new(DumpTap::new(
+                Arc::clone(dump),
+                Arc::clone(&worker_registry),
+            ))));
+        }
+
         Ok(AppContext {
             gateway_auth,
             client: self
@@ -568,6 +584,7 @@ impl AppContextBuilder {
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: self.webrtc_bind_addr,
             webrtc_stun_server: self.webrtc_stun_server,
+            token_dump,
         })
     }
 
