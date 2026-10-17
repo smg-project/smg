@@ -551,10 +551,10 @@ mod tests {
         (status, challenge, String::from_utf8(body.to_vec()).unwrap())
     }
 
-    /// One admission path for every credential: a missing or unknown token is
-    /// refused with the realm's challenge, a role short of the method is
-    /// forbidden, and an admitted caller reaches the handler as the principal
-    /// its credential names.
+    /// The API-key credential through the one admission path: a missing or
+    /// unknown token is refused with the realm's challenge, a role short of
+    /// the method is forbidden, and an admitted caller reaches the handler as
+    /// the principal its key names.
     #[tokio::test]
     async fn an_api_key_caller_is_refused_forbidden_or_admitted_through_one_path() {
         use axum::{middleware::from_fn_with_state, routing::get, Router};
@@ -610,6 +610,60 @@ mod tests {
                 StatusCode::OK,
                 "reader via api_key:reader as User".to_string()
             )
+        );
+    }
+
+    /// The JWT credential through the same path: a signed token is admitted
+    /// as the principal its claims name, and a token that is a JWT in shape
+    /// but does not verify is refused at once with the challenge and the
+    /// reason, with no fall-back to the API keys.
+    #[tokio::test]
+    async fn a_jwt_caller_is_admitted_or_refused_through_the_same_path() {
+        use axum::{middleware::from_fn_with_state, routing::get, Router};
+
+        use crate::{
+            config::ApiKeyEntry,
+            jwt::test_support::{token, validator, ISSUER},
+        };
+
+        let validator = validator().await;
+        let state = ControlPlaneAuthState::new(
+            ControlPlaneAuthConfig {
+                jwt: Some(validator.config().clone()),
+                api_keys: vec![ApiKeyEntry::new("ops", "Ops", "ops-key", Role::Admin)],
+                audit_enabled: false,
+            },
+            Some(Arc::new(validator)),
+        );
+        let app = Router::new()
+            .route("/thing", get(whoami))
+            .layer(from_fn_with_state(state, control_plane_auth_middleware));
+
+        let signed = token(None);
+        let (status, _, body) = call(&app, "GET", Some(&signed)).await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::OK, format!("alice via jwt:{ISSUER} as Admin"))
+        );
+
+        let mut tampered = signed.clone();
+        let last = tampered.pop().expect("a signed token has a signature");
+        tampered.push(if last == 'A' { 'B' } else { 'A' });
+        let (status, challenge, body) = call(&app, "GET", Some(&tampered)).await;
+        assert_eq!(
+            (status, challenge),
+            (
+                StatusCode::UNAUTHORIZED,
+                Some("Bearer realm=\"control-plane\"".to_string())
+            )
+        );
+        assert!(body.starts_with("Invalid JWT: "), "{body}");
+
+        // A token that is not a JWT in shape still reaches the API keys.
+        let (status, _, body) = call(&app, "GET", Some("ops-key")).await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::OK, "ops via api_key:ops as Admin".to_string())
         );
     }
 }
