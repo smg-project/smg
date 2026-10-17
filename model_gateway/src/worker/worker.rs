@@ -2496,6 +2496,21 @@ impl BasicWorker {
     }
 }
 
+impl BasicWorker {
+    /// The model cards this worker answers for, read in place: the lazily
+    /// discovered list when one was set, the metadata's cards otherwise. The
+    /// one place that chooses, so `models` and `any_model` cannot drift
+    /// apart.
+    fn with_model_cards<R>(&self, read: impl FnOnce(&[ModelCard]) -> R) -> R {
+        let overridden = self.models_override.load();
+        if overridden.is_wildcard() {
+            read(self.metadata.spec.models.all())
+        } else {
+            read(overridden.all())
+        }
+    }
+}
+
 #[async_trait]
 impl Worker for BasicWorker {
     /// [`BasicWorker`] keeps the trait's default `prepare_request`, so the
@@ -2953,23 +2968,11 @@ impl Worker for BasicWorker {
     }
 
     fn models(&self) -> Vec<ModelCard> {
-        let overridden = self.models_override.load();
-        let source = if overridden.is_wildcard() {
-            self.metadata.spec.models.all()
-        } else {
-            overridden.all()
-        };
-        source.to_vec()
+        self.with_model_cards(<[ModelCard]>::to_vec)
     }
 
     fn any_model(&self, pred: &mut dyn FnMut(&ModelCard) -> bool) -> bool {
-        let overridden = self.models_override.load();
-        let source = if overridden.is_wildcard() {
-            self.metadata.spec.models.all()
-        } else {
-            overridden.all()
-        };
-        source.iter().any(pred)
+        self.with_model_cards(|cards| cards.iter().any(pred))
     }
 
     fn context_length(&self, model_id: &str) -> Option<u32> {

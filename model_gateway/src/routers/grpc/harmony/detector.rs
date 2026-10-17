@@ -69,3 +69,59 @@ impl HarmonyDetector {
             .any(|worker| Self::is_harmony_worker(worker.as_ref()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, WorkerType};
+
+    fn builder() -> BasicWorkerBuilder {
+        BasicWorkerBuilder::new("grpc://127.0.0.1:1")
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Grpc)
+    }
+
+    /// A worker whose metadata holds no card yet, served as `model_id`.
+    fn undiscovered(model_id: &str) -> impl Worker {
+        builder().label("model_id", model_id).build()
+    }
+
+    /// A card found gpt_oss by its model type after discovery, on a worker
+    /// whose metadata held none: the lazily discovered list is what the
+    /// check reads.
+    #[test]
+    fn a_discovered_card_with_the_gpt_oss_model_type_is_harmony() {
+        let worker = undiscovered("served-model");
+        assert!(
+            !HarmonyDetector::is_harmony_worker(&worker),
+            "no card, a plain id"
+        );
+        let mut discovered = ModelCard::new("served-model");
+        discovered.hf_model_type = Some("gpt_oss".to_string());
+        worker.set_models(vec![discovered]);
+        assert!(HarmonyDetector::is_harmony_worker(&worker));
+    }
+
+    #[test]
+    fn a_card_with_the_gpt_oss_architecture_is_harmony_whatever_its_id() {
+        let mut card = ModelCard::new("plain-7b");
+        card.architectures = vec!["GptOssForCausalLM".to_string()];
+        let worker = builder().model(card).build();
+        assert!(HarmonyDetector::is_harmony_worker(&worker));
+    }
+
+    #[test]
+    fn a_worker_whose_id_says_gpt_oss_is_harmony_through_the_fallback() {
+        let worker = undiscovered("openai/GPT-OSS-20b");
+        assert!(HarmonyDetector::is_harmony_worker(&worker));
+    }
+
+    #[test]
+    fn a_plain_card_and_id_are_not_harmony() {
+        let worker = builder().model(ModelCard::new("plain-7b")).build();
+        assert!(!HarmonyDetector::is_harmony_worker(&worker));
+        assert!(!HarmonyDetector::is_harmony_worker(&undiscovered(
+            "plain-7b"
+        )));
+    }
+}
