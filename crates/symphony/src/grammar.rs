@@ -4164,7 +4164,7 @@ mod tests {
                     let node = json_schema_node(&answer["format"]).expect("the schema node");
                     assert_eq!(node["json_schema"], *schema, "{answer}");
                     assert_eq!(
-                        node["max_whitespace_cnt"], 16,
+                        node["max_whitespace_cnt"], 32,
                         "reasoning_open={reasoning_open} {start:?}: {answer}"
                     );
                 }

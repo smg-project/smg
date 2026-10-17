@@ -7,8 +7,11 @@
 //! A JSON answer's whitespace is bounded: held to a schema's JSON after a long thought by an
 //! engine that starts the grammar at the first token, the model drifted into runs of tabs and
 //! newlines inside the object until the budget ended, where its own server, which lets no thought
-//! precede the answer, stopped every time; a run of at most sixteen characters leaves ordinary
-//! layout room and ends the drift.
+//! precede the answer, stopped every time. A run of at most thirty-two characters ends a drift of
+//! thousands and leaves pretty-printing its room: a newline and four-space indentation to a depth
+//! of seven, two-space to fifteen; past that the model writes the next token early, the JSON
+//! still valid. The bound goes with the table to every model that reads with it (the d1 family's
+//! checkpoints too, on which the drift was not measured).
 
 use crate::{
     format::{CallSyntax, Emits, Format},
@@ -31,7 +34,7 @@ pub fn lfm2_5() -> Format {
         .transition("calls", "calls_close", "content")
         .calls(CallSyntax::Pythonic(Dialect::LFM2_5))
         .opens_turn("<|im_start|>assistant")
-        .bounds_answer_whitespace(16)
+        .bounds_answer_whitespace(32)
 }
 
 #[cfg(test)]

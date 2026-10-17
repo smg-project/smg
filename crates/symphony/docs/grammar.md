@@ -98,7 +98,8 @@ its tokens (`Format::bounds_answer_whitespace`, written as xgrammar's `max_white
 answer's schema node; an xgrammar before 0.2.7 ignores the key): a model held to its answer's JSON
 after a long thought, by an engine that starts the grammar at the first token, may drift into tabs
 and newlines the schema's grammar otherwise admits without end. LFM2.5's table bounds them to
-sixteen; the calls' values are never bounded.
+thirty-two, which leaves four-space indentation seven levels deep; the calls' values are never
+bounded.
 
 Whether a thought comes before the call or the answer is the table's, not the syntax's: a table
 whose template writes the thought before every call and answer (`Format::thinks_first`) gets it
