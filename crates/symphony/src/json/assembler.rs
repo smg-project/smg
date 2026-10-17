@@ -16,9 +16,9 @@
 use crate::{
     event::{Event, Events, MalformedReason, Text},
     json::{
+        fragments::Fragments,
         is_complete,
         outline::{Scanner, Span},
-        prefix::Prefix,
     },
 };
 
@@ -31,14 +31,8 @@ pub struct Assembler {
     /// The outline of `text`, read as it grows.
     scanner: Scanner,
     started: bool,
-    /// Argument bytes accounted for so far, as fragments or as malformed text.
-    emitted: usize,
-    /// Argument bytes the prefix has judged so far.
-    judged: usize,
-    /// Whether the argument bytes are still a JSON prefix, judged as they arrive.
-    prefix: Prefix,
-    /// The argument byte from which the arguments stopped being a valid JSON prefix, if they did.
-    invalid_from: Option<usize>,
+    /// The argument bytes, sent, held or reported as they arrive.
+    fragments: Fragments,
     done: bool,
     /// Whether the object ends where its bytes stop being a call's object: where its arguments
     /// stop being a JSON prefix, or where its outline stops short of the closing brace (the brace
@@ -59,10 +53,7 @@ impl Assembler {
             text: String::new(),
             scanner: Scanner::default(),
             started: false,
-            emitted: 0,
-            judged: 0,
-            prefix: Prefix::default(),
-            invalid_from: None,
+            fragments: Fragments::default(),
             done: false,
             ends_where_refused: false,
             ended_at: None,
@@ -71,7 +62,7 @@ impl Assembler {
 
     /// Whether the arguments stopped being a JSON prefix.
     pub fn refused(&self) -> bool {
-        self.invalid_from.is_some()
+        self.fragments.refused()
     }
 
     /// The object ends where its bytes stop being a call's object: where its arguments stop being
@@ -87,7 +78,7 @@ impl Assembler {
     /// ([`Self::ending_where_refused`]), and they did. An object that ended where its outline
     /// stopped, or one that closed after its arguments broke, did not.
     pub fn ended_where_refused(&self) -> bool {
-        self.ends_where_refused && self.invalid_from.is_some()
+        self.ends_where_refused && self.fragments.refused()
     }
 
     /// Where the outline stopped short of the object's close, for an object that ends there.
@@ -263,7 +254,7 @@ impl Assembler {
             // and a `Malformed` event of no bytes, before its end, says that its arguments are no
             // whole value, where a client would otherwise take them for one. The engine names the
             // reason for a region a marker closed.
-            if self.invalid_from.is_none() && !self.arguments_whole(found.arguments.as_ref()) {
+            if !self.fragments.refused() && !self.arguments_whole(found.arguments.as_ref()) {
                 out.push(Event::Malformed {
                     text: Text::default(),
                     why: MalformedReason::UnterminatedRegion,
@@ -308,77 +299,34 @@ impl Assembler {
     /// The argument bytes held back ([`Self::emit_new_argument_bytes`]), sent as the prefix they
     /// are when the value can take no more bytes: at its end, or the stream's.
     fn send_held(&mut self, arguments: Option<&Span>, out: &mut Events) {
-        let Some(span) = arguments else {
-            return;
-        };
-        let bytes = span.text(&self.text);
-        if self.invalid_from.is_none() && self.emitted < bytes.len() {
-            let held = &bytes[self.emitted..];
-            out.push(Event::ToolCallArguments {
-                index: self.index,
-                json: held.to_string(),
-                source: Text::uncounted(held),
-            });
-            self.emitted = bytes.len();
+        if let Some(span) = arguments {
+            self.fragments
+                .send_held(span.text(&self.text), self.index, out);
         }
     }
 
     /// The argument bytes that arrived since the last call: a fragment for the part that keeps the
-    /// arguments a valid JSON prefix, malformed text for the rest, once the prefix has broken.
+    /// arguments a valid JSON prefix, malformed text for the rest, once the prefix has broken,
+    /// and the bytes the judge may still go back to held while the value is open
+    /// ([`Fragments::send`]).
     fn emit_new_argument_bytes(&mut self, arguments: Option<&Span>, out: &mut Events) {
         let Some(span) = arguments else {
             return;
         };
         let bytes = span.text(&self.text);
-        if bytes.len() <= self.emitted {
+        let Some(sent_to) = self
+            .fragments
+            .send(bytes, span.end.is_none(), self.index, out)
+        else {
             return;
-        }
-        // Only the bytes that arrived are judged; the prefix keeps its place between pieces.
-        let verdict = self.prefix.feed(&bytes[self.judged..]);
-        self.judged = bytes.len();
-        let valid_end = match self.invalid_from {
-            Some(from) => from,
-            None => match verdict {
-                None => bytes.len(),
-                Some(from) => *self.invalid_from.insert(from.max(self.emitted)),
-            },
         };
-        // Bytes the judge may still go back to (a word being spelled, `nu`; a surrogate escape
-        // awaiting its low half; the whitespace before a value at the top) are held while the
-        // value is still open: a fragment passed on cannot be taken back, so the pieces would say
-        // `n` where the whole says nothing. They are sent once the next bytes settle them, with
-        // the value's end, or when no more bytes can come ([`Self::send_held`]), as the prefix
-        // they are then. A string-valued arguments streams as written, the one shape where the
-        // pieces may say more than the whole (`Prefix::held_from`).
-        let valid_end = match self.prefix.held_from() {
-            Some(start) if span.end.is_none() && self.invalid_from.is_none() => {
-                valid_end.min(start).max(self.emitted)
-            }
-            _ => valid_end,
-        };
-        if self.emitted < valid_end {
-            let fresh = &bytes[self.emitted..valid_end];
-            out.push(Event::ToolCallArguments {
-                index: self.index,
-                json: fresh.to_string(),
-                source: Text::uncounted(fresh),
-            });
-            self.emitted = valid_end;
-        }
-        if self.ends_where_refused && self.invalid_from.is_some() {
+        if self.ends_where_refused && self.fragments.refused() {
             // The object ends at the break; what follows is handed back, not reported as its
             // malformed rest.
-            self.ended_at = Some(span.start + valid_end);
+            self.ended_at = Some(span.start + sent_to);
             return;
         }
-        // Past the break the rest is malformed; before any break what is not sent is held.
-        if self.invalid_from.is_some() && self.emitted < bytes.len() {
-            out.push(Event::Malformed {
-                text: Text::uncounted(&bytes[self.emitted..]),
-                why: MalformedReason::InvalidArguments,
-            });
-            self.emitted = bytes.len();
-        }
+        self.fragments.send_malformed(bytes, out);
     }
 }
 

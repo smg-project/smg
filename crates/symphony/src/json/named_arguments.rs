@@ -29,7 +29,7 @@
 use super::header::{Found, Header};
 use crate::{
     event::{Event, Events, MalformedReason, Text},
-    json::{is_complete, outline::Scanner, prefix::Prefix},
+    json::{fragments::Fragments, is_complete, outline::Scanner},
 };
 
 const NAME_WITHOUT_ARGUMENTS: &str = "a call that names a tool and writes no arguments";
@@ -52,14 +52,8 @@ struct Arguments {
     text: String,
     /// The outline of `text`, read as it grows: its close is the object's.
     scanner: Scanner,
-    /// Bytes accounted for so far, as fragments or as malformed text.
-    emitted: usize,
-    /// Bytes the prefix has judged so far.
-    judged: usize,
-    /// Whether the bytes are still a JSON prefix, judged as they arrive.
-    prefix: Prefix,
-    /// The byte from which the arguments stopped being a valid JSON prefix, if they did.
-    invalid_from: Option<usize>,
+    /// The bytes, sent, held or reported as they arrive.
+    fragments: Fragments,
     done: bool,
 }
 
@@ -133,10 +127,7 @@ impl Arguments {
             index,
             text: String::new(),
             scanner: Scanner::default(),
-            emitted: 0,
-            judged: 0,
-            prefix: Prefix::default(),
-            invalid_from: None,
+            fragments: Fragments::default(),
             done: false,
         }
     }
@@ -179,16 +170,8 @@ impl Arguments {
         if self.done {
             return;
         }
-        if self.invalid_from.is_none() && self.emitted < self.text.len() {
-            let held = &self.text[self.emitted..];
-            out.push(Event::ToolCallArguments {
-                index: self.index,
-                json: held.to_string(),
-                source: Text::uncounted(held),
-            });
-            self.emitted = self.text.len();
-        }
-        if self.invalid_from.is_none() && !is_complete(&self.text) {
+        self.fragments.send_held(&self.text, self.index, out);
+        if !self.fragments.refused() && !is_complete(&self.text) {
             out.push(Event::Malformed {
                 text: Text::default(),
                 why: MalformedReason::UnterminatedRegion,
@@ -201,50 +184,17 @@ impl Arguments {
     }
 
     /// The bytes that arrived since the last call: a fragment for the part that keeps the
-    /// arguments a valid JSON prefix, malformed text for the rest, once the prefix has broken.
-    /// While the object is `open`, bytes the judge may still go back to (a word being spelled,
-    /// `nu`; a surrogate escape awaiting its low half; the whitespace before the value, which a
-    /// refused word at the top takes with it) are held: a fragment passed on cannot be taken
-    /// back, so the pieces would say `n` where the whole says nothing. They are sent once the
-    /// next bytes settle them, with the object's close, or when no more bytes can come
-    /// ([`Self::finish`]). A string where the object should be streams as written, the one shape
-    /// where the pieces may say more than the whole (`Prefix::held_from`).
+    /// arguments a valid JSON prefix, malformed text for the rest, once the prefix has broken,
+    /// and the bytes the judge may still go back to held while the object is `open`
+    /// ([`Fragments::send`]); they go with the object's close, or when no more bytes can come
+    /// ([`Self::finish`]).
     fn emit_new_bytes(&mut self, open: bool, out: &mut Events) {
-        if self.text.len() <= self.emitted {
-            return;
-        }
-        // Only the bytes that arrived are judged; the prefix keeps its place between pieces.
-        let verdict = self.prefix.feed(&self.text[self.judged..]);
-        self.judged = self.text.len();
-        let valid_end = match self.invalid_from {
-            Some(from) => from,
-            None => match verdict {
-                None => self.text.len(),
-                Some(from) => *self.invalid_from.insert(from.max(self.emitted)),
-            },
-        };
-        let valid_end = match self.prefix.held_from() {
-            Some(start) if open && self.invalid_from.is_none() => {
-                valid_end.min(start).max(self.emitted)
-            }
-            _ => valid_end,
-        };
-        if self.emitted < valid_end {
-            let fresh = &self.text[self.emitted..valid_end];
-            out.push(Event::ToolCallArguments {
-                index: self.index,
-                json: fresh.to_string(),
-                source: Text::uncounted(fresh),
-            });
-            self.emitted = valid_end;
-        }
-        // Past the break the rest is malformed; before any break what is not sent is held.
-        if self.invalid_from.is_some() && self.emitted < self.text.len() {
-            out.push(Event::Malformed {
-                text: Text::uncounted(&self.text[self.emitted..]),
-                why: MalformedReason::InvalidArguments,
-            });
-            self.emitted = self.text.len();
+        if self
+            .fragments
+            .send(&self.text, open, self.index, out)
+            .is_some()
+        {
+            self.fragments.send_malformed(&self.text, out);
         }
     }
 }
