@@ -1884,6 +1884,19 @@ mod tests {
         assert_eq!(named_table(&pair(Some("pythonic"), Some("qwen3"))), None);
         // The older `llama` parser's format is the json table's.
         assert_eq!(named_table(&pair(Some("llama"), None)), Some(Table::Json));
+        // The older DeepSeek pairings read with the tables, the thought included: R1-0528 behind
+        // `deepseek` + `deepseek_r1` writes V3's calls after a thought, and the V3 table reads it.
+        assert_eq!(
+            named_table(&pair(Some("deepseek"), Some("deepseek_r1"))),
+            Some(Table::DeepSeekV3)
+        );
+        assert!(Table::DeepSeekV3
+            .format()
+            .reasoning_open("<｜Assistant｜><think>\n"));
+        assert_eq!(
+            named_table(&pair(Some("deepseek31"), Some("deepseek_v31"))),
+            Some(Table::DeepSeekV3_1)
+        );
         // `passthrough` leaves a channel as written, which no table reads for: the legacy
         // parsers keep it, alone or beside another name.
         assert_eq!(

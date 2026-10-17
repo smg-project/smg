@@ -178,8 +178,13 @@ is the terminal that leaves the call. Beyond that:
   `<｜tool▁call▁end｜>` right after it is not a terminal: the bytes stay in the call as malformed
   text until the next opener or the block's close, as the older parser's pattern would not have
   read them either.
-- **No thought.** The template has no thinking switch, so `<think>` and `</think>` are content, as
-  the reference says.
+- **A thought the template never writes.** V3's template has no thinking switch, yet the table
+  keeps the thought rows (`<think>` opens it, `</think>` closes it, a calls block ends it) because
+  the gateway's older `deepseek` parser served checkpoints that share the call spelling and write
+  a thought: DeepSeek R1-0528, paired with the `deepseek_r1` reasoning parser. The `deepseek` alias
+  takes that deployment to this table, and the thought must never land in the content. The cost
+  is a V3-0324 output that spells `<think>` itself, which the reference keeps as content and the
+  table reads as a thought; the recorded sets hold none.
 - **The recorded set holds no call**, for the reason given under V3.1; the calls stand on the turns
   the template renders, held in the module's tests at every cut.
 

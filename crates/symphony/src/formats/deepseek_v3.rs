@@ -1,9 +1,8 @@
-//! DeepSeek V3: no thought, and the calls as one block, `<｜tool▁calls▁begin｜>` to
-//! `<｜tool▁calls▁end｜>`, holding one call after another, each as
-//! `<｜tool▁call▁begin｜>function<｜tool▁sep｜>`, the tool's name, a `json` code fence around the
-//! arguments object, and `<｜tool▁call▁end｜>`, the calls after the first on a new line. Content
-//! comes before the block. As the checkpoint's template renders it for
-//! `deepseek-ai/DeepSeek-V3-0324`:
+//! DeepSeek V3: the calls as one block, `<｜tool▁calls▁begin｜>` to `<｜tool▁calls▁end｜>`, holding
+//! one call after another, each as `<｜tool▁call▁begin｜>function<｜tool▁sep｜>`, the tool's name,
+//! a `json` code fence around the arguments object, and `<｜tool▁call▁end｜>`, the calls after the
+//! first on a new line. Content comes before the block. As the checkpoint's template renders it
+//! for `deepseek-ai/DeepSeek-V3-0324`:
 //!
 //! ```text
 //! <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather
@@ -13,10 +12,13 @@
 //! ```
 //!
 //! The spelling is the gateway's older `deepseek` parser's; DeepSeek V3.1 drops the type and the
-//! fence ([`deepseek_v3_1`]). Recorded as `deepseek-v3-0324`, whose parse sets hold content alone:
-//! the template takes a call's arguments as a string, so the recorder, whose corpus holds them as
-//! an object, refused every call case; the calls stand on the turns the template renders, held in
-//! the tests below.
+//! fence ([`deepseek_v3_1`]). V3's template writes no thought; the table reads one between
+//! `<think>` and `</think>` all the same, since the checkpoints that share the call spelling and
+//! write a thought (DeepSeek R1-0528, which the gateway's older pairing `deepseek` + `deepseek_r1`
+//! served) read with it under the `deepseek` alias, and a thought must never land in the content.
+//! Recorded as `deepseek-v3-0324`, whose parse sets hold content alone: the template takes a
+//! call's arguments as a string, so the recorder, whose corpus holds them as an object, refused
+//! every call case; the calls stand on the turns the template renders, held in the tests below.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 //!
@@ -30,14 +32,20 @@ pub const FENCE_OPEN: &str = "\n```json\n";
 /// The DeepSeek V3 table.
 pub fn deepseek_v3() -> Format {
     Format::new("deepseek_v3")
+        .terminal("think_open", "<think>")
+        .terminal("think_close", "</think>")
         .terminal("calls_open", "<｜tool▁calls▁begin｜>")
         .terminal("calls_close", "<｜tool▁calls▁end｜>")
         .terminal("call_open", "<｜tool▁call▁begin｜>function<｜tool▁sep｜>")
         .terminal("call_close", "```<｜tool▁call▁end｜>")
         .state("content", Emits::Content)
+        .state("reasoning", Emits::Reasoning)
         .state("calls", Emits::Wrapper)
         .state("call", Emits::Arguments)
+        .transition("content", "think_open", "reasoning")
+        .transition("reasoning", "think_close", "content")
         .transition("content", "calls_open", "calls")
+        .transition("reasoning", "calls_open", "calls")
         .transition("calls", "call_open", "call")
         .transition("call", "call_close", "calls")
         .transition("call", "call_open", "call")
@@ -60,6 +68,8 @@ mod tests {
 
     /// The generation prompt's tail: the turn's opener and nothing more.
     const PROMPT: &str = "<｜Assistant｜>";
+    /// The tail of a checkpoint that opens the thought in the prompt (R1-0528's spelling).
+    const THINKING: &str = "<｜Assistant｜><think>\n";
 
     fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
         let mut parser = Engine::new(deepseek_v3(), Declared::default());
@@ -135,6 +145,16 @@ mod tests {
             .collect()
     }
 
+    fn reasoning(events: &[Event]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Reasoning(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn malformed(events: &[Event]) -> Vec<&str> {
         events
             .iter()
@@ -161,24 +181,32 @@ mod tests {
 
     /// A turn as the checkpoint's chat template renders it (`chat_template` of
     /// `deepseek-ai/DeepSeek-V3-0324`, the arguments given as the strings the template
-    /// concatenates): the turn and the message the template rendered.
+    /// concatenates): the prompt's tail, the turn, and the message the template rendered.
     struct RenderedTurn {
+        tail: &'static str,
         output: &'static str,
+        reasoning: &'static str,
         content: &'static str,
         calls: &'static [(&'static str, &'static str)],
     }
 
     /// The turns the template renders for the shapes a tool-calling conversation takes: one call,
     /// three calls in one block (a newline before each call after the first), a call after
-    /// content, a call with no arguments, nested and non-ASCII values, and content alone.
+    /// content, a call with no arguments, nested and non-ASCII values, and content alone; then a
+    /// call and content after a thought the prompt opens, as the checkpoints that share the
+    /// spelling and write a thought (R1-0528) have it.
     const RENDERED_TURNS: &[RenderedTurn] = &[
         RenderedTurn {
+            tail: PROMPT,
             output: "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Paris\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+            reasoning: "",
             content: "",
             calls: &[("get_weather", "{\"city\": \"Paris\"}")],
         },
         RenderedTurn {
+            tail: PROMPT,
             output: "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Paris\"}\n```<｜tool▁call▁end｜>\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Rome\"}\n```<｜tool▁call▁end｜>\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_stock_price\n```json\n{\"ticker\": \"MSFT\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+            reasoning: "",
             content: "",
             calls: &[
                 ("get_weather", "{\"city\": \"Paris\"}"),
@@ -187,17 +215,23 @@ mod tests {
             ],
         },
         RenderedTurn {
+            tail: PROMPT,
             output: "Let me check.<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Paris\", \"unit\": \"celsius\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+            reasoning: "",
             content: "Let me check.",
             calls: &[("get_weather", "{\"city\": \"Paris\", \"unit\": \"celsius\"}")],
         },
         RenderedTurn {
+            tail: PROMPT,
             output: "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_stock_price\n```json\n{}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+            reasoning: "",
             content: "",
             calls: &[("get_stock_price", "{}")],
         },
         RenderedTurn {
+            tail: PROMPT,
             output: "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>save_note\n```json\n{\"title\": \"Plan\", \"body\": \"Line one\\nLine two with \\\"quotes\\\" and a backslash \\\\\", \"tags\": [\"a\", \"b\"], \"meta\": {\"nested\": {\"deep\": [1, 2.5, true, null]}}}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+            reasoning: "",
             content: "",
             calls: &[(
                 "save_note",
@@ -205,19 +239,43 @@ mod tests {
             )],
         },
         RenderedTurn {
+            tail: PROMPT,
             output: "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>save_note\n```json\n{\"title\": \"計画 🌍\", \"body\": \"café\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+            reasoning: "",
             content: "",
             calls: &[("save_note", "{\"title\": \"計画 🌍\", \"body\": \"café\"}")],
         },
         RenderedTurn {
+            tail: PROMPT,
             output: "It is sunny in Paris.",
+            reasoning: "",
             content: "It is sunny in Paris.",
+            calls: &[],
+        },
+        RenderedTurn {
+            tail: THINKING,
+            output: "The user asks about Paris.</think><｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Paris\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+            reasoning: "The user asks about Paris.",
+            content: "",
+            calls: &[("get_weather", "{\"city\": \"Paris\"}")],
+        },
+        RenderedTurn {
+            tail: THINKING,
+            output: "97 is not divisible by 2, 3, 5 or 7.</think>Yes, 97 is prime.",
+            reasoning: "97 is not divisible by 2, 3, 5 or 7.",
+            content: "Yes, 97 is prime.",
             calls: &[],
         },
     ];
 
     fn check(turn: &RenderedTurn, events: &[Event], how: &str) {
         assert_eq!(bytes(events), turn.output, "{how}: {:?}", turn.output);
+        assert_eq!(
+            reasoning(events),
+            turn.reasoning,
+            "{how}: {:?}",
+            turn.output
+        );
         assert_eq!(content(events), turn.content, "{how}: {:?}", turn.output);
         let expected: Vec<(String, String)> = turn
             .calls
@@ -243,7 +301,7 @@ mod tests {
     #[test]
     fn every_turn_the_template_renders_reads_back_as_the_message_it_rendered() {
         for turn in RENDERED_TURNS {
-            let events = run(PROMPT, &[turn.output]);
+            let events = run(turn.tail, &[turn.output]);
             check(turn, &events, "whole");
         }
     }
@@ -253,7 +311,7 @@ mod tests {
         for turn in RENDERED_TURNS {
             for (at, _) in turn.output.char_indices().skip(1) {
                 let (head, rest) = turn.output.split_at(at);
-                let events = run(PROMPT, &[head, rest]);
+                let events = run(turn.tail, &[head, rest]);
                 check(turn, &events, &format!("cut at {at}"));
             }
             let pieces: Vec<&str> = turn
@@ -261,7 +319,7 @@ mod tests {
                 .char_indices()
                 .map(|(at, c)| &turn.output[at..at + c.len_utf8()])
                 .collect();
-            let events = run(PROMPT, &pieces);
+            let events = run(turn.tail, &pieces);
             check(turn, &events, "character by character");
         }
     }
@@ -298,9 +356,11 @@ mod tests {
     }
 
     #[test]
-    fn content_keeps_the_other_families_markers_as_text() {
-        // The two probes: neither the fenced `<tool_call>` block nor `</think>` is a marker of
-        // this table, which has no thought, so both stay content, as the reference says.
+    fn content_keeps_the_fenced_block_and_a_thought_the_model_writes_is_read() {
+        // The two probes: the fenced `<tool_call>` block is no marker of this table, so it stays
+        // content; `<think>` and `</think>` are, though V3's template never writes them, so a
+        // thought the model writes is reasoning and a `</think>` quoted inside it ends it (the
+        // engine's rule for a marker inside a channel, bellwether #16).
         let fence =
             "The syntax is:\n\n```\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": \
                      {\"city\": \"Paris\"}}\n</tool_call>\n```\n\nThat is all.";
@@ -308,9 +368,17 @@ mod tests {
         assert_eq!(content(&events), fence);
         assert!(calls(&events).is_empty());
         assert_eq!(finish(&events), (FinishReason::Stop, 0));
-        let marker = "<think>I could write </think> here.</think>Paris.";
-        let events = run(PROMPT, &[marker]);
-        assert_eq!(content(&events), marker);
+        let events = run(
+            PROMPT,
+            &["<think>I could write </think> here.</think>Paris."],
+        );
+        assert_eq!(reasoning(&events), "I could write ");
+        assert_eq!(content(&events), " here.</think>Paris.");
+        // A thought the prompt opened and the model closed at once leaves the output in content,
+        // as the older pairing of the `deepseek` and `deepseek_r1` parsers read it.
+        let events = run(THINKING, &["</think>Paris is sunny."]);
+        assert_eq!(reasoning(&events), "");
+        assert_eq!(content(&events), "Paris is sunny.");
     }
 
     #[test]
@@ -355,6 +423,8 @@ mod tests {
     #[test]
     fn the_prompt_decides_where_the_output_starts() {
         let format = deepseek_v3();
+        assert!(!format.reasoning_open("<｜User｜>Hi<｜Assistant｜>"));
+        assert!(format.reasoning_open(THINKING));
         // After a tool result the prompt ends in `<｜tool▁outputs▁end｜>` with no new opener: the
         // replay walks the previous turn's calls block from its `<｜Assistant｜>` and leaves the
         // output in content, where the template puts it.

@@ -267,8 +267,8 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // DeepSeek V3.1 and V3.2-Exp close the thought in the prompt (`</think>` right after the
     // opener) unless the request's `thinking` kwarg opens it; the recorded requests carry
     // `enable_thinking`, which these templates do not read, so every recorded prompt closes it
-    // and the output starts in content. DeepSeek V3 has no thought. Their sets hold content
-    // alone: the templates take a call's arguments as a string, and the recorder refused every
+    // and the output starts in content. DeepSeek V3's template writes no thought. Their sets hold
+    // content alone: the templates take a call's arguments as a string, and the recorder refused every
     // call case of the corpus, whose arguments are objects.
     ("deepseek-v3.1", GenerationPrompt::Plain),
     ("deepseek-v3.2-exp", GenerationPrompt::Plain),
