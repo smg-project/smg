@@ -1937,14 +1937,28 @@ async fn decode_video_with_ffmpeg(
     cfg: VideoFetchConfig,
 ) -> Result<DecodedVideoFrames, MediaConnectorError> {
     // A probe that fails leaves the clip to the metadata-less runner, which
-    // reads the stream as it comes; a probe that states no size is the one
-    // refusal that ends the request here instead (`video_metadata_from`):
-    // that runner has no work cap, and nothing frames such a stream.
-    let metadata = match probe_video_metadata(input_path).await {
-        Ok(metadata) => Some(metadata),
-        Err(error) if is_video_size_unknown(&error) => return Err(error),
-        Err(_) => None,
-    };
+    // reads the stream as it comes.
+    let metadata = probe_video_metadata(input_path).await.ok();
+    // A probe that states no size (ffprobe's `0x0` for a stream whose codec
+    // parameters it could not find; the decoder still decodes it, its filter
+    // graph set up from the first frame) frames nothing for the headed and
+    // raw runners and counts no pixels for the work cap. The clip keeps the
+    // probe's frames and duration, so it gets its selection, and goes
+    // straight to the PNG runner, whose frames carry their own size: the
+    // decode ends at the selection's last pick, under the process budget,
+    // never on the resample route over every source frame.
+    if let Some(probed) = metadata.filter(VideoMetadata::is_unsized) {
+        let selection = FrameSelection::from_metadata(probed, cfg);
+        return decode_video_png_frames(
+            input_path,
+            input_bytes,
+            cfg,
+            Some(probed),
+            selection.as_ref(),
+            selection.as_ref().map(FrameSelection::sampling_info),
+        )
+        .await;
+    }
     let Some((probed, selection)) = metadata.and_then(|probed| {
         FrameSelection::from_metadata(probed, cfg).map(|selection| (probed, selection))
     }) else {
@@ -2101,7 +2115,7 @@ async fn decode_video_with_ffmpeg_runners(
                 .await
                 .and_then(|info| video_metadata_from(info, false))
             {
-                Ok(probed) => {
+                Ok(probed) if !probed.is_unsized() => {
                     // The cap was judged on the container's stated size; the
                     // probe's is the decoder's, so it is judged again before a
                     // second decoder starts on it.
@@ -2113,11 +2127,15 @@ async fn decode_video_with_ffmpeg_runners(
                     headed =
                         decode_video_with_ffmpeg_ppm(input_path, cfg, metadata, selection).await;
                 }
-                Err(error) => {
-                    info!(
-                        error = %error,
-                        "video probe after a frame size mismatch failed; the container's metadata stands"
-                    );
+                probed => {
+                    // A probe that cannot run, or states no size, leaves the
+                    // container's metadata standing.
+                    if let Err(error) = probed {
+                        info!(
+                            error = %error,
+                            "video probe after a frame size mismatch failed; the container's metadata stands"
+                        );
+                    }
                     return decode_video_png_frames(
                         input_path,
                         input_bytes,
@@ -2408,22 +2426,13 @@ const VIDEO_DECODED_BYTES_KNOB: &str = "SMG_VIDEO_MAX_DECODED_BYTES";
 /// What `ensure_decode_work_limit` names in the error of a decode refused for its work.
 const VIDEO_MAX_DECODE_PIXELS_KNOB: &str = "SMG_VIDEO_MAX_DECODE_PIXELS";
 
-/// The refusal of a probe that states no size (`video_metadata_from`).
-const VIDEO_SIZE_UNKNOWN: &str = "a stream of unknown size is not decoded";
-
-/// `true` for the refusal of a probe that states no size.
-fn is_video_size_unknown(error: &MediaConnectorError) -> bool {
-    matches!(error, MediaConnectorError::VideoDecode(message) if message.contains(VIDEO_SIZE_UNKNOWN))
-}
-
-/// `true` for the error of a decode refused for its size, its work or its
-/// stream's unknown size, or ended for its time: a budget no other runner
-/// over the same stream, and no resampling of it, can answer, so it ends the
-/// decode instead of starting the next runner.
+/// `true` for the error of a decode refused for its size or its work, or
+/// ended for its time: a budget no other runner over the same stream, and no
+/// resampling of it, can answer, so it ends the decode instead of starting
+/// the next runner.
 fn is_video_budget_error(error: &MediaConnectorError) -> bool {
     is_video_command_timeout(error)
         || matches!(error, MediaConnectorError::DecodedTooLarge { .. })
-        || is_video_size_unknown(error)
         || matches!(error, MediaConnectorError::VideoDecode(message) if message.contains(VIDEO_DECODED_BYTES_KNOB) || message.contains(VIDEO_MAX_DECODE_PIXELS_KNOB))
 }
 
@@ -2683,6 +2692,15 @@ struct VideoMetadata {
     from_container: bool,
 }
 
+impl VideoMetadata {
+    /// Whether the probe stated no size (ffprobe's `0x0` for a stream whose
+    /// codec parameters it could not find): nothing frames such a stream by
+    /// its size, and the work cap would count no pixels for it.
+    fn is_unsized(&self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ProbedVideoInfo {
     width: Option<u32>,
@@ -2718,15 +2736,10 @@ fn video_metadata_from(
         MediaConnectorError::VideoDecode("ffprobe did not return video height".to_string())
     })?;
     // ffprobe states `0x0` for a stream whose codec parameters it could not
-    // find: no decoder frames such a stream, and the work cap would count no
-    // pixels for it (the container's tables refuse a zero size already).
-    // `decode_video_with_ffmpeg` ends the request on this refusal instead of
-    // falling back to the metadata-less runner, which has no work cap.
-    if width == 0 || height == 0 {
-        return Err(MediaConnectorError::VideoDecode(format!(
-            "ffprobe reported a video size of {width}x{height}: {VIDEO_SIZE_UNKNOWN}"
-        )));
-    }
+    // find; the size is kept as stated ([`VideoMetadata::is_unsized`]) and
+    // `decode_video_with_ffmpeg` sends such a clip to the headed PNG runner,
+    // whose frames carry their own size, with the frames and duration the
+    // probe did state (the container's tables refuse a zero size already).
     Ok(VideoMetadata {
         width,
         height,
@@ -4001,25 +4014,28 @@ mod tests {
     }
 
     /// A probe that states no size (ffprobe's `0x0` for a stream whose codec
-    /// parameters it could not find) is refused: no decoder frames such a
-    /// stream, and the work cap would count no pixels for it.
+    /// parameters it could not find) is kept as stated, unsized, with the
+    /// frames and duration it did state; a sized probe is not unsized.
     #[test]
-    fn ffprobe_metadata_refuses_a_zero_size() {
+    fn ffprobe_metadata_keeps_a_zero_size_as_unsized() {
+        let probed = |width, height| ProbedVideoInfo {
+            width: Some(width),
+            height: Some(height),
+            duration_seconds: Some(1.0),
+            source_fps: Some(30.0),
+            total_frames: Some(30),
+            container_frames: Some(30),
+        };
         for (width, height) in [(0, 48), (64, 0), (0, 0)] {
-            let info = ProbedVideoInfo {
-                width: Some(width),
-                height: Some(height),
-                duration_seconds: Some(1.0),
-                source_fps: Some(30.0),
-                total_frames: Some(30),
-                container_frames: Some(30),
-            };
-            let error = video_metadata_from(info, false).expect_err("a zero size is refused");
-            assert!(
-                error.to_string().contains(&format!("{width}x{height}")),
-                "{error}"
-            );
+            let metadata =
+                video_metadata_from(probed(width, height), false).expect("a zero size is kept");
+            assert!(metadata.is_unsized(), "{width}x{height}");
+            assert_eq!((metadata.width, metadata.height), (width, height));
+            assert_eq!(metadata.total_frames, Some(30));
+            assert_eq!(metadata.duration_seconds, Some(1.0));
         }
+        let sized = video_metadata_from(probed(64, 48), false).expect("a sized probe");
+        assert!(!sized.is_unsized());
     }
 
     #[test]
@@ -5594,36 +5610,46 @@ mod video_sampling_tests {
         assert_eq!(info.total_frames, None);
     }
 
-    /// A probe that states no size ends the decode with its refusal: the
-    /// metadata-less runner, which has no work cap, never starts on such a
-    /// stream, and no fallback runner resamples it.
+    /// A probe that states no size keeps the clip's frames and duration, so
+    /// the clip gets its selection, and goes straight to the headed PNG
+    /// runner: the selection's frames come back, each at its own size, and
+    /// the decode ends at the last pick rather than resampling every source
+    /// frame. Skipped when ffmpeg or ffprobe is not on PATH.
     #[tokio::test]
-    async fn a_probe_that_states_no_size_ends_the_decode() {
+    async fn a_probe_that_states_no_size_goes_straight_to_the_png_runner() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("unsized.bin");
-        // Not a container whose tables are read: the probe answers for it.
-        std::fs::write(&path, b"not a container").expect("a clip stand-in");
+        // Not an MP4 whose tables are read: the probe answers for the clip.
+        let Some(path) = small_clip(dir.path(), "unsized.avi") else {
+            return;
+        };
+        let input_bytes = std::fs::metadata(&path).expect("clip size").len() as usize;
         probe_switch::ANSWER.with(|answer| {
             answer.set(Some(ProbedVideoInfo {
                 width: Some(0),
                 height: Some(0),
-                duration_seconds: Some(36_000.0),
-                source_fps: Some(30.0),
-                total_frames: Some(1_080_000),
-                container_frames: Some(1_080_000),
+                duration_seconds: Some(1.0),
+                source_fps: Some(24.0),
+                total_frames: Some(24),
+                container_frames: Some(24),
             }));
         });
-        let decoded = decode_video_with_ffmpeg(&path, 15, cfg()).await;
+        let decoded = decode_video_with_ffmpeg(&path, input_bytes, up_to_cfg(4)).await;
         probe_switch::ANSWER.with(|answer| answer.set(None));
-        let error = match decoded {
-            Ok(_) => panic!("a stream of unknown size is refused"),
-            Err(error) => error,
+        let DecodedVideoFrames::Images {
+            frames, sampling, ..
+        } = decoded.expect("the headed PNG runner decodes the clip")
+        else {
+            panic!("a probe that states no size goes to the headed PNG runner");
         };
-        assert!(error.to_string().contains(VIDEO_SIZE_UNKNOWN), "{error}");
-        assert!(
-            is_video_budget_error(&error),
-            "the refusal ends the request; no runner resamples it"
+        let sampling = sampling.expect("the clip kept its selection");
+        assert_eq!(sampling.source_fps, 24.0);
+        assert_eq!(sampling.frame_indices.len(), 4);
+        assert_eq!(
+            frames.len(),
+            4,
+            "the selection's frames, not every source frame"
         );
+        assert_eq!((frames[0].width(), frames[0].height()), (64, 48));
     }
 
     /// Skipped when ffmpeg or ffprobe is not on PATH.
