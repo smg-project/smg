@@ -4730,8 +4730,6 @@ mod tests {
         );
     }
 
-    /// The CLI parsers reject these, but TOML/JSON and the Python bindings
-    /// reach `RouterConfig` without going through clap.
     /// The wedge drain is opt-in and escalates the wedged veto: on with a
     /// wedge threshold, refused without one, and off by default.
     #[test]
@@ -4772,6 +4770,8 @@ mod tests {
         );
     }
 
+    /// The CLI parsers reject these, but TOML/JSON and the Python bindings
+    /// reach `RouterConfig` without going through clap.
     #[test]
     fn test_reject_degenerate_worker_overload_thresholds() {
         let mut config = RouterConfig::new(

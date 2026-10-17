@@ -748,20 +748,16 @@ impl WorkerService {
             validate_merged_labels(&worker.metadata().spec.labels, labels)?;
         }
 
-        // An operator's re-admission acts on the live workers now, on every
-        // rank behind the URL: the veto and the wedge drain ride the shared
+        // An operator's re-admission acts on the live workers, on every rank
+        // behind the URL: the veto and the wedge drain ride the shared
         // runtime, which the queued property update would inherit anyway. A
         // request that asks for nothing else queues no job; any other body
-        // (an empty one included) goes through the queue as before.
-        let readmitted = (update.readmit == Some(true)).then(|| {
-            // Every rank is re-admitted, whatever the first one had to end.
-            let mut any = false;
-            for worker in find_workers_by_url(&self.worker_registry, &url) {
-                any |= liveness::readmit(&worker);
-            }
-            any
-        });
-        if readmitted.is_some() && !update.updates_properties() {
+        // (an empty one included) goes through the queue as before, and is
+        // re-admitted once its job is queued, so a refused update ends
+        // nothing.
+        let readmit = update.readmit == Some(true);
+        if readmit && !update.updates_properties() {
+            let readmitted = Some(self.readmit_every_rank(&url));
             return Ok(UpdateWorkerResult {
                 worker_id,
                 url,
@@ -781,12 +777,23 @@ impl WorkerService {
             .await
             .map_err(|e| WorkerServiceError::QueueSubmitFailed { message: e })?;
 
+        let readmitted = readmit.then(|| self.readmit_every_rank(&url));
         Ok(UpdateWorkerResult {
             worker_id,
             url,
             queued: true,
             readmitted,
         })
+    }
+
+    /// Ends the veto and the wedge drain on every rank behind `url`, whatever
+    /// the first one had to end; whether any of them had something to end.
+    fn readmit_every_rank(&self, url: &str) -> bool {
+        let mut any = false;
+        for worker in find_workers_by_url(&self.worker_registry, url) {
+            any |= liveness::readmit(&worker);
+        }
+        any
     }
 }
 
@@ -1068,7 +1075,9 @@ mod tests {
         assert_eq!(result.readmitted, Some(false));
         assert!(!result.queued);
 
-        // A property update still needs the queue, readmit or not.
+        // A property update still needs the queue, readmit or not; one the
+        // queue refuses re-admits nothing, so the error means what it says.
+        assert!(worker.set_stall(Some(StallReason::Wedged)));
         let with_cost: WorkerUpdateRequest =
             serde_json::from_value(json!({"readmit": true, "cost": 2.0}))
                 .expect("an update the type takes");
@@ -1080,6 +1089,11 @@ mod tests {
                 .expect_err("queue is uninitialized"),
             WorkerServiceError::QueueNotInitialized
         ));
+        assert_eq!(
+            worker.stall_reason(),
+            Some(StallReason::Wedged),
+            "a refused update ends no veto"
+        );
     }
 
     /// An update is held to the same rules for the fields it may change.

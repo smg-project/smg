@@ -2155,57 +2155,53 @@ impl ProtoGenerateResponse {
         }
     }
 
+    /// The finish reason of a `Complete`, the engine's last message for a
+    /// request; `None` for a chunk or an empty message.
+    fn complete_finish_reason(&self) -> Option<&str> {
+        match self {
+            Self::Sglang(resp) => match &resp.response {
+                Some(sglang::generate_response::Response::Complete(c)) => Some(&c.finish_reason),
+                _ => None,
+            },
+            Self::Vllm(resp) => match &resp.response {
+                Some(vllm::generate_response::Response::Complete(c)) => Some(&c.finish_reason),
+                _ => None,
+            },
+            Self::Trtllm(resp) => match &resp.response {
+                Some(trtllm::generate_response::Response::Complete(c)) => Some(&c.finish_reason),
+                _ => None,
+            },
+            Self::Mlx(resp) => match &resp.response {
+                Some(mlx::generate_response::Response::Complete(c)) => Some(&c.finish_reason),
+                _ => None,
+            },
+            Self::TokenSpeed(resp) => match &resp.response {
+                Some(tokenspeed::generate_response::Response::Complete(c)) => {
+                    Some(&c.finish_reason)
+                }
+                _ => None,
+            },
+        }
+    }
+
     /// Whether this is a `Complete`: the engine's last message for a
     /// request, with or without an error.
     pub fn is_complete(&self) -> bool {
-        match self {
-            Self::Sglang(resp) => matches!(
-                &resp.response,
-                Some(sglang::generate_response::Response::Complete(_))
-            ),
-            Self::Vllm(resp) => matches!(
-                &resp.response,
-                Some(vllm::generate_response::Response::Complete(_))
-            ),
-            Self::Trtllm(resp) => matches!(
-                &resp.response,
-                Some(trtllm::generate_response::Response::Complete(_))
-            ),
-            Self::Mlx(resp) => matches!(
-                &resp.response,
-                Some(mlx::generate_response::Response::Complete(_))
-            ),
-            Self::TokenSpeed(resp) => matches!(
-                &resp.response,
-                Some(tokenspeed::generate_response::Response::Complete(_))
-            ),
-        }
+        self.complete_finish_reason().is_some()
     }
 
     /// Whether this is a `Complete` the engine finished with reason `"error"`.
     pub fn engine_error(&self) -> bool {
-        match self {
-            Self::Sglang(resp) => matches!(
-                &resp.response,
-                Some(sglang::generate_response::Response::Complete(c)) if c.finish_reason == "error"
-            ),
-            Self::Vllm(resp) => matches!(
-                &resp.response,
-                Some(vllm::generate_response::Response::Complete(c)) if c.finish_reason == "error"
-            ),
-            Self::Trtllm(resp) => matches!(
-                &resp.response,
-                Some(trtllm::generate_response::Response::Complete(c)) if c.finish_reason == "error"
-            ),
-            Self::Mlx(resp) => matches!(
-                &resp.response,
-                Some(mlx::generate_response::Response::Complete(c)) if c.finish_reason == "error"
-            ),
-            Self::TokenSpeed(resp) => matches!(
-                &resp.response,
-                Some(tokenspeed::generate_response::Response::Complete(c)) if c.finish_reason == "error"
-            ),
-        }
+        self.complete_finish_reason() == Some("error")
+    }
+
+    /// Whether this is a `Complete` the engine finished on its own terms:
+    /// any reason but `"error"` and `"abort"`. An abort the engine side
+    /// starts (its abort route, a pause that aborts) arrives as an ordinary
+    /// `Complete` with reason `"abort"`, and completed nothing; the gateway's
+    /// own aborts drop the stream before a `Complete` is read.
+    pub fn completed(&self) -> bool {
+        matches!(self.complete_finish_reason(), Some(reason) if reason != "error" && reason != "abort")
     }
 
     /// The prompt tokens the engine reports served from its prefix cache, on
@@ -3152,8 +3148,8 @@ mod tracked_tests {
 
     #[test]
     fn a_complete_is_the_engines_last_message_an_error_included() {
-        // The drain's proof is a `Complete` that is not an engine error; a
-        // chunk is progress only (see `ProtoStream::next`).
+        // The drain's proof is a `Complete` that is neither an engine error
+        // nor an abort; a chunk is progress only (see `ProtoStream::next`).
         let chunk = ProtoGenerateResponse::Vllm(Box::new(vllm::GenerateResponse {
             response: Some(vllm::generate_response::Response::Chunk(
                 vllm::GenerateStreamChunk::default(),
@@ -3170,6 +3166,7 @@ mod tracked_tests {
             ..Default::default()
         }));
         assert!(complete.is_complete() && !complete.engine_error());
+        assert!(complete.completed());
         let failed = ProtoGenerateResponse::Sglang(Box::new(sglang::GenerateResponse {
             response: Some(sglang::generate_response::Response::Complete(
                 sglang::GenerateComplete {
@@ -3180,7 +3177,22 @@ mod tracked_tests {
             ..Default::default()
         }));
         assert!(failed.is_complete() && failed.engine_error());
+        assert!(!failed.completed());
+        // An abort the engine side started is its last message too, and no
+        // completion: a probe that ends this way holds the worker again.
+        let aborted = ProtoGenerateResponse::Sglang(Box::new(sglang::GenerateResponse {
+            response: Some(sglang::generate_response::Response::Complete(
+                sglang::GenerateComplete {
+                    finish_reason: "abort".to_string(),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }));
+        assert!(aborted.is_complete() && !aborted.engine_error());
+        assert!(!aborted.completed());
         assert!(!ProtoGenerateResponse::Vllm(Box::default()).is_complete());
+        assert!(!chunk.completed());
     }
 
     #[test]
@@ -3620,8 +3632,8 @@ impl ProtoStream {
             Some(Ok(response)) => {
                 // A completion the engine finished on its own terms is the
                 // proof the wedge drain waits for; a chunk, or a completion
-                // that reports an engine error, is progress only.
-                if response.is_complete() && !response.engine_error() {
+                // that reports an engine error or an abort, is progress only.
+                if response.completed() {
                     liveness::on_completion(&tracked.worker);
                 } else {
                     liveness::on_token_progress(&tracked.worker);
@@ -4297,6 +4309,20 @@ mod engine_error_tests {
         assert!(!chunk.engine_error());
         let empty = ProtoGenerateResponse::Vllm(Box::default());
         assert!(!empty.engine_error());
+    }
+
+    #[test]
+    fn completed_is_false_for_error_and_abort_completions_on_every_backend() {
+        for reason in ["stop", "length", ""] {
+            assert!(completes(reason)
+                .iter()
+                .all(ProtoGenerateResponse::completed));
+        }
+        for reason in ["error", "abort"] {
+            assert!(!completes(reason)
+                .iter()
+                .any(ProtoGenerateResponse::completed));
+        }
     }
 
     #[test]

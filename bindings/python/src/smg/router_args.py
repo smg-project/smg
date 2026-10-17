@@ -644,12 +644,12 @@ class RouterArgs:
     worker_warmup_secs: int = 60
     worker_warmup_share: float = 0.25
     worker_warmup_thin_ratio: float = 0.5
-    # Liveness: seconds without progress before a loaded worker is wedged
     # Opt-in wedge drain: seconds a worker may stand vetoed as wedged before it
     # drains (0 = off), and how long a drained worker with nothing in flight is
     # held before it may take a probe request
     worker_wedge_drain_hold_secs: int = 30
     worker_wedge_drain_secs: int = 0
+    # Liveness: seconds without progress before a loaded worker is wedged
     worker_wedge_secs: int = 3
     # DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped)
     zmq_engine_count: int | None = None
