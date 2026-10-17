@@ -191,6 +191,10 @@ def rgb16_trns() -> bytes:
     return png_16bit(rgb, 2, struct.pack(">HHH", *(int(c) for c in key)))
 
 
+def gray16() -> bytes:
+    return png_16bit(sixteen_bit_samples(), 0)
+
+
 CASES = (
     ("alpha_grid", "png", alpha_grid, "RGBA PNG: every alpha against 52 values per channel"),
     ("rgba_opaque", "png", rgba_opaque, "RGBA PNG whose alpha is 255 everywhere"),
@@ -208,6 +212,7 @@ CASES = (
         rgb16_trns,
         "16-bit truecolour PNG with a tRNS colour key: kept as stored",
     ),
+    ("gray16", "png", gray16, "16-bit greyscale PNG: each sample clipped to 255"),
 )
 
 

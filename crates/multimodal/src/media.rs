@@ -5985,6 +5985,7 @@ pub(crate) fn decode_image_bytes(
             }
         },
     };
+    image = clip_sixteen_bit_grey(image, bytes);
     image = narrow_sixteen_bit_colour(image);
     // The transparency policy applies before the cap: the compositing loader
     // flattens to RGB first and resizes after, and a resample of straight
@@ -6083,6 +6084,160 @@ mod sixteen_bit_colour_tests {
     }
 }
 
+/// Bring 16-bit greyscale samples down to 8 bits the way the serving engine's
+/// own loader converts them: each sample is clipped to 255, not scaled (its
+/// 16-bit greyscale mode converts to RGB through a clip). A 16-bit greyscale
+/// photograph therefore reaches the model almost entirely white on both
+/// paths; this keeps the gateway bit-identical to the engine, which is the
+/// pipeline's rule. Scaling (`v * 255 / 65535`, what the `image` crate's
+/// conversion does) would be the visually faithful image.
+///
+/// A 16-bit greyscale PNG whose `tRNS` chunk names a transparency key is the
+/// same image to the loaders the gateway matches, which convert to RGB: that
+/// loader's 16-bit greyscale mode keeps the key as metadata, and its RGB
+/// conversion is the clip with the key ignored, while the decoder here
+/// expands the key into an alpha channel. So a greyscale-with-alpha layout
+/// from a PNG whose header declares no alpha channel (`bytes`, colour type
+/// 0) drops that alpha and clips. (The loader's conversion to RGBA is not
+/// matched: it keys the clipped samples on the key's low byte; a reference
+/// that converts such an image to RGBA itself would need the key read from
+/// `tRNS` and applied to the clipped value.) A PNG that stores greyscale with
+/// alpha (colour type 4) is another layout to that loader, unpacked by its
+/// high bytes: it is left to [`narrow_sixteen_bit_colour`].
+fn clip_sixteen_bit_grey(image: image::DynamicImage, bytes: &[u8]) -> image::DynamicImage {
+    let clipped = |width: u32, height: u32, samples: Vec<u8>| {
+        #[expect(
+            clippy::expect_used,
+            reason = "one byte per 16-bit sample, the same pixel count"
+        )]
+        image::DynamicImage::ImageLuma8(
+            image::GrayImage::from_raw(width, height, samples)
+                .expect("buffer matches image dimensions"),
+        )
+    };
+    match image {
+        image::DynamicImage::ImageLuma16(wide) => {
+            let (width, height) = wide.dimensions();
+            let samples = wide
+                .into_raw()
+                .into_iter()
+                .map(|sample| sample.min(255) as u8)
+                .collect();
+            clipped(width, height, samples)
+        }
+        image::DynamicImage::ImageLumaA16(wide)
+            if png_colour_type(bytes) == Some(PNG_COLOUR_TYPE_GREYSCALE) =>
+        {
+            let (width, height) = wide.dimensions();
+            let samples = wide
+                .into_raw()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|[sample, _alpha]| sample.min(&255).to_owned() as u8)
+                .collect();
+            clipped(width, height, samples)
+        }
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod sixteen_bit_grey_tests {
+    use super::*;
+
+    #[test]
+    fn greyscale_samples_are_clipped_not_scaled() {
+        let wide = image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_raw(
+            6,
+            1,
+            vec![0, 1, 254, 255, 256, 0xFFFF],
+        )
+        .expect("6x1 grey16");
+        match clip_sixteen_bit_grey(image::DynamicImage::ImageLuma16(wide), &[]) {
+            image::DynamicImage::ImageLuma8(narrow) => {
+                assert_eq!(narrow.as_raw(), &[0, 1, 254, 255, 255, 255]);
+            }
+            other => panic!("expected grey8, got {:?}", other.color()),
+        }
+    }
+
+    #[test]
+    fn other_layouts_pass_through_untouched() {
+        let rgb = image::DynamicImage::new_rgb16(2, 2);
+        assert!(matches!(
+            clip_sixteen_bit_grey(rgb, &[]),
+            image::DynamicImage::ImageRgb16(_)
+        ));
+        // Greyscale with alpha from a container that is not a greyscale PNG
+        // (here: no container at all) is the narrowing's, not the clip's.
+        let grey_alpha = image::DynamicImage::new_luma_a16(2, 2);
+        assert!(matches!(
+            clip_sixteen_bit_grey(grey_alpha, &[]),
+            image::DynamicImage::ImageLumaA16(_)
+        ));
+    }
+
+    /// A 2x2 16-bit greyscale PNG (colour type 0) with samples 1, 255, 256
+    /// and 65535 and a `tRNS` key of 256. The reference loader opens it in
+    /// its 16-bit greyscale mode with the key as metadata: its RGB is the
+    /// clipped sample on every channel, the key ignored.
+    const GREY16_WITH_KEY: [u8; 86] = [
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x10, 0x00, 0x00, 0x00, 0x00, 0x07,
+        0x4d, 0x8e, 0xbb, 0x00, 0x00, 0x00, 0x02, 0x74, 0x52, 0x4e, 0x53, 0x01, 0x00, 0x6f, 0x88,
+        0xfc, 0x79, 0x00, 0x00, 0x00, 0x0f, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x60, 0x60,
+        0x64, 0xf8, 0x0f, 0xc2, 0xff, 0x01, 0x09, 0x0d, 0x03, 0x00, 0x03, 0x69, 0x79, 0x60, 0x00,
+        0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    /// A 2x2 16-bit greyscale-with-alpha PNG (colour type 4) with the pairs
+    /// (1, 65535), (255, 65535), (256, 65535) and (65535, 32768). The
+    /// reference loader unpacks it by the high byte of each sample.
+    const GREY_ALPHA16: [u8; 79] = [
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x10, 0x04, 0x00, 0x00, 0x00, 0x88,
+        0x2f, 0x19, 0xec, 0x00, 0x00, 0x00, 0x16, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x60,
+        0x60, 0xfc, 0xff, 0x9f, 0xe1, 0x3f, 0x10, 0x33, 0x82, 0xc8, 0xff, 0x0d, 0x0c, 0x00, 0x50,
+        0xda, 0x09, 0x7a, 0xc6, 0xe8, 0x50, 0x15, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
+        0xae, 0x42, 0x60, 0x82,
+    ];
+
+    /// The key of a 16-bit greyscale PNG is not an alpha channel to the
+    /// reference loader's RGB conversion: the decode drops the alpha the
+    /// decoder expands from it and clips the samples, whatever the
+    /// transparency policy, so the pixels are that loader's RGB.
+    #[test]
+    fn a_sixteen_bit_greyscale_pngs_key_is_not_an_alpha_channel() {
+        for policy in [
+            TransparencyPolicy::CompositeOverWhite,
+            TransparencyPolicy::DropAlpha,
+            TransparencyPolicy::KeepAlpha,
+        ] {
+            let image = decode_image_bytes(&GREY16_WITH_KEY, None, policy).expect("a PNG");
+            assert!(!image.color().has_alpha(), "{policy:?}: no alpha channel");
+            assert_eq!(
+                image.to_rgb8().as_raw(),
+                &[1, 1, 1, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+                "{policy:?}"
+            );
+        }
+    }
+
+    /// Greyscale stored with an alpha channel at 16 bits is another layout to
+    /// the reference loader, read by the high byte of every sample: the clip
+    /// leaves it to the narrowing, and its alpha stays.
+    #[test]
+    fn a_sixteen_bit_grey_alpha_png_keeps_its_high_bytes() {
+        let image =
+            decode_image_bytes(&GREY_ALPHA16, None, TransparencyPolicy::KeepAlpha).expect("a PNG");
+        assert_eq!(
+            image.to_rgba8().as_raw(),
+            &[0, 0, 0, 255, 0, 0, 0, 255, 1, 1, 1, 255, 255, 255, 255, 128]
+        );
+    }
+}
+
 /// The decoded image under `policy` (see [`TransparencyPolicy`]): as it is
 /// without an alpha channel; with one, composited over opaque white, reduced
 /// to its stored colour, or kept. The composite is the compositing loader's:
@@ -6119,6 +6274,8 @@ pub(crate) fn apply_transparency(
 
 /// The eight-byte PNG signature.
 const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+/// PNG colour type 0: greyscale without an alpha channel.
+const PNG_COLOUR_TYPE_GREYSCALE: u8 = 0;
 /// PNG colour type 2: truecolour without an alpha channel.
 const PNG_COLOUR_TYPE_TRUECOLOUR: u8 = 2;
 
