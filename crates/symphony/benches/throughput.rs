@@ -3,7 +3,7 @@
 //! an engine, which is the parser's per-request setup. One subject per call syntax, each a turn as
 //! the table's own tests spell it: a thought, an answer and two calls, the tools declared as a
 //! request declares them. The parse and prose rows time the reading alone: the engine is made
-//! outside the timed closure, and the setup rows time that.
+//! before the timed closure and dropped after it, and the setup rows time the making.
 //!
 //! `cargo bench -p smg-symphony --bench throughput`; a filter narrows it (`-- parse/whole`).
 #![allow(clippy::expect_used)]
@@ -246,22 +246,22 @@ fn parse(c: &mut Criterion) {
         let name = subject.table.name();
         group.throughput(Throughput::Bytes(subject.output.len() as u64));
         group.bench_with_input(BenchmarkId::new("whole", name), subject, |b, subject| {
-            b.iter_batched(
+            b.iter_batched_ref(
                 || engine(subject.table, subject.prompt, &declared),
-                |mut engine| {
+                |engine| {
                     let mut out = Events::new();
-                    read(&mut engine, &[subject.output], &mut out);
+                    read(engine, &[subject.output], &mut out);
                 },
                 BatchSize::SmallInput,
             );
         });
         let cut = pieces(subject.output, 8);
         group.bench_with_input(BenchmarkId::new("pieces8", name), subject, |b, subject| {
-            b.iter_batched(
+            b.iter_batched_ref(
                 || engine(subject.table, subject.prompt, &declared),
-                |mut engine| {
+                |engine| {
                     let mut out = Events::new();
-                    read(&mut engine, &cut, &mut out);
+                    read(engine, &cut, &mut out);
                 },
                 BatchSize::SmallInput,
             );
@@ -285,21 +285,21 @@ fn prose_only(c: &mut Criterion) {
     for (table, prompt) in subjects {
         let name = table.name();
         group.bench_with_input(BenchmarkId::new("whole", name), &table, |b, table| {
-            b.iter_batched(
+            b.iter_batched_ref(
                 || engine(*table, prompt, &declared),
-                |mut engine| {
+                |engine| {
                     let mut out = Events::new();
-                    read(&mut engine, &[text.as_str()], &mut out);
+                    read(engine, &[text.as_str()], &mut out);
                 },
                 BatchSize::SmallInput,
             );
         });
         group.bench_with_input(BenchmarkId::new("pieces8", name), &table, |b, table| {
-            b.iter_batched(
+            b.iter_batched_ref(
                 || engine(*table, prompt, &declared),
-                |mut engine| {
+                |engine| {
                     let mut out = Events::new();
-                    read(&mut engine, &cut, &mut out);
+                    read(engine, &cut, &mut out);
                 },
                 BatchSize::SmallInput,
             );
