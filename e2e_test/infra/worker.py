@@ -618,33 +618,28 @@ class Worker:
             # integration and is prebuilt for Hopper. An explicit choice wins.
             env.setdefault("VLLM_FLASHINFER_ALLREDUCE_BACKEND", "trtllm")
 
-        # The vLLM gRPC servicer implementation is a flag inside the smg
-        # servicer package, read by upstream's entrypoint; the command stays.
-        if self.engine == "vllm" and self.mode == ConnectionMode.GRPC:
-            if get_vllm_servicer_impl() == "rust":
-                # A vLLM without the hook would run Python while the lane
-                # reports Rust coverage; refuse to start such a worker.
-                _require_rust_servicer_hook()
-                env["SMG_VLLM_SERVICER_IMPL"] = "rust"
+        # The servicer implementation of a gRPC worker is a flag inside the smg
+        # servicer package, read by the engine's own entrypoint (the command
+        # stays): per engine, the variable the worker reads and the lane's
+        # choice for it. Built here, not at import, so the getters and the hook
+        # check are the module's current ones (a test replaces them).
+        servicer_impl = {
+            "vllm": ("SMG_VLLM_SERVICER_IMPL", get_vllm_servicer_impl),
+            "tokenspeed": ("SMG_TOKENSPEED_SERVICER_IMPL", get_tokenspeed_servicer_impl),
+            "sglang": ("SMG_SGLANG_SERVICER_IMPL", get_sglang_servicer_impl),
+        }
+        # The engines whose Rust servicer needs a hook in the engine package: a
+        # worker without it would run Python while the lane reports Rust coverage.
+        rust_servicer_needs_hook = {"vllm"}
+        if self.mode == ConnectionMode.GRPC and self.engine in servicer_impl:
+            variable, lane_choice = servicer_impl[self.engine]
+            if lane_choice() == "rust":
+                if self.engine in rust_servicer_needs_hook:
+                    _require_rust_servicer_hook()
+                env[variable] = "rust"
             else:
                 # The lane setting is authoritative over an inherited value.
-                env.pop("SMG_VLLM_SERVICER_IMPL", None)
-
-        # The TokenSpeed servicer implementation is likewise a flag inside the
-        # smg servicer package, read by its own entrypoint; the command stays.
-        if self.engine == "tokenspeed" and self.mode == ConnectionMode.GRPC:
-            if get_tokenspeed_servicer_impl() == "rust":
-                env["SMG_TOKENSPEED_SERVICER_IMPL"] = "rust"
-            else:
-                env.pop("SMG_TOKENSPEED_SERVICER_IMPL", None)
-
-        # The SGLang servicer implementation is a flag inside the smg servicer
-        # package too, read at the entry SGLang's --grpc-mode calls.
-        if self.engine == "sglang" and self.mode == ConnectionMode.GRPC:
-            if get_sglang_servicer_impl() == "rust":
-                env["SMG_SGLANG_SERVICER_IMPL"] = "rust"
-            else:
-                env.pop("SMG_SGLANG_SERVICER_IMPL", None)
+                env.pop(variable, None)
 
         if (
             self.engine == "vllm"
