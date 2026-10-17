@@ -550,6 +550,16 @@ class RouterArgs:
     request_id_headers: list[str] | None = None
     # Request timeout in seconds
     request_timeout_secs: int = 1800
+    # The exact-match response cache (--response-cache off|memory): a repeated
+    # deterministic request (temperature 0 or a seed, not streamed, one choice,
+    # no tools) is answered from memory for the tenant that sent it, for
+    # response_cache_ttl_secs, within the entry and byte budgets (the
+    # response_cache_* fields below)
+    response_cache: str = "off"
+    response_cache_max_bytes: int = 256 * 1024 * 1024
+    response_cache_max_entries: int = 10000
+    response_cache_max_entry_bytes: int = 1024 * 1024
+    response_cache_ttl_secs: int = 300
     # Retries (disable_retries switches them off)
     retry_backoff_multiplier: float = 1.5
     retry_initial_backoff_ms: int = 50
@@ -744,6 +754,9 @@ class RouterArgs:
         )
         tenant_rate_limit_group = parser.add_argument_group(
             "Tenant Rate Limit", "Per-tenant token and request rate limiting"
+        )
+        response_cache_group = parser.add_argument_group(
+            "Response Cache", "Exact-match cache of deterministic answers"
         )
 
         if use_router_prefix:
@@ -2319,6 +2332,45 @@ class RouterArgs:
             type=int,
             default=RouterArgs.tokenizer_cache_l1_max_memory,
             help="Maximum memory for L1 tokenizer cache in bytes (default: 50MB)",
+        )
+
+        # Response cache
+        response_cache_group.add_argument(
+            f"--{prefix}response-cache",
+            type=str,
+            choices=["off", "memory"],
+            default=RouterArgs.response_cache,
+            help="The exact-match response cache: 'memory' answers a repeated deterministic "
+            "request (temperature 0 or a seed, not streamed, one choice, no tools) from memory "
+            "for the tenant that sent it; 'off' generates every request. Answers carry "
+            "x-smg-cache-status: hit, miss or bypass (default: off)",
+        )
+        response_cache_group.add_argument(
+            f"--{prefix}response-cache-ttl-secs",
+            type=int,
+            default=RouterArgs.response_cache_ttl_secs,
+            help="How long a cached answer is served, in seconds; a request shortens its own "
+            "with 'x-smg-cache: ttl=N' or opts out with 'x-smg-cache: no-store' (default: 300)",
+        )
+        response_cache_group.add_argument(
+            f"--{prefix}response-cache-max-entries",
+            type=int,
+            default=RouterArgs.response_cache_max_entries,
+            help="Most answers the response cache keeps; the least recently used leave first "
+            "(default: 10000)",
+        )
+        response_cache_group.add_argument(
+            f"--{prefix}response-cache-max-bytes",
+            type=int,
+            default=RouterArgs.response_cache_max_bytes,
+            help="Byte budget of all cached answers, with per-entry overhead (default: 256MB)",
+        )
+        response_cache_group.add_argument(
+            f"--{prefix}response-cache-max-entry-bytes",
+            type=int,
+            default=RouterArgs.response_cache_max_entry_bytes,
+            help="Largest answer the response cache keeps, in bytes; a larger one is served but "
+            "not kept (default: 1MB)",
         )
 
         # Parser configuration

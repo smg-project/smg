@@ -23,6 +23,16 @@
             "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
           }
         },
+        "responseCache": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "ttlSecs": { "type": "integer", "minimum": 1 },
+            "maxEntries": { "type": "integer", "minimum": 1 },
+            "maxBytes": { "type": "integer", "minimum": 1 },
+            "maxEntryBytes": { "type": "integer", "minimum": 1 }
+          }
+        },
         "autoscaling": {
           "type": "object",
           "properties": {

@@ -283,6 +283,11 @@ harness = false
 path = "benches/access_log.rs"
 
 [[bench]]
+name = "response_cache"
+harness = false
+path = "benches/response_cache.rs"
+
+[[bench]]
 name = "sse_rechunk"
 harness = false
 path = "benches/sse_rechunk.rs"

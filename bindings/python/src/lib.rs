@@ -578,6 +578,11 @@ struct Router {
     remove_unhealthy_workers: Option<bool>,
     request_id_headers: Option<Vec<String>>,
     request_timeout_secs: u64,
+    response_cache: String,
+    response_cache_max_bytes: usize,
+    response_cache_max_entries: usize,
+    response_cache_max_entry_bytes: usize,
+    response_cache_ttl_secs: u64,
     retry_backoff_multiplier: f32,
     retry_initial_backoff_ms: u64,
     retry_jitter_factor: f32,
@@ -1151,6 +1156,19 @@ impl Router {
             .disable_tokenizer_autoload(self.disable_tokenizer_autoload)
             .parser(parser)
             .history_backend(history_backend)
+            .response_cache(config::ResponseCacheConfig {
+                backend: config::ResponseCacheBackend::parse(&self.response_cache).ok_or_else(
+                    || config::ConfigError::InvalidValue {
+                        field: "response_cache".to_string(),
+                        value: self.response_cache.clone(),
+                        reason: "Must be 'off' or 'memory'".to_string(),
+                    },
+                )?,
+                ttl_secs: self.response_cache_ttl_secs,
+                max_entries: self.response_cache_max_entries,
+                max_bytes: self.response_cache_max_bytes,
+                max_entry_bytes: self.response_cache_max_entry_bytes,
+            })
             .memory_config(config::MemoryConfig {
                 max_responses: self.history_memory_max_responses,
                 max_items: self.history_memory_max_items,
@@ -1400,6 +1418,11 @@ impl Router {
         remove_unhealthy_workers = None,
         request_id_headers = None,
         request_timeout_secs = 1800,
+        response_cache = String::from("off"),
+        response_cache_max_bytes = 268435456,
+        response_cache_max_entries = 10000,
+        response_cache_max_entry_bytes = 1048576,
+        response_cache_ttl_secs = 300,
         retry_backoff_multiplier = 1.5,
         retry_initial_backoff_ms = 50,
         retry_jitter_factor = 0.2,
@@ -1607,6 +1630,11 @@ impl Router {
         remove_unhealthy_workers: Option<bool>,
         request_id_headers: Option<Vec<String>>,
         request_timeout_secs: u64,
+        response_cache: String,
+        response_cache_max_bytes: usize,
+        response_cache_max_entries: usize,
+        response_cache_max_entry_bytes: usize,
+        response_cache_ttl_secs: u64,
         retry_backoff_multiplier: f32,
         retry_initial_backoff_ms: u64,
         retry_jitter_factor: f32,
@@ -1844,6 +1872,11 @@ impl Router {
             remove_unhealthy_workers,
             request_id_headers,
             request_timeout_secs,
+            response_cache,
+            response_cache_max_bytes,
+            response_cache_max_entries,
+            response_cache_max_entry_bytes,
+            response_cache_ttl_secs,
             retry_backoff_multiplier,
             retry_initial_backoff_ms,
             retry_jitter_factor,

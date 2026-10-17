@@ -32,7 +32,7 @@ use smg::{
     config::{RouterConfig, RoutingMode},
     middleware::TokenBucket,
     policies::PolicyRegistry,
-    routers::{gateway::Gateway, RouterFactory, RouterTrait},
+    routers::{gateway::Gateway, response_cache::ResponseCache, RouterFactory, RouterTrait},
     worker::{
         BasicWorkerBuilder, ModelCard, RuntimeType, Worker, WorkerMonitor, WorkerRegistry,
         WorkerType,
@@ -348,7 +348,8 @@ impl AppTestContext {
             }
 
             let inner_router = RouterFactory::create_router(&app_context).await.unwrap();
-            let manager = Gateway::new(app_context.worker_registry.clone());
+            let manager = Gateway::new(app_context.worker_registry.clone())
+                .with_response_cache(ResponseCache::from_config(&config.response_cache));
             let router_id = Gateway::determine_router_id(&config.mode, config.connection_mode);
             let manager = Arc::new(manager);
             manager.register_router(router_id, Arc::from(inner_router));

@@ -408,6 +408,7 @@ impl ConfigValidator {
         }
 
         Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
+        Self::validate_response_cache(&config.response_cache)?;
         Self::validate_tokenizer_sources(config)?;
 
         Ok(())
@@ -1951,6 +1952,68 @@ impl ConfigValidator {
             });
         }
 
+        Ok(())
+    }
+
+    /// The response cache's budgets, when it is on: a TTL, an entry count or
+    /// a byte budget of zero would keep nothing, and an entry cap above the
+    /// byte budget could never be met.
+    fn validate_response_cache(cache: &ResponseCacheConfig) -> ConfigResult<()> {
+        /// The longest life of an in-memory entry: a bound the clock
+        /// arithmetic of every store holds within.
+        const RESPONSE_CACHE_MAX_TTL_SECS: u64 = 365 * 24 * 60 * 60;
+        if !cache.enabled() {
+            return Ok(());
+        }
+        let refuse = |field: &str, value: String, reason: &str| {
+            Err(ConfigError::InvalidValue {
+                field: format!("response_cache.{field}"),
+                value,
+                reason: reason.to_string(),
+            })
+        };
+        if cache.ttl_secs == 0 {
+            return refuse(
+                "ttl_secs",
+                cache.ttl_secs.to_string(),
+                "Must be > 0 when the response cache is on",
+            );
+        }
+        if cache.ttl_secs > RESPONSE_CACHE_MAX_TTL_SECS {
+            return refuse(
+                "ttl_secs",
+                cache.ttl_secs.to_string(),
+                "Must be at most one year (31536000 seconds) when the response cache is on",
+            );
+        }
+        if cache.max_entries == 0 {
+            return refuse(
+                "max_entries",
+                cache.max_entries.to_string(),
+                "Must be > 0 when the response cache is on",
+            );
+        }
+        if cache.max_bytes == 0 {
+            return refuse(
+                "max_bytes",
+                cache.max_bytes.to_string(),
+                "Must be > 0 when the response cache is on",
+            );
+        }
+        if cache.max_entry_bytes == 0 {
+            return refuse(
+                "max_entry_bytes",
+                cache.max_entry_bytes.to_string(),
+                "Must be > 0 when the response cache is on",
+            );
+        }
+        if cache.max_entry_bytes > cache.max_bytes {
+            return refuse(
+                "max_entry_bytes",
+                cache.max_entry_bytes.to_string(),
+                "Must not exceed response_cache.max_bytes",
+            );
+        }
         Ok(())
     }
 
@@ -4839,5 +4902,105 @@ mod tests {
             matches!(built, Err(ConfigError::InvalidValue { ref field, .. }) if field == "cors_allowed_origins"),
             "{built:?}"
         );
+    }
+
+    /// The response cache's knobs are free while it is off and must each
+    /// keep something while it is on; the entry cap fits the byte budget.
+    #[test]
+    fn response_cache_budgets_are_checked_only_while_it_is_on() {
+        let cache = |backend: ResponseCacheBackend| ResponseCacheConfig {
+            backend,
+            ttl_secs: 0,
+            max_entries: 0,
+            max_bytes: 0,
+            max_entry_bytes: 0,
+        };
+        assert!(
+            ConfigValidator::validate_response_cache(&cache(ResponseCacheBackend::Off)).is_ok()
+        );
+        assert!(
+            ConfigValidator::validate_response_cache(&ResponseCacheConfig {
+                backend: ResponseCacheBackend::Memory,
+                ..ResponseCacheConfig::default()
+            })
+            .is_ok()
+        );
+
+        let on = ResponseCacheConfig {
+            backend: ResponseCacheBackend::Memory,
+            ..ResponseCacheConfig::default()
+        };
+        let refused =
+            |config: ResponseCacheConfig| match ConfigValidator::validate_response_cache(&config) {
+                Err(ConfigError::InvalidValue { field, .. }) => field,
+                other => panic!("expected a refusal, got {other:?}"),
+            };
+        assert_eq!(
+            refused(ResponseCacheConfig {
+                ttl_secs: 0,
+                ..on.clone()
+            }),
+            "response_cache.ttl_secs"
+        );
+        assert_eq!(
+            refused(ResponseCacheConfig {
+                ttl_secs: 365 * 24 * 60 * 60 + 1,
+                ..on.clone()
+            }),
+            "response_cache.ttl_secs",
+            "a TTL past a year is refused before it can run past the clock"
+        );
+        assert!(
+            ConfigValidator::validate_response_cache(&ResponseCacheConfig {
+                ttl_secs: 365 * 24 * 60 * 60,
+                ..on.clone()
+            })
+            .is_ok()
+        );
+        assert_eq!(
+            refused(ResponseCacheConfig {
+                max_entries: 0,
+                ..on.clone()
+            }),
+            "response_cache.max_entries"
+        );
+        assert_eq!(
+            refused(ResponseCacheConfig {
+                max_bytes: 0,
+                ..on.clone()
+            }),
+            "response_cache.max_bytes"
+        );
+        assert_eq!(
+            refused(ResponseCacheConfig {
+                max_entry_bytes: 0,
+                ..on.clone()
+            }),
+            "response_cache.max_entry_bytes"
+        );
+        assert_eq!(
+            refused(ResponseCacheConfig {
+                max_bytes: 10,
+                max_entry_bytes: 11,
+                ..on.clone()
+            }),
+            "response_cache.max_entry_bytes"
+        );
+        assert_eq!(
+            refused(cache(ResponseCacheBackend::Memory)),
+            "response_cache.ttl_secs"
+        );
+
+        // Through the whole validator, on a default configuration.
+        let mut config = RouterConfig {
+            response_cache: on,
+            ..RouterConfig::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+        config.response_cache.ttl_secs = 0;
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { field, .. }) if field == "response_cache.ttl_secs"
+        ));
     }
 }

@@ -35,9 +35,9 @@ use smg::{
         FileDiscoveryConfig, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig,
         ManualAssignmentMode, MemoryConfig, MetricsConfig, OracleConfig, ParserChoice,
         PdPairingMode, PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric, RedisConfig,
-        RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig,
-        TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
-        DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
+        ResponseCacheBackend, ResponseCacheConfig, RetryConfig, RouterConfig,
+        RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
+        TokenizerCacheConfig, TraceConfig, DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
     },
     mesh_discovery::MeshDiscoveryConfig,
     observability::metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
@@ -1443,6 +1443,35 @@ struct ModelArgs {
     /// Maximum memory for L1 tokenizer cache in bytes
     #[arg(long, default_value_t = 52428800, help_heading = "Tokenizer")]
     tokenizer_cache_l1_max_memory: usize,
+
+    // ==================== Response Cache ====================
+    /// The exact-match response cache: `memory` answers a repeated
+    /// deterministic request (temperature 0 or a seed, not streamed, one
+    /// choice, no tools) from memory for the tenant that sent it; `off`
+    /// (the default) generates every request. Answers carry
+    /// x-smg-cache-status: hit, miss or bypass
+    #[arg(long, default_value = "off", value_parser = ["off", "memory"], help_heading = "Response Cache")]
+    response_cache: String,
+
+    /// How long a cached answer is served, in seconds; a request shortens
+    /// its own with `x-smg-cache: ttl=N` or opts out with `x-smg-cache:
+    /// no-store`
+    #[arg(long, default_value_t = 300, help_heading = "Response Cache")]
+    response_cache_ttl_secs: u64,
+
+    /// Most answers the response cache keeps; the least recently used
+    /// leave first
+    #[arg(long, default_value_t = 10_000, help_heading = "Response Cache")]
+    response_cache_max_entries: usize,
+
+    /// Byte budget of all cached answers, with per-entry overhead
+    #[arg(long, default_value_t = 268_435_456, help_heading = "Response Cache")]
+    response_cache_max_bytes: usize,
+
+    /// Largest answer the response cache keeps, in bytes; a larger one is
+    /// served but not kept
+    #[arg(long, default_value_t = 1_048_576, help_heading = "Response Cache")]
+    response_cache_max_entry_bytes: usize,
 
     // ==================== Parsers ====================
     /// Parser for reasoning models (e.g., deepseek-r1, qwen3). Under --parser
@@ -3211,6 +3240,15 @@ impl CliArgs {
             })
             .disable_tokenizer_autoload(self.model.disable_tokenizer_autoload)
             .parser(ParserChoice::parse(&self.model.parser).unwrap_or_default())
+            .response_cache(ResponseCacheConfig {
+                // clap admits `off` and `memory` only.
+                backend: ResponseCacheBackend::parse(&self.model.response_cache)
+                    .unwrap_or_default(),
+                ttl_secs: self.model.response_cache_ttl_secs,
+                max_entries: self.model.response_cache_max_entries,
+                max_bytes: self.model.response_cache_max_bytes,
+                max_entry_bytes: self.model.response_cache_max_entry_bytes,
+            })
             .history_backend(history_backend)
             .memory_config(MemoryConfig {
                 max_responses: self.model.history_memory_max_responses,
@@ -5210,6 +5248,44 @@ mod tests {
     #[test]
     fn cache_ttl_secs_zero_rejected_at_parse() {
         assert!(Cli::try_parse_from(["smg", "--cache-ttl-secs", "0"]).is_err());
+    }
+
+    /// The response cache flags reach `RouterConfig` and the wrapped
+    /// `ServerConfig.router_config`; the default is off, and a backend
+    /// other than `off` or `memory` is refused at parse.
+    #[test]
+    fn response_cache_flags_flow_into_both_configs() {
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.response_cache, ResponseCacheConfig::default());
+        assert!(!defaults.response_cache.enabled());
+
+        let cli = cli_args_from(&[
+            "--response-cache",
+            "memory",
+            "--response-cache-ttl-secs",
+            "30",
+            "--response-cache-max-entries",
+            "5",
+            "--response-cache-max-bytes",
+            "4096",
+            "--response-cache-max-entry-bytes",
+            "1024",
+        ]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(
+            router_config.response_cache,
+            ResponseCacheConfig {
+                backend: ResponseCacheBackend::Memory,
+                ttl_secs: 30,
+                max_entries: 5,
+                max_bytes: 4096,
+                max_entry_bytes: 1024,
+            }
+        );
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(server_config.router_config.response_cache.enabled());
+
+        assert!(Cli::try_parse_from(["smg", "--response-cache", "redis"]).is_err());
     }
 
     /// The media placement and engine-side media flags must reach both

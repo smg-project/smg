@@ -970,6 +970,24 @@ pub(crate) fn init_metrics() {
         "Bytes of preprocessed encoder inputs the pixel cache holds"
     );
     describe_gauge!("smg_mm_pixel_cache_entries", "Images the pixel cache holds");
+    // The exact-match response cache (--response-cache memory): one per
+    // process, keyed by tenant and canonical request.
+    describe_counter!(
+        "smg_response_cache_requests_total",
+        "Requests the exact-match response cache saw, by result: hit (answered from memory), miss (generated, and stored when the answer is a complete 200 JSON body) or bypass (not cacheable: streamed, sampled, tool use, several choices, or asked not to be)"
+    );
+    describe_counter!(
+        "smg_response_cache_evictions_total",
+        "Answers the response cache dropped: expired on touch, or the least recently used out to stay within its entry and byte budgets"
+    );
+    describe_gauge!(
+        "smg_response_cache_bytes",
+        "Bytes of answers the response cache holds, with per-entry overhead"
+    );
+    describe_gauge!(
+        "smg_response_cache_entries",
+        "Answers the response cache holds"
+    );
     describe_counter!(
         "smg_responses_stream_failures_total",
         "Responses streams that ended with a response.failed terminal, by model and reason"
@@ -1600,6 +1618,30 @@ impl Metrics {
         counter!("smg_mm_pixel_cache_evictions_total").increment(evicted);
         gauge!("smg_mm_pixel_cache_bytes").set(bytes as f64);
         gauge!("smg_mm_pixel_cache_entries").set(entries as f64);
+    }
+
+    /// The response cache's series at zero: called when the cache is built,
+    /// so every result and its occupancy are on the first scrape.
+    pub fn init_response_cache_series() {
+        for result in ["hit", "miss", "bypass"] {
+            counter!("smg_response_cache_requests_total", "result" => result).absolute(0);
+        }
+        counter!("smg_response_cache_evictions_total").absolute(0);
+        gauge!("smg_response_cache_bytes").set(0.0);
+        gauge!("smg_response_cache_entries").set(0.0);
+    }
+
+    /// One request through the response cache: `hit`, `miss` or `bypass`.
+    pub fn record_response_cache_request(result: &'static str) {
+        counter!("smg_response_cache_requests_total", "result" => result).increment(1);
+    }
+
+    /// The response cache after a change: the answers it dropped, and what
+    /// it holds now.
+    pub fn record_response_cache_change(evicted: u64, bytes: usize, entries: usize) {
+        counter!("smg_response_cache_evictions_total").increment(evicted);
+        gauge!("smg_response_cache_bytes").set(bytes as f64);
+        gauge!("smg_response_cache_entries").set(entries as f64);
     }
 
     /// Record where a multimodal request's media is processed and why.

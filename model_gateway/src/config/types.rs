@@ -534,6 +534,10 @@ pub struct RouterConfig {
     pub tool_call_parser: Option<String>,
     #[serde(default)]
     pub tokenizer_cache: TokenizerCacheConfig,
+    /// The exact-match response cache (`response_cache.backend = "memory"`);
+    /// off by default.
+    #[serde(default)]
+    pub response_cache: ResponseCacheConfig,
     /// Server TLS certificate (PEM)
     #[serde(skip)]
     pub server_cert: Option<Vec<u8>>,
@@ -845,6 +849,95 @@ impl Default for TokenizerCacheConfig {
             l0_max_memory: default_l0_max_memory(),
             enable_l1: default_enable_l1(),
             l1_max_memory: default_l1_max_memory(),
+        }
+    }
+}
+
+/// Where the exact-match response cache keeps its answers.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ResponseCacheBackend {
+    /// No response cache: the default.
+    #[default]
+    Off,
+    /// In the gateway's own memory, bounded by entries and bytes.
+    Memory,
+}
+
+impl ResponseCacheBackend {
+    /// The backend a flag names (`off`, `memory`), or `None`.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "off" => Some(Self::Off),
+            "memory" => Some(Self::Memory),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Memory => "memory",
+        }
+    }
+}
+
+/// The exact-match response cache: a non-streamed deterministic request
+/// (temperature 0 or a seed, one choice, no tools) is answered from memory
+/// when the same tenant sent the same request within `ttl_secs`. Off by
+/// default; see `routers::response_cache`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResponseCacheConfig {
+    #[serde(default)]
+    pub backend: ResponseCacheBackend,
+    /// How long an answer is served, in seconds; a request may shorten its
+    /// own with `x-smg-cache: ttl=N`.
+    #[serde(default = "default_response_cache_ttl_secs")]
+    pub ttl_secs: u64,
+    /// The most answers kept; the least recently used leave first.
+    #[serde(default = "default_response_cache_max_entries")]
+    pub max_entries: usize,
+    /// The byte budget of all answers, with per-entry overhead.
+    #[serde(default = "default_response_cache_max_bytes")]
+    pub max_bytes: usize,
+    /// The largest answer stored; a larger one is served but not kept.
+    #[serde(default = "default_response_cache_max_entry_bytes")]
+    pub max_entry_bytes: usize,
+}
+
+impl ResponseCacheConfig {
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.backend != ResponseCacheBackend::Off
+    }
+}
+
+fn default_response_cache_ttl_secs() -> u64 {
+    300
+}
+
+fn default_response_cache_max_entries() -> usize {
+    10_000
+}
+
+fn default_response_cache_max_bytes() -> usize {
+    256 * 1024 * 1024 // 256MB
+}
+
+fn default_response_cache_max_entry_bytes() -> usize {
+    1024 * 1024 // 1MB
+}
+
+impl Default for ResponseCacheConfig {
+    fn default() -> Self {
+        Self {
+            backend: ResponseCacheBackend::Off,
+            ttl_secs: default_response_cache_ttl_secs(),
+            max_entries: default_response_cache_max_entries(),
+            max_bytes: default_response_cache_max_bytes(),
+            max_entry_bytes: default_response_cache_max_entry_bytes(),
         }
     }
 }
@@ -1855,6 +1948,7 @@ impl Default for RouterConfig {
             reasoning_parser: None,
             tool_call_parser: None,
             tokenizer_cache: TokenizerCacheConfig::default(),
+            response_cache: ResponseCacheConfig::default(),
             client_identity: None,
             ca_certificates: vec![],
             upstream_http2: false,

@@ -7,8 +7,8 @@ use super::{
     AccessLogField, CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult,
     DiscoveryConfig, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig,
     MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PolicyConfig, PostgresConfig,
-    RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
-    TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+    RedisConfig, ResponseCacheConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig,
+    RoutingMode, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
 use crate::worker::{ConnectionMode, RuntimeType};
 
@@ -793,6 +793,13 @@ impl RouterConfigBuilder {
 
     pub fn tokenizer_cache(mut self, cache: TokenizerCacheConfig) -> Self {
         self.config.tokenizer_cache = cache;
+        self
+    }
+
+    // ==================== Response Cache ====================
+
+    pub fn response_cache(mut self, cache: ResponseCacheConfig) -> Self {
+        self.config.response_cache = cache;
         self
     }
 

@@ -1699,6 +1699,53 @@ class TestRouterArgsFieldOrder:
         assert tail == sorted(tail), out_of_place(tail)
 
 
+class TestResponseCache:
+    """--response-cache is off by default; memory switches the exact-match
+    cache on with its TTL and budgets; another backend is refused."""
+
+    def test_defaults(self):
+        args = parse_router_args([])
+        assert args.response_cache == "off"
+        assert args.response_cache_ttl_secs == 300
+        assert args.response_cache_max_entries == 10000
+        assert args.response_cache_max_bytes == 256 * 1024 * 1024
+        assert args.response_cache_max_entry_bytes == 1024 * 1024
+
+    def test_flags_parse(self):
+        args = parse_router_args(
+            [
+                "--response-cache",
+                "memory",
+                "--response-cache-ttl-secs",
+                "30",
+                "--response-cache-max-entries",
+                "5",
+                "--response-cache-max-bytes",
+                "4096",
+                "--response-cache-max-entry-bytes",
+                "1024",
+            ]
+        )
+        assert args.response_cache == "memory"
+        assert args.response_cache_ttl_secs == 30
+        assert args.response_cache_max_entries == 5
+        assert args.response_cache_max_bytes == 4096
+        assert args.response_cache_max_entry_bytes == 1024
+
+    def test_unknown_backend_is_refused(self):
+        with pytest.raises(SystemExit):
+            parse_router_args(["--response-cache", "redis"])
+
+    def test_router_prefix(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        args = RouterArgs.from_cli_args(
+            parser.parse_args(["--router-response-cache", "memory"]), use_router_prefix=True
+        )
+        assert args.response_cache == "memory"
+        assert args.response_cache_ttl_secs == 300
+
+
 class TestConnectionTimeouts:
     """The HTTP edge's connection-level timeouts: their defaults and the
     disabling zero."""
