@@ -3438,6 +3438,106 @@ async fn chat_stream_the_engine_rejects_after_its_first_chunk_is_the_requests_fa
     assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
 }
 
+/// The load guards a processor is handed ride on the body it builds: the
+/// worker stays loaded after the processor returns, read to the end or
+/// dropped unread, and is unloaded when the body goes.
+#[tokio::test]
+async fn the_load_guards_of_a_chat_stream_go_with_its_body() {
+    for read_to_the_end in [true, false] {
+        let (stream, server) =
+            scripted_stream(vec![chunk(0, "Hi"), complete(0, "stop")], "0").await;
+        let worker = breaker_worker();
+        let selection = context::WorkerSelection::Single {
+            worker: Arc::clone(&worker),
+        };
+        let guards = context::LoadGuards::new(&selection, None);
+        assert_eq!(worker.load(), 1, "the dispatch loaded the worker");
+        let source =
+            utils::StreamSource::new(Some(&selection), &dispatch(), metrics_labels::ENDPOINT_CHAT);
+        let response = Arc::new(processor(false))
+            .process_streaming_response(
+                context::ExecutionResult::Single { stream },
+                chat_spec(false),
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                false,
+                None,
+                Some(guards),
+                source,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            worker.load(),
+            1,
+            "the guards ride on the body (read_to_the_end={read_to_the_end})"
+        );
+        if read_to_the_end {
+            let body = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .expect("the SSE body")
+                .to_bytes();
+            let text = std::str::from_utf8(&body).expect("UTF-8 SSE");
+            assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+        } else {
+            drop(response);
+        }
+        assert_eq!(
+            worker.load(),
+            0,
+            "the body took the guards with it (read_to_the_end={read_to_the_end})"
+        );
+        server.abort();
+    }
+}
+
+/// A completion stream refused before its first frame (the execution result
+/// is no stream) carries its load guards on the refusal's body all the same.
+#[tokio::test]
+async fn the_load_guards_of_a_completion_stream_refused_before_its_first_frame_go_with_its_body() {
+    let worker = breaker_worker();
+    let selection = context::WorkerSelection::Single {
+        worker: Arc::clone(&worker),
+    };
+    let guards = context::LoadGuards::new(&selection, None);
+    let request: openai_protocol::completion::CompletionRequest = serde_json::from_value(
+        serde_json::json!({"model":"eof-test", "prompt":"test", "stream":true}),
+    )
+    .unwrap();
+    let nested = context::ExecutionResult::Batch {
+        results: vec![context::ExecutionResult::Batch {
+            results: Vec::new(),
+        }],
+    };
+    let response = Arc::new(processor(false))
+        .process_completion_streaming_response(
+            nested,
+            CompletionResponseSpec::from(&request),
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            None,
+            Some(guards),
+            utils::StreamSource::new(
+                Some(&selection),
+                &dispatch(),
+                metrics_labels::ENDPOINT_COMPLETIONS,
+            ),
+        )
+        .await;
+    assert_eq!(worker.load(), 1, "the refusal's body holds the guards");
+    let body = http_body_util::BodyExt::collect(response.into_body())
+        .await
+        .expect("the SSE body")
+        .to_bytes();
+    let text = std::str::from_utf8(&body).expect("UTF-8 SSE");
+    assert!(
+        text.contains("Nested batch or embedding result in completion streaming"),
+        "{text}"
+    );
+    assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+    assert_eq!(worker.load(), 0, "the body took the guards with it");
+}
+
 /// Two calls in the `qwen` tool format, one per chunk.
 const TWO_CALLS: [&str; 2] = [
     "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": 1}}\n</tool_call>",
