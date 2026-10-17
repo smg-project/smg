@@ -142,10 +142,13 @@ the gauge `smg_mm_turbojpeg_available` at 0. The TurboJPEG policy makes the
 state fatal instead: `--mm-turbojpeg require` on the router (`SMG_MM_TURBOJPEG`
 for a process without the flag, `mm_turbojpeg` in a config file) stops the
 router at start-up, and `--mm-turbojpeg require` on the worker
-(`SMG_VLLM_MM_TURBOJPEG`) refuses to build smg's pipeline at launch, each with
-an error naming the library and the gauge. The default, `prefer`, keeps the
-fallback; an unreadable value stops start-up as an unreadable
-`SMG_MM_PROCESSING` does.
+(`SMG_VLLM_MM_TURBOJPEG`, a supported spelling beside the flag, not a
+deprecated one) refuses to build smg's pipeline at launch, each with an error
+naming the library and the gauge. The router checks the policy once at
+start-up, in every routing mode, before anything binds; a worker whose
+launcher was not given the setting reads `SMG_MM_TURBOJPEG` as the router
+does. The default, `prefer`, keeps the fallback; an unreadable value stops
+start-up as an unreadable `SMG_MM_PROCESSING` does.
 
 To move fetching and processing out of the vLLM process, run the GPU-free
 sidecar next to a private Redis and point the worker at it

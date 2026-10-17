@@ -358,15 +358,23 @@ pub(crate) fn report_jpeg_decoder() {
 /// Apply the operator's TurboJPEG policy to this process. Under `require` a
 /// process whose loader did not find the library does not come up, with the
 /// library and the gauge named, instead of serving the fallback decoder's
-/// pixels behind the one warning above; under `prefer` nothing changes.
+/// pixels behind the one warning above; under `prefer` nothing changes. The
+/// router calls it once at start-up, in every routing mode, before anything
+/// binds (a gRPC router created behind the gateway's try-register would
+/// otherwise log its refusal and the process would start without it), and
+/// again where its components and the worker pipeline are built, for an
+/// embedded or test caller; the line under `require` is said once.
 pub(crate) fn enforce_jpeg_decoder_policy(
     policy: llm_multimodal::jpeg_turbo::TurboJpegPolicy,
 ) -> anyhow::Result<()> {
+    static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     llm_multimodal::jpeg_turbo::enforce_policy(policy).map_err(|error| {
         anyhow::anyhow!("{error} (the gauge smg_mm_turbojpeg_available reads 0 for this process)")
     })?;
     if policy == llm_multimodal::jpeg_turbo::TurboJpegPolicy::Require {
-        tracing::info!("libjpeg-turbo is required by the TurboJPEG policy and was loaded");
+        SAID.get_or_init(|| {
+            tracing::info!("libjpeg-turbo is required by the TurboJPEG policy and was loaded");
+        });
     }
     Ok(())
 }

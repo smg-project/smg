@@ -1924,7 +1924,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // Seed the process-wide multimodal tensor transport defaults from the
     // resolved router config; per-worker specs still override at request time.
     use crate::routers::grpc::multimodal::{
-        init_mm_settings, init_mm_transport_defaults, MultimodalSettings,
+        enforce_jpeg_decoder_policy, init_mm_settings, init_mm_transport_defaults,
+        report_jpeg_decoder, MultimodalSettings,
     };
     init_mm_transport_defaults(
         config.router_config.multimodal_tensor_transport,
@@ -1935,7 +1936,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let mm_settings = MultimodalSettings::resolve(&config.router_config)
         .map_err(|error| format!("multimodal settings: {error:#}"))?;
     llm_multimodal::init_log_video_decode_timing(mm_settings.log_mm_timing.value);
+    let turbojpeg = mm_settings.turbojpeg.value;
     init_mm_settings(mm_settings);
+    // The TurboJPEG policy is enforced here, once, in every routing mode and
+    // before anything binds: under `require` a host without the library stops
+    // the process now, where a refusal at router creation would be turned
+    // into a warning by the gateway's try-register (--enable-igw) and the
+    // process would start with no gRPC router behind its routes.
+    report_jpeg_decoder();
+    enforce_jpeg_decoder_policy(turbojpeg)
+        .map_err(|error| format!("TurboJPEG policy: {error:#}"))?;
 
     // The metrics recorder is installed now so start-up records land in it;
     // its listener binds further down, once every configuration read that

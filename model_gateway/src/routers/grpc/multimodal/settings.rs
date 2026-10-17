@@ -251,6 +251,24 @@ impl MultimodalSettings {
     }
 }
 
+/// The TurboJPEG policy for a process that was given no setting of its own
+/// (a worker pipeline whose launcher sent none): `SMG_MM_TURBOJPEG` read as
+/// the router reads it, strictly, so a misspelt `require` refuses the
+/// process instead of serving the fallback decoder's pixels under the
+/// default; unset or blank is the default, `prefer`.
+pub(crate) fn turbojpeg_policy_from_env() -> Result<TurboJpegPolicy> {
+    turbojpeg_policy(std::env::var(ENV_TURBOJPEG).ok())
+}
+
+/// [`turbojpeg_policy_from_env`] over an explicit value of the variable.
+fn turbojpeg_policy(env_value: Option<String>) -> Result<TurboJpegPolicy> {
+    let env_value = env_value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let defaults = MultimodalSettings::default();
+    Ok(strict(None, env_value, ENV_TURBOJPEG, None, defaults.turbojpeg)?.value)
+}
+
 /// A setting flag > env > default like the rest, except that an env value
 /// that cannot be read stops startup: carrying on with the default would
 /// leave the process doing the opposite of what the operator asked for
@@ -594,6 +612,28 @@ mod tests {
             MultimodalSettings::resolve_with(&config, env(&[("SMG_MM_TURBOJPEG", "REQUIRE")]))
                 .unwrap();
         assert_eq!(required.turbojpeg, from_env(TurboJpegPolicy::Require));
+    }
+
+    /// A process with no setting of its own (a worker pipeline whose
+    /// launcher sent none) reads `SMG_MM_TURBOJPEG` under the same strictness:
+    /// an unreadable value is refused rather than read as the default, a
+    /// readable one applies in any case, unset or blank is `prefer`.
+    #[test]
+    fn a_process_without_the_setting_reads_the_env_strictly() {
+        assert_eq!(
+            turbojpeg_policy(Some(" Require ".to_string())).unwrap(),
+            TurboJpegPolicy::Require
+        );
+        assert_eq!(turbojpeg_policy(None).unwrap(), TurboJpegPolicy::Prefer);
+        assert_eq!(
+            turbojpeg_policy(Some("  ".to_string())).unwrap(),
+            TurboJpegPolicy::Prefer
+        );
+        let error = turbojpeg_policy(Some("required".to_string())).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("SMG_MM_TURBOJPEG"),
+            "{error:#}"
+        );
     }
 
     /// Without the strict names in the reader, the other settings resolve
