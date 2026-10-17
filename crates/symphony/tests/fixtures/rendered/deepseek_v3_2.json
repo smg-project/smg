@@ -14,8 +14,8 @@
  "notes": [
   "A turn is the history rendered with the turn's message minus the generation prompt, minus the end-of-sentence token, which the stop decoder hides from the parser.",
   "The encoder ends the prompt with <think> in thinking mode and </think> in chat mode, after the last user message and again after a tool result (inside the same assistant turn, after </function_results>).",
-  "The two newlines the encoder writes before a calls block are the content's where the content stay already holds text (the turn's own content, or the prompt's text after a tool result in chat mode, which the replay walks); alone at a stay's start they are the encoder's spacing, dropped. The encoder's parser looks for the block after them either way. `content` is the table's reading and `reference_content` the parser's.",
-  "The tail is the prompt from its last user message; the replay walks it from the last <｜Assistant｜>."
+  "The two newlines the encoder writes before a calls block are the content's where the content stay already holds text (the turn's own content); alone at a stay's start, at the turn's start or after a tool result (the replay starts after the tail the encoder writes behind the result), they are the encoder's spacing, dropped. The encoder's parser looks for the block after them either way. `content` is the table's reading and `reference_content` the parser's.",
+  "The tail is the prompt from its last user message; the replay starts after the last of the four tails the table anchors the turn at (<｜Assistant｜> or </function_results> and two newlines, then <think> or </think>)."
  ],
  "tools": [
   {
@@ -626,7 +626,7 @@
    "tail": "<｜User｜>Weather in Paris?<｜Assistant｜></think>\n\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls><｜end▁of▁sentence｜>\n\n<function_results>\n<result>{\"temperature\": 18}</result>\n</function_results>\n\n</think>",
    "output": "\n\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Rome</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
    "reasoning": "",
-   "content": "\n\n",
+   "content": "",
    "reference_content": "",
    "calls": [
     {

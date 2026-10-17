@@ -17,10 +17,10 @@ stands for is what the encoder's parser reads from the completion: its `reasonin
 `content`, and its `tool_calls`, with one difference the fixture spells out: the two newlines the
 encoder writes before a calls block follow the content where there is some, and the table keeps
 them as the content's (the parser looks for the block after them and drops them), so a turn with
-content and calls has them at the end of its `content` here, and so has a turn after a tool
-result in chat mode, whose content stay began in the prompt; alone at a stay's start, after the
-thought or at the turn's start, they are the encoder's spacing, which the table drops as the
-parser does. `reference_content` is the parser's own.
+content and calls has them at the end of its `content` here; alone at a stay's start, after the
+thought, at the turn's start or after a tool result (the table anchors the turn at the tail the
+encoder writes behind the result, so nothing of the prompt is begun), they are the encoder's
+spacing, which the table drops as the parser does. `reference_content` is the parser's own.
 
 Usage: render_deepseek_v3_2_turns.py <encoding_dsv32.py> [--also <encoding_dsv32.py> ...] [--check]
   With --check nothing is written: the fixture is rendered again and compared byte for byte, and
@@ -230,12 +230,10 @@ def render_case(encoder, name, messages, mode):
         for c in read["tool_calls"]
     ]
     # The two newlines before a block are the content's where the content stay already holds
-    # text: the turn's own content, or, after a tool result in chat mode, the prompt's text since
-    # the previous block closed (the replay walks it). Alone at the start of a stay they are the
-    # encoder's spacing, which the table drops as the parser does.
-    after_result = any(m["role"] == "tool" for m in messages)
-    stay_has_text = bool(read["content"]) or (mode == "chat" and after_result)
-    content = read["content"] + (BLOCK_LEAD if calls and stay_has_text else "")
+    # text, the turn's own content. Alone at the start of a stay, at the turn's start or after a
+    # tool result (the replay starts after the tail the encoder writes behind the result), they
+    # are the encoder's spacing, which the table drops as the parser does.
+    content = read["content"] + (BLOCK_LEAD if calls and read["content"] else "")
     assert output.startswith(read["reasoning_content"]) or not read["reasoning_content"]
     tail = prompt[prompt.rfind("<｜User｜>") :]
     return {
@@ -294,12 +292,15 @@ def main(argv):
             "after the last user message and again after a tool result (inside the same "
             "assistant turn, after </function_results>).",
             "The two newlines the encoder writes before a calls block are the content's where the "
-            "content stay already holds text (the turn's own content, or the prompt's text after "
-            "a tool result in chat mode, which the replay walks); alone at a stay's start they are "
-            "the encoder's spacing, dropped. The encoder's parser looks for the block after them "
-            "either way. `content` is the table's reading and `reference_content` the parser's.",
-            "The tail is the prompt from its last user message; the replay walks it from the last "
-            "<｜Assistant｜>.",
+            "content stay already holds text (the turn's own content); alone at a stay's start, at "
+            "the turn's start or after a tool result (the replay starts after the tail the encoder "
+            "writes behind the result), they are the encoder's spacing, dropped. The encoder's "
+            "parser looks for the block after them either way. `content` is the table's reading "
+            "and `reference_content` the parser's.",
+            "The tail is the prompt from its last user message; the replay starts after the last of "
+            "the four tails the table anchors the turn at (<｜Assistant｜> or </function_results> "
+            "and two newlines, then <think> or </think>).",
+
         ],
         "tools": TOOLS,
         "turns": turns,
