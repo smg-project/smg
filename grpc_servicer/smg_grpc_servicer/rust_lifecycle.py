@@ -25,6 +25,7 @@ import logging
 import math
 import multiprocessing
 import os
+import random
 import signal
 import socket
 import subprocess
@@ -324,9 +325,30 @@ def servicer_switch(
 # that keep the engine's KV event publisher off when the launcher was given no
 # --kv-events-config.
 KV_EVENTS_OFF_VALUES = ("0", "false", "no", "off")
-# How many base ports the OS is asked for before the servicer gives up on a
-# block of consecutive free ports for a data-parallel engine's publishers.
+# How many base ports are tried before the servicer gives up on a block of
+# consecutive free ports for a data-parallel engine's publishers.
 KV_EVENTS_PORT_ATTEMPTS = 32
+# The publishers' ports are drawn from below the OS's ephemeral range (whose
+# low bound ``ip_local_port_range`` gives, 32768 by default), since the
+# outbound connections the engine opens while it loads (its weights, a
+# rendezvous, a client) draw their source ports from that range and could
+# take a port picked there before the engine binds it; and from above the
+# well-known ports and the engines' own fixed default (5557).
+KV_EVENTS_PORT_FLOOR = 10000
+KV_EVENTS_PORT_RANGE_FILE = "/proc/sys/net/ipv4/ip_local_port_range"
+_port_draw = random.SystemRandom()
+
+
+def _ephemeral_low(range_file: str = KV_EVENTS_PORT_RANGE_FILE) -> int:
+    """The low bound of the OS's ephemeral port range, as ``range_file``
+    (``ip_local_port_range``) states it; 32768, Linux's default, when it cannot
+    be read or makes no sense."""
+    try:
+        with open(range_file, encoding="utf-8") as f:
+            low = int(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 32768
+    return low if KV_EVENTS_PORT_FLOOR < low <= 65536 else 32768
 
 
 def _bindable(port: int) -> bool:
@@ -344,34 +366,38 @@ def _bindable(port: int) -> bool:
 
 def free_kv_events_endpoint(ranks: int = 1) -> str:
     """``tcp://*:<port>`` for the engine's default KV-event publisher: a port
-    the OS hands out as free on every interface, with the ``ranks - 1`` ports
-    after it free as well (rank ``r`` of a data-parallel engine publishes on
-    ``port + r``, and the relay dials the same), asked for again on another
-    base port until they are.
+    drawn at random from below the OS's ephemeral range (``KV_EVENTS_PORT_FLOOR``
+    up to ``ip_local_port_range``'s low bound), found free on every interface
+    with the ``ranks - 1`` ports after it (rank ``r`` of a data-parallel engine
+    publishes on ``port + r``, and the relay dials the same), drawn again until
+    a block is.
 
     Every engine's own configuration defaults the endpoint to the same fixed
     port, so two engines on one host, or an engine started next to a publisher
     an earlier job left behind, failed at the engine's bind with "Address
-    already in use". A port the OS hands out is one nothing holds at that
-    moment, and the OS hands no second asker the same one while the first
-    still holds it. The engine binds the port later, after its model loaded;
-    what else binds it in between is caught where it was before, at the
-    engine's bind, which names the port.
+    already in use". The engine binds its port only after its model loaded,
+    minutes later, and meanwhile opens outbound connections (its weights, a
+    rendezvous, a client) whose source ports the OS draws from its ephemeral
+    range: a port picked there could be taken by one of them in that window,
+    so the draw stays below the range, where only another listener could take
+    it. Two servicers starting at the same moment could draw the same base,
+    with the odds of one draw among more than twenty thousand ports; that, as
+    before, is caught at the engine's bind, which names the port.
     """
     ranks = max(int(ranks), 1)
+    ceiling = _ephemeral_low() - ranks
+    if ceiling < KV_EVENTS_PORT_FLOOR:
+        raise ServicerConfigError(
+            f"no room for {ranks} consecutive KV event publisher ports below the ephemeral "
+            f"port range; pass --kv-events-config with an endpoint"
+        )
     for _ in range(KV_EVENTS_PORT_ATTEMPTS):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind(("", 0))
-            base = int(sock.getsockname()[1])
-            # The base is held while its neighbours are probed, so no probe of
-            # a second servicer starting at the same moment gets it as a base.
-            if base + ranks - 1 <= 65535 and all(
-                _bindable(base + rank) for rank in range(1, ranks)
-            ):
-                return f"tcp://*:{base}"
+        base = _port_draw.randrange(KV_EVENTS_PORT_FLOOR, ceiling + 1)
+        if all(_bindable(base + rank) for rank in range(ranks)):
+            return f"tcp://*:{base}"
     raise ServicerConfigError(
         f"no block of {ranks} consecutive free ports for the KV event publishers after "
-        f"{KV_EVENTS_PORT_ATTEMPTS} attempts; pass --kv-events-config with an endpoint"
+        f"{KV_EVENTS_PORT_ATTEMPTS} draws; pass --kv-events-config with an endpoint"
     )
 
 
@@ -395,11 +421,11 @@ def apply_kv_events_default(
     ``default`` builds for the publisher's endpoint (``default(endpoint)``: the
     engine's ZMQ-publisher configuration, in whichever form the engine takes
     it) as its ``kv_events_config`` before the facts and the engine are built
-    from it, so publisher and relay agree. The endpoint is a free port's
-    (:func:`free_kv_events_endpoint`, one port per data-parallel rank of the
-    ``ranks``), never the engines' shared fixed default: a second engine on
-    the host, or a publisher another process left behind, no longer costs the
-    engine its start. An explicit configuration, anything but ``None`` or an
+    from it, so publisher and relay agree. The endpoint is a free port's,
+    below the OS's ephemeral range (:func:`free_kv_events_endpoint`, one port
+    per data-parallel rank of the ``ranks``), never the engines' shared fixed
+    default: a second engine on the host, or a publisher another process left
+    behind, no longer costs the engine its start. An explicit configuration, anything but ``None`` or an
     empty string, is kept as given, its endpoint and off included; ``env_name``
     set to one of ``KV_EVENTS_OFF_VALUES`` keeps the publisher off without one;
     a ``target`` that cannot be written (frozen server args) is left as it is,

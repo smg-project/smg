@@ -832,13 +832,40 @@ def test_the_default_publisher_port_is_a_free_one_not_the_engines_fixed_default(
     with "Address already in use": the lifecycle's endpoint is a port the OS
     hands out as free, so a held default is never chosen, and the ports after
     it, which a data-parallel engine's other ranks publish on, are free too."""
+    low = rust_lifecycle._ephemeral_low()
     with _listener(5557):
         assert not rust_lifecycle._bindable(5557)
         port = _port_of(rust_lifecycle.free_kv_events_endpoint())
         assert port != 5557
         assert rust_lifecycle._bindable(port)
+        assert rust_lifecycle.KV_EVENTS_PORT_FLOOR <= port < low
     base = _port_of(rust_lifecycle.free_kv_events_endpoint(ranks=4))
     assert all(rust_lifecycle._bindable(base + rank) for rank in range(4))
+    assert rust_lifecycle.KV_EVENTS_PORT_FLOOR <= base and base + 3 < low
+
+
+def test_the_ports_are_drawn_from_below_the_ephemeral_range(tmp_path, monkeypatch):
+    """An outbound connection the engine opens while its model loads draws its
+    source port from the OS's ephemeral range, and could take a port picked
+    there before the engine binds it: the draw stays below the range's low
+    bound as the OS states it (32768 when it cannot be read), above the
+    well-known ports and the engines' fixed default; a host with no room below
+    the range refuses, naming the knob."""
+    stated = tmp_path / "ip_local_port_range"
+    stated.write_text("20000\t60999\n")
+    assert rust_lifecycle._ephemeral_low(str(stated)) == 20000
+    assert rust_lifecycle._ephemeral_low(str(tmp_path / "missing")) == 32768
+    stated.write_text("garbage\n")
+    assert rust_lifecycle._ephemeral_low(str(stated)) == 32768
+    monkeypatch.setattr(rust_lifecycle, "_ephemeral_low", lambda: 20000)
+    for _ in range(20):
+        port = _port_of(rust_lifecycle.free_kv_events_endpoint(ranks=2))
+        assert rust_lifecycle.KV_EVENTS_PORT_FLOOR <= port and port + 1 < 20000
+    monkeypatch.setattr(
+        rust_lifecycle, "_ephemeral_low", lambda: rust_lifecycle.KV_EVENTS_PORT_FLOOR
+    )
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="--kv-events-config"):
+        rust_lifecycle.free_kv_events_endpoint()
 
 
 def test_the_probe_sees_what_a_zmq_publisher_holds():
@@ -858,20 +885,20 @@ def test_the_probe_sees_what_a_zmq_publisher_holds():
     assert rust_lifecycle._bindable(held)
 
 
-def test_a_block_with_a_held_neighbour_is_passed_over_for_another(monkeypatch):
-    """A data-parallel engine's ranks publish on consecutive ports: a base
-    whose neighbour is held is given up for another base, and a host that
-    has no such block refuses with the knob that names an endpoint."""
+def test_a_block_with_a_held_port_is_passed_over_for_another(monkeypatch):
+    """A data-parallel engine's ranks publish on consecutive ports: a block
+    with a held port, its base or a neighbour, is given up for another, and a
+    host that has no such block refuses with the knob that names an endpoint."""
     probed: list[int] = []
     real = rust_lifecycle._bindable
 
-    def neighbour_held(port: int) -> bool:
+    def one_held(port: int) -> bool:
         probed.append(port)
         return False if port == probed[0] else real(port)
 
-    monkeypatch.setattr(rust_lifecycle, "_bindable", neighbour_held)
+    monkeypatch.setattr(rust_lifecycle, "_bindable", one_held)
     base = _port_of(rust_lifecycle.free_kv_events_endpoint(ranks=2))
-    assert len(probed) >= 2 and base + 1 != probed[0]
+    assert len(probed) >= 3 and probed[0] not in (base, base + 1)
     assert real(base) and real(base + 1)
 
     monkeypatch.setattr(rust_lifecycle, "_bindable", lambda port: False)
