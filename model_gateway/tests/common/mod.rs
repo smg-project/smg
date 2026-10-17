@@ -618,29 +618,37 @@ pub fn create_test_context_with_tokenizer_registry(
 /// `create_test_context_with_tokenizer_registry` over a registry holding the
 /// mock tokenizer for `model` (loaded as `tokenizer-id`, source `test`): the
 /// context the gRPC worker tests run their routers in.
-#[expect(
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
 pub fn create_test_context_with_mock_tokenizer(
     config: RouterConfig,
     model: &str,
 ) -> Pin<Box<dyn Future<Output = Arc<AppContext>> + Send>> {
     let model = model.to_string();
     Box::pin(async move {
-        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-        let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
-        tokenizer_registry
-            .load(
-                "tokenizer-id",
-                &model,
-                "test",
-                || async move { Ok(tokenizer) },
-            )
-            .await
-            .expect("the mock tokenizer loads");
+        let tokenizer_registry = mock_tokenizer_registry(&model).await;
         create_test_context_with_tokenizer_registry(config, tokenizer_registry).await
     })
+}
+
+/// A tokenizer registry holding the mock tokenizer for `model`, loaded as
+/// `tokenizer-id` from source `test`: what the context helpers run on, for
+/// the tests that build their context some other way.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+pub async fn mock_tokenizer_registry(model: &str) -> Arc<TokenizerRegistry> {
+    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
+    let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
+    tokenizer_registry
+        .load(
+            "tokenizer-id",
+            model,
+            "test",
+            || async move { Ok(tokenizer) },
+        )
+        .await
+        .expect("the mock tokenizer loads");
+    tokenizer_registry
 }
 
 /// `create_test_context_with_tokenizer_registry` over the caller's storage

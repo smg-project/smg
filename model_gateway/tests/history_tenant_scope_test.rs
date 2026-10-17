@@ -18,7 +18,6 @@ use axum::{
     http::{header::CONTENT_TYPE, Method, Request, StatusCode},
     Router,
 };
-use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
 use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use serde_json::{json, Value};
 use smg::{
@@ -75,18 +74,7 @@ async fn app(trust_tenant_header: bool) -> (Router, tokio::task::AbortHandle) {
         .build_unchecked();
     config.health_check.disable_health_check = true;
     config.tenant_resolution.trust_tenant_header = trust_tenant_header;
-    let tokenizers = Arc::new(TokenizerRegistry::new());
-    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
-    tokenizers
-        .load(
-            "tokenizer-id",
-            MODEL,
-            "test",
-            || async move { Ok(tokenizer) },
-        )
-        .await
-        .unwrap();
-    let context = common::create_test_context_with_tokenizer_registry(config, tokenizers).await;
+    let context = common::create_test_context_with_mock_tokenizer(config, MODEL).await;
     context.worker_registry.register(worker).unwrap();
     let router = RouterFactory::create_router(&context).await.unwrap();
     let app = common::test_app::create_test_app_with_context(Arc::from(router), context);

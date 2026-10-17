@@ -21,7 +21,6 @@ use axum::{
     http::{header::CONTENT_TYPE, Method, Request, StatusCode},
     Router,
 };
-use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
 use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use serde_json::{json, Value};
 use smg::{
@@ -116,17 +115,7 @@ async fn app() -> (Router, tokio::task::AbortHandle) {
         .max_payload_size(1024 * 1024)
         .build_unchecked();
     config.health_check.disable_health_check = true;
-    let tokenizers = Arc::new(TokenizerRegistry::new());
-    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
-    tokenizers
-        .load(
-            "tokenizer-id",
-            MODEL,
-            "test",
-            || async move { Ok(tokenizer) },
-        )
-        .await
-        .unwrap();
+    let tokenizers = common::mock_tokenizer_registry(MODEL).await;
     // The store answers the start-up contact and is then gone: nothing
     // listens on its port, every call is refused.
     let store = TcpListener::bind("127.0.0.1:0").await.unwrap();

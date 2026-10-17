@@ -22,7 +22,6 @@ use std::{
 };
 
 use axum::{body::to_bytes, http::StatusCode};
-use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
 use openai_protocol::{
     chat::ChatCompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
 };
@@ -218,18 +217,7 @@ async fn answers_of(
         })
         .build_unchecked();
     config.health_check.disable_health_check = true;
-    let tokenizers = Arc::new(TokenizerRegistry::new());
-    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
-    tokenizers
-        .load(
-            "tokenizer-id",
-            MODEL,
-            "test",
-            || async move { Ok(tokenizer) },
-        )
-        .await
-        .unwrap();
-    let context = common::create_test_context_with_tokenizer_registry(config, tokenizers).await;
+    let context = common::create_test_context_with_mock_tokenizer(config, MODEL).await;
     context
         .worker_registry
         .register(Arc::clone(&worker))
