@@ -282,7 +282,9 @@ impl Assembler {
                 text: Text::uncounted(&rest[..=colon]),
                 why: MalformedReason::EmptyKey,
             });
-            self.skipping = Some(self.containers.len());
+            // A member without a key inside a member already skipped is part of what is skipped:
+            // the outer depth stands, so the skip ends at the outer member's end, not the inner.
+            self.skipping.get_or_insert(self.containers.len());
         } else {
             let mut json = self.separator();
             push_quoted(&mut json, key);
@@ -898,6 +900,9 @@ mod tests {
                 ":{x:[1,<|\"|>y<|\"|>]},",
             ),
             ("call:f{:[1,2]}", "{}", ":[1,2]"),
+            // A member without a key inside the skipped member: the outer skip stands.
+            ("call:f{:{:1},a:2}", r#"{"a": 2}"#, ":{:1},"),
+            ("call:f{:{:1,b:2},a:2}", r#"{"a": 2}"#, ":{:1,b:2},"),
         ] {
             let per_char: Vec<&str> = output
                 .char_indices()
@@ -925,6 +930,9 @@ mod tests {
             ("call:f{:<|\"|>te", true),
             ("call:f{:{x:", false),
             ("call:f{:{x:", true),
+            // A member without a key inside the skipped member, cut: the outer skip ends it.
+            ("call:f{:{:1", false),
+            ("call:f{:{:1", true),
         ] {
             let events = run(&[output], cut);
             assert_eq!(arguments(&events), "{}", "{output:?} cut {cut}");
