@@ -251,9 +251,14 @@ impl LoadBalancingPolicy for BucketPolicy {
     }
 }
 
+/// The declared span of request sizes a listing of the workers splits evenly
+/// among them; the last range is open-ended regardless. A constant, so that no
+/// path can widen it: the adjustment learns the real sizes from the requests
+/// seen.
+const L_MAX: usize = 4096;
+
 #[derive(Debug, Clone)]
 pub struct Bucket {
-    l_max: usize,
     bucket_cnt: usize,
     pub prefill_worker_urls: Arc<Mutex<Vec<String>>>,
     load_total: usize,
@@ -287,8 +292,6 @@ impl Boundary {
 
 impl Bucket {
     pub fn new(period: usize) -> Self {
-        let l_max = 4096;
-
         let bucket_cnt = 0;
 
         let load_total = 0;
@@ -304,7 +307,6 @@ impl Bucket {
         let prefill_worker_urls = Arc::new(Mutex::new(Vec::new()));
 
         Bucket {
-            l_max,
             bucket_cnt,
             prefill_worker_urls,
             load_total,
@@ -317,31 +319,47 @@ impl Bucket {
         }
     }
 
+    /// List the prefill workers the bucket partitions the sizes over, as the
+    /// registration step does whenever a worker joins (it hands the bucket
+    /// every prefill worker again). The same set again, in any order, is a
+    /// no-op: the partition and the load counters stay. A changed set keeps
+    /// the counters of the workers that stay, starts the newcomers at zero
+    /// and splits the declared span [`L_MAX`] evenly among all of them with
+    /// the last range open-ended, exactly as the first split does; the span
+    /// is a constant, so no later split divides the open end. The even split
+    /// is provisional: the next adjustment rebuilds it from the sizes seen
+    /// without waiting for the per-worker load to double
+    /// ([`Self::adjust_boundary`]).
     pub fn init_prefill_worker_urls(&mut self, prefill_worker_urls: Vec<String>) {
-        let bucket_cnt = prefill_worker_urls.len();
-        self.bucket_cnt = bucket_cnt;
-        let mut urls_lock = self.prefill_worker_urls.lock();
-        urls_lock.clone_from(&prefill_worker_urls);
-
-        let mut chars_lock = self.chars_per_url.lock();
-        chars_lock.clear();
-
-        for url in &prefill_worker_urls {
-            chars_lock.insert(url.clone(), 0);
+        {
+            let mut urls = self.prefill_worker_urls.lock();
+            let listed: HashSet<&str> = urls.iter().map(String::as_str).collect();
+            let incoming: HashSet<&str> = prefill_worker_urls.iter().map(String::as_str).collect();
+            if listed == incoming {
+                return;
+            }
+            urls.clone_from(&prefill_worker_urls);
         }
-
-        let worker_cnt = bucket_cnt;
-        let boundary = match self.l_max.checked_div(worker_cnt) {
+        {
+            let mut chars = self.chars_per_url.lock();
+            chars.retain(|url, _| prefill_worker_urls.contains(url));
+            for url in &prefill_worker_urls {
+                chars.entry(url.clone()).or_insert(0);
+            }
+        }
+        let worker_cnt = prefill_worker_urls.len();
+        self.bucket_cnt = worker_cnt;
+        self.boundary = match L_MAX.checked_div(worker_cnt) {
             None => Vec::new(),
             Some(gap) => {
-                self.l_max = usize::MAX;
+                let gap = gap.max(1);
                 prefill_worker_urls
                     .iter()
                     .enumerate()
                     .map(|(i, url)| {
                         let min = i * gap;
                         let max = if i == worker_cnt - 1 {
-                            self.l_max
+                            usize::MAX
                         } else {
                             (i + 1) * gap - 1
                         };
@@ -350,8 +368,7 @@ impl Bucket {
                     .collect()
             }
         };
-
-        self.boundary = boundary;
+        self.bucket_load = 0;
         info!("Init boundary:{:?}", self.boundary);
     }
 
@@ -1591,5 +1608,131 @@ mod tests {
             assert_eq!(counted.get("http://w2:8000"), Some(&0));
             assert_eq!(counted.get("http://w1:8000"), Some(&3050));
         }
+    }
+
+    /// The ranges of `bucket`'s partition, as (url, range).
+    fn bucket_ranges(bucket: &Bucket) -> Vec<(String, [usize; 2])> {
+        bucket
+            .boundary
+            .iter()
+            .map(|b| (b.url.clone(), b.range))
+            .collect()
+    }
+
+    /// A prefill worker that joins after the first split is re-listed with
+    /// the others (the registration step hands the bucket every prefill
+    /// worker again): the sizes split among all of them as the first split
+    /// did. A mid-size request reaches the second worker and a large one the
+    /// newcomer; the first worker does not take every size.
+    #[test]
+    fn a_prefill_worker_re_listed_after_the_first_split_takes_its_share_of_the_sizes() {
+        let policy = boundary_only_policy();
+        let two = prefill_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_prefill_worker_urls(&two);
+        assert_eq!(
+            boundaries(&policy, &two),
+            [
+                ("http://w1:8000".to_string(), [0, 2047]),
+                ("http://w2:8000".to_string(), [2048, usize::MAX]),
+            ]
+        );
+
+        let three = prefill_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_prefill_worker_urls(&three);
+
+        assert_eq!(
+            boundaries(&policy, &three),
+            [
+                ("http://w1:8000".to_string(), [0, 1364]),
+                ("http://w2:8000".to_string(), [1365, 2729]),
+                ("http://w3:8000".to_string(), [2730, usize::MAX]),
+            ]
+        );
+        for (size, owner) in [
+            (100, "http://w1:8000"),
+            (2000, "http://w2:8000"),
+            (3000, "http://w3:8000"),
+            (100_000, "http://w3:8000"),
+        ] {
+            let selected = select(&policy, &three, size)
+                .unwrap_or_else(|| panic!("a request of {size} chars selects no worker"));
+            assert_eq!(three[selected].url(), owner, "size {size}");
+        }
+    }
+
+    /// A registration pass that changed nothing about the prefill workers
+    /// (a decode worker joined, say) re-lists the same URLs, in whatever
+    /// order the registry returns them: the partition and the load counters
+    /// stay as they were.
+    #[test]
+    fn re_listing_the_same_prefill_workers_keeps_the_partition_and_the_counters() {
+        let policy = boundary_only_policy();
+        let workers = prefill_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_prefill_worker_urls(&workers);
+        assert_eq!(select(&policy, &workers, 2000), Some(1));
+        let partition = boundaries(&policy, &workers);
+
+        let same_in_another_order =
+            prefill_workers(&["http://w3:8000", "http://w1:8000", "http://w2:8000"]);
+        policy.init_prefill_worker_urls(&same_in_another_order);
+
+        assert_eq!(boundaries(&policy, &workers), partition);
+        let entry = policy
+            .buckets
+            .get(normalize_model_key(workers[0].model_id()))
+            .unwrap();
+        let bucket = entry.read();
+        assert_eq!(
+            bucket.chars_per_url.lock().get("http://w2:8000"),
+            Some(&2000)
+        );
+        assert_eq!(bucket.bucket_cnt, 3);
+    }
+
+    /// A changed membership leaves the even split provisional: the next
+    /// adjustment rebuilds the partition from the sizes seen, as the first
+    /// adjustment does, without waiting for the per-worker load to double.
+    /// The sizes seen are 100, 200, 300, 2000, 2100 and 2200; with three
+    /// workers a third of their sum, 2300, is one worker's share.
+    #[test]
+    fn a_changed_membership_lets_the_next_adjustment_re_split_from_the_sizes_seen() {
+        let url = |n: usize| format!("http://w{n}:8000");
+        let mut bucket = Bucket::new(3_600_000);
+        bucket.init_prefill_worker_urls(vec![url(1), url(2)]);
+        for size in [100, 200, 300, 2000, 2100, 2200] {
+            let owner = bucket.find_boundary(size).expect("every size has an owner");
+            bucket.post_process_request(size, owner);
+        }
+        bucket.adjust_boundary();
+        assert_eq!(
+            bucket_ranges(&bucket),
+            [(url(1), [0, 2100]), (url(2), [2101, usize::MAX])]
+        );
+        // Steady load: the second adjustment leaves the partition alone.
+        bucket.adjust_boundary();
+        assert_eq!(
+            bucket_ranges(&bucket),
+            [(url(1), [0, 2100]), (url(2), [2101, usize::MAX])]
+        );
+
+        bucket.init_prefill_worker_urls(vec![url(1), url(2), url(3)]);
+        assert_eq!(
+            bucket_ranges(&bucket),
+            [
+                (url(1), [0, 1364]),
+                (url(2), [1365, 2729]),
+                (url(3), [2730, usize::MAX]),
+            ]
+        );
+
+        bucket.adjust_boundary();
+        assert_eq!(
+            bucket_ranges(&bucket),
+            [
+                (url(1), [0, 2000]),
+                (url(2), [2001, 2200]),
+                (url(3), [2201, usize::MAX]),
+            ]
+        );
     }
 }
