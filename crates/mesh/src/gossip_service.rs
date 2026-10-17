@@ -376,8 +376,10 @@ impl Gossip for GossipService {
             reason = "server-side inbound handler bound to sync_stream lifetime; terminates when the stream closes"
         )]
         tokio::spawn(async move {
+            // The dialer's name comes with its first frame; the peer gauge is
+            // written under that name only, so no series carries a
+            // placeholder for the time before the name is known.
             let mut peer_id = String::new();
-            update_peer_connections(&peer_id, true);
             let mut sequence: u64 = 0;
 
             while let Some(msg) = next_frame(&mut incoming, &peer_id).await {
@@ -423,8 +425,12 @@ impl Gossip for GossipService {
                 }
             }
 
-            update_peer_connections(&peer_id, false);
-            record_peer_reconnect(&peer_id);
+            // A stream that closed before its first frame named the dialer
+            // was never a peer connection: nothing is recorded for it.
+            if !peer_id.is_empty() {
+                update_peer_connections(&peer_id, false);
+                record_peer_reconnect(&peer_id);
+            }
             if let Some(handle) = sender_handle {
                 handle.abort();
             }
@@ -434,5 +440,187 @@ impl Gossip for GossipService {
         Ok(Response::new(
             Box::pin(output_stream) as Self::SyncStreamStream
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The acceptor's connection accounting, read the way an operator reads
+    //! it: the text of a Prometheus recorder installed for the test thread
+    //! (the gateway installs the same recorder type for the process), with
+    //! the mesh nodes on a current-thread runtime so every task of theirs
+    //! records into it.
+
+    use std::{future::Future, net::SocketAddr, time::Duration};
+
+    use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+    use tokio_stream::StreamExt;
+
+    use crate::{
+        service::gossip::{gossip_client::GossipClient, StreamMessage},
+        tests::test_utils::{bind_node, wait_for},
+        transport::sync_stream::build_heartbeat,
+        MeshServerBuilder, MeshServerHandler,
+    };
+
+    const PEER_GAUGE: &str = "router_mesh_peer_connections";
+
+    /// Runs `scenario` on a current-thread runtime under a Prometheus
+    /// recorder installed for this thread; the rendered text, the way
+    /// `/metrics` serves it, once the scenario is done.
+    fn metrics_of<F, Fut>(scenario: F) -> String
+    where
+        F: FnOnce(PrometheusHandle) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(scenario(handle.clone()));
+        });
+        handle.render()
+    }
+
+    /// The peer gauge's lines of a rendered scrape.
+    fn peer_gauge_lines(rendered: &str) -> Vec<&str> {
+        rendered
+            .lines()
+            .filter(|line| line.starts_with(PEER_GAUGE))
+            .collect()
+    }
+
+    /// A mesh node on an ephemeral loopback port, joining `init_peer` when
+    /// given.
+    async fn node(name: &str, init_peer: Option<SocketAddr>) -> (SocketAddr, MeshServerHandler) {
+        let (listener, addr) = bind_node().await;
+        let (server, handler) =
+            MeshServerBuilder::new(name.to_string(), addr, addr, init_peer).build();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test node runs in the background for the duration of the assertion"
+        )]
+        tokio::spawn(async move {
+            if let Err(e) = server.start_with_listener(listener).await {
+                tracing::error!("Mesh node failed: {e}");
+            }
+        });
+        (addr, handler)
+    }
+
+    /// Two members: A, the lower name, dials the sync stream; B accepts it
+    /// and records the peer gauge. The gauge appears under A's name and
+    /// under nothing else: no series with an empty `peer` for the time
+    /// before A's first frame named it.
+    #[test]
+    fn the_peer_gauge_carries_the_dialers_name_and_no_empty_label() {
+        let rendered = metrics_of(|metrics| async move {
+            let (addr_a, handler_a) = node("A", None).await;
+            let (_addr_b, handler_b) = node("B", Some(addr_a)).await;
+            wait_for(
+                || {
+                    peer_gauge_lines(&metrics.render())
+                        .iter()
+                        .any(|line| line.contains("peer=\"A\"") && line.ends_with(" 1"))
+                },
+                Duration::from_secs(20),
+                "B accepts A's sync stream",
+            )
+            .await;
+            handler_a.shutdown();
+            handler_b.shutdown();
+        });
+
+        let lines = peer_gauge_lines(&rendered);
+        assert!(
+            !lines.iter().any(|line| line.contains("peer=\"\"")),
+            "a peer series without a name: {lines:?}"
+        );
+    }
+
+    /// A stream that closes before its first frame named the dialer was
+    /// never a peer connection: neither the gauge nor the reconnect count is
+    /// recorded for it, so no series with an empty `peer` is left behind.
+    #[test]
+    fn a_stream_closed_before_naming_its_peer_leaves_no_series() {
+        let rendered = metrics_of(|_| async move {
+            let (addr, handler) = node("A", None).await;
+            wait_for(
+                || std::net::TcpStream::connect(addr).is_ok(),
+                Duration::from_secs(5),
+                "mesh listener started",
+            )
+            .await;
+            let mut client = GossipClient::connect(format!("http://{addr}"))
+                .await
+                .expect("connect to the mesh listener");
+            // An outbound stream that ends at once: the acceptor reads no
+            // frame. Its response stream ends once its handler has run its
+            // close path, which is what the assertion is about.
+            let response = client
+                .sync_stream(tokio_stream::iter(Vec::<StreamMessage>::new()))
+                .await
+                .expect("open the sync stream");
+            let mut inbound = response.into_inner();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while inbound.next().await.is_some() {}
+            })
+            .await
+            .expect("the acceptor closes its side of a stream the dialer ended");
+            handler.shutdown();
+        });
+
+        assert!(
+            !rendered.contains("peer=\"\""),
+            "a series without a peer name:\n{rendered}"
+        );
+    }
+
+    /// A stream whose dialer named itself and then ended: the acceptor's
+    /// series for that name reads 1 while the stream is open and 0 after,
+    /// the closed stream is counted under that name, and no series carries
+    /// an empty `peer` at any point.
+    #[test]
+    fn a_named_stream_that_closed_reads_zero_under_its_name() {
+        let rendered = metrics_of(|_| async move {
+            let (addr, handler) = node("A", None).await;
+            wait_for(
+                || std::net::TcpStream::connect(addr).is_ok(),
+                Duration::from_secs(5),
+                "mesh listener started",
+            )
+            .await;
+            let mut client = GossipClient::connect(format!("http://{addr}"))
+                .await
+                .expect("connect to the mesh listener");
+            // One heartbeat naming the dialer, then the end of the stream.
+            let response = client
+                .sync_stream(tokio_stream::iter(vec![build_heartbeat(1, "probe")]))
+                .await
+                .expect("open the sync stream");
+            let mut inbound = response.into_inner();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while inbound.next().await.is_some() {}
+            })
+            .await
+            .expect("the acceptor closes its side of a stream the dialer ended");
+            handler.shutdown();
+        });
+
+        assert!(
+            rendered.contains("router_mesh_peer_connections{peer=\"probe\"} 0"),
+            "the closed stream's series does not read 0 under its name:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("router_mesh_peer_reconnects_total{peer=\"probe\"} 1"),
+            "the closed stream is not counted under its name:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("peer=\"\""),
+            "a series without a peer name:\n{rendered}"
+        );
     }
 }

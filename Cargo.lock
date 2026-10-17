@@ -7975,6 +7975,7 @@ dependencies = [
  "lazy_static",
  "lz4_flex",
  "metrics",
+ "metrics-exporter-prometheus",
  "num-bigint 0.4.8",
  "num-traits",
  "openssl",
