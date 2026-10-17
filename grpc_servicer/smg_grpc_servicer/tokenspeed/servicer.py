@@ -455,7 +455,13 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 logger.warning("Health probe failed: %s", e)
                 return False
             finally:
-                await engine_outputs.aclose()
+                # Best-effort like the probe itself: an error the engine's exit
+                # raises is logged, not raised over the probe's verdict (an
+                # exception out of a finally would replace the return).
+                try:
+                    await engine_outputs.aclose()
+                except Exception as e:  # noqa: BLE001 — the probe is best-effort.
+                    logger.warning("Health probe close failed: %s", e)
             return False
 
         task = asyncio.create_task(_drive_probe())

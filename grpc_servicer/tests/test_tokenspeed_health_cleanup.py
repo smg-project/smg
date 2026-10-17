@@ -38,11 +38,25 @@ class _AsyncLlm:
         self.aborted.append(rid)
 
 
-@pytest.fixture
-def servicer(tokenspeed_servicer_mod, monkeypatch):
+class _AsyncLlmWhoseExitFails(_AsyncLlm):
+    """An engine whose stream's exit raises: what the close the probe runs
+    meets when releasing what the stream held fails."""
+
+    async def generate_request(self, probe):
+        self.iterated_in = asyncio.current_task()
+        try:
+            yield {"output_ids": [1], "meta_info": {"finish_reason": None}}
+            raise AssertionError("the probe read past its first output")
+        finally:
+            self.exited_in = asyncio.current_task()
+            raise RuntimeError("the engine's exit failed")
+
+
+@pytest.fixture(params=[_AsyncLlm, _AsyncLlmWhoseExitFails])
+def servicer(request, tokenspeed_servicer_mod, monkeypatch):
     mod = tokenspeed_servicer_mod
     servicer = mod.TokenSpeedSchedulerServicer.__new__(mod.TokenSpeedSchedulerServicer)
-    servicer.async_llm = _AsyncLlm()
+    servicer.async_llm = request.param()
     servicer._config = SimpleNamespace(server_args=SimpleNamespace(disaggregation_mode="null"))
     monkeypatch.setattr(
         mod, "_lazy_generate_req_input", lambda: lambda **kwargs: SimpleNamespace(**kwargs)
@@ -61,6 +75,8 @@ def servicer(tokenspeed_servicer_mod, monkeypatch):
 
 
 def test_the_probe_closes_the_engines_stream_in_its_own_task(servicer):
+    # With either engine: the one whose exit fails keeps the probe's verdict,
+    # the close error being logged, not raised over the first output.
     async def run():
         response = await servicer.HealthCheck(tokenspeed_scheduler_pb2.HealthCheckRequest(), None)
         engine = servicer.async_llm
