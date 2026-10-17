@@ -308,16 +308,20 @@ pub const RUNTIME_WORKER_THREADS_CEILING: usize = 4096;
 /// operator's choice, which the host's quota must not veto.
 pub const RUNTIME_WORKER_THREADS_PER_CPU: usize = 4;
 
-/// The warning for an explicit `runtime_worker_threads` above
-/// [`RUNTIME_WORKER_THREADS_PER_CPU`] x the `cpus` available to the process
-/// (never under one CPU's worth: a parallelism that cannot be read counts as
-/// one), `None` within it. Pure over the CPU count so the rule is testable;
-/// start-up logs it where it logs the runtime's size.
+/// The warning for a configured worker-thread count (the flag or the
+/// variable) above [`RUNTIME_WORKER_THREADS_PER_CPU`] x the `cpus` available
+/// to the process (never under one CPU's worth: a parallelism that cannot be
+/// read counts as one), `None` within it. Worded by the runtime's count, not
+/// by the flag's name, since the variable sets it too. Pure over the CPU
+/// count so the rule is testable; start-up logs it where it logs the
+/// runtime's size, and only when the count was configured (the budget's own
+/// count falls back to the cap when the parallelism cannot be read, which
+/// is no setting of the operator's).
 pub fn runtime_worker_threads_oversubscription(threads: usize, cpus: usize) -> Option<String> {
     let advised = cpus.max(1).saturating_mul(RUNTIME_WORKER_THREADS_PER_CPU);
     (threads > advised).then(|| {
         format!(
-            "runtime_worker_threads {threads} is above {advised}, \
+            "the runtime's {threads} worker threads are above {advised}, \
              {RUNTIME_WORKER_THREADS_PER_CPU} x the {cpus} CPUs available to this process: a \
              worker thread beyond the CPUs only waits for one and costs its stack"
         )
@@ -2619,12 +2623,12 @@ mod tests {
         assert_eq!(runtime_worker_threads_oversubscription(1, 0), None);
         let warning = runtime_worker_threads_oversubscription(16, 2).expect("a warning");
         assert!(
-            warning.contains("runtime_worker_threads 16 is above 8")
+            warning.contains("the runtime's 16 worker threads are above 8")
                 && warning.contains("2 CPUs available"),
             "{warning}"
         );
         let warning = runtime_worker_threads_oversubscription(5, 0).expect("a warning");
-        assert!(warning.contains("is above 4"), "{warning}");
+        assert!(warning.contains("are above 4"), "{warning}");
 
         let config = RouterConfig {
             runtime_worker_threads: Some(

@@ -126,7 +126,7 @@ fn a_runtime_worker_thread_count_above_four_per_cpu_serves_with_a_warning() {
         "the gateway did not serve its health route with {threads} worker threads (exit {:?})\n{}",
         launch.status, launch.log
     );
-    let expected = format!("runtime_worker_threads {threads} is above {advised}");
+    let expected = format!("the runtime's {threads} worker threads are above {advised}");
     let warned = launch
         .log
         .lines()

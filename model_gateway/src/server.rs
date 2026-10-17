@@ -979,6 +979,76 @@ async fn v1_tokenizers_remove(
     tokenize::remove_tokenizer(&state.context, &tokenizer_id).await
 }
 
+/// The most worker threads the async runtime gets when `--runtime-worker-threads`
+/// is unset. The gateway's work is a few cores at the loads it is built for
+/// (under two cores at 40 streamed chat requests per second with 8k-token
+/// prompts, or 1,000 short requests per second), and every worker beyond the
+/// work still parks and unparks on each streamed chunk: a runtime sized to a
+/// 16-core quota spent 7-12 % of the gateway's CPU on those wakeups. The flag
+/// sizes a heavier deployment explicitly.
+pub const DEFAULT_RUNTIME_WORKER_THREADS_CAP: usize = 8;
+
+/// The environment variable tokio reads for its worker count when a builder
+/// leaves it unset; a runtime built by [`runtime_worker_threads`] always sets
+/// the count, so the variable is read here instead, with the same meaning.
+pub const TOKIO_WORKER_THREADS: &str = "TOKIO_WORKER_THREADS";
+
+/// The async runtime's worker-thread count, in this order: the explicit
+/// setting when there is one (the validator refuses 0 and a count above
+/// [`RUNTIME_WORKER_THREADS_CEILING`](crate::config::RUNTIME_WORKER_THREADS_CEILING)),
+/// then `TOKIO_WORKER_THREADS` as tokio reads it (a positive integer, held to
+/// the same ceiling; anything else is a configuration error naming the
+/// variable, where tokio would refuse to start or build a runtime the
+/// validator refuses by flag), then the gateway's budget: the available parallelism
+/// (the container's CPU quota on Rust 1.95+) capped at
+/// [`DEFAULT_RUNTIME_WORKER_THREADS_CAP`], never below 1, and the cap when
+/// the parallelism cannot be read.
+pub fn runtime_worker_threads(explicit: Option<usize>) -> Result<usize, String> {
+    runtime_worker_threads_from(
+        explicit,
+        std::env::var_os(TOKIO_WORKER_THREADS).as_deref(),
+        std::thread::available_parallelism().ok(),
+    )
+}
+
+/// The rule behind [`runtime_worker_threads`], over the values it reads; the
+/// variable comes in as read, so that a set-but-not-UTF-8 value is a setting
+/// (refused by name) and not an absence.
+fn runtime_worker_threads_from(
+    explicit: Option<usize>,
+    env_setting: Option<&std::ffi::OsStr>,
+    parallelism: Option<std::num::NonZeroUsize>,
+) -> Result<usize, String> {
+    // An explicit count is the setting, and the variable is not read under
+    // it (tokio, given a count, does not read it either): a malformed value,
+    // UTF-8 or not, cannot refuse a pinned runtime.
+    if let Some(count) = explicit {
+        return Ok(count);
+    }
+    if let Some(value) = env_setting {
+        let ceiling = crate::config::RUNTIME_WORKER_THREADS_CEILING;
+        return match value.to_str().and_then(|text| text.parse::<usize>().ok()) {
+            None | Some(0) => Err(format!(
+                "{TOKIO_WORKER_THREADS}={value:?} is not a positive integer"
+            )),
+            // The flag's ceiling holds for the variable too: a count this
+            // size builds its threads for a long time and holds their stacks
+            // before the first bind, whichever way it was set.
+            Some(count) if count > ceiling => Err(format!(
+                "{TOKIO_WORKER_THREADS}={count} is above {ceiling}, the ceiling on the \
+                 runtime's worker threads (the same as --runtime-worker-threads's)"
+            )),
+            Some(count) => Ok(count),
+        };
+    }
+    Ok(parallelism
+        .map_or(
+            DEFAULT_RUNTIME_WORKER_THREADS_CAP,
+            std::num::NonZeroUsize::get,
+        )
+        .clamp(1, DEFAULT_RUNTIME_WORKER_THREADS_CAP))
+}
+
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -986,10 +1056,11 @@ pub struct ServerConfig {
     /// leaves the dedicated listener off; probe routes always stay on the
     /// main `port` regardless.
     pub health_check_port: Option<u16>,
-    /// Explicit async runtime worker-thread count. `None` uses tokio's
-    /// container-aware default (`available_parallelism()`). Only the CLI's
-    /// `main` sizes its runtime from it; `startup` runs on the caller's
-    /// runtime and logs the size it finds (and this setting, as `pinned`).
+    /// Explicit async runtime worker-thread count. `None` leaves the size to
+    /// [`runtime_worker_threads`]: the gateway's own budget rather than the
+    /// container's quota. The CLI's `main` and the Python binding size their
+    /// runtime by it; `startup` runs on the caller's runtime and logs the
+    /// size it finds (and this setting, as `pinned`).
     pub runtime_worker_threads: Option<usize>,
     pub router_config: RouterConfig,
     pub max_payload_size: usize,
@@ -1598,23 +1669,33 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // The runtime was built by the caller (the CLI's `main`, the Python
     // binding, a library caller) before the subscriber existed: its size is
     // logged here, where the line reaches the log. `pinned` is the
-    // configuration's say; only the CLI's `main` sizes its runtime from it.
+    // configuration's say; the CLI's `main` and the Python binding size
+    // theirs by `runtime_worker_threads`.
+    let worker_threads = tokio::runtime::Handle::current().metrics().num_workers();
     info!(
-        worker_threads = tokio::runtime::Handle::current().metrics().num_workers(),
+        worker_threads,
         pinned = config.runtime_worker_threads.is_some(),
+        tokio_worker_threads_env = std::env::var_os(TOKIO_WORKER_THREADS).is_some(),
         "Tokio runtime sized"
     );
-    // A pinned count well above the CPUs available to the process is the
-    // operator's choice, served with a warning: a worker thread beyond the
-    // CPUs only waits for one. The ceiling on the count is the validator's,
-    // and reads nothing of the host.
-    if let Some(warning) = config.runtime_worker_threads.and_then(|threads| {
-        crate::config::runtime_worker_threads_oversubscription(
-            threads,
-            crate::config::available_cpus(),
-        )
-    }) {
-        tracing::warn!("{warning}");
+    // A count well above the CPUs available to the process, by the flag or
+    // by the variable, is the operator's choice, served with a warning: a
+    // worker thread beyond the CPUs only waits for one. The runtime's own
+    // count is checked, so the warning covers both ways it was set; it is
+    // checked only when it was set: the budget's own count never exceeds
+    // the parallelism it read, and when the parallelism cannot be read the
+    // budget falls back to the cap while the CPU count reads as one, which
+    // would warn about a setting nobody made. The ceiling on the count is
+    // the validator's, and reads nothing of the host.
+    let configured =
+        config.runtime_worker_threads.is_some() || std::env::var_os(TOKIO_WORKER_THREADS).is_some();
+    if configured {
+        let cpus = crate::config::available_cpus();
+        if let Some(warning) =
+            crate::config::runtime_worker_threads_oversubscription(worker_threads, cpus)
+        {
+            tracing::warn!("{warning}");
+        }
     }
 
     // Who else can read the private key files: checked here, once the
@@ -2615,6 +2696,92 @@ mod tests {
 
     use super::*;
     use crate::config::TenantApiKeyEntry;
+
+    /// The runtime follows the gateway's budget, not the container's quota:
+    /// unset and without `TOKIO_WORKER_THREADS`, the worker count is the
+    /// available parallelism capped at `DEFAULT_RUNTIME_WORKER_THREADS_CAP`,
+    /// never below 1, and the cap when the parallelism cannot be read; the
+    /// variable, as tokio reads it and held to the flag's ceiling, comes
+    /// before the budget; an explicit `--runtime-worker-threads` comes first,
+    /// above the cap included, and the variable, well-formed or not, is not
+    /// read under it.
+    #[test]
+    fn the_runtime_size_follows_the_gateway_budget_unless_pinned() {
+        let cap = DEFAULT_RUNTIME_WORKER_THREADS_CAP;
+        let cores = |n: usize| std::num::NonZeroUsize::new(n);
+        let var = |value: &'static str| Some(std::ffi::OsStr::new(value));
+        assert_eq!(runtime_worker_threads_from(None, None, cores(16)), Ok(cap));
+        assert_eq!(runtime_worker_threads_from(None, None, cores(cap)), Ok(cap));
+        assert_eq!(runtime_worker_threads_from(None, None, cores(2)), Ok(2));
+        assert_eq!(runtime_worker_threads_from(None, None, cores(1)), Ok(1));
+        assert_eq!(runtime_worker_threads_from(None, None, None), Ok(cap));
+        assert_eq!(
+            runtime_worker_threads_from(None, var("12"), cores(2)),
+            Ok(12)
+        );
+        assert_eq!(
+            runtime_worker_threads_from(None, var("1"), cores(16)),
+            Ok(1)
+        );
+        assert_eq!(
+            runtime_worker_threads_from(Some(3), var("12"), cores(16)),
+            Ok(3)
+        );
+        assert_eq!(
+            runtime_worker_threads_from(Some(cap * 4), None, cores(2)),
+            Ok(cap * 4)
+        );
+        for bad in ["0", "-1", "eight", "8 ", ""] {
+            let err = runtime_worker_threads_from(None, var(bad), cores(16)).unwrap_err();
+            assert!(
+                err.contains(TOKIO_WORKER_THREADS) && err.contains(bad),
+                "{bad:?}: {err}"
+            );
+            assert_eq!(
+                runtime_worker_threads_from(Some(3), var(bad), cores(16)),
+                Ok(3)
+            );
+        }
+        // The flag's ceiling holds for the variable: the ceiling itself is
+        // taken, one above it is refused by name with the ceiling's value,
+        // and an explicit count is not refused by a variable above it.
+        let ceiling = crate::config::RUNTIME_WORKER_THREADS_CEILING;
+        let at = ceiling.to_string();
+        let above = [(ceiling + 1).to_string(), "100000".to_string()];
+        assert_eq!(
+            runtime_worker_threads_from(None, Some(std::ffi::OsStr::new(&at)), cores(16)),
+            Ok(ceiling)
+        );
+        for value in &above {
+            let err =
+                runtime_worker_threads_from(None, Some(std::ffi::OsStr::new(value)), cores(16))
+                    .unwrap_err();
+            assert!(
+                err.contains(TOKIO_WORKER_THREADS) && err.contains(value) && err.contains(&at),
+                "{value}: {err}"
+            );
+            assert_eq!(
+                runtime_worker_threads_from(Some(3), Some(std::ffi::OsStr::new(value)), cores(16)),
+                Ok(3)
+            );
+        }
+        // Set but not UTF-8 is a setting, not an absence: refused by name when
+        // it would be read, and not read under an explicit count.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = std::ffi::OsStr::from_bytes(b"\xff");
+            let err = runtime_worker_threads_from(None, Some(raw), cores(16)).unwrap_err();
+            assert!(err.contains(TOKIO_WORKER_THREADS), "{err}");
+            assert_eq!(
+                runtime_worker_threads_from(Some(3), Some(raw), cores(16)),
+                Ok(3)
+            );
+        }
+        // The reading wrapper: an explicit count needs neither the variable
+        // nor the parallelism.
+        assert_eq!(runtime_worker_threads(Some(5)), Ok(5));
+    }
 
     /// A request without `anthropic-version` is served (this gateway's own
     /// SDK clients send none); a version that is not a real calendar date of

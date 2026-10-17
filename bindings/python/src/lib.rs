@@ -1955,16 +1955,17 @@ impl Router {
             })
             .transpose()?;
 
-        // The runtime's default size unless a thread count is given (the
-        // validation above refused 0), as the CLI's `serve` builds it.
-        let runtime = match self.runtime_worker_threads {
-            Some(threads) => tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(threads)
-                .enable_all()
-                .build(),
-            None => tokio::runtime::Runtime::new(),
-        }
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        // Sized as the CLI sizes its runtime: an explicit count when one is
+        // given (the validation above refused 0), else `TOKIO_WORKER_THREADS`
+        // when set, else the gateway's budget rather than the container's
+        // quota.
+        let worker_threads = server::runtime_worker_threads(self.runtime_worker_threads)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(worker_threads)
+            .enable_all()
+            .build()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         // Release the GIL while the server runs so Python threads can make progress.
         py.detach(|| {
@@ -2152,6 +2153,12 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(print_banner, m)?)?;
     m.add_function(wrap_pyfunction!(get_available_tool_call_parsers, m)?)?;
     m.add_function(wrap_pyfunction!(get_available_reasoning_parsers, m)?)?;
+    // The cap on the runtime's default worker-thread count, as the launcher's
+    // help spells it: its test pins the help against this value.
+    m.add(
+        "DEFAULT_RUNTIME_WORKER_THREADS_CAP",
+        server::DEFAULT_RUNTIME_WORKER_THREADS_CAP,
+    )?;
     m.add_function(wrap_pyfunction!(init_servicer_tracing, m)?)?;
     Ok(())
 }
