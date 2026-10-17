@@ -16,6 +16,7 @@ pub mod common_proto {
 pub mod abort_on_drop;
 pub mod channel;
 pub mod codec;
+pub mod deadline;
 pub mod engine_load;
 pub mod media_fault;
 pub mod mlx_engine;
@@ -33,6 +34,9 @@ pub use abort_on_drop::{AbortOnDropClient, AbortOnDropStream};
 pub use channel::{
     connect_channel, connect_channel_with_timeout, is_transport_failure, normalize_grpc_endpoint,
     DEFAULT_CONNECT_TIMEOUT,
+};
+pub use deadline::{
+    deadline_request, is_call_deadline, request_timeout, set_request_timeout, CallDeadline,
 };
 /// The HTTP/2 layer under the channels, re-exported for callers that build
 /// or classify the transport faults [`is_transport_failure`] recognises.

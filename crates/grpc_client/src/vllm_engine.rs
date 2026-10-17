@@ -12,7 +12,7 @@ use openai_protocol::{
 use tonic::{transport::Channel, Request};
 use tracing::{debug, warn};
 
-use crate::{AbortOnDropClient, BoxedTraceInjector};
+use crate::{deadline::deadline_request, AbortOnDropClient, BoxedTraceInjector};
 
 // Include the generated protobuf code
 #[expect(clippy::allow_attributes)]
@@ -59,7 +59,7 @@ impl VllmEngineClient {
     ) -> Result<AbortOnDropStream, tonic::Status> {
         let request_id = req.request_id.clone();
         let mut client = self.client.clone();
-        let mut request = Request::new(req);
+        let (deadline, mut request) = deadline_request(req);
 
         // Inject W3C trace context into gRPC metadata for distributed tracing
         if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
@@ -68,11 +68,10 @@ impl VllmEngineClient {
 
         let response = client.generate(request).await?;
 
-        Ok(AbortOnDropStream::new(
-            response.into_inner(),
-            request_id,
-            self.clone(),
-        ))
+        Ok(
+            AbortOnDropStream::new(response.into_inner(), request_id, self.clone())
+                .with_deadline(deadline),
+        )
     }
 
     /// Abort a request
@@ -516,7 +515,7 @@ impl VllmEngineClient {
         req: proto::EmbedRequest,
     ) -> Result<proto::EmbedResponse, tonic::Status> {
         let mut client = self.client.clone();
-        let mut request = Request::new(req);
+        let (_, mut request) = deadline_request(req);
 
         if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
             warn!("Failed to inject trace context: {}", e);
