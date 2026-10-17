@@ -1935,7 +1935,7 @@ struct IntegrationArgs {
     /// names the ceiling); a count above 4 x the CPUs available to the process
     /// starts with a warning, since a worker thread beyond the CPUs only waits for
     /// one. Unset: `TOKIO_WORKER_THREADS` when it is set (a positive integer, as
-    /// tokio reads it), else the available parallelism (the container's CPU quota)
+    /// tokio reads it, under the same ceiling), else the available parallelism (the container's CPU quota)
     /// capped at 8, the gateway's own budget: idle workers park and unpark on every
     /// streamed chunk, so a runtime the size of a large quota costs CPU for no
     /// work. Set it to size the runtime for a heavier deployment.
