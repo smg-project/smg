@@ -61,10 +61,10 @@ The serving keys and the store URLs need not be on the command line, where other
 | Oracle credentials | `--oracle-connect-descriptor`, `--oracle-username`, `--oracle-password` | `ATP_DSN`, `ATP_USER`, `ATP_PASSWORD` | – | – |
 
 - The flag beats the environment. A value (from the flag or the environment) together with a file for the same secret is refused at start-up rather than ranked: the second source of one secret is a stale one about to be honoured.
-- A single-value file holds the value alone; the surrounding whitespace (a trailing newline) is dropped, and so is the whitespace around a single value from the environment (a Secret made from a file carries the editor's newline into both). An empty file, or one with more than one line, is refused.
+- A single-value file holds the value alone; the surrounding whitespace (a trailing newline) is dropped, and so is the whitespace around a single value from the environment (a Secret made from a file carries the editor's newline into both); the `ATP_*` values are the exception, see below. An empty file, or one with more than one line, is refused.
 - `SMG_TENANT_API_KEYS` holds `tenant_id:key` entries separated by `,` or a newline; the file holds one entry per line, blank lines and lines starting with `#` skipped. A source that is set but holds no entry is refused.
 - A store URL file is read for the selected `--history-backend` alone. The launcher still reads the older `POSTGRES_DB_URL` and `REDIS_URL` names when the `SMG_` names are unset.
-- The Oracle credentials have no file source; the launcher and the binary (`--oracle-dsn`, `--oracle-user`, `--oracle-password`) read the `ATP_*` variables when the flags are absent, as they always did.
+- The Oracle credentials have no file source; the launcher and the binary (`--oracle-dsn`, `--oracle-user`, `--oracle-password`) read the `ATP_*` variables when the flags are absent, as they always did, and use them exactly as set, with no trimming: a Secret for them is made with `--from-literal`, or from a file that ends without a newline (a password that ends in one is a wrong password to the database).
 - No value is echoed: a refusal names the sources and the path, and `--help` shows no value of a variable. The Rust binary's start-up record (`CREDENTIAL SOURCES`) names each secret's source as `flag`, `env` or `file`; the Python launcher emits no such record.
 
 ## Directory Structure
