@@ -52,6 +52,7 @@ mod tests {
         input::{EngineFinish, Input},
         parser::Parser,
         tagged::Declared,
+        testing::{arguments_of, bytes, content, names, reasoning},
     };
 
     const SEP: &str = "]<]minimax[>[";
@@ -158,32 +159,6 @@ mod tests {
         run_with(Declared::default(), prompt, pieces)
     }
 
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
-    }
-
-    fn arguments_of(events: &[Event], call: u32) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallArguments { index, json, .. } if *index == call => {
-                    Some(json.as_str())
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
     fn fragments_of(events: &[Event], call: u32) -> Vec<&str> {
         events
             .iter()
@@ -191,36 +166,6 @@ mod tests {
                 Event::ToolCallArguments { index, json, .. } if *index == call => {
                     Some(json.as_str())
                 }
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn names(events: &[Event]) -> Vec<&str> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallStart { name, .. } => Some(name.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn reasoning(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
                 _ => None,
             })
             .collect()

@@ -59,16 +59,17 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::ids::CallIds;
+    use crate::{
+        ids::CallIds,
+        testing::{arguments_of, bytes, content, drive, reasoning},
+    };
 
     fn ids() -> CallIds {
         CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
     }
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, Events, MalformedReason, Text},
-        input::{EngineFinish, Input},
-        parser::Parser,
+        event::{DropReason, Event, MalformedReason, Text},
         tagged::Declared,
     };
 
@@ -86,74 +87,11 @@ mod tests {
     );
 
     fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
-        let mut parser = Engine::with_call_ids(Arc::new(kimi_k3()), Declared::default(), ids());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        for piece in pieces {
-            parser
-                .feed(
-                    Input::Delta {
-                        token_ids: &[],
-                        text: piece,
-                        spans: &[],
-                    },
-                    &mut out,
-                )
-                .expect("delta");
-        }
-        parser
-            .feed(
-                Input::End {
-                    finish: EngineFinish::Stop,
-                },
-                &mut out,
-            )
-            .expect("end");
-        out.drain()
-    }
-
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
-    }
-
-    fn arguments_of(events: &[Event], call: u32) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallArguments { index, json, .. } if *index == call => {
-                    Some(json.as_str())
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
+        drive(
+            &mut Engine::with_call_ids(Arc::new(kimi_k3()), Declared::default(), ids()),
+            prompt,
+            pieces,
+        )
     }
 
     fn ends(events: &[Event]) -> Vec<&str> {
@@ -548,16 +486,6 @@ mod tests {
         "<|sep|>",
         "",
     ];
-
-    fn reasoning(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
 
     #[test]
     fn a_tag_the_end_of_the_output_cut_short_is_dropped_not_released_as_content() {

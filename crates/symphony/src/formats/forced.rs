@@ -30,6 +30,7 @@ mod tests {
         input::{EngineFinish, Input},
         parser::Parser,
         tagged::Declared,
+        testing::calls,
     };
 
     fn run(pieces: &[&str], declared: Declared) -> Vec<Event> {
@@ -65,20 +66,6 @@ mod tests {
             )
             .expect("end");
         out.drain()
-    }
-
-    fn calls(events: &[Event]) -> Vec<(String, String)> {
-        let mut calls: Vec<(String, String)> = Vec::new();
-        for event in events {
-            match event {
-                Event::ToolCallStart { name, .. } => calls.push((name.clone(), String::new())),
-                Event::ToolCallArguments { json, .. } => {
-                    calls.last_mut().expect("a call started").1.push_str(json);
-                }
-                _ => {}
-            }
-        }
-        calls
     }
 
     fn finish(events: &[Event]) -> (FinishReason, u32) {

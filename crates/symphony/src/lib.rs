@@ -38,6 +38,8 @@ pub mod parser;
 pub mod pythonic;
 pub mod shape;
 pub mod tagged;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod tokens;
 
 pub use engine::Engine;

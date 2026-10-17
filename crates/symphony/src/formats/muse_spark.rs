@@ -202,6 +202,7 @@ mod tests {
         input::{EngineFinish, Input},
         parser::Parser,
         tagged::Declared,
+        testing::{bytes, content, reasoning},
     };
 
     fn tool(name: &str, parameters: Value) -> Tool {
@@ -294,20 +295,6 @@ mod tests {
         run_with(prompt, pieces, EngineFinish::Stop)
     }
 
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
-    }
-
     /// The calls as (name, arguments) pairs, the arguments as the JSON value their fragments make.
     fn calls(events: &[Event]) -> Vec<(String, Value)> {
         let mut found: Vec<(String, String)> = Vec::new();
@@ -329,26 +316,6 @@ mod tests {
                 let value = serde_json::from_str(&arguments)
                     .unwrap_or_else(|e| panic!("{name}: arguments {arguments:?}: {e}"));
                 (name, value)
-            })
-            .collect()
-    }
-
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn reasoning(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
-                _ => None,
             })
             .collect()
     }
