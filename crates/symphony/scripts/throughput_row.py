@@ -17,6 +17,11 @@ import pathlib
 import statistics
 import sys
 
+# Baseline names criterion writes on its own: `base` is the default of `--save-baseline` (any
+# plain run), `new` is rewritten by every run, `change` by a comparison. A side under one of them
+# would take a stray run for a repeat.
+RESERVED_LABELS = ("base", "new", "change")
+
 
 def unit_of(full_id, throughput):
     if "Bytes" in throughput:
@@ -44,6 +49,14 @@ def baselines(root, label):
     return out
 
 
+def repeats(benches, ids):
+    """The repeat count of `benches` over the benches shown, or its range when they differ."""
+    counts = sorted({len(benches[full_id][1]) for full_id in ids if full_id in benches})
+    if not counts:
+        return 0
+    return counts[0] if len(counts) == 1 else f"{counts[0]}-{counts[-1]}"
+
+
 def cell(values):
     median = statistics.median(values)
     if len(values) == 1:
@@ -63,15 +76,18 @@ def main():
         label, _, root = side.partition("=")
         if not root:
             sys.exit(f"throughput_row: {side!r} is not LABEL=CRITERION_DIR")
+        if label in RESERVED_LABELS:
+            sys.exit(
+                f"throughput_row: {label!r} is a name criterion writes itself; "
+                "label the side by hand (main, pr)"
+            )
         sides.append((label, baselines(root, label)))
     ids = sorted(
         {full_id for _, benches in sides for full_id in benches if full_id.startswith(args.filter)}
     )
     if not ids:
         sys.exit("throughput_row: no bench matches; the baselines are missing or the filter is off")
-    header = ["bench", "unit"] + [
-        f"{label} ({len(next(iter(b.values()))[1]) if b else 0})" for label, b in sides
-    ]
+    header = ["bench", "unit"] + [f"{label} ({repeats(b, ids)})" for label, b in sides]
     header += [f"{label} vs {sides[0][0]}" for label, _ in sides[1:]]
     print("| " + " | ".join(header) + " |")
     print("|" + "---|" * len(header))

@@ -141,18 +141,23 @@ three interleaved repeats on one pinned core, against `main` built the same way.
 1. Build the bench on `main` and on the change, each in its own checkout and target directory:
    `cargo bench -p smg-symphony --bench throughput --no-run` prints the binary's path.
 2. Run the two binaries interleaved, three repeats each, pinned to one core, saving one baseline
-   per repeat: `taskset -c 7 <main binary> --bench --save-baseline main-1 'slice/thought_call/tokens'`,
-   then the change's binary with `pr-1`, then `main-2`, `pr-2`, `main-3`, `pr-3`.
+   per repeat, with the directory the baselines go to named outright (a bench binary run on its
+   own, outside `cargo bench`, writes to `./target/criterion` of the current directory otherwise):
+   `CRITERION_HOME=<baselines dir> taskset -c 7 <main binary> --bench --save-baseline main-1 'slice/thought_call/tokens'`,
+   then the change's binary with `pr-1`, then `main-2`, `pr-2`, `main-3`, `pr-3`. One directory
+   serves both sides: the labels keep them apart.
 3. Render the table for the pull request's Numbers section:
-   `python3 crates/symphony/scripts/throughput_row.py --filter slice/thought_call/tokens main=<main target dir>/criterion pr=<change target dir>/criterion`
+   `python3 crates/symphony/scripts/throughput_row.py --filter slice/thought_call/tokens main=<baselines dir> pr=<baselines dir>`
    prints, per bench, the median of the repeats with their spread and the change against `main`.
+   A label is a name of your own (`main`, `pr`): `base`, `new` and `change` are criterion's and
+   are refused.
 
 The filter names the question: `slice/<family>/tokens` for the streaming cost per token,
 `slice/<family>/chars` for the per-delta floor, `slice/<family>/whole` for an output read at once,
 `setup/` for the per-request fixed cost, `adapt/` for the adapters and `prose/` for text with no
-marker in it. A slice row includes one engine's setup, which `setup/engine` states on its own. A
-row measured on a loaded machine is provisional and says so; a regression in a row is a
-regression, reverted before it is explained.
+marker in it. A slice row is the reading alone, the engine built outside the timing; the
+per-request setup is `setup/engine`'s row. A row measured on a loaded machine is provisional and
+says so; a regression in a row is a regression, reverted before it is explained.
 
 ## Models
 
