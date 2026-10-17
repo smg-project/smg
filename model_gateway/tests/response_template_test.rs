@@ -13,12 +13,13 @@ mod scripted_tokenizer;
 mod scripted_worker;
 
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use axum::{body::to_bytes, http::StatusCode, response::Response};
-use llm_tokenizer::{traits::Tokenizer, TokenizerRegistry};
+use llm_tokenizer::{chat_template::ChatTemplateParams, traits::Tokenizer, TokenizerRegistry};
 use openai_protocol::{
     model_card::ModelCard,
     worker::{ConstrainedDecoding, HealthCheckConfig},
@@ -163,6 +164,24 @@ impl Gateway {
         let requests = self.requests[0].lock().unwrap();
         constraint_of(requests.last()?)
     }
+}
+
+/// The prompt the Qwen3.5-9B chat template renders for [`chat_request`]'s messages with the
+/// request's `chat_template_kwargs`: where the template leaves the model.
+#[expect(clippy::expect_used, reason = "test helper")]
+fn rendered(kwargs: Option<&HashMap<String, Value>>) -> String {
+    ScriptedTokenizer::from_chunks(Vec::new())
+        .with_chat_template(&qwen3_5_chat_template())
+        .expect("the chat template")
+        .apply_chat_template(
+            &[json!({"role": "user", "content": "weather?"})],
+            ChatTemplateParams {
+                add_generation_prompt: true,
+                template_kwargs: kwargs,
+                ..Default::default()
+            },
+        )
+        .expect("a rendered prompt")
 }
 
 /// A request's constraint as `(kind, value)`.
@@ -600,8 +619,10 @@ async fn always_constrains_the_calls_a_request_allows_under_auto() {
     chat(&requested, json!({"tools": tools()})).await;
     assert_eq!(requested.last_constraint(), None);
 
-    // On a registry table, a JSON response_format is the engine's own schema constraint; the
-    // auto tag must not displace it (nor a prompt that continues the assistant's message).
+    // On a registry table too. A JSON response_format is the request's own constraint, which
+    // the auto tag never displaces: the answer's constraint is sent instead, the JSON where the
+    // calls' block would be (its shape on this template, whose prompt leaves the thought open:
+    // `a_registry_tables_json_answer_follows_the_thought_the_prompt_leaves_open`).
     let registry = serve(Setup {
         constrained_decoding: Some(ConstrainedDecoding::Always),
         tool_parser: Some("qwen"),
@@ -610,21 +631,96 @@ async fn always_constrains_the_calls_a_request_allows_under_auto() {
     })
     .await;
     chat(&registry, json!({"tools": tools()})).await;
-    let (kind, _) = registry.last_constraint().expect("a constraint under auto");
+    let (kind, tag) = registry.last_constraint().expect("a constraint under auto");
     assert_eq!(kind, "structural_tag");
+    assert_eq!(block_of(&tag), "triggered_tags", "{tag}");
     chat(
         &registry,
         json!({"tools": tools(), "response_format": {"type": "json_object"}}),
     )
     .await;
-    let (kind, _) = registry.last_constraint().expect("the schema constraint");
-    assert_eq!(kind, "json_schema");
+    let (kind, tag) = registry.last_constraint().expect("the answer's constraint");
+    assert_eq!(kind, "structural_tag");
+    assert_eq!(block_of(&tag), "json_schema", "{tag}");
 }
 
-/// Which engine a tag under `auto` is shaped for, the prompt leaving the thought open: the free
-/// text before the block for an engine that does not say where it starts the grammar, the block
-/// alone for one that starts it after its reasoning parser's gate, the closed thought then the
-/// block for one that starts it at the first token.
+/// A registry table's JSON `response_format` under `always` follows the prompt as the table and
+/// the engine read it (`regular::symphony::reasoning_open`), not the thinking switch alone. The
+/// Qwen 3.5 chat template's generation prompt ends in `<think>\n`, so the model writes its thought
+/// first and the answer after its close: the engine receives the table's answer tag, the
+/// thought's free text (closing itself) and then the JSON, where the bare schema from the first
+/// token would force the JSON inside the thought, which the table reads as reasoning, and the
+/// client would get no content. The engine's own schema constraint stays wherever the tag would
+/// be the schema alone: a request with thinking off, whose prompt closes the thought
+/// (`<think>\n\n</think>\n\n`), and an engine that starts the grammar after its reasoning parser
+/// has seen the close; one that runs it from the first token gets the closed thought, then the
+/// schema.
+#[tokio::test]
+async fn a_registry_tables_json_answer_follows_the_thought_the_prompt_leaves_open() {
+    let answer = json!({"tools": tools(), "response_format": {"type": "json_object"}});
+    let registry = |labels: Vec<(&'static str, &'static str)>| Setup {
+        constrained_decoding: Some(ConstrainedDecoding::Always),
+        tool_parser: Some("qwen"),
+        reasoning_parser: None,
+        labels,
+        ..Setup::default()
+    };
+    // The template's default leaves the thought open: the thought's free text, then the JSON,
+    // for an engine that does not say where it starts the grammar.
+    let prompt = rendered(None);
+    assert!(prompt.ends_with(THINKING), "{prompt:?}");
+    let gateway = serve(registry(Vec::new())).await;
+    chat(&gateway, answer.clone()).await;
+    let sent = gateway.last_constraint();
+    assert_eq!(shape_of(sent.clone()), "the free text then the block");
+    let (_, tag) = sent.expect("the answer's tag");
+    assert_eq!(block_of(&tag), "json_schema", "{tag}");
+    let tag: Value = serde_json::from_str(&tag).expect("the tag as JSON");
+    let block = &tag["format"]["elements"][1];
+    assert_eq!(block["json_schema"], json!({"type": "object"}), "{tag}");
+    // Thinking off closes the thought in the prompt: the tag would be the schema alone, and the
+    // engine's own constraint is sent, as before.
+    let off = HashMap::from([("enable_thinking".to_string(), json!(false))]);
+    let prompt = rendered(Some(&off));
+    assert!(prompt.ends_with("</think>\n\n"), "{prompt:?}");
+    let mut request = answer.clone();
+    request["chat_template_kwargs"] = json!(off);
+    chat(&gateway, request).await;
+    let (kind, _) = gateway.last_constraint().expect("the schema constraint");
+    assert_eq!(kind, "json_schema");
+    // An engine that starts the grammar after its reasoning parser has consumed the thought: the
+    // schema alone, the engine's own constraint; one that runs it from the first token: the
+    // thought closed by its own marker, then the schema.
+    let after = ("constrained_decoding_start", "after_reasoning");
+    let gateway = serve(registry(vec![after])).await;
+    chat(&gateway, answer.clone()).await;
+    let (kind, _) = gateway.last_constraint().expect("the schema constraint");
+    assert_eq!(kind, "json_schema");
+    let first = ("constrained_decoding_start", "first_token");
+    let gateway = serve(registry(vec![first])).await;
+    chat(&gateway, answer).await;
+    let sent = gateway.last_constraint();
+    assert_eq!(shape_of(sent.clone()), "the closed thought then the block");
+    let (_, tag) = sent.expect("the answer's tag");
+    assert_eq!(block_of(&tag), "json_schema", "{tag}");
+}
+
+/// The kind of the block a tag's format writes after what leads it (the free text or the closed
+/// thought of a prompt that leaves the thought open): the calls' `triggered_tags`, or an answer's
+/// `json_schema`.
+#[expect(clippy::expect_used, reason = "test helper")]
+fn block_of(tag: &str) -> String {
+    let tag: Value = serde_json::from_str(tag).expect("a tag");
+    tag["format"]["elements"][1]["type"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Which engine a tag under `auto`, or an answer's, is shaped for, the prompt leaving the thought
+/// open: the free text before the block for an engine that does not say where it starts the
+/// grammar, the block alone for one that starts it after its reasoning parser's gate, the closed
+/// thought then the block for one that starts it at the first token.
 #[expect(clippy::expect_used, reason = "test helper")]
 fn shape_of(constraint: Option<(String, String)>) -> &'static str {
     let Some((kind, tag)) = constraint else {
