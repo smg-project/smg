@@ -36,6 +36,14 @@ pip install smg-grpc-servicer[sglang]
 vllm serve meta-llama/Llama-2-7b-hf --grpc
 ```
 
+Without `--kv-events-config`, the servicer turns vLLM's ZMQ KV-event publisher
+on by itself, under either implementation, before the engine is built, at a
+port found free on the host rather than vLLM's fixed default (one per
+data-parallel rank), so `SubscribeKvEvents` relays the events a cache-aware
+router routes by and workers that share a host do not collide; an explicit
+configuration is kept as given, its endpoint and off included, and
+`SMG_VLLM_SERVICER_KV_EVENTS=0` leaves the publisher off.
+
 #### Worker-side multimodal processing (media refs)
 
 By default the smg router fetches and preprocesses images itself and sends
@@ -263,12 +271,13 @@ contract the Python servicer serves: text generation, PD disaggregation
 (inline and `/dev/shm` tensors), worker-side media processing (`media_refs`,
 below), `Embed`, `FlushCache`, `GetTokenizer` (which answers
 FAILED_PRECONDITION when the launcher could not resolve a local tokenizer
-directory) and `SubscribeKvEvents` (vLLM's ZMQ publisher, which Rust mode
-turns on by itself when the launcher is given no `--kv-events-config`, at a
-port found free on the host rather than vLLM's fixed default, so two engines
-on one host do not collide; an explicit one is kept as given, its endpoint
-included, and `SMG_VLLM_SERVICER_KV_EVENTS=0` leaves the publisher off).
-Tuning: `SMG_VLLM_SERVICER_HANDSHAKE_PORT` (default: a free port),
+directory) and `SubscribeKvEvents` (vLLM's ZMQ publisher, which the servicer
+turns on by itself, on this path as on the Python one, when the launcher is
+given no `--kv-events-config`, at a port found free on the host rather than
+vLLM's fixed default, so two engines on one host do not collide; an explicit
+one is kept as given, its endpoint included, and
+`SMG_VLLM_SERVICER_KV_EVENTS=0` leaves the publisher off). Tuning:
+`SMG_VLLM_SERVICER_HANDSHAKE_PORT` (default: a free port),
 `SMG_VLLM_SERVICER_DRAIN_SECS` (default 5),
 `SMG_VLLM_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800: how long the servicer
 waits for a sign of life from the engine during its handshake; the launcher
@@ -471,6 +480,15 @@ python -m smg_grpc_servicer.tokenspeed --model meta-llama/Llama-2-7b-hf --host 0
 SMG_TOKENSPEED_SERVICER_IMPL=rust python -m smg_grpc_servicer.tokenspeed --model meta-llama/Llama-2-7b-hf --port 50051
 ```
 
+Without `--kv-events-config`, the servicer turns TokenSpeed's ZMQ KV-event
+publisher on by itself, under either implementation, before the engine is
+built, at a port found free on the host rather than TokenSpeed's fixed default,
+so `SubscribeKvEvents` relays the events a cache-aware router routes by and
+workers that share a host do not collide; an explicit configuration is kept as
+given, its endpoint and off included, and `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0`
+leaves the publisher off. An encode worker (`--disaggregation-mode encode`) has
+no KV cache and is left as given.
+
 This is the process `ts serve` spawns for its gRPC worker; `--servicer-impl`
 is this package's flag (listed first by `--help`, ahead of TokenSpeed's own
 flags), and `SMG_TOKENSPEED_SERVICER_IMPL` is the fallback the flag overrides
@@ -486,11 +504,12 @@ prompt logprobs are refused, and PD/EPD disaggregation stays with the Python
 implementation, as do the RL control-plane extras (the `rl.*` advertisement,
 the live `weight_version` on generate responses, `is_paused`); the Rust server
 redacts credentials from `server_args` the same way. `SubscribeKvEvents` relays
-TokenSpeed's ZMQ KV-event publisher, which Rust mode turns on by itself when
-the launcher is given no `--kv-events-config`, at a port found free on the
-host rather than TokenSpeed's fixed default (an explicit one is kept as given,
-its endpoint included; `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0` leaves the
-publisher off). Tuning:
+TokenSpeed's ZMQ KV-event publisher, which the servicer turns on by itself, on
+this path as on the Python one, when the launcher is given no
+`--kv-events-config`, at a port found free on the host rather than
+TokenSpeed's fixed default (an explicit one is kept as given, its endpoint
+included; `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0` leaves the publisher off).
+Tuning:
 `SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT` (default: a
 free port), `SMG_TOKENSPEED_SERVICER_DRAIN_SECS` (default 5),
 `SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800) and
@@ -567,6 +586,14 @@ livenessProbe:
 ```bash
 sglang serve --model-path meta-llama/Llama-2-7b-hf --grpc-mode
 ```
+
+Without `--kv-events-config`, the servicer turns SGLang's ZMQ KV-event
+publisher on by itself, under either implementation, before the schedulers are
+started, at a port found free on the host rather than SGLang's fixed default,
+so `SubscribeKvEvents` relays the events a cache-aware router routes by and
+workers that share a host do not collide; an explicit configuration is kept as
+given, its endpoint and off included, and `SMG_SGLANG_SERVICER_KV_EVENTS=0`
+leaves the publisher off.
 
 Both SGLang servicers advertise the engine's `--limit-mm-data-per-request` as
 the flat `mm_item_limits` label (`image=1,video=1`) in `GetServerInfo`'s
@@ -656,12 +683,13 @@ What the wire does not carry is reported, not emulated: multimodal inputs and
 hidden states are refused, PD/EPD disaggregation stays with the Python
 implementation (the worker refuses to start on the Rust path in those modes),
 and LoRA loading answers UNIMPLEMENTED, as it does on the Python servicer.
-`SubscribeKvEvents` relays SGLang's ZMQ KV-event publisher, which Rust mode
-turns on by itself when the launcher is given no `--kv-events-config`, at a
-port found free on the host rather than SGLang's fixed default (an explicit
-one is kept as given, its endpoint included; `SMG_SGLANG_SERVICER_KV_EVENTS=0`
-leaves the publisher off). SGLang's HTTP sidecar (metrics and profiling endpoints) is not
-started on this path. Tuning: `SMG_SGLANG_SERVICER_HANDSHAKE_PORT` (default: a
+`SubscribeKvEvents` relays SGLang's ZMQ KV-event publisher, which the servicer
+turns on by itself, on this path as on the Python one, when the launcher is
+given no `--kv-events-config`, at a port found free on the host rather than
+SGLang's fixed default (an explicit one is kept as given, its endpoint
+included; `SMG_SGLANG_SERVICER_KV_EVENTS=0` leaves the publisher off). SGLang's
+HTTP sidecar (metrics and profiling endpoints) is not started on this path.
+Tuning: `SMG_SGLANG_SERVICER_HANDSHAKE_PORT` (default: a
 free port), `SMG_SGLANG_SERVICER_DRAIN_SECS` (default 5),
 `SMG_SGLANG_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800) and
 `SMG_SGLANG_SERVICER_STARTUP_CEILING_SECS` (default 14400; the two startup
