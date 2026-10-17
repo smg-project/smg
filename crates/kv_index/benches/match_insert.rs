@@ -196,11 +196,13 @@ fn bench_string_tree(c: &mut Criterion) {
     // The request routes to a tenant other than the one it matched: the insert
     // replay attaches the routed tenant on every path node (confirming each
     // edge first) instead of taking the skip branch that "hit" measures. The
-    // attachment happens once per tenant per tree, so the tree is rebuilt in
-    // the untimed setup every TENANTS iterations: each timed call replays onto
-    // a path the routed tenant is not yet attached to. Its own tree, so the
-    // rows after it see the tree "hit" left.
-    let other_tree = RefCell::new(warm_string_tree().0);
+    // attachment happens once per tenant per tree, and criterion runs a whole
+    // batch of setups before the first timed call, so each input carries its
+    // own tree, rebuilt every TENANTS setups: every group of TENANTS
+    // consecutive calls replays onto a tree no earlier call has touched. The
+    // routine returns the tree, so its last drop falls outside the timed
+    // region. Its own trees, so the rows after it see the tree "hit" left.
+    let mut other_tree = warm_string_tree().0;
     let next_names: HashMap<&str, &str> = tenants
         .iter()
         .zip(tenants.iter().cycle().skip(1))
@@ -211,18 +213,18 @@ fn bench_string_tree(c: &mut Criterion) {
         b.iter_batched(
             || {
                 if j.is_multiple_of(TENANTS as u64) {
-                    *other_tree.borrow_mut() = warm_string_tree().0;
+                    other_tree = warm_string_tree().0;
                 }
                 let k = (j % TENANTS as u64) as usize;
                 j += 1;
-                k
+                (Arc::clone(&other_tree), k)
             },
-            |k| {
-                let result = other_tree.borrow().match_and_insert_with(&prompts[k], |r| {
+            |(tree, k)| {
+                let result = tree.match_and_insert_with(&prompts[k], |r| {
                     next_names.get(r.tenant.as_ref()).copied()
                 });
                 assert!(result.matched_char_count >= SYSTEM_CHARS);
-                result.matched_char_count
+                (tree, result.matched_char_count)
             },
             BatchSize::SmallInput,
         );
