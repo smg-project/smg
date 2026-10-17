@@ -19,7 +19,11 @@
 //!
 //! The encoder ends the prompt with `<think>` in thinking mode and `</think>` in chat mode, after
 //! the last user message and again after a tool result (`</function_results>`, inside the same
-//! assistant turn). DeepSeek-V3.2-Speciale ships the identical encoder; DeepSeek-V3.2-Exp, before
+//! assistant turn). Those four tails are the table's turn anchors: the replay starts after the
+//! last of them, in the state it names, so the turn's earlier block and a tool result's text are
+//! not walked, and the turn is never unopened (the table has no unopened row: V4's would read the
+//! `<｜end▁of▁sentence｜>` after a tool result as one and start the output in the thought).
+//! DeepSeek-V3.2-Speciale ships the identical encoder; DeepSeek-V3.2-Exp, before
 //! it, writes the V3.1 spelling. The gateway's older `deepseek32` parser reads this format, and
 //! the alias takes a deployment that names it to this table. bellwether has no recorded group for
 //! the family: the table stands on the turns the encoder renders, each read as the encoder's own
@@ -58,7 +62,15 @@ pub fn deepseek_v3_2() -> Format {
         .transition("invoke", "calls_close", "content")
         .transition("calls", "calls_close", "content")
         .calls(CallSyntax::Attributed(Tags::DSML_V4))
-        .opens_turn("<｜Assistant｜>")
+        // The four tails the encoder writes before the model's turn: the thought opened or closed
+        // right after the turn's opener, or right after a tool result's block inside the same
+        // assistant turn. The replay starts after the last of them, in the state it names, so the
+        // turn's earlier block and the result's text are not walked (a marker quoted in a result
+        // moves nothing), and the turn is never unopened: no unopened row, unlike V4's.
+        .turn_anchor_starting_in("<｜Assistant｜><think>", "reasoning")
+        .turn_anchor_starting_in("<｜Assistant｜></think>", "content")
+        .turn_anchor_starting_in("</function_results>\n\n<think>", "reasoning")
+        .turn_anchor_starting_in("</function_results>\n\n</think>", "content")
 }
 
 #[cfg(test)]
@@ -330,8 +342,9 @@ mod tests {
         assert!(format.reasoning_open(THINKING));
         assert!(!format.reasoning_open(CHAT));
         // After a tool result the encoder writes `</function_results>` and opens the thought
-        // again (or closes it, in chat mode) inside the same assistant turn: the replay walks the
-        // turn's block from its `<｜Assistant｜>` and the output starts inside the thought.
+        // again (or closes it, in chat mode) inside the same assistant turn: the replay starts
+        // after that tail, the turn's earlier block and the result left unwalked, and the output
+        // starts inside the thought.
         let after_result = concat!(
             "<｜User｜>Weather in Paris?<｜Assistant｜><think>Need the weather.</think>\n\n",
             "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n",
@@ -351,6 +364,42 @@ mod tests {
         assert!(!format.reasoning_open(&chat_after_result));
         let events = run(&chat_after_result, &["It is 18 degrees."]);
         assert_eq!(content(&events), "It is 18 degrees.");
+        // The two newlines before a block after a tool result in chat mode start a stay with
+        // nothing begun: the encoder's spacing, dropped as at the turn's start.
+        let events = run(
+            &chat_after_result,
+            &[concat!(
+                "\n\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n",
+                "<｜DSML｜parameter name=\"location\" string=\"true\">Rome</｜DSML｜parameter>\n",
+                "</｜DSML｜invoke>\n</｜DSML｜function_calls>"
+            )],
+        );
+        assert_eq!(content(&events), "");
+        assert_eq!(
+            calls(&events),
+            vec![("get_weather".to_string(), value!({"location": "Rome"}))]
+        );
+        // A marker quoted in a tool result moves nothing: the replay starts after the tail the
+        // encoder writes behind the result, so the result's text is never walked.
+        let quoted_result = after_result.replace(
+            "<result>{\"temperature\": 18}</result>",
+            "<result>The tag <｜DSML｜function_calls> opens the calls.</result>",
+        );
+        assert!(format.reasoning_open(&quoted_result));
+        let events = run(&quoted_result, &["Got it.</think>It is 18 degrees."]);
+        assert_eq!(reasoning(&events), "Got it.");
+        assert_eq!(content(&events), "It is 18 degrees.");
+        assert!(calls(&events).is_empty());
+        // Nor does a result that quotes an invoke's opening, in chat mode: the output starts in
+        // the content, as the tail says.
+        let open_invoke = chat_after_result.replace(
+            "<result>{\"temperature\": 18}</result>",
+            "<result>Write <｜DSML｜invoke name=\" and then the name.</result>",
+        );
+        assert!(!format.reasoning_open(&open_invoke));
+        let events = run(&open_invoke, &["It is 18 degrees."]);
+        assert_eq!(content(&events), "It is 18 degrees.");
+        assert!(calls(&events).is_empty());
         // A marker quoted in an earlier turn moves nothing.
         let quoted = "<｜User｜>Why did you write <｜DSML｜function_calls>?<｜Assistant｜><think>";
         let events = run(
@@ -412,10 +461,19 @@ mod tests {
     }
 
     #[test]
-    fn the_table_validates_and_names_its_opener() {
+    fn the_table_validates_and_anchors_the_turn_at_the_encoders_tails() {
         let format = deepseek_v3_2();
         format.validate().expect("a valid table");
         assert_eq!(format.name(), "deepseek_v3.2");
-        assert_eq!(format.turn_opener(), Some("<｜Assistant｜>"));
+        assert_eq!(format.turn_opener(), None);
+        assert_eq!(
+            format.turn_texts(),
+            [
+                "<｜Assistant｜><think>",
+                "<｜Assistant｜></think>",
+                "</function_results>\n\n<think>",
+                "</function_results>\n\n</think>",
+            ]
+        );
     }
 }

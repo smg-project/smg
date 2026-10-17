@@ -90,28 +90,34 @@ V4.1's, and the registry reads each checkpoint with its own. Beyond that:
 ## DeepSeek V3.2 (`deepseek_v3.2`)
 
 DSML as V4 spells it, with `function_calls` for the block's name: the table is V4's with the block's
-two terminals changed and the same `Tags::DSML_V4` for the invoke and parameter tags, so everything
-the V4 section says holds here (a calls block ends the thought; the two newlines before the block
-are the content's where text precedes them and the template's spacing, dropped, where none does;
-the prompt ends with `<think>` or `</think>` right after `<｜Assistant｜>`). One consequence of
-the stay rule shows here and not under V4's fixtures: after a tool result in chat mode the content
-stay began in the prompt (`</function_results>`, two newlines, `</think>` are its text), so the two
-newlines the model then writes before its block are content, where at the turn's start they are
-dropped; the thinking-mode turn opens a new stay at `</think>` and drops them. The fixture records
-both readings; whether a stay should begin at the output's first byte is a question for the
-engine, not this table.
+two terminals changed and the same `Tags::DSML_V4` for the invoke and parameter tags, so what the
+V4 section says of the format holds here (a calls block ends the thought; the two newlines before
+the block are the content's where text precedes them and the template's spacing, dropped, where
+none does; the prompt ends with `<think>` or `</think>` right after `<｜Assistant｜>`), with two
+exceptions at the turn's start. The table has no unopened row, and must not take V4's: the encoder
+writes `<think>` or `</think>` after every user message and after every tool result, so the turn
+is never left unopened, and after a tool result `<｜end▁of▁sentence｜>` follows the last
+`<｜Assistant｜>`, which V4's row would read as an unopened turn and start in the thought (in chat
+mode the answer would then read as reasoning; the `chat_after_result` assertion of
+`the_prompt_decides_where_the_output_starts` guards it). And the table names no turn opener but
+the four tails the encoder writes before the model's turn, as turn anchors (`<｜Assistant｜>` and
+`</function_results>` with two newlines, each followed by `<think>` or `</think>`): the replay
+starts after the last of them, in the state it names, so the turn's earlier block and the tool
+result's text are not walked (a DSML marker quoted in a result moves nothing), and the two newlines
+the model writes before a block after a tool result in chat mode start a stay with nothing begun
+and are dropped, as at the turn's start and as the encoder's parser drops them.
 Beyond that:
 
 - **The checkpoint ships an encoder, not a chat template.** The repository's `encoding` module
   renders the prompt and reads a completion, and the gateway's own renderer for the family is a
   port of it. After a tool result the encoder writes `<function_results>` blocks inside the same
   assistant turn and opens the thought again (`</function_results>`, two newlines, `<think>`; or
-  `</think>` in chat mode), so the replay walks the turn's earlier block from its `<｜Assistant｜>`
-  and the output starts inside the thought, or in the content, as the tail says.
+  `</think>` in chat mode), the tails the table anchors the turn at, so the output starts inside
+  the thought, or in the content, as the tail says.
 - **Each DSML checkpoint reads with its own table.** The V4 block name and the V4.1 spaced tags are
   content under this table and this block is content under theirs; the registry reads V3.2 and
-  V3.2-Speciale here, V3.2-Exp with the V3.1 table (it writes the earlier spelling) and the V4
-  checkpoints with theirs, and the `deepseek32` alias takes a deployment that names the older
+  V3.2-Speciale here, V3.2-Exp (it writes the earlier V3.1 spelling) with no table yet, so the
+  older `deepseek31` parser, and the V4 checkpoints with theirs, and the `deepseek32` alias takes a deployment that names the older
   parser to this table.
 - **A string value that holds a closing tag is two parameters.** DSML writes a string raw, so a
   value holding `</｜DSML｜parameter>` and another parameter's opening tag reads as two parameters,
