@@ -2303,12 +2303,19 @@ class TestRuntimeWorkerThreads:
 
     def test_the_help_names_the_default_cap(self):
         """The help documents the default the Rust CLI's help documents: the cap is
-        spelled in both, and this pins the Python side as the Rust help test pins its own."""
+        spelled in both, and this pins the Python side against the cap the binding
+        exposes, as the Rust help test pins its own against the constant; the option's
+        own help string is read, not the rendered help, which wraps at the terminal's
+        width and can split the phrase."""
+        from smg.smg_rs import DEFAULT_RUNTIME_WORKER_THREADS_CAP
+
         parser = argparse.ArgumentParser()
         RouterArgs.add_cli_args(parser)
-        help_text = parser.format_help()
+        help_text = next(
+            a.help for a in parser._actions if "--runtime-worker-threads" in a.option_strings
+        )
         assert "TOKIO_WORKER_THREADS" in help_text
-        assert "capped at 8" in help_text
+        assert f"capped at {DEFAULT_RUNTIME_WORKER_THREADS_CAP}" in help_text
 
     def test_value_lands_on_the_dataclass(self):
         assert parse_router_args(["--runtime-worker-threads", "4"]).runtime_worker_threads == 4

@@ -2153,6 +2153,12 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(print_banner, m)?)?;
     m.add_function(wrap_pyfunction!(get_available_tool_call_parsers, m)?)?;
     m.add_function(wrap_pyfunction!(get_available_reasoning_parsers, m)?)?;
+    // The cap on the runtime's default worker-thread count, as the launcher's
+    // help spells it: its test pins the help against this value.
+    m.add(
+        "DEFAULT_RUNTIME_WORKER_THREADS_CAP",
+        server::DEFAULT_RUNTIME_WORKER_THREADS_CAP,
+    )?;
     m.add_function(wrap_pyfunction!(init_servicer_tracing, m)?)?;
     Ok(())
 }

@@ -1681,14 +1681,21 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // A count well above the CPUs available to the process, by the flag or
     // by the variable, is the operator's choice, served with a warning: a
     // worker thread beyond the CPUs only waits for one. The runtime's own
-    // count is checked, so the warning covers every way it was set (the
-    // budget never exceeds the parallelism, so it never warns). The ceiling
-    // on the count is the validator's, and reads nothing of the host.
-    if let Some(warning) = crate::config::runtime_worker_threads_oversubscription(
-        worker_threads,
-        crate::config::available_cpus(),
-    ) {
-        tracing::warn!("{warning}");
+    // count is checked, so the warning covers both ways it was set; it is
+    // checked only when it was set: the budget's own count never exceeds
+    // the parallelism it read, and when the parallelism cannot be read the
+    // budget falls back to the cap while the CPU count reads as one, which
+    // would warn about a setting nobody made. The ceiling on the count is
+    // the validator's, and reads nothing of the host.
+    let configured =
+        config.runtime_worker_threads.is_some() || std::env::var_os(TOKIO_WORKER_THREADS).is_some();
+    if configured {
+        let cpus = crate::config::available_cpus();
+        if let Some(warning) =
+            crate::config::runtime_worker_threads_oversubscription(worker_threads, cpus)
+        {
+            tracing::warn!("{warning}");
+        }
     }
 
     // Who else can read the private key files: checked here, once the
