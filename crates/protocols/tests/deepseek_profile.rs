@@ -25,6 +25,7 @@ fn deepseek_profile_is_limited_to_the_verified_v4_family() {
         "deepseek-v4-flash",
         "deepseek-ai/DeepSeek-V4.1-Flash",
         "/models/DeepSeek-V4.1-Flash",
+        "deepseek-ai/DeepSeek-V4.1-Flash-1017",
     ] {
         assert_ne!(
             ProviderProfile::for_model(model),
@@ -210,6 +211,7 @@ fn deepseek_v41_preserves_native_xhigh_for_both_effort_fields() {
         "deepseek-v4.1-flash",
         "deepseek-ai/DeepSeek-V4.1-Flash",
         "/models/DEEPSEEK-V4.1-FLASH",
+        "deepseek-ai/DeepSeek-V4.1-Flash-1017",
     ] {
         for extra in [
             json!({"reasoning_effort":"xhigh"}),

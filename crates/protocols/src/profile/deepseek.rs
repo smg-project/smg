@@ -14,21 +14,21 @@ use crate::{
     common::ToolChoice,
 };
 
+const V41_MODELS: [&str; 2] = ["deepseek-v4.1-flash", "deepseek-v4.1-flash-1017"];
+
 pub(super) fn matches_model(segment: &str) -> bool {
-    [
-        "deepseek-flash",
-        "deepseek-v4-flash",
-        "deepseek-v4-pro",
-        "deepseek-v4.1-flash",
-    ]
-    .iter()
-    .any(|model| segment.eq_ignore_ascii_case(model))
+    ["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"]
+        .iter()
+        .chain(&V41_MODELS)
+        .any(|model| segment.eq_ignore_ascii_case(model))
 }
 
 fn is_v41_model(model: &str) -> bool {
-    model
-        .split('/')
-        .any(|segment| segment.eq_ignore_ascii_case("deepseek-v4.1-flash"))
+    model.split('/').any(|segment| {
+        V41_MODELS
+            .iter()
+            .any(|v41| segment.eq_ignore_ascii_case(v41))
+    })
 }
 
 pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {

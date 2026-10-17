@@ -176,7 +176,7 @@ jobs:
               # is a separate change that needs a run on this leg.
               {"name": "deepseek-v4.1", "runner": "blackwell", "tp": 8,
                "gpu_a": "0,1,2,3,4,5,6,7", "gpu_b": "",  # sequential: arm B reuses GPU_A (whole node)
-               "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+               "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
                "vllm_tool": "deepseek_v41", "vllm_reason": "deepseek_v41",
                "smg_tool": "deepseek_v41", "smg_reason": "deepseek_v41",
                # No kv-cache/block-size flags: vLLM's V4.1 path resolves both itself
