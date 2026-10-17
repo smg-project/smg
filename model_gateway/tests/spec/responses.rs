@@ -947,6 +947,21 @@ fn test_validate_top_logprobs_does_not_require_include() {
     }
 }
 
+/// previous_response_id is opaque: the ids the gRPC router hands out need not
+/// start with "resp_", so the validator must not require the prefix.
+#[test]
+fn test_validate_previous_response_id_accepts_any_format() {
+    let request = ResponsesRequest {
+        input: ResponseInput::Text("test".to_string()),
+        previous_response_id: Some("response_123abc".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        request.validate().is_ok(),
+        "a previous_response_id without the resp_ prefix is accepted"
+    );
+}
+
 /// Test conversation and previous_response_id mutual exclusion
 #[test]
 fn test_validate_conversation_previous_response_mutual_exclusion() {
