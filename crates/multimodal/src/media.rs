@@ -1936,7 +1936,15 @@ async fn decode_video_with_ffmpeg(
     input_bytes: usize,
     cfg: VideoFetchConfig,
 ) -> Result<DecodedVideoFrames, MediaConnectorError> {
-    let metadata = probe_video_metadata(input_path).await.ok();
+    // A probe that fails leaves the clip to the metadata-less runner, which
+    // reads the stream as it comes; a probe that states no size is the one
+    // refusal that ends the request here instead (`video_metadata_from`):
+    // that runner has no work cap, and nothing frames such a stream.
+    let metadata = match probe_video_metadata(input_path).await {
+        Ok(metadata) => Some(metadata),
+        Err(error) if is_video_size_unknown(&error) => return Err(error),
+        Err(_) => None,
+    };
     let Some((probed, selection)) = metadata.and_then(|probed| {
         FrameSelection::from_metadata(probed, cfg).map(|selection| (probed, selection))
     }) else {
@@ -2400,13 +2408,22 @@ const VIDEO_DECODED_BYTES_KNOB: &str = "SMG_VIDEO_MAX_DECODED_BYTES";
 /// What `ensure_decode_work_limit` names in the error of a decode refused for its work.
 const VIDEO_MAX_DECODE_PIXELS_KNOB: &str = "SMG_VIDEO_MAX_DECODE_PIXELS";
 
-/// `true` for the error of a decode refused for its size or its work, or
-/// ended for its time: a budget no other runner over the same stream, and no
-/// resampling of it, can answer, so it ends the decode instead of starting
-/// the next runner.
+/// The refusal of a probe that states no size (`video_metadata_from`).
+const VIDEO_SIZE_UNKNOWN: &str = "a stream of unknown size is not decoded";
+
+/// `true` for the refusal of a probe that states no size.
+fn is_video_size_unknown(error: &MediaConnectorError) -> bool {
+    matches!(error, MediaConnectorError::VideoDecode(message) if message.contains(VIDEO_SIZE_UNKNOWN))
+}
+
+/// `true` for the error of a decode refused for its size, its work or its
+/// stream's unknown size, or ended for its time: a budget no other runner
+/// over the same stream, and no resampling of it, can answer, so it ends the
+/// decode instead of starting the next runner.
 fn is_video_budget_error(error: &MediaConnectorError) -> bool {
     is_video_command_timeout(error)
         || matches!(error, MediaConnectorError::DecodedTooLarge { .. })
+        || is_video_size_unknown(error)
         || matches!(error, MediaConnectorError::VideoDecode(message) if message.contains(VIDEO_DECODED_BYTES_KNOB) || message.contains(VIDEO_MAX_DECODE_PIXELS_KNOB))
 }
 
@@ -2703,9 +2720,11 @@ fn video_metadata_from(
     // ffprobe states `0x0` for a stream whose codec parameters it could not
     // find: no decoder frames such a stream, and the work cap would count no
     // pixels for it (the container's tables refuse a zero size already).
+    // `decode_video_with_ffmpeg` ends the request on this refusal instead of
+    // falling back to the metadata-less runner, which has no work cap.
     if width == 0 || height == 0 {
         return Err(MediaConnectorError::VideoDecode(format!(
-            "ffprobe reported a video size of {width}x{height}: a stream of unknown size is not decoded"
+            "ffprobe reported a video size of {width}x{height}: {VIDEO_SIZE_UNKNOWN}"
         )));
     }
     Ok(VideoMetadata {
@@ -2745,13 +2764,18 @@ fn probed_from_container(container: &crate::mp4_metadata::ContainerVideoInfo) ->
     }
 }
 
-/// A test switch: on this thread the probe tool is treated as unable to run.
+/// Test switches: on this thread the probe tool is treated as unable to run,
+/// or answers with a stated probe instead of running.
 #[cfg(test)]
 mod probe_switch {
     use std::cell::Cell;
 
+    use super::ProbedVideoInfo;
+
     thread_local! {
         pub(super) static UNAVAILABLE: Cell<bool> = const { Cell::new(false) };
+        /// The probe's answer on this thread, in place of running the tool.
+        pub(super) static ANSWER: Cell<Option<ProbedVideoInfo>> = const { Cell::new(None) };
     }
 }
 
@@ -2762,6 +2786,9 @@ async fn probe_video_info(input_path: &Path) -> Result<ProbedVideoInfo, MediaCon
             return Err(MediaConnectorError::VideoDecode(
                 "the probe tool is switched off for this test".to_string(),
             ));
+        }
+        if let Some(answer) = probe_switch::ANSWER.with(|answer| answer.get()) {
+            return Ok(answer);
         }
     }
     let mut command = Command::new("ffprobe");
@@ -5565,6 +5592,38 @@ mod video_sampling_tests {
         let info = parse_ffprobe_video_info(output).expect("valid ffprobe output");
         assert_eq!(info.source_fps, None);
         assert_eq!(info.total_frames, None);
+    }
+
+    /// A probe that states no size ends the decode with its refusal: the
+    /// metadata-less runner, which has no work cap, never starts on such a
+    /// stream, and no fallback runner resamples it.
+    #[tokio::test]
+    async fn a_probe_that_states_no_size_ends_the_decode() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("unsized.bin");
+        // Not a container whose tables are read: the probe answers for it.
+        std::fs::write(&path, b"not a container").expect("a clip stand-in");
+        probe_switch::ANSWER.with(|answer| {
+            answer.set(Some(ProbedVideoInfo {
+                width: Some(0),
+                height: Some(0),
+                duration_seconds: Some(36_000.0),
+                source_fps: Some(30.0),
+                total_frames: Some(1_080_000),
+                container_frames: Some(1_080_000),
+            }));
+        });
+        let decoded = decode_video_with_ffmpeg(&path, 15, cfg()).await;
+        probe_switch::ANSWER.with(|answer| answer.set(None));
+        let error = match decoded {
+            Ok(_) => panic!("a stream of unknown size is refused"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(VIDEO_SIZE_UNKNOWN), "{error}");
+        assert!(
+            is_video_budget_error(&error),
+            "the refusal ends the request; no runner resamples it"
+        );
     }
 
     /// Skipped when ffmpeg or ffprobe is not on PATH.
