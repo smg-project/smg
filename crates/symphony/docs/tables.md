@@ -131,11 +131,25 @@ is the terminal that leaves the call. Beyond that:
   read them either.
 - **A thought the template never writes.** V3's template has no thinking switch, yet the table
   keeps the thought rows (`<think>` opens it, `</think>` closes it, a calls block ends it) because
-  the gateway's older `deepseek` parser served checkpoints that share the call spelling and write
-  a thought: DeepSeek R1-0528, paired with the `deepseek_r1` reasoning parser. The `deepseek` alias
-  takes that deployment to this table, and the thought must never land in the content. The cost
-  is a V3-0324 output that spells `<think>` itself, which the reference keeps as content and the
-  table reads as a thought; the recorded sets hold none.
+  the checkpoints that share the call spelling and write a thought read with it: the DeepSeek R1
+  line, by id, and the gateway's older pairing `deepseek` + `deepseek_r1` under the `deepseek`
+  alias. The thought must never land in the content. The cost is a V3-0324 output that spells
+  `<think>` itself, which the reference keeps as content and the table reads as a thought; the
+  recorded sets hold none.
+- **The R1 line is this table by id.** The templates of DeepSeek-R1, R1-Zero, the six distills,
+  R1-0528 and R1-0528-Qwen3-8B, and the bf16 mirror of R1, render V3's calls block from the history
+  (`function<｜tool▁sep｜>`, the name, the `json` fence) and declare no tool, and keep an assistant
+  message from its `</think>` on. They differ in the generation prompt alone: R1's, R1-Zero's and the
+  distills' end in `<think>` and a newline after `<｜Assistant｜>`, so the output starts inside the
+  thought and the prompt's replay puts it there; R1-0528's, R1-0528-Qwen3-8B's and the bf16
+  mirror's end at the header, and the model writes `<think>` itself. The recorded sets (R1-0528, R1-0528-Qwen3-8B, the bf16
+  mirror, Distill-Qwen-1.5B, Distill-Llama-8B) hold content alone, as the templates render a
+  message, and replay bitwise; the thought's two openings are held by the module's tests. Under
+  `--parser symphony` the ids select this table, so a deployment that named only the
+  `deepseek_r1` reasoning parser reads with the table by its model id; the reasoning parser's
+  name alone selects no table (it reads only a thought, and a table that reads V3's calls under
+  that name would be a wider reading than the name says), which an operator serving an R1 under an
+  opaque name settles by naming the table on both flags.
 - **The recorded set holds no call**, for the reason given under V3.1; the calls stand on the turns
   the template renders, held in the module's tests at every cut.
 

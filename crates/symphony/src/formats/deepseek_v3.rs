@@ -14,8 +14,12 @@
 //! The spelling is the gateway's older `deepseek` parser's; DeepSeek V3.1 drops the type and the
 //! fence ([`deepseek_v3_1`]). V3's template writes no thought; the table reads one between
 //! `<think>` and `</think>` all the same, since the checkpoints that share the call spelling and
-//! write a thought (DeepSeek R1-0528, which the gateway's older pairing `deepseek` + `deepseek_r1`
-//! served) read with it under the `deepseek` alias, and a thought must never land in the content.
+//! write a thought read with it: the DeepSeek R1 line (R1, R1-Zero, the bf16 mirror, the six
+//! distills, R1-0528 and R1-0528-Qwen3-8B, by id, and the gateway's older pairing `deepseek` +
+//! `deepseek_r1` under the `deepseek` alias), whose templates render V3's block from the history
+//! and either open the thought in the prompt (`<think>` after the assistant header: R1, R1-Zero,
+//! the distills) or leave the model to open it (R1-0528, R1-0528-Qwen3-8B, the bf16 mirror); a
+//! thought must never land in the content.
 //! Recorded as `deepseek-v3-0324`, whose parse sets hold content alone: the template takes a
 //! call's arguments as a string, so the recorder, whose corpus holds them as an object, refused
 //! every call case; the calls stand on the turns the template renders, held in the tests below.
@@ -68,8 +72,10 @@ mod tests {
 
     /// The generation prompt's tail: the turn's opener and nothing more.
     const PROMPT: &str = "<｜Assistant｜>";
-    /// The tail of a checkpoint whose template opens the thought in the prompt (the original R1
-    /// and its distills). R1-0528 ends its prompt at the opener and writes `<think>` itself.
+    /// The tail of a checkpoint whose template opens the thought in the prompt: DeepSeek R1's,
+    /// R1-Zero's and the R1 distills' write `<think>` and a newline after the assistant header.
+    /// R1-0528's, R1-0528-Qwen3-8B's and the bf16 mirror's end at the header, and the model writes
+    /// `<think>` itself.
     const THINKING: &str = "<｜Assistant｜><think>\n";
 
     fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
@@ -461,6 +467,54 @@ mod tests {
                       <｜end▁of▁sentence｜><｜User｜>Thanks.<｜Assistant｜>";
         let events = run(quoted, &["You are welcome."]);
         assert_eq!(content(&events), "You are welcome.");
+    }
+
+    #[test]
+    fn the_r1_line_reads_its_thought_whether_the_prompt_or_the_model_opens_it() {
+        // R1, R1-Zero and the distills: the prompt ends `<think>\n`, the model closes the thought
+        // and answers; the replay of the tail puts the output in the thought from its first byte.
+        let output = "The user greets me.\n</think>\n\nHello!";
+        let events = run(THINKING, &[output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(reasoning(&events), "The user greets me.\n");
+        assert_eq!(content(&events), "\n\nHello!");
+        assert!(calls(&events).is_empty());
+        // R1-0528, R1-0528-Qwen3-8B and the bf16 mirror: the prompt ends at the header and the
+        // model opens the thought itself; the same table reads it from the content state.
+        let output = "<think>The user greets me.</think>Hello!";
+        let events = run(PROMPT, &[output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(reasoning(&events), "The user greets me.");
+        assert_eq!(content(&events), "Hello!");
+        // Either way, a call after the thought is V3's block, which R1's templates render.
+        let call = "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Paris\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>";
+        let openings = [
+            (
+                THINKING,
+                "I need the weather.\n</think>\n\n",
+                "I need the weather.\n",
+            ),
+            (
+                PROMPT,
+                "<think>I need the weather.</think>",
+                "I need the weather.",
+            ),
+        ];
+        for (prompt, thought, expected) in openings {
+            let output = format!("{thought}{call}");
+            let events = run(prompt, &[&output]);
+            assert_eq!(bytes(&events), output, "{prompt}");
+            assert_eq!(reasoning(&events), expected, "{prompt}");
+            assert_eq!(
+                calls(&events),
+                [(
+                    "get_weather".to_string(),
+                    "{\"city\": \"Paris\"}".to_string()
+                )],
+                "{prompt}"
+            );
+            assert_eq!(content(&events).trim(), "", "{prompt}");
+        }
     }
 
     #[test]
