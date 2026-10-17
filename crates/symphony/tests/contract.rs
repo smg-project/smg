@@ -17,7 +17,8 @@
 //!   `Malformed` event came while it was open, so that a client is never handed a cut call as a
 //!   whole one without a word, and a fragment that closes a string the arguments left open
 //!   carries the bytes of the output that closed it, so that no closing quote is made up for a
-//!   value the model never closed;
+//!   value the model never closed, and a fragment that is an empty string carries bytes of the
+//!   output too, so that no value is made up for a member that has none;
 //! - order: calls are numbered from zero as they start, with ids that follow the index;
 //! - the lifecycle: one `Prompt`, deltas, one `End`, and an input out of order is a `Lifecycle`
 //!   error that emits nothing.
@@ -1345,8 +1346,8 @@ const LLAMA_NEMOTRON_OUTPUTS: &[&str] = &[
 ];
 
 /// FunctionGemma's calls: Gemma's spelling between `<start_function_call>` and
-/// `<end_function_call>`, `<escape>` around a string, `None` for a null; cut streams, a block that
-/// is no call, and text after the arguments.
+/// `<end_function_call>`, `<escape>` around a string, `None` for a null; cut streams, a member
+/// without a key and one without a value, a block that is no call, and text after the arguments.
 const FUNCTION_GEMMA_OUTPUTS: &[&str] = &[
     "<start_function_call>call:get_weather{city:<escape>Paris<escape>,days:[1,2.5,true,None]}\
      <end_function_call>",
@@ -1356,6 +1357,7 @@ const FUNCTION_GEMMA_OUTPUTS: &[&str] = &[
      <end_function_call>",
     "<start_function_call>call:get_weather{city:<escape>Par",
     "<start_function_call>call:f{:1,a:<escape>x<escape>}<end_function_call>",
+    "<start_function_call>call:f{a:,b:<escape>x<escape>}<end_function_call>",
     "<start_function_call>call:get_wea",
     "<start_function_call>not a call<end_function_call>",
     "<start_function_call>call:get_weather{} trailing<end_function_call>",
@@ -1504,7 +1506,7 @@ const ERNIE_OUTPUTS: &[&str] = &[
 /// Gemma 4's turns: transformers' streaming fixture for the template, a thought, calls and an
 /// answer with whitespace at every edge, whitespace inside the text, the content's own close
 /// between two stays, Python's whitespace beyond ASCII, a call written inside a thought, a stay
-/// of whitespace only, a cut call, and nothing.
+/// of whitespace only, a cut call, a member without a value, and nothing.
 const GEMMA4_TEMPLATE_OUTPUTS: &[&str] = &[
     "<|channel>thought\nhi<channel|><|tool_call>call:foo{a:1,b:<|\"|>bar<|\"|>}<tool_call|>",
     "<|channel>thought\n The user wants the weather.\n<channel|>\n<|tool_call>call:get_weather{\
@@ -1515,6 +1517,7 @@ const GEMMA4_TEMPLATE_OUTPUTS: &[&str] = &[
     " \n\t ",
     "Sure.\n<|tool_call>call:get_weather{city:<|\"|>Par",
     "Sure.\n<|tool_call>call:get_weather{city:<|\"|>Par<tool_call|>",
+    "<|tool_call>call:get_weather{city:,unit:<|\"|>celsius<|\"|>}<tool_call|>\nDone.",
     "",
 ];
 
@@ -1732,7 +1735,8 @@ const K2_HORIZON_OUTPUTS: &[&str] = &[
     "<ifm|think>plan</ifm|think><ifm|tool_calls>\n<ifm|tool_call>get_weather\n<ifm|arg_key>city</ifm|arg_key>\n<ifm|arg_value>Par</ifm|tool_call>\n</ifm|tool_calls>",
 ];
 
-/// The outputs bellwether's common set records for Gemma 4, and one cut short.
+/// The outputs bellwether's common set records for Gemma 4, one cut short, and the members the
+/// template never writes: cut, without a key, without a value.
 const GEMMA4_OUTPUTS: &[&str] = &[
     "<|channel>thought\nThe user asks about Paris.\n<channel|><|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>",
     "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,unit:<|\"|>celsius<|\"|>}<tool_call|>Let me check.",
@@ -1754,6 +1758,12 @@ const GEMMA4_OUTPUTS: &[&str] = &[
     "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days:<tool_call|>",
     "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days:",
     "<|tool_call>call:get_weather{tags:[<tool_call|>",
+    // A member without a value, before a comma and before the close, a list item missing before
+    // a comma, and a member without a key around one.
+    "<|tool_call>call:get_weather{city:,days:3}<tool_call|>",
+    "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days: }<tool_call|>",
+    "<|tool_call>call:f{a:{x:},b:[1,,2]}<tool_call|>",
+    "<|tool_call>call:f{:{:1},a:<|\"|><|\"|>}<tool_call|>",
 ];
 
 /// The outputs bellwether's common set records for Inkling, and one cut short.
@@ -1941,6 +1951,15 @@ fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event]) {
                     assert!(
                         !closes_an_open_string(so_far, json) || !source.text.is_empty(),
                         "{}: the fragment {json:?} closes an open string with no byte of the output behind it, a made-up closing quote",
+                        place()
+                    );
+                    // An empty string a fragment writes has bytes of the output behind it, the
+                    // string the model opened and closed at once or the JSON it wrote: one with
+                    // none, or whitespace alone, is made up for a member that has no value.
+                    assert!(
+                        !(matches!(json.as_str(), "\"\"" | ", \"\"")
+                            && source.text.trim().is_empty()),
+                        "{}: the fragment {json:?} writes an empty string with no byte of the output behind it, a made-up value",
                         place()
                     );
                     so_far.push_str(json);
