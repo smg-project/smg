@@ -602,14 +602,19 @@ func (s *GrpcChatCompletionStream) Close() error {
 	}
 	// The flag says whether the read loop still has to be stopped: a loop that
 	// ended on its own set it in its cleanup, and so did an earlier Close. Only
-	// then is the engine told the request is over, and not when the client
-	// disconnected (the engine side is left to finish).
+	// then is the stream half-closed from this side, and not when the client
+	// disconnected. The half-close does not reach the engine: the generated
+	// client half-closed the stream when it sent the request, and the call runs
+	// on the caller's context, so a request the engine is still generating is
+	// not aborted by Close (the receive goroutine returns when the engine ends
+	// the stream or the caller's context does).
 	if atomic.CompareAndSwapInt32(&s.closed, 0, 1) && atomic.LoadInt32(&s.clientDisconnected) == 0 {
 		_ = s.stream.CloseSend()
 	}
 
 	// The loop's cleanup waits for the in-flight chunk processors; the handle
-	// must outlive them.
+	// must outlive them. Should this wait give up, release still frees the
+	// handle under the postprocessor's lock, behind a processor still inside it.
 	if s.readLoopDone != nil {
 		select {
 		case <-s.readLoopDone:
@@ -622,10 +627,14 @@ func (s *GrpcChatCompletionStream) Close() error {
 }
 
 // release flushes what the batch postprocessor still holds and frees the
-// converter handle.
+// converter handle, under the lock every chunk takes: a processor still
+// inside the converter finishes first, and a chunk that arrives later meets a
+// closed postprocessor, not freed memory.
 func (s *GrpcChatCompletionStream) release() {
 	_, _ = s.flushBatch()
-	if s.converterHandle != nil {
+	if s.batchPostprocessor != nil {
+		s.batchPostprocessor.Close()
+	} else if s.converterHandle != nil {
 		ffi.FreeGrpcResponseConverter(s.converterHandle)
 	}
 }

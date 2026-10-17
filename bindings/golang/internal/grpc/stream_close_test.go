@@ -284,6 +284,64 @@ func TestCloseReleasesTheConverterOnEveryPath(t *testing.T) {
 	}
 }
 
+// The converter is freed under the lock every chunk takes: a chunk processor
+// still inside it when Close frees (Close gave up waiting for the loop) finishes
+// first, and a chunk that arrives after Close meets a closed postprocessor
+// instead of freed memory.
+func TestChunksAroundCloseMeetTheConverterOrAClosedPostprocessor(t *testing.T) {
+	client := newCloseTestClient(t, &scriptedScheduler{}, 16)
+	before := ffi.LiveGrpcResponseConverters()
+	stream, err := client.CreateChatCompletionStream(context.Background(), closeTestRequest)
+	if err != nil {
+		t.Fatalf("CreateChatCompletionStream: %v", err)
+	}
+	chunkJSON, err := protoToJSON(scriptedAnswer()[0])
+	if err != nil {
+		t.Fatalf("chunk JSON: %v", err)
+	}
+	// A processor that keeps feeding chunks while Close runs: every call takes
+	// the converter under the postprocessor's lock, so it either completes on
+	// a live converter or is refused after the free, never in between.
+	stop := make(chan struct{})
+	processed := make(chan int, 1)
+	go func() {
+		n := 0
+		for {
+			select {
+			case <-stop:
+				processed <- n
+				return
+			default:
+			}
+			if _, _, err := stream.batchPostprocessor.AddChunk(chunkJSON); err != nil {
+				if !errors.Is(err, ffi.ErrPostprocessorClosed) {
+					t.Errorf("a chunk in flight around Close failed with %v", err)
+				}
+				processed <- n
+				return
+			}
+			n++
+		}
+	}()
+	time.Sleep(10 * time.Millisecond)
+	_ = stream.Close()
+	close(stop)
+	n := <-processed
+	if n == 0 {
+		t.Fatal("no chunk was processed before Close")
+	}
+	if got := ffi.LiveGrpcResponseConverters() - before; got != 0 {
+		t.Fatalf("live converters after Close = %d, want 0", got)
+	}
+	if _, _, err := stream.batchPostprocessor.AddChunk(chunkJSON); !errors.Is(err, ffi.ErrPostprocessorClosed) {
+		t.Fatalf("a chunk after Close got %v, want the closed-postprocessor error", err)
+	}
+	stream.batchPostprocessor.Close()
+	if got := ffi.LiveGrpcResponseConverters() - before; got != 0 {
+		t.Fatalf("live converters after a second Close = %d, want 0", got)
+	}
+}
+
 // N requests completed the ordinary way (read to EOF, then Close) leave no
 // converter handle behind.
 func TestCompletedStreamsLeaveNoLiveConverters(t *testing.T) {
