@@ -446,10 +446,6 @@ pub(crate) fn init_metrics() {
         "smg_router_request_errors_total",
         "Router errors by router_type, backend_type, connection_mode, model, endpoint, error_type; model is the served model's id, unknown for a request that names no model, or other for a model the gateway does not serve"
     );
-    describe_histogram!(
-        "smg_router_stage_duration_seconds",
-        "Pipeline stage duration by router_type and stage (gRPC only)"
-    );
     describe_counter!(
         "smg_router_upstream_responses_total",
         "Upstream backend HTTP responses by router_type, status_code, error_code"
@@ -562,10 +558,6 @@ pub(crate) fn init_metrics() {
     describe_gauge!(
         "smg_worker_pool_size",
         "Current worker pool size by worker_type, connection_mode, model"
-    );
-    describe_gauge!(
-        "smg_worker_connections_active",
-        "Active connections to workers by worker_type, connection_mode"
     );
     describe_gauge!(
         "smg_worker_requests_active",
@@ -922,21 +914,6 @@ pub(crate) fn init_metrics() {
         "smg_mcp_tool_iterations_total",
         "Tool loop iterations in Responses API by model"
     );
-
-    // Layer 6: Database metrics
-    describe_counter!(
-        "smg_db_operations_total",
-        "Total database operations by storage_type, operation, result"
-    );
-    describe_histogram!(
-        "smg_db_operation_duration_seconds",
-        "Database operation duration by storage_type, operation"
-    );
-    describe_gauge!(
-        "smg_db_connections_active",
-        "Active database connections by storage_type"
-    );
-    describe_counter!("smg_db_items_stored", "Total items stored by storage_type");
 
     // Multimodal tensor transport (shm vs inline), labeled by runtime.
     describe_counter!(
@@ -1663,21 +1640,6 @@ impl Metrics {
     // Layer 2: Router metrics
     // ========================================================================
 
-    /// Record pipeline stage duration (gRPC only).
-    /// All labels are static, so this is very fast.
-    pub fn record_router_stage_duration(
-        router_type: &'static str,
-        stage: &'static str,
-        duration: Duration,
-    ) {
-        histogram!(
-            "smg_router_stage_duration_seconds",
-            "router_type" => router_type,
-            "stage" => stage
-        )
-        .record(duration.as_secs_f64());
-    }
-
     /// Record a single-shot resend after a pre-response transport failure.
     pub fn record_upstream_send_retry(router_type: &'static str) {
         counter!(
@@ -1724,65 +1686,6 @@ impl Metrics {
     // ========================================================================
     // Layer 2: Router inference metrics (gRPC only)
     // ========================================================================
-
-    /// Record time to first token.
-    /// Uses string interning for model_id.
-    pub fn record_router_ttft(
-        router_type: &'static str,
-        backend_type: &'static str,
-        model_id: &str,
-        endpoint: &'static str,
-        duration: Duration,
-    ) {
-        let model = intern_model_label(model_id);
-        histogram!(
-            "smg_router_ttft_seconds",
-            "router_type" => router_type,
-            "backend_type" => backend_type,
-            "model" => model,
-            "endpoint" => endpoint
-        )
-        .record(duration.as_secs_f64());
-    }
-
-    /// Record time per output token
-    pub fn record_router_tpot(
-        router_type: &'static str,
-        backend_type: &'static str,
-        model_id: &str,
-        endpoint: &'static str,
-        duration: Duration,
-    ) {
-        let model = intern_model_label(model_id);
-        histogram!(
-            "smg_router_tpot_seconds",
-            "router_type" => router_type,
-            "backend_type" => backend_type,
-            "model" => model,
-            "endpoint" => endpoint
-        )
-        .record(duration.as_secs_f64());
-    }
-
-    /// Record total generation duration.
-    /// Uses string interning for model_id.
-    pub fn record_router_generation_duration(
-        router_type: &'static str,
-        backend_type: &'static str,
-        model_id: &str,
-        endpoint: &'static str,
-        duration: Duration,
-    ) {
-        let model = intern_model_label(model_id);
-        histogram!(
-            "smg_router_generation_duration_seconds",
-            "router_type" => router_type,
-            "backend_type" => backend_type,
-            "model" => model,
-            "endpoint" => endpoint
-        )
-        .record(duration.as_secs_f64());
-    }
 
     /// Record all streaming metrics in a single batch call.
     ///
@@ -2059,20 +1962,6 @@ impl Metrics {
             "model" => model
         )
         .set(size as f64);
-    }
-
-    /// Set active worker connections
-    pub fn set_worker_connections_active(
-        worker_type: &'static str,
-        connection_mode: &'static str,
-        count: usize,
-    ) {
-        gauge!(
-            "smg_worker_connections_active",
-            "worker_type" => worker_type,
-            "connection_mode" => connection_mode
-        )
-        .set(count as f64);
     }
 
     /// Record health check result
@@ -2706,57 +2595,6 @@ impl Metrics {
     /// Set active MCP servers count
     pub fn set_mcp_servers_active(count: usize) {
         gauge!("smg_mcp_servers_active").set(count as f64);
-    }
-
-    // ========================================================================
-    // Layer 6: Database metrics
-    // ========================================================================
-
-    /// Record database operation
-    pub fn record_db_operation(
-        storage_type: &'static str,
-        operation: &'static str,
-        result: &'static str,
-    ) {
-        counter!(
-            "smg_db_operations_total",
-            "storage_type" => storage_type,
-            "operation" => operation,
-            "result" => result
-        )
-        .increment(1);
-    }
-
-    /// Record database operation duration
-    pub fn record_db_operation_duration(
-        storage_type: &'static str,
-        operation: &'static str,
-        duration: Duration,
-    ) {
-        histogram!(
-            "smg_db_operation_duration_seconds",
-            "storage_type" => storage_type,
-            "operation" => operation
-        )
-        .record(duration.as_secs_f64());
-    }
-
-    /// Set active database connections
-    pub fn set_db_connections_active(storage_type: &'static str, count: usize) {
-        gauge!(
-            "smg_db_connections_active",
-            "storage_type" => storage_type
-        )
-        .set(count as f64);
-    }
-
-    /// Record item stored
-    pub fn increment_db_items_stored(storage_type: &'static str) {
-        counter!(
-            "smg_db_items_stored",
-            "storage_type" => storage_type
-        )
-        .increment(1);
     }
 
     // ========================================================================
