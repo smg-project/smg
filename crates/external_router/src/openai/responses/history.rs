@@ -8,7 +8,10 @@ use std::collections::HashSet;
 use axum::response::Response;
 use openai_protocol::{
     event_types::ItemType,
-    responses::{ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponsesRequest},
+    responses::{
+        without_outputs_of_missing_calls, ResponseContentPart, ResponseInput,
+        ResponseInputOutputItem, ResponsesRequest,
+    },
 };
 use serde_json::Value;
 use smg_data_connector::{
@@ -24,6 +27,10 @@ use crate::{
     persistence_utils::split_stored_message_content,
 };
 
+/// How many of a conversation's stored items a request replays: its newest
+/// ones, oldest first; what is older is not sent. A window this limit cuts
+/// can begin between a call and its output, so the outputs of the calls
+/// before the window are left out of it.
 const MAX_CONVERSATION_HISTORY_ITEMS: usize = 100;
 
 pub(crate) struct LoadedInputHistory {
@@ -172,9 +179,13 @@ pub(crate) async fn load_input_history(
             }
         }
 
+        // The newest items, listed newest first so that the limit cuts the
+        // oldest off, then put back in the order they were stored. One more
+        // than the limit is asked for: a conversation of exactly the limit
+        // replays whole, and only one with an item past the window is cut.
         let params = ListParams {
-            limit: MAX_CONVERSATION_HISTORY_ITEMS,
-            order: SortOrder::Asc,
+            limit: MAX_CONVERSATION_HISTORY_ITEMS + 1,
+            order: SortOrder::Desc,
             after: None,
         };
 
@@ -183,7 +194,12 @@ pub(crate) async fn load_input_history(
             .list_items(&conv_id, params)
             .await
         {
-            Ok(stored_items) => {
+            Ok(mut stored_items) => {
+                stored_items.reverse();
+                let cut = stored_items.len() > MAX_CONVERSATION_HISTORY_ITEMS;
+                if cut {
+                    stored_items.drain(..stored_items.len() - MAX_CONVERSATION_HISTORY_ITEMS);
+                }
                 let mut items: Vec<ResponseInputOutputItem> = Vec::new();
                 for item in stored_items {
                     match item.item_type.as_str() {
@@ -245,6 +261,12 @@ pub(crate) async fn load_input_history(
                             warn!("Unknown item type in conversation: {}", item.item_type);
                         }
                     }
+                }
+                if cut {
+                    // The window is cut at the limit: the items before it are
+                    // not replayed, and an output whose call is among them is
+                    // not either.
+                    items = without_outputs_of_missing_calls(items);
                 }
 
                 append_current_input(&mut items, &request_body.input, conv_id_str);
@@ -338,5 +360,240 @@ fn append_current_input(
                 items.push(openai_protocol::responses::normalize_input_item(item));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use rustls::crypto::ring;
+    use serde_json::json;
+    use smg_data_connector::{
+        AddedAtSequence, ConversationStorage, MemoryConversationItemStorage,
+        MemoryConversationStorage, MemoryResponseStorage, NewConversation, NewConversationItem,
+    };
+    use smg_mcp::{McpConfig, McpOrchestrator};
+
+    use super::*;
+    use crate::openai::context::{ResponsesComponents, SharedComponents};
+
+    /// The tests' HTTP client, the process-level TLS crypto provider
+    /// installed first; the loader under test sends nothing with it.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test binary's client factory; the process TLS crypto provider is installed first"
+    )]
+    fn client() -> reqwest::Client {
+        let _ = ring::default_provider().install_default();
+        reqwest::Client::new()
+    }
+
+    /// The components of one router over in-memory stores, with the
+    /// conversation `conv_1`.
+    async fn components() -> ResponsesComponents {
+        let conversations = Arc::new(MemoryConversationStorage::new());
+        conversations
+            .create_conversation(NewConversation {
+                id: Some(ConversationId::from("conv_1")),
+                metadata: None,
+                tenant: None,
+            })
+            .await
+            .expect("the conversation is created");
+        ResponsesComponents {
+            shared: Arc::new(SharedComponents { client: client() }),
+            mcp_orchestrator: Arc::new(
+                McpOrchestrator::new(McpConfig::default())
+                    .await
+                    .expect("an orchestrator without servers"),
+            ),
+            mcp_format_registry: Default::default(),
+            response_storage: Arc::new(MemoryResponseStorage::new()),
+            conversation_storage: conversations,
+            conversation_item_storage: Arc::new(MemoryConversationItemStorage::new()),
+        }
+    }
+
+    /// Links `rows` to `conv_1` in order, each stamped later than the one
+    /// before, as the conversations API does.
+    async fn link_rows(components: &ResponsesComponents, rows: Vec<NewConversationItem>) {
+        let conv_id = ConversationId::from("conv_1");
+        let mut stamps = AddedAtSequence::new();
+        for row in rows {
+            let created = components
+                .conversation_item_storage
+                .create_item(row)
+                .await
+                .expect("the row is created");
+            components
+                .conversation_item_storage
+                .link_item(&conv_id, &created.id, stamps.next_added_at())
+                .await
+                .expect("the row is linked");
+        }
+    }
+
+    /// Message `n` of a conversation: a user's for an odd `n`, the
+    /// assistant's for an even one, its text `item n`.
+    fn message_row(n: usize) -> NewConversationItem {
+        let (role, content) = if n % 2 == 1 {
+            (
+                "user",
+                json!([{"type": "input_text", "text": format!("item {n}")}]),
+            )
+        } else {
+            (
+                "assistant",
+                json!([{"type": "output_text", "text": format!("item {n}"), "annotations": []}]),
+            )
+        };
+        NewConversationItem {
+            id: None,
+            response_id: None,
+            item_type: "message".to_string(),
+            role: Some(role.to_string()),
+            content,
+            status: Some("completed".to_string()),
+            tenant: None,
+        }
+    }
+
+    fn call_row(call_id: &str) -> NewConversationItem {
+        NewConversationItem {
+            id: None,
+            response_id: None,
+            item_type: ItemType::FUNCTION_CALL.to_string(),
+            role: None,
+            content: json!({
+                "type": "function_call", "call_id": call_id, "name": "calc",
+                "arguments": "{}", "status": "completed"
+            }),
+            status: Some("completed".to_string()),
+            tenant: None,
+        }
+    }
+
+    fn output_row(call_id: &str) -> NewConversationItem {
+        NewConversationItem {
+            id: None,
+            response_id: None,
+            item_type: ItemType::FUNCTION_CALL_OUTPUT.to_string(),
+            role: None,
+            content: json!({"type": "function_call_output", "call_id": call_id, "output": "42"}),
+            status: Some("completed".to_string()),
+            tenant: None,
+        }
+    }
+
+    /// The kinds of the items, with the call id of a tool item, and the text
+    /// of a message, for the window assertions.
+    fn shape(items: &[ResponseInputOutputItem]) -> Vec<String> {
+        items
+            .iter()
+            .map(|item| match item {
+                ResponseInputOutputItem::Message { role, content, .. } => {
+                    let text = content
+                        .iter()
+                        .find_map(|part| match part {
+                            ResponseContentPart::InputText { text }
+                            | ResponseContentPart::OutputText { text, .. } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .unwrap_or("");
+                    format!("{role}:{text}")
+                }
+                ResponseInputOutputItem::FunctionToolCall { call_id, .. } => {
+                    format!("function_call:{call_id}")
+                }
+                ResponseInputOutputItem::FunctionCallOutput { call_id, .. } => {
+                    format!("function_call_output:{call_id}")
+                }
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    async fn loaded_input(
+        components: &ResponsesComponents,
+        text: &str,
+    ) -> Vec<ResponseInputOutputItem> {
+        let mut request = ResponsesRequest {
+            input: ResponseInput::Text(text.to_string()),
+            ..Default::default()
+        };
+        load_input_history(components, Some("conv_1"), &mut request, "m", None)
+            .await
+            .expect("the conversation loads");
+        match request.input {
+            ResponseInput::Items(items) => items,
+            ResponseInput::Text(_) => panic!("the loaded input is an item list"),
+        }
+    }
+
+    /// A conversation of 120 items replays its newest 100, oldest first,
+    /// then the request's input: the first 20 are not sent.
+    #[tokio::test]
+    async fn a_conversation_longer_than_the_limit_replays_its_newest_items() {
+        let components = components().await;
+        link_rows(&components, (1..=120).map(message_row).collect()).await;
+
+        let items = loaded_input(&components, "item 121").await;
+
+        let expected: Vec<String> = (21..=121)
+            .map(|n| format!("{}:item {n}", if n % 2 == 1 { "user" } else { "assistant" }))
+            .collect();
+        assert_eq!(shape(&items), expected);
+    }
+
+    /// A conversation one item longer than the limit: its window begins at
+    /// the second item, the output of a call before the window, which is
+    /// left out; the call and the output inside the window stay, in order.
+    #[tokio::test]
+    async fn a_cut_window_leaves_out_the_output_of_a_call_before_it() {
+        let components = components().await;
+        let mut rows = vec![
+            call_row("call_A"),
+            output_row("call_A"),
+            call_row("call_B"),
+            output_row("call_B"),
+        ];
+        rows.extend((5..=101).map(message_row));
+        link_rows(&components, rows).await;
+
+        let items = loaded_input(&components, "item 102").await;
+
+        let kinds = shape(&items);
+        assert_eq!(
+            &kinds[..3],
+            [
+                "function_call:call_B",
+                "function_call_output:call_B",
+                "user:item 5"
+            ],
+            "{kinds:?}"
+        );
+        assert!(!kinds.contains(&"function_call_output:call_A".to_string()));
+        // call_A is before the window, its output left out, the rest replays
+        assert_eq!(items.len(), 101 - 2 + 1);
+        assert_eq!(kinds.last().map(String::as_str), Some("user:item 102"));
+    }
+
+    /// A conversation of exactly the limit is not cut: every item replays,
+    /// an output whose call is not among them included (the window did not
+    /// begin after its call).
+    #[tokio::test]
+    async fn a_conversation_of_exactly_the_limit_replays_whole() {
+        let components = components().await;
+        let mut rows = vec![output_row("call_A")];
+        rows.extend((2..=100).map(message_row));
+        link_rows(&components, rows).await;
+
+        let items = loaded_input(&components, "item 101").await;
+
+        let kinds = shape(&items);
+        assert_eq!(kinds[0], "function_call_output:call_A", "{kinds:?}");
+        assert_eq!(items.len(), 100 + 1);
+        assert_eq!(kinds.last().map(String::as_str), Some("user:item 101"));
     }
 }
