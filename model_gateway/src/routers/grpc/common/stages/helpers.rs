@@ -21,8 +21,17 @@ use crate::{
     routers::{
         error,
         grpc::{
-            context::{AttemptStamp, ExecutionPlan, LoadGuards, RequestType, WorkerSelection},
-            proto_wrapper::ProtoGenerateRequest,
+            backend_client::BackendClient,
+            context::{
+                stage_output, AttemptStamp, ClientSelection, ExecutionPlan, LoadGuards,
+                RequestContext, RequestType, WorkerSelection,
+            },
+            multimodal::{
+                assemble_media_refs, assemble_multimodal_data,
+                assemble_multimodal_data_after_encode, assembly_error_response,
+                reserve_multimodal_inflight,
+            },
+            proto_wrapper::{MultimodalData, ProtoGenerateRequest},
             utils,
         },
     },
@@ -861,6 +870,103 @@ pub(crate) fn maybe_inject_pd_rendezvous(
     if protocol.rendezvous == PdRendezvous::KvBootstrapRoom {
         inject_kv_bootstrap_room(request, prefill, protocol.dp_placement);
     }
+}
+
+/// The client that builds the request, from the clients a stage acquired, or
+/// the failure a stage reports when that stage has not run.
+fn builder_client<'a>(
+    clients: Option<&'a ClientSelection>,
+    function: &'static str,
+) -> Result<&'a BackendClient, Response> {
+    stage_output(clients, function).map(ClientSelection::builder)
+}
+
+/// The request's media, assembled for the engine that builds the request now
+/// that the worker is known: `None` for a request without media; otherwise
+/// the intermediate is taken (the prefill serialization needs it here), the
+/// pixel-drop assembly runs when an encode stage did, the plain one else, a
+/// failure is answered as the media error it is, and the request's share of
+/// the in-flight media budget is reserved for the inline bytes. The builder is
+/// resolved here rather than passed in, so a caller's borrow of the clients
+/// does not pin the whole context across the call.
+pub(crate) async fn assemble_prompt_media(
+    ctx: &mut RequestContext,
+    function: &'static str,
+) -> Result<Option<MultimodalData>, Response> {
+    let Some(intermediate) = ctx.state.multimodal_intermediate.take() else {
+        return Ok(None);
+    };
+    let builder = builder_client(ctx.state.clients.as_ref(), function)?;
+    // `encode_outputs` set by EncodeStage selects the pixel-drop assembly path.
+    let assembled = if ctx.state.encode_outputs.is_some() {
+        assemble_multimodal_data_after_encode(intermediate, builder, ctx.state.workers.as_ref())
+            .await
+    } else {
+        assemble_multimodal_data(intermediate, builder, ctx.state.workers.as_ref()).await
+    };
+    let data = assembled.map_err(|e| {
+        error!(function = function, error = %e, "Failed to assemble multimodal request");
+        assembly_error_response(&e)
+    })?;
+    ctx.state.multimodal_inflight = reserve_multimodal_inflight(
+        ctx.components
+            .multimodal
+            .as_ref()
+            .and_then(|multimodal| multimodal.inflight.as_deref()),
+        data.inline_bytes(),
+    )
+    .await?;
+    Ok(Some(data))
+}
+
+/// What a built generate request gets before it is planned, in the order the
+/// dispatch needs: the string `stop`s its engine cannot match resolved by the
+/// client, which reports the router's residual trim obligations; the PD
+/// metadata when the stage injects it; an EPD request's per-item encode
+/// bootstrap info (the dispatch plan stays on `encode_outputs` for request
+/// execution to take); the prefill->decode KV rendezvous for the backends
+/// that carry it in the request; and, for worker-side multimodal processing,
+/// the media references now that the wire is known. The last two land before
+/// the disaggregated dispatch clones the request, so both legs carry them.
+pub(crate) fn finish_generate_request(
+    ctx: &mut RequestContext,
+    proto_request: &mut ProtoGenerateRequest,
+    inject_pd_metadata: bool,
+    function: &'static str,
+) -> Result<(), Response> {
+    let builder = builder_client(ctx.state.clients.as_ref(), function)?;
+    ctx.state.response.router_stop_obligations =
+        builder.finalize_generate_request(proto_request, ctx.tokenizer_arc().as_ref());
+
+    if inject_pd_metadata {
+        if let Some(workers) = ctx.state.workers.as_ref() {
+            maybe_inject_pd_metadata(proto_request, workers);
+        }
+    }
+
+    if let Some(outputs) = ctx.state.encode_outputs.as_mut() {
+        proto_request.set_encode_bootstrap_info(std::mem::take(&mut outputs.bootstrap_info));
+    }
+
+    if let Some(workers) = ctx.state.workers.as_ref() {
+        maybe_inject_pd_rendezvous(proto_request, workers);
+    }
+
+    if let Some(plan) = ctx.state.multimodal_refs.take() {
+        if builder.is_zmq() {
+            return Err(error::bad_request(
+                "multimodal_not_supported",
+                "media references require a gRPC vLLM worker",
+            ));
+        }
+        let refs =
+            assemble_media_refs(plan).map_err(|e| error::bad_request(e.code(), e.to_string()))?;
+        proto_request
+            .set_vllm_media_refs(refs)
+            .map_err(|e| error::bad_request("multimodal_not_supported", e))?;
+        ctx.state.media_refs_forwarded = true;
+    }
+    Ok(())
 }
 
 /// Inject the KV bootstrap host/port/room into a generate request.
@@ -1952,5 +2058,169 @@ mod wire_prompt_text_tests {
             wire_prompt_text("<|user|><|image|>describe".to_string(), true),
             "<|user|><|image|>describe"
         );
+    }
+}
+
+#[cfg(test)]
+mod shared_pieces_tests {
+    use std::{sync::Arc, time::Duration};
+
+    use llm_multimodal::MediaContentPart;
+    use llm_tokenizer::TokenizerRegistry;
+    use openai_protocol::generate::GenerateRequest;
+    use smg_grpc_client::VllmEngineClient;
+    use tokio::{net::TcpListener, task::JoinHandle};
+
+    use super::*;
+    use crate::{
+        routers::grpc::{
+            client::GrpcClient, context::SharedComponents, multimodal::MediaPlan,
+            regular::symphony::template::Templates,
+        },
+        worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, WorkerRegistry, WorkerType},
+    };
+
+    /// A mock engine on a loopback port, as its URL and its server task; the
+    /// pieces under test send it nothing.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "bounded test fixture; server task is explicitly aborted"
+    )]
+    async fn mock_engine() -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock worker");
+        let port = listener.local_addr().expect("mock worker address").port();
+        let config = Arc::new(mock_worker::config::Config {
+            admin_port: None,
+            context_length: 32768,
+            host: "127.0.0.1".to_string(),
+            http_base_port: 0,
+            http_count: 0,
+            grpc_base_port: port,
+            grpc_count: 1,
+            zmq_handshake: None,
+            zmq_count: 0,
+            zmq_start_index: 0,
+            model_id: "test-model".to_string(),
+            tokenizer_path: "test-model".to_string(),
+            gen_delay: Duration::ZERO,
+            output_tokens: 0,
+            realistic: false,
+            engine: mock_worker::engine::EngineParams::default(),
+            ..mock_worker::config::Config::default()
+        });
+        let server = tokio::spawn(mock_worker::grpc::serve_with_listener(config, listener));
+        (format!("http://127.0.0.1:{port}"), server)
+    }
+
+    /// A request context after worker selection and client acquisition: one
+    /// selected worker, a builder client on the mock engine, and the media
+    /// references of worker-side processing waiting to be attached.
+    async fn context_with_media_refs() -> (RequestContext, JoinHandle<()>) {
+        let (url, server) = mock_engine().await;
+        let client = VllmEngineClient::connect(&url)
+            .await
+            .expect("connect mock worker");
+        let components = Arc::new(SharedComponents {
+            templates: Arc::new(Templates::new(Arc::new(TokenizerRegistry::new()))),
+            tokenizer_registry: Arc::new(TokenizerRegistry::new()),
+            worker_registry: Arc::new(WorkerRegistry::new()),
+            tool_parser_factory: Default::default(),
+            reasoning_parser_factory: Default::default(),
+            parser_resolver: utils::ParserResolver::disabled(),
+            multimodal: None,
+            tokenizer_autoload: true,
+            tokenizer_load_failures: Arc::default(),
+            parser: crate::config::ParserChoice::Legacy,
+        });
+        let request: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "text": "Hello"
+        }))
+        .expect("a generate request");
+        let mut ctx = RequestContext::for_generate(
+            Arc::new(request),
+            None,
+            "test-model".to_string(),
+            components,
+        );
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url.replace("http://", "grpc://"))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .model(ModelCard::new("test-model"))
+                .build(),
+        );
+        ctx.state.workers = Some(WorkerSelection::Single { worker });
+        ctx.state.clients = Some(ClientSelection::Single {
+            client: BackendClient::Grpc(GrpcClient::Vllm(client)),
+        });
+        ctx.state.multimodal_refs = Some(MediaPlan::new([MediaContentPart::ImageUrl {
+            url: "data:image/png;base64,AAAA".to_string(),
+            detail: None,
+            uuid: None,
+            max_long_side_pixel: None,
+        }]));
+        (ctx, server)
+    }
+
+    /// The media references are attached by the finishing every request
+    /// builder shares, once: the request built first carries them and the
+    /// context records the forwarding; the plan is taken, so a request
+    /// finished after it carries none.
+    #[tokio::test]
+    async fn finishing_attaches_the_media_references_once() {
+        let (mut ctx, server) = context_with_media_refs().await;
+
+        let mut request = ProtoGenerateRequest::Vllm(Box::default());
+        finish_generate_request(&mut ctx, &mut request, false, "a_builder").expect("finished");
+        assert!(
+            request.has_vllm_media_refs(),
+            "the first request carries the references"
+        );
+        assert!(ctx.state.media_refs_forwarded);
+        assert!(ctx.state.multimodal_refs.is_none(), "the plan is taken");
+
+        let mut again = ProtoGenerateRequest::Vllm(Box::default());
+        finish_generate_request(&mut ctx, &mut again, false, "a_builder").expect("finished");
+        assert!(!again.has_vllm_media_refs(), "attached once");
+        server.abort();
+    }
+
+    /// A request without media assembles none and reserves no share of the
+    /// in-flight media budget.
+    #[tokio::test]
+    async fn a_request_without_media_assembles_none() {
+        let (mut ctx, server) = context_with_media_refs().await;
+        let assembled = assemble_prompt_media(&mut ctx, "a_builder")
+            .await
+            .expect("assembled");
+        assert!(assembled.is_none());
+        assert!(ctx.state.multimodal_inflight.is_none());
+        server.abort();
+    }
+
+    /// Before the clients are acquired, the finishing answers the one failure
+    /// of a missing client selection, a 500 under its code.
+    #[tokio::test]
+    async fn without_acquired_clients_the_finishing_reports_the_missing_stage() {
+        let (mut ctx, server) = context_with_media_refs().await;
+        ctx.state.clients = None;
+        let mut request = ProtoGenerateRequest::Vllm(Box::default());
+        let failure = match finish_generate_request(&mut ctx, &mut request, false, "a_builder") {
+            Ok(()) => panic!("finished without clients"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(failure.into_body(), usize::MAX)
+            .await
+            .expect("drain body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+        assert_eq!(
+            body["error"]["code"], "client_acquisition_not_completed",
+            "{body}"
+        );
+        server.abort();
     }
 }

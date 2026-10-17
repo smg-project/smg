@@ -20,11 +20,6 @@ use crate::{
                 stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan,
                 ExecutionPlanKind, PreparationOutput, RequestContext,
             },
-            multimodal::{
-                assemble_media_refs, assemble_multimodal_data,
-                assemble_multimodal_data_after_encode, assembly_error_response,
-                reserve_multimodal_inflight,
-            },
             regular::symphony,
             spec::ResponseSpec,
             utils,
@@ -53,6 +48,9 @@ impl MessageRequestBuildingStage {
 #[async_trait]
 impl BuildStage for MessageRequestBuildingStage {
     async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
+        let multimodal_data =
+            helpers::assemble_prompt_media(ctx, "MessageRequestBuildingStage::build").await?;
+
         // Take preparation state (last consumer — worker_selection already ran)
         let prep = stage_output(
             ctx.state.preparation.take(),
@@ -66,11 +64,7 @@ impl BuildStage for MessageRequestBuildingStage {
 
         let messages_request = ctx.messages_request_arc();
 
-        // Get client for building request (use prefill client in disaggregated mode)
-        let builder_client = match clients {
-            ClientSelection::Single { client } => client,
-            ClientSelection::Disaggregated { prefill, .. } => prefill,
-        };
+        let builder_client = clients.builder();
 
         let PreparationOutput::Messages {
             token_ids,
@@ -94,42 +88,6 @@ impl BuildStage for MessageRequestBuildingStage {
             "msg_",
             disaggregated,
         );
-
-        // `encode_outputs` set by EncodeStage selects the pixel-drop assembly path.
-        let is_encode_routed = ctx.state.encode_outputs.is_some();
-
-        // Assemble backend-specific multimodal data now that the backend is known;
-        // take the intermediate here for the prefill serialization. When
-        // encode-routed, drop the prefill pixels.
-        let multimodal_data = if let Some(intermediate) = ctx.state.multimodal_intermediate.take() {
-            let assembled = if is_encode_routed {
-                assemble_multimodal_data_after_encode(
-                    intermediate,
-                    builder_client,
-                    ctx.state.workers.as_ref(),
-                )
-                .await
-            } else {
-                assemble_multimodal_data(intermediate, builder_client, ctx.state.workers.as_ref())
-                    .await
-            };
-            Some(assembled.map_err(|e| {
-                error!(function = "MessageRequestBuildingStage::build", error = %e, "Failed to assemble multimodal request");
-                assembly_error_response(&e)
-            })?)
-        } else {
-            None
-        };
-        if let Some(data) = multimodal_data.as_ref() {
-            ctx.state.multimodal_inflight = reserve_multimodal_inflight(
-                ctx.components
-                    .multimodal
-                    .as_ref()
-                    .and_then(|multimodal| multimodal.inflight.as_deref()),
-                data.inline_bytes(),
-            )
-            .await?;
-        }
 
         let continued_final_message = processed_messages.continued_final_message;
         // Whether the rendered prompt leaves the model inside its thought:
@@ -299,47 +257,12 @@ impl BuildStage for MessageRequestBuildingStage {
             ctx.state.workers.as_ref(),
         );
 
-        // The client resolves string `stop`s its engine can't match and
-        // reports the router's residual trim obligation; no transport
-        // knowledge needed here.
-        ctx.state.response.router_stop_obligations = builder_client
-            .finalize_generate_request(&mut proto_request, ctx.tokenizer_arc().as_ref());
-
-        if self.inject_pd_metadata {
-            if let Some(workers) = ctx.state.workers.as_ref() {
-                helpers::maybe_inject_pd_metadata(&mut proto_request, workers);
-            }
-        }
-
-        // EPD: inject the per-item encode bootstrap info into the prefill
-        // request; the dispatch plan stays on `encode_outputs` for request
-        // execution to take.
-        if let Some(outputs) = ctx.state.encode_outputs.as_mut() {
-            proto_request.set_encode_bootstrap_info(std::mem::take(&mut outputs.bootstrap_info));
-        }
-
-        // EPD: inject the prefill->decode KV rendezvous (mirrors the chat path).
-        // No-op unless the backend carries it in the request.
-        if let Some(workers) = ctx.state.workers.as_ref() {
-            helpers::maybe_inject_pd_rendezvous(&mut proto_request, workers);
-        }
-
-        // Worker-side multimodal processing: attach the media references now
-        // that the wire is known, before the PD clone so both legs carry them.
-        if let Some(plan) = ctx.state.multimodal_refs.take() {
-            if builder_client.is_zmq() {
-                return Err(error::bad_request(
-                    "multimodal_not_supported",
-                    "media references require a gRPC vLLM worker",
-                ));
-            }
-            let refs = assemble_media_refs(plan)
-                .map_err(|e| error::bad_request(e.code(), e.to_string()))?;
-            proto_request
-                .set_vllm_media_refs(refs)
-                .map_err(|e| error::bad_request("multimodal_not_supported", e))?;
-            ctx.state.media_refs_forwarded = true;
-        }
+        helpers::finish_generate_request(
+            ctx,
+            &mut proto_request,
+            self.inject_pd_metadata,
+            "MessageRequestBuildingStage::build",
+        )?;
 
         let tool_constraint = match auto_tag {
             Some(auto_tag) => helpers::ToolConstraintStamp::capture_table(auto_tag, &proto_request),

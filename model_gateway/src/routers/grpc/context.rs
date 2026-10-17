@@ -1453,6 +1453,15 @@ impl WorkerSelection {
 /// Some methods are kept for API completeness even if currently unused.
 #[expect(dead_code)]
 impl ClientSelection {
+    /// The client that builds the request: the single engine's, or the
+    /// prefill's when disaggregated.
+    pub fn builder(&self) -> &BackendClient {
+        match self {
+            Self::Single { client } => client,
+            Self::Disaggregated { prefill, .. } => prefill,
+        }
+    }
+
     pub fn single(&self) -> Option<&BackendClient> {
         match self {
             Self::Single { client } => Some(client),
