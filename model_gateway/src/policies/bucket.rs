@@ -585,6 +585,7 @@ impl Bucket {
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::HealthCheckConfig;
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::worker::{BasicWorkerBuilder, WorkerType};
@@ -1734,5 +1735,36 @@ mod tests {
                 (url(3), [2201, usize::MAX]),
             ]
         );
+    }
+
+    /// A listed worker the caller does not offer (draining before its removal,
+    /// or already tried on a retry) hands its range to the neighbour the
+    /// removal will hand it to: the previous range's owner, the next one when
+    /// it was first. Every request of the range goes there, none at random.
+    #[test]
+    #[traced_test]
+    fn an_unoffered_workers_range_goes_to_the_neighbour_the_removal_would_pick() {
+        let policy = boundary_only_policy();
+        let workers = prefill_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_prefill_worker_urls(&workers);
+
+        // w2 owns [1365, 2729] and is not offered: w1, the previous neighbour,
+        // serves its range, request after request.
+        let without_w2 = [Arc::clone(&workers[0]), Arc::clone(&workers[2])];
+        for _ in 0..32 {
+            assert_eq!(select(&policy, &without_w2, 2000), Some(0));
+        }
+        // w1 owns the first range and is not offered: w2, the next, takes it.
+        let without_w1 = [Arc::clone(&workers[1]), Arc::clone(&workers[2])];
+        for _ in 0..32 {
+            assert_eq!(select(&policy, &without_w1, 100), Some(0));
+        }
+        // Only w3 is offered: it serves every size.
+        let only_w3 = [Arc::clone(&workers[2])];
+        for size in [100, 2000, 3000] {
+            assert_eq!(select(&policy, &only_w3, size), Some(0), "size {size}");
+        }
+        // A normal drain is not worth a warning per request.
+        assert!(!logs_contain("randomly selecting"));
     }
 }
