@@ -48,14 +48,16 @@ impl ChatRequestBuildingStage {
 /// request's grammar, the plan's reasoning state and the response spec all
 /// read it: native Gemma4 channels follow the rendered prompt when that
 /// parser decides; other parsers keep their tokenizer-driven preference for
-/// the engine's reasoning gate.
+/// the engine's reasoning gate; and where a Symphony table reads the
+/// response, the table's own replay of the prompt (a turn the prompt leaves
+/// unopened starts inside the thought: `regular::symphony::reasoning_open`).
 fn reasoning_decision(
     ctx: &RequestContext,
     chat_request: &openai_protocol::chat::ChatCompletionRequest,
     processed_text: &str,
     continued_final_message: bool,
 ) -> bool {
-    utils::rendered_prompt_reasoning_in_prefill(
+    let switch = utils::rendered_prompt_reasoning_in_prefill(
         &ctx.components.reasoning_parser_factory,
         ctx.components
             .parser_resolver
@@ -72,7 +74,15 @@ fn reasoning_decision(
                 tokenizer.as_ref(),
             )
         })
-    })
+    });
+    switch
+        || symphony::reasoning_open(
+            ctx.state.parser.unwrap_or_default(),
+            &ctx.components.parser_resolver.names(&chat_request.model),
+            &chat_request.model,
+            &ctx.components.templates,
+            processed_text,
+        )
 }
 
 /// Build the backend `GenerateRequest` from a chat-shaped request, shared by

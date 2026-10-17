@@ -365,11 +365,6 @@ pub(crate) async fn prepare_chat_like(
         // the choice lets the model call, dynamic tools declared on messages
         // included (see `ChatCompletionRequest::callable_tools`).
         let constraint_tools = request.callable_tools();
-        let reasoning = utils::chat_reasoning_starts_in_rendered_prefill(
-            request,
-            processed_messages.continued_final_message,
-            tokenizer.as_ref(),
-        );
         // When Symphony reads the response, its table gives a forced call, or a
         // JSON response_format, its tag, so the output comes back in the syntax
         // the table parses (see `regular::symphony`, which decides both with one
@@ -387,6 +382,21 @@ pub(crate) async fn prepare_chat_like(
             .components
             .worker_registry
             .get_by_model(&ctx.input.model_id);
+        // The thinking switch's answer, or the table's replay of the rendered
+        // prompt where a table reads the response: a turn the prompt leaves
+        // unopened starts inside the thought whatever the switch says, and the
+        // tag must read it as the engine will (`regular::symphony::reasoning_open`).
+        let reasoning = utils::chat_reasoning_starts_in_rendered_prefill(
+            request,
+            processed_messages.continued_final_message,
+            tokenizer.as_ref(),
+        ) || symphony::reasoning_open(
+            parser,
+            &names,
+            &request.model,
+            &ctx.components.templates,
+            &processed_messages.text,
+        );
         let symphony_constraint = symphony::constraint(
             parser,
             &names,

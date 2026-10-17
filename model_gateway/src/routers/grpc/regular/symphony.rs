@@ -351,6 +351,23 @@ fn answer_tag(
     tagged(grammar, compiled, model, "a JSON answer", continues)
 }
 
+/// Whether the rendered `prompt` leaves the model inside its thought as the table reads it: the
+/// table's replay of the prompt ([`Format::reasoning_open`]), which starts a turn the prompt leaves
+/// unopened inside the thought where the template writes no opener (DeepSeek's after a system
+/// message rendered in place). The grammar built for the request takes it OR'd with the request's
+/// thinking switch, so the tag and the engine read the prompt the same way: a JSON answer the
+/// switch would place at the first token follows the thought's close instead of streaming as
+/// reasoning. `false` when no table reads the response, leaving the switch's answer as it was.
+pub(crate) fn reasoning_open(
+    parser: ParserChoice,
+    names: &Names,
+    model: &str,
+    templates: &Templates,
+    prompt: &str,
+) -> bool {
+    matches!(reads(parser, names, model, templates), Ok(Some(format)) if format.reasoning_open(prompt))
+}
+
 /// Whether the table that reads `model`'s responses under `parser` ([`reads`]) needs the
 /// vocabulary's special tokens kept in the decoded output: one of its markers is, or holds, a
 /// token the stop decoder would drop with `skip_special_tokens` (Muse Spark's `<|message|>` and
@@ -1380,6 +1397,48 @@ mod tests {
             grammar_start_from(WorkerGrammarStart::Unknown),
             symphony::GrammarStart::Unknown
         );
+    }
+
+    /// A prompt the template leaves without a turn opener (a system message rendered in place
+    /// after the user turn) starts the model inside its thought on the DeepSeek V4 table, and the
+    /// grammar built for the request reads it as the engine does, whatever the thinking switch
+    /// said: the answer tag of a JSON `response_format` takes the thought first, as it does on a
+    /// prompt that opened the thought. A prompt that opened and closed the thought (thinking off)
+    /// leaves the model in the content, and the legacy choice asks the table nothing.
+    #[test]
+    fn a_turn_the_prompt_leaves_unopened_is_inside_the_thought_for_the_grammar_too() {
+        let model = "deepseek-ai/DeepSeek-V4-Flash";
+        let unopened = concat!(
+            "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>Be brief.",
+            "<\u{ff5c}User\u{ff5c}>Fix the failing test.# Environment\n - Platform: linux"
+        );
+        let thinking = "<\u{ff5c}User\u{ff5c}>q<\u{ff5c}Assistant\u{ff5c}><think>";
+        let closed = "<\u{ff5c}User\u{ff5c}>q<\u{ff5c}Assistant\u{ff5c}></think>";
+        let open = |parser, prompt| {
+            reasoning_open(parser, &names(None, None), model, &templates(), prompt)
+        };
+        assert!(open(ParserChoice::Symphony, unopened));
+        assert!(open(ParserChoice::Symphony, thinking));
+        assert!(!open(ParserChoice::Symphony, closed));
+        assert!(!open(ParserChoice::Legacy, unopened));
+        // The JSON answer's tag on the unopened prompt is the thinking prompt's, thought first;
+        // with the thought closed the schema alone is the engine's own constraint, and no tag.
+        let request = request(json!({
+            "model": model, "response_format": {"type": "json_object"}
+        }));
+        let answer = |prompt| {
+            super::constraint(
+                ParserChoice::Symphony,
+                &names(None, None),
+                &request,
+                &[],
+                open(ParserChoice::Symphony, prompt),
+                symphony::GrammarStart::Unknown,
+                &templates(),
+            )
+        };
+        assert_eq!(tag_of(answer(unopened)), tag_of(answer(thinking)));
+        assert!(matches!(answer(closed), Ok(None)));
     }
 
     #[test]

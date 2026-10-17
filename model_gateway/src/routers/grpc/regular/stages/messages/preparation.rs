@@ -245,12 +245,22 @@ impl MessagePreparationStage {
         // follows the reasoning instead of preempting it. The table's refusal
         // waits for request building, which decides on the selected worker
         // (`regular::symphony::worker_constraint`).
+        let names = ctx.components.parser_resolver.names(&request.model);
+        // The thinking switch's answer, or the table's replay of the rendered
+        // prompt where a table reads the message: a turn the prompt leaves
+        // unopened starts inside the thought whatever the switch says, and the
+        // tag must read it as the engine will (`regular::symphony::reasoning_open`).
         let reasoning = utils::messages_reasoning_starts_in_prefill(
             request,
             processed_messages.continued_final_message,
             tokenizer.as_ref(),
+        ) || symphony::reasoning_open(
+            parser,
+            &names,
+            &request.model,
+            &ctx.components.templates,
+            &processed_messages.text,
         );
-        let names = ctx.components.parser_resolver.names(&request.model);
         let workers = ctx
             .components
             .worker_registry

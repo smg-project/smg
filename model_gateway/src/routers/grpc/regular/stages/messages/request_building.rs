@@ -157,7 +157,17 @@ impl BuildStage for MessageRequestBuildingStage {
                     tokenizer.as_ref(),
                 )
             })
-        });
+        })
+            // Where a Symphony table reads the message, its replay of the
+            // prompt: a turn the prompt leaves unopened starts inside the
+            // thought whatever the switch says (`regular::symphony::reasoning_open`).
+            || symphony::reasoning_open(
+                ctx.state.parser.unwrap_or_default(),
+                &ctx.components.parser_resolver.names(&messages_request.model),
+                &messages_request.model,
+                &ctx.components.templates,
+                &processed_messages.text,
+            );
 
         // Now that the worker is known, a forced call's grammar takes the
         // shape its engine needs: the bare calls behind a reasoning parser's
