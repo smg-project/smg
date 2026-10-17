@@ -1215,8 +1215,12 @@ const KIMI_K2_OUTPUTS: &[&str] = &[
     "<|tool_calls_section_begin|><|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>{} trailing<|tool_call_end|><|tool_calls_section_end|>",
     "<|tool_calls_section_begin|>stray<|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>",
     "<|tool_calls_section_begin|><|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>{}<|tool_calls_section_end|>",
-    // Two calls the model gave one id: the second takes a minted id, under every cut.
+    // Two calls the model gave one id: the second takes a minted id, under every cut; the same
+    // id inside the whitespace the header allows repeats it too, and an id one digit longer
+    // does not.
     "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Rome\"}<|tool_call_end|><|tool_calls_section_end|>",
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_call_begin|> functions.get_weather:0 <|tool_call_argument_begin|>{\"city\": \"Rome\"}<|tool_call_end|><|tool_calls_section_end|>",
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:1<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_call_begin|>functions.get_weather:10<|tool_call_argument_begin|>{\"city\": \"Rome\"}<|tool_call_end|><|tool_calls_section_end|>",
     // Arguments that nest and hold text outside ASCII, and a brace inside a string value.
     "<|tool_calls_section_begin|><|tool_call_begin|>functions.save_note:0<|tool_call_argument_begin|>{\"title\": \"計画 🌍\", \"body\": \"a \\\"q\\\" \\\\ b\\nc\", \"tags\": [\"a\", \"b\"], \"meta\": {\"nested\": {\"deep\": [1, 2.5, true, null]}}}<|tool_call_end|><|tool_calls_section_end|>",
     "<|tool_calls_section_begin|><|tool_call_begin|>functions.save_note:0<|tool_call_argument_begin|>{\"title\": \"Braces\", \"body\": \"a } b { c\"}<|tool_call_end|><|tool_calls_section_end|>",
@@ -2182,13 +2186,29 @@ fn calls_are_numbered_from_zero_in_order_with_ids_that_count_from_a_nonce_of_the
             .table
             .is_some_and(|table| table.format().call_id_source() == CallId::Header);
         if from_header {
-            // A call's id is its header's, found in the header's bytes; a header whose text
-            // repeats an earlier call's gets a minted id instead, so the ids stay distinct.
-            let mut headers: Vec<&String> = Vec::new();
+            // A call's id is its header's, found in the header's bytes; a header whose id
+            // repeats an earlier call's gets a minted id instead, so the ids stay distinct. The
+            // engine reads the header's id as its text without the ending literal, trimmed; here
+            // the literal is what followed the earlier call's id in its header, so a header
+            // repeats when, past the whitespace the pattern allows, it is that id and that
+            // literal again.
             for (position, (index, id, source)) in calls.iter().enumerate() {
                 assert_eq!(*index as usize, position, "{}: {text:?}", subject.name);
-                let repeated = headers.contains(&source);
-                headers.push(source);
+                let repeated = calls[..position]
+                    .iter()
+                    .any(|(_, earlier, earlier_source)| {
+                        if common::minted_id(earlier).is_some() {
+                            return false;
+                        }
+                        let Some(at) = earlier_source.find(earlier.as_str()) else {
+                            return false;
+                        };
+                        let literal = earlier_source[at + earlier.len()..].trim_start();
+                        source
+                            .trim_start()
+                            .strip_prefix(earlier.as_str())
+                            .is_some_and(|rest| rest.trim_start() == literal)
+                    });
                 if repeated {
                     assert!(
                         common::minted_id(id).is_some(),
@@ -2212,14 +2232,7 @@ fn calls_are_numbered_from_zero_in_order_with_ids_that_count_from_a_nonce_of_the
             let shaped = |calls: &[(u32, String, String)]| -> Vec<(u32, String, String)> {
                 calls
                     .iter()
-                    .map(|(index, id, source)| {
-                        let id = if common::minted_id(id).is_some() {
-                            "<minted>".to_string()
-                        } else {
-                            id.clone()
-                        };
-                        (*index, id, source.clone())
-                    })
+                    .map(|(index, id, source)| (*index, common::id_shape(id), source.clone()))
                     .collect()
             };
             let again = replay(subject, text, &[], false)
