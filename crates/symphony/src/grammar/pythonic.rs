@@ -176,7 +176,8 @@ fn value(schema: &Value, definitions: Definitions<'_>, values: Values) -> Gramma
         }
     }
     let string = move || match values {
-        Values::Python | Values::Quoted => python_string(),
+        Values::Python => python_string(),
+        Values::Quoted => quoted_string(),
         Values::Json => json_string(),
     };
     match shape(schema, definitions, string) {
@@ -197,13 +198,24 @@ fn value(schema: &Value, definitions: Definitions<'_>, values: Values) -> Gramma
 }
 
 /// An `enum` value as the dialect quotes it: in either quote under Python, each with its own
-/// escaping; as the one JSON string under JSON.
+/// escaping; under the quoted dialect the double-quoted form is the option as written, since
+/// the reader keeps the text between double quotes as it stands and decodes no escape there, and
+/// it is offered only when the option holds no double quote, the single-quoted form (a Python
+/// literal, escapes decoded) standing for every option; as the one JSON string under JSON.
 fn quoted(option: &str, values: Values) -> Vec<Grammar> {
     match values {
-        Values::Python | Values::Quoted => vec![
+        Values::Python => vec![
             Grammar::ConstString(format!("\"{}\"", escape(option, '"'))),
             Grammar::ConstString(format!("'{}'", escape(option, '\''))),
         ],
+        Values::Quoted => {
+            let mut forms = Vec::with_capacity(2);
+            if !option.contains('"') {
+                forms.push(Grammar::ConstString(format!("\"{option}\"")));
+            }
+            forms.push(Grammar::ConstString(format!("'{}'", escape(option, '\''))));
+            forms
+        }
         Values::Json => vec![Grammar::ConstString(
             Value::String(option.to_string()).to_string(),
         )],
@@ -214,6 +226,13 @@ fn quoted(option: &str, values: Values) -> Vec<Grammar> {
 /// the same quote.
 fn python_string() -> Grammar {
     Grammar::Regex(r#""([^"\\]|\\.)*"|'([^'\\]|\\.)*'"#.to_string())
+}
+
+/// A string under the quoted dialect: between double quotes any text but a double quote, as the
+/// reader takes it (no escape is decoded there, so none is written); or a single-quoted Python
+/// string, which the reader decodes.
+fn quoted_string() -> Grammar {
+    Grammar::Regex(r#""[^"]*"|'([^'\\]|\\.)*'"#.to_string())
 }
 
 /// A JSON string, as `tojson` writes one.
@@ -548,5 +567,44 @@ mod tests {
                 value!({"type": "any_text", "excludes": [")"]})
             );
         }
+    }
+
+    /// The quoted dialect writes what its reader reads: between double quotes the text as it
+    /// stands (the reader decodes no escape there), so an option with a quote or a backslash is
+    /// written raw or only in the single-quoted form, and a free string allows no escape between
+    /// double quotes.
+    #[test]
+    fn the_quoted_dialect_writes_strings_as_its_reader_reads_them() {
+        let root = value!({});
+        let definitions = Definitions::of(&root);
+        assert_eq!(
+            value(&value!({"enum": ["C:\\tmp"]}), definitions, Values::Quoted).to_json(),
+            value!({"type": "or", "elements": [
+                {"type": "const_string", "value": "\"C:\\tmp\""},
+                {"type": "const_string", "value": "'C:\\\\tmp'"},
+            ]})
+        );
+        assert_eq!(
+            value(
+                &value!({"enum": ["say \"hi\""]}),
+                definitions,
+                Values::Quoted
+            )
+            .to_json(),
+            value!({"type": "or", "elements": [
+                {"type": "const_string", "value": "'say \"hi\"'"},
+            ]})
+        );
+        assert_eq!(
+            value(&value!({"enum": ["it's"]}), definitions, Values::Quoted).to_json(),
+            value!({"type": "or", "elements": [
+                {"type": "const_string", "value": "\"it's\""},
+                {"type": "const_string", "value": "'it\\'s'"},
+            ]})
+        );
+        assert_eq!(
+            value(&value!({"type": "string"}), definitions, Values::Quoted).to_json(),
+            value!({"type": "regex", "pattern": r#""[^"]*"|'([^'\\]|\\.)*'"#})
+        );
     }
 }
