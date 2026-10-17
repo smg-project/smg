@@ -3856,7 +3856,7 @@ mod tests {
             table("mistral_v13")
         );
         assert_eq!(
-            read(&labeled(pair(Some("llama"), None), &v13), known),
+            read(&labeled(pair(Some("cohere"), None), &v13), known),
             Ok(None)
         );
         assert_eq!(
