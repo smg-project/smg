@@ -589,11 +589,19 @@ impl RequestPipeline {
         }
         .ok_or_else(consumed)?;
 
+        // The stub the rendering added to the prompt, which the usage row
+        // leaves out: the chat spec carries it (request building set it); no
+        // other response shape has one.
+        let unbilled_prompt_tokens = match &attempt_spec {
+            ResponseSpec::Chat(spec) => spec.unbilled_prompt_tokens,
+            _ => 0,
+        };
         dctx.dispatch = Some(prepare_dispatch_metadata(
             &attempt_plan,
             &dctx.dispatch_model,
             dctx.workers.as_ref(),
             dctx.tenant_key.clone(),
+            unbilled_prompt_tokens,
         ));
 
         execute_plan(dctx, attempt_plan, last_attempt).await?;

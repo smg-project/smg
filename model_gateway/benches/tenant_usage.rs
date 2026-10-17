@@ -1,12 +1,14 @@
 //! The request-path cost of per-tenant usage accounting: one `record` for a
 //! tenant with a row (the steady state), for a tenant past the maximum (the
 //! `other` bucket), for a hundred tenants interleaved (the lookup under a
-//! populated table), and the disabled path (nothing installed).
+//! populated table), and the disabled path (nothing installed); and the
+//! per-stream cost of the stream guard (begun at dispatch, one add per
+//! chunk, finished at the end or dropped booked), off and on.
 
-use std::time::Duration;
+use std::{hint::black_box, time::Duration};
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use smg::observability::tenant_usage::{self, RequestUsage, TenantUsage};
+use smg::observability::tenant_usage::{self, RequestUsage, StreamUsage, TenantUsage};
 
 fn usage() -> RequestUsage {
     RequestUsage {
@@ -86,5 +88,46 @@ fn bench_render(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_record, bench_render);
+/// The stream guard: what a streamed response adds per chunk and per stream.
+fn bench_stream_usage(c: &mut Criterion) {
+    let mut group = c.benchmark_group("tenant_usage_stream");
+
+    // Accounting off: a guard that holds nothing.
+    let off = StreamUsage::begin_on(None, "auth:tenant-0", "model-a", 512);
+    group.bench_function("disabled_add_completion_tokens", |b| {
+        b.iter(|| off.add_completion_tokens(black_box(1)));
+    });
+    group.bench_function("disabled_begin_add_finish", |b| {
+        b.iter(|| {
+            let stream = StreamUsage::begin_on(None, "auth:tenant-0", "model-a", 512);
+            stream.add_completion_tokens(black_box(1));
+            stream.finish(Some(512), 128, Duration::from_millis(850));
+        });
+    });
+
+    // Accounting on: a table with the tenant's row in place.
+    let table: &'static TenantUsage = Box::leak(Box::new(TenantUsage::new(128)));
+    table.record("auth:tenant-0", "model-a", usage());
+    let on = StreamUsage::begin_on(Some(table), "auth:tenant-0", "model-a", 512);
+    group.bench_function("add_completion_tokens", |b| {
+        b.iter(|| on.add_completion_tokens(black_box(1)));
+    });
+    group.bench_function("begin_add_finish", |b| {
+        b.iter(|| {
+            let stream = StreamUsage::begin_on(Some(table), "auth:tenant-0", "model-a", 512);
+            stream.add_completion_tokens(black_box(1));
+            stream.finish(Some(512), 128, Duration::from_millis(850));
+        });
+    });
+    group.bench_function("begin_add_drop_abandoned", |b| {
+        b.iter(|| {
+            let stream = StreamUsage::begin_on(Some(table), "auth:tenant-0", "model-a", 512);
+            stream.add_completion_tokens(black_box(1));
+            drop(stream);
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(benches, bench_record, bench_render, bench_stream_usage);
 criterion_main!(benches);

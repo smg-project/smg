@@ -438,6 +438,7 @@ mod tests {
             created: 1,
             weight_version: None,
             tenant_key: None,
+            prompt_tokens: 0,
         }
     }
 

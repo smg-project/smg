@@ -20,7 +20,7 @@ pub use smg_external_router::metrics::{
 };
 
 use super::{
-    tenant_usage::{self, RequestUsage},
+    tenant_usage::StreamUsage,
     worker_metrics::{self, WorkerSeries, WorkerSeriesRecorder},
 };
 
@@ -1332,8 +1332,15 @@ pub struct StreamingMetricsParams<'a> {
     pub input_tokens: Option<u64>,
     /// Output token count
     pub output_tokens: u64,
-    /// The tenant the request's usage is booked to (`DispatchMetadata::usage_tenant`).
-    pub tenant: &'a str,
+    /// Prompt tokens the caller is not billed for (a stub the gateway's
+    /// template rendering added): the usage row takes `input_tokens` without
+    /// them, as the usage block the client reads does; the token series keeps
+    /// the engine's count.
+    pub unbilled_prompt_tokens: u32,
+    /// The stream's usage guard (`DispatchMetadata::begin_usage`), finished
+    /// here with the end's numbers: a stream end records its metrics and
+    /// books its tenant's usage row in the one call, once.
+    pub usage: StreamUsage,
 }
 
 impl Metrics {
@@ -1709,19 +1716,18 @@ impl Metrics {
             generation_duration,
             input_tokens,
             output_tokens,
-            tenant,
+            unbilled_prompt_tokens,
+            usage,
         } = params;
 
-        // The tenant's usage row, when accounting is on: before the metrics
-        // handles, so a stream is booked whether the handles are kept or not.
-        tenant_usage::record(
-            tenant,
-            model_id,
-            RequestUsage {
-                prompt_tokens: input_tokens.unwrap_or(0),
-                completion_tokens: output_tokens,
-                elapsed: generation_duration,
-            },
+        // The tenant's usage row, when accounting is on: the end's numbers,
+        // the prompt as tokenized at dispatch when the end has no count;
+        // before the metrics handles, so a stream is booked whether the
+        // handles are kept or not.
+        usage.finish(
+            input_tokens.map(|count| count.saturating_sub(u64::from(unbilled_prompt_tokens))),
+            output_tokens,
+            generation_duration,
         );
 
         // TPOT is only meaningful past the first token.
@@ -2878,6 +2884,7 @@ mod tests {
     use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 
     use super::{test_support::render_with_recorder, *};
+    use crate::observability::tenant_usage;
 
     #[test]
     fn tokenizer_activity_registers_both_layers_on_scrape() {
@@ -3808,7 +3815,8 @@ mod tests {
                     generation_duration: Duration::from_millis(50),
                     input_tokens,
                     output_tokens,
-                    tenant: tenant_usage::UNRESOLVED_TENANT,
+                    unbilled_prompt_tokens: 0,
+                    usage: StreamUsage::begin_on(None, tenant_usage::UNRESOLVED_TENANT, "m1", 0),
                 });
             }
             Metrics::record_streaming_metrics(StreamingMetricsParams {
@@ -3820,7 +3828,8 @@ mod tests {
                 generation_duration: Duration::from_millis(20),
                 input_tokens: None,
                 output_tokens: 1,
-                tenant: tenant_usage::UNRESOLVED_TENANT,
+                unbilled_prompt_tokens: 0,
+                usage: StreamUsage::begin_on(None, tenant_usage::UNRESOLVED_TENANT, "m2", 0),
             });
         };
         let built = render_with_recorder(records);
@@ -3986,7 +3995,8 @@ mod tests {
                 generation_duration: Duration::from_secs(1),
                 input_tokens: Some(128),
                 output_tokens: 128,
-                tenant: tenant_usage::UNRESOLVED_TENANT,
+                unbilled_prompt_tokens: 0,
+                usage: StreamUsage::begin_on(None, tenant_usage::UNRESOLVED_TENANT, MODEL, 0),
             });
             duration();
         };

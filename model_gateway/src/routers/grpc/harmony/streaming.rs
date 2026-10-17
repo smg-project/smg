@@ -29,7 +29,10 @@ use super::{
     HarmonyParserAdapter,
 };
 use crate::{
-    observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
+    observability::{
+        metrics::{metrics_labels, Metrics, StreamingMetricsParams},
+        tenant_usage::StreamUsage,
+    },
     rate_limit::SharedReservationHandle,
     routers::{
         common::{
@@ -203,6 +206,7 @@ impl HarmonyStreamingProcessor {
     ) -> Result<(), utils::StreamFailure> {
         let mut prompt_tokens = HashMap::new();
         let mut cached_tokens = HashMap::new();
+        let stream_usage = dispatch.begin_usage();
         Self::process_chat_decode_stream(
             grpc_stream,
             &dispatch,
@@ -212,6 +216,7 @@ impl HarmonyStreamingProcessor {
             &mut cached_tokens,
             &router_stop_strings,
             reservation,
+            stream_usage,
         )
         .await
     }
@@ -231,7 +236,10 @@ impl HarmonyStreamingProcessor {
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
-        // Phase 1: Process prefill stream (collect metadata)
+        // Phase 1: Process prefill stream (collect metadata). The stream's
+        // usage guard begins before the leg: a leg that fails before the
+        // first token books the prompt it was dispatched with.
+        let stream_usage = dispatch.begin_usage();
         let mut prompt_tokens: HashMap<u32, u32> = HashMap::new();
         let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
 
@@ -252,6 +260,7 @@ impl HarmonyStreamingProcessor {
             &mut cached_tokens,
             &router_stop_strings,
             reservation,
+            stream_usage,
         )
         .await?;
 
@@ -266,7 +275,9 @@ impl HarmonyStreamingProcessor {
     /// Shared between single-stream and prefill/decode stream modes. The `prompt_tokens`
     /// and `cached_tokens` maps may be pre-populated from a prefill phase
     /// (prefill/decode stream) or empty (single stream). Values from `Complete` messages
-    /// are inserted only if not already present.
+    /// are inserted only if not already present. `stream_usage` is the stream's
+    /// usage guard: finished at the stream's end here, dropped booked on the
+    /// way out of any earlier return.
     #[expect(clippy::too_many_arguments)]
     async fn process_chat_decode_stream(
         mut decode_stream: ProtoStream,
@@ -277,6 +288,7 @@ impl HarmonyStreamingProcessor {
         cached_tokens: &mut HashMap<u32, u32>,
         router_stop_strings: &[String],
         reservation: Option<Arc<SharedReservationHandle>>,
+        stream_usage: StreamUsage,
     ) -> Result<(), utils::StreamFailure> {
         // Timing for metrics
         let start_time = Instant::now();
@@ -335,7 +347,9 @@ impl HarmonyStreamingProcessor {
                         is_firsts.insert(index, true);
                     }
 
-                    completion_tokens.record_chunk(&chunk_wrapper);
+                    stream_usage.add_completion_tokens(u64::from(
+                        completion_tokens.record_chunk(&chunk_wrapper),
+                    ));
 
                     // Convert logprobs if present and requested
                     let chunk_logprobs = if original_request.logprobs {
@@ -442,6 +456,16 @@ impl HarmonyStreamingProcessor {
                         .entry(index)
                         .or_insert_with(|| complete_wrapper.prompt_tokens());
                     completion_tokens.record_complete(&complete_wrapper);
+                    // The engine's counts are in (the completion count only
+                    // once the tracker took the `Complete`: on a cumulative
+                    // engine the chunks wrote none): a client that stops
+                    // reading from here on is booked with them.
+                    stream_usage.settle(
+                        Some(u64::from(
+                            prompt_tokens.values().copied().max().unwrap_or(0),
+                        )),
+                        u64::from(completion_tokens.total()),
+                    );
                     cached_tokens
                         .entry(index)
                         .or_insert_with(|| complete_wrapper.cached_tokens());
@@ -555,6 +579,14 @@ impl HarmonyStreamingProcessor {
             spec_accepted: spec_accepted.values().sum(),
             spec_drafted: spec_drafted.values().sum(),
         };
+        // The engine's counts are in: a client that stops reading at the
+        // usage chunk is booked with them from here. `prompt_tokens` holds
+        // only what `Complete` messages carried: with none, the dispatch count
+        // stands.
+        stream_usage.settle(
+            (!prompt_tokens.is_empty()).then_some(u64::from(counts.prompt)),
+            u64::from(counts.completion),
+        );
 
         if let Some(handle) = reservation {
             // A clean decode EOF with fewer decode `Complete` messages than
@@ -593,9 +625,10 @@ impl HarmonyStreamingProcessor {
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: first_token_time.map(|t| t.duration_since(start_time)),
             generation_duration: start_time.elapsed(),
-            input_tokens: Some(counts.prompt as u64),
+            input_tokens: (!prompt_tokens.is_empty()).then_some(counts.prompt as u64),
             output_tokens: counts.completion as u64,
-            tenant: dispatch.usage_tenant(),
+            unbilled_prompt_tokens: 0,
+            usage: stream_usage,
         });
 
         Ok(())

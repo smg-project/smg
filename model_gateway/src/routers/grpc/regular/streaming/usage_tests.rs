@@ -33,6 +33,7 @@ use super::{
     *,
 };
 use crate::{
+    observability::tenant_usage::{StreamUsage, UNRESOLVED_TENANT},
     rate_limit::test_support::RecordingBackend,
     routers::grpc::{pipeline::RequestPipeline, regular::processor::ResponseProcessor},
     worker::WorkerRegistry,
@@ -172,6 +173,7 @@ fn dispatch() -> context::DispatchMetadata {
         created: 1,
         weight_version: None,
         tenant_key: None,
+        prompt_tokens: 0,
     }
 }
 
@@ -325,7 +327,7 @@ async fn streamed_generate(
         return_logprob: false,
         backend_type: "test",
         model: "eof-test".to_string(),
-        tenant_key: None,
+        usage: StreamUsage::begin_on(None, UNRESOLVED_TENANT, "eof-test", 0),
         expected_choices: choices,
     };
     let (tx, rx) = sse_channel();
