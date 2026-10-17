@@ -47,7 +47,10 @@ What the engine decides for every format, and what it leaves open:
   the call is closed for the client first, as `tagged::Assembler::close` says. A JSON call whose
   arguments value the close cut ends with the fragments it sent and a `Malformed` event of no
   bytes, with the region's reason, before its end: a cut call is never handed over as a whole one
-  without a word (`json::assembler`).
+  without a word (`json::assembler`). A tagged call the end of the stream cut ends the same way
+  whatever stage the cut found, since the object the assembler writes closes only at the call's
+  own end (`tagged::end_cut_call`); the one event carries the bytes still held, when there are
+  any.
 - With the tagged syntax, a value's type comes from the request's tools (`Declared`): a
   declared string streams, every other value is written at its close. A call to a function the
   request did not declare has every value inferred.

@@ -26,7 +26,10 @@ use super::object::{Mode, Object};
 use crate::{
     event::{runs, Event, Events, MalformedReason, Text},
     markers::{Piece, Scanner},
-    tagged::value::{json, Declared, Kind},
+    tagged::{
+        end_cut_call,
+        value::{json, Declared, Kind},
+    },
 };
 
 const KEY_OPEN: usize = 0;
@@ -293,25 +296,27 @@ impl Assembler {
     }
 
     /// The stream was cut: nothing is closed, so arguments cut short never look complete to a
-    /// client. A streamed string's open fragment stays open; everything held comes back as
-    /// `Malformed { UnterminatedRegion }`; a call that started still ends, with no bytes of its
-    /// own, as every assembler ends one.
+    /// client. A streamed string's open fragment stays open; a call that started still ends, with
+    /// no bytes of its own, as every assembler ends one, after the one `Malformed {
+    /// UnterminatedRegion }` event that carries everything held and says that its arguments are
+    /// no whole value ([`end_cut_call`]); what a block that named no call held comes back as
+    /// `Malformed { UnterminatedRegion }` too.
     pub fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
         }
         let held = self.scanner.held().to_string();
         self.object.carried.push_str(&held);
-        if !self.object.carried.is_empty() {
+        if self.started() {
+            end_cut_call(
+                self.object.index,
+                std::mem::take(&mut self.object.carried),
+                out,
+            );
+        } else if !self.object.carried.is_empty() {
             out.push(Event::Malformed {
                 text: Text::uncounted(std::mem::take(&mut self.object.carried)),
                 why: MalformedReason::UnterminatedRegion,
-            });
-        }
-        if self.started() {
-            out.push(Event::ToolCallEnd {
-                index: self.object.index,
-                source: Text::default(),
             });
         }
     }
@@ -741,12 +746,21 @@ mod tests {
         assert_eq!(starts(&events), 1);
         assert_eq!(fragments(&events), [r#"{"s": ""#, "Pa"]);
         assert_eq!(ends(&events), [""]);
+        // The arguments are no whole value: one `Malformed` event says so before the end, of no
+        // bytes since nothing was held at the cut.
+        assert_eq!(malformed(&events), [("", "unterminated")]);
+        assert!(matches!(
+            &events[events.len() - 2..],
+            [Event::Malformed { .. }, Event::ToolCallEnd { .. }]
+        ));
+        assert_eq!(bytes(&events), "f<arg_key>s</arg_key><arg_value>Pa");
+        // A value held for its close rides in that one event.
         let events = run(&["f<arg_key>n</arg_key><arg_value>12"], true);
         assert_eq!(fragments(&events), Vec::<&str>::new());
-        assert!(malformed(&events)
-            .iter()
-            .any(|(text, why)| *text == "<arg_key>n</arg_key><arg_value>12"
-                && *why == "unterminated"));
+        assert_eq!(
+            malformed(&events),
+            [("<arg_key>n</arg_key><arg_value>12", "unterminated")]
+        );
         assert_eq!(ends(&events), [""]);
         // A block with no name at all, cut: its bytes are unterminated, and no call started.
         let events = run(&["<arg_key>a"], true);

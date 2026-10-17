@@ -48,7 +48,7 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, Events, Text},
+        event::{DropReason, Event, Events, MalformedReason, Text},
         input::{EngineFinish, Input},
         parser::Parser,
         tagged::Declared,
@@ -427,6 +427,27 @@ mod tests {
         assert_eq!(bytes(&events), output);
         assert_eq!(fragments_of(&events, 0), [r#"{"name": ""#, "Par"]);
         assert_eq!(ends(&events), 1);
+        // The arguments are no whole value and nothing is made up: one `Malformed` event of no
+        // bytes says so, right before the call's end.
+        let ended = events
+            .iter()
+            .position(|event| matches!(event, Event::ToolCallEnd { .. }))
+            .expect("the call ends");
+        assert!(
+            matches!(
+                &events[ended - 1],
+                Event::Malformed { text, why: MalformedReason::UnterminatedRegion }
+                    if text.text.is_empty()
+            ),
+            "{events:#?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::Malformed { .. }))
+                .count(),
+            1
+        );
         assert!(events.iter().any(|event| matches!(
             event,
             Event::ToolCallEnd { source, .. } if source.text.is_empty()

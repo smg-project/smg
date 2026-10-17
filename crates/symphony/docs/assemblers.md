@@ -67,7 +67,13 @@ marker came, or the next call began): the call is over as far as the model is co
 string is closed, the object is closed, and what was held comes back as `Malformed`.
 `Assembler::finish` is for a stream that was cut: nothing is closed, as in `crate::json::Assembler`,
 because arguments cut short must not look complete to a client. A value that is written whole and
-never closed comes back as `Malformed` in both, since its key was never written.
+never closed comes back as `Malformed` in both, since its key was never written. At `finish` a
+started call's arguments are no whole JSON whatever stage the cut found, since the object closes
+only at the call's own end, and the call says so as the JSON assembler does: one `Malformed {
+UnterminatedRegion }` event before `ToolCallEnd`, carrying what was held (that value, the start of a
+tag, the template's newline) or no bytes when the cut fell between events. The fragments stand,
+since a fragment passed on cannot be taken back, and nothing is made up for a value the model never
+finished; the four assemblers of `tagged` share that end (`tagged::end_cut_call`).
 
 `feed` takes one piece and returns how many of its bytes the call took: all of them before
 `</function>`, and up to that tag in the piece that carries it, so the format routes whatever
@@ -93,7 +99,10 @@ What the syntax says, and what the assembler does with it:
 - **Two endings.** `Assembler::close` is the call's closing marker, or the block's end before
   it: after the last value it names the call if it has not, closes the object and pushes
   `ToolCallEnd` with the marker's bytes; inside a value it closes an open string and the object
-  and reports what was held. `Assembler::finish` is a stream that was cut: nothing is closed.
+  and reports what was held. `Assembler::finish` is a stream that was cut: nothing is closed,
+  and a started call ends as the Qwen assembler's does, after one `Malformed { UnterminatedRegion }`
+  event, with what was held or no bytes, that says its arguments are no whole value
+  (`tagged::end_cut_call`).
 - **Every byte of the call lands in exactly one event**, with the Qwen assembler's accounting:
   the name's bytes in `ToolCallStart`, each tag's and value's bytes in the fragments they
   produce, text where the syntax has tags as `Malformed` run by run with the whitespace before
@@ -138,7 +147,9 @@ What the syntax says, and what the assembler does with it:
 - **The newlines between the tags are the template's** and go into the next event's source;
   text where the syntax has tags is reported.
 - **Two endings**, as DSML's: `Assembler::close` is the invoke's closing tag, or the block's
-  end before it; `Assembler::finish` is a stream that was cut, and closes nothing.
+  end before it; `Assembler::finish` is a stream that was cut, and closes nothing: a started
+  call ends after the one `Malformed { UnterminatedRegion }` event that says its arguments are
+  no whole value (`tagged::end_cut_call`).
 - **Every byte of the call lands in exactly one event.**
 
 ## The XML assembler (`tagged::xml`)
@@ -187,8 +198,11 @@ What the syntax says, and what the assembler does with it:
   and an element without a child come back as `Malformed`, and the arguments object is
   closed. An invoke that named no call takes whichever terminal ended it, so that it is
   reported the same way however it ended. `Assembler::finish` is a stream that was
-  cut: nothing is closed, what was held comes back as `Malformed { UnterminatedRegion }`, and a
-  call that started still ends, with no bytes of its own, as every assembler ends one.
+  cut: nothing is closed, and a call that started still ends, with no bytes of its own, as
+  every assembler ends one, after the one `Malformed { UnterminatedRegion }` event that
+  carries what was held, or no bytes, and says that its arguments are no whole value
+  (`tagged::end_cut_call`); what an invoke that named no call held comes back as
+  `Malformed { UnterminatedRegion }` too.
 - **Every byte of the invoke lands in exactly one event**, with the tagged assemblers'
   accounting: the name's bytes in `ToolCallStart`, each tag's and value's bytes in the
   fragments they produce, text where the syntax has tags as `Malformed` run by run with the

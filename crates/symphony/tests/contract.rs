@@ -12,9 +12,10 @@
 //! - well-formedness: arguments and an end only for a call that has started and not ended, one
 //!   start per index, reasoning text only inside an open region, exactly one `Finish`, counting the
 //!   calls that started, after every fragment each call's arguments so far a valid JSON prefix,
-//!   which is what prefix stability promises a client, and a call its own terminal closed has
-//!   arguments that are whole JSON unless a `Malformed` event came while it was open, so that a
-//!   client is never handed a cut call as a whole one without a word;
+//!   which is what prefix stability promises a client, and a call that ended, by its own
+//!   terminal, the region's or the end of the stream, has arguments that are whole JSON unless a
+//!   `Malformed` event came while it was open, so that a client is never handed a cut call as a
+//!   whole one without a word;
 //! - order: calls are numbered from zero as they start, with ids that follow the index;
 //! - the lifecycle: one `Prompt`, deltas, one `End`, and an input out of order is a `Lifecycle`
 //!   error that emits nothing.
@@ -1823,9 +1824,8 @@ fn valid_json_prefix(text: &str) -> bool {
     matches!(PartialJson::default().parse(text, true), Ok((_, consumed)) if consumed == text.len())
 }
 
-/// What a client relies on in the shape of the stream, checked event by event; `before_end` is
-/// where the events of the stream's end begin.
-fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event], before_end: usize) {
+/// What a client relies on in the shape of the stream, checked event by event.
+fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event]) {
     let mut started: Vec<u32> = Vec::new();
     let mut ended: Vec<u32> = Vec::new();
     let mut arguments: Vec<(u32, String)> = Vec::new();
@@ -1865,9 +1865,10 @@ fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event], b
                 );
                 assert!(!ended.contains(index), "{}: a second end", place());
                 ended.push(*index);
-                // A call its own terminal closed is whole, or the parser said it is not: a client
-                // that reads the arguments as JSON relies on one or the other.
-                if at < before_end && !malformed_inside.contains(index) {
+                // A call that ended is whole, or the parser said it is not, whether its own
+                // terminal, the region's or the end of the stream ended it: a client that reads
+                // the arguments as JSON relies on one or the other.
+                if !malformed_inside.contains(index) {
                     let so_far = arguments
                         .iter()
                         .find(|(i, _)| i == index)
@@ -1989,16 +1990,9 @@ fn empty_deltas_between_the_pieces_change_nothing() {
 fn the_event_stream_is_well_formed_under_every_chunking() {
     for (subject, text) in corpus() {
         for (_, cuts) in chunkings(text, usize::MAX) {
-            let (events, before_end) = common::replay_marked(
-                &mut *(subject.new)(),
-                "",
-                text,
-                &cuts,
-                &EngineFinish::Stop,
-                false,
-            )
-            .unwrap_or_else(|e| panic!("{}: {text:?}: {e}", subject.name));
-            check_well_formed(subject.name, text, &cuts, &events, before_end);
+            let events = replay(subject, text, &cuts, false)
+                .unwrap_or_else(|e| panic!("{}: {text:?}: {e}", subject.name));
+            check_well_formed(subject.name, text, &cuts, &events);
         }
     }
 }

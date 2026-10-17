@@ -58,7 +58,10 @@ use super::object::{Mode, Object};
 use crate::{
     event::{runs, Event, Events, MalformedReason, Text},
     markers::{Piece, Scanner},
-    tagged::value::{json, Declared, Kind},
+    tagged::{
+        end_cut_call,
+        value::{json, Declared, Kind},
+    },
 };
 
 /// A CDATA section's opener and closer, where the family's template writes one around a value.
@@ -406,9 +409,11 @@ impl Assembler {
     }
 
     /// The stream was cut: nothing is closed, so arguments cut short never look complete to a
-    /// client. A streamed string's open fragment stays open; everything held comes back as
-    /// `Malformed { UnterminatedRegion }`; a call that started still ends, with no bytes of its
-    /// own, as every assembler ends one.
+    /// client. A streamed string's open fragment stays open; a call that started still ends, with
+    /// no bytes of its own, as every assembler ends one, after the one `Malformed {
+    /// UnterminatedRegion }` event that carries everything held and says that its arguments are
+    /// no whole value ([`end_cut_call`]); what a block that named no call held comes back as
+    /// `Malformed { UnterminatedRegion }` too.
     pub fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
@@ -417,16 +422,16 @@ impl Assembler {
         self.object.carried.push_str(&held);
         let held = self.scanner.held().to_string();
         self.object.carried.push_str(&held);
-        if !self.object.carried.is_empty() {
+        if self.started() {
+            end_cut_call(
+                self.object.index,
+                std::mem::take(&mut self.object.carried),
+                out,
+            );
+        } else if !self.object.carried.is_empty() {
             out.push(Event::Malformed {
                 text: Text::uncounted(std::mem::take(&mut self.object.carried)),
                 why: MalformedReason::UnterminatedRegion,
-            });
-        }
-        if self.started() {
-            out.push(Event::ToolCallEnd {
-                index: self.object.index,
-                source: Text::default(),
             });
         }
     }
@@ -1080,12 +1085,20 @@ mod tests {
             &["f\" index=\"1\"<|sep|><|open|>argument key=\"s\" type=\"string\"<|sep|>par"],
             true,
         );
-        nothing_empty(&cut);
         assert_eq!(arguments(&cut), r#"{"s": "par"#);
-        assert!(matches!(
-            cut.last(),
-            Some(Event::ToolCallEnd { source, .. }) if source.text.is_empty()
-        ));
+        // The arguments are no whole value: one `Malformed` event of no bytes says so before the
+        // end, the only event without bytes.
+        assert!(
+            matches!(
+                &cut[cut.len() - 2..],
+                [
+                    Event::Malformed { text, why: MalformedReason::UnterminatedRegion },
+                    Event::ToolCallEnd { source, .. }
+                ] if text.text.is_empty() && source.text.is_empty()
+            ),
+            "{cut:?}"
+        );
+        nothing_empty(&cut[..cut.len() - 2]);
 
         let mut assembler = Assembler::new(0, "call_0", Tags::XTML);
         let mut out = Events::new();
@@ -1195,10 +1208,21 @@ mod tests {
         assert_eq!(bytes(&events), pieces.concat());
         // The opening fragment, then every piece of the string as it came; no closing quote.
         assert_eq!(arguments(&events), r#"{"s": "Paris, France"#);
+        // No closing quote is made up: the one word before the end says the value is no whole one.
         assert!(matches!(
-            events.last(),
-            Some(Event::ToolCallEnd { source, .. }) if source.text.is_empty()
+            &events[events.len() - 2..],
+            [
+                Event::Malformed { text, why: MalformedReason::UnterminatedRegion },
+                Event::ToolCallEnd { source, .. }
+            ] if text.text.is_empty() && source.text.is_empty()
         ));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::Malformed { .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]

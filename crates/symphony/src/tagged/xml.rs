@@ -25,6 +25,7 @@ use crate::{
     event::{runs, DropReason, Event, Events, MalformedReason, Text},
     tagged::{
         assembler::{push_escaped, push_quoted},
+        end_cut_call,
         value::{json, Declared, Kind, ITEM, NULL_WORDS},
     },
 };
@@ -216,24 +217,22 @@ impl Assembler {
     }
 
     /// The stream was cut: nothing is closed, so arguments cut short never look complete to a
-    /// client. A streamed string's open fragment stays open; everything held comes back as
-    /// `Malformed { UnterminatedRegion }`; a call that started still ends, with no bytes of its
-    /// own, as every assembler ends one.
+    /// client. A streamed string's open fragment stays open; a call that started still ends, with
+    /// no bytes of its own, as every assembler ends one, after the one `Malformed {
+    /// UnterminatedRegion }` event that carries everything held and says that its arguments are
+    /// no whole value ([`end_cut_call`]); what a block that named no call held comes back as
+    /// `Malformed { UnterminatedRegion }` too.
     pub fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
         }
         self.hold_tag();
-        if !self.carried.is_empty() {
+        if self.started() {
+            end_cut_call(self.index, std::mem::take(&mut self.carried), out);
+        } else if !self.carried.is_empty() {
             out.push(Event::Malformed {
                 text: Text::uncounted(std::mem::take(&mut self.carried)),
                 why: MalformedReason::UnterminatedRegion,
-            });
-        }
-        if self.started() {
-            out.push(Event::ToolCallEnd {
-                index: self.index,
-                source: Text::default(),
             });
         }
     }

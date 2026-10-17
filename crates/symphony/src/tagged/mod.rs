@@ -27,3 +27,26 @@ pub mod xml;
 
 pub use assembler::{Assembler, Placement, Spelling};
 pub use value::{json, Declared, Kind};
+
+use crate::event::{Event, Events, MalformedReason, Text};
+
+/// The end of a started call the stream cut, for the four assemblers of this module. Each writes
+/// the arguments object itself and closes it only at the call's own end, so when the stream ends
+/// first the fragments sent are no whole JSON value, whatever stage the cut found: a string left
+/// open, a value held for its close, or no member yet. The fragments stand, since a fragment
+/// passed on cannot be taken back, nothing is made up for what the model never finished, and one
+/// `Malformed` event before the call's end says that the arguments are no whole value, as the
+/// JSON assembler says it: it carries the bytes still held (the start of a tag, a value's text,
+/// the template's newline), or none when the cut fell between events, so that a client that
+/// reads the arguments as JSON is told rather than left to find out. The engine keeps
+/// `UnterminatedRegion` for a region the end of the stream cut.
+pub(crate) fn end_cut_call(index: u32, held: String, out: &mut Events) {
+    out.push(Event::Malformed {
+        text: Text::uncounted(held),
+        why: MalformedReason::UnterminatedRegion,
+    });
+    out.push(Event::ToolCallEnd {
+        index,
+        source: Text::default(),
+    });
+}
