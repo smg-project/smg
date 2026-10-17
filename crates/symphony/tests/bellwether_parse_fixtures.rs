@@ -698,8 +698,9 @@ enum GenerationPrompt {
     Plain,
     /// MiniMax M3 and Kimi K2 Thinking: nothing, whatever the request says (M3's template reads
     /// `thinking_mode`, which the requests do not set; K2 Thinking's has no switch), and the
-    /// template has a thought: the model writes `<mm:think>` or `<think>` itself, or closes an
-    /// empty thought with the closer at once.
+    /// template has a thought: the model writes `<mm:think>` or `<think>` itself, or (M3 only)
+    /// closes an empty thought with `</mm:think>` at once; the Kimi K2 table reads a closer
+    /// with no opener as content.
     ModelDecides,
     /// Laguna: the thought's opener alone, with no newline, when the request turns thinking on,
     /// so the output starts inside the thought; otherwise (the default) its closer alone, which
