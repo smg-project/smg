@@ -112,7 +112,7 @@ impl MinimaxM2Parser {
     fn parse_parameters(
         &self,
         params_text: &str,
-        param_types: &HashMap<String, String>,
+        param_types: &helpers::ParamTypes<'_>,
     ) -> serde_json::Map<String, Value> {
         let mut parameters = serde_json::Map::new();
 
@@ -121,11 +121,8 @@ impl MinimaxM2Parser {
             let value_str = capture.get(2).map_or("", |m| m.as_str());
 
             let decoded_value = Self::decode_xml_entities(value_str);
-            let value = helpers::coerce_by_schema_type(
-                &decoded_value,
-                param_types.get(key).map(String::as_str),
-            )
-            .unwrap_or_else(|| Self::parse_value(&decoded_value));
+            let value = helpers::coerce_by_schema_type(&decoded_value, param_types.get(key))
+                .unwrap_or_else(|| Self::parse_value(&decoded_value));
 
             parameters.insert(key.to_string(), value);
         }
@@ -157,7 +154,7 @@ impl MinimaxM2Parser {
             let params_text = captures.get(2).map_or("", |m| m.as_str());
 
             // Parse parameters, coerced by this function's declared schema.
-            let param_types = helpers::param_types_for_function(tools, func_name);
+            let param_types = helpers::ParamTypes::for_function(tools, func_name);
             let parameters = self.parse_parameters(params_text, &param_types);
 
             match serde_json::to_string(&parameters) {
@@ -212,7 +209,7 @@ impl MinimaxM2Parser {
     /// Parse and stream parameters incrementally
     fn parse_and_stream_parameters(&mut self, text: &str, tools: &[Tool]) -> Vec<ToolCallItem> {
         let mut calls = Vec::new();
-        let param_types = helpers::param_types_for_function(tools, &self.current_function_name);
+        let param_types = helpers::ParamTypes::for_function(tools, &self.current_function_name);
 
         // Find all complete parameter patterns in the buffer
         let param_matches: Vec<_> = self
@@ -225,18 +222,15 @@ impl MinimaxM2Parser {
 
                 // Coerce by declared type when known; otherwise keep the prior
                 // JSON-first-then-infer behavior for nested objects/arrays.
-                let value = helpers::coerce_by_schema_type(
-                    &decoded,
-                    param_types.get(&name).map(String::as_str),
-                )
-                .unwrap_or_else(|| {
-                    if decoded.starts_with('{') || decoded.starts_with('[') {
-                        serde_json::from_str::<Value>(&decoded)
-                            .unwrap_or_else(|_| Self::parse_value(&decoded))
-                    } else {
-                        Self::parse_value(&decoded)
-                    }
-                });
+                let value = helpers::coerce_by_schema_type(&decoded, param_types.get(&name))
+                    .unwrap_or_else(|| {
+                        if decoded.starts_with('{') || decoded.starts_with('[') {
+                            serde_json::from_str::<Value>(&decoded)
+                                .unwrap_or_else(|_| Self::parse_value(&decoded))
+                        } else {
+                            Self::parse_value(&decoded)
+                        }
+                    });
 
                 (name, value)
             })
