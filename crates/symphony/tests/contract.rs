@@ -1213,6 +1213,9 @@ const KIMI_K2_OUTPUTS: &[&str] = &[
     "<|tool_calls_section_begin|><|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>{}<|tool_calls_section_end|>",
     // Two calls the model gave one id: the second takes a minted id, under every cut.
     "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Rome\"}<|tool_call_end|><|tool_calls_section_end|>",
+    // Arguments that nest and hold text outside ASCII, and a brace inside a string value.
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.save_note:0<|tool_call_argument_begin|>{\"title\": \"計画 🌍\", \"body\": \"a \\\"q\\\" \\\\ b\\nc\", \"tags\": [\"a\", \"b\"], \"meta\": {\"nested\": {\"deep\": [1, 2.5, true, null]}}}<|tool_call_end|><|tool_calls_section_end|>",
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.save_note:0<|tool_call_argument_begin|>{\"title\": \"Braces\", \"body\": \"a } b { c\"}<|tool_call_end|><|tool_calls_section_end|>",
     "<think>unfinished",
     "",
 ];
