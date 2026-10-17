@@ -798,8 +798,7 @@ impl WorkerService {
             // for a clear 400 rather than a 202 whose job then fails, and
             // again in the queued step over the labels it actually merges.
             if self.router_config.traffic_split {
-                let mut merged = existing.clone();
-                merged.extend(labels.iter().map(|(k, v)| (k.clone(), v.clone())));
+                let merged = merge_labels(existing, labels);
                 traffic_split::validate_named_group_has_weight(&merged).map_err(bad_request)?;
             }
         }
