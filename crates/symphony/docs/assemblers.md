@@ -78,6 +78,21 @@ the reason the syntax names (`NameWithoutACall`, `NameWithoutArguments`), and as
 `UnterminatedRegion` when the stream is cut; an empty header leaves nothing, which is how a thought
 or an answer message reads under the Inkling table.
 
+## The list reader (`json::list`)
+
+A list of call objects is read by one assembler around the JSON assembler, each object going to
+one of its own with the next free index (spent only by an object that starts a call) and its id
+from the engine's `CallIds`. What frames the calls is one value, `Framing`, given at construction
+and mapped from the table's call syntax by the engine's factory: `Bare` (xLAM) is the list alone in
+the output, where anything but a list is prose; `Framed` (Llama Nemotron) is the list between
+markers, where text in place of it is malformed; `ObjectOrList` (the `json` table) also reads a
+`{` at the first byte as one call alone. The stages (deciding at the first byte that is not
+whitespace, between objects, inside one, after the `]`) and what they say of the bytes around the
+objects (the brackets, commas and wrapping whitespace `Dropped`, text between objects or after the
+list `Malformed`, one run per event) are the same under every framing. A call written as one
+object inside a table's markers (`CallSyntax::Json`) is not a framing of this reader: it is the JSON
+assembler itself, and the engine, not the reader, reports what follows the object.
+
 ## The Qwen tagged assembler (`tagged::assembler`)
 
 Every byte of the call lands in exactly one event. Whitespace between tags is the template's and

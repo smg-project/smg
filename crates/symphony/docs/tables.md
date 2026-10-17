@@ -233,7 +233,7 @@ What the table says beyond the others:
 
 - **One state, no markers, an object or a list.** As `xlam`, the output starts in the arguments
   state and the assembler decides at the first byte that is not whitespace; unlike `xlam`, a `{`
-  there is one call alone (`json::list::Assembler::object_or_list`), whose object reads as a
+  there is one call alone (`json::list`, `Framing::ObjectOrList`), whose object reads as a
   list's object does, `arguments`, `parameters` or `args` naming the arguments. What follows the
   object reads as what follows a list's `]`: whitespace that ends the output is the template's
   wrapping, dropped; text is malformed, with the whitespace before and between its words, since

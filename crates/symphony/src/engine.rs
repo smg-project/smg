@@ -245,10 +245,22 @@ fn assembler(
         Some(CallSyntax::Keyed(tags)) => Box::new(tagged::keyed::Assembler::new(index, id, tags)),
         Some(CallSyntax::Pythonic(_)) => Box::new(pythonic::Assembler::new(index, ids)),
         // The list between markers (Llama Nemotron) takes text in place of it as malformed; the
-        // bare list the output starts in (xLAM) takes it for prose.
-        Some(CallSyntax::JsonList) if framed => Box::new(json::list::Assembler::framed(index, ids)),
-        Some(CallSyntax::JsonList) => Box::new(json::list::Assembler::new(index, ids)),
-        Some(CallSyntax::JsonAlone) => Box::new(json::list::Assembler::object_or_list(index, ids)),
+        // bare list the output starts in (xLAM) takes it for prose; the lone object the `json`
+        // table also reads is one call.
+        Some(CallSyntax::JsonList) => Box::new(json::list::Assembler::new(
+            index,
+            ids,
+            if framed {
+                json::list::Framing::Framed
+            } else {
+                json::list::Framing::Bare
+            },
+        )),
+        Some(CallSyntax::JsonAlone) => Box::new(json::list::Assembler::new(
+            index,
+            ids,
+            json::list::Framing::ObjectOrList,
+        )),
         Some(CallSyntax::Xml) => Box::new(tagged::xml::Assembler::new(index, id)),
         Some(CallSyntax::Attributed(tags)) => {
             Box::new(tagged::attributed::Assembler::new(index, id, tags))
