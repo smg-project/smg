@@ -22,6 +22,11 @@
 //! unpack` writes (`fixtures-plain/` unless `--out` names another), where
 //! every fixture set is plain JSON Lines beside each model's `manifest.toml`
 //! and `sets.toml`; without it the test prints a skip notice and passes.
+//! The tree the lists below are judged against is the one CI unpacks,
+//! bellwether at the commit `.github/versions/bellwether.ref` pins: a
+//! case's reference moves between bellwether commits, so an entry taken
+//! from another checkout's tree fails the run there as stale, or leaves a
+//! difference unlisted.
 //! bellwether's own `fixtures/` directory keeps a benchmark set as
 //! `<set>.jsonl.zst` in Git LFS, so a compressed set or a Git LFS pointer under
 //! the root fails the run and says to unpack first. Each case is compared as
@@ -109,167 +114,7 @@ const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 /// pre-tokenizer for instance, and is held to the rule an id is: the run
 /// fails when no loaded case under it differs any more, and when no loaded
 /// case is under it at all.
-/// Why the render fixtures of four Qwen3.5-family vocabularies differ on text
-/// with combining marks (Bengali, Telugu and Thai sets wholesale, a few
-/// Devanagari and Arabic cases): they were recorded with transformers 5.17.0,
-/// whose `AutoTokenizer` took the class the checkpoints' `tokenizer_config.json`
-/// names, `Qwen2Tokenizer`, and that class builds its own pre-tokenizer with
-/// the legacy split `[^\r\n\p{L}\p{N}]?\p{L}+` in place of the checkpoint's
-/// `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+`, so a combining mark splits from its
-/// letter and the vocabularies' letter-and-mark tokens are never produced. The
-/// encoder keeps the mark with its letter, as `tokenizers` 0.23.2 does on the
-/// checkpoint's `tokenizer.json`, as transformers 4 did, and as transformers
-/// does again from 5.18 on, where huggingface/transformers#49116 maps the
-/// family to `Qwen3_5Tokenizer`. The entries go when the fixtures are
-/// re-recorded with transformers 5.18 or later; the run then fails on them as
-/// healed.
-const SPLIT_MARKS: &str =
-    "recorded with transformers 5.17.0, whose Qwen2Tokenizer splits a combining \
-                           mark from its letter (legacy `\\p{L}+` pre-tokenizer) where the \
-                           checkpoint's tokenizer.json keeps them together (`[\\p{L}\\p{M}]+`), as \
-                           the encoder, `tokenizers` on the file and transformers 5.18 on do \
-                           (huggingface/transformers#49116); re-record to clear";
-
-const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
-    (
-        "qwen3.5-35b-a3b/render/bfcl-live-multiple-131-50-3",
-        SPLIT_MARKS,
-    ),
-    (
-        "qwen3.5-35b-a3b/render/bfcl-live-simple-174-100-0",
-        SPLIT_MARKS,
-    ),
-    (
-        "qwen3.5-35b-a3b/render/bfcl-live-simple-175-101-0",
-        SPLIT_MARKS,
-    ),
-    (
-        "qwen3.5-35b-a3b/render/bfcl-live-simple-176-102-0",
-        SPLIT_MARKS,
-    ),
-    (
-        "qwen3.5-35b-a3b/render/hermes-glaive-func-calling-4967-11",
-        SPLIT_MARKS,
-    ),
-    (
-        "qwen3.5-35b-a3b/render/hermes-glaive-func-calling-4967-3",
-        SPLIT_MARKS,
-    ),
-    (
-        "qwen3.5-35b-a3b/render/hermes-glaive-func-calling-4967-5",
-        SPLIT_MARKS,
-    ),
-    (
-        "qwen3.5-35b-a3b/render/hermes-glaive-func-calling-4967-7",
-        SPLIT_MARKS,
-    ),
-    (
-        "qwen3.5-35b-a3b/render/hermes-glaive-func-calling-4967-9",
-        SPLIT_MARKS,
-    ),
-    ("qwen3.5-35b-a3b/render/mgsm-bn-*", SPLIT_MARKS),
-    ("qwen3.5-35b-a3b/render/mgsm-te-*", SPLIT_MARKS),
-    ("qwen3.5-35b-a3b/render/mgsm-th-*", SPLIT_MARKS),
-    (
-        "qwen3.6-27b/render/bfcl-live-multiple-131-50-3",
-        SPLIT_MARKS,
-    ),
-    ("qwen3.6-27b/render/bfcl-live-simple-174-100-0", SPLIT_MARKS),
-    ("qwen3.6-27b/render/bfcl-live-simple-175-101-0", SPLIT_MARKS),
-    ("qwen3.6-27b/render/bfcl-live-simple-176-102-0", SPLIT_MARKS),
-    (
-        "qwen3.6-27b/render/hermes-glaive-func-calling-4967-11",
-        SPLIT_MARKS,
-    ),
-    (
-        "qwen3.6-27b/render/hermes-glaive-func-calling-4967-3",
-        SPLIT_MARKS,
-    ),
-    (
-        "qwen3.6-27b/render/hermes-glaive-func-calling-4967-5",
-        SPLIT_MARKS,
-    ),
-    (
-        "qwen3.6-27b/render/hermes-glaive-func-calling-4967-7",
-        SPLIT_MARKS,
-    ),
-    (
-        "qwen3.6-27b/render/hermes-glaive-func-calling-4967-9",
-        SPLIT_MARKS,
-    ),
-    ("qwen3.6-27b/render/mgsm-bn-*", SPLIT_MARKS),
-    ("qwen3.6-27b/render/mgsm-te-*", SPLIT_MARKS),
-    ("qwen3.6-27b/render/mgsm-th-*", SPLIT_MARKS),
-    (
-        "qwen3.6-35b-a3b/render/bfcl-live-multiple-131-50-3",
-        SPLIT_MARKS,
-    ),
-    (
-        "qwen3.6-35b-a3b/render/bfcl-live-simple-174-100-0",
-        SPLIT_MARKS,
-    ),
-    (
-        "qwen3.6-35b-a3b/render/bfcl-live-simple-175-101-0",
-        SPLIT_MARKS,
-    ),
-    (
-        "qwen3.6-35b-a3b/render/bfcl-live-simple-176-102-0",
-        SPLIT_MARKS,
-    ),
-    (
-        "qwen3.6-35b-a3b/render/hermes-glaive-func-calling-4967-11",
-        SPLIT_MARKS,
-    ),
-    (
-        "qwen3.6-35b-a3b/render/hermes-glaive-func-calling-4967-3",
-        SPLIT_MARKS,
-    ),
-    (
-        "qwen3.6-35b-a3b/render/hermes-glaive-func-calling-4967-5",
-        SPLIT_MARKS,
-    ),
-    (
-        "qwen3.6-35b-a3b/render/hermes-glaive-func-calling-4967-7",
-        SPLIT_MARKS,
-    ),
-    (
-        "qwen3.6-35b-a3b/render/hermes-glaive-func-calling-4967-9",
-        SPLIT_MARKS,
-    ),
-    ("qwen3.6-35b-a3b/render/mgsm-bn-*", SPLIT_MARKS),
-    ("qwen3.6-35b-a3b/render/mgsm-te-*", SPLIT_MARKS),
-    ("qwen3.6-35b-a3b/render/mgsm-th-*", SPLIT_MARKS),
-    (
-        "qwen3.8-27b/render/bfcl-live-multiple-131-50-3",
-        SPLIT_MARKS,
-    ),
-    ("qwen3.8-27b/render/bfcl-live-simple-174-100-0", SPLIT_MARKS),
-    ("qwen3.8-27b/render/bfcl-live-simple-175-101-0", SPLIT_MARKS),
-    ("qwen3.8-27b/render/bfcl-live-simple-176-102-0", SPLIT_MARKS),
-    (
-        "qwen3.8-27b/render/hermes-glaive-func-calling-4967-11",
-        SPLIT_MARKS,
-    ),
-    (
-        "qwen3.8-27b/render/hermes-glaive-func-calling-4967-3",
-        SPLIT_MARKS,
-    ),
-    (
-        "qwen3.8-27b/render/hermes-glaive-func-calling-4967-5",
-        SPLIT_MARKS,
-    ),
-    (
-        "qwen3.8-27b/render/hermes-glaive-func-calling-4967-7",
-        SPLIT_MARKS,
-    ),
-    (
-        "qwen3.8-27b/render/hermes-glaive-func-calling-4967-9",
-        SPLIT_MARKS,
-    ),
-    ("qwen3.8-27b/render/mgsm-bn-*", SPLIT_MARKS),
-    ("qwen3.8-27b/render/mgsm-te-*", SPLIT_MARKS),
-    ("qwen3.8-27b/render/mgsm-th-*", SPLIT_MARKS),
-];
+const KNOWN_DIFFERENCES: &[(&str, &str)] = &[];
 
 /// Models whose tokenizer is known not to load, with the reason and where it
 /// is tracked, so the run compares the others: an unlisted model that does
