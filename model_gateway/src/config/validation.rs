@@ -16,13 +16,13 @@ use crate::{middleware::scheduler, policies::cost as selection_cost};
 fn validate_distinct_listener_ports(listeners: &[(&str, &str, u16)]) -> ConfigResult<()> {
     for (i, (field, flag, port)) in listeners.iter().enumerate() {
         if let Some((_, other_flag, _)) = listeners[..i].iter().find(|(_, _, p)| p == port) {
-            return Err(ConfigError::InvalidValue {
-                field: (*field).to_string(),
-                value: port.to_string(),
-                reason: format!(
+            return Err(ConfigError::invalid_value(
+                *field,
+                port,
+                format!(
                     "{flag} and {other_flag} are both {port}; each listener needs its own port"
                 ),
-            });
+            ));
         }
     }
     Ok(())
@@ -177,11 +177,11 @@ fn text_file_error(path: &Path) -> Result<(), String> {
 /// panic at mesh adapter construction during startup.
 pub fn validate_mesh_server_name(name: &str) -> ConfigResult<()> {
     if name.is_empty() || name.contains(':') {
-        return Err(ConfigError::InvalidValue {
-            field: "mesh_server_name".to_string(),
-            value: name.to_string(),
-            reason: "must be non-empty and must not contain ':'".to_string(),
-        });
+        return Err(ConfigError::invalid_value(
+            "mesh_server_name",
+            name,
+            "must be non-empty and must not contain ':'",
+        ));
     }
     Ok(())
 }
@@ -196,11 +196,11 @@ pub fn validate_mesh_server_name(name: &str) -> ConfigResult<()> {
 /// worker.
 pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
     if url.is_empty() {
-        return Err(ConfigError::InvalidValue {
-            field: "worker_url".to_string(),
-            value: url.to_string(),
-            reason: "URL cannot be empty".to_string(),
-        });
+        return Err(ConfigError::invalid_value(
+            "worker_url",
+            url,
+            "URL cannot be empty",
+        ));
     }
 
     // Exact (lowercase) scheme allow-list. Case-insensitive matching is
@@ -211,12 +211,12 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
     const ALLOWED_SCHEMES: &[&str] = &["http", "https", "grpc", "grpcs", "ipc"];
     let scheme = url.split_once("://").map_or("", |(s, _)| s);
     if !ALLOWED_SCHEMES.contains(&scheme) {
-        return Err(ConfigError::InvalidValue {
-            field: "worker_url".to_string(),
-            value: url.to_string(),
-            reason: "URL must start with a lowercase http://, https://, grpc://, grpcs://, or ipc:// scheme"
-                .to_string(),
-        });
+        return Err(ConfigError::invalid_value(
+            "worker_url",
+            url,
+            "URL must start with a lowercase http://, https://, grpc://, grpcs://, or ipc:// \
+             scheme",
+        ));
     }
 
     // ipc:// worker URLs are same-host ZMQ unix-socket paths (no host); validate
@@ -224,11 +224,11 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
     if scheme == "ipc" {
         let path = url.strip_prefix("ipc://").unwrap_or("");
         if path.is_empty() {
-            return Err(ConfigError::InvalidValue {
-                field: "worker_url".to_string(),
-                value: url.to_string(),
-                reason: "ipc:// worker URL must include a socket path".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "worker_url",
+                url,
+                "ipc:// worker URL must include a socket path",
+            ));
         }
         return Ok(());
     }
@@ -236,19 +236,19 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
     match ::url::Url::parse(url) {
         Ok(parsed) => {
             if parsed.host_str().is_none() {
-                return Err(ConfigError::InvalidValue {
-                    field: "worker_url".to_string(),
-                    value: url.to_string(),
-                    reason: "URL must have a valid host".to_string(),
-                });
+                return Err(ConfigError::invalid_value(
+                    "worker_url",
+                    url,
+                    "URL must have a valid host",
+                ));
             }
         }
         Err(e) => {
-            return Err(ConfigError::InvalidValue {
-                field: "worker_url".to_string(),
-                value: url.to_string(),
-                reason: format!("Invalid URL format: {e}"),
-            });
+            return Err(ConfigError::invalid_value(
+                "worker_url",
+                url,
+                format!("Invalid URL format: {e}"),
+            ));
         }
     }
     Ok(())
@@ -442,11 +442,11 @@ impl ConfigValidator {
         if config.effective_prefill_queue_size() > 0
             && config.effective_prefill_queue_timeout_secs() == 0
         {
-            return Err(ConfigError::InvalidValue {
-                field: "prefill_queue_timeout_secs".to_string(),
-                value: "0".to_string(),
-                reason: "Must be > 0 when the Prefill queue is enabled".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "prefill_queue_timeout_secs",
+                "0",
+                "Must be > 0 when the Prefill queue is enabled",
+            ));
         }
 
         Ok(())
@@ -465,28 +465,24 @@ impl ConfigValidator {
         }
         scheduler::settings_from_config(config)
             .map(drop)
-            .map_err(|e| ConfigError::InvalidValue {
-                field: e.field.to_string(),
-                value: e.value,
-                reason: e.reason,
-            })
+            .map_err(|e| ConfigError::invalid_value(e.field, e.value, e.reason))
     }
 
     fn validate_model_aliases(config: &RouterConfig) -> ConfigResult<()> {
         for (alias, canonical) in &config.model_aliases {
             if alias.is_empty() || canonical.is_empty() {
-                return Err(ConfigError::InvalidValue {
-                    field: "model_aliases".to_string(),
-                    value: format!("{alias}={canonical}"),
-                    reason: "Alias and canonical model ID must be non-empty".to_string(),
-                });
+                return Err(ConfigError::invalid_value(
+                    "model_aliases",
+                    format!("{alias}={canonical}"),
+                    "Alias and canonical model ID must be non-empty",
+                ));
             }
             if alias == canonical {
-                return Err(ConfigError::InvalidValue {
-                    field: "model_aliases".to_string(),
-                    value: alias.clone(),
-                    reason: "Alias must differ from the canonical model ID".to_string(),
-                });
+                return Err(ConfigError::invalid_value(
+                    "model_aliases",
+                    alias,
+                    "Alias must differ from the canonical model ID",
+                ));
             }
         }
 
@@ -503,10 +499,8 @@ impl ConfigValidator {
     /// `validate_health_check`); the command line keeps the shapes of what
     /// never reaches `RouterConfig`.
     fn validate_value_shapes(config: &RouterConfig) -> ConfigResult<()> {
-        let invalid = |field: &str, value: &str, reason: &str| ConfigError::InvalidValue {
-            field: field.to_string(),
-            value: value.to_string(),
-            reason: reason.to_string(),
+        let invalid = |field: &str, value: &str, reason: &str| {
+            ConfigError::invalid_value(field, value, reason)
         };
         for name in config.request_id_headers.iter().flatten() {
             if HeaderName::try_from(name.as_str()).is_err() {
@@ -544,12 +538,11 @@ impl ConfigValidator {
             }
 
             if HeaderName::try_from(header_name).is_err() {
-                return Err(ConfigError::InvalidValue {
-                    field: "storage_context_headers".to_string(),
-                    value: header_name.to_string(),
-                    reason: "not a valid HTTP header name: it could never match a request"
-                        .to_string(),
-                });
+                return Err(ConfigError::invalid_value(
+                    "storage_context_headers",
+                    header_name,
+                    "not a valid HTTP header name: it could never match a request",
+                ));
             }
 
             if context_key.is_empty() {
@@ -599,11 +592,11 @@ impl ConfigValidator {
         let mut seen: Vec<AccessLogField> = Vec::with_capacity(config.access_log_fields.len());
         for field in &config.access_log_fields {
             if seen.contains(field) {
-                return Err(ConfigError::InvalidValue {
-                    field: "access_log_fields".to_string(),
-                    value: field.to_string(),
-                    reason: "listed twice".to_string(),
-                });
+                return Err(ConfigError::invalid_value(
+                    "access_log_fields",
+                    field,
+                    "listed twice",
+                ));
             }
             seen.push(*field);
         }
@@ -741,27 +734,27 @@ impl ConfigValidator {
         }
 
         if oracle.pool_min < 1 {
-            return Err(ConfigError::InvalidValue {
-                field: "oracle.pool_min".to_string(),
-                value: oracle.pool_min.to_string(),
-                reason: "Must be at least 1".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "oracle.pool_min",
+                oracle.pool_min,
+                "Must be at least 1",
+            ));
         }
 
         if oracle.pool_max < oracle.pool_min {
-            return Err(ConfigError::InvalidValue {
-                field: "oracle.pool_max".to_string(),
-                value: oracle.pool_max.to_string(),
-                reason: "Must be >= oracle.pool_min".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "oracle.pool_max",
+                oracle.pool_max,
+                "Must be >= oracle.pool_min",
+            ));
         }
 
         if oracle.pool_timeout_secs == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "oracle.pool_timeout_secs".to_string(),
-                value: oracle.pool_timeout_secs.to_string(),
-                reason: "Must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "oracle.pool_timeout_secs",
+                oracle.pool_timeout_secs,
+                "Must be > 0",
+            ));
         }
 
         Ok(())
@@ -795,11 +788,11 @@ impl ConfigValidator {
                 for (_url, port) in prefill_urls {
                     if let Some(port) = port {
                         if *port == 0 {
-                            return Err(ConfigError::InvalidValue {
-                                field: "bootstrap_port".to_string(),
-                                value: port.to_string(),
-                                reason: "Port must be between 1 and 65535".to_string(),
-                            });
+                            return Err(ConfigError::invalid_value(
+                                "bootstrap_port",
+                                port,
+                                "Port must be between 1 and 65535",
+                            ));
                         }
                     }
                 }
@@ -828,11 +821,11 @@ impl ConfigValidator {
                     for (_url, port) in urls {
                         if let Some(port) = port {
                             if *port == 0 {
-                                return Err(ConfigError::InvalidValue {
-                                    field: "bootstrap_port".to_string(),
-                                    value: port.to_string(),
-                                    reason: "Port must be between 1 and 65535".to_string(),
-                                });
+                                return Err(ConfigError::invalid_value(
+                                    "bootstrap_port",
+                                    port,
+                                    "Port must be between 1 and 65535",
+                                ));
                             }
                         }
                     }
@@ -909,51 +902,51 @@ impl ConfigValidator {
                 if let Err(err) =
                     selection_cost::build(selection_policy_name, *selection_temperature)
                 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "selection_policy".to_string(),
-                        value: selection_policy_name.to_string(),
-                        reason: err.to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "selection_policy",
+                        selection_policy_name,
+                        err.to_string(),
+                    ));
                 }
 
                 if *cache_ttl_secs == 0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "cache_ttl_secs".to_string(),
-                        value: cache_ttl_secs.to_string(),
-                        reason: "Must be > 0".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "cache_ttl_secs",
+                        cache_ttl_secs,
+                        "Must be > 0",
+                    ));
                 }
 
                 if *cache_index == CacheIndexKind::Hash && cache_boundaries.is_empty() {
-                    return Err(ConfigError::InvalidValue {
-                        field: "cache_index".to_string(),
-                        value: "hash".to_string(),
-                        reason: "cache_index=hash requires non-empty cache_boundaries".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "cache_index",
+                        "hash",
+                        "cache_index=hash requires non-empty cache_boundaries",
+                    ));
                 }
 
                 if !overlap_decay.is_finite() || *overlap_decay < 0.0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "overlap_decay".to_string(),
-                        value: overlap_decay.to_string(),
-                        reason: "Must be finite and >= 0.0 (0.0 disables)".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "overlap_decay",
+                        overlap_decay,
+                        "Must be finite and >= 0.0 (0.0 disables)",
+                    ));
                 }
 
                 if !selection_temperature.is_finite() || *selection_temperature < 0.0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "selection_temperature".to_string(),
-                        value: selection_temperature.to_string(),
-                        reason: "Must be finite and >= 0.0 (0.0 is argmax)".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "selection_temperature",
+                        selection_temperature,
+                        "Must be finite and >= 0.0 (0.0 is argmax)",
+                    ));
                 }
 
                 if *block_size == 0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "block_size".to_string(),
-                        value: block_size.to_string(),
-                        reason: "Must be > 0".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "block_size",
+                        block_size,
+                        "Must be > 0",
+                    ));
                 }
 
                 // NaN passes every comparison and an infinite threshold is a typo
@@ -961,53 +954,53 @@ impl ConfigValidator {
                 if !balance_token_usage_threshold.is_finite()
                     || *balance_token_usage_threshold <= 0.0
                 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "balance_token_usage_threshold".to_string(),
-                        value: balance_token_usage_threshold.to_string(),
-                        reason: "Must be finite and > 0.0 (use >= 1.0 to disable)".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "balance_token_usage_threshold",
+                        balance_token_usage_threshold,
+                        "Must be finite and > 0.0 (use >= 1.0 to disable)",
+                    ));
                 }
 
                 if !overload_token_usage_threshold.is_finite()
                     || *overload_token_usage_threshold <= 0.0
                 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "overload_token_usage_threshold".to_string(),
-                        value: overload_token_usage_threshold.to_string(),
-                        reason: "Must be finite and > 0.0 (use >= 1.0 to disable)".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "overload_token_usage_threshold",
+                        overload_token_usage_threshold,
+                        "Must be finite and > 0.0 (use >= 1.0 to disable)",
+                    ));
                 }
 
                 if !(0.0..=1.0).contains(cache_threshold) {
-                    return Err(ConfigError::InvalidValue {
-                        field: "cache_threshold".to_string(),
-                        value: cache_threshold.to_string(),
-                        reason: "Must be between 0.0 and 1.0".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "cache_threshold",
+                        cache_threshold,
+                        "Must be between 0.0 and 1.0",
+                    ));
                 }
 
                 if !balance_rel_threshold.is_finite() || *balance_rel_threshold < 1.0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "balance_rel_threshold".to_string(),
-                        value: balance_rel_threshold.to_string(),
-                        reason: "Must be finite and >= 1.0".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "balance_rel_threshold",
+                        balance_rel_threshold,
+                        "Must be finite and >= 1.0",
+                    ));
                 }
 
                 if *eviction_interval_secs == 0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "eviction_interval_secs".to_string(),
-                        value: eviction_interval_secs.to_string(),
-                        reason: "Must be > 0".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "eviction_interval_secs",
+                        eviction_interval_secs,
+                        "Must be > 0",
+                    ));
                 }
 
                 if *max_tree_size == 0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "max_tree_size".to_string(),
-                        value: max_tree_size.to_string(),
-                        reason: "Must be > 0".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "max_tree_size",
+                        max_tree_size,
+                        "Must be > 0",
+                    ));
                 }
             }
             PolicyConfig::PowerOfTwo {
@@ -1015,11 +1008,11 @@ impl ConfigValidator {
                 ..
             } => {
                 if *load_check_interval_secs == 0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "load_check_interval_secs".to_string(),
-                        value: load_check_interval_secs.to_string(),
-                        reason: "Must be > 0".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "load_check_interval_secs",
+                        load_check_interval_secs,
+                        "Must be > 0",
+                    ));
                 }
             }
             PolicyConfig::LeastLoad {
@@ -1030,35 +1023,35 @@ impl ConfigValidator {
                 max_waiting_requests: _,
             } => {
                 if *load_check_interval_secs == 0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "load_check_interval_secs".to_string(),
-                        value: load_check_interval_secs.to_string(),
-                        reason: "Must be > 0".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "load_check_interval_secs",
+                        load_check_interval_secs,
+                        "Must be > 0",
+                    ));
                 }
 
                 if !kv_pressure_weight.is_finite() || *kv_pressure_weight < 0.0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "kv_pressure_weight".to_string(),
-                        value: kv_pressure_weight.to_string(),
-                        reason: "Must be finite and >= 0.0".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "kv_pressure_weight",
+                        kv_pressure_weight,
+                        "Must be finite and >= 0.0",
+                    ));
                 }
 
                 if *mean_prefill_tokens == 0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "mean_prefill_tokens".to_string(),
-                        value: mean_prefill_tokens.to_string(),
-                        reason: "Must be > 0".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "mean_prefill_tokens",
+                        mean_prefill_tokens,
+                        "Must be > 0",
+                    ));
                 }
 
                 if !default_throughput.is_finite() || *default_throughput <= 0.0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "default_throughput".to_string(),
-                        value: default_throughput.to_string(),
-                        reason: "Must be finite and > 0.0".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "default_throughput",
+                        default_throughput,
+                        "Must be finite and > 0.0",
+                    ));
                 }
             }
             PolicyConfig::Bucket {
@@ -1067,26 +1060,26 @@ impl ConfigValidator {
                 bucket_adjust_interval_secs,
             } => {
                 if !balance_rel_threshold.is_finite() || *balance_rel_threshold < 1.0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "balance_rel_threshold".to_string(),
-                        value: balance_rel_threshold.to_string(),
-                        reason: "Must be finite and >= 1.0".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "balance_rel_threshold",
+                        balance_rel_threshold,
+                        "Must be finite and >= 1.0",
+                    ));
                 }
 
                 if *bucket_adjust_interval_secs < 1 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "bucket_adjust_interval_secs".to_string(),
-                        value: bucket_adjust_interval_secs.to_string(),
-                        reason: "Must be >= 1s".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "bucket_adjust_interval_secs",
+                        bucket_adjust_interval_secs,
+                        "Must be >= 1s",
+                    ));
                 }
                 if *bucket_adjust_interval_secs >= 4294967296 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "bucket_adjust_interval_secs".to_string(),
-                        value: bucket_adjust_interval_secs.to_string(),
-                        reason: "Must be < 4294967296s".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "bucket_adjust_interval_secs",
+                        bucket_adjust_interval_secs,
+                        "Must be < 4294967296s",
+                    ));
                 }
             }
             PolicyConfig::PrefixHash {
@@ -1096,19 +1089,19 @@ impl ConfigValidator {
                 cache_boundaries,
             } => {
                 if *prefix_token_count == 0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "prefix_token_count".to_string(),
-                        value: prefix_token_count.to_string(),
-                        reason: "Must be > 0".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "prefix_token_count",
+                        prefix_token_count,
+                        "Must be > 0",
+                    ));
                 }
 
                 if !load_factor.is_finite() || *load_factor < 1.0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "load_factor".to_string(),
-                        value: load_factor.to_string(),
-                        reason: "Must be finite and >= 1.0".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "load_factor",
+                        load_factor,
+                        "Must be finite and >= 1.0",
+                    ));
                 }
 
                 Self::validate_cache_boundaries(cache_boundaries)?;
@@ -1119,18 +1112,18 @@ impl ConfigValidator {
 
     fn validate_cache_boundaries(boundaries: &[usize]) -> ConfigResult<()> {
         if boundaries.first() == Some(&0) {
-            return Err(ConfigError::InvalidValue {
-                field: "cache_boundaries".to_string(),
-                value: "0".to_string(),
-                reason: "Boundaries must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "cache_boundaries",
+                "0",
+                "Boundaries must be > 0",
+            ));
         }
         if boundaries.windows(2).any(|w| w[0] >= w[1]) {
-            return Err(ConfigError::InvalidValue {
-                field: "cache_boundaries".to_string(),
-                value: format!("{boundaries:?}"),
-                reason: "Boundaries must be strictly ascending".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "cache_boundaries",
+                format!("{boundaries:?}"),
+                "Boundaries must be strictly ascending",
+            ));
         }
         Ok(())
     }
@@ -1149,11 +1142,7 @@ impl ConfigValidator {
 
     fn validate_server_settings(config: &RouterConfig) -> ConfigResult<()> {
         if let Err(reason) = parse_bind_host(&config.host) {
-            return Err(ConfigError::InvalidValue {
-                field: "host".to_string(),
-                value: config.host.clone(),
-                reason,
-            });
+            return Err(ConfigError::invalid_value("host", &config.host, reason));
         }
 
         // The RDMA pixel lane's listener: an IP address or nothing (blank is
@@ -1165,20 +1154,16 @@ impl ConfigValidator {
             .filter(|ip| !ip.trim().is_empty())
         {
             if let Err(reason) = parse_listen_ip(ip) {
-                return Err(ConfigError::InvalidValue {
-                    field: "rdma_listen_ip".to_string(),
-                    value: ip.to_string(),
-                    reason,
-                });
+                return Err(ConfigError::invalid_value("rdma_listen_ip", ip, reason));
             }
         }
 
         if config.port == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "port".to_string(),
-                value: config.port.to_string(),
-                reason: "Port must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "port",
+                config.port,
+                "Port must be > 0",
+            ));
         }
 
         // Reject a configured dedicated probe port of 0: 0 means "OS-assigned
@@ -1187,41 +1172,34 @@ impl ConfigValidator {
         // itself still accepts 0 so the ephemeral-port unit tests can bind;
         // only the config-sourced value is rejected here.)
         if config.health_check_port == Some(0) {
-            return Err(ConfigError::InvalidValue {
-                field: "health_check_port".to_string(),
-                value: "0".to_string(),
-                reason: "Port must be > 0 (0 would request an unstable OS-ephemeral port)"
-                    .to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "health_check_port",
+                "0",
+                "Port must be > 0 (0 would request an unstable OS-ephemeral port)",
+            ));
         }
 
         // The admin listener: a port of 0 would be an unstable ephemeral one
         // (as for the probe listener), a host without a port names a listener
         // that does not exist, and the host must be a bind host.
         if config.admin_port == Some(0) {
-            return Err(ConfigError::InvalidValue {
-                field: "admin_port".to_string(),
-                value: "0".to_string(),
-                reason: "Port must be > 0 (0 would request an unstable OS-ephemeral port)"
-                    .to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "admin_port",
+                "0",
+                "Port must be > 0 (0 would request an unstable OS-ephemeral port)",
+            ));
         }
         if let Some(admin_host) = &config.admin_host {
             if config.admin_port.is_none() {
-                return Err(ConfigError::InvalidValue {
-                    field: "admin_host".to_string(),
-                    value: admin_host.clone(),
-                    reason: "--admin-host needs --admin-port: the admin listener exists only \
-                             with a port"
-                        .to_string(),
-                });
+                return Err(ConfigError::invalid_value(
+                    "admin_host",
+                    admin_host,
+                    "--admin-host needs --admin-port: the admin listener exists only \
+                             with a port",
+                ));
             }
             if let Err(reason) = parse_bind_host(admin_host) {
-                return Err(ConfigError::InvalidValue {
-                    field: "admin_host".to_string(),
-                    value: admin_host.clone(),
-                    reason,
-                });
+                return Err(ConfigError::invalid_value("admin_host", admin_host, reason));
             }
         }
 
@@ -1246,19 +1224,19 @@ impl ConfigValidator {
         validate_distinct_listener_ports(&listeners)?;
 
         if config.max_payload_size == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "max_payload_size".to_string(),
-                value: config.max_payload_size.to_string(),
-                reason: "Must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "max_payload_size",
+                config.max_payload_size,
+                "Must be > 0",
+            ));
         }
 
         if config.mm_per_request_image_limit == Some(0) {
-            return Err(ConfigError::InvalidValue {
-                field: "mm_per_request_image_limit".to_string(),
-                value: "0".to_string(),
-                reason: "Must be at least 1".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "mm_per_request_image_limit",
+                "0",
+                "Must be at least 1",
+            ));
         }
 
         // The async runtime builder panics on zero worker threads; refuse it
@@ -1272,22 +1250,22 @@ impl ConfigValidator {
         // oversubscription of the host's CPUs is a warning at start-up.
         match config.runtime_worker_threads {
             Some(0) => {
-                return Err(ConfigError::InvalidValue {
-                    field: "runtime_worker_threads".to_string(),
-                    value: "0".to_string(),
-                    reason: "Must be >= 1".to_string(),
-                });
+                return Err(ConfigError::invalid_value(
+                    "runtime_worker_threads",
+                    "0",
+                    "Must be >= 1",
+                ));
             }
             Some(threads) if threads > RUNTIME_WORKER_THREADS_CEILING => {
-                return Err(ConfigError::InvalidValue {
-                    field: "runtime_worker_threads".to_string(),
-                    value: threads.to_string(),
-                    reason: format!(
+                return Err(ConfigError::invalid_value(
+                    "runtime_worker_threads",
+                    threads,
+                    format!(
                         "Must be at most {RUNTIME_WORKER_THREADS_CEILING} (a worker thread is a \
                          stack and a thread the scheduler wakes; a count this size is a typo or \
                          a misread unit)"
                     ),
-                });
+                ));
             }
             Some(_) | None => {}
         }
@@ -1299,18 +1277,18 @@ impl ConfigValidator {
         // the same guarantees (zero panics at channel construction; unbounded
         // values are allocation hazards).
         if !(1..=1_000_000).contains(&config.job_queue_capacity) {
-            return Err(ConfigError::InvalidValue {
-                field: "job_queue_capacity".to_string(),
-                value: config.job_queue_capacity.to_string(),
-                reason: "Must be in 1..=1000000".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "job_queue_capacity",
+                config.job_queue_capacity,
+                "Must be in 1..=1000000",
+            ));
         }
         if !(1..=100_000).contains(&config.job_queue_concurrency) {
-            return Err(ConfigError::InvalidValue {
-                field: "job_queue_concurrency".to_string(),
-                value: config.job_queue_concurrency.to_string(),
-                reason: "Must be in 1..=100000".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "job_queue_concurrency",
+                config.job_queue_concurrency,
+                "Must be in 1..=100000",
+            ));
         }
 
         // Overload thresholds are `>=` comparisons, so the excluded ends of
@@ -1318,28 +1296,28 @@ impl ConfigValidator {
         // unconditionally. Mirrors the CLI parsers for the config-file and
         // bindings paths.
         if config.worker_overload_waiting_requests == Some(0) {
-            return Err(ConfigError::InvalidValue {
-                field: "worker_overload_waiting_requests".to_string(),
-                value: "0".to_string(),
-                reason: "Must be >= 1 (0 would mark every worker overloaded)".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "worker_overload_waiting_requests",
+                "0",
+                "Must be >= 1 (0 would mark every worker overloaded)",
+            ));
         }
         if let Some(threshold) = config.worker_overload_token_usage {
             if !threshold.is_finite() || threshold <= 0.0 || threshold > 1.0 {
-                return Err(ConfigError::InvalidValue {
-                    field: "worker_overload_token_usage".to_string(),
-                    value: threshold.to_string(),
-                    reason: "Must be a fraction in (0.0, 1.0]".to_string(),
-                });
+                return Err(ConfigError::invalid_value(
+                    "worker_overload_token_usage",
+                    threshold,
+                    "Must be a fraction in (0.0, 1.0]",
+                ));
             }
         }
 
         if config.request_timeout_secs == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "request_timeout_secs".to_string(),
-                value: config.request_timeout_secs.to_string(),
-                reason: "Must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "request_timeout_secs",
+                config.request_timeout_secs,
+                "Must be > 0",
+            ));
         }
 
         // The connection limit is a semaphore's permit count, and the
@@ -1347,54 +1325,54 @@ impl ConfigValidator {
         // a named configuration error here instead, for the config-file and
         // bindings paths as much as the CLI.
         if config.max_connections > Semaphore::MAX_PERMITS {
-            return Err(ConfigError::InvalidValue {
-                field: "max_connections".to_string(),
-                value: config.max_connections.to_string(),
-                reason: format!("Must be at most {} (0 = no bound)", Semaphore::MAX_PERMITS),
-            });
+            return Err(ConfigError::invalid_value(
+                "max_connections",
+                config.max_connections,
+                format!("Must be at most {} (0 = no bound)", Semaphore::MAX_PERMITS),
+            ));
         }
 
         if config.queue_size > 0 && config.queue_timeout_secs == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "queue_timeout_secs".to_string(),
-                value: config.queue_timeout_secs.to_string(),
-                reason: "Must be > 0 when queue_size > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "queue_timeout_secs",
+                config.queue_timeout_secs,
+                "Must be > 0 when queue_size > 0",
+            ));
         }
 
         if let Some(tokens_per_second) = config.rate_limit_tokens_per_second {
             // Allow 0 for pure concurrency limiting (semaphore behavior)
             if tokens_per_second < 0 {
-                return Err(ConfigError::InvalidValue {
-                    field: "rate_limit_tokens_per_second".to_string(),
-                    value: tokens_per_second.to_string(),
-                    reason: "Must be >= 0 when specified".to_string(),
-                });
+                return Err(ConfigError::invalid_value(
+                    "rate_limit_tokens_per_second",
+                    tokens_per_second,
+                    "Must be >= 0 when specified",
+                ));
             }
         }
 
         if config.worker_startup_timeout_secs == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "worker_startup_timeout_secs".to_string(),
-                value: config.worker_startup_timeout_secs.to_string(),
-                reason: "Must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "worker_startup_timeout_secs",
+                config.worker_startup_timeout_secs,
+                "Must be > 0",
+            ));
         }
 
         if config.worker_startup_check_interval_secs == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "worker_startup_check_interval_secs".to_string(),
-                value: config.worker_startup_check_interval_secs.to_string(),
-                reason: "Must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "worker_startup_check_interval_secs",
+                config.worker_startup_check_interval_secs,
+                "Must be > 0",
+            ));
         }
 
         if config.load_monitor_interval_secs == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "load_monitor_interval_secs".to_string(),
-                value: config.load_monitor_interval_secs.to_string(),
-                reason: "Must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "load_monitor_interval_secs",
+                config.load_monitor_interval_secs,
+                "Must be > 0",
+            ));
         }
 
         Ok(())
@@ -1405,10 +1383,8 @@ impl ConfigValidator {
     /// launcher and library callers (`RouterConfig::builder().build()`)
     /// refuse the same values by name as `smg launch` does.
     fn validate_cors_allowed_origins(config: &RouterConfig) -> ConfigResult<()> {
-        let invalid = |origin: &str, reason: &str| ConfigError::InvalidValue {
-            field: "cors_allowed_origins".to_string(),
-            value: origin.to_string(),
-            reason: reason.to_string(),
+        let invalid = |origin: &str, reason: &str| {
+            ConfigError::invalid_value("cors_allowed_origins", origin, reason)
         };
         for origin in &config.cors_allowed_origins {
             // A lone `*` is the open policy; next to an origin it would be
@@ -1465,11 +1441,7 @@ impl ConfigValidator {
         let Some(log_dir) = config.log_dir.as_deref() else {
             return Ok(());
         };
-        let invalid = |reason: String| ConfigError::InvalidValue {
-            field: "log_dir".to_string(),
-            value: log_dir.to_string(),
-            reason,
-        };
+        let invalid = |reason: String| ConfigError::invalid_value("log_dir", log_dir, reason);
         if log_dir.trim().is_empty() {
             return Err(invalid("must name a directory".to_string()));
         }
@@ -1547,35 +1519,32 @@ impl ConfigValidator {
         };
         match value.trim().to_ascii_lowercase().as_str() {
             "chain" => Ok(()),
-            "positional" => Err(ConfigError::InvalidValue {
-                field: "kv_index".to_string(),
-                value: value.to_string(),
-                reason: "the positional KV index was removed (kv-index 2.0.0): the chain index \
-                         is the only KV index, drop kv_index"
-                    .to_string(),
-            }),
-            _ => Err(ConfigError::InvalidValue {
-                field: "kv_index".to_string(),
-                value: value.to_string(),
-                reason: "the chain index is the only KV index, so kv_index takes chain only \
-                         (and is deprecated)"
-                    .to_string(),
-            }),
+            "positional" => Err(ConfigError::invalid_value(
+                "kv_index",
+                value,
+                "the positional KV index was removed (kv-index 2.0.0): the chain index \
+                         is the only KV index, drop kv_index",
+            )),
+            _ => Err(ConfigError::invalid_value(
+                "kv_index",
+                value,
+                "the chain index is the only KV index, so kv_index takes chain only \
+                         (and is deprecated)",
+            )),
         }
     }
 
     fn validate_rl(config: &RouterConfig) -> ConfigResult<()> {
-        config
-            .rl
-            .validate()
-            .map_err(|reason| ConfigError::InvalidValue {
-                field: "rl".to_string(),
-                value: format!(
+        config.rl.validate().map_err(|reason| {
+            ConfigError::invalid_value(
+                "rl",
+                format!(
                     "control_timeout_secs={} fanout_concurrency={}",
                     config.rl.control_timeout_secs, config.rl.fanout_concurrency
                 ),
                 reason,
-            })
+            )
+        })
     }
 
     fn validate_discovery(discovery: &DiscoveryConfig, mode: &RoutingMode) -> ConfigResult<()> {
@@ -1595,19 +1564,19 @@ impl ConfigValidator {
         mode: &RoutingMode,
     ) -> ConfigResult<()> {
         if discovery.path.as_os_str().is_empty() {
-            return Err(ConfigError::InvalidValue {
-                field: "discovery.path".to_string(),
-                value: String::new(),
-                reason: "File discovery needs a manifest path".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "discovery.path",
+                String::new(),
+                "File discovery needs a manifest path",
+            ));
         }
 
         if discovery.check_interval_secs == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "discovery.check_interval_secs".to_string(),
-                value: discovery.check_interval_secs.to_string(),
-                reason: "Must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "discovery.check_interval_secs",
+                discovery.check_interval_secs,
+                "Must be > 0",
+            ));
         }
 
         let unsupported = match mode {
@@ -1628,19 +1597,19 @@ impl ConfigValidator {
         mode: &RoutingMode,
     ) -> ConfigResult<()> {
         if discovery.port == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "discovery.port".to_string(),
-                value: discovery.port.to_string(),
-                reason: "Port must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "discovery.port",
+                discovery.port,
+                "Port must be > 0",
+            ));
         }
 
         if discovery.check_interval_secs == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "discovery.check_interval_secs".to_string(),
-                value: discovery.check_interval_secs.to_string(),
-                reason: "Must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "discovery.check_interval_secs",
+                discovery.check_interval_secs,
+                "Must be > 0",
+            ));
         }
 
         for (field, value) in [
@@ -1655,12 +1624,11 @@ impl ConfigValidator {
         ] {
             let trimmed = value.trim();
             if trimmed.is_empty() || trimmed != value {
-                return Err(ConfigError::InvalidValue {
-                    field: field.to_string(),
-                    value: value.clone(),
-                    reason: "Annotation name must not be empty or padded with whitespace"
-                        .to_string(),
-                });
+                return Err(ConfigError::invalid_value(
+                    field,
+                    value,
+                    "Annotation name must not be empty or padded with whitespace",
+                ));
             }
         }
 
@@ -1712,28 +1680,27 @@ impl ConfigValidator {
 
     fn validate_metrics(metrics: &MetricsConfig) -> ConfigResult<()> {
         if metrics.port == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "metrics.port".to_string(),
-                value: metrics.port.to_string(),
-                reason: "Port must be > 0 (0 would request an unstable OS-ephemeral port)"
-                    .to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "metrics.port",
+                metrics.port,
+                "Port must be > 0 (0 would request an unstable OS-ephemeral port)",
+            ));
         }
 
         if metrics.host.is_empty() {
-            return Err(ConfigError::InvalidValue {
-                field: "metrics.host".to_string(),
-                value: metrics.host.clone(),
-                reason: "Host cannot be empty".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "metrics.host",
+                &metrics.host,
+                "Host cannot be empty",
+            ));
         }
 
         if let Err(reason) = parse_bind_host(&metrics.host) {
-            return Err(ConfigError::InvalidValue {
-                field: "metrics.host".to_string(),
-                value: metrics.host.clone(),
+            return Err(ConfigError::invalid_value(
+                "metrics.host",
+                &metrics.host,
                 reason,
-            });
+            ));
         }
 
         Ok(())
@@ -1745,10 +1712,8 @@ impl ConfigValidator {
         }
 
         let endpoint = &trace_config.otlp_traces_endpoint;
-        let invalid = |reason: String| ConfigError::InvalidValue {
-            field: "trace_config.otlp_traces_endpoint".to_string(),
-            value: endpoint.clone(),
-            reason,
+        let invalid = |reason: String| {
+            ConfigError::invalid_value("trace_config.otlp_traces_endpoint", endpoint, reason)
         };
         const EXPECTED: &str = "expected <host>:<port> or http(s)://<host>:<port>, with an \
                                 IPv6 literal in brackets, e.g. otel-collector:4317, \
@@ -1805,71 +1770,71 @@ impl ConfigValidator {
 
     fn validate_retry(retry: &RetryConfig) -> ConfigResult<()> {
         if retry.max_retries < 1 {
-            return Err(ConfigError::InvalidValue {
-                field: "retry.max_retries".to_string(),
-                value: retry.max_retries.to_string(),
-                reason: "Must be >= 1 (set to 1 to effectively disable retries)".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "retry.max_retries",
+                retry.max_retries,
+                "Must be >= 1 (set to 1 to effectively disable retries)",
+            ));
         }
         if retry.initial_backoff_ms == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "retry.initial_backoff_ms".to_string(),
-                value: retry.initial_backoff_ms.to_string(),
-                reason: "Must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "retry.initial_backoff_ms",
+                retry.initial_backoff_ms,
+                "Must be > 0",
+            ));
         }
         if retry.max_backoff_ms < retry.initial_backoff_ms {
-            return Err(ConfigError::InvalidValue {
-                field: "retry.max_backoff_ms".to_string(),
-                value: retry.max_backoff_ms.to_string(),
-                reason: "Must be >= initial_backoff_ms".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "retry.max_backoff_ms",
+                retry.max_backoff_ms,
+                "Must be >= initial_backoff_ms",
+            ));
         }
         if !retry.backoff_multiplier.is_finite() || retry.backoff_multiplier < 1.0 {
-            return Err(ConfigError::InvalidValue {
-                field: "retry.backoff_multiplier".to_string(),
-                value: retry.backoff_multiplier.to_string(),
-                reason: "Must be finite and >= 1.0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "retry.backoff_multiplier",
+                retry.backoff_multiplier,
+                "Must be finite and >= 1.0",
+            ));
         }
         if !(0.0..=1.0).contains(&retry.jitter_factor) {
-            return Err(ConfigError::InvalidValue {
-                field: "retry.jitter_factor".to_string(),
-                value: retry.jitter_factor.to_string(),
-                reason: "Must be between 0.0 and 1.0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "retry.jitter_factor",
+                retry.jitter_factor,
+                "Must be between 0.0 and 1.0",
+            ));
         }
         Ok(())
     }
 
     fn validate_circuit_breaker(cb: &CircuitBreakerConfig) -> ConfigResult<()> {
         if cb.failure_threshold < 1 {
-            return Err(ConfigError::InvalidValue {
-                field: "circuit_breaker.failure_threshold".to_string(),
-                value: cb.failure_threshold.to_string(),
-                reason: "Must be >= 1 (set to u32::MAX to effectively disable CB)".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "circuit_breaker.failure_threshold",
+                cb.failure_threshold,
+                "Must be >= 1 (set to u32::MAX to effectively disable CB)",
+            ));
         }
         if cb.success_threshold < 1 {
-            return Err(ConfigError::InvalidValue {
-                field: "circuit_breaker.success_threshold".to_string(),
-                value: cb.success_threshold.to_string(),
-                reason: "Must be >= 1".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "circuit_breaker.success_threshold",
+                cb.success_threshold,
+                "Must be >= 1",
+            ));
         }
         if cb.timeout_duration_secs == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "circuit_breaker.timeout_duration_secs".to_string(),
-                value: cb.timeout_duration_secs.to_string(),
-                reason: "Must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "circuit_breaker.timeout_duration_secs",
+                cb.timeout_duration_secs,
+                "Must be > 0",
+            ));
         }
         if cb.window_duration_secs == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "circuit_breaker.window_duration_secs".to_string(),
-                value: cb.window_duration_secs.to_string(),
-                reason: "Must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "circuit_breaker.window_duration_secs",
+                cb.window_duration_secs,
+                "Must be > 0",
+            ));
         }
         Ok(())
     }
@@ -1884,12 +1849,11 @@ impl ConfigValidator {
     /// still sleeps on it between connect signals.
     fn validate_health_check(health_check: &HealthCheckConfig) -> ConfigResult<()> {
         if !health_check.endpoint.starts_with('/') {
-            return Err(ConfigError::InvalidValue {
-                field: "health_check.endpoint".to_string(),
-                value: health_check.endpoint.clone(),
-                reason: "must start with '/': it is appended to every HTTP worker's URL"
-                    .to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "health_check.endpoint",
+                &health_check.endpoint,
+                "must start with '/': it is appended to every HTTP worker's URL",
+            ));
         }
         let knobs = [
             (
@@ -1916,11 +1880,11 @@ impl ConfigValidator {
         ];
         for (field, value, consequence) in knobs {
             if value == 0 {
-                return Err(ConfigError::InvalidValue {
-                    field: field.to_string(),
-                    value: value.to_string(),
-                    reason: format!("Must be >= 1 ({consequence})"),
-                });
+                return Err(ConfigError::invalid_value(
+                    field,
+                    value,
+                    format!("Must be >= 1 ({consequence})"),
+                ));
             }
         }
         Ok(())
@@ -1928,27 +1892,27 @@ impl ConfigValidator {
 
     fn validate_tokenizer_cache(cache: &TokenizerCacheConfig) -> ConfigResult<()> {
         if cache.enable_l0 && cache.l0_max_entries == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "tokenizer_cache.l0_max_entries".to_string(),
-                value: cache.l0_max_entries.to_string(),
-                reason: "Must be > 0 when L0 cache is enabled".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "tokenizer_cache.l0_max_entries",
+                cache.l0_max_entries,
+                "Must be > 0 when L0 cache is enabled",
+            ));
         }
 
         if cache.enable_l0 && cache.l0_max_memory == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "tokenizer_cache.l0_max_memory".to_string(),
-                value: cache.l0_max_memory.to_string(),
-                reason: "Must be > 0 when L0 cache is enabled".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "tokenizer_cache.l0_max_memory",
+                cache.l0_max_memory,
+                "Must be > 0 when L0 cache is enabled",
+            ));
         }
 
         if cache.enable_l1 && cache.l1_max_memory == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "tokenizer_cache.l1_max_memory".to_string(),
-                value: cache.l1_max_memory.to_string(),
-                reason: "Must be > 0 when L1 cache is enabled".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "tokenizer_cache.l1_max_memory",
+                cache.l1_max_memory,
+                "Must be > 0 when L1 cache is enabled",
+            ));
         }
 
         Ok(())
@@ -1984,20 +1948,13 @@ impl ConfigValidator {
                 Ok(()) => {}
                 Err(SourceProblem::Missing) if a_grpc_worker_may_register(config) => {}
                 Err(problem) => {
-                    return Err(ConfigError::InvalidValue {
-                        field: field.to_string(),
-                        value: source.to_string(),
-                        reason: problem.reason(),
-                    });
+                    return Err(ConfigError::invalid_value(field, source, problem.reason()));
                 }
             }
         }
         if let Some(template) = config.chat_template.as_deref() {
-            text_file_error(Path::new(template)).map_err(|reason| ConfigError::InvalidValue {
-                field: "chat_template".to_string(),
-                value: template.to_string(),
-                reason,
-            })?;
+            text_file_error(Path::new(template))
+                .map_err(|reason| ConfigError::invalid_value("chat_template", template, reason))?;
         }
         Ok(())
     }
