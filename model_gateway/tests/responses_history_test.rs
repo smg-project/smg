@@ -407,12 +407,13 @@ async fn a_conversation_longer_than_the_history_window_reaches_the_engine_with_i
     engine.abort();
 }
 
-/// A conversation one item longer than the window, whose first two items are
-/// a call and its output: the window begins at the output, which answers a
-/// call the engine would not see, so it is left out; the next call and its
-/// output reach the engine in order, in front of the messages.
+/// A conversation one item longer than the window, whose first items are two
+/// calls with their outputs: the window begins at the first output, inside a
+/// turn the engine would not see the start of. The engine receives the window
+/// from its first user message; the output before it and the call with its
+/// output after it go with the turn the cut split.
 #[tokio::test]
-async fn a_history_window_that_begins_at_a_tool_output_leaves_it_out() {
+async fn a_history_window_that_begins_inside_a_turn_reaches_the_engine_from_its_user_message() {
     let (app, requests, engine) = app().await;
 
     let (status, conversation) = call(&app, Method::POST, "/v1/conversations", json!({})).await;
@@ -449,14 +450,16 @@ async fn a_history_window_that_begins_at_a_tool_output_leaves_it_out() {
     assert_eq!(response["status"], "completed", "{response}");
 
     let turns = last_prompt_turns(&requests);
-    assert_eq!(
-        &turns[..3],
-        ["assistant+calls:call_B", "tool:call_B", "user"],
+    assert_eq!(turns[0], "user", "{turns:?}");
+    assert!(
+        !turns
+            .iter()
+            .any(|turn| turn.starts_with("assistant+calls") || turn.starts_with("tool:")),
         "{turns:?}"
     );
-    assert!(!turns.contains(&"tool:call_A".to_string()), "{turns:?}");
-    // call_A is before the window, its output left out, the rest replays
-    assert_eq!(turns.len(), 101 - 2 + 1, "{turns:?}");
+    // the calls and outputs are the tail of the turn the cut split: the
+    // messages reach the engine, then the request
+    assert_eq!(turns.len(), 101 - 4 + 1, "{turns:?}");
     assert_eq!(
         last_prompt_texts(&requests).last().map(String::as_str),
         Some("item 102")

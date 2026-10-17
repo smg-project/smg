@@ -4034,21 +4034,25 @@ pub fn without_outputs_of_missing_calls(
         .collect()
 }
 
-/// `items` from their first turn boundary on: a message the client sent (a
-/// user, developer or system message), or a tool call with its output (one
-/// an output among them answers, one that carries its output, a hosted
-/// call), with the reasoning right before that call. The newest items of a
-/// long conversation can begin inside a turn, with the tail of a turn whose
-/// request is not among them: the answer to a question the model does not
-/// see, the output of a call it did not make. What is before the first
-/// boundary is left out; items with no boundary come back as they are.
+/// `items` from their first turn boundary on: the first message the client
+/// sent (a user, developer or system message), or, when no client message is
+/// among them (one long turn of the model's calls), the first tool call with
+/// its output (one an output among them answers, one that carries its
+/// output, a hosted call with its output or its failure), with the reasoning
+/// right before that call. The newest items of a long conversation can begin
+/// inside a turn, with the tail of a turn whose request is not among them:
+/// the answer to a question the model does not see, the output of a call it
+/// did not make. What is before the first boundary is left out, a call with
+/// its output before the client's first message included (it is the tail of
+/// the turn the cut split, and a strict chat template reads a conversation
+/// that opens with the client); items with no boundary come back as they are.
 pub fn from_turn_boundary(items: Vec<ResponseInputOutputItem>) -> Vec<ResponseInputOutputItem> {
-    let boundary = {
+    let boundary = items.iter().position(is_client_message).or_else(|| {
         let answered: HashSet<&str> = items.iter().filter_map(tool_output_call_id).collect();
         items
             .iter()
-            .position(|item| is_client_message(item) || is_answered_call(item, &answered))
-    };
+            .position(|item| is_answered_call(item, &answered))
+    });
     let Some(boundary) = boundary else {
         return items;
     };
@@ -4077,13 +4081,19 @@ fn is_client_message(item: &ResponseInputOutputItem) -> bool {
 
 /// Whether `item` is a tool call with its output: a call an output among the
 /// items answers (`answered` holds their call ids), a call that carries its
-/// output, or a hosted call (its output, or its failure, is in the item).
+/// output, or a hosted call whose output, or whose failure, is in the item
+/// (one still in progress is a call without its output).
 fn is_answered_call(item: &ResponseInputOutputItem, answered: &HashSet<&str>) -> bool {
     match item {
         ResponseInputOutputItem::FunctionToolCall {
             output: Some(_), ..
-        }
-        | ResponseInputOutputItem::McpCall { .. } => true,
+        } => true,
+        ResponseInputOutputItem::McpCall {
+            output,
+            error,
+            status,
+            ..
+        } => output.is_some() || error.is_some() || status.as_deref() == Some("failed"),
         _ => tool_call_id(item).is_some_and(|call_id| answered.contains(call_id)),
     }
 }
@@ -4590,8 +4600,35 @@ mod tests {
         );
     }
 
-    /// A hosted call carries its output and is a boundary; a window with no
-    /// boundary, and one already at a boundary, come back as they are.
+    /// A call with its output before the client's first message is the tail
+    /// of the turn the cut split: the window begins at that message, not at
+    /// the call, whichever row the cut landed on.
+    #[test]
+    fn from_turn_boundary_passes_a_call_with_its_output_before_the_first_client_message() {
+        let items = items(serde_json::json!([
+            {"type": "function_call", "call_id": "call_13", "name": "calc",
+             "arguments": "{}", "status": "completed"},
+            {"type": "function_call_output", "call_id": "call_13", "output": "1"},
+            {"type": "message", "id": "msg_1", "role": "assistant",
+             "content": [{"type": "output_text", "text": "the answer of turn 13", "annotations": []}]},
+            {"type": "message", "id": "msg_2", "role": "user",
+             "content": [{"type": "input_text", "text": "turn 14"}]},
+            {"type": "function_call", "call_id": "call_14", "name": "calc",
+             "arguments": "{}", "status": "completed"},
+            {"type": "function_call_output", "call_id": "call_14", "output": "2"},
+        ]));
+
+        let kept = from_turn_boundary(items);
+
+        assert_eq!(
+            kinds(&kept),
+            ["message:user", "function_call", "function_call_output"]
+        );
+    }
+
+    /// A hosted call with its output, or with its failure, is a boundary; one
+    /// still in progress is a call without its output and is none. A window
+    /// with no boundary, and one already at a boundary, come back as they are.
     #[test]
     fn from_turn_boundary_takes_a_hosted_call_and_keeps_a_window_without_one() {
         let answer = |text: &str| {
@@ -4607,6 +4644,28 @@ mod tests {
         assert_eq!(
             kinds(&from_turn_boundary(hosted)),
             ["mcp_call", "message:assistant"]
+        );
+
+        let failed = items(serde_json::json!([
+            answer("the tail of a turn"),
+            {"type": "mcp_call", "id": "mcp_1", "name": "search", "server_label": "docs",
+             "arguments": "{}", "status": "failed"},
+            answer("it failed"),
+        ]));
+        assert_eq!(
+            kinds(&from_turn_boundary(failed)),
+            ["mcp_call", "message:assistant"]
+        );
+
+        let in_progress = items(serde_json::json!([
+            answer("the tail of a turn"),
+            {"type": "mcp_call", "id": "mcp_1", "name": "search", "server_label": "docs",
+             "arguments": "{}", "status": "in_progress"},
+            answer("still looking"),
+        ]));
+        assert_eq!(
+            kinds(&from_turn_boundary(in_progress)),
+            ["message:assistant", "mcp_call", "message:assistant"]
         );
 
         let tail_only = items(serde_json::json!([

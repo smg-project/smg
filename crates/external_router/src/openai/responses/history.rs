@@ -509,11 +509,13 @@ mod tests {
         assert_eq!(shape(&items), expected);
     }
 
-    /// A conversation one item longer than the limit: its window begins at
-    /// the second item, the output of a call before the window, which is
-    /// left out; the call and the output inside the window stay, in order.
+    /// A conversation one item longer than the limit, whose first items are
+    /// two calls with their outputs: its window begins at the first output,
+    /// inside a turn whose request is before the window. The window replays
+    /// from its first client message; the output of the call before it and
+    /// the call with its output after it go with the turn the cut split.
     #[tokio::test]
-    async fn a_cut_window_leaves_out_the_output_of_a_call_before_it() {
+    async fn a_cut_window_begins_at_its_first_client_message() {
         let components = components().await;
         let mut rows = vec![
             call_row("call_A"),
@@ -527,18 +529,14 @@ mod tests {
         let items = loaded_input(&components, "item 102").await;
 
         let kinds = shape(&items);
-        assert_eq!(
-            &kinds[..3],
-            [
-                "function_call:call_B",
-                "function_call_output:call_B",
-                "user:item 5"
-            ],
+        assert_eq!(kinds[0], "user:item 5", "{kinds:?}");
+        assert!(
+            !kinds.iter().any(|kind| kind.starts_with("function_call")),
             "{kinds:?}"
         );
-        assert!(!kinds.contains(&"function_call_output:call_A".to_string()));
-        // call_A is before the window, its output left out, the rest replays
-        assert_eq!(items.len(), 101 - 2 + 1);
+        // the calls and outputs are the tail of the turn the cut split: the
+        // messages replay, then the request
+        assert_eq!(items.len(), 101 - 4 + 1);
         assert_eq!(kinds.last().map(String::as_str), Some("user:item 102"));
     }
 
