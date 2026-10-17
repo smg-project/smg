@@ -410,7 +410,11 @@ fn fresh_in_rank_space(
 /// it; a label the operator set or overrode (its value differs from what
 /// discovery read, or discovery never read it) keeps its value; a key the
 /// engine reports for the first time is added unless the operator already
-/// set it.
+/// set it. The result then passes through the merge registration and a
+/// label update make (`merge_labels`, the operator's labels on top): a
+/// running window the operator set by hand stays the worker's only window,
+/// so the engine's figure under the other window name, which the reader
+/// would prefer, is not added beside it.
 pub(crate) fn refreshed_labels(
     current: &HashMap<String, String>,
     discovered_before: &HashMap<String, String>,
@@ -436,7 +440,12 @@ pub(crate) fn refreshed_labels(
             labels.insert(key.clone(), now.clone());
         }
     }
-    labels
+    let by_hand: HashMap<String, String> = current
+        .iter()
+        .filter(|(key, value)| discovered_before.get(*key) != Some(*value))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    merge_labels(&labels, &by_hand)
 }
 
 #[cfg(test)]
@@ -513,6 +522,40 @@ mod refreshed_labels_tests {
         assert_eq!(
             refreshed_labels(&current, &discovered, &fresh),
             map(&[("weight_version", "pinned"), ("vocab_size", "32000")]),
+        );
+    }
+
+    #[test]
+    fn a_window_the_operator_set_stays_the_only_window_when_the_engine_names_the_other() {
+        // Registration read nothing (or answered during the load without the
+        // window) and the operator set the window under the name the reader
+        // prefers less; the engine's first report names it under the other.
+        let discovered = HashMap::new();
+        let current = map(&[("max_running_requests", "64")]);
+        let fresh = map(&[("max_num_seqs", "256"), ("page_size", "128")]);
+        assert_eq!(
+            refreshed_labels(&current, &discovered, &fresh),
+            map(&[("max_running_requests", "64"), ("page_size", "128")]),
+            "the engine's window under the other name is not added beside the operator's"
+        );
+        // The same window name the operator overrode: the operator's value, as
+        // registration and a label update keep it.
+        let discovered = map(&[("max_num_seqs", "256")]);
+        let current = map(&[("max_num_seqs", "64")]);
+        let fresh = map(&[("max_num_seqs", "512"), ("max_running_requests", "512")]);
+        assert_eq!(
+            refreshed_labels(&current, &discovered, &fresh),
+            map(&[("max_num_seqs", "64")]),
+            "a hand-set window drops the engine's figure under either name"
+        );
+        // A window discovery recorded and the operator left alone follows the
+        // engine under the same name, as before.
+        let discovered = map(&[("max_num_seqs", "256")]);
+        let current = map(&[("max_num_seqs", "256")]);
+        let fresh = map(&[("max_num_seqs", "8")]);
+        assert_eq!(
+            refreshed_labels(&current, &discovered, &fresh),
+            map(&[("max_num_seqs", "8")]),
         );
     }
 }
