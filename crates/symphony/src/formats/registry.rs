@@ -185,8 +185,8 @@ impl Table {
 
     /// The other names a table answers to ([`Self::answering_to`]): the gateway's older tool and
     /// reasoning parsers that read the table's format, so that a deployment that names one
-    /// (`--tool-call-parser qwen_xml`, `--reasoning-parser qwen3_thinking`) reads with the table
-    /// (`qwen3_tagged`, `qwen3`) when the gateway reads with Symphony. The rule, so that a
+    /// (`--tool-call-parser qwen_xml`) reads with the table (`qwen3_tagged`) when the gateway
+    /// reads with Symphony. The rule, so that a
     /// deployment's existing flags keep a working parser when the gateway's default parser
     /// changes: every legacy tool-call or reasoning parser's name whose format a table reads is
     /// an alias of that table; a legacy name no table answers to keeps its own parser and is in
@@ -194,9 +194,8 @@ impl Table {
     /// as written, which no table reads for. A row may also be the name a downstream launcher
     /// passes for a model family whose table has no older parser (`muse` for `muse_spark`), so
     /// that the launcher's flags read with the table.
-    pub const ALIASES: [(&str, Table); 11] = [
+    pub const ALIASES: [(&str, Table); 10] = [
         ("qwen", Table::Qwen3),
-        ("qwen3_thinking", Table::Qwen3),
         ("qwen_xml", Table::Qwen3Tagged),
         ("qwen_coder", Table::Qwen3Tagged),
         ("nemotron", Table::Qwen3Tagged),
@@ -215,7 +214,7 @@ impl Table {
     /// unmapped, and a table that takes a name here removes its row. Under Symphony a tool-call
     /// name here keeps the legacy parsers, and a reasoning name here alone leaves the choice to
     /// the registry (`passthrough` excepted, which keeps the legacy parsers either way).
-    pub const UNANSWERED: [(&str, &str); 20] = [
+    pub const UNANSWERED: [(&str, &str); 21] = [
         (
             "passthrough",
             "leaves its channel as written, which no table reads for: the way back to the \
@@ -236,6 +235,12 @@ impl Table {
             "nano_v3",
             "a thought two tables' families share, qwen3_tagged (Nemotron 3) and llama_nemotron \
              (Llama Nemotron): the tool-call name, nemotron or json, or the registry decides",
+        ),
+        (
+            "qwen3_thinking",
+            "a thought two tables' families share, qwen3 (the Qwen3-2507 thinking line) and \
+             qwen3_tagged (Qwen 3.5 and later): the tool-call name, qwen or qwen_xml, or the \
+             registry decides",
         ),
         (
             "deepseek",

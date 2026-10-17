@@ -1848,7 +1848,6 @@ mod tests {
             ("gemma4", "gemma4"),
             ("qwen", "qwen3"),
             ("qwen3", "qwen3"),
-            ("qwen3_thinking", "qwen3"),
             ("qwen_xml", "qwen3_tagged"),
             ("qwen_coder", "qwen3_tagged"),
             ("nemotron", "qwen3_tagged"),
