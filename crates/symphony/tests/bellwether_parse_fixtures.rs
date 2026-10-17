@@ -797,6 +797,15 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::LlamaNemotron,
         GenerationPrompt::Plain,
     ),
+    // The Ultra 253B v1 template (not the CPT checkpoint's, which keeps Llama 3.1's own) renders
+    // neither a call nor a thought and keeps an assistant message from its `</think>` on: the set
+    // holds content alone, the reasoning probe was refused at record time, and the model writes
+    // `<think>` itself under its "detailed thinking on" system prompt, as the Nano does.
+    (
+        "llama-3-1-nemotron-ultra-253b-v1",
+        Family::LlamaNemotron,
+        GenerationPrompt::Plain,
+    ),
     // Qwen3's JSON calls under other templates (bellwether main 8029536af5): EXAONE 4.5 opens the
     // thought in the prompt under its own opener; AReaL-SEA and the tau2 SFT open it whatever the
     // request says; the boba-2 line and the tau2 user SFT leave it to the model.

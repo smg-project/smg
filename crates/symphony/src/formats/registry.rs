@@ -693,6 +693,18 @@ const GROUPS: &[Group] = &[
         opener: Some("<|start_header_id|>assistant<|end_header_id|>"),
     },
     Group {
+        model: "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1",
+        also: &[],
+        table: Table::LlamaNemotron,
+        opener: None,
+    },
+    Group {
+        model: "nvidia/Llama-3_3-Nemotron-Super-49B-v1",
+        also: &[],
+        table: Table::LlamaNemotron,
+        opener: None,
+    },
+    Group {
         model: "nvidia/Llama-3_3-Nemotron-Super-49B-v1_5",
         also: &[],
         table: Table::LlamaNemotron,
@@ -1271,6 +1283,20 @@ mod tests {
         assert_eq!(
             table_for("Qwen/Qwen2.5-VL-72B-Instruct"),
             Some(Table::Qwen2_5)
+        );
+        // The v1 Nemotron checkpoints, whose own template renders no call, read with the table
+        // their vendor's tool parser reads for; the CPT checkpoint keeps Llama 3.1's syntax.
+        assert_eq!(
+            table_for("nvidia/Llama-3_3-Nemotron-Super-49B-v1"),
+            Some(Table::LlamaNemotron)
+        );
+        assert_eq!(
+            table_for("nvidia/Llama-3_1-Nemotron-Ultra-253B-v1"),
+            Some(Table::LlamaNemotron)
+        );
+        assert_eq!(
+            table_for("nvidia/Llama-3_1-Nemotron-Ultra-253B-CPT-v1"),
+            Some(Table::Json)
         );
     }
 

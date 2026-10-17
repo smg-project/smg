@@ -153,8 +153,8 @@ with Symphony (a quantized or renamed checkpoint is not listed, and keeps the ol
 its group names it); whether the flags stay as aliases is an open question of the design.
 
 <!-- models: begin -->
-201 groups, 342 checkpoints, newest first.
-12 ready, 128 replaying a recorded set, 2 on main awaiting fixtures, 59 pending.
+202 groups, 343 checkpoints, newest first.
+12 ready, 129 replaying a recorded set, 3 on main awaiting fixtures, 58 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
@@ -331,13 +331,14 @@ its group names it); whether the flags stay as aliases is an open question of th
 | 2025-04-08 | [gemma-3-12b-it-qat-q4-0-unquantized](https://github.com/smg-project/bellwether/tree/main/fixtures/gemma-3-12b-it-qat-q4-0-unquantized) | google/gemma-3-12b-it-qat-q4_0-unquantized | gemma-3-27b-it-qat-q4_0-unquantized, gemma-3-4b-it-qat-q4_0-unquantized | — | 184,969 | pending | `json`, none |
 | 2025-04-08 | [llama-3-1-nemotron-ultra-253b-cpt-v1](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3-1-nemotron-ultra-253b-cpt-v1) | nvidia/Llama-3_1-Nemotron-Ultra-253B-CPT-v1 |  | `json` | 458,185 | replaying the set | `json`, none |
 | 2025-04-07 | [baichuanmed-ocr-7b](https://github.com/smg-project/bellwether/tree/main/fixtures/baichuanmed-ocr-7b) | baichuan-inc/BaichuanMed-OCR-7B | BaichuanMed-OCR-72B | `qwen2.5` | 576,772 | replaying the set | none |
-| 2025-04-07 | [llama-3-1-nemotron-ultra-253b-v1](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3-1-nemotron-ultra-253b-v1) | nvidia/Llama-3_1-Nemotron-Ultra-253B-v1 |  | — | 328,643 | pending | `json`, none |
+| 2025-04-07 | [llama-3-1-nemotron-ultra-253b-v1](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3-1-nemotron-ultra-253b-v1) | nvidia/Llama-3_1-Nemotron-Ultra-253B-v1 |  | `llama_nemotron` | 328,643 | replaying the set | `json`, none |
 | 2025-03-27 | [llama-xlam-2-8b-fc-r](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-xlam-2-8b-fc-r) | Salesforce/Llama-xLAM-2-8b-fc-r |  | `xlam` | 483,062 | replaying the set | `json`, none |
 | 2025-03-26 | [granite-speech-3.2-8b](https://github.com/smg-project/bellwether/tree/main/fixtures/granite-speech-3.2-8b) | ibm-granite/granite-speech-3.2-8b |  | — | 328,662 | pending | none |
 | 2025-03-24 | [deepseek-v3-0324](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v3-0324) | deepseek-ai/DeepSeek-V3-0324 | DeepSeek-Prover-V2-671B | — | 19,299 | pending | `deepseek`, none |
 | 2025-03-24 | [deepseek-v3-0324-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v3-0324-bf16) | arcee-ai/DeepSeek-V3-0324-bf16 |  | — | 3,110 | pending | `deepseek`, none |
 | 2025-03-22 | [qwen2.5-omni-7b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen2.5-omni-7b) | Qwen/Qwen2.5-Omni-7B | Qwen2.5-Omni-3B | `qwen2.5` | 328,662 | replaying the set | `qwen`, `qwen3` |
 | 2025-03-21 | [qwen2.5-vl-32b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen2.5-vl-32b-instruct) | Qwen/Qwen2.5-VL-32B-Instruct |  | `qwen2.5` | 328,662 | replaying the set | `qwen`, `qwen3` |
+| 2025-03-16 | [llama-3-3-nemotron-super-49b-v1](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3-3-nemotron-super-49b-v1) | nvidia/Llama-3_3-Nemotron-Super-49B-v1 |  | `llama_nemotron` | — | awaiting fixtures | `json`, `nano_v3` |
 | 2025-03-16 | [llama-3.1-nemotron-nano-8b-v1](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.1-nemotron-nano-8b-v1) | nvidia/Llama-3.1-Nemotron-Nano-8B-v1 |  | `llama_nemotron` | 416,850 | replaying the set | `json`, `nano_v3` |
 | 2025-03-10 | [gemma-3-1b-it](https://github.com/smg-project/bellwether/tree/main/fixtures/gemma-3-1b-it) | google/gemma-3-1b-it |  | — | 184,969 | pending | `json`, none |
 | 2025-03-05 | [qwq-32b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwq-32b) | Qwen/QwQ-32B |  | — | — | pending | `qwen`, `qwen3` |

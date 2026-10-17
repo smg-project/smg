@@ -256,18 +256,28 @@ What the table says beyond the others:
   template renders an assistant message's content from its `</think>` on, so the model writes
   `<think>…</think>` itself; `/no_think` in the system prompt makes the template close the thought
   in the prompt (`<think>\n\n</think>\n\n`), and the request's `enable_thinking` changes nothing.
-  The Nano 8B and DLER templates have no thought. Bellwether records no reasoning case for the three
-  groups (their templates render no `reasoning_content`), so the thought's rows rest on the Super
-  template and the model cards, not on a replay.
+  The Nano 8B and DLER templates have no thought. Bellwether records no reasoning case for any of
+  the five groups (their templates render no `reasoning_content`, and the Ultra v1's reasoning probe
+  was refused at record time), so the thought's rows rest on the Super template and the model
+  cards, not on a replay.
 - **The tag is one tag around the list.** `Format::grammar` writes `<TOOLCALL>`, the tools' calls
   as the list, `</TOOLCALL>`, and the table's thought takes the prefix the JSON syntax takes. The
   gateway's older parsers have no tag for this syntax (`llama` reads Llama 3.2's pythonic calls,
   `json` the bare object), so nothing is pinned.
+- **The v1 checkpoints bring their vendor's syntax, not their template's.** The chat templates of
+  Llama-3_3-Nemotron-Super-49B-v1 and Llama-3_1-Nemotron-Ultra-253B-v1 are a Llama 3 header
+  template that renders no tool and no call and keeps an assistant message from its `</think>` on:
+  the thought is the model's own (`detailed thinking on` in the system prompt), and the calls are
+  the `<TOOLCALL>` list the vendor's tool parser reads, written when the system prompt lists the
+  tools. Both read with this table; the CPT checkpoint of the Ultra keeps Llama 3.1's own
+  template and reads with `json`. The Ultra's recorded set holds content alone, as the template
+  writes; the Super v1 has no recorded set.
 
 What the table leaves open: the thought's rows against a recorded reasoning case; Nemotron Nano 4B
 v1.1, whose template writes each call one `}` short (`{"name": …, "arguments": {…}]`), which
-bellwether's reference heals and this table does not read; and Nemotron Ultra's bare
-`{"name": …, "parameters": …}` object, Llama 3.1's own syntax, which the `json` table reads.
+bellwether's reference heals and this table does not read; and the Ultra's CPT checkpoint
+(`Llama-3_1-Nemotron-Ultra-253B-CPT-v1`), whose bare `{"name": …, "parameters": …}` object is
+Llama 3.1's own syntax, which the `json` table reads.
 
 ## MiniCPM5 (`minicpm5`)
 
