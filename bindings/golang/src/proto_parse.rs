@@ -169,4 +169,33 @@ mod tests {
             Err("Response JSON must contain 'chunk' or 'complete' field")
         );
     }
+
+    /// The lenient reads: an id entry that is not a number (a string, a
+    /// negative) is skipped, and a count that is not a number reads as 0.
+    #[test]
+    fn entries_and_counts_that_are_not_numbers_are_skipped_or_zero() {
+        let response = parse_proto_response(&json!({
+            "chunk": {
+                "token_ids": [1, "x", -2, 3],
+                "prompt_tokens": "4",
+                "completion_tokens": -1,
+                "cached_tokens": 2.5,
+                "reasoning_tokens": 6
+            }
+        }))
+        .unwrap();
+        let Some(Response::Chunk(chunk)) = response.response else {
+            panic!("a chunk response");
+        };
+        assert_eq!(chunk.token_ids, vec![1, 3]);
+        assert_eq!(
+            (
+                chunk.prompt_tokens,
+                chunk.completion_tokens,
+                chunk.cached_tokens,
+                chunk.reasoning_tokens
+            ),
+            (0, 0, 0, 6)
+        );
+    }
 }
