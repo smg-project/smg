@@ -34,9 +34,9 @@
 //! a member; a list item missing before a comma the same. A member the call's end cuts after its
 //! colon is the cut call's: the key held for the value comes back with the end's reason, nothing
 //! is made up for the value that never came, and the object closes whole without the member. Nesting
-//! past the prefix parser's bound ([`DEEPEST`]) is reported from the bracket that passes it, with
-//! the key held for it, so that the fragments stay a prefix that parser takes, as the JSON syntax
-//! keeps them, and the object closes whole without the member.
+//! past the prefix parser's bound ([`DEEPEST`]) in what is written is reported from the bracket
+//! that passes it, with the key held for it, so that the fragments stay a prefix that parser
+//! takes, as the JSON syntax keeps them, and the object closes whole without the member.
 //!
 //! [`formats::gemma4`]: crate::formats::gemma4()
 
@@ -89,7 +89,8 @@ fn header_name(head: &str) -> Result<&str, MalformedReason> {
 
 /// The nesting the arguments may reach, the arguments object counted: the prefix parser's bound
 /// ([`PartialJson::DEFAULT_MAX_DEPTH`]), which the JSON syntax's judge applies, so that the
-/// fragments of a call stay a prefix that parser takes, whichever syntax wrote them.
+/// fragments of a call stay a prefix that parser takes, whichever syntax wrote them. It counts
+/// what is written: the containers of a member without a key, which is not written, do not count.
 const DEEPEST: usize = PartialJson::DEFAULT_MAX_DEPTH;
 
 /// The events of one call, from the bytes after `<|tool_call>`.
@@ -371,14 +372,17 @@ impl Assembler {
             self.stage = Stage::AfterValue;
             return key + space;
         }
-        if matches!(first, '{' | '[') && self.containers.len() >= DEEPEST {
+        if matches!(first, '{' | '[') && self.skipping.is_none() && self.containers.len() >= DEEPEST
+        {
             // Nesting the prefix parser would refuse: the fragments stop here, where they are
             // still a prefix it takes, and the bytes from here on are reported, as the JSON
             // syntax reports the bytes from the bracket it cannot take: a member from its key,
             // held for this value and not written, so that the object closes whole without it,
             // as it does without a member that has no value; a list's element from the
             // whitespace before its bracket. The members written before stay the call's; the end
-            // closes what is open.
+            // closes what is open. A member being skipped is not written, so its nesting is not
+            // counted: nothing of it reaches the parser, and the members after it are written as
+            // before.
             self.key = None;
             self.stage = Stage::Refused;
             return refused(rest, out);
@@ -1407,6 +1411,34 @@ mod tests {
                     "{how} cut {cut}"
                 );
             }
+        }
+        // The bound counts what is written: a member without a key is reported and not written,
+        // so the containers opened inside it, however deep, refuse nothing, and the members after
+        // it are written as before.
+        let skipped = format!(
+            "call:f{{:{}1{},b:1}}",
+            "[".repeat(DEEPEST + 8),
+            "]".repeat(DEEPEST + 8)
+        );
+        for cut in [false, true] {
+            let events = run(&[&skipped], cut);
+            assert_eq!(arguments(&events), "{\"b\": 1}", "skipped cut {cut}");
+            assert!(
+                malformed(&events)
+                    .iter()
+                    .all(|(_, why)| *why == MalformedReason::EmptyKey),
+                "skipped cut {cut}: {:?}",
+                malformed(&events)
+            );
+            assert_eq!(
+                bytes(&events),
+                if cut {
+                    skipped.clone()
+                } else {
+                    format!("{skipped}{CLOSE}")
+                },
+                "skipped cut {cut}"
+            );
         }
     }
 
