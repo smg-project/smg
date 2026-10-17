@@ -293,3 +293,8 @@ workspace = true
 [target.'cfg(all(not(target_env = "msvc"), not(target_env = "musl")))'.dependencies]
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true, features = ["stats"] }
+
+[[bench]]
+name = "tenant_usage"
+harness = false
+path = "benches/tenant_usage.rs"

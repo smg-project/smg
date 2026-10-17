@@ -3,15 +3,20 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::routers::grpc::context::{DispatchMetadata, ExecutionPlan, WorkerSelection};
+use crate::{
+    middleware::TenantKey,
+    routers::grpc::context::{DispatchMetadata, ExecutionPlan, WorkerSelection},
+};
 
 /// Metadata for one dispatch attempt. `dispatch_model` was captured from the
 /// request at the build boundary (already canonical); the weight version
-/// comes from the attempt's selected worker.
+/// comes from the attempt's selected worker; `tenant_key` is the caller's,
+/// for the usage row the response is booked to.
 pub(crate) fn prepare_dispatch_metadata(
     plan: &ExecutionPlan,
     dispatch_model: &str,
     workers: Option<&WorkerSelection>,
+    tenant_key: Option<TenantKey>,
 ) -> DispatchMetadata {
     let weight_version = workers
         .map(|w| match w {
@@ -31,5 +36,6 @@ pub(crate) fn prepare_dispatch_metadata(
         model: dispatch_model.to_string(),
         created,
         weight_version: Some(weight_version),
+        tenant_key,
     }
 }

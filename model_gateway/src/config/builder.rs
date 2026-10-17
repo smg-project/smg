@@ -531,6 +531,18 @@ impl RouterConfigBuilder {
         self
     }
 
+    // ==================== Usage Accounting ====================
+
+    pub fn tenant_usage_accounting_enabled(mut self, enabled: bool) -> Self {
+        self.config.tenant_usage_accounting_enabled = enabled;
+        self
+    }
+
+    pub fn tenant_usage_accounting_max_tenants(mut self, max_tenants: u32) -> Self {
+        self.config.tenant_usage_accounting_max_tenants = max_tenants;
+        self
+    }
+
     // ==================== Tenant Rate Limit ====================
 
     pub fn tenant_rate_limit_enabled(mut self, enabled: bool) -> Self {

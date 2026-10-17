@@ -827,6 +827,9 @@ class TestParseRouterArgs:
                 "--tenant-rate-limit-enabled",
                 "--tenant-rate-limit-config",
                 "/etc/smg/rate-limit.yaml",
+                "--tenant-usage-accounting-enabled",
+                "--tenant-usage-accounting-max-tenants",
+                "16",
             ]
         )
         assert router_args.trust_tenant_header is True
@@ -841,6 +844,8 @@ class TestParseRouterArgs:
         assert router_args.priority_scheduler_tenant_metric_top_n == 8
         assert router_args.tenant_rate_limit_enabled is True
         assert router_args.tenant_rate_limit_config == "/etc/smg/rate-limit.yaml"
+        assert router_args.tenant_usage_accounting_enabled is True
+        assert router_args.tenant_usage_accounting_max_tenants == 16
 
         defaults = parse_router_args([])
         assert defaults.trust_tenant_header is False
@@ -852,6 +857,8 @@ class TestParseRouterArgs:
         assert defaults.priority_scheduler_tenant_metric_top_n == 32
         assert defaults.tenant_rate_limit_enabled is False
         assert defaults.tenant_rate_limit_config is None
+        assert defaults.tenant_usage_accounting_enabled is False
+        assert defaults.tenant_usage_accounting_max_tenants == 128
 
     def test_tenant_api_key_without_separator_is_rejected(self):
         """A key without the ':' separator fails to parse, and the error does
