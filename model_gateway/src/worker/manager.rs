@@ -1568,6 +1568,10 @@ mod tests {
             CircuitState::HalfOpen,
             "the promotion puts the open breaker on trial instead of leaving it to its timeout"
         );
+        assert!(
+            worker.is_available(),
+            "a worker promoted by its probes is routable at once, its breaker on trial"
+        );
     }
 
     /// Labels follow the engine for a worker this node registered itself over
