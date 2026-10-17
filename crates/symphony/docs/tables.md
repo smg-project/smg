@@ -205,11 +205,12 @@ What the table says beyond the others:
 
 - **A call has no closing marker.** `[TOOL_CALLS]` opens the call state, and the state's own rows
   are the next `[TOOL_CALLS]` and the end of the turn: the arguments object's close ends the call
-  (`json::named`, reading the arguments alone), the next opener or the turn's end ends the region. Text after a closed
-  object and before the next opener is the template's wrapping: whitespace dropped, anything else
-  malformed. The tool's name is the text between the opener and `[ARGS]`, taken as written; the
-  object after `[ARGS]` is the arguments alone, so `ToolCallStart` carries the name and the marker
-  as its source, and the fragments are the object's bytes.
+  (`json::named`, reading the arguments alone), the next opener or the turn's end ends the
+  region. Text after a closed object and before the next opener is the template's wrapping:
+  whitespace dropped, anything else malformed. The tool's name is the text between the opener and
+  `[ARGS]`, taken as written; the object after `[ARGS]` is the arguments alone, so
+  `ToolCallStart` carries the name and the marker as its source, and the fragments are the
+  object's bytes.
 - **The prompt ends at `[/INST]`, or after a tool result.** The template writes no assistant opener
   and no thought in the prompt, whatever the request says: the model writes `[THINK]` itself. After
   a tool result the prompt ends in `[/TOOL_RESULTS]`, and its last `[/INST]` stands before the
