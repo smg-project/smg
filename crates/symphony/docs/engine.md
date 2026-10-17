@@ -54,9 +54,10 @@ What the engine decides for every format, and what it leaves open:
   are made up for a value the model never finished, and the one event carries the bytes still held,
   when there are any. Gemma's reader does the same in its own way (`gemma::Assembler::end`): its one
   event names the value's reason, which the engine does not rename, and the bytes held at the marker
-  are the string's text, not the event's. A pythonic call the end cut ends as a tagged one does
-  (`tagged::end_cut_call`), the cut right after its `(` included, since its object closes only at
-  the call's own `)`.
+  are the string's text, not the event's. A pythonic call ends as a tagged one does
+  (`tagged::end_cut_call`) whether the stream's end or the region's marker cut it, the cut right
+  after its `(` included, since its object closes only at the call's own `)`, which every template
+  writes before the marker.
 - With the tagged syntax, a value's type comes from the request's tools (`Declared`): a
   declared string streams, every other value is written at its close. A call to a function the
   request did not declare has every value inferred.
