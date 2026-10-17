@@ -19,11 +19,12 @@ use crate::{
     config::{validate_worker_url, RouterConfig},
     routers::provider_support,
     worker::{
+        liveness,
         registry::WorkerId,
         worker::{merge_labels, worker_to_info},
         WorkerRegistry, WorkerType,
     },
-    workflow::{Job, JobQueue, WorkerRegistrationMode},
+    workflow::{steps::local::find_workers_by_url, Job, JobQueue, WorkerRegistrationMode},
 };
 
 /// Validate the URL of an incoming worker-management request, translating a
@@ -353,21 +354,41 @@ impl IntoResponse for DeleteWorkerResult {
     }
 }
 
-/// Result of updating a worker (async job submission)
+/// Result of updating a worker: a property update is queued as a job; a
+/// `readmit` is applied as the request is handled.
 #[derive(Debug)]
 pub struct UpdateWorkerResult {
     pub worker_id: WorkerId,
     pub url: String,
+    /// A property update was queued.
+    pub queued: bool,
+    /// The request asked for a re-admission, and whether there was a veto or
+    /// a drain to end on any of the URL's workers.
+    pub readmitted: Option<bool>,
 }
 
 impl IntoResponse for UpdateWorkerResult {
     fn into_response(self) -> Response {
-        let response = json!({
-            "status": "accepted",
+        let (status, message) = match (self.queued, self.readmitted) {
+            (true, _) => (
+                StatusCode::ACCEPTED,
+                "Worker update queued for background processing",
+            ),
+            (false, Some(true)) => (StatusCode::OK, "Worker re-admitted to routing"),
+            (false, _) => (
+                StatusCode::OK,
+                "Worker was not vetoed or draining; nothing to re-admit",
+            ),
+        };
+        let mut response = json!({
+            "status": if self.queued { "accepted" } else { "ok" },
             "worker_id": self.worker_id.as_str(),
-            "message": "Worker update queued for background processing"
+            "message": message,
         });
-        (StatusCode::ACCEPTED, Json(response)).into_response()
+        if let Some(readmitted) = self.readmitted {
+            response["readmitted"] = json!(readmitted);
+        }
+        (status, Json(response)).into_response()
     }
 }
 
@@ -601,7 +622,12 @@ impl WorkerService {
             .await
             .map_err(|e| WorkerServiceError::QueueSubmitFailed { message: e })?;
 
-        Ok(UpdateWorkerResult { worker_id, url })
+        Ok(UpdateWorkerResult {
+            worker_id,
+            url,
+            queued: true,
+            readmitted: None,
+        })
     }
 
     /// List all workers with their info, optionally filtered to workers
@@ -722,6 +748,24 @@ impl WorkerService {
             validate_merged_labels(&worker.metadata().spec.labels, labels)?;
         }
 
+        // An operator's re-admission acts on the live workers, on every rank
+        // behind the URL: the veto and the wedge drain ride the shared
+        // runtime, which the queued property update would inherit anyway. A
+        // request that asks for nothing else queues no job; any other body
+        // (an empty one included) goes through the queue as before, and is
+        // re-admitted once its job is queued, so a refused update ends
+        // nothing.
+        let readmit = update.readmit == Some(true);
+        if readmit && !update.updates_properties() {
+            let readmitted = Some(self.readmit_every_rank(&url));
+            return Ok(UpdateWorkerResult {
+                worker_id,
+                url,
+                queued: false,
+                readmitted,
+            });
+        }
+
         let job = Job::UpdateWorker {
             url: url.clone(),
             update: Box::new(update),
@@ -733,7 +777,23 @@ impl WorkerService {
             .await
             .map_err(|e| WorkerServiceError::QueueSubmitFailed { message: e })?;
 
-        Ok(UpdateWorkerResult { worker_id, url })
+        let readmitted = readmit.then(|| self.readmit_every_rank(&url));
+        Ok(UpdateWorkerResult {
+            worker_id,
+            url,
+            queued: true,
+            readmitted,
+        })
+    }
+
+    /// Ends the veto and the wedge drain on every rank behind `url`, whatever
+    /// the first one had to end; whether any of them had something to end.
+    fn readmit_every_rank(&self, url: &str) -> bool {
+        let mut any = false;
+        for worker in find_workers_by_url(&self.worker_registry, url) {
+            any |= liveness::readmit(&worker);
+        }
+        any
     }
 }
 
@@ -968,6 +1028,72 @@ mod tests {
                 .expect_err("queue is uninitialized"),
             WorkerServiceError::QueueNotInitialized
         ));
+    }
+
+    /// `readmit` ends the liveness veto and the wedge drain on the live
+    /// workers as the request is handled, with no job queue involved (none
+    /// is set up here); a request with nothing else to update is answered
+    /// at once, one that was not vetoed says so.
+    #[tokio::test]
+    async fn a_readmit_update_ends_the_veto_and_the_drain_without_a_job() {
+        use crate::worker::worker::{StallReason, WedgeDrain};
+        let registry = Arc::new(WorkerRegistry::new());
+        register_worker(&registry, "grpc://10.0.0.5:8000", Some("m"));
+        let id = registry.reserve_id_for_url("grpc://10.0.0.5:8000");
+        let worker = registry
+            .get_by_url("grpc://10.0.0.5:8000")
+            .expect("registered");
+        assert!(worker.set_stall(Some(StallReason::Wedged)));
+        assert!(worker.set_wedge_drain(WedgeDrain::Held));
+        assert!(worker.stall_reason().is_some());
+        let service = make_service(Arc::clone(&registry));
+
+        let update: WorkerUpdateRequest =
+            serde_json::from_value(json!({"readmit": true})).expect("an update the type takes");
+        assert!(!update.updates_properties());
+        let result = service
+            .update_worker(id.as_str(), update)
+            .await
+            .expect("no job needed");
+        assert!(!result.queued);
+        assert_eq!(result.readmitted, Some(true));
+        assert!(worker.stall_reason().is_none());
+        assert_eq!(worker.wedge_drain(), WedgeDrain::Off);
+        assert_eq!(
+            result.into_response().status(),
+            StatusCode::OK,
+            "applied, not queued"
+        );
+
+        // Nothing to end the second time.
+        let again: WorkerUpdateRequest =
+            serde_json::from_value(json!({"readmit": true})).expect("an update the type takes");
+        let result = service
+            .update_worker(id.as_str(), again)
+            .await
+            .expect("no job needed");
+        assert_eq!(result.readmitted, Some(false));
+        assert!(!result.queued);
+
+        // A property update still needs the queue, readmit or not; one the
+        // queue refuses re-admits nothing, so the error means what it says.
+        assert!(worker.set_stall(Some(StallReason::Wedged)));
+        let with_cost: WorkerUpdateRequest =
+            serde_json::from_value(json!({"readmit": true, "cost": 2.0}))
+                .expect("an update the type takes");
+        assert!(with_cost.updates_properties());
+        assert!(matches!(
+            service
+                .update_worker(id.as_str(), with_cost)
+                .await
+                .expect_err("queue is uninitialized"),
+            WorkerServiceError::QueueNotInitialized
+        ));
+        assert_eq!(
+            worker.stall_reason(),
+            Some(StallReason::Wedged),
+            "a refused update ends no veto"
+        );
     }
 
     /// An update is held to the same rules for the fields it may change.

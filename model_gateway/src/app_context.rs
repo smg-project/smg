@@ -853,6 +853,10 @@ impl AppContextBuilder {
             Duration::from_secs(config.worker_wedge_secs),
             Duration::from_secs(config.worker_stale_secs),
         );
+        liveness::configure_drain(liveness::Drain {
+            secs: Duration::from_secs(config.worker_wedge_drain_secs),
+            hold: Duration::from_secs(config.worker_wedge_drain_hold_secs),
+        });
         liveness::configure_warmup(liveness::Warmup {
             secs: Duration::from_secs(config.worker_warmup_secs),
             share: config.worker_warmup_share,

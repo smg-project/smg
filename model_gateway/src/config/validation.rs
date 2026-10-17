@@ -1354,6 +1354,19 @@ impl ConfigValidator {
             });
         }
 
+        // The wedge drain escalates the wedged veto; with that rule off
+        // (`worker_wedge_secs` 0) there is nothing to escalate, and the drain
+        // would silently never run.
+        if config.worker_wedge_drain_secs > 0 && config.worker_wedge_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "worker_wedge_drain_secs".to_string(),
+                value: config.worker_wedge_drain_secs.to_string(),
+                reason: "The wedge drain escalates the wedged veto, which worker_wedge_secs = 0 \
+                         turns off; set worker_wedge_secs or leave the drain at 0"
+                    .to_string(),
+            });
+        }
+
         if config.queue_size > 0 && config.queue_timeout_secs == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "queue_timeout_secs".to_string(),
@@ -4714,6 +4727,46 @@ mod tests {
                 Err(ConfigError::InvalidValue { ref field, .. }) if field == "health_check.check_interval_secs"
             ),
             "the checker's loop sleeps on the interval with probing disabled too"
+        );
+    }
+
+    /// The wedge drain is opt-in and escalates the wedged veto: on with a
+    /// wedge threshold, refused without one, and off by default.
+    #[test]
+    fn the_wedge_drain_needs_the_wedge_rule() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker1:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+        assert_eq!(config.worker_wedge_drain_secs, 0, "off by default");
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config.worker_wedge_drain_secs = 10;
+        assert!(
+            ConfigValidator::validate(&config).is_ok(),
+            "the default wedge rule is on"
+        );
+
+        config.worker_wedge_secs = 0;
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, ref value, .. })
+                if field == "worker_wedge_drain_secs" && value == "10"
+        ));
+
+        config.worker_wedge_drain_secs = 0;
+        assert!(
+            ConfigValidator::validate(&config).is_ok(),
+            "the wedge rule off with the drain off is a valid pair"
+        );
+        config.worker_wedge_secs = 3;
+        config.worker_wedge_drain_secs = 10;
+        config.worker_wedge_drain_hold_secs = 0;
+        assert!(
+            ConfigValidator::validate(&config).is_ok(),
+            "a zero hold probes as soon as nothing is in flight"
         );
     }
 
