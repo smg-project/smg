@@ -248,6 +248,61 @@ Principle): one call alone, `parameters` naming the arguments, and never a list,
 call or a thought, since the template refuses them; the list and the wrapping after an object rest
 on the unit tests until a group writes them.
 
+## Llama 4 (`llama4`)
+
+The template writes the turn as the content, if the message has one, then the calls as a Python
+list, `[get_weather(city="Paris"), get_stock_price()]`, with nothing between the content and the
+list and nothing after it; no thought. What the table says beyond the others:
+
+- **One state, no markers, the list bare in the turn.** As `xlam` and `json`, the output starts in
+  the arguments state; the pythonic assembler reads the turn bare (`pythonic::Assembler::bare`).
+  A turn that starts, after whitespace alone, with a `[` that a name and its `(` follow is the
+  list, read as it arrives, the whitespace its wrapping; after the list's `]` whitespace is
+  dropped and anything else malformed. A turn that starts with anything else is content, and a
+  `[name(` after that content, the shape the template renders for a message that holds both
+  (`Let me check.[get_weather(city="Paris")]`), is held until the `]` that closes it and read as
+  its calls only when the whole is a well-formed list of calls with keyword arguments to tools
+  the request declares: code holds `[name(` of its own (`lim(h→0)[f(a+h) - f(a)]/h`,
+  `movies[Math.floor(…)]`, `[set(range(10)) for _ in range(3)]`, `[Authorize(Roles = "Manager")]`,
+  `ingredients[exotic_ingredient.lower()]`: twenty-two of the 5,841 content cases a 1-in-100
+  sample of the recorded sets holds), and a list opened there as it arrives took those brackets
+  for calls; held, checked whole and held to the request's tools, every one of them is content,
+  and the recorded messages with content and calls read as the reference has them. A `[` that no
+  call follows (`[1]`, `[Note]`, a markdown link, a list of
+  names) is content, and so is a list the stream's end cut before its `]`, since no call began.
+  The engine's own reader for the family opens the list at the output's start alone; where the
+  model writes content before its list, that reader gives content only and this table the calls.
+- **Every value is a quoted string in the template, so the quotes carry no type.** The template
+  writes each argument as `"%s"` of its value: `days="3"`, `detailed="True"`, a list or an object
+  as Python's repr inside the quotes (`tags="['a', 'b']"`). The assembler reads a quoted value by
+  the kind the request's tool declares for the parameter, as the tagged tables read a value's
+  text (`Dialect::LLAMA4`, `Values::Quoted`): a declared string stays the string, digits or not;
+  an integer, an array, an object come back as what the text spells; a parameter no tool
+  declares reads by its text, a number or a word as what it is and anything else as the string.
+  The text between the quotes is the value's characters as they are: the template decodes no
+  escape, so a backslash and an `r` in a value stay those two characters (the recorded patches
+  are full of them), and the table reads them so. A value the model writes bare (`days=3`,
+  `detailed=False`, `city='Paris'`), the spelling its model card and the family's parsers take,
+  reads as Python's, a single-quoted string with its escapes. The structural tags write Python's
+  values, the spelling the model is told to write.
+- **A quote inside a quoted value is the template's loss.** The template does not escape a `"`
+  inside a string it quotes, so the bytes it writes for such a value cannot be read back by any
+  reader, this one included; the recorded sets hold a few such cases (five in a hundred thousand
+  of Scout's), and the corpus replay counts them apart, by the reference that holds the quote,
+  rather than against the table. A string that holds a newline or a backslash reads as written.
+- **`<|python_start|>` and `<|python_end|>` are wrapping wherever they stand.** The family's
+  earlier template wrote a tool turn's content between them, and the model may write them around
+  its code or its list; the table ignores both terminals, so the text between them reads as what
+  it is, content or the list.
+- **The prompt ends at the turn's opener.** `<|header_start|>assistant<|header_end|>` and two
+  newlines; after a tool result the previous turn's list stands in the prompt, and the replay
+  starts at the last opener, in content, where the template puts the answer.
+
+What the table leaves open: a live reading on an engine (owed with the family's weights); the
+base checkpoints' template (`llama-4-scout-17b-16e`), which writes JSON objects back to back behind
+the python markers, another format no table reads yet; and the structural tag of a forced call,
+which writes the bare list as the `xlam` table's does and is not yet proven on an engine.
+
 ## The forced call (`forced`)
 
 Not a table an operator names: the gateway picks this format for a request whose `tool_choice`

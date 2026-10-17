@@ -330,6 +330,11 @@ impl Declared {
         self.forced.as_deref()
     }
 
+    /// Whether a tool of the request declares `function`.
+    pub fn declares(&self, function: &str) -> bool {
+        self.tools.functions.contains_key(function)
+    }
+
     /// The kind `function` declares for `parameter`, if it declares one.
     pub fn kind(&self, function: &str, parameter: &str) -> Option<Kind> {
         self.tools
