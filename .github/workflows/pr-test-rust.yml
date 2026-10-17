@@ -839,19 +839,19 @@ jobs:
             # The gateway and everything it links: every crate but the radix tree,
             # plus the sources two gateway integration tests read from disk
             # (the metrics catalogue test walks model_gateway, crates, clients,
-            # bindings and examples for recorder and family names; the dashboard
-            # test reads the Helm chart), which the previous filter ran the
-            # gateway tests for too. The radix tree keeps its own shard: no
-            # gateway metric is named there.
+            # bindings and examples for recorder and family names, Rust sources
+            # only; the dashboard test reads the Helm chart), which the previous
+            # filter ran the gateway tests for too. The radix tree keeps its own
+            # shard: no gateway metric is named there.
             rust-gateway: &rust-gateway
               - *rust-infra
               - 'model_gateway/**'
               - 'crates/**'
               - '!crates/radix_tree/**'
-              - 'bindings/python/src/**'
-              - 'bindings/golang/src/**'
-              - 'clients/**'
-              - 'examples/**'
+              - 'bindings/python/src/**/*.rs'
+              - 'bindings/golang/src/**/*.rs'
+              - 'clients/**/*.rs'
+              - 'examples/**/*.rs'
               - 'deploy/helm/smg/templates/grafana-dashboard.yaml'
             rust-bindings:
               - *rust-gateway
