@@ -281,7 +281,7 @@ impl MessagePreparationStage {
                 .tool_parser_factory
                 .registry()
                 .generate_tool_constraint(
-                    names.tool(),
+                    ctx.components.parser_resolver.legacy_tool(&names),
                     &filtered_tools,
                     tool_choice,
                     reasoning,

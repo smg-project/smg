@@ -193,7 +193,8 @@ impl PipelineDeps {
             self.worker_registry.clone(),
             self.configured_tool_parser.clone(),
             self.configured_reasoning_parser.clone(),
-        );
+        )
+        .with_legacy_registries(&self.tool_parser_factory, &self.reasoning_parser_factory);
         let processor = processor::ResponseProcessor::new(
             self.tool_parser_factory.clone(),
             self.reasoning_parser_factory.clone(),

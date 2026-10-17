@@ -129,7 +129,8 @@ impl GrpcRouter {
                 worker_registry.clone(),
                 ctx.configured_tool_parser.clone(),
                 ctx.configured_reasoning_parser.clone(),
-            ),
+            )
+            .with_legacy_registries(&tool_parser_factory, &reasoning_parser_factory),
             multimodal,
             tokenizer_autoload: !ctx.router_config.disable_tokenizer_autoload,
             tokenizer_load_failures: ctx.tokenizer_load_failures.clone(),
