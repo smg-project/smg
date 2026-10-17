@@ -372,7 +372,7 @@ fn messages_spec(thinking: bool) -> MessagesResponseSpec {
         tool_choice: None,
         has_tools: false,
         history_tool_calls_count: 0,
-        chat_tools: Vec::new(),
+        chat_tools: Vec::new().into(),
         stop_sequences: None,
         symphony: None,
         first_tool_call_only: false,

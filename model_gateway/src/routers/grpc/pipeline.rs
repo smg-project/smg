@@ -997,18 +997,28 @@ impl RequestPipeline {
 
     /// The settlement of a non-streamed generate answer, one entry per
     /// choice: the choices share one prompt, so its count and its cache hit
-    /// are taken once (the first entry's; every entry reports the same), and
-    /// each choice's own completion and reasoning counts sum.
+    /// are taken once, the greatest any choice reports, as `TokenCounts::of`
+    /// and the streamed paths take them (the choice that prefilled the
+    /// shared prefix may report fewer hits than its siblings), and each
+    /// choice's own completion and reasoning counts sum.
     pub(in crate::routers::grpc) fn generate_settlement(
         responses: &[GenerateResponse],
     ) -> UsageSettlement {
         UsageSettlement {
-            actual_input_tokens: responses.first().map_or(0, |r| r.meta_info.prompt_tokens),
+            actual_input_tokens: responses
+                .iter()
+                .map(|r| r.meta_info.prompt_tokens)
+                .max()
+                .unwrap_or(0),
             completion_tokens: responses
                 .iter()
                 .map(|r| r.meta_info.completion_tokens)
                 .sum(),
-            cached_input_tokens: responses.first().map_or(0, |r| r.meta_info.cached_tokens),
+            cached_input_tokens: responses
+                .iter()
+                .map(|r| r.meta_info.cached_tokens)
+                .max()
+                .unwrap_or(0),
             reasoning_tokens: responses
                 .iter()
                 .map(|r| r.meta_info.reasoning_tokens.unwrap_or(0))
@@ -4606,37 +4616,46 @@ mod rate_limit_reserve_tests {
     }
 
     /// The non-streamed generate answer settles its shared prompt and cache
-    /// hit once and sums each choice's completion and reasoning counts; an
-    /// empty answer settles zeros.
+    /// hit once, the greatest any choice reports, and sums each choice's
+    /// completion and reasoning counts; an empty answer settles zeros.
     #[test]
     fn generate_settlement_takes_the_shared_prompt_once_and_sums_the_choices() {
-        let choice = |completion_tokens: u32, reasoning_tokens: Option<u32>| GenerateResponse {
-            text: String::new(),
-            output_ids: Vec::new(),
-            meta_info: GenerateMetaInfo {
-                id: "gen".to_string(),
-                finish_reason: GenerateFinishReason::Stop {
-                    finish_type: GenerateFinishType::Stop,
+        let choice = |completion_tokens: u32, reasoning_tokens: Option<u32>, cached_tokens: u32| {
+            GenerateResponse {
+                text: String::new(),
+                output_ids: Vec::new(),
+                meta_info: GenerateMetaInfo {
+                    id: "gen".to_string(),
+                    finish_reason: GenerateFinishReason::Stop {
+                        finish_type: GenerateFinishType::Stop,
+                    },
+                    prompt_tokens: 9,
+                    weight_version: "default".to_string(),
+                    input_token_logprobs: None,
+                    output_token_logprobs: None,
+                    completion_tokens,
+                    cached_tokens,
+                    reasoning_tokens,
+                    e2e_latency: 0.0,
+                    matched_stop: None,
                 },
-                prompt_tokens: 9,
-                weight_version: "default".to_string(),
-                input_token_logprobs: None,
-                output_token_logprobs: None,
-                completion_tokens,
-                cached_tokens: 4,
-                reasoning_tokens,
-                e2e_latency: 0.0,
-                matched_stop: None,
-            },
+            }
         };
         assert_eq!(
-            RequestPipeline::generate_settlement(&[choice(3, Some(1)), choice(5, None)]),
+            RequestPipeline::generate_settlement(&[choice(3, Some(1), 4), choice(5, None, 4)]),
             UsageSettlement {
                 actual_input_tokens: 9,
                 completion_tokens: 8,
                 cached_input_tokens: 4,
                 reasoning_tokens: 1,
             }
+        );
+        // The choices report different cache hits: the settlement takes the
+        // greatest, as the streamed answer settles.
+        assert_eq!(
+            RequestPipeline::generate_settlement(&[choice(3, Some(1), 2), choice(5, None, 6)])
+                .cached_input_tokens,
+            6
         );
         assert_eq!(
             RequestPipeline::generate_settlement(&[]),
