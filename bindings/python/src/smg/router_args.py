@@ -468,6 +468,10 @@ class RouterArgs:
     # Where media for vLLM gRPC workers is fetched and preprocessed:
     # auto | router | worker; None falls back to SMG_MM_PROCESSING, then auto
     mm_processing: str | None = None
+    # What the gateway's own media pipeline does when libjpeg-turbo cannot be
+    # loaded: prefer (the pure-Rust fallback decoder, behind one warning) |
+    # require (start-up fails); None falls back to SMG_MM_TURBOJPEG, then prefer
+    mm_turbojpeg: str | None = None
     model_aliases: dict[str, str] = dataclasses.field(default_factory=dict)
     model_id_from: str | None = None
     model_path: str | None = None
@@ -1644,6 +1648,20 @@ class RouterArgs:
                 "Allow client-supplied media URLs that name or resolve to a loopback,"
                 " link-local or private address (an internal media origin); by default"
                 " such URLs are refused. Falls back to SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}mm-turbojpeg",
+            type=str.lower,
+            choices=["prefer", "require"],
+            default=RouterArgs.mm_turbojpeg,
+            help=(
+                "What the gateway's own media pipeline does when libjpeg-turbo"
+                " (libturbojpeg.so.0) cannot be loaded: prefer (default) decodes JPEGs"
+                " with the pure-Rust decoder, whose pixels differ from the reference"
+                " decoder's by a few levels, warns once and sets the gauge"
+                " smg_mm_turbojpeg_available to 0; require stops start-up instead."
+                " Falls back to SMG_MM_TURBOJPEG"
             ),
         )
         parser.add_argument(

@@ -12,10 +12,11 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use llm_multimodal::{
-    configure_parallelism, data_url::data_url_payload_bytes, registry::modality_limit_override,
-    vision::PreProcessorConfig, FrameSampling, MediaConnector, MediaConnectorConfig,
-    MediaConnectorError, MediaContentPart, MediaFault, Modality, ModelMetadata, ModelRegistry,
-    MultiModalError, Parallelism, TransparencyPolicy, VisionProcessorRegistry, POOL_THREADS_ENV,
+    configure_parallelism, data_url::data_url_payload_bytes, jpeg_turbo::TurboJpegPolicy,
+    registry::modality_limit_override, vision::PreProcessorConfig, FrameSampling, MediaConnector,
+    MediaConnectorConfig, MediaConnectorError, MediaContentPart, MediaFault, Modality,
+    ModelMetadata, ModelRegistry, MultiModalError, Parallelism, TransparencyPolicy,
+    VisionProcessorRegistry, POOL_THREADS_ENV,
 };
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
@@ -100,6 +101,14 @@ pub struct WorkerMediaSettings {
     /// samples as the pipeline expects. Refused at construction for a spec
     /// that samples the way the loader does (see `loader_rule_conflict`).
     pub video_loader_rule: Option<String>,
+    /// What the pipeline does when libjpeg-turbo cannot be loaded, as the
+    /// launcher resolved it: `Require` refuses to construct the pipeline, so
+    /// the servicer does not start, rather than serve the fallback decoder's
+    /// pixels. `None` leaves it to `SMG_MM_TURBOJPEG`, read as the router
+    /// reads it, strictly (an unreadable value refuses the pipeline, never
+    /// passes as the default), for a launcher without the setting or one
+    /// that was not given it.
+    pub turbojpeg: Option<TurboJpegPolicy>,
 }
 
 /// Whether the engine's loader rule the launcher reported (`video.fps`, a
@@ -368,6 +377,14 @@ impl WorkerMediaPipeline {
             }
         }
         super::report_jpeg_decoder();
+        // The launcher's policy, else `SMG_MM_TURBOJPEG` read strictly: the
+        // lazily resolved process settings would read an unreadable value as
+        // the default, the one misreading this policy must not have.
+        let turbojpeg = match settings.turbojpeg {
+            Some(policy) => policy,
+            None => super::settings::turbojpeg_policy_from_env()?,
+        };
+        super::enforce_jpeg_decoder_policy(turbojpeg)?;
         let config_registry = Arc::new(MultimodalConfigRegistry::new());
         let loaded = config_registry
             .get_or_load(CONFIG_KEY, &settings.model_dir)
@@ -845,6 +862,7 @@ mod tests {
             video_fetch_timeout: Duration::from_secs(1),
             video_frame_budget: None,
             video_loader_rule: None,
+            turbojpeg: None,
         };
         let pipeline = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::new()))
             .await
@@ -909,6 +927,7 @@ mod tests {
             video_fetch_timeout: Duration::from_secs(1),
             video_frame_budget: None,
             video_loader_rule: None,
+            turbojpeg: None,
         };
         let pipeline = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::new()))
             .await
@@ -1090,6 +1109,7 @@ mod unsupported_model_tests {
             video_fetch_timeout: Duration::from_secs(1),
             video_frame_budget: None,
             video_loader_rule: None,
+            turbojpeg: None,
         };
         let error = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::default()))
             .await
@@ -1128,6 +1148,7 @@ mod unsupported_model_tests {
             video_fetch_timeout: Duration::from_secs(1),
             video_frame_budget: None,
             video_loader_rule: None,
+            turbojpeg: None,
         };
         let error = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::default()))
             .await
@@ -1168,6 +1189,7 @@ mod unsupported_model_tests {
             video_fetch_timeout: Duration::from_secs(1),
             video_frame_budget: None,
             video_loader_rule: None,
+            turbojpeg: None,
         };
         let message = unsupported_model_message(
             &settings,

@@ -213,6 +213,8 @@ def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[
     (``video_loader_rule``), and the pipeline refuses it for those families
     only.
     """
+    from smg_grpc_servicer.vllm.mm_processor import SOURCE_DEFAULT
+
     model_config = vllm_config.model_config
     if not getattr(model_config, "is_multimodal_model", False):
         logger.warning(
@@ -243,6 +245,12 @@ def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[
         "max_item_bytes": settings.max_item_bytes,
         "video_frame_budget": video_frame_budget(model_config),
         "video_loader_rule": video_loader_rule(model_config),
+        # A launcher that was not given the policy sends none, so the pipeline
+        # reads SMG_MM_TURBOJPEG as the router does; a value from the flag or
+        # from SMG_VLLM_MM_TURBOJPEG travels as resolved.
+        "turbojpeg": (
+            settings.turbojpeg if settings.sources.get("turbojpeg") != SOURCE_DEFAULT else None
+        ),
         "source": settings.source,
     }
 

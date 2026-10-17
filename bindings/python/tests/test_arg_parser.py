@@ -596,6 +596,8 @@ class TestParseRouterArgs:
                 "--mm-allowed-media-domains",
                 "media.example, cdn.example",
                 "--mm-allow-private-media-hosts",
+                "--mm-turbojpeg",
+                "require",
             ]
         )
         assert router_args.mm_processing == "worker"
@@ -606,6 +608,7 @@ class TestParseRouterArgs:
         assert router_args.log_mm_timing is True
         assert router_args.mm_allowed_media_domains == ["media.example", "cdn.example"]
         assert router_args.mm_allow_private_media_hosts is True
+        assert router_args.mm_turbojpeg == "require"
 
         defaults = parse_router_args([])
         assert defaults.mm_processing is None
@@ -616,9 +619,13 @@ class TestParseRouterArgs:
         assert defaults.log_mm_timing is False
         assert defaults.mm_allowed_media_domains is None
         assert defaults.mm_allow_private_media_hosts is False
+        assert defaults.mm_turbojpeg is None
 
         with pytest.raises(SystemExit):
             parse_router_args(["--mm-processing", "routers"])
+        with pytest.raises(SystemExit):
+            parse_router_args(["--mm-turbojpeg", "required"])
+        assert parse_router_args(["--mm-turbojpeg", "Require"]).mm_turbojpeg == "require"
         # Same spelling rules as the Rust CLI: case-insensitive, sign-checked.
         assert parse_router_args(["--mm-processing", "Router"]).mm_processing == "router"
         for flag in ("--mm-pixel-cache-mb", "--rdma-slot-ttl-s"):

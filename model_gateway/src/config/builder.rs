@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use llm_multimodal::jpeg_turbo::TurboJpegPolicy;
 use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use smg_mcp::McpConfig;
 
@@ -424,6 +425,13 @@ impl RouterConfigBuilder {
     /// Serve cached pixels over RDMA (legacy switch for the RDMA lane).
     pub fn mm_pixel_rdma(mut self, enabled: bool) -> Self {
         self.config.mm_pixel_rdma = enabled;
+        self
+    }
+
+    /// What the router's own media pipeline does when libjpeg-turbo cannot be
+    /// loaded: `prefer` (the fallback decoder) or `require` (no start-up).
+    pub fn mm_turbojpeg(mut self, policy: Option<TurboJpegPolicy>) -> Self {
+        self.config.mm_turbojpeg = policy;
         self
     }
 

@@ -26,12 +26,15 @@
 #![allow(unsafe_code)]
 
 use std::{
+    fmt,
     os::raw::{c_int, c_uchar, c_ulong, c_void},
+    str::FromStr,
     sync::OnceLock,
 };
 
 use image::{DynamicImage, RgbImage};
 use libloading::{Library, Symbol};
+use serde::{Deserialize, Serialize};
 
 type TjHandle = *mut c_void;
 /// TurboJPEG pixel formats (`enum TJPF`).
@@ -80,18 +83,26 @@ struct TurboJpeg {
 unsafe impl Send for TurboJpeg {}
 unsafe impl Sync for TurboJpeg {}
 
+/// The names the library is tried under: the runtime soname first (shipped
+/// by the runtime package), then the dev symlink and common macOS names.
+const CANDIDATES: &[&str] = &[
+    "libturbojpeg.so.0",
+    "libturbojpeg.so",
+    "libturbojpeg.0.dylib",
+    "libturbojpeg.dylib",
+];
+
 fn load_turbojpeg() -> Option<TurboJpeg> {
-    // Try the runtime soname first (shipped by the runtime package), then the
-    // dev symlink and common macOS names.
-    const CANDIDATES: &[&str] = &[
-        "libturbojpeg.so.0",
-        "libturbojpeg.so",
-        "libturbojpeg.0.dylib",
-        "libturbojpeg.dylib",
-    ];
+    load_turbojpeg_from(CANDIDATES)
+}
+
+/// Load the library under the first of `candidates` the loader resolves, or
+/// `None` when none does: the seam a test uses to stand in a loader that
+/// finds nothing, without touching the process-wide binding.
+fn load_turbojpeg_from(candidates: &[&str]) -> Option<TurboJpeg> {
     // SAFETY: loading a system shared library by name; we only resolve the four
     // documented TurboJPEG symbols below and keep the handle for their lifetime.
-    let lib = CANDIDATES
+    let lib = candidates
         .iter()
         .find_map(|name| unsafe { Library::new(name) }.ok())?;
     // SAFETY: each symbol is resolved against the just-loaded library with the
@@ -242,6 +253,80 @@ mod neon {
 /// Whether libjpeg-turbo was found, so JPEGs decode to PIL's pixels.
 pub fn turbojpeg_available() -> bool {
     turbojpeg().is_some()
+}
+
+/// What a process does when the library cannot be loaded.
+///
+/// `Prefer`, the default, decodes JPEGs with the pure-Rust decoder then,
+/// whose pixels differ from the reference decoder's by a few levels on a
+/// share of every JPEG's bytes; `Require` refuses to come up without the
+/// library, for a deployment whose pixels must be the reference decoder's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TurboJpegPolicy {
+    #[default]
+    Prefer,
+    Require,
+}
+
+impl TurboJpegPolicy {
+    /// Parse from a case-insensitive string (`prefer` | `require`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "prefer" => Some(Self::Prefer),
+            "require" => Some(Self::Require),
+            _ => None,
+        }
+    }
+
+    /// Canonical lowercase name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prefer => "prefer",
+            Self::Require => "require",
+        }
+    }
+}
+
+impl fmt::Display for TurboJpegPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for TurboJpegPolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+            .ok_or_else(|| format!("invalid TurboJPEG policy '{s}'; expected prefer|require"))
+    }
+}
+
+/// The library could not be loaded and the policy is
+/// [`TurboJpegPolicy::Require`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "libturbojpeg.so.0 (libjpeg-turbo's TurboJPEG library) could not be loaded and the TurboJPEG \
+     policy is `require`: without it JPEGs decode with the pure-Rust decoder, whose pixels differ \
+     from the reference decoder's by a few levels; install the libjpeg-turbo runtime package where \
+     this process runs, or set the policy to `prefer` to serve with the fallback decoder"
+)]
+pub struct TurboJpegUnavailable;
+
+/// Apply `policy` to this process: `Ok` unless the policy requires the
+/// library and the loader did not find it.
+pub fn enforce_policy(policy: TurboJpegPolicy) -> Result<(), TurboJpegUnavailable> {
+    enforce(policy, turbojpeg_available())
+}
+
+/// The decision for an availability the caller states: the process-wide
+/// loader's in [`enforce_policy`], a stated one in tests.
+fn enforce(policy: TurboJpegPolicy, available: bool) -> Result<(), TurboJpegUnavailable> {
+    match policy {
+        TurboJpegPolicy::Require if !available => Err(TurboJpegUnavailable),
+        TurboJpegPolicy::Prefer | TurboJpegPolicy::Require => Ok(()),
+    }
 }
 
 /// True if `bytes` start with the JPEG SOI marker.
@@ -500,5 +585,55 @@ mod tests {
             }
             assert_eq!(fnv1a(rgb.as_raw()), hash, "{name}: not PIL's pixels");
         }
+    }
+
+    /// The policy reads its two values in any case and spacing, names an
+    /// unknown one, and round-trips through serde as its lowercase name.
+    #[test]
+    fn turbojpeg_policy_parses_its_two_values_and_names_an_unknown_one() {
+        assert_eq!(TurboJpegPolicy::default(), TurboJpegPolicy::Prefer);
+        assert_eq!(" Require ".parse(), Ok(TurboJpegPolicy::Require));
+        assert_eq!("PREFER".parse(), Ok(TurboJpegPolicy::Prefer));
+        assert_eq!(TurboJpegPolicy::parse("required"), None);
+        assert_eq!(
+            "required".parse::<TurboJpegPolicy>().unwrap_err(),
+            "invalid TurboJPEG policy 'required'; expected prefer|require"
+        );
+        assert_eq!(TurboJpegPolicy::Require.to_string(), "require");
+        assert_eq!(
+            serde_json::to_string(&TurboJpegPolicy::Require).unwrap(),
+            "\"require\""
+        );
+        assert_eq!(
+            serde_json::from_str::<TurboJpegPolicy>("\"prefer\"").unwrap(),
+            TurboJpegPolicy::Prefer
+        );
+        assert!(serde_json::from_str::<TurboJpegPolicy>("\"Require\"").is_err());
+    }
+
+    /// `require` with a loader that found nothing is the one refusal, with
+    /// the library named; `prefer` never refuses, and `require` with the
+    /// library loaded passes.
+    #[test]
+    fn require_refuses_without_the_library_and_prefer_never_does() {
+        // A loader given a name nothing resolves: the "absent" case, stated
+        // rather than depending on what this host has installed.
+        let absent = load_turbojpeg_from(&["libturbojpeg-absent-for-this-test.so.0"]);
+        assert!(absent.is_none());
+        let available = absent.is_some();
+        let error = enforce(TurboJpegPolicy::Require, available).unwrap_err();
+        assert_eq!(error, TurboJpegUnavailable);
+        let message = error.to_string();
+        assert!(message.contains("libturbojpeg.so.0"), "{message}");
+        assert!(message.contains("`require`"), "{message}");
+        assert_eq!(enforce(TurboJpegPolicy::Prefer, available), Ok(()));
+        assert_eq!(enforce(TurboJpegPolicy::Require, true), Ok(()));
+        assert_eq!(enforce(TurboJpegPolicy::Prefer, true), Ok(()));
+        // The process-wide check agrees with what this process's loader found.
+        assert_eq!(
+            enforce_policy(TurboJpegPolicy::Require).is_ok(),
+            turbojpeg_available()
+        );
+        assert_eq!(enforce_policy(TurboJpegPolicy::Prefer), Ok(()));
     }
 }
