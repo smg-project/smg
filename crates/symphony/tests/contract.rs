@@ -1354,6 +1354,7 @@ const FUNCTION_GEMMA_OUTPUTS: &[&str] = &[
     "Let me check.<start_function_call>call:get_weather{city:<escape>Paris<escape>}\
      <end_function_call>",
     "<start_function_call>call:get_weather{city:<escape>Par",
+    "<start_function_call>call:f{:1,a:<escape>x<escape>}<end_function_call>",
     "<start_function_call>call:get_wea",
     "<start_function_call>not a call<end_function_call>",
     "<start_function_call>call:get_weather{} trailing<end_function_call>",
@@ -1737,6 +1738,10 @@ const GEMMA4_OUTPUTS: &[&str] = &[
     // A string the closing marker cuts, alone and nested in a list.
     "<|tool_call>call:get_weather{city:<|\"|>Par<tool_call|>",
     "<|tool_call>call:f{tags:[<|\"|>a<|\"|>,<|\"|>b<tool_call|>",
+    // A member without a key: alone, after a member with a container, and cut by the marker.
+    "<|tool_call>call:f{:1,a:2}<tool_call|>",
+    "<|tool_call>call:f{a:2,:{x:[<|\"|>y<|\"|>]}}<tool_call|>",
+    "<|tool_call>call:f{:<|\"|>te<tool_call|>",
     // A member cut between its colon and its value, by the closing marker and by the end.
     "<|tool_call>call:get_weather{city:<tool_call|>",
     "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days:<tool_call|>",

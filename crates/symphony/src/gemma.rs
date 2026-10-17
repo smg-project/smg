@@ -25,7 +25,9 @@
 //! marker the end's. Text after the object closed and before the marker, which the template never
 //! writes, is reported; a header that is not `call:NAME{` is reported and no call starts. A member
 //! the call's end cuts between its colon and its value is reported too, since the object closed for
-//! the client has no value where one must stand and nothing is made up for it.
+//! the client has no value where one must stand and nothing is made up for it. A member without a
+//! key, colon and value, is reported and not written, as the tagged assemblers leave one, since
+//! the template writes no such member.
 //!
 //! [`formats::gemma4`]: crate::formats::gemma4()
 
@@ -86,6 +88,10 @@ pub struct Assembler {
     stage: Stage,
     /// The open containers, innermost last, each with whether a member has been written in it.
     containers: Vec<Container>,
+    /// The depth of the object whose member without a key is being read, while it is: the
+    /// template writes no such member, so its bytes come back as `Malformed` and nothing of it is
+    /// written, as the tagged assemblers leave one.
+    skipping: Option<usize>,
     started: bool,
     done: bool,
     /// The template's string token and null word.
@@ -124,6 +130,7 @@ impl Assembler {
             carried: String::new(),
             stage: Stage::Header,
             containers: Vec::new(),
+            skipping: None,
             started: false,
             done: false,
             spelling,
@@ -201,6 +208,7 @@ impl Assembler {
         if self.done {
             return;
         }
+        self.end_skipped(out);
         let string_open = self.started && self.stage == Stage::Text;
         if !self.carried.is_empty() || self.value_missing() || string_open {
             out.push(Event::Malformed {
@@ -267,15 +275,14 @@ impl Assembler {
         };
         let key = rest[space..colon].trim_end();
         if key.is_empty() {
-            // The colon is reported; the member keeps its place with an empty key, so that the
-            // value that follows it stays inside a valid object.
+            // The template writes no member without a key: the colon is reported, the value that
+            // follows comes back the same way while nothing of it is written, and the object stays
+            // whole without the member, as the tagged assemblers leave it.
             out.push(Event::Malformed {
                 text: Text::uncounted(&rest[..=colon]),
                 why: MalformedReason::EmptyKey,
             });
-            let mut json = self.separator();
-            json.push_str("\"\": ");
-            self.push_fragment(json, Text::default(), out);
+            self.skipping = Some(self.containers.len());
         } else {
             let mut json = self.separator();
             push_quoted(&mut json, key);
@@ -387,6 +394,7 @@ impl Assembler {
         match first {
             ',' => {
                 self.push_fragment(String::new(), Text::uncounted(&rest[..=space]), out);
+                self.member_done();
                 self.stage = if self.in_list() {
                     Stage::Value
                 } else {
@@ -404,6 +412,7 @@ impl Assembler {
                         why: MalformedReason::ValueCutShort,
                     });
                 }
+                self.member_done();
                 let next = &rest[space..];
                 let taken = if self.in_list() {
                     self.stage = Stage::Value;
@@ -420,6 +429,7 @@ impl Assembler {
 
     /// The innermost container closes: `}` or `]` written, with `source` as the bytes.
     fn close_container(&mut self, source: &str, out: &mut Events) {
+        self.member_done();
         let container = self.containers.pop();
         let json = if container.is_some_and(|c| c.list) {
             "]"
@@ -436,6 +446,31 @@ impl Assembler {
 
     fn in_list(&self) -> bool {
         self.containers.last().is_some_and(|c| c.list)
+    }
+
+    /// A member of the innermost container ended: a member without a key read there is over, and
+    /// the fragments resume.
+    fn member_done(&mut self) {
+        if self.skipping == Some(self.containers.len()) {
+            self.skipping = None;
+        }
+    }
+
+    /// The call ends inside a member without a key: what was held is the member's bytes, the
+    /// containers opened inside it have nothing to write, and the object closes whole without it.
+    fn end_skipped(&mut self, out: &mut Events) {
+        let Some(depth) = self.skipping.take() else {
+            return;
+        };
+        let held = std::mem::take(&mut self.carried);
+        if !held.is_empty() {
+            out.push(Event::Malformed {
+                text: Text::uncounted(held),
+                why: MalformedReason::EmptyKey,
+            });
+        }
+        self.containers.truncate(depth);
+        self.stage = Stage::AfterValue;
     }
 
     /// Whether the call stands where an object member's value must come and none has: its key
@@ -468,6 +503,7 @@ impl Assembler {
     /// nothing closes after it, neither the string nor the containers above it: a `Malformed`
     /// event of no bytes, with the value's reason, says that the arguments are no whole value.
     fn end(&mut self, out: &mut Events) {
+        self.end_skipped(out);
         let held = std::mem::take(&mut self.carried);
         match self.stage {
             Stage::Header if !held.is_empty() => {
@@ -519,7 +555,18 @@ impl Assembler {
         self.stage = Stage::Closed;
     }
 
+    /// A fragment of the arguments; inside a member without a key, its bytes as `Malformed`
+    /// instead, since nothing of that member is written.
     fn push_fragment(&self, json: String, source: Text, out: &mut Events) {
+        if self.skipping.is_some() {
+            if !source.text.is_empty() {
+                out.push(Event::Malformed {
+                    text: source,
+                    why: MalformedReason::EmptyKey,
+                });
+            }
+            return;
+        }
         out.push(Event::ToolCallArguments {
             index: self.index,
             json,
@@ -647,15 +694,15 @@ mod tests {
     fn a_member_that_follows_a_value_without_a_separator_keeps_its_first_byte() {
         // A value followed by the next member where a comma should be: the member is read from
         // its first byte, so every byte of the output lands in an event, whole and in pieces,
-        // and the arguments stay a valid object; an empty key keeps its member's place as `""`.
+        // and the arguments stay a valid object; a member without a key is reported and skipped.
         let cases = [
             (
                 "call:f{a:<|\"|>x<|\"|>coconut<|\"|>,b:1}",
                 r#"{"a": "x", "coconut<|\"|>,b": 1}"#,
             ),
             ("call:f{a:<|\"|>x<|\"|>  coconut}", r#"{"a": "x"}"#),
-            ("call:f{a:<|\"|>x<|\"|>:2}", r#"{"a": "x", "": 2}"#),
-            ("call:f{:2}", r#"{"": 2}"#),
+            ("call:f{a:<|\"|>x<|\"|>:2}", r#"{"a": "x"}"#),
+            ("call:f{:2}", "{}"),
             ("call:f{a:[<|\"|>x<|\"|>y]}", r#"{"a": ["x", "y"]}"#),
         ];
         for (text, expected) in cases {
@@ -822,6 +869,87 @@ mod tests {
         let cut_in_key = run(&["call:f{ci"], true);
         assert_eq!(arguments(&cut_in_key), "{}");
         assert_eq!(bytes(&cut_in_key), "call:f{ci");
+    }
+
+    /// A member without a key (`{:1}`): the template writes none, so the colon and the value that
+    /// follows come back as `Malformed`, run by run, and nothing of the member is written, as the
+    /// tagged assemblers leave one; the object stays whole without it, its next member first.
+    /// The same for a string, for a container with members of its own, and for a member the
+    /// marker or the end of the stream cuts, whole and character by character.
+    #[test]
+    fn a_member_without_a_key_is_reported_and_nothing_of_it_is_written() {
+        let skipped = |events: &[Event]| -> String {
+            malformed(events)
+                .iter()
+                .filter(|(_, why)| *why == MalformedReason::EmptyKey)
+                .map(|(text, _)| text.as_str())
+                .collect()
+        };
+        for (output, expected, bytes_skipped) in [
+            ("call:f{:1,a:2}", r#"{"a": 2}"#, ":1,"),
+            (
+                "call:f{a:2,:<|\"|>x<|\"|>}",
+                r#"{"a": 2}"#,
+                ":<|\"|>x<|\"|>",
+            ),
+            (
+                "call:f{:{x:[1,<|\"|>y<|\"|>]},a:2}",
+                r#"{"a": 2}"#,
+                ":{x:[1,<|\"|>y<|\"|>]},",
+            ),
+            ("call:f{:[1,2]}", "{}", ":[1,2]"),
+        ] {
+            let per_char: Vec<&str> = output
+                .char_indices()
+                .map(|(i, c)| &output[i..i + c.len_utf8()])
+                .collect();
+            for (pieces, how) in [(&[output][..], "whole"), (&per_char[..], "per character")] {
+                let events = run(pieces, false);
+                assert_eq!(arguments(&events), expected, "{output:?} {how}");
+                assert_eq!(skipped(&events), bytes_skipped, "{output:?} {how}");
+                assert!(
+                    malformed(&events)
+                        .iter()
+                        .all(|(_, why)| *why == MalformedReason::EmptyKey),
+                    "{output:?} {how}: {events:?}"
+                );
+                assert_eq!(
+                    bytes(&events),
+                    format!("{output}{CLOSE}"),
+                    "{output:?} {how}"
+                );
+            }
+        }
+        for (output, cut) in [
+            ("call:f{:<|\"|>te", false),
+            ("call:f{:<|\"|>te", true),
+            ("call:f{:{x:", false),
+            ("call:f{:{x:", true),
+        ] {
+            let events = run(&[output], cut);
+            assert_eq!(arguments(&events), "{}", "{output:?} cut {cut}");
+            assert_eq!(
+                skipped(&events),
+                &output["call:f{".len()..],
+                "{output:?} cut {cut}"
+            );
+            assert!(
+                malformed(&events)
+                    .iter()
+                    .all(|(_, why)| *why == MalformedReason::EmptyKey),
+                "{output:?} cut {cut}: {events:?}"
+            );
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    Event::Malformed {
+                        why: MalformedReason::UnterminatedRegion,
+                        ..
+                    }
+                )),
+                "{output:?} cut {cut}: {events:?}"
+            );
+        }
     }
 
     /// A string the closing marker or the end of the stream cuts: the fragments sent stand, no
