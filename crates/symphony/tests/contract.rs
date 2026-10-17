@@ -1419,6 +1419,9 @@ const OLMO3_OUTPUTS: &[&str] = &[
     "<function_calls>get_weather(city=\"Paris\"",
     "<function_calls>get_weather(",
     "<function_calls>get_weather(city=\"Paris\")\nget_stock_price(",
+    "<function_calls>get_weather(</function_calls>",
+    "<function_calls>get_weather(city=\"Paris\",</function_calls>",
+    "<function_calls>get_weather(city=\"Par</function_calls>\nDone.",
     "<function_calls>I will call:\nget_weather(city=\"a)b\", n=-1.5e3)</function_calls>\nDone.",
     "<function_calls></function_calls>",
     "Hello!",
@@ -1433,6 +1436,11 @@ const LFM_OUTPUTS: &[&str] = &[
     "<|tool_call_start|>[get_weather(ci",
     "<|tool_call_start|>[get_weather(city='Paris', ",
     "<|tool_call_start|>[get_weather(city='Paris'), get_stock_price(",
+    "<|tool_call_start|>[get_weather(<|tool_call_end|>",
+    "<|tool_call_start|>[get_weather(city='Paris'), get_stock_price(<|tool_call_end|>",
+    "<|tool_call_start|>[get_weather(ci<|tool_call_end|>",
+    "<|tool_call_start|>[get_weather(city='Paris', <|tool_call_end|>",
+    "<|tool_call_start|>[get_weather(city='Par<|tool_call_end|>Then text.",
     "<think>The user asks.</think><|tool_call_start|>[get_weather(city='計画 🌍 \"q\"')]\
      <|tool_call_end|>",
     "<|tool_call_start|>[]<|tool_call_end|>Nothing to call.",
@@ -2190,7 +2198,13 @@ fn closes_an_open_string(so_far: &str, fragment: &str) -> bool {
 }
 
 /// What a client relies on in the shape of the stream, checked event by event.
-fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event]) {
+fn check_well_formed(subject: &Subject, text: &str, cuts: &[usize], events: &[Event]) {
+    let name = subject.name;
+    // A pythonic call's end is its own `)`, which every template writes before the region's
+    // marker; the other syntaxes' ends may carry no bytes (the region's marker closes them).
+    let pythonic = subject
+        .table
+        .is_some_and(|table| matches!(table.format().call_syntax(), Some(CallSyntax::Pythonic(_))));
     let mut started: Vec<u32> = Vec::new();
     let mut ended: Vec<u32> = Vec::new();
     let mut arguments: Vec<(u32, String)> = Vec::new();
@@ -2256,7 +2270,7 @@ fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event]) {
                     }
                 }
             }
-            Event::ToolCallEnd { index, .. } => {
+            Event::ToolCallEnd { index, source } => {
                 assert!(
                     started.contains(index),
                     "{}: before the call's start",
@@ -2264,6 +2278,20 @@ fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event]) {
                 );
                 assert!(!ended.contains(index), "{}: a second end", place());
                 ended.push(*index);
+                // A pythonic call that ended without its `)` was cut by the region's marker or
+                // the stream's end: it says so, and nothing closes its object for it.
+                if pythonic && source.text.is_empty() {
+                    let so_far = arguments
+                        .iter()
+                        .find(|(i, _)| i == index)
+                        .map_or("", |(_, so_far)| so_far.as_str());
+                    assert!(
+                        malformed_inside.contains(index)
+                            && serde_json::from_str::<serde_json::Value>(so_far).is_err(),
+                        "{}: a pythonic call ended without its `)` with arguments {so_far:?}: a cut call says so and its object stays open",
+                        place()
+                    );
+                }
                 // A call that ended is whole, or the parser said it is not, whether its own
                 // terminal, the region's or the end of the stream ended it: a client that reads
                 // the arguments as JSON relies on one or the other.
@@ -2398,7 +2426,7 @@ fn the_event_stream_is_well_formed_under_every_chunking() {
         for (_, cuts) in chunkings(text, usize::MAX) {
             let events = replay(subject, text, &cuts, false)
                 .unwrap_or_else(|e| panic!("{}: {text:?}: {e}", subject.name));
-            check_well_formed(subject.name, text, &cuts, &events);
+            check_well_formed(subject, text, &cuts, &events);
         }
     }
 }
