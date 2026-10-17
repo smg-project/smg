@@ -35,7 +35,7 @@ use smg::{
 use smg_grpc_client::sglang_scheduler::SglangSchedulerClient;
 
 use super::{
-    chat_stream::{prepare_chat, start_chat_stream, weight_version_of},
+    chat_stream::{fingerprint_of, prepare_chat, start_chat_stream, weight_version_of},
     error::{set_error_message, SglErrorCode},
     runtime::RUNTIME,
     stream::SglangStreamHandle,
@@ -56,7 +56,7 @@ pub struct GrpcWorker {
     pub(crate) http_client: Arc<reqwest::Client>,
     pub(crate) resilience: ResolvedResilience,
     /// The engine's weight version at creation, the chunks' `system_fingerprint`.
-    pub(crate) weight_version: Option<String>,
+    pub(crate) weight_version: String,
 }
 
 impl GrpcWorker {
@@ -85,12 +85,12 @@ impl GrpcWorker {
             api_key: None,
             http_client: Arc::new(smg::http_client::client()),
             resilience: ResolvedResilience::default(),
-            weight_version: None,
+            weight_version: fingerprint_of(None),
         }
     }
 
     /// The worker with the weight version its engine reported.
-    pub(crate) fn with_weight_version(mut self, weight_version: Option<String>) -> Self {
+    pub(crate) fn with_weight_version(mut self, weight_version: String) -> Self {
         self.weight_version = weight_version;
         self
     }
@@ -637,7 +637,7 @@ pub unsafe extern "C" fn sgl_multi_client_chat_completion_stream(
         &tokenizer,
         prepared,
         Some(load),
-        worker.weight_version.as_deref(),
+        &worker.weight_version,
         error_out,
     ) {
         Ok(handle) => {

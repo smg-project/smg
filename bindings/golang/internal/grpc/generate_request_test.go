@@ -32,6 +32,12 @@ func (c *capturingScheduler) Generate(_ context.Context, in *proto.GenerateReque
 	return endedGenerateStream{}, nil
 }
 
+// GetModelInfo answers the client's one-time weight-version lookup; the
+// embedded nil client would panic on it.
+func (c *capturingScheduler) GetModelInfo(_ context.Context, _ *proto.GetModelInfoRequest, _ ...grpc.CallOption) (*proto.GetModelInfoResponse, error) {
+	return &proto.GetModelInfoResponse{WeightVersion: "v-test"}, nil
+}
+
 func (c *capturingScheduler) last() *proto.GenerateRequest {
 	c.mu.Lock()
 	defer c.mu.Unlock()

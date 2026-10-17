@@ -31,6 +31,7 @@ GrpcResponseConverterHandle* sgl_grpc_response_converter_create(
     const char* stop_token_ids,
     int skip_special_tokens,
     int initial_prompt_tokens,
+    const char* weight_version,
     char** error_out
 );
 
@@ -63,6 +64,7 @@ func CreateGrpcResponseConverter(
 	stopTokenIDs []uint32,
 	skipSpecialTokens bool,
 	initialPromptTokens int32,
+	weightVersion string,
 ) (*GrpcResponseConverterHandle, error) {
 	// Create tokenizer handle
 	tokenizerHandle, err := createTokenizerHandle(tokenizerPath)
@@ -81,6 +83,7 @@ func CreateGrpcResponseConverter(
 		stopTokenIDs,
 		skipSpecialTokens,
 		initialPromptTokens,
+		weightVersion,
 	)
 }
 
@@ -96,6 +99,7 @@ func CreateGrpcResponseConverterWithTokenizer(
 	stopTokenIDs []uint32,
 	skipSpecialTokens bool,
 	initialPromptTokens int32,
+	weightVersion string,
 ) (*GrpcResponseConverterHandle, error) {
 	if tokenizerHandle == nil || tokenizerHandle.handle == nil {
 		return nil, fmt.Errorf("invalid tokenizer handle")
@@ -111,6 +115,7 @@ func CreateGrpcResponseConverterWithTokenizer(
 		stopTokenIDs,
 		skipSpecialTokens,
 		initialPromptTokens,
+		weightVersion,
 	)
 }
 
@@ -125,6 +130,7 @@ func createGrpcResponseConverterWithTokenizerHandle(
 	stopTokenIDs []uint32,
 	skipSpecialTokens bool,
 	initialPromptTokens int32,
+	weightVersion string,
 ) (*GrpcResponseConverterHandle, error) {
 
 	// Convert strings to C strings
@@ -176,6 +182,14 @@ func createGrpcResponseConverterWithTokenizerHandle(
 
 	initialPromptTokensC := C.int(initialPromptTokens)
 
+	// The engine's weight version, the chunks' system_fingerprint; nil for
+	// the gateway's default.
+	var weightVersionC *C.char
+	if weightVersion != "" {
+		weightVersionC = C.CString(weightVersion)
+		defer C.free(unsafe.Pointer(weightVersionC))
+	}
+
 	converterHandle := C.sgl_grpc_response_converter_create(
 		tokenizerHandle,
 		modelC,
@@ -186,6 +200,7 @@ func createGrpcResponseConverterWithTokenizerHandle(
 		stopTokenIDsJSONC,
 		skipSpecialTokensC,
 		initialPromptTokensC,
+		weightVersionC,
 		&errorOut,
 	)
 

@@ -18,7 +18,7 @@ pub struct SglangClientHandle {
     pub(crate) client: Arc<SglangSchedulerClient>,
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
     /// The engine's weight version at creation, the chunks' `system_fingerprint`.
-    pub(crate) weight_version: Option<String>,
+    pub(crate) weight_version: String,
 }
 
 /// Create a new SGLang client handle
@@ -153,7 +153,7 @@ pub unsafe extern "C" fn sgl_client_chat_completion_stream(
         &client_ref.tokenizer,
         prepared,
         None,
-        client_ref.weight_version.as_deref(),
+        &client_ref.weight_version,
         error_out,
     ) {
         Ok(handle) => {

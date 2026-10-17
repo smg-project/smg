@@ -28,18 +28,35 @@ use super::{
 const MODEL_INFO_BOUND: Duration = Duration::from_secs(2);
 
 /// The weight version the engine reports in its model information, the
-/// value the gateway puts in `system_fingerprint`: `None` when the engine
-/// reports none, answers with an error, or does not answer within the bound.
-pub(crate) async fn weight_version_of(client: &SglangSchedulerClient) -> Option<String> {
+/// value the gateway puts in `system_fingerprint`: the gateway's fallback,
+/// `default`, when the engine reports a blank one, answers with an error, or
+/// does not answer within the bound (both logged, so an absent version is
+/// diagnosable).
+pub(crate) async fn weight_version_of(client: &SglangSchedulerClient) -> String {
     match tokio::time::timeout(MODEL_INFO_BOUND, client.get_model_info()).await {
-        Ok(Ok(info)) => reported_version(&info.weight_version),
-        Ok(Err(_)) | Err(_) => None,
+        Ok(Ok(info)) => fingerprint_of(Some(&info.weight_version)),
+        Ok(Err(status)) => {
+            tracing::warn!(%status, "model info lookup failed; system_fingerprint is the default");
+            fingerprint_of(None)
+        }
+        Err(_) => {
+            tracing::warn!(
+                ?MODEL_INFO_BOUND,
+                "model info lookup timed out; system_fingerprint is the default"
+            );
+            fingerprint_of(None)
+        }
     }
 }
 
-/// A version the engine reported: a non-blank string.
-pub(crate) fn reported_version(version: &str) -> Option<String> {
-    (!version.trim().is_empty()).then(|| version.to_string())
+/// The `system_fingerprint` for a weight version the engine reported: the
+/// version itself when it is not blank, else the gateway's fallback,
+/// `default` (what the gateway sends for a worker without a version).
+pub(crate) fn fingerprint_of(weight_version: Option<&str>) -> String {
+    match weight_version.map(str::trim) {
+        Some(version) if !version.is_empty() => version.to_string(),
+        _ => "default".to_string(),
+    }
 }
 
 /// A chat request read from the caller's JSON, its prompt rendered by the
@@ -94,9 +111,9 @@ pub(crate) fn prepare_chat(
 /// selected (the policy client; the single client holds none): the stream
 /// carries it until the caller frees the handle, and a failure here drops
 /// it, which gives it back. `weight_version` is the engine's, read when the
-/// client was built; the chunks carry it as `system_fingerprint`, as the
-/// gateway's do, and none when the engine reported none. A failure leaves
-/// the entry point's message in `error_out` and returns its code.
+/// client was built (the gateway's `default` when it reported none); the
+/// chunks carry it as `system_fingerprint`, as the gateway's do. A failure
+/// leaves the entry point's message in `error_out` and returns its code.
 ///
 /// # Safety
 /// - `error_out` may be null; if non-null, must point to writable memory
@@ -105,7 +122,7 @@ pub(crate) unsafe fn start_chat_stream(
     tokenizer: &Arc<dyn Tokenizer>,
     prepared: PreparedChat,
     load: Option<HeldLoad>,
-    weight_version: Option<&str>,
+    weight_version: &str,
     error_out: *mut *mut c_char,
 ) -> Result<SglangStreamHandle, SglErrorCode> {
     let PreparedChat {
@@ -161,7 +178,7 @@ pub(crate) unsafe fn start_chat_stream(
     let mut converter =
         GrpcResponseConverterHandle::for_chat(Arc::clone(tokenizer), &request, request_id);
     converter.initial_prompt_tokens = Some(prompt_tokens);
-    converter.system_fingerprint = weight_version.map(str::to_owned);
+    converter.system_fingerprint = Some(weight_version.to_owned());
     Ok(SglangStreamHandle {
         stream: Arc::new(tokio::sync::Mutex::new(stream)),
         converter: Arc::new(tokio::sync::Mutex::new(converter)),
@@ -185,10 +202,12 @@ mod tests {
     }
 
     #[test]
-    fn a_reported_version_is_a_non_blank_string() {
-        assert_eq!(reported_version("v7"), Some("v7".to_string()));
-        assert_eq!(reported_version(""), None);
-        assert_eq!(reported_version("  "), None);
+    fn the_fingerprint_is_the_reported_version_or_the_gateways_default() {
+        assert_eq!(fingerprint_of(Some("v7")), "v7");
+        assert_eq!(fingerprint_of(Some(" v7 ")), "v7");
+        assert_eq!(fingerprint_of(Some("")), "default");
+        assert_eq!(fingerprint_of(Some("  ")), "default");
+        assert_eq!(fingerprint_of(None), "default");
     }
 
     #[test]
