@@ -124,8 +124,21 @@ impl LoadBalancingPolicy for BucketPolicy {
                 let choiced_url = buc.find_boundary(char_count);
                 (choiced_url, chars_per_url_snapshot)
             };
-            let max_load = chars_per_url_snapshot.values().copied().max().unwrap_or(0);
-            let min_load = chars_per_url_snapshot.values().copied().min().unwrap_or(0);
+            // The imbalance test and the spill weigh the offered healthy
+            // workers alone: a listed worker nobody offers drains to zero and
+            // would otherwise drag the minimum down and draw every spill to a
+            // worker that cannot serve.
+            let offered: Vec<(&String, usize)> = chars_per_url_snapshot
+                .iter()
+                .filter(|(url, _)| {
+                    healthy_indices
+                        .iter()
+                        .any(|&i| workers[i].url() == url.as_str())
+                })
+                .map(|(url, &chars)| (url, chars))
+                .collect();
+            let max_load = offered.iter().map(|&(_, chars)| chars).max().unwrap_or(0);
+            let min_load = offered.iter().map(|&(_, chars)| chars).min().unwrap_or(0);
             let abs_diff = max_load.saturating_sub(min_load);
             let rel_threshold = self.config.balance_rel_threshold * min_load as f32;
             let is_imbalanced =
@@ -138,10 +151,10 @@ impl LoadBalancingPolicy for BucketPolicy {
             let mut rng = rand::rng();
             let prefill_url = if is_imbalanced {
                 debug!("select prefill instance by Load Balance policy");
-                let min_url = chars_per_url_snapshot
+                let min_url = offered
                     .iter()
-                    .min_by_key(|(_, &chars)| chars)
-                    .map(|(url, _)| url.clone())
+                    .min_by_key(|&&(_, chars)| chars)
+                    .map(|&(url, _)| url.clone())
                     .unwrap_or_else(|| {
                         let idx = rng.random_range(0..healthy_indices.len());
                         let url = workers[healthy_indices[idx]].url();
@@ -1547,5 +1560,36 @@ mod tests {
         let counted = bucket.chars_per_url.lock();
         assert_eq!(counted.get("http://w2:8000"), Some(&0));
         assert_eq!(counted.get(served.as_str()), Some(&2000));
+    }
+
+    /// The imbalance test and the spill weigh the offered workers alone: a
+    /// listed worker nobody offers drains to zero and must neither trip the
+    /// spill on every request nor receive it.
+    #[test]
+    fn the_spill_weighs_the_offered_workers_alone() {
+        for _ in 0..8 {
+            let policy = BucketPolicy::with_config(BucketConfig {
+                balance_abs_threshold: 100,
+                balance_rel_threshold: 1.1,
+                bucket_adjust_interval_secs: 3600,
+            });
+            let workers = prefill_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+            policy.init_prefill_worker_urls(&workers);
+            // w2 is listed but never offered; w1 takes 50 chars, then w3 3000.
+            let offered = [Arc::clone(&workers[0]), Arc::clone(&workers[2])];
+            assert_eq!(select(&policy, &offered, 50), Some(0));
+            assert_eq!(select(&policy, &offered, 3000), Some(1));
+            // Among the offered workers w3 is 2950 chars ahead: the spill sends
+            // the next request to w1, never to the unoffered w2.
+            assert_eq!(select(&policy, &offered, 3000), Some(0));
+            let entry = policy
+                .buckets
+                .get(normalize_model_key(workers[0].model_id()))
+                .expect("the workers' model has a bucket");
+            let bucket = entry.read();
+            let counted = bucket.chars_per_url.lock();
+            assert_eq!(counted.get("http://w2:8000"), Some(&0));
+            assert_eq!(counted.get("http://w1:8000"), Some(&3050));
+        }
     }
 }
