@@ -11,6 +11,7 @@
         },
         "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "replicas": { "type": "integer", "minimum": 1 },
+        "parser": { "type": "string", "enum": ["", "legacy", "symphony"] },
         "service": {
           "type": "object",
           "properties": {

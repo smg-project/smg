@@ -1465,14 +1465,15 @@ struct ModelArgs {
     #[arg(long, help_heading = "Parsers")]
     tool_call_parser: Option<String>,
 
-    /// Which parser reads a chat completion's reasoning and tool calls: the
-    /// per-model parsers (legacy) or Symphony. With Symphony, a model's
+    /// Which parser reads a chat completion's reasoning and tool calls:
+    /// Symphony (the default) or the per-model parsers (legacy). With
+    /// Symphony, a model's
     /// worker labels decide, else Symphony's registry for a model it knows,
     /// else --tool-call-parser and --reasoning-parser: a Symphony table's
     /// name reads with that table, a legacy parser's keeps the legacy
     /// parsers, and no name leaves the legacy parsers to detect. A request's
     /// X-SMG-Parser header overrides the flag for that request.
-    #[arg(long, default_value = "legacy", value_parser = ["legacy", "symphony"], help_heading = "Parsers")]
+    #[arg(long, default_value = "symphony", value_parser = ["legacy", "symphony"], help_heading = "Parsers")]
     parser: String,
 
     /// Path to MCP server configuration file
@@ -5378,6 +5379,30 @@ mod tests {
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert!(!server_config.router_config.engine_metrics);
+    }
+
+    /// Symphony is the default parser in both conversions; `--parser legacy`
+    /// selects the per-model parsers, and any other name is refused by clap.
+    #[test]
+    fn parser_defaults_to_symphony_and_legacy_selects_the_legacy_parsers() {
+        let cli = cli_args_from(&[]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.parser, ParserChoice::Symphony);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(server_config.router_config.parser, ParserChoice::Symphony);
+
+        let cli = cli_args_from(&["--parser", "legacy"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.parser, ParserChoice::Legacy);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(server_config.router_config.parser, ParserChoice::Legacy);
+
+        let cli = cli_args_from(&["--parser", "symphony"]);
+        assert_eq!(
+            cli.to_router_config(vec![], vec![]).unwrap().parser,
+            ParserChoice::Symphony
+        );
+        assert!(Cli::try_parse_from(["smg", "--parser", "fast"]).is_err());
     }
 
     /// clap rejects out-of-range probe ports at parse time (the `u16`

@@ -75,9 +75,13 @@ fn reasoning_decision(
             )
         })
     });
+    // A request that chose no parser (transcription shares this path and
+    // sets none) keeps the legacy parsers here as at the sites below, rather
+    // than inheriting the enum's default: its response is read by them, so
+    // no table's replay of the prompt decides its reasoning state.
     switch
         || symphony::reasoning_open(
-            ctx.state.parser.unwrap_or_default(),
+            ctx.state.parser.unwrap_or(ParserChoice::Legacy),
             &ctx.components.parser_resolver.names(&chat_request.model),
             &chat_request.model,
             &ctx.components.templates,
@@ -234,7 +238,7 @@ impl BuildStage for ChatRequestBuildingStage {
         // the one that reads the response is Symphony only when a table takes
         // the request, so the state records that for the response's header.
         let names = ctx.components.parser_resolver.names(&chat_request.model);
-        let parser = ctx.state.parser.unwrap_or_default();
+        let parser = ctx.state.parser.unwrap_or(ParserChoice::Legacy);
         // What constrains the output is decided here, on the worker selected
         // for the request (`regular::symphony::worker_constraint`): the whole
         // turn's grammar on a worker whose engine takes one on every turn from
