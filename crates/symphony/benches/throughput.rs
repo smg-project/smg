@@ -2,23 +2,26 @@
 //! per second of prose with no marker in it (the common streaming case), and the construction of
 //! an engine, which is the parser's per-request setup. One subject per call syntax, each a turn as
 //! the table's own tests spell it: a thought, an answer and two calls, the tools declared as a
-//! request declares them.
+//! request declares them. The parse and prose rows time the reading alone: the engine is made
+//! outside the timed closure, and the setup rows time that.
 //!
 //! `cargo bench -p smg-symphony --bench throughput`; a filter narrows it (`-- parse/whole`).
 #![allow(clippy::expect_used)]
 
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use openai_protocol::common::{Function, Tool};
 use serde_json::json;
 use symphony::{formats::Table, Declared, Engine, EngineFinish, Events, Input, Parser};
 
-/// One table under measurement, with the prompt tail that places the output and the output.
+/// One table under measurement: the prompt tail that places the output, the output, and the prompt
+/// tail that leaves the model in its answer, for the prose rows.
 struct Subject {
     table: Table,
     prompt: &'static str,
     output: &'static str,
+    content_prompt: &'static str,
 }
 
 const SUBJECTS: &[Subject] = &[
@@ -32,6 +35,7 @@ const SUBJECTS: &[Subject] = &[
             "<tool_call>\n{\"name\": \"change_drink\", \"arguments\": {\"drink_id\": \"latte\", ",
             "\"new_preferences\": {\"size\": \"large\", \"temperature\": \"hot\"}}}\n</tool_call>"
         ),
+        content_prompt: "<|im_start|>assistant\n",
     },
     Subject {
         table: Table::Qwen3Tagged,
@@ -45,6 +49,7 @@ const SUBJECTS: &[Subject] = &[
             "<parameter=new_preferences>\n{\"size\": \"large\", \"temperature\": \"hot\"}\n</parameter>\n",
             "</function>\n</tool_call>"
         ),
+        content_prompt: "<|im_start|>assistant\n",
     },
     Subject {
         table: Table::Glm,
@@ -57,6 +62,7 @@ const SUBJECTS: &[Subject] = &[
             "<arg_key>new_preferences</arg_key><arg_value>",
             "{\"size\": \"large\", \"temperature\": \"hot\"}</arg_value></tool_call>"
         ),
+        content_prompt: "<|assistant|>",
     },
     Subject {
         table: Table::DeepSeekV4_1,
@@ -75,6 +81,7 @@ const SUBJECTS: &[Subject] = &[
             "</｜DSML｜ invoke>\n",
             "</｜DSML｜ calls>"
         ),
+        content_prompt: "<｜Assistant｜></think>",
     },
     Subject {
         table: Table::KimiK3,
@@ -91,6 +98,7 @@ const SUBJECTS: &[Subject] = &[
             "{\"size\": \"large\", \"temperature\": \"hot\"}<|close|>argument<|sep|>",
             "<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
         ),
+        content_prompt: "<|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>",
     },
     Subject {
         table: Table::MinimaxM3,
@@ -105,6 +113,7 @@ const SUBJECTS: &[Subject] = &[
             "]<]minimax[>[</temperature>]<]minimax[>[</new_preferences>]<]minimax[>[</invoke>\n",
             "]<]minimax[>[</tool_call>"
         ),
+        content_prompt: "]~b]ai\n",
     },
     Subject {
         table: Table::Gemma4,
@@ -116,6 +125,7 @@ const SUBJECTS: &[Subject] = &[
             "new_preferences:{size:<|\"|>large<|\"|>,temperature:<|\"|>hot<|\"|>}}<tool_call|>",
             "Let me check both."
         ),
+        content_prompt: "<|turn>model\n",
     },
     Subject {
         table: Table::Lfm2_5,
@@ -126,6 +136,7 @@ const SUBJECTS: &[Subject] = &[
             "change_drink(drink_id='latte', new_preferences={'size': 'large', 'temperature': 'hot'})]",
             "<|tool_call_end|>"
         ),
+        content_prompt: "<|im_start|>assistant\n",
     },
 ];
 
@@ -235,51 +246,63 @@ fn parse(c: &mut Criterion) {
         let name = subject.table.name();
         group.throughput(Throughput::Bytes(subject.output.len() as u64));
         group.bench_with_input(BenchmarkId::new("whole", name), subject, |b, subject| {
-            b.iter(|| {
-                let mut engine = engine(subject.table, subject.prompt, &declared);
-                let mut out = Events::new();
-                read(&mut engine, &[subject.output], &mut out);
-            });
+            b.iter_batched(
+                || engine(subject.table, subject.prompt, &declared),
+                |mut engine| {
+                    let mut out = Events::new();
+                    read(&mut engine, &[subject.output], &mut out);
+                },
+                BatchSize::SmallInput,
+            );
         });
         let cut = pieces(subject.output, 8);
         group.bench_with_input(BenchmarkId::new("pieces8", name), subject, |b, subject| {
-            b.iter(|| {
-                let mut engine = engine(subject.table, subject.prompt, &declared);
-                let mut out = Events::new();
-                read(&mut engine, &cut, &mut out);
-            });
+            b.iter_batched(
+                || engine(subject.table, subject.prompt, &declared),
+                |mut engine| {
+                    let mut out = Events::new();
+                    read(&mut engine, &cut, &mut out);
+                },
+                BatchSize::SmallInput,
+            );
         });
     }
     group.finish();
 }
 
+/// The prose rows: every subject's table with the output placed in its answer, and the table with
+/// no markers at all, which is the floor.
 fn prose_only(c: &mut Criterion) {
     let declared = declared();
     let text = prose();
     let cut = pieces(&text, 8);
     let mut group = c.benchmark_group("prose");
     group.throughput(Throughput::Bytes(text.len() as u64));
-    for table in [
-        Table::Qwen3,
-        Table::Qwen3Tagged,
-        Table::KimiK3,
-        Table::MinimaxM3,
-        Table::Plain,
-    ] {
+    let subjects = SUBJECTS
+        .iter()
+        .map(|subject| (subject.table, subject.content_prompt))
+        .chain(std::iter::once((Table::Plain, "")));
+    for (table, prompt) in subjects {
         let name = table.name();
         group.bench_with_input(BenchmarkId::new("whole", name), &table, |b, table| {
-            b.iter(|| {
-                let mut engine = engine(*table, "", &declared);
-                let mut out = Events::new();
-                read(&mut engine, &[text.as_str()], &mut out);
-            });
+            b.iter_batched(
+                || engine(*table, prompt, &declared),
+                |mut engine| {
+                    let mut out = Events::new();
+                    read(&mut engine, &[text.as_str()], &mut out);
+                },
+                BatchSize::SmallInput,
+            );
         });
         group.bench_with_input(BenchmarkId::new("pieces8", name), &table, |b, table| {
-            b.iter(|| {
-                let mut engine = engine(*table, "", &declared);
-                let mut out = Events::new();
-                read(&mut engine, &cut, &mut out);
-            });
+            b.iter_batched(
+                || engine(*table, prompt, &declared),
+                |mut engine| {
+                    let mut out = Events::new();
+                    read(&mut engine, &cut, &mut out);
+                },
+                BatchSize::SmallInput,
+            );
         });
     }
     group.finish();
