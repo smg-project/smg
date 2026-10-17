@@ -14,6 +14,16 @@
 //! wrappers through the response's extensions ([`BodyDuties`]) and wrap
 //! nothing themselves.
 //!
+//! The hand-over rides on the response's extensions, so it holds across the
+//! layers that keep them. A layer between a producer and the edge that
+//! builds the response again from scratch (the WASM middleware's reject and
+//! modify phases do, with `Response::builder()`) drops the duties handed so
+//! far with the old response: the permit and the keep-alive end there, as
+//! their in-body wrappers did when such a layer drained the old body, and
+//! the span closes with the head ([`BodyDuties`]' drop). A layer that
+//! replaces the body but keeps the parts (the Messages error envelope) keeps
+//! them.
+//!
 //! The duties end as they did. At the body's end (its last frame, the length
 //! the response declared, or an error of the body) the response is counted,
 //! the in-flight guard and the permit are released and the span closes; a
@@ -102,7 +112,9 @@ impl BodyDuties {
 impl Drop for BodyDuties {
     fn drop(&mut self) {
         // Duties still here were taken by no edge body: the response left a
-        // stack with no metrics layer outside. The span then closes with the
+        // stack with no metrics layer outside, or a layer between the
+        // producer and the edge built the response again without its
+        // extensions (see the module doc). The span then closes with the
         // response head, and its close line stays unwritten rather than
         // claiming a client that closed.
         if let Some(span) = &mut self.span {
@@ -282,7 +294,15 @@ impl HttpBody for EdgeBody {
                 if !this.data_frame_allowed() {
                     return this.end_before_first_byte();
                 }
-                Poll::Ready(Some(Ok(Frame::data(frame))))
+                // The keep-alive's bytes reach the client like any frame's:
+                // counted in the access log's bytes, as they were. A
+                // keep-alive rides only a body with no declared length, so
+                // this is never the body's end.
+                let frame = Frame::data(frame);
+                if this.progress.frame_out(&frame, false) {
+                    this.finished();
+                }
+                Poll::Ready(Some(Ok(frame)))
             }
         }
     }

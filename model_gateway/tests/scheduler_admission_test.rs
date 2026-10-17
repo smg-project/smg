@@ -471,8 +471,9 @@ async fn preemption_evicts_bulk_and_serves_high_priority() {
         Some("1"),
         "preemption 503 must carry Retry-After: 1"
     );
-    // Draining the victim's 503 body drops the permit it carries and frees the
-    // slot, so the (now-enqueued) interactive admission can proceed.
+    // The victim's slot went with its 503 (a preemption 503 carries no permit),
+    // so the (now-enqueued) interactive admission can proceed; the body is
+    // drained whole.
     let _ = body_json(bulk_resp).await;
 
     // Once the interactive request reaches the worker it holds the slot too;

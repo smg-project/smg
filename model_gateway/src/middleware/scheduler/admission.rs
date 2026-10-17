@@ -26,7 +26,7 @@ use tracing::trace;
 
 use super::{
     metrics as sched_metrics, state::SchedulerState, AdmitOutcome, Class, RejectionReason,
-    SchedulerError, HEADER_X_SMG_PREEMPTED, PRIORITY_HEADER,
+    SchedulerError, SchedulerPermit, HEADER_X_SMG_PREEMPTED, PRIORITY_HEADER,
 };
 use crate::{
     middleware::{edge_body::BodyDuties, tenant_resolution::restamp_accepted_at, RouteRequestMeta},
@@ -164,11 +164,7 @@ pub async fn priority_admission_middleware(
                 scheduler.admit_outcome = outcome,
                 "scheduler admission decision"
             );
-            // Held until the response body ends or is dropped, by the edge's
-            // one body wrapper, which marks TTFT on the first data frame.
-            BodyDuties::hand(&mut response, |duties| {
-                duties.permit = Some(Box::new(permit));
-            });
+            carry_permit(&mut response, permit);
             response
         }
         AdmitOutcome::Rejected(reason) => {
@@ -186,13 +182,32 @@ pub async fn priority_admission_middleware(
     }
 }
 
+/// The permit rides on the response body, held until the body ends or is
+/// dropped by the edge's one body wrapper, which marks TTFT on the first data
+/// frame; unless the response is the preemption 503 the handler's guard
+/// wrote. That request is over: the permit goes now, the slot with it, and the
+/// 503's body goes out whole. The wrapper's first-frame check could not tell
+/// that 503 from a 200 whose first byte a preemption beat (the scheduler won
+/// the preempt CAS either way), and a layer between here and the edge that
+/// replaces the body while keeping the extensions (the Messages error
+/// envelope) would have it end the rebuilt body before its first byte.
+fn carry_permit(response: &mut Response, permit: SchedulerPermit) {
+    if response.headers().contains_key(HEADER_X_SMG_PREEMPTED) {
+        drop(permit);
+        return;
+    }
+    BodyDuties::hand(response, |duties| {
+        duties.permit = Some(Box::new(permit));
+    });
+}
+
 #[cfg(test)]
 mod permit_tests {
     //! The scheduler's permit on the edge's one body wrapper: TTFT on the
     //! first data frame, the slot released with the body.
     use std::sync::Arc;
 
-    use axum::{body::Body, response::Response};
+    use axum::{body::Body, http::StatusCode, response::Response};
     use http_body::Body as HttpBody;
     use http_body_util::BodyExt;
     use smg_auth::RequestId;
@@ -303,5 +318,34 @@ mod permit_tests {
             0,
             "dropping the guarded body releases the slot"
         );
+    }
+
+    /// The preemption 503 the handler's guard wrote carries no permit: the
+    /// request is over, the slot goes with the response head, and the body
+    /// goes out whole, since no first-frame check rides on it.
+    #[tokio::test]
+    async fn a_preemption_503_carries_no_permit_and_goes_out_whole() {
+        let sched = scheduler();
+        let p = permit(&sched, "req-503");
+        let handle = Arc::clone(p.handle());
+        assert!(handle.try_mark_preempted(), "the scheduler won the CAS");
+        let mut response = Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header(HEADER_X_SMG_PREEMPTED, "true")
+            .body(Body::from("{\"error\":\"overloaded\"}"))
+            .expect("response");
+        carry_permit(&mut response, p);
+        assert_eq!(
+            sched.inflight_for_test(Class::Default),
+            0,
+            "the slot goes with the 503, not with its body"
+        );
+        let body = at_the_edge(response)
+            .into_body()
+            .collect()
+            .await
+            .expect("whole")
+            .to_bytes();
+        assert_eq!(&body[..], b"{\"error\":\"overloaded\"}");
     }
 }

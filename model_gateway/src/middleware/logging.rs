@@ -1255,6 +1255,7 @@ mod field_tests {
         io,
         net::SocketAddr,
         sync::{Arc, Mutex},
+        time::Duration,
     };
 
     use axum::{
@@ -1278,8 +1279,8 @@ mod field_tests {
     use crate::{
         config::{PolicyConfig, RouterConfig, RoutingMode},
         middleware::{
-            auth_middleware, route_request_meta_middleware, AuthConfig, HttpMetricsLayer,
-            TenantResolutionState,
+            auth_middleware, route_request_meta_middleware, sse_keepalive_middleware, AuthConfig,
+            HttpMetricsLayer, SseKeepAlive, TenantResolutionState,
         },
         observability::{
             inflight_tracker::InFlightRequestTracker,
@@ -1413,6 +1414,10 @@ mod field_tests {
                     }
                 }),
             )
+            .route_layer(from_fn_with_state(
+                SseKeepAlive::every_secs(15),
+                sse_keepalive_middleware,
+            ))
             .route_layer(from_fn_with_state(tenants, route_request_meta_middleware))
             .route_layer(from_fn_with_state(auth, auth_middleware))
             .layer(create_logging_layer(fields))
@@ -1583,6 +1588,46 @@ mod field_tests {
                 assert_eq!(span["status_code"], 200);
             }
         }
+    }
+
+    /// A keep-alive frame the edge wrote into a quiet stream reached the
+    /// client like any frame: the end line's bytes count it.
+    #[tokio::test(start_paused = true)]
+    async fn a_keep_alive_frame_counts_in_the_streamed_bytes() {
+        let capture = Capture::default();
+        let _guard = tracing::subscriber::set_default(json_subscriber(&capture));
+        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
+        let response = app(
+            AccessLogFields::all(),
+            Some(Body::from_stream(ReceiverStream::new(rx))),
+        )
+        .oneshot(request("/v1/stream"))
+        .await
+        .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        tx.send(Ok(Bytes::from_static(FRAME))).await.expect("send");
+        let first = body.frame().await.expect("a frame").expect("frame ok");
+        assert_eq!(first.data_ref().map(|data| data.len()), Some(FRAME.len()));
+        // Silence: the keep-alive comment comes through the edge.
+        let ping = tokio::time::timeout(Duration::from_secs(16), body.frame())
+            .await
+            .expect("a keep-alive within the interval")
+            .expect("a frame")
+            .expect("frame ok");
+        let ping_len = ping
+            .data_ref()
+            .map(|data| data.len())
+            .expect("a data frame");
+        assert_eq!(ping_len, b": ping\n\n".len());
+        drop(tx);
+        assert!(body.frame().await.is_none());
+
+        let lines = access_lines(&capture);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        let (message, span) = &lines[2];
+        assert_eq!(message, "finished streaming the response");
+        assert_eq!(span["response_bytes"], FRAME.len() + ping_len);
     }
 
     /// A client that leaves mid-stream gets the bytes that went out on its
