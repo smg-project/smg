@@ -62,14 +62,17 @@ mod handles {
     use std::{
         cell::{OnceCell, RefCell},
         collections::HashMap,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        },
     };
 
     use metrics::{Counter, Gauge, Histogram};
     #[cfg(test)]
     pub(super) use smg_external_router::metrics::handles::force_on_this_thread;
     pub(super) use smg_external_router::metrics::handles::{
-        keep_handles, nested, recorder_installed, with_handle, ByLabels,
+        keep_handles, nested, recorder_installed, with_handle, with_model_handle, ByLabels,
     };
 
     /// Handles by the matched path (the only label a request computes).
@@ -119,17 +122,18 @@ mod handles {
     }
 
     /// This thread's kept `smg_worker_requests_total` handles, by worker
-    /// URL then model, with the worker-set generation they were kept under.
+    /// URL then the model label as the interner gave it, with the
+    /// worker-set generation they were kept under.
     #[derive(Default)]
     pub(super) struct WorkerRequests {
         generation: u64,
-        by_worker: HashMap<String, HashMap<String, Counter>>,
+        by_worker: HashMap<String, HashMap<Arc<str>, Counter>>,
     }
 
     impl WorkerRequests {
         /// The handles by model for `worker_url`, after dropping every kept
         /// handle if the worker set changed since they were kept.
-        pub(super) fn for_worker(&mut self, worker_url: &str) -> &mut HashMap<String, Counter> {
+        pub(super) fn for_worker(&mut self, worker_url: &str) -> &mut HashMap<Arc<str>, Counter> {
             let generation = WORKER_SET_GENERATION.load(Ordering::Acquire);
             if self.generation != generation {
                 self.by_worker.clear();
@@ -174,16 +178,16 @@ mod handles {
 
         #[test]
         fn kept_worker_counters_go_when_the_worker_set_changes() {
+            // The generation is process-wide and other tests register and
+            // remove workers: the steady state is read off the map one
+            // `for_worker` call handed out, with no second call in between
+            // that a bump elsewhere could clear.
             let mut kept = WorkerRequests::default();
-            kept.for_worker("http://w1")
-                .insert("m".to_owned(), Counter::noop());
-            assert_eq!(kept.for_worker("http://w1").len(), 1);
+            let counters = kept.for_worker("http://w1");
+            counters.insert(Arc::from("m"), Counter::noop());
+            assert_eq!(counters.len(), 1);
             worker_set_changed();
             assert!(kept.for_worker("http://w1").is_empty());
-            // Steady again until the next change.
-            kept.for_worker("http://w1")
-                .insert("m".to_owned(), Counter::noop());
-            assert_eq!(kept.for_worker("http://w1").len(), 1);
         }
     }
 }
@@ -1881,10 +1885,10 @@ impl Metrics {
             endpoint,
         };
         handles::STREAMS.with_borrow_mut(|by_labels| {
-            handles::with_handle(
+            handles::with_model_handle(
                 by_labels.entry(labels).or_default(),
                 model_id,
-                handles::StreamHandles::default,
+                |_label| handles::StreamHandles::default(),
                 |kept| {
                     if let Some(ttft) = ttft {
                         kept.ttft
@@ -2305,10 +2309,10 @@ impl Metrics {
             return;
         }
         handles::WORKER_REQUESTS.with_borrow_mut(|kept| {
-            handles::with_handle(
+            handles::with_model_handle(
                 kept.for_worker(worker_url),
                 model_id,
-                || Self::worker_requests(worker_url, model_id),
+                |_label| Self::worker_requests(worker_url, model_id),
                 |counter| counter.increment(1),
             );
         });
@@ -4058,11 +4062,11 @@ mod tests {
     fn a_registration_or_a_removal_drops_the_kept_worker_counters() {
         let mut kept = handles::WorkerRequests::default();
         kept.for_worker("http://w")
-            .insert("m".to_owned(), metrics::Counter::noop());
+            .insert(Arc::from("m"), metrics::Counter::noop());
         Metrics::remove_worker_metrics("http://gone");
         assert!(kept.for_worker("http://w").is_empty(), "a removal");
         kept.for_worker("http://w")
-            .insert("m".to_owned(), metrics::Counter::noop());
+            .insert(Arc::from("m"), metrics::Counter::noop());
         Metrics::worker_registered("http://new");
         assert!(kept.for_worker("http://w").is_empty(), "a registration");
     }

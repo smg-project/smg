@@ -261,12 +261,15 @@ pub mod handles {
     use std::{
         cell::{Cell, RefCell},
         collections::HashMap,
-        sync::atomic::{AtomicBool, Ordering},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
     };
 
     use metrics::{Counter, Histogram};
 
-    use super::MAX_MODEL_LABELS;
+    use super::{intern_model_label, BOUNDED_LABEL_SENTINEL_ARC, MAX_MODEL_LABELS};
 
     static RECORDER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
@@ -300,8 +303,10 @@ pub mod handles {
         FORCED.set(keep);
     }
 
-    /// Handles by a static label set, then by the model label.
-    pub type ByLabels<L, H> = HashMap<L, HashMap<String, H>>;
+    /// Handles by a static label set, then by the model label as the
+    /// interner gave it: the key is the interner's own allocation, shared
+    /// with every thread that kept the handle.
+    pub type ByLabels<L, H> = HashMap<L, HashMap<Arc<str>, H>>;
 
     /// The static labels of `smg_router_requests_total`.
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -348,6 +353,44 @@ pub mod handles {
         use_handle(&handle);
         if map.len() < MAX_KEPT_PER_MAP {
             map.insert(key.to_owned(), handle);
+        }
+    }
+
+    /// Whether `label` is the sentinel the interner gives a name past its
+    /// cap (or refused in a race at the cap).
+    pub fn is_sentinel(label: &Arc<str>) -> bool {
+        Arc::ptr_eq(label, &BOUNDED_LABEL_SENTINEL_ARC)
+    }
+
+    /// Whether a handle built under `label` is kept in a map of `len`
+    /// entries: under the cap, and never for the sentinel. A name the
+    /// interner refused is used and dropped, so a flood of distinct names
+    /// grows no map, and a name refused in a race does not pin the
+    /// sentinel's series under its own spelling for the thread's life.
+    pub fn kept(len: usize, label: &Arc<str>) -> bool {
+        len < MAX_KEPT_PER_MAP && !is_sentinel(label)
+    }
+
+    /// Uses the handle under the model label of `model_id`, building it on
+    /// first sight with the label the interner gives and keeping it, when
+    /// [`kept`] says so, under that same `Arc<str>`: the map holds the
+    /// interner's allocation, not a copy of a client-controlled name.
+    pub fn with_model_handle<H>(
+        map: &mut HashMap<Arc<str>, H>,
+        model_id: &str,
+        build: impl FnOnce(Arc<str>) -> H,
+        use_handle: impl FnOnce(&H),
+    ) {
+        if let Some(handle) = map.get(model_id) {
+            use_handle(handle);
+            return;
+        }
+        let label = intern_model_label(model_id);
+        let keep = kept(map.len(), &label);
+        let handle = build(Arc::clone(&label));
+        use_handle(&handle);
+        if keep {
+            map.insert(label, handle);
         }
     }
 
@@ -423,6 +466,39 @@ pub mod handles {
         }
 
         #[test]
+        fn a_kept_model_handle_is_keyed_by_the_interners_label() {
+            let mut map: HashMap<Arc<str>, usize> = HashMap::new();
+            let mut built = None;
+            with_model_handle(
+                &mut map,
+                "kept-model",
+                |label| {
+                    built = Some(Arc::clone(&label));
+                    label.len()
+                },
+                |_| {},
+            );
+            let key = map.keys().next().expect("kept");
+            assert!(Arc::ptr_eq(key, &intern_model_label("kept-model")));
+            assert!(Arc::ptr_eq(key, built.as_ref().expect("built once")));
+            let mut used = None;
+            with_model_handle(&mut map, "kept-model", |_| 0, |handle| used = Some(*handle));
+            assert_eq!(used, Some("kept-model".len()), "found by its text");
+            assert_eq!(map.len(), 1);
+        }
+
+        #[test]
+        fn the_sentinel_is_used_but_never_kept() {
+            let sentinel = Arc::clone(&BOUNDED_LABEL_SENTINEL_ARC);
+            assert!(is_sentinel(&sentinel));
+            assert!(!kept(0, &sentinel));
+            let admitted = intern_model_label("an-admitted-model");
+            assert!(!is_sentinel(&admitted));
+            assert!(kept(0, &admitted));
+            assert!(!kept(MAX_KEPT_PER_MAP, &admitted));
+        }
+
+        #[test]
         fn the_forced_say_of_a_thread_outranks_the_installed_flag() {
             assert!(!keep_handles());
             force_on_this_thread(Some(true));
@@ -453,8 +529,7 @@ impl Metrics {
         endpoint: &'static str,
         streaming: &'static str,
     ) {
-        let build = || {
-            let model = intern_model_label(model_id);
+        let build = |model: Arc<str>| {
             counter!(
                 "smg_router_requests_total",
                 "router_type" => router_type,
@@ -466,7 +541,7 @@ impl Metrics {
             )
         };
         if !handles::keep_handles() {
-            build().increment(1);
+            build(intern_model_label(model_id)).increment(1);
             return;
         }
         let labels = handles::RequestLabels {
@@ -477,7 +552,7 @@ impl Metrics {
             streaming,
         };
         handles::ROUTER_REQUESTS.with_borrow_mut(|by_labels| {
-            handles::with_handle(
+            handles::with_model_handle(
                 by_labels.entry(labels).or_default(),
                 model_id,
                 build,
@@ -495,8 +570,7 @@ impl Metrics {
         endpoint: &'static str,
         duration: Duration,
     ) {
-        let build = || {
-            let model = intern_model_label(model_id);
+        let build = |model: Arc<str>| {
             histogram!(
                 "smg_router_request_duration_seconds",
                 "router_type" => router_type,
@@ -508,7 +582,7 @@ impl Metrics {
         };
         let seconds = duration.as_secs_f64();
         if !handles::keep_handles() {
-            build().record(seconds);
+            build(intern_model_label(model_id)).record(seconds);
             return;
         }
         let labels = handles::DurationLabels {
@@ -518,7 +592,7 @@ impl Metrics {
             endpoint,
         };
         handles::ROUTER_DURATIONS.with_borrow_mut(|by_labels| {
-            handles::with_handle(
+            handles::with_model_handle(
                 by_labels.entry(labels).or_default(),
                 model_id,
                 build,
