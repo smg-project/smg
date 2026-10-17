@@ -15,7 +15,9 @@
 //!   which is what prefix stability promises a client, and a call that ended, by its own
 //!   terminal, the region's or the end of the stream, has arguments that are whole JSON unless a
 //!   `Malformed` event came while it was open, so that a client is never handed a cut call as a
-//!   whole one without a word;
+//!   whole one without a word, and a fragment that closes a string the arguments left open
+//!   carries the bytes of the output that closed it, so that no closing quote is made up for a
+//!   value the model never closed;
 //! - order: calls are numbered from zero as they start, with ids that follow the index;
 //! - the lifecycle: one `Prompt`, deltas, one `End`, and an input out of order is a `Lifecycle`
 //!   error that emits nothing.
@@ -1115,6 +1117,11 @@ const M3_OUTPUTS: &[&str] = &[
      ]<]minimax[>[</invoke>\n]<]minimax[>[<invoke name=\"g\">]<]minimax[>[</invoke>\n\
      ]<]minimax[>[</tool_call>",
     "</mm:think><tool_call>\n<invoke name=\"get_weather\"><city>Par",
+    // The block's close inside a string value: at the top, nested in an object, and with the
+    // start of a tag held before the invoke's own closing tag.
+    "</mm:think><tool_call>\n<invoke name=\"get_weather\"><city>Par</tool_call>",
+    "</mm:think><tool_call>\n<invoke name=\"get_weather\"><opts><unit>C</tool_call>",
+    "</mm:think><tool_call>\n<invoke name=\"get_weather\"><city>Par</ci</invoke>\n</tool_call>",
     "</mm:think><tool_call>\n<invoke name=\"get_weather\"><opts><unit>C</unit><days>3",
     "</mm:think><tool_call>\n<invoke name=\"f\"><a>x</a><invoke name=\"g\"><b>y</b></invoke>\n\
      </tool_call>",
@@ -1216,6 +1223,10 @@ const KIMI_K3_OUTPUTS: &[&str] = &[
     "<|open|>think<|sep|><|close|>think<|sep|>\
      <|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>\
      <|open|>argument key=\"city\" type=\"string\"<|sep|>Par",
+    "<|open|>think<|sep|><|close|>think<|sep|>\
+     <|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>\
+     <|open|>argument key=\"city\" type=\"string\"<|sep|>Par<|close|>call<|sep|><|close|>tools<|sep|>\
+     <|close|>message<|sep|>",
     "<|open|>think<|sep|><|close|>think<|sep|>\
      <|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>\
      <|open|>argument key=\"n\" type=\"number\"<|sep|>12",
@@ -1373,6 +1384,7 @@ const SEED_OUTPUTS: &[&str] = &[
      2.5e-07, None, True]}\n</parameter>\n<parameter=note>\nNone\n</parameter>\n</function>\n\
      </seed:tool_call>\n<seed:tool_call>\n<function=other>\n</function>\n</seed:tool_call>",
     "<seed:tool_call>\n<function=get_weather>\n<parameter=city>\nPar",
+    "<seed:tool_call>\n<function=get_weather>\n<parameter=city>\nPar\n</seed:tool_call>",
     "<seed:tool_call>\n<function=f<parameter=city>\nx\n</parameter>\n</function>\n\
      </seed:tool_call>",
     "<seed:tool_call>\nprose <parameter=city>\nParis\n</parameter>\n</function>\n</seed:tool_call>",
@@ -1394,6 +1406,9 @@ const HY4_OUTPUTS: &[&str] = &[
     "</think:opensource><tool_calls:opensource><tool_call:opensource>get_weather\
      <arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Par",
     "</think:opensource><tool_calls:opensource><tool_call:opensource>get_weather\
+     <arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Par</tool_call:opensource>\
+     </tool_calls:opensource>",
+    "</think:opensource><tool_calls:opensource><tool_call:opensource>get_weather\
      <arg_key:opensource>note</arg_key:opensource><arg_value:opensource>null</arg_value:opensource>\
      <arg_key:opensource>extra</arg_key:opensource><arg_value:opensource>[1, 2]\
      </arg_value:opensource>\
@@ -1412,6 +1427,7 @@ const LING_OUTPUTS: &[&str] = &[
      <arg_key>days</arg_key>\n<arg_value>3</arg_value>\n</tool_call>\n<tool_call>get_weather\n\
      </tool_call>",
     "</think><tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Par",
+    "</think><tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Par</tool_call>",
     "</think><tool_call>get_weather\n<arg_key>q</arg_key>\n<arg_value>計画 🌍 \"q\" \\ \n\
      </arg_value>\n</tool_call>",
     "<think>plan</think>Sure.<tool_call>\n</tool_call>",
@@ -1425,6 +1441,7 @@ const GLM_OUTPUTS: &[&str] = &[
      </arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call><tool_call>get_weather\
      </tool_call>",
     "<think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Par",
+    "<think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Par</tool_call>",
     "<think></think><tool_call>get_weather<arg_key>q</arg_key><arg_value>計画 🌍 \"q\" \\ \
      </arg_value></tool_call>",
     "<think></think><tool_call>get_weather<arg_key>days</arg_key><arg_value>three</arg_value>\
@@ -1494,6 +1511,7 @@ const GEMMA4_TEMPLATE_OUTPUTS: &[&str] = &[
     "<|channel>thought\nPlan <|tool_call>call:f{}<tool_call|> more<channel|>Done",
     " \n\t ",
     "Sure.\n<|tool_call>call:get_weather{city:<|\"|>Par",
+    "Sure.\n<|tool_call>call:get_weather{city:<|\"|>Par<tool_call|>",
     "",
 ];
 
@@ -1518,6 +1536,7 @@ const IQUEST_OUTPUTS: &[&str] = &[
      <arg_key>days</arg_key><arg_value>3</arg_value></iquest_tool_call><iquest_tool_call>\
      get_weather</iquest_tool_call>",
     "</think><iquest_tool_call>get_weather<arg_key>city</arg_key><arg_value>Par",
+    "</think><iquest_tool_call>get_weather<arg_key>city</arg_key><arg_value>Par</iquest_tool_call>",
     "</think><iquest_tool_call><arg_key>city</arg_key><arg_value>Paris</arg_value>\
      <arg_key>days</arg_key><arg_value>3</arg_value></iquest_tool_call>",
 ];
@@ -1530,6 +1549,11 @@ const DSML_OUTPUTS: &[&str] = &[
      string=\"false\">3</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke \
      name=\"get_stock_price\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
     "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"a\" string=\"true\">par",
+    // The block's close, and the next invoke, inside a string value.
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"a\" string=\"true\">par\
+     </｜DSML｜ calls>",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"a\" string=\"true\">par\n\
+     <｜DSML｜ invoke name=\"g\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
     "Let me call.<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"a\" \
      string=\"true\">x</｜DSML｜ parameter>\n<｜DSML｜ invoke name=\"g\">\n</｜DSML｜ invoke>\n\
      </｜DSML｜ calls>",
@@ -1564,6 +1588,9 @@ const QWEN3_TAGGED_OUTPUTS: &[&str] = &[
      </function>\n</tool_call>",
     "<tool_call>\n<function=get_weather>\n<parameter=city>\nTwo\nlines\n</parameter>\n</function>",
     "<tool_call>\n<function=get_weather>\n<parameter=city>\nPar",
+    // The block's close inside a string value, with the template's newline held and without.
+    "<tool_call>\n<function=get_weather>\n<parameter=city>\nPar\n</tool_call>",
+    "<tool_call>\n<function=get_weather>\n<parameter=city>\nPar</tool_call>Sunny.",
     "<tool_call>\n<function=f<parameter=city>\nx\n</parameter>\n</function>\n</tool_call>",
     "<tool_call>\nprose <parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
     "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>",
@@ -1610,6 +1637,7 @@ const QWEN3_TAGGED_DIRECT_OUTPUTS: &[&str] = &[
     "<think>97 is not divisible by 2, 3, 5 or 7.</think>Yes, 97 is prime.",
     "Hello!",
     "<tool_call>\n<function=get_weather>\n<parameter=city>Par",
+    "<tool_call>\n<function=get_weather>\n<parameter=city>Par</tool_call>",
 ];
 
 /// DeepSeek V4's DSML as its reference encoder renders it (the thought the prompt opens written
@@ -1621,6 +1649,7 @@ const DEEPSEEK_V4_OUTPUTS: &[&str] = &[
     "<think>still thinking",
     "Hello!",
     "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Par",
+    "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Par</｜DSML｜tool_calls>",
 ];
 
 /// Llama 3.1's bare call object, a list of them, content, and one cut short.
@@ -1644,6 +1673,7 @@ const MINIMAX_M2_OUTPUTS: &[&str] = &[
     "<think>\nplan\n</think>\n\n<minimax:tool_call>\n<invoke name=\"save_note\">\n<parameter name=\"title\">Plan</parameter>\n<parameter name=\"body\">Line one\nLine two with \"quotes\" and a backslash \\</parameter>\n<parameter name=\"tags\">[\"a\", \"b\"]</parameter>\n<parameter name=\"meta\">{\"nested\": {\"deep\": [1, 2.5, true, null]}}</parameter>\n</invoke>\n</minimax:tool_call>",
     "<think>\n</think>\n<minimax:tool_call>\n<invoke name=\"get_stock_price\">\n</invoke>\n</minimax:tool_call>",
     "<think>\nplan\n</think>\n<minimax:tool_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">Par",
+    "<think>\nplan\n</think>\n<minimax:tool_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">Par</minimax:tool_call>",
 ];
 
 /// The outputs bellwether's common set records for MiniCPM5, and one cut short.
@@ -1655,6 +1685,7 @@ const MINICPM5_OUTPUTS: &[&str] = &[
     "<function name=\"get_stock_price\"></function>",
     "<think>\n97 is not divisible by 2, 3, 5 or 7.\n</think>\n\nYes, 97 is prime.",
     "<function name=\"save_note\"><param name=\"body\"><![CDATA[Line one\nLine two",
+    "<function name=\"get_weather\"><param name=\"city\">Par</function>",
 ];
 
 /// The outputs bellwether's common set records for dots3, and one cut short.
@@ -1666,6 +1697,7 @@ const DOTS3_OUTPUTS: &[&str] = &[
     "\n<dots_function_call>\n<invoke name=\"get_stock_price\">\n</invoke>\n</dots_function_call>",
     "<think>\n97 is not divisible by 2, 3, 5 or 7.\n</think>\n\nYes, 97 is prime.",
     "<dots_function_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">\nPar",
+    "<dots_function_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">\nPar\n</dots_function_call>",
 ];
 
 /// The outputs bellwether's common set records for GLM 4.6, and one cut short.
@@ -1677,6 +1709,7 @@ const GLM4_OUTPUTS: &[&str] = &[
     "\n<tool_call>get_stock_price\n</tool_call>",
     "\nHello!",
     "\n<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Par",
+    "\n<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Par</tool_call>",
 ];
 
 /// The outputs bellwether's common set records for K2-Horizon (the thought the prompt opens
@@ -1688,6 +1721,7 @@ const K2_HORIZON_OUTPUTS: &[&str] = &[
     "<ifm|think>plan</ifm|think><ifm|tool_calls>\n<ifm|tool_call>save_note\n<ifm|arg_key>title</ifm|arg_key>\n<ifm|arg_value>Plan</ifm|arg_value>\n<ifm|arg_key>tags</ifm|arg_key>\n<ifm|arg_value>[\"a\", \"b\"]</ifm|arg_value>\n<ifm|arg_key>meta</ifm|arg_key>\n<ifm|arg_value>{\"nested\": {\"deep\": [1, 2.5, true, null]}}</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>",
     "<ifm|think>still thinking",
     "<ifm|think>plan</ifm|think><ifm|tool_calls>\n<ifm|tool_call>get_weather\n<ifm|arg_key>city</ifm|arg_key>\n<ifm|arg_value>Par",
+    "<ifm|think>plan</ifm|think><ifm|tool_calls>\n<ifm|tool_call>get_weather\n<ifm|arg_key>city</ifm|arg_key>\n<ifm|arg_value>Par</ifm|tool_call>\n</ifm|tool_calls>",
 ];
 
 /// The outputs bellwether's common set records for Gemma 4, and one cut short.
@@ -1700,6 +1734,9 @@ const GEMMA4_OUTPUTS: &[&str] = &[
     "<|channel>thought\n97 is not divisible by 2, 3, 5 or 7.\n<channel|>Yes, 97 is prime.",
     "Hello!",
     "<|tool_call>call:get_weather{city:<|\"|>Par",
+    // A string the closing marker cuts, alone and nested in a list.
+    "<|tool_call>call:get_weather{city:<|\"|>Par<tool_call|>",
+    "<|tool_call>call:f{tags:[<|\"|>a<|\"|>,<|\"|>b<tool_call|>",
     // A member cut between its colon and its value, by the closing marker and by the end.
     "<|tool_call>call:get_weather{city:<tool_call|>",
     "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days:<tool_call|>",
@@ -1824,6 +1861,37 @@ fn valid_json_prefix(text: &str) -> bool {
     matches!(PartialJson::default().parse(text, true), Ok((_, consumed)) if consumed == text.len())
 }
 
+/// Whether `fragment`, appended to the arguments `so_far`, closes a JSON string `so_far` left
+/// open: the quote that ends a value the parser was streaming.
+fn closes_an_open_string(so_far: &str, fragment: &str) -> bool {
+    let mut inside = false;
+    let mut escaped = false;
+    for c in so_far.chars() {
+        if !inside {
+            inside = c == '"';
+        } else if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            inside = false;
+        }
+    }
+    if !inside {
+        return false;
+    }
+    for c in fragment.chars() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            return true;
+        }
+    }
+    false
+}
+
 /// What a client relies on in the shape of the stream, checked event by event.
 fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event]) {
     let mut started: Vec<u32> = Vec::new();
@@ -1841,7 +1909,11 @@ fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event]) {
                 started.push(*index);
                 arguments.push((*index, String::new()));
             }
-            Event::ToolCallArguments { index, json, .. } => {
+            Event::ToolCallArguments {
+                index,
+                json,
+                source,
+            } => {
                 assert!(
                     started.contains(index),
                     "{}: before the call's start",
@@ -1849,6 +1921,15 @@ fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event]) {
                 );
                 assert!(!ended.contains(index), "{}: after the call's end", place());
                 if let Some((_, so_far)) = arguments.iter_mut().find(|(i, _)| i == index) {
+                    // A fragment that closes a string the arguments so far left open carries the
+                    // bytes that closed it, the model's closing tag or token: a closing quote with
+                    // no source is one no byte of the output accounts for, made up for a value the
+                    // model never closed.
+                    assert!(
+                        !closes_an_open_string(so_far, json) || !source.text.is_empty(),
+                        "{}: the fragment {json:?} closes an open string with no byte of the output behind it, a made-up closing quote",
+                        place()
+                    );
                     so_far.push_str(json);
                     assert!(
                         valid_json_prefix(so_far),

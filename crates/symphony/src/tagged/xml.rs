@@ -168,8 +168,11 @@ impl Assembler {
 
     /// The call's end: `terminal` is the closing marker the engine read (its bytes go into
     /// `ToolCallEnd`), or nothing when the block ended another way. Every open container is
-    /// closed, an open string gets its quote, a leaf never written is reported, the object is
-    /// closed; an invoke whose name never closed, or that had none, has its bytes reported.
+    /// closed, a leaf never written is reported, the object is closed; inside a streamed string
+    /// nothing is closed, since nothing is made up for a value the model never finished: the
+    /// fragments stand, and one `Malformed` event with what was held, or no bytes, says that the
+    /// arguments are no whole value before the call's end ([`end_cut_call`]); an invoke whose
+    /// name never closed, or that had none, has its bytes reported.
     pub fn close(mut self, terminal: &str, out: &mut Events) {
         if self.done {
             return;
@@ -180,16 +183,23 @@ impl Assembler {
             self.report(WITHOUT_A_NAME, out);
             return;
         }
-        while let Some(element) = self.open.last() {
-            match element.shape {
+        if let Some(Element {
+            shape:
                 Shape::Leaf(Leaf {
                     mode: Mode::Streaming,
                     ..
-                }) => {
-                    // A tag the end cut short is reported, not hidden in the quote's source.
-                    self.report(TAG_CUT_SHORT, out);
-                    self.push_fragment("\"".to_string(), Text::default(), out);
-                }
+                }),
+            ..
+        }) = self.open.last()
+        {
+            // Inside a streamed string nothing is closed, neither the string nor the containers
+            // above it; the one word before the end carries the start of a tag held, or no bytes.
+            end_cut_call(self.index, std::mem::take(&mut self.carried), terminal, out);
+            self.done = true;
+            return;
+        }
+        while let Some(element) = self.open.last() {
+            match element.shape {
                 Shape::Object => {
                     let source = Text::uncounted(std::mem::take(&mut self.carried));
                     self.push_fragment("}".to_string(), source, out);
@@ -228,7 +238,7 @@ impl Assembler {
         }
         self.hold_tag();
         if self.started() {
-            end_cut_call(self.index, std::mem::take(&mut self.carried), out);
+            end_cut_call(self.index, std::mem::take(&mut self.carried), "", out);
         } else if !self.carried.is_empty() {
             out.push(Event::Malformed {
                 text: Text::uncounted(std::mem::take(&mut self.carried)),

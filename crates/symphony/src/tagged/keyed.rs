@@ -264,8 +264,11 @@ impl Assembler {
     /// The call's end: `terminal` is the closing marker the engine read (its bytes go into
     /// `ToolCallEnd`), or nothing when the block ended another way. A call that has not been
     /// named yet is named from the text so far; after the last value the object is closed; inside
-    /// a value an open string is closed, the object is closed, and what was held comes back as
-    /// `Malformed`; a block with no name at all has its bytes reported.
+    /// a value held for its close what was held comes back as `Malformed` and the object closes
+    /// without that member; inside a streamed string nothing is closed, since nothing is made up
+    /// for a value the model never finished: the fragments stand, and one `Malformed` event with
+    /// what was held, or no bytes, says that the arguments are no whole value before the call's
+    /// end ([`end_cut_call`]); a block with no name at all has its bytes reported.
     pub fn close(mut self, terminal: &str, out: &mut Events) {
         if self.done {
             return;
@@ -282,8 +285,22 @@ impl Assembler {
         }
         match std::mem::replace(&mut self.stage, Stage::Between) {
             Stage::Between | Stage::Name => {}
-            Stage::Value(value) => self.cut_value(&value, out),
-            // A key or a tag the end cut short: its bytes are reported, and the object closes.
+            Stage::Value(ValueState {
+                mode: Mode::Streaming { opened: true },
+                ..
+            }) => {
+                // The start of a tag held at the end rides in the one word.
+                end_cut_call(
+                    self.object.index,
+                    std::mem::take(&mut self.object.carried),
+                    terminal,
+                    out,
+                );
+                self.done = true;
+                return;
+            }
+            // A key, a tag or a value held for its close that the end cut short: its bytes are
+            // reported, its member is never written, and the object closes.
             _ => self.object.report(TAG_CUT_SHORT, out),
         }
         let source = Text::uncounted(std::mem::take(&mut self.object.carried));
@@ -311,6 +328,7 @@ impl Assembler {
             end_cut_call(
                 self.object.index,
                 std::mem::take(&mut self.object.carried),
+                "",
                 out,
             );
         } else if !self.object.carried.is_empty() {
@@ -485,20 +503,6 @@ impl Assembler {
         };
         self.object.close_member(fragment, tag, out);
         self.stage = Stage::Between;
-    }
-
-    /// The call ended inside a value: an open string is closed, and a value never written comes
-    /// back as `Malformed`, since its member was never written.
-    fn cut_value(&mut self, value: &ValueState, out: &mut Events) {
-        if matches!(value.mode, Mode::Streaming { opened: true }) {
-            // Bytes the end cut short (the beginning of a tag) are reported, not hidden in the
-            // quote's source.
-            self.object.report(TAG_CUT_SHORT, out);
-            self.object
-                .push_fragment("\"".to_string(), Text::default(), out);
-        } else {
-            self.object.report(TAG_CUT_SHORT, out);
-        }
     }
 }
 
@@ -768,20 +772,40 @@ mod tests {
         assert!(ends(&events).is_empty());
     }
 
+    /// The call's closing marker inside a streamed string: no closing quote and no closing brace
+    /// are made up for a value the model never closed; the fragments stand, and one `Malformed`
+    /// event before the end carries what was held (`<` could begin `<arg_key>`) or no bytes and
+    /// says that the arguments are no whole value. The marker's bytes are still the call's end.
     #[test]
-    fn the_calls_end_inside_a_streamed_string_reports_the_held_bytes_and_closes_the_string() {
-        // `<` could begin `<arg_key>`, so it is held; the call's end reports it and closes the
-        // string with no bytes of its own.
+    fn the_calls_end_inside_a_streamed_string_leaves_it_open_and_says_so() {
         let events = run(&["f<arg_key>s</arg_key><arg_value>a <"], false);
-        assert_eq!(fragments(&events), [r#"{"s": ""#, "a ", "\"", "}"]);
-        assert!(malformed(&events)
-            .iter()
-            .any(|(text, why)| *text == "<" && *why == TAG_CUT_SHORT));
+        assert_eq!(fragments(&events), [r#"{"s": ""#, "a "]);
+        assert_eq!(malformed(&events), [("<", "unterminated")]);
+        assert!(matches!(
+            &events[events.len() - 2..],
+            [Event::Malformed { .. }, Event::ToolCallEnd { .. }]
+        ));
         assert_eq!(ends(&events), [CLOSE]);
         assert_eq!(
             bytes(&events),
             format!("f<arg_key>s</arg_key><arg_value>a <{CLOSE}")
         );
+        // Nothing held: the one event has no bytes.
+        let events = run(&["f<arg_key>s</arg_key><arg_value>Par"], false);
+        assert_eq!(fragments(&events), [r#"{"s": ""#, "Par"]);
+        assert_eq!(malformed(&events), [("", "unterminated")]);
+        assert_eq!(ends(&events), [CLOSE]);
+        assert_eq!(
+            bytes(&events),
+            format!("f<arg_key>s</arg_key><arg_value>Par{CLOSE}")
+        );
+        // A string its tag closed is whole: no word, however the block ended.
+        let events = run(
+            &["f<arg_key>s</arg_key><arg_value>Paris</arg_value>"],
+            false,
+        );
+        assert_eq!(arguments(&events), r#"{"s": "Paris"}"#);
+        assert!(malformed(&events).is_empty());
     }
 
     #[test]

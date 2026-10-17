@@ -300,8 +300,17 @@ mod tests {
         assert_eq!(starts, [(0, "f"), (1, "g"), (2, "h")]);
         assert_eq!(arguments_of(&events, 0), r#"{"a": true}"#);
         assert_eq!(arguments_of(&events, 1), "{}");
-        // The block's close cut `h` inside a string: the string and the object are closed.
-        assert_eq!(arguments_of(&events, 2), r#"{"b": "x"}"#);
+        // The block's close cut `h` inside a string: nothing is closed for a value the model
+        // never closed, and the one word of no bytes before the end says so.
+        assert_eq!(arguments_of(&events, 2), r#"{"b": "x"#);
+        let ended = events
+            .iter()
+            .position(|event| matches!(event, Event::ToolCallEnd { index: 2, .. }))
+            .expect("the third call ends");
+        assert!(matches!(
+            &events[ended - 1],
+            Event::Malformed { text, .. } if text.text.is_empty()
+        ));
         assert_eq!(ends(&events), [Tags::XTML.invoke_close, "", ""]);
         assert!(matches!(
             events.last(),

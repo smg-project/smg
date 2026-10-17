@@ -1102,18 +1102,31 @@ mod tests {
     }
 
     #[test]
-    fn a_tagged_block_its_marker_closes_early_ends_the_call_closed_and_a_cut_stream_leaves_it_open()
-    {
-        // The block's closing marker arrives before `</function>`: the string and the object close.
+    fn a_tagged_block_its_marker_closes_inside_a_string_leaves_it_open_and_so_does_a_cut_stream() {
+        // The block's closing marker arrives before `</function>`, inside a string: nothing is
+        // closed for a value the model never finished, and one `Malformed` event of no bytes,
+        // under the engine's name for a block a marker closed, says so before the call's end.
         let output = "<tool_call>\n<function=get_weather>\n<parameter=city>\nPar</tool_call>";
         let events = run_tagged(&[output], EngineFinish::Stop);
-        assert_eq!(arguments_of(&events, 0), r#"{"city": "Par"}"#);
+        assert_eq!(arguments_of(&events, 0), r#"{"city": "Par"#);
         assert_eq!(bytes(&events), output);
+        let ended = events
+            .iter()
+            .position(|event| matches!(event, Event::ToolCallEnd { .. }))
+            .expect("the call ends");
         assert!(
-            !events
+            matches!(
+                &events[ended - 1],
+                Event::Malformed { text, .. } if text.text.is_empty()
+            ),
+            "{events:#?}"
+        );
+        assert_eq!(
+            events
                 .iter()
-                .any(|event| matches!(event, Event::Malformed { .. })),
-            "nothing was held when the marker came"
+                .filter(|event| matches!(event, Event::Malformed { .. }))
+                .count(),
+            1
         );
         assert!(matches!(
             events.last(),

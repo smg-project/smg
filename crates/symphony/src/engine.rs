@@ -1318,13 +1318,15 @@ mod tests {
             );
             assert_eq!(bytes(&stopped), output);
         }
+        // Inside a string the stop closes nothing, as the marker would not: the call ends with
+        // the fragments it sent and the word that says they are no whole value.
         assert_eq!(
             calls(&run(
                 glm().closes_at_stop("call"),
                 "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Par",
                 EngineFinish::Stop,
             )),
-            [(r#"{"city": "Par"}"#.to_string(), Some(String::new()))]
+            [(r#"{"city": "Par"#.to_string(), Some(String::new()))]
         );
     }
 

@@ -366,9 +366,12 @@ impl Assembler {
 
     /// The invoke's end: `terminal` is the closing tag the engine read (its bytes go into
     /// `ToolCallEnd`), or nothing when the block ended another way. After the last parameter the
-    /// object is closed and the call ends; inside a value an open string is closed, the object is
-    /// closed, and what was held comes back as `Malformed`; an invoke that never named a function
-    /// has its bytes reported.
+    /// object is closed and the call ends; inside a value held for its close what was held comes
+    /// back as `Malformed` and the object closes without that member; inside a streamed string
+    /// nothing is closed, since nothing is made up for a value the model never finished: the
+    /// fragments stand, and one `Malformed` event with what was held, or no bytes, says that the
+    /// arguments are no whole value before the call's end ([`end_cut_call`]); an invoke that
+    /// never named a function has its bytes reported.
     pub fn close(mut self, terminal: &str, out: &mut Events) {
         if self.done {
             return;
@@ -395,8 +398,23 @@ impl Assembler {
         }
         match std::mem::replace(&mut self.stage, Stage::Between) {
             Stage::Between => {}
-            Stage::Value(value) => self.cut_value(&value, out),
-            // A name or a tag the end cut short: its bytes are reported, and the object closes.
+            Stage::Value(ValueState {
+                mode: Mode::Streaming { opened: true },
+                ..
+            }) => {
+                // The value's held bytes and the start of a tag, in `carried` above, ride in the
+                // one word.
+                end_cut_call(
+                    self.object.index,
+                    std::mem::take(&mut self.object.carried),
+                    terminal,
+                    out,
+                );
+                self.done = true;
+                return;
+            }
+            // A name, a tag or a value held for its close that the end cut short: its bytes are
+            // reported, its member is never written, and the object closes.
             _ => self.object.report(TAG_CUT_SHORT, out),
         }
         let source = Text::uncounted(std::mem::take(&mut self.object.carried));
@@ -426,6 +444,7 @@ impl Assembler {
             end_cut_call(
                 self.object.index,
                 std::mem::take(&mut self.object.carried),
+                "",
                 out,
             );
         } else if !self.object.carried.is_empty() {
@@ -823,17 +842,6 @@ impl Assembler {
         };
         self.object.close_member(fragment, tag, out);
         self.stage = Stage::Between;
-    }
-
-    /// The call ended inside a value: an open string is closed, and a value never written comes
-    /// back as `Malformed`, since its member was never written.
-    fn cut_value(&mut self, value: &ValueState, out: &mut Events) {
-        // The value's held bytes went to `carried` before the scanner's, at the close.
-        self.object.report(TAG_CUT_SHORT, out);
-        if matches!(value.mode, Mode::Streaming { opened: true }) {
-            self.object
-                .push_fragment("\"".to_string(), Text::default(), out);
-        }
     }
 }
 
@@ -1301,6 +1309,70 @@ mod tests {
                 TAG_CUT_SHORT.to_string()
             )
         );
+    }
+
+    /// The invoke's close inside a streamed string, by the block's end or by its own closing tag:
+    /// nothing is closed for a value the model never closed; the fragments stand, and one
+    /// `Malformed` event before the end carries what was held (the start of a tag, dots3's
+    /// framing newline) or no bytes and says that the arguments are no whole value; the tag's
+    /// bytes are still the call's end.
+    #[test]
+    fn a_close_inside_a_streamed_string_leaves_it_open_and_says_so() {
+        let invoke_close = Tags::MINIMAX_M2.invoke_close;
+        for (tags, pieces, terminal, held) in [
+            (
+                Tags::MINIMAX_M2,
+                &["f\">\n<parameter name=\"s\">Par"][..],
+                "",
+                "",
+            ),
+            (
+                Tags::MINIMAX_M2,
+                &["f\">\n<parameter name=\"s\">Pa", "r</par"][..],
+                invoke_close,
+                "</par",
+            ),
+            (
+                Tags::DOTS3,
+                &["f\">\n<parameter name=\"s\">\nPar\n"][..],
+                "",
+                "\n",
+            ),
+            (
+                Tags::XTML,
+                &["f\" index=\"1\"<|sep|><|open|>argument key=\"s\" type=\"string\"<|sep|>Par"][..],
+                "",
+                "",
+            ),
+        ] {
+            let mut assembler = Assembler::new(0, "call_0", tags);
+            let mut out = Events::new();
+            for piece in pieces {
+                assembler.feed(piece, &declared(), &mut out);
+            }
+            assembler.close(terminal, &mut out);
+            let events = out.drain();
+            assert_eq!(arguments(&events), r#"{"s": "Par"#, "{pieces:?}");
+            assert!(
+                matches!(
+                    &events[events.len() - 2..],
+                    [
+                        Event::Malformed { text, why: MalformedReason::UnterminatedRegion },
+                        Event::ToolCallEnd { source, .. }
+                    ] if text.text == held && source.text == terminal
+                ),
+                "{pieces:?}: {events:?}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, Event::Malformed { .. }))
+                    .count(),
+                1,
+                "{pieces:?}"
+            );
+            assert_eq!(bytes(&events), format!("{}{terminal}", pieces.concat()));
+        }
     }
 
     /// MiniCPM5's spelling: `<param name="…">`, `</param>`, `</function>`, CDATA sections.

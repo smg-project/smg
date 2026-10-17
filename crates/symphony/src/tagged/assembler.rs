@@ -182,10 +182,14 @@ impl Assembler {
         bytes.len()
     }
 
-    /// The block the model ended before `</function>`: an open string is closed, the object is
-    /// closed, and the bytes of a value, a name or a tag cut short come back as `Malformed`. A
-    /// block that never named a function has had its text reported as it came; what is left of it
-    /// comes back as `Malformed` here.
+    /// The block the model ended before `</function>`: after the last value the object is closed;
+    /// the bytes of a value held for its close, a name or a tag cut short come back as `Malformed`
+    /// and the object closes without the member never written; inside a streamed string nothing
+    /// is closed, since nothing is made up for a value the model never finished: the fragments
+    /// stand, and one `Malformed` event with what was held, or no bytes, says that the arguments
+    /// are no whole value before the call's end ([`end_cut_call`]). A block that never named a
+    /// function has had its text reported as it came; what is left of it comes back as
+    /// `Malformed` here.
     pub fn close(mut self, out: &mut Events) {
         if self.done {
             return;
@@ -205,13 +209,15 @@ impl Assembler {
             self.close_object(source, out);
             self.carried = held;
             self.leftover(MalformedReason::Other(CLOSED_EARLY.into()), out);
+        } else if self.open_string() {
+            // The newline held as the template's and the start of a tag ride in the one word; the
+            // marker's bytes are the region's.
+            self.carried.push_str(&held);
+            end_cut_call(self.index, std::mem::take(&mut self.carried), "", out);
+            return;
         } else {
-            let open_string = self.open_string();
             self.carried.push_str(&held);
             self.report_tag(CLOSED_EARLY, out);
-            if open_string {
-                self.push_fragment("\"".to_string(), Text::default(), out);
-            }
             self.close_object(Text::default(), out);
         }
         out.push(Event::ToolCallEnd {
@@ -233,7 +239,7 @@ impl Assembler {
         let held = self.held_tag();
         self.carried.push_str(&held);
         if self.started() {
-            end_cut_call(self.index, std::mem::take(&mut self.carried), out);
+            end_cut_call(self.index, std::mem::take(&mut self.carried), "", out);
         } else {
             self.leftover(MalformedReason::UnterminatedRegion, out);
         }
@@ -1207,20 +1213,6 @@ mod tests {
 
     #[test]
     fn a_block_that_closed_before_its_function_tag_closed_gets_its_arguments_closed() {
-        // Inside a streamed string: the string and the object are closed, the held bytes returned.
-        let events = closed(&["<function=f>\n<parameter=city>\nPar", "is\n</param"]);
-        assert_eq!(arguments(&events), r#"{"city": "Paris"}"#);
-        assert_eq!(
-            malformed(&events),
-            vec![("</param".to_string(), other(CLOSED_EARLY))]
-        );
-        assert_eq!(dropped(&events), vec!["\n"]);
-        assert_eq!(
-            bytes(&events),
-            "<function=f>\n<parameter=city>\nParis\n</param"
-        );
-        assert_eq!(events.last(), Some(&end("")));
-        assert_eq!(ends(&events), 1);
         // Inside a value written whole: its key was never written, so its bytes come back.
         let events =
             closed(&["<function=f>\n<parameter=city>\nParis\n</parameter>\n<parameter=limit>\n5"]);
@@ -1260,6 +1252,74 @@ mod tests {
         let events = closed(&["<function=f>\n"]);
         assert_eq!(events[1..], [fragment("{}", "\n"), end("")]);
         assert_eq!(bytes(&events), "<function=f>\n");
+    }
+
+    /// A block the model ended inside a declared string value (its closing marker came, or the
+    /// next call began, before `</parameter>`): the fragments sent stand, no closing quote and no
+    /// closing brace are made up, and one `Malformed` event before the call's end says that the
+    /// arguments are no whole value, carrying what was held (the template's newline, the start
+    /// of a tag) or no bytes, under either placement and however the bytes are cut. A call whose
+    /// value closed needs no word.
+    #[test]
+    fn a_block_that_closed_inside_a_streamed_string_leaves_it_open_and_says_so() {
+        let said_cut = |events: &[Event], held: &str| {
+            matches!(
+                &events[events.len() - 2..],
+                [
+                    Event::Malformed { text, why: MalformedReason::UnterminatedRegion },
+                    Event::ToolCallEnd { source, .. }
+                ] if text.text == held && source.text.is_empty()
+            )
+        };
+        for (call, placement, held) in [
+            (
+                "<function=f>\n<parameter=city>\nPar\n",
+                Placement::OwnLine,
+                "\n",
+            ),
+            (
+                "<function=f>\n<parameter=city>\nPar",
+                Placement::OwnLine,
+                "",
+            ),
+            ("<function=f><parameter=city>Par", Placement::Direct, ""),
+        ] {
+            let whole = run(&[call], placement, Assembler::close).0;
+            assert_eq!(arguments(&whole), r#"{"city": "Par"#, "{call:?}");
+            assert!(said_cut(&whole, held), "{call:?}: {whole:?}");
+            assert_eq!(malformed(&whole).len(), 1, "{call:?}");
+            assert!(dropped(&whole).is_empty(), "{call:?}");
+            assert_eq!(bytes(&whole), call, "{call:?}");
+            let per_char: Vec<&str> = call
+                .char_indices()
+                .map(|(i, c)| &call[i..i + c.len_utf8()])
+                .collect();
+            let streamed = run(&per_char, placement, Assembler::close).0;
+            assert_eq!(
+                arguments(&streamed),
+                r#"{"city": "Par"#,
+                "{call:?} per character"
+            );
+            assert!(
+                said_cut(&streamed, held),
+                "{call:?} per character: {streamed:?}"
+            );
+            assert_eq!(bytes(&streamed), call, "{call:?} per character");
+        }
+        // The start of a tag held at the close rides in the one word, after the newline held
+        // before it.
+        let held = closed(&["<function=f>\n<parameter=city>\nPar", "is\n</param"]);
+        assert_eq!(arguments(&held), r#"{"city": "Paris"#);
+        assert!(said_cut(&held, "\n</param"), "{held:?}");
+        assert_eq!(
+            bytes(&held),
+            "<function=f>\n<parameter=city>\nParis\n</param"
+        );
+        assert_eq!(ends(&held), 1);
+        // The value's own close makes it whole: no word, however the block ended.
+        let closed = closed(&["<function=f>\n<parameter=city>\nParis\n</parameter>\n"]);
+        assert_eq!(arguments(&closed), r#"{"city": "Paris"}"#);
+        assert!(malformed(&closed).is_empty());
     }
 
     #[test]

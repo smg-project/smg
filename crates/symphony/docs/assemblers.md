@@ -63,8 +63,13 @@ and `</function>` there are the value's text (the engine's parser ends a value a
 port).
 
 Two endings. `Assembler::close` is for a block the model ended before `</function>` (its own closing
-marker came, or the next call began): the call is over as far as the model is concerned, so an open
-string is closed, the object is closed, and what was held comes back as `Malformed`.
+marker came, or the next call began): the call is over as far as the model is concerned, so after
+the last value the object is closed, and a value held for its close comes back as `Malformed`, its
+member never written. A streamed string the close cut is left open, since nothing is made up for a
+value the model never finished: no closing quote and no closing brace come, the fragments stand,
+and the one `Malformed` event before `ToolCallEnd` carries what was held (the template's newline,
+the start of a tag) or no bytes and says that the arguments are no whole value, as at `finish`
+(`tagged::end_cut_call`); the engine names the reason for a block a marker closed.
 `Assembler::finish` is for a stream that was cut: nothing is closed, as in `crate::json::Assembler`,
 because arguments cut short must not look complete to a client. A value that is written whole and
 never closed comes back as `Malformed` in both, since its key was never written. At `finish` a
@@ -98,8 +103,11 @@ What the syntax says, and what the assembler does with it:
 - **Inside a value only `</arg_value>` is a tag**; the other three there are the value's text.
 - **Two endings.** `Assembler::close` is the call's closing marker, or the block's end before
   it: after the last value it names the call if it has not, closes the object and pushes
-  `ToolCallEnd` with the marker's bytes; inside a value it closes an open string and the object
-  and reports what was held. `Assembler::finish` is a stream that was cut: nothing is closed,
+  `ToolCallEnd` with the marker's bytes; inside a value held for its close it reports what was
+  held and closes the object without that member; inside a streamed string it closes nothing,
+  since nothing is made up for a value the model never finished, and the one `Malformed` event
+  before the end, with what was held or no bytes, says that the arguments are no whole value
+  (`tagged::end_cut_call`). `Assembler::finish` is a stream that was cut: nothing is closed,
   and a started call ends as the Qwen assembler's does, after one `Malformed { UnterminatedRegion }`
   event, with what was held or no bytes, that says its arguments are no whole value
   (`tagged::end_cut_call`).
@@ -147,7 +155,8 @@ What the syntax says, and what the assembler does with it:
 - **The newlines between the tags are the template's** and go into the next event's source;
   text where the syntax has tags is reported.
 - **Two endings**, as DSML's: `Assembler::close` is the invoke's closing tag, or the block's
-  end before it; `Assembler::finish` is a stream that was cut, and closes nothing: a started
+  end before it, and inside a streamed string closes nothing, as the keyed assembler's does
+  (`tagged::end_cut_call`); `Assembler::finish` is a stream that was cut, and closes nothing: a started
   call ends after the one `Malformed { UnterminatedRegion }` event that says its arguments are
   no whole value (`tagged::end_cut_call`).
 - **Every byte of the call lands in exactly one event.**
@@ -194,9 +203,12 @@ What the syntax says, and what the assembler does with it:
 - **Two endings.** `Assembler::close` is the invoke's closing tag (`INVOKE_CLOSE`, the one
   terminal a started call's end carries), or the next invoke's opening or the block's close,
   which end the call with no bytes of their own: every open container is closed, a tag the
-  end cut short is reported and an open streamed string gets its quote, a leaf never written
-  and an element without a child come back as `Malformed`, and the arguments object is
-  closed. An invoke that named no call takes whichever terminal ended it, so that it is
+  end cut short is reported, a leaf never written and an element without a child come back as
+  `Malformed`, and the arguments object is closed, unless the innermost element is a streamed
+  string: then nothing is closed, since nothing is made up for a value the model never
+  finished, and the one `Malformed` event before the end, with the start of a tag held or no
+  bytes, says that the arguments are no whole value (`tagged::end_cut_call`). An invoke that
+  named no call takes whichever terminal ended it, so that it is
   reported the same way however it ended. `Assembler::finish` is a stream that was
   cut: nothing is closed, and a call that started still ends, with no bytes of its own, as
   every assembler ends one, after the one `Malformed { UnterminatedRegion }` event that

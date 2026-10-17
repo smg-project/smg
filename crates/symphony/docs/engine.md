@@ -44,13 +44,15 @@ What the engine decides for every format, and what it leaves open:
   arrived, or the bytes as `Malformed { UnterminatedRegion }`. A region whose closing terminal
   comes before a complete call gives what is left as `Malformed` with a reason that says so,
   since `UnterminatedRegion` means the stream ended inside the region; with the tagged syntax
-  the call is closed for the client first, as `tagged::Assembler::close` says. A JSON call whose
-  arguments value the close cut ends with the fragments it sent and a `Malformed` event of no
-  bytes, with the region's reason, before its end: a cut call is never handed over as a whole one
-  without a word (`json::assembler`). A tagged call the end of the stream cut ends the same way
-  whatever stage the cut found, since the object the assembler writes closes only at the call's
-  own end (`tagged::end_cut_call`); the one event carries the bytes still held, when there are
-  any.
+  the call is closed for the client first, as `tagged::Assembler::close` says, unless the close
+  fell inside a streamed string. A JSON call whose arguments value the close cut ends with the
+  fragments it sent and a `Malformed` event of no bytes, with the region's reason, before its
+  end: a cut call is never handed over as a whole one without a word (`json::assembler`). A
+  tagged call the end of the stream cut ends the same way whatever stage the cut found, since the
+  object the assembler writes closes only at the call's own end, and so does one whose close cut
+  a streamed string, in every tag-based syntax and in Gemma's: no closing quote and no closing
+  brace are made up for a value the model never finished (`tagged::end_cut_call`); the one event
+  carries the bytes still held, when there are any.
 - With the tagged syntax, a value's type comes from the request's tools (`Declared`): a
   declared string streams, every other value is written at its close. A call to a function the
   request did not declare has every value inferred.

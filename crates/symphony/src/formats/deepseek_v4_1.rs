@@ -433,11 +433,17 @@ mod tests {
         );
         let events = run("<think>\n\n</think>\n\n", &[output]);
         assert_eq!(bytes(&events), output);
-        assert_eq!(arguments_of(&events, 0), r#"{"a": "x"}"#);
-        assert!(events.iter().any(|event| matches!(
-            event,
+        // The string the invoke's close cut stays open: nothing is made up for it, and the one
+        // word before the end carries the tag's bytes.
+        assert_eq!(arguments_of(&events, 0), r#"{"a": "x"#);
+        let ended = events
+            .iter()
+            .position(|event| matches!(event, Event::ToolCallEnd { .. }))
+            .expect("the call ends");
+        assert!(matches!(
+            &events[ended - 1],
             Event::Malformed { text, .. } if text.text == "</｜DSML｜ par"
-        )));
+        ));
     }
 
     #[test]
