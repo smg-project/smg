@@ -272,6 +272,13 @@ impl LoadBalancingPolicy for BucketPolicy {
         true // Bucket policy needs request text
     }
 
+    /// The size signal is the token count when the ids are there and the
+    /// text's length only without them, so a tokenized request keeps no
+    /// copy of its prompt for a retry's re-selection.
+    fn needs_request_text_with_tokens(&self) -> bool {
+        false
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

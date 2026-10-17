@@ -4517,6 +4517,73 @@ mod tests {
         ctx
     }
 
+    /// Under `cache_aware`, which routes on the token ids, a tokenized
+    /// request's snapshot carries the ids alone; a request without ids keeps
+    /// its text, which is all the policy has then.
+    #[tokio::test]
+    async fn the_snapshot_keeps_the_text_only_without_token_ids_under_cache_aware() {
+        let registry = Arc::new(WorkerRegistry::new());
+        registry
+            .register(regular_worker(
+                "grpc://127.0.0.1:8831",
+                "test-model",
+                UNLABELED,
+            ))
+            .unwrap();
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&registry),
+            Arc::new(PolicyRegistry::new(PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 0,
+                max_tree_size: 4096,
+                block_size: 16,
+                balance_token_usage_threshold: 1.0,
+                overload_token_usage_threshold: 1.0,
+                overlap_decay: 0.0,
+                selection_temperature: 0.0,
+                cache_index: Default::default(),
+                cache_ttl_secs: 180,
+                cache_boundaries: Vec::new(),
+                selection_policy: None,
+                selection_accounting_ttl_ms: 0,
+            })),
+            WorkerSelectionMode::Regular,
+            None,
+        );
+
+        let mut ctx = prepared_ctx(Arc::clone(&registry), None);
+        ctx.state.preparation = Some(PreparationOutput::Generate {
+            original_text: Some("Hello".to_string()),
+            token_ids: vec![1, 2, 3],
+        });
+        stage
+            .execute(&mut ctx)
+            .await
+            .expect("a tokenized request selects");
+        let snapshot = ctx.state.routing_snapshot.as_ref().expect("snapshot");
+        assert_eq!(snapshot.token_ids, [1, 2, 3]);
+        assert!(
+            snapshot.routing_text.is_none(),
+            "the ids route; the prompt is not copied: {:?}",
+            snapshot.routing_text
+        );
+
+        let mut ctx = prepared_ctx(Arc::clone(&registry), None);
+        ctx.state.preparation = Some(PreparationOutput::Generate {
+            original_text: Some("Hello".to_string()),
+            token_ids: Vec::new(),
+        });
+        stage
+            .execute(&mut ctx)
+            .await
+            .expect("a text request selects");
+        let snapshot = ctx.state.routing_snapshot.as_ref().expect("snapshot");
+        assert!(snapshot.token_ids.is_empty());
+        assert_eq!(snapshot.routing_text.as_deref(), Some("Hello"));
+    }
+
     /// The vision verdict of a worker without the encoder, of one with it,
     /// and of one whose servicer gave none.
     const NO_VISION_ENCODER: &[(&str, &str)] = &[(multimodal::SUPPORTS_VISION_LABEL, "false")];

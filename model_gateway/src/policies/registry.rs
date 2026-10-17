@@ -1388,6 +1388,55 @@ mod tests {
         assert!(!reg.any_policy_needs_request_text(Some(&headers_with_key("session-A"))));
     }
 
+    /// A policy that reads the text beside the ids; none of the built-in
+    /// ones does, so the trait's default is what such a policy gets.
+    #[derive(Debug)]
+    struct TextBesideIds;
+
+    impl LoadBalancingPolicy for TextBesideIds {
+        fn select_worker(
+            &self,
+            workers: &[Arc<dyn Worker>],
+            _info: &SelectWorkerInfo,
+        ) -> Option<usize> {
+            (!workers.is_empty()).then_some(0)
+        }
+
+        fn name(&self) -> &'static str {
+            "text_beside_ids"
+        }
+
+        fn needs_request_text(&self) -> bool {
+            true
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Beside token ids the text is wanted only by a policy that reads it
+    /// there: `cache_aware` and `bucket` route on the ids and answer no, as
+    /// the default and as a per-model policy, with the same hint rules; a
+    /// policy that says nothing about the ids keeps its text answer.
+    #[test]
+    fn text_beside_token_ids_is_wanted_only_by_a_policy_that_reads_it_there() {
+        let reg = PolicyRegistry::new(cache_aware_config());
+        assert!(reg.any_policy_needs_request_text(None));
+        assert!(!reg.any_policy_needs_request_text_with_tokens(None));
+        assert!(!reg.any_policy_needs_request_text_with_tokens(Some(&headers_with_tokens("1,2,3"))));
+        for policy in ["cache_aware", "bucket"] {
+            let reg = PolicyRegistry::with_override(PolicyConfig::RoundRobin, enabled_override());
+            reg.on_worker_added("llama-3", Some(policy));
+            assert!(reg.any_policy_needs_request_text(None), "{policy}");
+            assert!(
+                !reg.any_policy_needs_request_text_with_tokens(None),
+                "{policy}"
+            );
+        }
+        assert!(TextBesideIds.needs_request_text_with_tokens());
+    }
+
     #[test]
     fn override_disabled_ignores_key() {
         let reg = PolicyRegistry::new(PolicyConfig::RoundRobin); // override off

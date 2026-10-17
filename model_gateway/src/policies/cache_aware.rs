@@ -3305,13 +3305,6 @@ impl Default for CacheAwarePolicy {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn text_is_wanted_only_without_token_ids() {
-        let policy = CacheAwarePolicy::new();
-        assert!(policy.needs_request_text());
-        assert!(!policy.needs_request_text_with_tokens());
-    }
-
     use kv_index::{compute_content_hash, SequenceHash, StoredBlock};
     use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
     use openai_protocol::worker::{
@@ -3321,6 +3314,13 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
+
+    #[test]
+    fn text_is_wanted_only_without_token_ids() {
+        let policy = CacheAwarePolicy::new();
+        assert!(policy.needs_request_text());
+        assert!(!policy.needs_request_text_with_tokens());
+    }
 
     /// Neutral tuning: decay and temperature off, no load snapshot — the
     /// historical selection behavior.
