@@ -2611,11 +2611,18 @@ impl WorkerRegistry {
             // mutation lock, in one step with the write: decided outside
             // it, a probe's `Failed` (or the drain step's `Draining`)
             // landing between the read and the write was written over
-            // with the hint's `Ready` (or `NotReady`). A worker that is
+            // with the hint's `Ready` (or `NotReady`). The origin is read
+            // again under the lock: a local registration claiming the URL
+            // in between (`register_or_replace`) replaces the worker and
+            // promotes its origin under this same lock, and the hint must
+            // not write the replacement's status either. A worker that is
             // gone by the time the lock is taken (`None`) is imported anew
             // below, as before.
             let health = state.health;
             let outcome = self.transition_under_lock(&existing_id, None, |existing| {
+                if self.origin_of(&existing_id) == Some(WorkerOrigin::Local) {
+                    return ((), None);
+                }
                 let target = match (health, existing.status()) {
                     (true, WorkerStatus::Pending | WorkerStatus::NotReady) => {
                         Some(WorkerStatus::Ready)
@@ -3420,6 +3427,60 @@ mod tests {
     #[test]
     fn mesh_hint_keeps_a_drain_written_between_its_read_and_its_write() {
         mesh_hint_keeps_the_status_written_in_between(false, true, WorkerStatus::Draining);
+    }
+
+    /// A `health=true` hint that found a mesh import `NotReady` does not
+    /// write `Ready` over the local worker a `register_or_replace` installed
+    /// at the URL in between: the claim replaces the worker under the same
+    /// mutation lock and promotes its origin to `Local`, which the hint reads
+    /// again under the lock and stands down. Checked before the lock alone,
+    /// the hint promoted a locally-owned worker no local probe had passed.
+    #[test]
+    fn mesh_hint_stands_down_for_a_local_claim_landed_between_its_read_and_its_write() {
+        let url = "http://remote:8080";
+        let registry = WorkerRegistry::new();
+        registry.on_remote_worker_state(&remote_state("peer-w1", url, false, vec![]));
+        let worker_id = registry.get_id_by_url(url).expect("imported");
+        assert_eq!(registry.origin_of(&worker_id), Some(WorkerOrigin::Mesh));
+        let mut rx = registry.subscribe_events();
+
+        let hint = remote_state("peer-w1", url, true, vec![]);
+        // The status the claim leaves the local worker with: not `Ready`
+        // (its own prober promotes it), so the hint would promote it if it
+        // still looked.
+        let after_claim = std::cell::Cell::new(None);
+        registry.with_another_write_before_the_lock(
+            |registry| registry.on_remote_worker_state(&hint),
+            |registry| {
+                let local: Arc<dyn Worker> = Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .worker_type(WorkerType::Regular)
+                        .build(),
+                );
+                assert_eq!(
+                    registry.register_or_replace(local),
+                    worker_id,
+                    "the claim keeps the URL's id"
+                );
+                assert_eq!(registry.origin_of(&worker_id), Some(WorkerOrigin::Local));
+                let status = registry.get_by_url(url).expect("the local worker").status();
+                assert_ne!(status, WorkerStatus::Ready, "the local prober promotes it");
+                after_claim.set(Some(status));
+            },
+        );
+
+        assert_eq!(registry.origin_of(&worker_id), Some(WorkerOrigin::Local));
+        assert_eq!(
+            Some(registry.get_by_url(url).expect("the local worker").status()),
+            after_claim.get(),
+            "the hint did not promote the locally-owned worker"
+        );
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(event, WorkerEvent::StatusChanged { .. }),
+                "the hint published nothing; the events are the claim's own: {event:?}"
+            );
+        }
     }
 
     #[test]
