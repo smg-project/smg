@@ -18,10 +18,7 @@ use crate::observability::log_throttle::KeyedLogThrottle;
 use crate::{
     middleware::{tenant_resolution::AcceptedAt, SHED_RETRY_AFTER_SECS},
     observability::metrics::{metrics_labels, Metrics},
-    policies::{
-        traffic_split, CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo,
-        WorkerRole,
-    },
+    policies::{CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerRole},
     routers::{
         common::{
             placement::{
