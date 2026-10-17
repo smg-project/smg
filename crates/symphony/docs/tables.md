@@ -264,8 +264,9 @@ What the table says beyond the others:
   …]` as it reads xLAM's bare list: each object a call, the brackets and the commas the template's
   wrapping. Between markers prose has no place, so text where the list should be, a `[` that opens
   no list of calls included, is malformed where the bare list takes it for content; the engine
-  picks that form for a table with a row into the arguments state. After the `]`, whitespace is
-  dropped and other text malformed, as for the bare list.
+  picks that form for a table with a row into the arguments state. After the `]`, whitespace
+  before the closing marker is dropped; text is malformed with the whitespace before and between
+  its words, as for the bare list.
 - **The thought is the Super template's, and the model's own.** Llama-3.3-Nemotron-Super-49B-v1.5's
   template renders an assistant message's content from its `</think>` on, so the model writes
   `<think>…</think>` itself; `/no_think` in the system prompt makes the template close the thought
