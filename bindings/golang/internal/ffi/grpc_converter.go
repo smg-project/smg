@@ -47,8 +47,20 @@ import "C"
 
 import (
 	"fmt"
+	"sync/atomic"
 	"unsafe"
 )
+
+// liveGrpcResponseConverters counts the converter handles created and not yet
+// freed. A stream path that forgets its free shows as a count that only grows;
+// the tests check it returns to where it started.
+var liveGrpcResponseConverters atomic.Int64
+
+// LiveGrpcResponseConverters reports how many converter handles are live:
+// created by this process and not yet freed.
+func LiveGrpcResponseConverters() int64 {
+	return liveGrpcResponseConverters.Load()
+}
 
 // CreateGrpcResponseConverter creates a gRPC response converter handle
 // This function creates a new tokenizer handle each time (for backward compatibility)
@@ -201,16 +213,19 @@ func createGrpcResponseConverterWithTokenizerHandle(
 		return nil, fmt.Errorf("%s", errorMsg)
 	}
 
+	liveGrpcResponseConverters.Add(1)
 	return &GrpcResponseConverterHandle{
 		handle: converterHandle,
 	}, nil
 }
 
-// FreeGrpcResponseConverter frees a gRPC response converter handle
+// FreeGrpcResponseConverter frees a gRPC response converter handle. A handle
+// that was freed already is left alone.
 func FreeGrpcResponseConverter(handle *GrpcResponseConverterHandle) {
 	if handle != nil && handle.handle != nil {
 		C.sgl_grpc_response_converter_free(handle.handle)
 		handle.handle = nil
+		liveGrpcResponseConverters.Add(-1)
 	}
 }
 
