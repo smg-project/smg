@@ -1074,7 +1074,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        policies::{CacheAwareConfig, LeastLoadPolicy, SelectWorkerInfo},
+        policies::{BucketConfig, CacheAwareConfig, LeastLoadPolicy, SelectWorkerInfo},
         worker::{
             load_state::LoadSnapshot, BasicWorkerBuilder, HashRing, Worker, WorkerLoadGuard,
             WorkerType,
@@ -2627,5 +2627,100 @@ mod tests {
                 ("grpc://decode:9000".to_string(), 0)
             ]
         );
+    }
+
+    /// A policy that remembers which workers it was told to forget and
+    /// consumes no load reports.
+    #[derive(Debug, Default)]
+    struct RemovalRecorder {
+        removed: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl LoadBalancingPolicy for RemovalRecorder {
+        fn select_worker(
+            &self,
+            workers: &[Arc<dyn Worker>],
+            _info: &SelectWorkerInfo,
+        ) -> Option<usize> {
+            (!workers.is_empty()).then_some(0)
+        }
+
+        fn remove_worker(&self, url: &str) {
+            self.removed.lock().unwrap().push(url.to_string());
+        }
+
+        fn name(&self) -> &'static str {
+            "removal_recorder"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// A worker's removal reaches every policy instance once: the ones that
+    /// consume load reports and the ones that do not, a shared instance once
+    /// however many roles it serves.
+    #[test]
+    fn worker_removal_reaches_every_policy_once() {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let shared = Arc::new(RemovalRecorder::default());
+        registry.set_prefill_policy(Arc::clone(&shared) as Arc<dyn LoadBalancingPolicy>);
+        registry.set_decode_policy(Arc::clone(&shared) as Arc<dyn LoadBalancingPolicy>);
+        let per_model = Arc::new(RemovalRecorder::default());
+        registry.model_policies.insert(
+            "m1".to_string(),
+            Arc::clone(&per_model) as Arc<dyn LoadBalancingPolicy>,
+        );
+
+        registry.remove_worker_from_load_aware("http://w2:8000");
+
+        assert_eq!(
+            shared.removed.lock().unwrap().as_slice(),
+            ["http://w2:8000"]
+        );
+        assert_eq!(
+            per_model.removed.lock().unwrap().as_slice(),
+            ["http://w2:8000"]
+        );
+    }
+
+    /// A prefill worker's removal reaches the bucket policy, which keeps the
+    /// prefill workers' size partition without consuming load reports: every
+    /// request size still selects one of the workers left.
+    #[test]
+    fn removing_a_prefill_worker_reaches_the_bucket_policy() {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        registry.set_prefill_policy(Arc::new(BucketPolicy::with_config(BucketConfig {
+            balance_abs_threshold: usize::MAX,
+            bucket_adjust_interval_secs: 3600,
+            ..Default::default()
+        })));
+        let prefill = vec![
+            worker("http://prefill-1:8000", WorkerType::Prefill),
+            worker("http://prefill-2:8000", WorkerType::Prefill),
+            worker("http://prefill-3:8000", WorkerType::Prefill),
+        ];
+        registry.init_pd_bucket_policies(&prefill);
+
+        registry.remove_worker_from_load_aware("http://prefill-2:8000");
+
+        let remaining = [Arc::clone(&prefill[0]), Arc::clone(&prefill[2])];
+        let policy = registry.get_prefill_policy();
+        for size in [0, 1364, 1365, 2000, 2729, 2730, 10_000] {
+            let text = "a".repeat(size);
+            let info = SelectWorkerInfo {
+                request_text: Some(&text),
+                ..Default::default()
+            };
+            let selected = policy
+                .select_worker(&remaining, &info)
+                .unwrap_or_else(|| panic!("a request of {size} chars selects no prefill worker"));
+            assert_ne!(
+                remaining[selected].url(),
+                "http://prefill-2:8000",
+                "size {size}"
+            );
+        }
     }
 }

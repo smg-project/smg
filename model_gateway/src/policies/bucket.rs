@@ -1252,4 +1252,130 @@ mod tests {
             }
         }
     }
+
+    fn prefill_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
+        urls.iter()
+            .map(|url| {
+                Arc::new(
+                    BasicWorkerBuilder::new(*url)
+                        .worker_type(WorkerType::Prefill)
+                        .health_config(no_health_check())
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect()
+    }
+
+    /// A policy whose selection follows the boundaries alone: the load spill
+    /// never fires and the periodic adjustment never runs within a test.
+    fn boundary_only_policy() -> BucketPolicy {
+        BucketPolicy::with_config(BucketConfig {
+            balance_abs_threshold: usize::MAX,
+            bucket_adjust_interval_secs: 3600,
+            ..Default::default()
+        })
+    }
+
+    /// The boundaries of the bucket `workers` share, as (url, range).
+    fn boundaries(policy: &BucketPolicy, workers: &[Arc<dyn Worker>]) -> Vec<(String, [usize; 2])> {
+        let entry = policy
+            .buckets
+            .get(normalize_model_key(workers[0].model_id()))
+            .expect("the workers' model has a bucket");
+        let bucket = entry.read();
+        bucket
+            .boundary
+            .iter()
+            .map(|b| (b.url.clone(), b.range))
+            .collect()
+    }
+
+    fn select(policy: &BucketPolicy, workers: &[Arc<dyn Worker>], size: usize) -> Option<usize> {
+        let text = "a".repeat(size);
+        policy.select_worker(
+            workers,
+            &SelectWorkerInfo {
+                request_text: Some(&text),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A removed worker leaves the bucket with its range: a request of a size
+    /// it owned goes to the neighbour that took the range over, not to no
+    /// worker because a boundary still named a departed URL.
+    #[test]
+    fn a_removed_worker_leaves_the_boundaries_and_a_neighbour_takes_its_range() {
+        let policy = boundary_only_policy();
+        let workers = prefill_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_prefill_worker_urls(&workers);
+        // The first split hands 4096 out evenly: w2 owns [1365, 2729].
+        assert_eq!(
+            boundaries(&policy, &workers),
+            [
+                ("http://w1:8000".to_string(), [0, 1364]),
+                ("http://w2:8000".to_string(), [1365, 2729]),
+                ("http://w3:8000".to_string(), [2730, usize::MAX]),
+            ]
+        );
+
+        policy.remove_worker("http://w2:8000");
+
+        let remaining = [Arc::clone(&workers[0]), Arc::clone(&workers[2])];
+        let selected = select(&policy, &remaining, 2000)
+            .expect("a request in the removed worker's range selects a worker");
+        assert_eq!(remaining[selected].url(), "http://w1:8000");
+        assert_eq!(
+            boundaries(&policy, &workers),
+            [
+                ("http://w1:8000".to_string(), [0, 2729]),
+                ("http://w3:8000".to_string(), [2730, usize::MAX]),
+            ]
+        );
+        let entry = policy
+            .buckets
+            .get(normalize_model_key(workers[0].model_id()))
+            .unwrap();
+        let bucket = entry.read();
+        assert_eq!(
+            *bucket.prefill_worker_urls.lock(),
+            ["http://w1:8000", "http://w3:8000"]
+        );
+        assert!(!bucket.chars_per_url.lock().contains_key("http://w2:8000"));
+        assert_eq!(bucket.bucket_cnt, 2);
+    }
+
+    /// At either end the one neighbour takes the range; the last worker
+    /// standing owns every size; an emptied bucket still selects among the
+    /// workers the caller offers; a URL the bucket never held is a no-op.
+    #[test]
+    fn removal_at_either_end_hands_the_range_to_the_one_neighbour() {
+        let policy = boundary_only_policy();
+        let workers = prefill_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_prefill_worker_urls(&workers);
+
+        policy.remove_worker("http://w1:8000");
+        assert_eq!(
+            boundaries(&policy, &workers),
+            [
+                ("http://w2:8000".to_string(), [0, 2729]),
+                ("http://w3:8000".to_string(), [2730, usize::MAX]),
+            ]
+        );
+        policy.remove_worker("http://w3:8000");
+        assert_eq!(
+            boundaries(&policy, &workers),
+            [("http://w2:8000".to_string(), [0, usize::MAX])]
+        );
+        let only = [Arc::clone(&workers[1])];
+        for size in [0, 1365, 4096, 100_000] {
+            assert_eq!(select(&policy, &only, size), Some(0), "size {size}");
+        }
+
+        policy.remove_worker("http://w2:8000");
+        policy.remove_worker("http://w9:8000");
+        assert!(boundaries(&policy, &workers).is_empty());
+        let newcomer = prefill_workers(&["http://w4:8000"]);
+        assert_eq!(select(&policy, &newcomer, 2000), Some(0));
+    }
 }
