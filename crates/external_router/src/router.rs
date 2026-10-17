@@ -3,12 +3,7 @@
 use std::{any::Any, fmt::Debug, future::Future, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
-use axum::{
-    body::Body,
-    extract::Request,
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
-};
+use axum::{body::Body, extract::Request, http::HeaderMap, response::Response};
 use openai_protocol::{
     chat::ChatCompletionRequest,
     interactions::InteractionsRequest,
@@ -21,7 +16,7 @@ use openai_protocol::{
     worker::ProviderType,
 };
 
-use crate::{tenant::TenantRequestMeta, ExternalContext};
+use crate::{error, tenant::TenantRequestMeta, ExternalContext};
 
 /// A router that fronts a third-party provider. Implement only the
 /// endpoints the provider serves; the rest answer 501.
@@ -33,11 +28,14 @@ pub trait ExternalRouter: Send + Sync + Debug {
     fn router_type(&self) -> &'static str;
 
     async fn health_generate(&self, _req: Request<Body>) -> Response {
-        not_implemented("Health generate not implemented")
+        error::not_implemented(
+            "health_generate_not_implemented",
+            "Health generate not implemented",
+        )
     }
 
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
-        not_implemented("Server info not implemented")
+        error::not_implemented("server_info_not_implemented", "Server info not implemented")
     }
 
     async fn route_chat(
@@ -47,7 +45,10 @@ pub trait ExternalRouter: Send + Sync + Debug {
         _body: ChatCompletionRequest,
         _model_id: &str,
     ) -> Response {
-        not_implemented("Chat completions not implemented")
+        error::not_implemented(
+            "chat_completions_not_implemented",
+            "Chat completions not implemented",
+        )
     }
 
     async fn route_responses(
@@ -57,7 +58,10 @@ pub trait ExternalRouter: Send + Sync + Debug {
         _body: ResponsesRequest,
         _model_id: &str,
     ) -> Response {
-        not_implemented("Responses endpoint not implemented")
+        error::not_implemented(
+            "responses_not_implemented",
+            "Responses endpoint not implemented",
+        )
     }
 
     async fn route_messages(
@@ -67,7 +71,10 @@ pub trait ExternalRouter: Send + Sync + Debug {
         _body: CreateMessageRequest,
         _model_id: &str,
     ) -> Response {
-        not_implemented("Messages API not yet implemented for this router")
+        error::not_implemented(
+            "messages_not_implemented",
+            "Messages API not yet implemented for this router",
+        )
     }
 
     async fn route_interactions(
@@ -77,7 +84,10 @@ pub trait ExternalRouter: Send + Sync + Debug {
         _body: InteractionsRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        not_implemented("Interactions API not implemented for this router")
+        error::not_implemented(
+            "interactions_not_implemented",
+            "Interactions API not implemented for this router",
+        )
     }
 
     async fn route_realtime_session(
@@ -85,7 +95,10 @@ pub trait ExternalRouter: Send + Sync + Debug {
         _headers: Option<&HeaderMap>,
         _body: &RealtimeSessionCreateRequest,
     ) -> Response {
-        not_implemented("Realtime sessions not implemented")
+        error::not_implemented(
+            "realtime_sessions_not_implemented",
+            "Realtime sessions not implemented",
+        )
     }
 
     async fn route_realtime_client_secret(
@@ -93,7 +106,10 @@ pub trait ExternalRouter: Send + Sync + Debug {
         _headers: Option<&HeaderMap>,
         _body: &RealtimeClientSecretCreateRequest,
     ) -> Response {
-        not_implemented("Realtime client secrets not implemented")
+        error::not_implemented(
+            "realtime_client_secrets_not_implemented",
+            "Realtime client secrets not implemented",
+        )
     }
 
     async fn route_realtime_transcription_session(
@@ -101,20 +117,25 @@ pub trait ExternalRouter: Send + Sync + Debug {
         _headers: Option<&HeaderMap>,
         _body: &RealtimeTranscriptionSessionCreateRequest,
     ) -> Response {
-        not_implemented("Realtime transcription sessions not implemented")
+        error::not_implemented(
+            "realtime_transcription_sessions_not_implemented",
+            "Realtime transcription sessions not implemented",
+        )
     }
 
     async fn route_realtime_ws(&self, _req: Request<Body>, _model_id: &str) -> Response {
-        not_implemented("Realtime WebSocket not implemented")
+        error::not_implemented(
+            "realtime_websocket_not_implemented",
+            "Realtime WebSocket not implemented",
+        )
     }
 
     async fn route_realtime_webrtc(&self, _req: Request<Body>, _model_id: &str) -> Response {
-        not_implemented("Realtime WebRTC not implemented")
+        error::not_implemented(
+            "realtime_webrtc_not_implemented",
+            "Realtime WebRTC not implemented",
+        )
     }
-}
-
-fn not_implemented(message: &'static str) -> Response {
-    (StatusCode::NOT_IMPLEMENTED, message).into_response()
 }
 
 /// The future a router constructor returns.
@@ -317,6 +338,144 @@ pub fn spec_for_provider(provider: Option<&ProviderType>) -> Option<ExternalRout
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct StubRouter;
+
+    #[async_trait]
+    impl ExternalRouter for StubRouter {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn router_type(&self) -> &'static str {
+            "stub"
+        }
+    }
+
+    /// The status of an answer and the code and message of its JSON error object.
+    async fn error_shape(answer: Response) -> (http::StatusCode, String, String) {
+        let status = answer.status();
+        let body = axum::body::to_bytes(answer.into_body(), usize::MAX)
+            .await
+            .expect("drain body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+        let field = |name: &str| {
+            body["error"][name]
+                .as_str()
+                .unwrap_or_else(|| panic!("error.{name} in {body}"))
+                .to_owned()
+        };
+        (status, field("code"), field("message"))
+    }
+
+    fn body<T: serde::de::DeserializeOwned>(json: serde_json::Value) -> T {
+        serde_json::from_value(json).expect("a request body")
+    }
+
+    /// Every default answer of the trait is the JSON error object, a 501
+    /// under the endpoint's own code, like the refusals the routers write.
+    #[tokio::test]
+    async fn every_default_answer_is_the_json_error_object_under_its_code() {
+        use serde_json::json;
+
+        use crate::tenant::TenantKey;
+
+        let router = StubRouter;
+        let meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let empty = || Request::new(Body::empty());
+        let answers = [
+            (
+                router.health_generate(empty()).await,
+                "health_generate_not_implemented",
+                "Health generate not implemented",
+            ),
+            (
+                router.get_server_info(empty()).await,
+                "server_info_not_implemented",
+                "Server info not implemented",
+            ),
+            (
+                router
+                    .route_chat(
+                        None,
+                        &meta,
+                        body(json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]})),
+                        "m",
+                    )
+                    .await,
+                "chat_completions_not_implemented",
+                "Chat completions not implemented",
+            ),
+            (
+                router
+                    .route_responses(None, &meta, body(json!({"model": "m", "input": "hi"})), "m")
+                    .await,
+                "responses_not_implemented",
+                "Responses endpoint not implemented",
+            ),
+            (
+                router
+                    .route_messages(
+                        None,
+                        &meta,
+                        body(json!({"model": "m", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]})),
+                        "m",
+                    )
+                    .await,
+                "messages_not_implemented",
+                "Messages API not yet implemented for this router",
+            ),
+            (
+                router
+                    .route_interactions(None, &meta, body(json!({"input": "hi"})), Some("m"))
+                    .await,
+                "interactions_not_implemented",
+                "Interactions API not implemented for this router",
+            ),
+            (
+                router
+                    .route_realtime_session(None, &body(json!({"type": "realtime"})))
+                    .await,
+                "realtime_sessions_not_implemented",
+                "Realtime sessions not implemented",
+            ),
+            (
+                router
+                    .route_realtime_client_secret(None, &body(json!({"session": {"type": "realtime"}})))
+                    .await,
+                "realtime_client_secrets_not_implemented",
+                "Realtime client secrets not implemented",
+            ),
+            (
+                router
+                    .route_realtime_transcription_session(None, &body(json!({"type": "transcription"})))
+                    .await,
+                "realtime_transcription_sessions_not_implemented",
+                "Realtime transcription sessions not implemented",
+            ),
+            (
+                router.route_realtime_ws(empty(), "m").await,
+                "realtime_websocket_not_implemented",
+                "Realtime WebSocket not implemented",
+            ),
+            (
+                router.route_realtime_webrtc(empty(), "m").await,
+                "realtime_webrtc_not_implemented",
+                "Realtime WebRTC not implemented",
+            ),
+        ];
+        for (answer, code, message) in answers {
+            assert_eq!(
+                error_shape(answer).await,
+                (
+                    http::StatusCode::NOT_IMPLEMENTED,
+                    code.to_owned(),
+                    message.to_owned()
+                )
+            );
+        }
+    }
 
     fn providers() -> Vec<ProviderType> {
         vec![

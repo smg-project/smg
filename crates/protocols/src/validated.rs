@@ -61,7 +61,12 @@ pub struct RejectionCode(pub String);
 /// `param` the offending field when one is known; the code also rides on the
 /// response as a [`RejectionCode`] extension.
 #[cfg(feature = "axum")]
-fn rejection(status: StatusCode, code: &str, param: Option<String>, message: String) -> Response {
+pub(crate) fn rejection(
+    status: StatusCode,
+    code: &str,
+    param: Option<String>,
+    message: String,
+) -> Response {
     let mut response = (
         status,
         Json(json!({
