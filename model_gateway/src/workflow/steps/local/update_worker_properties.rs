@@ -389,8 +389,8 @@ fn models_for_labels(
 /// worker's labels agree on the share whichever side names the width.
 fn fresh_in_rank_space(
     worker: &Arc<dyn Worker>,
-    fresh: &std::collections::HashMap<String, String>,
-) -> std::collections::HashMap<String, String> {
+    fresh: &HashMap<String, String>,
+) -> HashMap<String, String> {
     let current = &worker.metadata().spec.labels;
     let before = &worker.metadata().discovered_labels;
     let mut width_source = fresh.clone();
@@ -412,10 +412,10 @@ fn fresh_in_rank_space(
 /// engine reports for the first time is added unless the operator already
 /// set it.
 pub(crate) fn refreshed_labels(
-    current: &std::collections::HashMap<String, String>,
-    discovered_before: &std::collections::HashMap<String, String>,
-    fresh: &std::collections::HashMap<String, String>,
-) -> std::collections::HashMap<String, String> {
+    current: &HashMap<String, String>,
+    discovered_before: &HashMap<String, String>,
+    fresh: &HashMap<String, String>,
+) -> HashMap<String, String> {
     let mut labels = current.clone();
     for (key, before) in discovered_before {
         if current.get(key) != Some(before) {
@@ -1721,6 +1721,22 @@ mod tests {
     /// A worker as registration builds it: its card derived from the spec and
     /// the labels, the labels on the worker.
     fn registered(spec: WorkerSpec, labels: HashMap<String, String>) -> Arc<dyn Worker> {
+        registered_worker(spec, labels, HashMap::new())
+    }
+
+    /// A worker registered from a discovery read: the labels are on record as
+    /// the engine's, so a refresh lets them follow it.
+    fn discovered(spec: WorkerSpec, labels: HashMap<String, String>) -> Arc<dyn Worker> {
+        registered_worker(spec, labels.clone(), labels)
+    }
+
+    /// A worker as registration builds it: the model card derived from the
+    /// labels, with `discovered_labels` as the record of what discovery read.
+    fn registered_worker(
+        spec: WorkerSpec,
+        labels: HashMap<String, String>,
+        discovered_labels: HashMap<String, String>,
+    ) -> Arc<dyn Worker> {
         use super::super::create_worker::{build_model_card, resolve_model_id};
         let model_id = resolve_model_id(&spec, &labels).to_string();
         let card = build_model_card(&model_id, &spec, &labels, &HashMap::new());
@@ -1728,9 +1744,62 @@ mod tests {
             BasicWorkerBuilder::from_spec(spec)
                 .model(card)
                 .labels(labels)
+                .discovered_labels(discovered_labels)
                 .status(WorkerStatus::Ready)
                 .build(),
         )
+    }
+
+    /// The card registration derived from the engine's provisional read
+    /// follows a refresh as it follows a label update: a worker registered
+    /// while its engine was still loading reads with the engine's final
+    /// context window and vision flag once the refresh lands.
+    #[tokio::test]
+    async fn a_label_refresh_re_derives_the_model_card_from_the_engines_labels() {
+        let worker = discovered(
+            WorkerSpec::new("http://w:8000"),
+            labels(&[("served_model_name", "m"), ("max_model_len", "4096")]),
+        );
+        assert_eq!(
+            worker.context_length("m"),
+            Some(4096),
+            "as registered from the provisional read"
+        );
+        assert!(!worker.models().remove(0).model_type.supports_vision());
+        let app_ctx = make_app_context(std::slice::from_ref(&worker));
+
+        let fresh = labels(&[
+            ("served_model_name", "m"),
+            ("max_model_len", "32768"),
+            ("supports_vision", "true"),
+        ]);
+        let mut refresh =
+            make_refresh_context(Arc::clone(&app_ctx), Arc::clone(&worker), fresh.clone());
+        assert_eq!(
+            UpdateWorkerPropertiesStep
+                .execute(&mut refresh)
+                .await
+                .unwrap(),
+            StepResult::Success
+        );
+
+        let rebuilt = app_ctx
+            .worker_registry
+            .get_by_url("http://w:8000")
+            .expect("the worker stays registered");
+        assert_eq!(
+            rebuilt.context_length("m"),
+            Some(32768),
+            "the context window follows the engine's final read"
+        );
+        let card = rebuilt.models().remove(0);
+        assert_eq!(card.id, "m", "the id stays");
+        assert!(
+            card.model_type.supports_vision(),
+            "the vision flag follows the engine's final read"
+        );
+        assert_eq!(*rebuilt.metadata().discovered_labels, fresh);
+        assert_eq!(rebuilt.status(), WorkerStatus::Ready);
     }
 
     /// The card registration derived from the labels follows a label update:
