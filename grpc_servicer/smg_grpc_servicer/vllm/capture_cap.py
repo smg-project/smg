@@ -204,7 +204,9 @@ def _is_none_mode(mode: Any) -> bool:
     return str(mode).strip().upper() == "NONE"
 
 
-def _positive_int(value: Any) -> int | None:
+def _positive_int_from_text(value: Any) -> int | None:
+    """``value`` (text or a number, as argparse hands it over) as a count above
+    zero, else ``None``; unlike :func:`config_view.positive_int`, text is read."""
     try:
         number = int(value)
     except (TypeError, ValueError):
@@ -245,9 +247,11 @@ def launch_settings(parsed: Any, environ: Mapping[str, str] = os.environ) -> dic
     if not explicit_sizes:
         explicit_sizes = _field(config, "cudagraph_capture_sizes")
     return {
-        "max_num_seqs": _positive_int(getattr(parsed, "max_num_seqs", None)),
-        "max_num_batched_tokens": _positive_int(getattr(parsed, "max_num_batched_tokens", None)),
-        "explicit_cap": _positive_int(explicit_cap),
+        "max_num_seqs": _positive_int_from_text(getattr(parsed, "max_num_seqs", None)),
+        "max_num_batched_tokens": _positive_int_from_text(
+            getattr(parsed, "max_num_batched_tokens", None)
+        ),
+        "explicit_cap": _positive_int_from_text(explicit_cap),
         "explicit_sizes": list(explicit_sizes) if explicit_sizes else None,
         "enforce_eager": bool(getattr(parsed, "enforce_eager", False)),
         "cudagraph_mode": _field(config, "cudagraph_mode"),
