@@ -7,13 +7,20 @@
 
 use std::time::Duration;
 
+use futures::{stream, StreamExt as _};
+use http_body::Frame;
 use http_body_util::BodyExt;
-use tokio::{sync::oneshot, time::sleep};
+use smg_grpc_client::sglang_scheduler::{
+    proto as scheduler, proto::generate_response::Response as SchedulerEvent,
+    AbortOnDropStream as SchedulerStream, SglangSchedulerClient,
+};
+use tokio::{sync::oneshot, task::JoinHandle, time::sleep};
 
 use super::{
     eof_tests::{
-        chat_spec, chunk, complete_with_prompt, cut_stream, gated_stream, processor,
-        scripted_stream, CharacterTokenizer,
+        chat_spec, chunk, collect_events, complete_with_prompt, cut_stream, data_frame,
+        decoded_stream, gated_stream, mock_worker_endpoint, processor, scripted_stream,
+        trailers_frame, CharacterTokenizer,
     },
     *,
 };
@@ -384,4 +391,227 @@ async fn a_completions_stream_the_client_abandons_books_what_its_units_streamed_
         "the request's one guard, counted into by its prompt's unit"
     );
     server.abort();
+}
+
+/// A chunk of a cumulative-semantics engine (the scheduler proto): `text` with
+/// the running count `generated`, which the tracker only reports; the count it
+/// books comes from the `Complete`.
+fn scheduler_chunk(index: u32, text: &str, generated: u32) -> scheduler::GenerateResponse {
+    scheduler::GenerateResponse {
+        request_id: String::new(),
+        response: Some(SchedulerEvent::Chunk(scheduler::GenerateStreamChunk {
+            index,
+            completion_tokens: generated,
+            token_ids: text.chars().map(u32::from).collect(),
+            ..Default::default()
+        })),
+    }
+}
+
+/// The `Complete` of a cumulative-semantics engine: the prompt count and the
+/// whole output's ids, whose length is the completion count.
+fn scheduler_complete(index: u32, prompt_tokens: u32, output: &str) -> scheduler::GenerateResponse {
+    let output_ids: Vec<u32> = output.chars().map(u32::from).collect();
+    scheduler::GenerateResponse {
+        request_id: String::new(),
+        response: Some(SchedulerEvent::Complete(scheduler::GenerateComplete {
+            index,
+            finish_reason: "stop".to_string(),
+            prompt_tokens,
+            completion_tokens: output_ids.len() as u32,
+            output_ids,
+            ..Default::default()
+        })),
+    }
+}
+
+/// [`gated_stream`] over the scheduler proto: a cumulative-semantics stream
+/// whose frames after `first` are held back until `gate` fires.
+async fn gated_scheduler_stream(
+    first: Vec<scheduler::GenerateResponse>,
+    gate: oneshot::Receiver<()>,
+    rest: Vec<scheduler::GenerateResponse>,
+) -> (ProtoStream, JoinHandle<()>) {
+    let head: Vec<Result<Frame<Bytes>, tonic::Status>> =
+        first.iter().map(|frame| Ok(data_frame(frame))).collect();
+    let tail: Vec<Result<Frame<Bytes>, tonic::Status>> = rest
+        .iter()
+        .map(|frame| Ok(data_frame(frame)))
+        .chain(std::iter::once(Ok(trailers_frame("0"))))
+        .collect();
+    let (url, server) = mock_worker_endpoint().await;
+    let client = SglangSchedulerClient::connect(&url)
+        .await
+        .expect("connect mock worker");
+    let gated = stream::once(async move {
+        let _ = gate.await;
+        stream::iter(tail)
+    })
+    .flatten();
+    let stream = SchedulerStream::new(
+        decoded_stream(stream::iter(head).chain(gated)),
+        "usage-row-test".to_string(),
+        client,
+    );
+    // No generation was sent to the mock, so there is nothing to cancel.
+    stream.mark_completed();
+    (ProtoStream::Sglang(stream), server)
+}
+
+fn messages_spec() -> MessagesResponseSpec {
+    MessagesResponseSpec {
+        thinking_requested: false,
+        thinking_text_returned: true,
+        reasoning_in_prefill: false,
+        tool_choice: None,
+        has_tools: false,
+        history_tool_calls_count: 0,
+        chat_tools: Vec::new().into(),
+        stop_sequences: None,
+        symphony: None,
+        first_tool_call_only: false,
+    }
+}
+
+/// The Messages streaming path over `stream` for `tenant`, its events sent to
+/// `tx`; the caller reads them, or leaves.
+fn messages_task(
+    stream: ProtoStream,
+    tenant: &str,
+    tx: SseSender,
+) -> JoinHandle<Result<(), utils::StreamFailure>> {
+    let dispatch = dispatch(tenant);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "bounded test fixture; the task ends with the stream"
+    )]
+    tokio::spawn(async move {
+        processor(false)
+            .process_messages_streaming_chunks(
+                stream,
+                dispatch,
+                character_tokenizer(),
+                (None, None, false, false, false),
+                messages_spec(),
+                &tx,
+                None,
+            )
+            .await
+    })
+}
+
+#[tokio::test]
+async fn a_messages_stream_the_client_leaves_at_the_finish_books_the_engines_counts_once() {
+    let tenant = "auth:usage-row-messages-client-gone-after-complete";
+    // A cumulative-semantics engine: the chunks carry the running count, which
+    // the tracker only reports; the count it books arrives with the Complete.
+    let (gate, held) = oneshot::channel();
+    let (stream, server) = gated_scheduler_stream(
+        vec![scheduler_chunk(0, "Hel", 3), scheduler_chunk(0, "lo", 5)],
+        held,
+        vec![scheduler_complete(0, 7, "Hello")],
+    )
+    .await;
+    let (tx, mut rx) = sse_channel();
+    let task = messages_task(stream, tenant, tx);
+
+    // The client reads the whole text ...
+    let mut seen = String::new();
+    while !seen.contains(r#""text":"lo""#) {
+        let frame = rx
+            .recv()
+            .await
+            .expect("a frame before the client leaves")
+            .expect("successful SSE write");
+        seen.push_str(std::str::from_utf8(&frame).expect("UTF-8 SSE"));
+    }
+    // ... and leaves. The engine's Complete arrives; the events after it (the
+    // block's stop, the message delta and stop) cannot be sent: the row takes
+    // the engine's counts, the completion count included.
+    drop(rx);
+    let _ = gate.send(());
+    let result = task.await.expect("the stream task");
+    assert!(
+        result.is_err(),
+        "the send after the client left fails: {result:?}"
+    );
+
+    assert_eq!(
+        counts(&booked(tenant).await),
+        (1, 7, 5),
+        "one request; the engine's prompt count and the completion count its Complete \
+         carried (the chunks of a cumulative engine book nothing on their own)"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_messages_stream_that_ends_without_a_complete_books_the_dispatch_prompt_once() {
+    let tenant = "auth:usage-row-messages-no-complete";
+    let (stream, server) = scripted_stream(vec![chunk(0, "Hel")], "0").await;
+    let (tx, rx) = sse_channel();
+    let task = messages_task(stream, tenant, tx);
+    let events = collect_events(rx).await;
+    let result = task.await.expect("the stream task");
+    assert!(result.is_ok(), "{result:?}");
+    assert!(
+        events.iter().any(|event| event["type"] == "message_stop"),
+        "the stream ends on its own: {events:?}"
+    );
+    server.abort();
+
+    assert_eq!(
+        counts(&booked(tenant).await),
+        (1, u64::from(PROMPT_AT_DISPATCH), 3),
+        "a clean end without the engine's count keeps the prompt as tokenized at dispatch, \
+         on the message_stop exit as on the message_delta one"
+    );
+}
+
+#[tokio::test]
+async fn a_chat_stream_that_ends_without_a_complete_books_the_dispatch_prompt_once() {
+    let tenant = "auth:usage-row-chat-no-complete";
+    let (stream, server) = scripted_stream(vec![chunk(0, "Hel")], "0").await;
+    let text = read_to_end(chat_response(stream, dispatch(tenant)).await).await;
+    assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+    server.abort();
+
+    assert_eq!(
+        counts(&booked(tenant).await),
+        (1, u64::from(PROMPT_AT_DISPATCH), 3),
+        "no Complete populated the prompt count: the dispatch count stands, not zero"
+    );
+}
+
+#[tokio::test]
+async fn a_completions_stream_that_ends_without_a_complete_books_the_dispatch_prompt_once() {
+    let tenant = "auth:usage-row-completions-no-complete";
+    let request: openai_protocol::completion::CompletionRequest = serde_json::from_value(
+        serde_json::json!({"model": "usage-row-test", "prompt": "test", "stream": true}),
+    )
+    .expect("a completion request");
+    let (stream, server) = scripted_stream(vec![chunk(0, "Hel")], "0").await;
+    let dispatch = dispatch(tenant);
+    let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_COMPLETIONS);
+    let response = Arc::new(processor(false))
+        .process_completion_streaming_response(
+            context::ExecutionResult::Single { stream },
+            CompletionResponseSpec::from(&request),
+            dispatch,
+            character_tokenizer(),
+            None,
+            None,
+            source,
+        )
+        .await;
+    let text = read_to_end(response).await;
+    assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+    server.abort();
+
+    assert_eq!(
+        counts(&booked(tenant).await),
+        (1, u64::from(PROMPT_AT_DISPATCH), 3),
+        "a unit without a Complete leaves the dispatch count in place, as the settle before the \
+         usage chunk has it"
+    );
 }

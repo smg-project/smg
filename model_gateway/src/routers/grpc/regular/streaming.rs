@@ -2106,13 +2106,15 @@ impl StreamingProcessor {
 
                     prompt_tokens = complete.prompt_tokens();
                     saw_complete = true;
-                    // The engine's counts are in: a client that stops reading
-                    // from here on is booked with them.
+                    completion_tokens.record_complete(&complete);
+                    // The engine's counts are in (the completion count only
+                    // once the tracker took the `Complete`: on a cumulative
+                    // engine the chunks wrote none): a client that stops
+                    // reading from here on is booked with them.
                     stream_usage.settle(
                         Some(u64::from(prompt_tokens)),
                         u64::from(completion_tokens.total()),
                     );
-                    completion_tokens.record_complete(&complete);
                     engine_thinking_tokens = complete.reasoning_tokens();
                     cached_tokens = complete.cached_tokens();
                     // A local stop-decoder match already pinned "stop"; don't let
@@ -2747,7 +2749,10 @@ impl StreamingProcessor {
             endpoint: metrics_labels::ENDPOINT_MESSAGES,
             ttft: first_token_time.map(|t| t.duration_since(start_time)),
             generation_duration: start_time.elapsed(),
-            input_tokens: Some(u64::from(prompt_tokens)),
+            // The prompt count the engine's `Complete` carried, else none:
+            // the row then keeps the count the dispatch made, as the settle
+            // above and the `/generate` end have it.
+            input_tokens: saw_complete.then_some(u64::from(prompt_tokens)),
             output_tokens: u64::from(completion_tokens.total()),
             unbilled_prompt_tokens: 0,
             usage: stream_usage,
@@ -3020,7 +3025,10 @@ impl StreamingProcessor {
                         endpoint: metrics_labels::ENDPOINT_COMPLETIONS,
                         ttft: first_token_time.map(|t| t.duration_since(start_time)),
                         generation_duration: start_time.elapsed(),
-                        input_tokens: Some(total_prompt as u64),
+                        // The units' prompt count once every unit saw its
+                        // `Complete`, else none: the row keeps the dispatch
+                        // count, as the settle above has it.
+                        input_tokens: all_saw_complete.then_some(total_prompt as u64),
                         output_tokens: total_completion as u64,
                         unbilled_prompt_tokens: 0,
                         usage: stream_usage,
@@ -4647,7 +4655,9 @@ impl<'a> ChatStream<'a> {
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: self.first_token_time.map(|t| t.duration_since(stream_base)),
             generation_duration: stream_base.elapsed(),
-            input_tokens: Some(total_prompt as u64),
+            // `prompt_tokens` is only ever populated from a `Complete`
+            // message: with none, the row keeps the count the dispatch made.
+            input_tokens: (!self.prompt_tokens.is_empty()).then_some(total_prompt as u64),
             output_tokens: total_completion as u64,
             unbilled_prompt_tokens: self.spec.unbilled_prompt_tokens,
             usage: self.usage,

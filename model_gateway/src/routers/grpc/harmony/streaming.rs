@@ -455,15 +455,17 @@ impl HarmonyStreamingProcessor {
                     prompt_tokens
                         .entry(index)
                         .or_insert_with(|| complete_wrapper.prompt_tokens());
-                    // The engine's counts are in: a client that stops reading
-                    // from here on is booked with them.
+                    completion_tokens.record_complete(&complete_wrapper);
+                    // The engine's counts are in (the completion count only
+                    // once the tracker took the `Complete`: on a cumulative
+                    // engine the chunks wrote none): a client that stops
+                    // reading from here on is booked with them.
                     stream_usage.settle(
                         Some(u64::from(
                             prompt_tokens.values().copied().max().unwrap_or(0),
                         )),
                         u64::from(completion_tokens.total()),
                     );
-                    completion_tokens.record_complete(&complete_wrapper);
                     cached_tokens
                         .entry(index)
                         .or_insert_with(|| complete_wrapper.cached_tokens());
@@ -578,8 +580,13 @@ impl HarmonyStreamingProcessor {
             spec_drafted: spec_drafted.values().sum(),
         };
         // The engine's counts are in: a client that stops reading at the
-        // usage chunk is booked with them from here.
-        stream_usage.settle(Some(u64::from(counts.prompt)), u64::from(counts.completion));
+        // usage chunk is booked with them from here. `prompt_tokens` holds
+        // only what `Complete` messages carried: with none, the dispatch count
+        // stands.
+        stream_usage.settle(
+            (!prompt_tokens.is_empty()).then_some(u64::from(counts.prompt)),
+            u64::from(counts.completion),
+        );
 
         if let Some(handle) = reservation {
             // A clean decode EOF with fewer decode `Complete` messages than
@@ -618,7 +625,7 @@ impl HarmonyStreamingProcessor {
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: first_token_time.map(|t| t.duration_since(start_time)),
             generation_duration: start_time.elapsed(),
-            input_tokens: Some(counts.prompt as u64),
+            input_tokens: (!prompt_tokens.is_empty()).then_some(counts.prompt as u64),
             output_tokens: counts.completion as u64,
             unbilled_prompt_tokens: 0,
             usage: stream_usage,
