@@ -250,11 +250,13 @@ render no tool call at all. What the table says beyond the others:
   starts in content.
 - **The recorded set holds no call.** Mistral Small 3's template renders no tool call, so the
   recorder kept its content sets alone (184,972 cases), which replay; 7B v0.3's parse sets are
-  not recorded. The calls stand on the turns 7B v0.3's template renders, held in the rendered-turn
-  fixtures and the module's tests at every cut.
+  not recorded. The calls stand on the turns 7B v0.3's template renders, held in the module's tests
+  at every cut; bellwether's hand-written sets record them for the family once its recorder has a
+  rule for call ids (the template requires one of nine letters or digits, and a corpus case's
+  calls carry none).
 - **7B v0.3's template writes a space before the assistant's text** (`[/INST] Hello!</s>`), and
   none before `[TOOL_CALLS]`; the table reads the space as the model's bytes, as the v13 table
-  reads what its template writes around the content, and the rendered turns expect it. Whether
+  reads what its template writes around the content, and the module tests expect it. Whether
   the family's own tokenizer shows that space to a client is for the live reading to say.
 - **A forced call is the list behind the marker, with no end.** `Format::grammar` writes one tag:
   `[TOOL_CALLS]`, the list of the tools' calls as Llama Nemotron's tag holds it, and nothing after
