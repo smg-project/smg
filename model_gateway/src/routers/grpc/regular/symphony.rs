@@ -1802,7 +1802,7 @@ mod tests {
         );
         // The older DSML parser for the V3.2 checkpoints reads with their table.
         assert_eq!(
-            named_table(&names(Some("deepseek32"), None)),
+            named_table(&names(Some("deepseek32"), None).labels),
             Some(Table::DeepSeekV3_2)
         );
         // The reasoning name counts only without a tool-call name.

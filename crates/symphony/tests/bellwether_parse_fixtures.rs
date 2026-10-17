@@ -245,6 +245,11 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("qwen-drive-1.0-4b", GenerationPrompt::OpensTheThought),
     // DeepSeek V4.1 writes DSML and opens the thought in the prompt (`<think>`, no newline).
     ("deepseek-v4.1-flash", GenerationPrompt::OpensTheThought),
+    // DeepSeek V3.2 and V3.2-Speciale write DSML; the encoder ends the prompt with `<think>` in
+    // thinking mode and `</think>` in chat mode, right after `<｜Assistant｜>`. bellwether holds
+    // their manifests and no set yet: each slug is skipped with the notice until the pin holds it.
+    ("deepseek-v3.2", GenerationPrompt::OpensTheThought),
+    ("deepseek-v3.2-speciale", GenerationPrompt::OpensTheThought),
     // The Kimi K2 line reads with one table, and each template ends the generation prompt its own
     // way: K2 Instruct and Instruct-0905 write no thought; K2 Thinking ends at the turn's opener
     // and the model writes its own `<think>`; K2.5, K2.6 and K2.7-Code open the thought in the
@@ -607,11 +612,12 @@ impl Recorded for Table {
             | Self::MistralV13
             | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
-            // tagged ones' (no call comes of the fence); IQuest, DSML, Kimi K2, LFM2.5,
+            // tagged ones' (no call comes of the fence); IQuest, the DSML tables, Kimi K2, LFM2.5,
             // MiniMax M2, MiniCPM5, dots3 and Llama Nemotron read `</think>` but not
             // `<tool_call>`.
             Self::Ling | Self::Glm | Self::Glm4 => KNOWN_TAGGED_DIFFERENCES,
             Self::IQuest
+            | Self::DeepSeekV3_2
             | Self::DeepSeekV4
             | Self::DeepSeekV4_1
             | Self::KimiK2
