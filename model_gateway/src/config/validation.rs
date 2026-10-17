@@ -1362,6 +1362,33 @@ impl ConfigValidator {
             });
         }
 
+        // A per-tenant or per-model cap above an explicit in-flight bound can
+        // never apply: the bound sheds first. The host-derived bound (-1) is
+        // not known here, and with the bound off (0) the caps stand alone.
+        if config.max_concurrent_requests > 0 {
+            let bound = config.max_concurrent_requests as usize;
+            for (field, cap) in [
+                (
+                    "max_concurrent_requests_per_tenant",
+                    config.max_concurrent_requests_per_tenant,
+                ),
+                (
+                    "max_concurrent_requests_per_model",
+                    config.max_concurrent_requests_per_model,
+                ),
+            ] {
+                if cap > bound {
+                    return Err(ConfigError::InvalidValue {
+                        field: field.to_string(),
+                        value: cap.to_string(),
+                        reason: format!(
+                            "Must not exceed max_concurrent_requests ({bound}): a cap above the in-flight bound can never apply"
+                        ),
+                    });
+                }
+            }
+        }
+
         if let Some(tokens_per_second) = config.rate_limit_tokens_per_second {
             // Allow 0 for pure concurrency limiting (semaphore behavior)
             if tokens_per_second < 0 {
@@ -2587,6 +2614,50 @@ mod tests {
             ..Default::default()
         };
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// A concurrency bulkhead above an explicit in-flight bound is refused by
+    /// name; at or under the bound, with the host-derived bound, or with the
+    /// bound off, it is accepted.
+    #[test]
+    fn a_concurrency_bulkhead_above_the_explicit_in_flight_bound_is_refused() {
+        for (field, per_tenant, per_model) in [
+            ("max_concurrent_requests_per_tenant", 65, 0),
+            ("max_concurrent_requests_per_model", 0, 65),
+        ] {
+            let config = RouterConfig {
+                max_concurrent_requests: 64,
+                max_concurrent_requests_per_tenant: per_tenant,
+                max_concurrent_requests_per_model: per_model,
+                ..Default::default()
+            };
+            match ConfigValidator::validate(&config) {
+                Err(ConfigError::InvalidValue {
+                    field: refused,
+                    value,
+                    reason,
+                }) => {
+                    assert_eq!(refused, field);
+                    assert_eq!(value, "65");
+                    assert!(reason.contains("64"), "the bound is named: {reason}");
+                }
+                other => panic!("{field} above the bound is refused: {other:?}"),
+            }
+        }
+        for (bound, per_tenant, per_model) in
+            [(64, 64, 64), (64, 1, 0), (-1, 4096, 4096), (0, 8, 8)]
+        {
+            let config = RouterConfig {
+                max_concurrent_requests: bound,
+                max_concurrent_requests_per_tenant: per_tenant,
+                max_concurrent_requests_per_model: per_model,
+                ..Default::default()
+            };
+            assert!(
+                ConfigValidator::validate(&config).is_ok(),
+                "bound {bound}, caps {per_tenant}/{per_model} are accepted"
+            );
+        }
     }
 
     #[test]

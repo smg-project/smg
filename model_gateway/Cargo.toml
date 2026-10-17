@@ -214,6 +214,11 @@ harness = false
 path = "benches/request_processing.rs"
 
 [[bench]]
+name = "bulkhead"
+harness = false
+path = "benches/bulkhead.rs"
+
+[[bench]]
 name = "router_registry_bench"
 harness = false
 

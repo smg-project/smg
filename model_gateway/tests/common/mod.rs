@@ -30,7 +30,7 @@ use serde_json::json;
 use smg::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
-    middleware::TokenBucket,
+    middleware::{Bulkheads, TokenBucket},
     policies::PolicyRegistry,
     routers::{gateway::Gateway, RouterFactory, RouterTrait},
     worker::{
@@ -348,7 +348,10 @@ impl AppTestContext {
             }
 
             let inner_router = RouterFactory::create_router(&app_context).await.unwrap();
-            let manager = Gateway::new(app_context.worker_registry.clone());
+            // As the server builds it: the config's concurrency bulkheads, off
+            // unless a test sets them.
+            let manager = Gateway::new(app_context.worker_registry.clone())
+                .with_bulkheads(Bulkheads::from_config(&config));
             let router_id = Gateway::determine_router_id(&config.mode, config.connection_mode);
             let manager = Arc::new(manager);
             manager.register_router(router_id, Arc::from(inner_router));

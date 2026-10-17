@@ -427,6 +427,19 @@ pub struct RouterConfig {
     /// `None` applies the built-in default when admission is enabled.
     #[serde(default)]
     pub prefill_queue_timeout_secs: Option<u64>,
+    /// Most in-flight requests one tenant may hold at once, across all
+    /// models (a concurrency bulkhead): taken when the request is dispatched
+    /// to its router, held for the full response; one beyond answers 429
+    /// `tenant_concurrency_exceeded` with `Retry-After`. 0 (default) sets no
+    /// per-tenant cap.
+    #[serde(default)]
+    pub max_concurrent_requests_per_tenant: usize,
+    /// Most in-flight requests one model may hold at once, across all
+    /// tenants (a concurrency bulkhead; an alias counts against its model);
+    /// one beyond answers 503 `model_concurrency_exceeded` with
+    /// `Retry-After`. 0 (default) sets no per-model cap.
+    #[serde(default)]
+    pub max_concurrent_requests_per_model: usize,
     /// Sustained admission rate (requests per second), bursting up to
     /// `max_concurrent_requests`, which keeps bounding standing concurrency.
     /// Unset or 0 = no rate limit.
@@ -1821,6 +1834,8 @@ impl Default for RouterConfig {
             prefill_max_inflight_requests_per_worker: default_disabled_limit(),
             prefill_queue_size: None,
             prefill_queue_timeout_secs: None,
+            max_concurrent_requests_per_tenant: 0,
+            max_concurrent_requests_per_model: 0,
             rate_limit_tokens_per_second: None,
             max_background_responses: default_max_background_responses(),
             priority_scheduler_enabled: false,

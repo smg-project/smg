@@ -31,8 +31,13 @@ use crate::{
     server::AppState,
 };
 
-/// Standard error body plus `Retry-After` for admission sheds.
-fn shed_response(status: StatusCode, code: &'static str, message: &'static str) -> Response {
+/// Standard error body plus `Retry-After` for admission sheds, the
+/// concurrency bulkheads' included.
+pub(crate) fn shed_response(
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+) -> Response {
     let mut response = create_error(status, code, message);
     response
         .headers_mut()

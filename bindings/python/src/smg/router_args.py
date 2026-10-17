@@ -435,6 +435,12 @@ class RouterArgs:
     max_buffered_request_bytes: int = 1048576
     # Standing-concurrency cap (-1 to disable); permits span the full response
     max_concurrent_requests: int = -1
+    # Concurrency bulkheads: the most in-flight requests one model (across tenants) may hold
+    # at once, 0 = no cap
+    max_concurrent_requests_per_model: int = 0
+    # Concurrency bulkheads: the most in-flight requests one tenant (across models) may hold
+    # at once, 0 = no cap
+    max_concurrent_requests_per_tenant: int = 0
     # Most client connections the data listener holds open at once (0 = no bound)
     max_connections: int = 0
     max_idle_secs: int = 4 * 3600
@@ -2021,6 +2027,36 @@ class RouterArgs:
             type=int,
             default=RouterArgs.queue_timeout_secs,
             help="Maximum time (in seconds) a request can wait in queue before timing out",
+        )
+        rate_limit_group.add_argument(
+            f"--{prefix}max-concurrent-requests-per-tenant",
+            type=int,
+            default=RouterArgs.max_concurrent_requests_per_tenant,
+            help=(
+                "Most in-flight requests one tenant may hold at once, across all"
+                " models (a concurrency bulkhead): taken when the request is"
+                " dispatched to its router, after admission, and held for the full"
+                " response; one beyond answers 429 tenant_concurrency_exceeded with"
+                " Retry-After. The tenant is the resolved tenant key: without"
+                " tenant API keys or a trusted tenant header it is the client"
+                " address, one key for every caller behind a proxy. 0 (default)"
+                " sets no per-tenant cap. Must not exceed an explicit"
+                " --max-concurrent-requests."
+            ),
+        )
+        rate_limit_group.add_argument(
+            f"--{prefix}max-concurrent-requests-per-model",
+            type=int,
+            default=RouterArgs.max_concurrent_requests_per_model,
+            help=(
+                "Most in-flight requests one model may hold at once, across all"
+                " tenants (a concurrency bulkhead; an alias counts against its"
+                " model, a request that names no model against the one served"
+                " model when there is exactly one, else under a key of its own);"
+                " one beyond answers 503 model_concurrency_exceeded with"
+                " Retry-After. 0 (default) sets no per-model cap. Must not exceed"
+                " an explicit --max-concurrent-requests."
+            ),
         )
         rate_limit_group.add_argument(
             f"--{prefix}rate-limit-tokens-per-second",

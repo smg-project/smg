@@ -1250,6 +1250,27 @@ struct ServingArgs {
     #[arg(long, default_value_t = 60, help_heading = "Rate Limiting")]
     queue_timeout_secs: u64,
 
+    /// Most in-flight requests one tenant may hold at once, across all
+    /// models (a concurrency bulkhead): taken when the request is dispatched
+    /// to its router, after admission, and held for the full response,
+    /// streaming bodies included; one beyond answers 429
+    /// tenant_concurrency_exceeded with Retry-After. The tenant is the
+    /// resolved tenant key: without tenant API keys or a trusted tenant
+    /// header it is the client address, one key for every caller behind a
+    /// proxy. 0 (default) sets no per-tenant cap. Must not exceed an explicit
+    /// --max-concurrent-requests
+    #[arg(long, default_value_t = 0, help_heading = "Rate Limiting")]
+    max_concurrent_requests_per_tenant: usize,
+
+    /// Most in-flight requests one model may hold at once, across all
+    /// tenants (a concurrency bulkhead; an alias counts against its model, a
+    /// request that names no model against the one served model when there
+    /// is exactly one, else under a key of its own); one beyond answers 503
+    /// model_concurrency_exceeded with Retry-After. 0 (default) sets no
+    /// per-model cap. Must not exceed an explicit --max-concurrent-requests
+    #[arg(long, default_value_t = 0, help_heading = "Rate Limiting")]
+    max_concurrent_requests_per_model: usize,
+
     /// Sustained admission rate in requests per second, bursting up to
     /// --max-concurrent-requests, which keeps bounding standing concurrency
     /// (a completed request frees its slot, not rate budget). Unset or 0 =
@@ -3176,6 +3197,8 @@ impl CliArgs {
             .tenant_rate_limit_enabled(self.serving.tenant_rate_limit_enabled)
             .tenant_rate_limit_config(self.serving.tenant_rate_limit_config.clone())
             .cors_allowed_origins(self.serving.cors_allowed_origins.clone())
+            .max_concurrent_requests_per_tenant(self.serving.max_concurrent_requests_per_tenant)
+            .max_concurrent_requests_per_model(self.serving.max_concurrent_requests_per_model)
             .retry_config(RetryConfig {
                 max_retries: self.serving.retry_max_retries,
                 initial_backoff_ms: self.serving.retry_initial_backoff_ms,
@@ -4294,6 +4317,29 @@ mod tests {
                 "--zmq-engine-count {bad} should be rejected"
             );
         }
+    }
+
+    /// The concurrency bulkhead flags flow into the config; unset, both
+    /// caps are off.
+    #[test]
+    fn concurrency_bulkhead_flags_flow_into_router_config() {
+        let cli = launch_args_from(&[
+            "--worker-urls",
+            "http://worker:8000",
+            "--max-concurrent-requests-per-tenant",
+            "8",
+            "--max-concurrent-requests-per-model",
+            "16",
+        ]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.max_concurrent_requests_per_tenant, 8);
+        assert_eq!(router_config.max_concurrent_requests_per_model, 16);
+
+        let defaults = launch_args_from(&["--worker-urls", "http://worker:8000"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        assert_eq!(defaults.max_concurrent_requests_per_tenant, 0);
+        assert_eq!(defaults.max_concurrent_requests_per_model, 0);
     }
 
     /// The deprecated indexer prune flags are still accepted and flow into

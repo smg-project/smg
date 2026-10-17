@@ -186,6 +186,14 @@ Called from the router Deployment template.
 - {{ .Values.router.queueSize | quote }}
 - "--queue-timeout-secs"
 - {{ .Values.router.queueTimeoutSecs | quote }}
+{{- if .Values.router.maxConcurrentRequestsPerTenant }}
+- "--max-concurrent-requests-per-tenant"
+- {{ .Values.router.maxConcurrentRequestsPerTenant | quote }}
+{{- end }}
+{{- if .Values.router.maxConcurrentRequestsPerModel }}
+- "--max-concurrent-requests-per-model"
+- {{ .Values.router.maxConcurrentRequestsPerModel | quote }}
+{{- end }}
 {{- if not .Values.router.retry.enabled }}
 - "--disable-retries"
 {{- else }}

@@ -437,7 +437,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_admission_queue_rejected_total",
-        "Requests rejected at admission by reason (full/timeout), or refused ahead of worker selection after waiting longer than the queue timeout inside the gateway (selection_timeout)"
+        "Requests rejected at admission by reason (full/timeout), refused ahead of worker selection after waiting longer than the queue timeout inside the gateway (selection_timeout), or refused at dispatch by a concurrency bulkhead (tenant_concurrency: the caller's per-tenant in-flight cap, answered 429; model_concurrency: the model's in-flight cap, answered 503)"
     );
     describe_gauge!(
         "smg_admission_inflight",

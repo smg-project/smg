@@ -473,6 +473,18 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// The most in-flight requests one tenant may hold at once (0 = no cap).
+    pub fn max_concurrent_requests_per_tenant(mut self, max: usize) -> Self {
+        self.config.max_concurrent_requests_per_tenant = max;
+        self
+    }
+
+    /// The most in-flight requests one model may hold at once (0 = no cap).
+    pub fn max_concurrent_requests_per_model(mut self, max: usize) -> Self {
+        self.config.max_concurrent_requests_per_model = max;
+        self
+    }
+
     pub fn queue_size(mut self, size: usize) -> Self {
         self.config.queue_size = size;
         self

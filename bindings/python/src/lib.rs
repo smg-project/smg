@@ -514,6 +514,8 @@ struct Router {
     max_background_responses: usize,
     max_buffered_request_bytes: u64,
     max_concurrent_requests: i32,
+    max_concurrent_requests_per_model: usize,
+    max_concurrent_requests_per_tenant: usize,
     max_connections: usize,
     max_idle_secs: u64,
     max_payload_size: usize,
@@ -1101,6 +1103,8 @@ impl Router {
             .load_monitor_interval_secs(self.load_monitor_interval)
             .pd_admission_wait_secs(self.pd_admission_wait_secs)
             .max_concurrent_requests(self.max_concurrent_requests)
+            .max_concurrent_requests_per_tenant(self.max_concurrent_requests_per_tenant)
+            .max_concurrent_requests_per_model(self.max_concurrent_requests_per_model)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
             .priority_scheduler_enabled(self.priority_scheduler_enabled)
@@ -1339,6 +1343,8 @@ impl Router {
         max_background_responses = 1024,
         max_buffered_request_bytes = 1_048_576,
         max_concurrent_requests = -1,
+        max_concurrent_requests_per_model = 0,
+        max_concurrent_requests_per_tenant = 0,
         max_connections = 0,
         max_idle_secs = 14400,
         max_payload_size = 512 * 1024 * 1024,
@@ -1546,6 +1552,8 @@ impl Router {
         max_background_responses: usize,
         max_buffered_request_bytes: u64,
         max_concurrent_requests: i32,
+        max_concurrent_requests_per_model: usize,
+        max_concurrent_requests_per_tenant: usize,
         max_connections: usize,
         max_idle_secs: u64,
         max_payload_size: usize,
@@ -1783,6 +1791,8 @@ impl Router {
             max_background_responses,
             max_buffered_request_bytes,
             max_concurrent_requests,
+            max_concurrent_requests_per_model,
+            max_concurrent_requests_per_tenant,
             max_connections,
             max_idle_secs,
             max_payload_size,

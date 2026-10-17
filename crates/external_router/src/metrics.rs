@@ -212,6 +212,10 @@ pub mod metrics_labels {
     /// Admitted, then held inside the gateway ahead of worker selection for
     /// longer than the queue timeout.
     pub const ADMISSION_REJECTED_SELECTION_TIMEOUT: &str = "selection_timeout";
+    /// Beyond the caller's per-tenant in-flight cap (a concurrency bulkhead).
+    pub const ADMISSION_REJECTED_TENANT_CONCURRENCY: &str = "tenant_concurrency";
+    /// Beyond the served model's in-flight cap (a concurrency bulkhead).
+    pub const ADMISSION_REJECTED_MODEL_CONCURRENCY: &str = "model_concurrency";
 
     // Circuit breaker states
     pub const CB_CLOSED: &str = "closed";

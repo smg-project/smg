@@ -1366,6 +1366,10 @@ class TestParseRouterArgs:
             "120",
             "--rate-limit-tokens-per-second",
             "100",
+            "--max-concurrent-requests-per-tenant",
+            "32",
+            "--max-concurrent-requests-per-model",
+            "256",
         ]
 
         router_args = parse_router_args(args)
@@ -1374,6 +1378,12 @@ class TestParseRouterArgs:
         assert router_args.queue_size == 200
         assert router_args.queue_timeout_secs == 120
         assert router_args.rate_limit_tokens_per_second == 100
+        assert router_args.max_concurrent_requests_per_tenant == 32
+        assert router_args.max_concurrent_requests_per_model == 256
+
+        defaults = parse_router_args([])
+        assert defaults.max_concurrent_requests_per_tenant == 0
+        assert defaults.max_concurrent_requests_per_model == 0
 
     def test_parse_health_check_args(self):
         """Test parsing health check arguments."""

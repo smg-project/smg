@@ -8,7 +8,7 @@
 //! size of the pools they would select from, so traffic can migrate between
 //! HTTP and gRPC and between regular and disaggregated fleets gradually.
 
-use std::{collections::HashMap, future::Future, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, future::Future, sync::Arc};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
@@ -38,7 +38,10 @@ use tracing::{debug, info, warn};
 use crate::{
     app_context::AppContext,
     config::RoutingMode,
-    middleware::TenantRequestMeta,
+    middleware::{
+        bulkhead::{BulkheadPermits, Bulkheads},
+        TenantRequestMeta,
+    },
     routers::{
         common::body_policy::REASON_MODEL_SELECTION,
         error as route_error,
@@ -47,7 +50,7 @@ use crate::{
         BodyPolicy, RouterFactory, RouterTrait,
     },
     server::ServerConfig,
-    worker::{ConnectionMode, ProviderType, RoutingPool, WorkerRegistry},
+    worker::{AttachedBody, ConnectionMode, ProviderType, RoutingPool, WorkerRegistry},
 };
 
 /// A router family the weighted selection chooses among: its router and the
@@ -107,6 +110,9 @@ pub struct Gateway {
     routers: ArcSwap<HashMap<RouterId, Arc<dyn RouterTrait>>>,
     default_router: ArcSwapOption<RouterId>,
     enable_igw: bool,
+    /// The per-tenant and per-model in-flight caps, taken at dispatch; off
+    /// unless configured.
+    bulkheads: Bulkheads,
 }
 
 /// The answer when no router serves a request: the JSON error object, a 404
@@ -122,7 +128,16 @@ impl Gateway {
             routers: ArcSwap::from_pointee(HashMap::new()),
             default_router: ArcSwapOption::empty(),
             enable_igw: false,
+            bulkheads: Bulkheads::none(),
         }
+    }
+
+    /// The gateway with `bulkheads` taken at dispatch (see
+    /// [`Self::run_within_bulkheads`]).
+    #[must_use]
+    pub fn with_bulkheads(mut self, bulkheads: Bulkheads) -> Self {
+        self.bulkheads = bulkheads;
+        self
     }
 
     fn try_register(
@@ -146,7 +161,8 @@ impl Gateway {
         config: &ServerConfig,
         app_context: &Arc<AppContext>,
     ) -> Result<Arc<Self>, String> {
-        let mut gateway = Self::new(app_context.worker_registry.clone());
+        let mut gateway = Self::new(app_context.worker_registry.clone())
+            .with_bulkheads(Bulkheads::from_config(&config.router_config));
         gateway.enable_igw = config.router_config.enable_igw;
         let gateway = Arc::new(gateway);
 
@@ -456,9 +472,11 @@ impl Gateway {
 
     /// Hand a request to the router that serves `model`, or answer with the
     /// refusal `miss` builds (built on a miss alone: a request a router takes
-    /// pays nothing for it).
+    /// pays nothing for it). A request with a caller runs within the caller's
+    /// and the model's bulkheads.
     async fn dispatch<F, Fut>(
         &self,
+        tenant_meta: Option<&TenantRequestMeta>,
         model: Option<&str>,
         miss: impl FnOnce() -> Response,
         run: F,
@@ -468,8 +486,94 @@ impl Gateway {
         Fut: Future<Output = Response>,
     {
         match self.select_router_for_request(model) {
-            Some(router) => run(router).await,
+            Some(router) => {
+                self.run_within_bulkheads(tenant_meta, model, router, run)
+                    .await
+            }
             None => miss(),
+        }
+    }
+
+    /// Run `run` on `router` within the concurrency bulkheads (see
+    /// [`Self::acquire_bulkheads`]): a request beyond a cap is answered
+    /// before the router runs, and the permits ride on the response body, so
+    /// a streaming response holds its slots to its last frame or the
+    /// disconnect; the body of a response that is dropped unread gives them
+    /// back as well.
+    async fn run_within_bulkheads<F, Fut>(
+        &self,
+        tenant_meta: Option<&TenantRequestMeta>,
+        model: Option<&str>,
+        router: Arc<dyn RouterTrait>,
+        run: F,
+    ) -> Response
+    where
+        F: FnOnce(Arc<dyn RouterTrait>) -> Fut,
+        Fut: Future<Output = Response>,
+    {
+        match self.acquire_bulkheads(tenant_meta, model) {
+            Ok(Some(permits)) => AttachedBody::wrap_response(run(router).await, permits),
+            Ok(None) => run(router).await,
+            Err(refusal) => refusal,
+        }
+    }
+
+    /// The permits of a request by `tenant_meta` for `model` under the
+    /// concurrency bulkheads (`middleware::bulkhead`), or its refusal: a
+    /// tenant at its in-flight cap is answered 429 and a model at its cap
+    /// 503, with `Retry-After`. `None` with the caps off, or for a request
+    /// without a caller (a probe, a realtime session, a cancel). An alias
+    /// counts against the model it names; a request that names no model, or
+    /// the unknown one, counts against the one served model when there is
+    /// exactly one (that is where it is routed), else under the unknown
+    /// model's key. Dispatch takes the permits here, and so does the streamed
+    /// request-body path, before it forwards the body.
+    pub(crate) fn acquire_bulkheads(
+        &self,
+        tenant_meta: Option<&TenantRequestMeta>,
+        model: Option<&str>,
+    ) -> Result<Option<BulkheadPermits>, Response> {
+        let Some(tenant_meta) = tenant_meta.filter(|_| !self.bulkheads.is_off()) else {
+            return Ok(None);
+        };
+        let model = self
+            .bulkheads
+            .model()
+            .map(|_| self.model_bulkhead_key(model));
+        let tenant = Some(tenant_meta.tenant_key().as_str());
+        match self.bulkheads.try_acquire(tenant, model.as_deref()) {
+            Ok(permits) => Ok(Some(permits)),
+            Err(scope) => {
+                debug!(
+                    scope = ?scope,
+                    tenant,
+                    model = model.as_deref(),
+                    "request beyond a concurrency bulkhead"
+                );
+                Err(scope.reject())
+            }
+        }
+    }
+
+    /// The key a request for `model` counts against under the per-model
+    /// cap: the canonical model behind an alias, the one served model for a
+    /// request that names none (or the unknown one) when there is exactly
+    /// one, else the name as given.
+    fn model_bulkhead_key<'a>(&self, model: Option<&'a str>) -> Cow<'a, str> {
+        match model {
+            Some(model) if model != UNKNOWN_MODEL_ID => self
+                .worker_registry
+                .resolve_model_alias(model)
+                .map_or(Cow::Borrowed(model), |canonical| {
+                    Cow::Owned(canonical.to_string())
+                }),
+            _ => {
+                let mut served = self.worker_registry.get_models();
+                match served.pop() {
+                    Some(only) if served.is_empty() => Cow::Owned(only),
+                    _ => Cow::Borrowed(UNKNOWN_MODEL_ID),
+                }
+            }
         }
     }
 }
@@ -496,7 +600,7 @@ impl RouterTrait for Gateway {
                 "No routers with healthy workers available",
             )
         };
-        self.dispatch(None, miss, |router| async move {
+        self.dispatch(None, None, miss, |router| async move {
             router.health_generate(req).await
         })
         .await
@@ -504,7 +608,7 @@ impl RouterTrait for Gateway {
 
     async fn get_server_info(&self, req: Request<Body>) -> Response {
         let miss = || route_error::service_unavailable("no_routers", "No routers available");
-        self.dispatch(None, miss, |router| async move {
+        self.dispatch(None, None, miss, |router| async move {
             router.get_server_info(req).await
         })
         .await
@@ -536,11 +640,16 @@ impl RouterTrait for Gateway {
                 "/generate requests must include a model when IGW routing is enabled",
             );
         }
-        self.dispatch(Some(model_id), no_router, |router| async move {
-            router
-                .route_generate(headers, tenant_meta, body, model_id)
-                .await
-        })
+        self.dispatch(
+            Some(tenant_meta),
+            Some(model_id),
+            no_router,
+            |router| async move {
+                router
+                    .route_generate(headers, tenant_meta, body, model_id)
+                    .await
+            },
+        )
         .await
     }
 
@@ -551,11 +660,16 @@ impl RouterTrait for Gateway {
         body: ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.dispatch(Some(model_id), no_router, |router| async move {
-            router
-                .route_chat(headers, tenant_meta, body, model_id)
-                .await
-        })
+        self.dispatch(
+            Some(tenant_meta),
+            Some(model_id),
+            no_router,
+            |router| async move {
+                router
+                    .route_chat(headers, tenant_meta, body, model_id)
+                    .await
+            },
+        )
         .await
     }
 
@@ -566,11 +680,16 @@ impl RouterTrait for Gateway {
         body: CompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.dispatch(Some(model_id), no_router, |router| async move {
-            router
-                .route_completion(headers, tenant_meta, body, model_id)
-                .await
-        })
+        self.dispatch(
+            Some(tenant_meta),
+            Some(model_id),
+            no_router,
+            |router| async move {
+                router
+                    .route_completion(headers, tenant_meta, body, model_id)
+                    .await
+            },
+        )
         .await
     }
 
@@ -588,9 +707,17 @@ impl RouterTrait for Gateway {
         };
         match router {
             Some(router) => {
-                router
-                    .route_messages(headers, tenant_meta, body, model_id)
-                    .await
+                self.run_within_bulkheads(
+                    Some(tenant_meta),
+                    Some(model_id),
+                    router,
+                    |router| async move {
+                        router
+                            .route_messages(headers, tenant_meta, body, model_id)
+                            .await
+                    },
+                )
+                .await
             }
             None => no_router(),
         }
@@ -629,9 +756,17 @@ impl RouterTrait for Gateway {
         };
         match router {
             Some(router) => {
-                router
-                    .route_messages_count_tokens(headers, tenant_meta, body, model_id)
-                    .await
+                self.run_within_bulkheads(
+                    Some(tenant_meta),
+                    Some(model_id),
+                    router,
+                    |router| async move {
+                        router
+                            .route_messages_count_tokens(headers, tenant_meta, body, model_id)
+                            .await
+                    },
+                )
+                .await
             }
             None => no_router(),
         }
@@ -650,11 +785,16 @@ impl RouterTrait for Gateway {
                 "No router available to handle responses request",
             )
         };
-        self.dispatch(Some(model_id), miss, |router| async move {
-            router
-                .route_responses(headers, tenant_meta, body, model_id)
-                .await
-        })
+        self.dispatch(
+            Some(tenant_meta),
+            Some(model_id),
+            miss,
+            |router| async move {
+                router
+                    .route_responses(headers, tenant_meta, body, model_id)
+                    .await
+            },
+        )
         .await
     }
 
@@ -671,7 +811,7 @@ impl RouterTrait for Gateway {
                 "No router available to handle interactions request",
             )
         };
-        self.dispatch(model_id, miss, |router| async move {
+        self.dispatch(Some(tenant_meta), model_id, miss, |router| async move {
             router
                 .route_interactions(headers, tenant_meta, body, model_id)
                 .await
@@ -691,7 +831,7 @@ impl RouterTrait for Gateway {
                 format!("No router available to cancel response '{response_id}'"),
             )
         };
-        self.dispatch(None, miss, |router| async move {
+        self.dispatch(None, None, miss, |router| async move {
             router
                 .cancel_response(headers, tenant_meta, response_id)
                 .await
@@ -706,11 +846,16 @@ impl RouterTrait for Gateway {
         body: EmbeddingRequest,
         model_id: &str,
     ) -> Response {
-        self.dispatch(Some(model_id), no_router, |router| async move {
-            router
-                .route_embeddings(headers, tenant_meta, body, model_id)
-                .await
-        })
+        self.dispatch(
+            Some(tenant_meta),
+            Some(model_id),
+            no_router,
+            |router| async move {
+                router
+                    .route_embeddings(headers, tenant_meta, body, model_id)
+                    .await
+            },
+        )
         .await
     }
 
@@ -721,11 +866,16 @@ impl RouterTrait for Gateway {
         body: ClassifyRequest,
         model_id: &str,
     ) -> Response {
-        self.dispatch(Some(model_id), no_router, |router| async move {
-            router
-                .route_classify(headers, tenant_meta, body, model_id)
-                .await
-        })
+        self.dispatch(
+            Some(tenant_meta),
+            Some(model_id),
+            no_router,
+            |router| async move {
+                router
+                    .route_classify(headers, tenant_meta, body, model_id)
+                    .await
+            },
+        )
         .await
     }
 
@@ -770,9 +920,17 @@ impl RouterTrait for Gateway {
         };
         match router {
             Some(router) => {
-                router
-                    .route_decisions(headers, tenant_meta, body, model_id)
-                    .await
+                self.run_within_bulkheads(
+                    Some(tenant_meta),
+                    Some(model_id),
+                    router,
+                    |router| async move {
+                        router
+                            .route_decisions(headers, tenant_meta, body, model_id)
+                            .await
+                    },
+                )
+                .await
             }
             None => route_error::not_implemented(
                 "decisions_not_supported",
@@ -818,9 +976,17 @@ impl RouterTrait for Gateway {
         };
         match router {
             Some(router) => {
-                router
-                    .route_systemone(headers, tenant_meta, body, model_id)
-                    .await
+                self.run_within_bulkheads(
+                    Some(tenant_meta),
+                    Some(model_id),
+                    router,
+                    |router| async move {
+                        router
+                            .route_systemone(headers, tenant_meta, body, model_id)
+                            .await
+                    },
+                )
+                .await
             }
             None => route_error::not_implemented(
                 "systemone_not_supported",
@@ -837,11 +1003,16 @@ impl RouterTrait for Gateway {
         audio: AudioFile,
         model_id: &str,
     ) -> Response {
-        self.dispatch(Some(model_id), no_router, |router| async move {
-            router
-                .route_audio_transcriptions(headers, tenant_meta, body, audio, model_id)
-                .await
-        })
+        self.dispatch(
+            Some(tenant_meta),
+            Some(model_id),
+            no_router,
+            |router| async move {
+                router
+                    .route_audio_transcriptions(headers, tenant_meta, body, audio, model_id)
+                    .await
+            },
+        )
         .await
     }
 
@@ -853,11 +1024,16 @@ impl RouterTrait for Gateway {
         model_id: &str,
     ) -> Response {
         let miss = || route_error::not_found("no_router", "No router available for rerank request");
-        self.dispatch(Some(model_id), miss, |router| async move {
-            router
-                .route_rerank(headers, tenant_meta, body, model_id)
-                .await
-        })
+        self.dispatch(
+            Some(tenant_meta),
+            Some(model_id),
+            miss,
+            |router| async move {
+                router
+                    .route_rerank(headers, tenant_meta, body, model_id)
+                    .await
+            },
+        )
         .await
     }
 
@@ -873,7 +1049,7 @@ impl RouterTrait for Gateway {
             )
         };
         let model = body.model.as_deref();
-        self.dispatch(model, miss, |router| async move {
+        self.dispatch(None, model, miss, |router| async move {
             router.route_realtime_session(headers, body).await
         })
         .await
@@ -891,7 +1067,7 @@ impl RouterTrait for Gateway {
             )
         };
         let model = body.session.model.as_deref();
-        self.dispatch(model, miss, |router| async move {
+        self.dispatch(None, model, miss, |router| async move {
             router.route_realtime_client_secret(headers, body).await
         })
         .await
@@ -909,7 +1085,7 @@ impl RouterTrait for Gateway {
             )
         };
         let model = body.model.as_deref();
-        self.dispatch(model, miss, |router| async move {
+        self.dispatch(None, model, miss, |router| async move {
             router
                 .route_realtime_transcription_session(headers, body)
                 .await
@@ -924,7 +1100,7 @@ impl RouterTrait for Gateway {
                 "No router available for realtime WebSocket request",
             )
         };
-        self.dispatch(Some(model), miss, |router| async move {
+        self.dispatch(None, Some(model), miss, |router| async move {
             router.route_realtime_ws(req, model).await
         })
         .await
@@ -937,7 +1113,7 @@ impl RouterTrait for Gateway {
                 "No router available for realtime WebRTC request",
             )
         };
-        self.dispatch(Some(model), miss, |router| async move {
+        self.dispatch(None, Some(model), miss, |router| async move {
             router.route_realtime_webrtc(req, model).await
         })
         .await
@@ -963,7 +1139,10 @@ mod tests {
     use std::collections::HashMap;
 
     use async_trait::async_trait;
-    use axum::{http::StatusCode, response::IntoResponse};
+    use axum::{
+        http::{header::RETRY_AFTER, StatusCode},
+        response::IntoResponse,
+    };
     use openai_protocol::model_card::ModelCard;
 
     use super::*;
@@ -2146,5 +2325,200 @@ mod tests {
             .select_router_for_request(Some("model-alias"))
             .expect("alias should select the PD router");
         assert_eq!(router.router_type(), "pd");
+    }
+
+    /// A body that never ends: a response carrying it is in flight until it
+    /// is dropped.
+    struct PendingBody;
+
+    impl http_body::Body for PendingBody {
+        type Data = bytes::Bytes;
+        type Error = axum::Error;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// A router whose generate answer streams for as long as the test holds
+    /// the response.
+    #[derive(Debug)]
+    struct HoldingStubRouter;
+
+    #[async_trait]
+    impl RouterTrait for HoldingStubRouter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        async fn route_generate(
+            &self,
+            _headers: Option<&HeaderMap>,
+            _tenant_meta: &TenantRequestMeta,
+            _body: GenerateRequest,
+            _model_id: &str,
+        ) -> Response {
+            Response::new(Body::new(PendingBody))
+        }
+
+        fn router_type(&self) -> &'static str {
+            "holding"
+        }
+    }
+
+    fn bulkheaded_gateway(per_tenant: usize, per_model: usize) -> Arc<Gateway> {
+        let gateway = Arc::new(
+            Gateway::new(Arc::new(WorkerRegistry::new()))
+                .with_bulkheads(Bulkheads::new(per_tenant, per_model)),
+        );
+        gateway.register_router(router_ids::HTTP_REGULAR, Arc::new(HoldingStubRouter));
+        gateway
+    }
+
+    async fn generate_as(gateway: &Gateway, tenant: &str, model: &str) -> Response {
+        let body: GenerateRequest =
+            serde_json::from_value(serde_json::json!({ "text": "hello", "model": model })).unwrap();
+        gateway
+            .route_generate(
+                None,
+                &RouteRequestMeta::new(TenantKey::from(tenant)),
+                body,
+                model,
+            )
+            .await
+    }
+
+    fn error_code(response: &Response) -> Option<&str> {
+        response
+            .headers()
+            .get(route_error::HEADER_X_SMG_ERROR_CODE)
+            .and_then(|value| value.to_str().ok())
+    }
+
+    /// With a per-tenant cap of one, a tenant's second in-flight request is
+    /// answered 429 while another tenant is served; the slot frees with the
+    /// response body, and an idle tenant leaves no entry behind.
+    #[tokio::test]
+    async fn a_tenant_at_its_cap_is_refused_while_another_tenant_is_served() {
+        let gateway = bulkheaded_gateway(1, 0);
+        let tenants = gateway.bulkheads.tenant().expect("the per-tenant cap");
+
+        let held = generate_as(&gateway, "auth:a", "m").await;
+        assert_eq!(held.status(), StatusCode::OK);
+        let refused = generate_as(&gateway, "auth:a", "m").await;
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error_code(&refused), Some("tenant_concurrency_exceeded"));
+        assert_eq!(refused.headers().get(RETRY_AFTER).unwrap(), "2");
+        let other = generate_as(&gateway, "auth:b", "m").await;
+        assert_eq!(other.status(), StatusCode::OK, "another tenant is served");
+        assert_eq!(tenants.inflight("auth:a"), 1);
+        assert_eq!(tenants.inflight("auth:b"), 1);
+
+        drop(held);
+        assert_eq!(tenants.inflight("auth:a"), 0, "the body returned the slot");
+        let again = generate_as(&gateway, "auth:a", "m").await;
+        assert_eq!(again.status(), StatusCode::OK);
+
+        drop((other, again));
+        assert_eq!(tenants.active_keys(), 0, "idle tenants hold no entry");
+    }
+
+    /// A request that names no model, or the unknown one, counts against the
+    /// one served model when there is exactly one (that is where it is
+    /// routed), so the model's bound stays tight; with more than one model
+    /// served it has a key of its own.
+    #[tokio::test]
+    async fn an_unnamed_request_counts_against_the_one_served_model() {
+        let gateway = bulkheaded_gateway(0, 1);
+        let models = gateway.bulkheads.model().expect("the per-model cap");
+        gateway
+            .worker_registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("http://worker-1:8080")
+                    .model(ModelCard::new("m"))
+                    .build(),
+            ))
+            .unwrap();
+
+        let held = generate_as(&gateway, "auth:a", UNKNOWN_MODEL_ID).await;
+        assert_eq!(held.status(), StatusCode::OK);
+        assert_eq!(models.inflight("m"), 1, "the one served model's slot");
+        assert_eq!(models.inflight(UNKNOWN_MODEL_ID), 0);
+        let refused = generate_as(&gateway, "auth:b", "m").await;
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_code(&refused), Some("model_concurrency_exceeded"));
+        drop((held, refused));
+        assert_eq!(models.active_keys(), 0);
+
+        gateway
+            .worker_registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("http://worker-2:8080")
+                    .model(ModelCard::new("m2"))
+                    .build(),
+            ))
+            .unwrap();
+        let unnamed = generate_as(&gateway, "auth:a", UNKNOWN_MODEL_ID).await;
+        assert_eq!(unnamed.status(), StatusCode::OK);
+        assert_eq!(models.inflight(UNKNOWN_MODEL_ID), 1, "a key of its own");
+        assert_eq!(models.inflight("m"), 0);
+        let named = generate_as(&gateway, "auth:a", "m").await;
+        assert_eq!(named.status(), StatusCode::OK);
+        assert_eq!(models.inflight("m"), 1);
+        drop((unnamed, named));
+        assert_eq!(models.active_keys(), 0);
+    }
+
+    /// With a per-model cap of one, a second request for the model by any
+    /// tenant is answered 503 while another model is served; a refused
+    /// request gives its tenant slot back.
+    #[tokio::test]
+    async fn a_model_at_its_cap_is_refused_and_a_refusal_holds_no_tenant_slot() {
+        let gateway = bulkheaded_gateway(1, 1);
+        let models = gateway.bulkheads.model().expect("the per-model cap");
+
+        let held = generate_as(&gateway, "auth:a", "m1").await;
+        assert_eq!(held.status(), StatusCode::OK);
+        let refused = generate_as(&gateway, "auth:b", "m1").await;
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_code(&refused), Some("model_concurrency_exceeded"));
+        assert_eq!(refused.headers().get(RETRY_AFTER).unwrap(), "2");
+        let other_model = generate_as(&gateway, "auth:b", "m2").await;
+        assert_eq!(
+            other_model.status(),
+            StatusCode::OK,
+            "the refusal left tenant b its slot"
+        );
+        assert_eq!(models.inflight("m1"), 1);
+        assert_eq!(models.inflight("m2"), 1);
+
+        drop(held);
+        let served = generate_as(&gateway, "auth:c", "m1").await;
+        assert_eq!(served.status(), StatusCode::OK);
+
+        drop((other_model, served));
+        assert_eq!(models.active_keys(), 0);
+    }
+
+    /// Without the caps, the default, dispatch takes no permit and the
+    /// routers answer as before.
+    #[tokio::test]
+    async fn without_caps_dispatch_takes_no_permit() {
+        let gateway = test_gateway(false);
+        assert!(gateway.bulkheads.is_off());
+        for _ in 0..3 {
+            let response = gateway
+                .route_generate(
+                    None,
+                    &test_tenant_meta(),
+                    generate_request_without_model(),
+                    "m",
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
     }
 }

@@ -312,6 +312,13 @@ class Router:
             (0 = no queue, return 429 immediately). Default: 100
         queue_timeout_secs: Maximum time (in seconds) a request can wait in queue
             before timing out. Default: 60
+        max_concurrent_requests_per_tenant: Most in-flight requests one tenant may
+            hold at once, across all models (a concurrency bulkhead); one beyond
+            answers 429 with Retry-After. 0 sets no per-tenant cap. Default: 0
+        max_concurrent_requests_per_model: Most in-flight requests one model may
+            hold at once, across all tenants (an alias counts against its model);
+            one beyond answers 503 with Retry-After. 0 sets no per-model cap.
+            Default: 0
         rate_limit_tokens_per_second: Sustained admission rate (requests per
             second), bursting up to max_concurrent_requests, which keeps bounding
             standing concurrency. Unset or 0 = no rate limit. Default: None

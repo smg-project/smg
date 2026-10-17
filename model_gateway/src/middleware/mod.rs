@@ -7,6 +7,7 @@
 pub mod auth;
 pub mod body_limit;
 pub mod body_timeout;
+pub mod bulkhead;
 pub mod concurrency;
 pub mod edge_body;
 pub mod logging;
@@ -23,6 +24,7 @@ pub mod wasm;
 pub use auth::{auth_middleware, deny_all_middleware, AuthConfig};
 pub use body_limit::{mark_passed_body_limit_middleware, payload_too_large_envelope_middleware};
 pub use body_timeout::{request_body_timeout_middleware, RequestBodyTimeouts};
+pub use bulkhead::{Bulkhead, BulkheadPermit, BulkheadPermits, BulkheadScope, Bulkheads};
 pub use concurrency::{concurrency_limit_middleware, AdmissionQueue};
 pub use logging::{
     create_logging_layer, trace_context_response, AccessLogFields, AccessLogRecord, ProbeResponse,

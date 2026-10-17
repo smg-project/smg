@@ -65,6 +65,10 @@ router:
   maxConcurrentRequests: -1    # -1 = unlimited
   queueSize: 100
   queueTimeoutSecs: 60
+  # Concurrency bulkheads: the most in-flight requests one tenant (across
+  # models) or one model (across tenants) may hold at once; 0 = no cap
+  maxConcurrentRequestsPerTenant: 0
+  maxConcurrentRequestsPerModel: 0
 
   # -- Resilience: retry
   retry:

@@ -208,6 +208,16 @@ class TestRouterConfigValidation:
         assert args.queue_size == 100
         assert args.queue_timeout_secs == 60
         assert args.rate_limit_tokens_per_second == 100
+        assert args.max_concurrent_requests_per_tenant == 0
+        assert args.max_concurrent_requests_per_model == 0
+
+        bulkheads = RouterArgs(
+            max_concurrent_requests=256,
+            max_concurrent_requests_per_tenant=16,
+            max_concurrent_requests_per_model=64,
+        )
+        assert bulkheads.max_concurrent_requests_per_tenant == 16
+        assert bulkheads.max_concurrent_requests_per_model == 64
 
     def test_service_discovery_config_validation(self):
         """Test service discovery configuration validation."""
