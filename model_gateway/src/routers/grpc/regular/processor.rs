@@ -16,6 +16,7 @@ use openai_protocol::{
     completion::{CompletionChoice, CompletionResponse},
     generate::{GenerateMetaInfo, GenerateResponse},
     messages::{self, Message},
+    smg::{ParseReport, SmgExtension},
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use symphony::{adapt, Events};
@@ -80,7 +81,7 @@ impl ResponseProcessor {
         // between availability check and parsing.
         reasoning_parser_name: Option<&str>,
         tool_parser_name: Option<&str>,
-    ) -> Result<(ChatChoice, u32), String> {
+    ) -> Result<(ChatChoice, u32, Option<ParseReport>), String> {
         stop_decoder.reset();
         if let Some(assignment) = &original_request.symphony {
             return Self::read_with_symphony(
@@ -94,6 +95,11 @@ impl ResponseProcessor {
                 stop_decoder,
             );
         }
+        // The legacy parsers read this choice: the report, when asked, says so and no more.
+        let legacy_report = original_request
+            .parse_report
+            .wanted(false)
+            .then(legacy_parse_report);
         let Decoded {
             text: final_text,
             token_ends,
@@ -218,7 +224,7 @@ impl ResponseProcessor {
             matched_stop,
             hidden_states: None,
         };
-        Ok((choice, reasoning_tokens))
+        Ok((choice, reasoning_tokens, legacy_report))
     }
 
     /// The choice as Symphony reads it (see `regular::symphony`): the output as
@@ -237,7 +243,7 @@ impl ResponseProcessor {
         model: &str,
         tokenizer: &Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
-    ) -> Result<(ChatChoice, u32), String> {
+    ) -> Result<(ChatChoice, u32, Option<ParseReport>), String> {
         let tools = original_request.tools.clone().unwrap_or_default();
         // The output as one delta, then the decoder's last text: two deltas the events borrow,
         // both outliving the buffer.
@@ -245,7 +251,8 @@ impl ResponseProcessor {
         let mut flushed = Delta::default();
         let mut events = Events::new();
         let mut reader = Reader::new(assignment, tools, &mut events)?
-            .first_call_only(original_request.first_tool_call_only);
+            .first_call_only(original_request.first_tool_call_only)
+            .reporting(original_request.parse_report, original_request.parse_silent);
         let stopped = reader.read(stop_decoder, complete.output_ids(), &mut delta, &mut events)?;
         // Complete token decoding, including bytes and a partial stop match, as
         // on the older path; the text it releases is the last token's.
@@ -301,7 +308,7 @@ impl ResponseProcessor {
             }
             logprobs
         });
-        Ok((choice, reasoning_tokens))
+        Ok((choice, reasoning_tokens, reader.parse_report(index as u32)))
     }
 
     /// The message as Symphony reads it (see `regular::symphony`): the output as one delta
@@ -322,7 +329,8 @@ impl ResponseProcessor {
         let mut flushed = Delta::default();
         let mut events = Events::new();
         let mut reader = Reader::new(assignment, Arc::clone(&request.chat_tools), &mut events)?
-            .first_call_only(request.first_tool_call_only);
+            .first_call_only(request.first_tool_call_only)
+            .reporting(request.parse_report, request.parse_silent);
         stop_decoder.reset();
         let stopped = reader.read(stop_decoder, complete.output_ids(), &mut delta, &mut events)?;
         let tail = stop_decoder
@@ -381,6 +389,7 @@ impl ResponseProcessor {
                 thinking_requested.then_some(complete.reasoning_tokens().max(reasoning_tokens)),
             ),
             container: None,
+            smg: reader.parse_report(0).map(SmgExtension::boxed_parse),
         })
     }
 
@@ -450,6 +459,7 @@ impl ResponseProcessor {
         // Process all choices
         let mut choices = Vec::new();
         let mut parsed_reasoning_tokens = 0;
+        let mut parse_reports = Vec::new();
         for (index, complete) in all_responses.iter().enumerate() {
             match self
                 .process_single_choice(
@@ -468,9 +478,12 @@ impl ResponseProcessor {
                 )
                 .await
             {
-                Ok((choice, reasoning_tokens)) => {
+                Ok((choice, reasoning_tokens, report)) => {
                     choices.push(choice);
                     parsed_reasoning_tokens += reasoning_tokens;
+                    if let Some(report) = report {
+                        parse_reports.push(report);
+                    }
                 }
                 Err(e) => {
                     return Err(error::internal_error(
@@ -499,6 +512,7 @@ impl ResponseProcessor {
             .choices(choices)
             .usage(usage)
             .maybe_system_fingerprint(dispatch.weight_version.clone())
+            .maybe_smg(merged_parse_report(parse_reports).map(SmgExtension::parse))
             .build();
         Ok((response, counts))
     }
@@ -1001,6 +1015,10 @@ impl ResponseProcessor {
             stop_details: None,
             usage,
             container: None,
+            smg: messages_request
+                .parse_report
+                .wanted(false)
+                .then(|| SmgExtension::boxed_parse(legacy_parse_report())),
         };
         Ok((message, counts))
     }
@@ -1470,6 +1488,32 @@ fn messages_usage_from_counts(
     }
 }
 
+/// The report of an output the legacy parsers read: the parser's name and no more.
+pub(crate) fn legacy_parse_report() -> ParseReport {
+    ParseReport {
+        parser: "legacy".to_string(),
+        ..ParseReport::default()
+    }
+}
+
+/// One report for a whole answer from its choices' reports, in choice order: the first
+/// choice's parser and table (every choice of a request is read the same way), `malformed`
+/// when any choice was, the runs of every choice, each numbered with its choice, and the
+/// suppressed calls summed. `None` when no choice has a report.
+pub(crate) fn merged_parse_report(reports: Vec<ParseReport>) -> Option<ParseReport> {
+    let mut reports = reports.into_iter();
+    let mut merged = reports.next()?;
+    for report in reports {
+        if report.outcome.as_deref() == Some("malformed") {
+            merged.outcome = report.outcome;
+        }
+        merged.malformed.extend(report.malformed);
+        merged.dropped.extend(report.dropped);
+        merged.suppressed_calls += report.suppressed_calls;
+    }
+    Some(merged)
+}
+
 #[cfg(test)]
 mod content_normalization_tests {
     use super::normalize_assistant_content;
@@ -1783,7 +1827,7 @@ mod responses_finish_reason_tests {
                 llm_tokenizer::StopSequenceConfig::default(),
                 false,
             );
-            let (choice, _) = processor
+            let (choice, _, _) = processor
                 .process_single_choice(
                     "test-request",
                     &complete,
@@ -1843,7 +1887,7 @@ mod responses_finish_reason_tests {
                 llm_tokenizer::StopSequenceConfig::default(),
                 false,
             );
-            let (choice, _) = processor
+            let (choice, _, _) = processor
                 .process_single_choice(
                     "test-request",
                     &complete,
@@ -1909,7 +1953,7 @@ plan<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>"#;
                 llm_tokenizer::StopSequenceConfig::default(),
                 false,
             );
-            let (choice, _) = processor
+            let (choice, _, _) = processor
                 .process_single_choice(
                     "test-request",
                     &complete,
@@ -1975,7 +2019,7 @@ plan<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>"#;
                 llm_tokenizer::StopSequenceConfig::default(),
                 false,
             );
-            let (choice, _) = processor
+            let (choice, _, _) = processor
                 .process_single_choice(
                     "test-request",
                     &complete,

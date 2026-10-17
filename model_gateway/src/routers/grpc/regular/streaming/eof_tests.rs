@@ -25,7 +25,10 @@ use super::*;
 use crate::{
     routers::{
         common::sse::SseReceiver,
-        grpc::{regular::processor::ResponseProcessor, test_engine::mock_engine},
+        grpc::{
+            regular::{processor::ResponseProcessor, symphony::telemetry::Report},
+            test_engine::mock_engine,
+        },
     },
     worker::{
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
@@ -626,6 +629,8 @@ async fn byte_fallback_messages_eof_emits_exact_text_before_block_stop() {
     let (stream, server) = scripted_stream(byte_fallback_eof_frames(), "0").await;
     let (tx, rx) = sse_channel();
     let spec = MessagesResponseSpec {
+        parse_report: Report::Off,
+        parse_silent: false,
         thinking_requested: false,
         thinking_text_returned: true,
         reasoning_in_prefill: false,
@@ -723,6 +728,8 @@ fn byte_fallback_reasoning_tokenizer() -> Arc<dyn Tokenizer> {
 
 fn byte_fallback_messages_spec(thinking: bool) -> MessagesResponseSpec {
     MessagesResponseSpec {
+        parse_report: Report::Off,
+        parse_silent: false,
         thinking_requested: thinking,
         thinking_text_returned: true,
         reasoning_in_prefill: false,
@@ -1083,7 +1090,7 @@ async fn byte_fallback_unary_valid_reasoning_counts_original_tokens() {
             ..Default::default()
         };
         let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
-        let (choice, reasoning_tokens) = processor
+        let (choice, reasoning_tokens, _) = processor
             .process_single_choice(
                 "test-request",
                 &ProtoGenerateComplete::Vllm(Box::new(complete.clone())),
@@ -1153,7 +1160,7 @@ async fn non_byte_fallback_held_stop_keeps_original_reasoning_accounting() {
         ReasoningParserFactory::new(),
         utils::ParserResolver::disabled(),
     );
-    let (choice, reasoning_tokens) = processor
+    let (choice, reasoning_tokens, _) = processor
         .process_single_choice(
             "test-request",
             &complete,
@@ -1202,7 +1209,7 @@ async fn byte_fallback_unary_malformed_tail_retains_canonical_reasoning() {
         ..Default::default()
     }));
     let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
-    let (choice, _) = processor
+    let (choice, _, _) = processor
         .process_single_choice(
             "test-request",
             &complete,
@@ -1897,6 +1904,8 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
         let (stream, server) = scripted_stream(responses, "0").await;
         let (tx, rx) = sse_channel();
         let spec = MessagesResponseSpec {
+            parse_report: Report::Off,
+            parse_silent: false,
             thinking_requested: true,
             thinking_text_returned: true,
             reasoning_in_prefill: false,
@@ -1983,6 +1992,8 @@ async fn messages_stream_stop_reason_follows_what_the_engine_matched() {
         let (stream, server) = scripted_stream(vec![chunk(0, "Hi."), done], "0").await;
         let (tx, rx) = sse_channel();
         let spec = MessagesResponseSpec {
+            parse_report: Report::Off,
+            parse_silent: false,
             thinking_requested: false,
             thinking_text_returned: true,
             reasoning_in_prefill: false,
@@ -2358,6 +2369,8 @@ async fn messages_blocks_and_inputs(
     texts: &[&str],
 ) -> (Vec<String>, Vec<Value>) {
     let spec = MessagesResponseSpec {
+        parse_report: Report::Off,
+        parse_silent: false,
         thinking_requested: true,
         thinking_text_returned: true,
         reasoning_in_prefill: false,

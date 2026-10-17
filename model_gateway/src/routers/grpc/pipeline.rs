@@ -1870,6 +1870,7 @@ mod alias_pipeline_tests {
             tokenizer_autoload: true,
             tokenizer_load_failures: Arc::default(),
             parser: crate::config::ParserChoice::Legacy,
+            parse_failures: crate::config::ParseFailures::Log,
         });
         let request: GenerateRequest = serde_json::from_value(json!({
             "model": MODEL_ALIAS,
@@ -2406,6 +2407,7 @@ mod request_release_tests {
             tokenizer_autoload: true,
             tokenizer_load_failures: Arc::default(),
             parser: crate::config::ParserChoice::Legacy,
+            parse_failures: crate::config::ParseFailures::Log,
         })
     }
 
@@ -4232,6 +4234,7 @@ mod request_release_tests {
             tokenizer_autoload: true,
             tokenizer_load_failures: Arc::default(),
             parser: crate::config::ParserChoice::Legacy,
+            parse_failures: crate::config::ParseFailures::Log,
         })
     }
 
@@ -4711,6 +4714,7 @@ mod request_release_tests {
             tokenizer_autoload: true,
             tokenizer_load_failures: Arc::default(),
             parser: crate::config::ParserChoice::Legacy,
+            parse_failures: crate::config::ParseFailures::Log,
         });
 
         let response = pipeline
@@ -4815,6 +4819,7 @@ mod rate_limit_reserve_tests {
             tokenizer_autoload: true,
             tokenizer_load_failures: Arc::default(),
             parser: crate::config::ParserChoice::Legacy,
+            parse_failures: crate::config::ParseFailures::Log,
         })
     }
 

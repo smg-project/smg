@@ -32,7 +32,7 @@ use crate::{
         proto_wrapper::ProtoGenerateComplete,
         regular::{
             processor::ResponseProcessor,
-            symphony::{assign, template::Templates, Asks, Assignment},
+            symphony::{assign, telemetry::Report, template::Templates, Asks, Assignment},
         },
         utils::ModelNames,
     },
@@ -384,6 +384,7 @@ async fn fold_with(output: &str, format: Format, prompt: &str) -> (ChatChoice, u
             None,
         )
         .await
+        .map(|(choice, reasoning_tokens, _)| (choice, reasoning_tokens))
         .expect("a choice")
 }
 
@@ -479,6 +480,8 @@ fn lookup_tools() -> Vec<Tool> {
 /// A Messages spec with Symphony assigned `format`, replaying `prompt`, with the `lookup` tool.
 fn assigned_message(format: Format, prompt: &str, thinking: bool) -> MessagesResponseSpec {
     MessagesResponseSpec {
+        parse_report: Report::Off,
+        parse_silent: false,
         first_tool_call_only: false,
         thinking_requested: thinking,
         thinking_text_returned: true,
@@ -1178,4 +1181,213 @@ async fn a_stream_whose_only_answer_is_a_python_call_in_the_tag_carries_it_as_co
         "Symphony did not read the whole output as content, reasoning and calls"
     ));
     assert!(logs_contain(&format!("released_bytes={}", released.len())));
+}
+
+/// [`fold`] under a report mode: the choice and the whole answer's `smg` object as the
+/// non-streaming processor builds it, from the spec's report mode.
+async fn fold_reported(
+    output: &str,
+    report: Report,
+    with_symphony: bool,
+) -> Option<openai_protocol::smg::ParseReport> {
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let output_ids: Vec<u32> = output.chars().map(u32::from).collect();
+    let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
+        output_ids,
+        finish_reason: "stop".to_string(),
+        ..Default::default()
+    });
+    let mut decoder =
+        StopSequenceDecoder::new(tokenizer.clone(), StopSequenceConfig::default(), false);
+    let mut spec = chat_spec(true);
+    if with_symphony {
+        spec = assigned(spec, qwen3(CallSyntax::Json), "<|im_start|>assistant\n");
+    }
+    spec.parse_report = report;
+    let processor = ResponseProcessor::new(
+        ToolParserFactory::new(),
+        ReasoningParserFactory::new(),
+        utils::ParserResolver::disabled(),
+    );
+    let (_, _, report) = processor
+        .process_single_choice(
+            "test-request",
+            &complete,
+            0,
+            &spec,
+            "Qwen/Qwen3-8B",
+            &tokenizer,
+            &mut decoder,
+            0,
+            false,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("a choice");
+    report
+}
+
+#[tokio::test]
+async fn a_whole_answer_reports_its_malformed_runs_when_asked() {
+    let report = fold_reported(
+        "Hello <tool_call>\nnot a call\n</tool_call>",
+        Report::Always,
+        true,
+    )
+    .await
+    .expect("a report");
+    assert_eq!(report.parser, "symphony");
+    assert_eq!(report.table.as_deref(), Some("qwen3"));
+    assert_eq!(report.outcome.as_deref(), Some("malformed"));
+    assert_eq!(report.malformed.len(), 1);
+    let run = &report.malformed[0];
+    assert_eq!(run.choice, 0);
+    assert_eq!(run.at, "Hello <tool_call>".len() as u64);
+    assert_eq!(run.excerpt, "\nnot a call\n");
+    assert!(report.dropped.is_empty());
+    // `detail` adds the wrapping the table dropped.
+    let detailed = fold_reported(
+        "Hello <tool_call>\nnot a call\n</tool_call>",
+        Report::Detail,
+        true,
+    )
+    .await
+    .expect("a report");
+    assert_eq!(detailed.malformed.len(), 1);
+    assert!(
+        detailed
+            .dropped
+            .iter()
+            .any(|run| run.reason == "wrapper" && run.excerpt == "<tool_call>"),
+        "{detailed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_clean_answer_reports_only_when_asked_and_a_legacy_one_names_its_parser() {
+    assert_eq!(fold_reported("Hello there", Report::Off, true).await, None);
+    assert_eq!(
+        fold_reported("Hello there", Report::OnFailure, true).await,
+        None
+    );
+    let clean = fold_reported("Hello there", Report::Always, true)
+        .await
+        .expect("a report");
+    assert_eq!(clean.outcome.as_deref(), Some("clean"));
+    assert!(clean.malformed.is_empty());
+    let legacy = fold_reported("Hello there", Report::Always, false)
+        .await
+        .expect("a report");
+    assert_eq!(legacy.parser, "legacy");
+    assert_eq!(legacy.table, None);
+    assert_eq!(fold_reported("Hello there", Report::Off, false).await, None);
+}
+
+#[tokio::test]
+async fn a_streamed_choice_carries_the_report_on_its_finish_chunk() {
+    let mut spec = assigned(
+        chat_spec(true),
+        qwen3(CallSyntax::Json),
+        "<|im_start|>assistant\n",
+    );
+    spec.parse_report = Report::Always;
+    let (result, events) = stream_events(
+        vec![
+            chunk(0, "Hi <tool_call>\nnot a call\n"),
+            chunk(0, "</tool_call>"),
+            complete(0, "stop"),
+        ],
+        true,
+        spec,
+    )
+    .await;
+    result.expect("the stream ends well");
+    let with_smg: Vec<&Value> = events.iter().filter(|e| e.get("smg").is_some()).collect();
+    assert_eq!(with_smg.len(), 1, "{events:?}");
+    let chunk = with_smg[0];
+    assert_eq!(chunk["choices"][0]["finish_reason"], "stop");
+    let parse = &chunk["smg"]["parse"];
+    assert_eq!(parse["parser"], "symphony");
+    assert_eq!(parse["table"], "qwen3");
+    assert_eq!(parse["outcome"], "malformed");
+    // The run starts after "Hi " and the opening marker the table dropped: offsets count every
+    // byte of the output, dropped wrapping included.
+    assert_eq!(parse["malformed"][0]["at"], "Hi <tool_call>".len());
+    assert_eq!(parse["malformed"][0]["choice"], 0);
+    assert!(parse.get("dropped").is_none());
+}
+
+#[tokio::test]
+async fn a_choice_a_table_was_assigned_but_never_read_reports_the_table_not_the_legacy_parsers() {
+    // The Complete frame comes with no chunk before it (an empty output): no reader was made,
+    // and the report still names the table that was assigned, clean.
+    let mut spec = assigned(
+        chat_spec(true),
+        qwen3(CallSyntax::Json),
+        "<|im_start|>assistant\n",
+    );
+    spec.parse_report = Report::Always;
+    let (result, events) = stream_events(vec![complete(0, "stop")], true, spec).await;
+    result.expect("the stream ends well");
+    let with_smg: Vec<&Value> = events.iter().filter(|e| e.get("smg").is_some()).collect();
+    assert_eq!(with_smg.len(), 1, "{events:?}");
+    let parse = &with_smg[0]["smg"]["parse"];
+    assert_eq!(parse["parser"], "symphony");
+    assert_eq!(parse["table"], "qwen3");
+    assert_eq!(parse["outcome"], "clean");
+    // Without an assignment the legacy parsers read the stream, and the report says so.
+    let mut legacy = chat_spec(true);
+    legacy.parse_report = Report::Always;
+    let (result, events) =
+        stream_events(vec![chunk(0, "Hi"), complete(0, "stop")], true, legacy).await;
+    result.expect("the stream ends well");
+    let with_smg: Vec<&Value> = events.iter().filter(|e| e.get("smg").is_some()).collect();
+    assert_eq!(with_smg.len(), 1, "{events:?}");
+    assert_eq!(with_smg[0]["smg"]["parse"]["parser"], "legacy");
+}
+
+#[tokio::test]
+async fn a_stream_without_a_report_mode_carries_no_smg_member() {
+    let spec = assigned(
+        chat_spec(true),
+        qwen3(CallSyntax::Json),
+        "<|im_start|>assistant\n",
+    );
+    let (result, events) = stream_events(
+        vec![
+            chunk(0, "Hi <tool_call>\nnot a call\n</tool_call>"),
+            complete(0, "stop"),
+        ],
+        true,
+        spec,
+    )
+    .await;
+    result.expect("the stream ends well");
+    assert!(events.iter().all(|e| e.get("smg").is_none()), "{events:?}");
+}
+
+#[tokio::test]
+async fn a_streamed_message_carries_the_report_on_its_message_delta() {
+    let mut spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    spec.parse_report = Report::Always;
+    let (result, events) = message_events(
+        vec![
+            chunk(0, "Hi <tool_call>\nnot a call\n</tool_call>"),
+            complete(0, "stop"),
+        ],
+        spec,
+        None,
+    )
+    .await;
+    result.expect("the stream ends well");
+    let delta = events
+        .iter()
+        .find(|e| e["type"] == "message_delta")
+        .expect("a message_delta");
+    let parse = &delta["delta"]["smg"]["parse"];
+    assert_eq!(parse["parser"], "symphony");
+    assert_eq!(parse["outcome"], "malformed");
+    assert_eq!(parse["malformed"][0]["excerpt"], "\nnot a call\n");
 }

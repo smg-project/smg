@@ -357,6 +357,7 @@ mod tests {
             tokenizer_autoload: true,
             tokenizer_load_failures: Arc::default(),
             parser: ParserChoice::Symphony,
+            parse_failures: crate::config::ParseFailures::Log,
         })
     }
 

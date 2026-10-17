@@ -6,21 +6,24 @@ use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
-use crate::routers::{
-    error,
-    grpc::{
-        client::GenerateRequestBuildOptions,
-        common::stages::{
-            helpers::{self, TagForStart},
-            BuildStage,
+use crate::{
+    config::ParseFailures,
+    routers::{
+        error,
+        grpc::{
+            client::GenerateRequestBuildOptions,
+            common::stages::{
+                helpers::{self, TagForStart},
+                BuildStage,
+            },
+            context::{
+                stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan,
+                ExecutionPlanKind, PreparationOutput, RequestContext,
+            },
+            regular::{stages::reading, symphony},
+            spec::{ChatResponseSpec, ResponseSpec},
+            utils,
         },
-        context::{
-            stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan,
-            ExecutionPlanKind, PreparationOutput, RequestContext,
-        },
-        regular::{stages::reading, symphony},
-        spec::{ChatResponseSpec, ResponseSpec},
-        utils,
     },
 };
 
@@ -277,6 +280,8 @@ impl BuildStage for ChatRequestBuildingStage {
         spec.unbilled_prompt_tokens = unbilled_prompt_tokens;
         spec.reasoning_in_prefill = reasoning_in_prefill;
         spec.symphony = assignment;
+        spec.parse_report = ctx.state.parse_report;
+        spec.parse_silent = ctx.components.parse_failures == ParseFailures::Silent;
 
         Ok(BuildOutput {
             plan,

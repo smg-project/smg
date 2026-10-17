@@ -14,7 +14,7 @@ use tracing::debug;
 use super::{
     constraint::Asks,
     names::{reading, Fallback, Reading},
-    telemetry::{self, Tally, Who},
+    telemetry::{self, Report, Tally, Who},
     template::Templates,
     SymphonyError,
 };
@@ -246,6 +246,19 @@ impl Reader {
     pub(crate) fn first_call_only(mut self, on: bool) -> Self {
         self.first_call_only = on;
         self
+    }
+
+    /// What the response reports about the output ([`telemetry::Report`]): the runs it needs
+    /// are kept from here on, nothing under `Off`.
+    pub(crate) fn reporting(mut self, report: Report, silent: bool) -> Self {
+        self.tally = Tally::reporting(report).silenced(silent);
+        self
+    }
+
+    /// The report of the output as the choice at `choice`, once it ended, when the request's
+    /// mode wants one for it ([`Tally::parse_report`]).
+    pub(crate) fn parse_report(&self, choice: u32) -> Option<openai_protocol::smg::ParseReport> {
+        self.tally.parse_report(self.table, choice)
     }
 
     /// Reads `token_ids` through `decoder` as one delta: the text the decoder releases, with each

@@ -58,12 +58,85 @@ use std::{
     time::Instant,
 };
 
+use axum::http::HeaderMap;
 use metrics::{Key, Label, Level, Metadata};
+use openai_protocol::smg::{ParseReport, ParseRun};
 use parking_lot::Mutex;
 use symphony::{formats::Table, DropReason, Event, FinishReason, MalformedReason};
 use tracing::warn;
 
 use super::names::Fallback;
+use crate::config::ParseFailures;
+
+/// The request header that asks for the report: `on`, `off` or `detail`.
+pub(crate) const REPORT_HEADER: &str = "x-smg-parse-report";
+
+/// What a response says about how its output was read: the `smg.parse` object next to its
+/// usage (on a streamed choice's finish chunk; on a Messages answer's `message` and
+/// `message_delta`). Decided once per request from the gateway's policy and the request's
+/// `X-SMG-Parse-Report` header ([`report_mode`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Report {
+    /// Nothing.
+    #[default]
+    Off,
+    /// The report when the output is not clean.
+    OnFailure,
+    /// The report on every output, a clean one saying so.
+    Always,
+    /// The report on every output, with the runs the table dropped as wrapping too.
+    Detail,
+}
+
+impl Report {
+    /// Whether a report is wanted for an output that is clean (`not_clean` false) or not.
+    pub(crate) fn wanted(self, not_clean: bool) -> bool {
+        match self {
+            Self::Off => false,
+            Self::OnFailure => not_clean,
+            Self::Always | Self::Detail => true,
+        }
+    }
+
+    /// Whether the runs are kept for the report at all.
+    fn keeps_runs(self) -> bool {
+        self != Self::Off
+    }
+}
+
+/// The report mode of a request under `policy`: `surface` reports every output that is not
+/// clean unless the header says `off`, and a clean one too when it says `on` or `detail`; `log`
+/// reports when the header says `on` or `detail`; `silent` never, whatever the header. The
+/// error names a header value that is none of the three, for the 400 response.
+pub(crate) fn report_mode(
+    policy: ParseFailures,
+    headers: Option<&HeaderMap>,
+) -> Result<Report, String> {
+    if policy == ParseFailures::Silent {
+        return Ok(Report::Off);
+    }
+    let asked = match headers.and_then(|headers| headers.get(REPORT_HEADER)) {
+        None => None,
+        Some(value) => {
+            let spelled = String::from_utf8_lossy(value.as_bytes());
+            match spelled.trim().to_ascii_lowercase().as_str() {
+                "on" => Some(Report::Always),
+                "detail" => Some(Report::Detail),
+                "off" => Some(Report::Off),
+                _ => {
+                    return Err(format!(
+                        "{REPORT_HEADER} must be on, off or detail, not {spelled:?}"
+                    ))
+                }
+            }
+        }
+    };
+    Ok(match (policy, asked) {
+        (_, Some(asked)) => asked,
+        (ParseFailures::Surface, None) => Report::OnFailure,
+        (ParseFailures::Log | ParseFailures::Silent, None) => Report::Off,
+    })
+}
 
 /// Outputs read to their end, by `table` and `outcome` (`clean`, `malformed`, `failed`,
 /// `empty`).
@@ -220,6 +293,28 @@ fn fallback_index(why: Fallback) -> usize {
     }
 }
 
+/// The crate's sentence for a reason whose label says only `other`; the three typed labels spell
+/// their reason themselves.
+fn other_words(why: MalformedReason) -> Option<String> {
+    (reason_index(why) == REASONS.len() - 1).then(|| why.sentence().to_string())
+}
+
+/// The bytes of a run the report quotes ([`ParseRun::excerpt`]): the client that asked for the
+/// report gets this much of each run it names; no log line carries any of the output.
+const EXCERPT_BYTES: usize = 120;
+
+/// The first [`EXCERPT_BYTES`] of `text`, cut at a character boundary.
+fn excerpt(text: &str) -> &str {
+    if text.len() <= EXCERPT_BYTES {
+        return text;
+    }
+    let mut end = EXCERPT_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 /// The bytes an event accounts for in the output.
 pub(super) fn bytes_of(event: &Event) -> usize {
     match event {
@@ -284,9 +379,41 @@ pub(crate) struct Tally {
     /// stream carries it), or the refused call blocks of an output that answered with nothing
     /// else, which every surface carries.
     released: u64,
+    /// What the response reports, and the runs kept for it: every malformed run, and under
+    /// `Detail` every dropped one, in the output's order. Nothing is kept under `Off`.
+    report: Report,
+    /// `--parse-failures silent`: the counters alone, no line and no excerpt event.
+    silent: bool,
+    malformed_runs: Vec<ParseRun>,
+    dropped_runs: Vec<ParseRun>,
+}
+
+/// The `reason` of a dropped run in the report.
+fn drop_label(why: DropReason) -> &'static str {
+    match why {
+        DropReason::ControlToken => "control_token",
+        DropReason::Wrapper => "wrapper",
+        DropReason::Whitespace => "whitespace",
+        DropReason::LaterCall => "later_call",
+        DropReason::MalformedCall => "malformed_call",
+    }
 }
 
 impl Tally {
+    /// A tally that keeps what `report` needs.
+    pub(crate) fn reporting(report: Report) -> Self {
+        Self {
+            report,
+            ..Self::default()
+        }
+    }
+
+    /// Under `--parse-failures silent`: the counters alone, no line and no excerpt event.
+    pub(crate) fn silenced(mut self, silent: bool) -> Self {
+        self.silent = silent;
+        self
+    }
+
     /// Accounts for `event`, the next of the output; `first_call_only` says whether the reader
     /// drops the calls after the first, which are then counted as suppressed.
     pub(crate) fn see(&mut self, event: &Event, first_call_only: bool) {
@@ -312,6 +439,16 @@ impl Tally {
                     });
                     self.announced = true;
                 }
+                if self.report.keeps_runs() {
+                    self.malformed_runs.push(ParseRun {
+                        choice: 0,
+                        reason: reason_label(*why).to_string(),
+                        why: other_words(*why),
+                        at: self.at as u64,
+                        bytes: text.text.len() as u64,
+                        excerpt: excerpt(&text.text).to_string(),
+                    });
+                }
             }
             // The bytes of a call block a syntax refused (the keyed one): they are the malformed
             // run's, announced by the event of no bytes right before them, so the histogram and
@@ -327,6 +464,9 @@ impl Tally {
                     if let Some(first) = &mut self.first {
                         first.bytes += text.text.len();
                     }
+                    if let Some(run) = self.malformed_runs.last_mut() {
+                        run.bytes += text.text.len() as u64;
+                    }
                 }
             }
             Event::Dropped { text, why } => {
@@ -335,6 +475,16 @@ impl Tally {
                     _ => self.dropped_wrapping += text.text.len() as u64,
                 }
                 self.dropped_tokens += text.tokens.unwrap_or(0);
+                if self.report == Report::Detail {
+                    self.dropped_runs.push(ParseRun {
+                        choice: 0,
+                        reason: drop_label(*why).to_string(),
+                        why: None,
+                        at: self.at as u64,
+                        bytes: text.text.len() as u64,
+                        excerpt: excerpt(&text.text).to_string(),
+                    });
+                }
             }
             Event::ToolCallStart { index, source, .. } => {
                 self.calls_begun += 1;
@@ -388,6 +538,40 @@ impl Tally {
     /// Malformed runs by reason, in the order of [`REASONS`]: none for a clean output.
     fn reasons(&self) -> &[u32] {
         self.reasons.as_deref().map_or(&[], |reasons| &reasons[..])
+    }
+
+    /// Whether the output was not clean: a malformed run or a suppressed call.
+    fn not_clean(&self) -> bool {
+        self.malformed() > 0 || self.suppressed_calls > 0
+    }
+
+    /// The report of the output read under `table` as the choice at `choice`, when the mode
+    /// wants one for it.
+    pub(crate) fn parse_report(&self, table: &'static str, choice: u32) -> Option<ParseReport> {
+        if !self.report.wanted(self.not_clean()) {
+            return None;
+        }
+        let numbered = |runs: &[ParseRun]| {
+            runs.iter()
+                .cloned()
+                .map(|run| ParseRun { choice, ..run })
+                .collect()
+        };
+        Some(ParseReport {
+            parser: "symphony".to_string(),
+            table: Some(table.to_string()),
+            outcome: Some(
+                if self.malformed() > 0 {
+                    "malformed"
+                } else {
+                    "clean"
+                }
+                .to_string(),
+            ),
+            malformed: numbered(&self.malformed_runs),
+            dropped: numbered(&self.dropped_runs),
+            suppressed_calls: self.suppressed_calls,
+        })
     }
 
     /// Malformed runs seen.
@@ -462,7 +646,7 @@ impl Tally {
         if self.suppressed_calls > 0 {
             increment(&series.calls_suppressed, u64::from(self.suppressed_calls));
         }
-        if malformed == 0 {
+        if malformed == 0 || self.silent {
             return;
         }
         let Some(suppressed_lines) = series.sampler.allow() else {
@@ -688,6 +872,22 @@ mod tests {
         assert_eq!(table_label("response_template"), "response_template");
         assert_eq!(table_label("markers"), "other");
         assert_eq!(table_label(""), "other");
+    }
+
+    #[test]
+    fn the_reports_excerpt_is_bounded_at_a_character_boundary() {
+        assert_eq!(excerpt("short"), "short");
+        let exact = "x".repeat(EXCERPT_BYTES);
+        assert_eq!(excerpt(&exact), exact);
+        // Every character is three bytes; 120 is not a multiple of three.
+        let wide = "日".repeat(60);
+        let cut = excerpt(&wide);
+        assert!(
+            cut.len() <= EXCERPT_BYTES && cut.len() > EXCERPT_BYTES - 3,
+            "{}",
+            cut.len()
+        );
+        assert!(cut.chars().all(|c| c == '日'));
     }
 
     #[test]
@@ -1219,6 +1419,175 @@ mod tests {
         // The run's text is model output: no line at any level carries it.
         assert!(!logs_contain("not a call"));
         assert!(!logs_contain("excerpt"));
+    }
+
+    fn headers(value: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(value) = value {
+            headers.insert(REPORT_HEADER, value.parse().expect("a header value"));
+        }
+        headers
+    }
+
+    #[test]
+    fn the_report_mode_follows_the_policy_and_the_header() {
+        use ParseFailures::{Log, Silent, Surface};
+        let mode = |policy, header| report_mode(policy, Some(&headers(header))).expect("a mode");
+        assert_eq!(mode(Log, None), Report::Off);
+        assert_eq!(mode(Log, Some("on")), Report::Always);
+        assert_eq!(mode(Log, Some("detail")), Report::Detail);
+        assert_eq!(mode(Log, Some("off")), Report::Off);
+        assert_eq!(mode(Surface, None), Report::OnFailure);
+        assert_eq!(mode(Surface, Some("on")), Report::Always);
+        assert_eq!(mode(Surface, Some("Detail")), Report::Detail);
+        assert_eq!(mode(Surface, Some("off")), Report::Off);
+        assert_eq!(mode(Silent, None), Report::Off);
+        assert_eq!(mode(Silent, Some("on")), Report::Off);
+        assert_eq!(mode(Silent, Some("detail")), Report::Off);
+        assert_eq!(report_mode(Log, None).expect("a mode"), Report::Off);
+        let why = report_mode(Log, Some(&headers(Some("yes")))).expect_err("refused");
+        assert_eq!(
+            why,
+            "x-smg-parse-report must be on, off or detail, not \"yes\""
+        );
+        // The header value is not read under `silent`, so a bad one is not an error there.
+        assert_eq!(mode(Silent, Some("yes")), Report::Off);
+    }
+
+    #[test]
+    fn a_report_is_wanted_as_its_mode_says() {
+        assert!(!Report::Off.wanted(true));
+        assert!(!Report::OnFailure.wanted(false));
+        assert!(Report::OnFailure.wanted(true));
+        assert!(Report::Always.wanted(false));
+        assert!(Report::Detail.wanted(false));
+    }
+
+    fn seen(report: Report) -> Tally {
+        let mut tally = Tally::reporting(report);
+        let events = [
+            Event::Content(Text::uncounted("Hello ")),
+            Event::Dropped {
+                text: Text::uncounted("<tool_call>"),
+                why: DropReason::Wrapper,
+            },
+            malformed("\nnot a call\n", MalformedReason::InvalidArguments),
+            Event::Dropped {
+                text: Text::uncounted("</tool_call>"),
+                why: DropReason::Wrapper,
+            },
+            malformed("x", MalformedReason::NameWithoutACall),
+            call_start(0, "<tool_call>"),
+            call_start(1, "<tool_call>"),
+            finish(2),
+        ];
+        for event in &events {
+            tally.see(event, true);
+        }
+        tally
+    }
+
+    #[test]
+    fn the_report_lists_the_malformed_runs_with_their_choice_and_place() {
+        let report = seen(Report::Always)
+            .parse_report("qwen3", 2)
+            .expect("a report");
+        assert_eq!(report.parser, "symphony");
+        assert_eq!(report.table.as_deref(), Some("qwen3"));
+        assert_eq!(report.outcome.as_deref(), Some("malformed"));
+        assert_eq!(report.suppressed_calls, 1);
+        assert!(report.dropped.is_empty());
+        assert_eq!(report.malformed.len(), 2);
+        let first = &report.malformed[0];
+        assert_eq!(
+            (first.choice, first.reason.as_str(), first.at, first.bytes),
+            (2, "invalid_arguments", 17, 12)
+        );
+        assert_eq!(first.why, None);
+        assert_eq!(first.excerpt, "\nnot a call\n");
+        let second = &report.malformed[1];
+        assert_eq!(second.reason, "name_without_a_call");
+        assert_eq!(second.why, None);
+        assert_eq!(second.at, 17 + 12 + "</tool_call>".len() as u64);
+    }
+
+    #[test]
+    fn detail_adds_the_dropped_runs_in_order() {
+        let report = seen(Report::Detail)
+            .parse_report("qwen3", 0)
+            .expect("a report");
+        assert_eq!(report.malformed.len(), 2);
+        let dropped: Vec<(&str, u64)> = report
+            .dropped
+            .iter()
+            .map(|run| (run.reason.as_str(), run.at))
+            .collect();
+        assert_eq!(dropped, vec![("wrapper", 6), ("wrapper", 29)]);
+    }
+
+    #[test]
+    fn off_keeps_no_runs_and_gives_no_report() {
+        let tally = seen(Report::Off);
+        assert!(tally.malformed_runs.is_empty() && tally.dropped_runs.is_empty());
+        assert_eq!(tally.parse_report("qwen3", 0), None);
+        // The counters still see everything.
+        assert_eq!(tally.malformed(), 2);
+    }
+
+    #[test]
+    fn on_failure_reports_only_an_output_that_is_not_clean() {
+        let mut clean = Tally::reporting(Report::OnFailure);
+        clean.see(&Event::Content(Text::uncounted("Hello")), false);
+        clean.see(&finish(0), false);
+        assert_eq!(clean.parse_report("qwen3", 0), None);
+        let mut suppressed = Tally::reporting(Report::OnFailure);
+        suppressed.see(&call_start(0, "<tool_call>"), true);
+        suppressed.see(&call_start(1, "<tool_call>"), true);
+        suppressed.see(&finish(2), true);
+        let report = suppressed.parse_report("qwen3", 0).expect("a report");
+        assert_eq!(report.outcome.as_deref(), Some("clean"));
+        assert_eq!(report.suppressed_calls, 1);
+        let mut always = Tally::reporting(Report::Always);
+        always.see(&Event::Content(Text::uncounted("Hello")), false);
+        always.see(&finish(0), false);
+        let report = always.parse_report("plain", 0).expect("a report");
+        assert_eq!(report.outcome.as_deref(), Some("clean"));
+        assert!(report.malformed.is_empty());
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn under_silent_a_malformed_output_is_counted_and_writes_nothing() {
+        let scrape = rendered(|| {
+            let mut tally = Tally::reporting(Report::Off).silenced(true);
+            tally.see(
+                &malformed("\nnot a call\n", MalformedReason::InvalidArguments),
+                false,
+            );
+            tally.see(&finish(0), false);
+            tally.report(
+                "plain",
+                Who {
+                    request_id: "req-silent",
+                    model: "the-model",
+                    choice: 0,
+                },
+            );
+        });
+        assert!(
+            line_with(
+                &scrape,
+                OUTPUTS,
+                &["table=\"plain\"", "outcome=\"malformed\""]
+            )
+            .is_some(),
+            "{scrape}"
+        );
+        assert!(
+            line_with(&scrape, MALFORMED, &["table=\"plain\""]).is_some(),
+            "{scrape}"
+        );
+        assert!(!logs_contain("req-silent"));
     }
 
     #[tracing_test::traced_test]

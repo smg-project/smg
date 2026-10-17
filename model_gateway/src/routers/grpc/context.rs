@@ -44,14 +44,14 @@ use super::{
     utils::{ParserResolver, WorkerDecoding},
 };
 use crate::{
-    config::ParserChoice,
+    config::{ParseFailures, ParserChoice},
     middleware::TenantRequestMeta,
     observability::{cache_trace, metrics::Metrics},
     policies::CacheNamespace,
     routers::{
         common::{attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard},
         error::internal_error,
-        grpc::regular::symphony::{template::Templates, PreparedConstraint},
+        grpc::regular::symphony::{telemetry::Report, template::Templates, PreparedConstraint},
     },
     worker::{
         ConnectionMode, PrefillLoadGuard, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
@@ -217,6 +217,9 @@ pub(crate) struct SharedComponents {
     /// Which parser reads a chat completion's or a message's output unless the request's
     /// `X-SMG-Parser` header says otherwise (see `regular::symphony`).
     pub parser: ParserChoice,
+    /// What the gateway does about an output a Symphony table did not read whole: the log
+    /// line and the per-request report (see `regular::symphony::telemetry`).
+    pub parse_failures: ParseFailures,
     /// The tables the registered tokenizers' response templates compile into, which the parser
     /// name `hf` selects (see `regular::symphony::template`).
     pub templates: Arc<Templates>,
@@ -235,6 +238,11 @@ pub(crate) struct ProcessingState {
     /// otherwise, which the response reports as `x-smg-parser`. `None` on the other endpoints,
     /// which keep the legacy parsers.
     pub parser: Option<ParserChoice>,
+
+    /// What the response says about how its output was read, decided in preparation from the
+    /// gateway's parse-failure policy and the request's `X-SMG-Parse-Report` header (see
+    /// `regular::symphony::telemetry::Report`); the response spec carries it to the drivers.
+    pub parse_report: Report,
 
     /// Owned here rather than inside `PreparationOutput` so EPD's `EncodeStage`
     /// can borrow it for the with-pixels encode serialization before request

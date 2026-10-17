@@ -1204,6 +1204,11 @@ pub struct Message {
     /// The code-execution container of the turn when one ran; null otherwise
     /// (the public API always writes the key).
     pub container: Option<Value>,
+
+    /// The gateway's own members, present only when the request asked for them or the
+    /// gateway's policy surfaces them (see [`crate::smg`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smg: Option<Box<crate::smg::SmgExtension>>,
 }
 
 /// Output content block types
@@ -1451,6 +1456,11 @@ pub struct MessageDelta {
 
     #[serde(default)]
     pub container: Option<Value>,
+
+    /// The gateway's own members, present only when the request asked for them or the
+    /// gateway's policy surfaces them (see [`crate::smg`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smg: Option<Box<crate::smg::SmgExtension>>,
 }
 
 /// Usage delta for streaming updates. The token counts are always written

@@ -136,6 +136,7 @@ impl GrpcRouter {
             tokenizer_autoload: !ctx.router_config.disable_tokenizer_autoload,
             tokenizer_load_failures: ctx.tokenizer_load_failures.clone(),
             parser: ctx.router_config.parser,
+            parse_failures: ctx.router_config.parse_failures,
             templates: Arc::new(Templates::new(tokenizer_registry.clone())),
         });
 
@@ -926,6 +927,7 @@ impl GrpcRouter {
             stop_details: None,
             usage: Usage::from_counts(input_tokens, 0),
             container: None,
+            smg: None,
         };
         if !stream {
             return (StatusCode::OK, Json(message)).into_response();

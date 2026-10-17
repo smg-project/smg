@@ -777,6 +777,7 @@ impl GrpcResponseConverterHandle {
                 matched_stop,
             }],
             usage,
+            smg: None,
         }
     }
 }

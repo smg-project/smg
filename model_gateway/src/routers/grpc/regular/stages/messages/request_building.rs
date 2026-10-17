@@ -6,22 +6,25 @@ use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
-use crate::routers::{
-    error,
-    grpc::{
-        client::GenerateRequestBuildOptions,
-        common::stages::{
-            helpers::{self, TagForStart},
-            BuildStage,
+use crate::{
+    config::ParseFailures,
+    routers::{
+        error,
+        grpc::{
+            client::GenerateRequestBuildOptions,
+            common::stages::{
+                helpers::{self, TagForStart},
+                BuildStage,
+            },
+            context::{
+                stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan,
+                ExecutionPlanKind, PreparationOutput, RequestContext,
+            },
+            proto_wrapper::MultimodalData,
+            regular::{stages::reading, symphony},
+            spec::ResponseSpec,
+            utils,
         },
-        context::{
-            stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan,
-            ExecutionPlanKind, PreparationOutput, RequestContext,
-        },
-        proto_wrapper::MultimodalData,
-        regular::{stages::reading, symphony},
-        spec::ResponseSpec,
-        utils,
     },
 };
 
@@ -257,6 +260,8 @@ impl BuildStage for MessageRequestBuildingStage {
         )?;
         spec.reasoning_in_prefill = require_reasoning;
         spec.symphony = assignment;
+        spec.parse_report = ctx.state.parse_report;
+        spec.parse_silent = ctx.components.parse_failures == ParseFailures::Silent;
         Ok(BuildOutput {
             plan,
             spec: ResponseSpec::Messages(spec),

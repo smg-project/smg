@@ -549,6 +549,9 @@ struct Router {
     otlp_traces_endpoint: String,
     overlap_decay: f32,
     overload_token_usage_threshold: f32,
+    /// `surface`, `log` or `silent`: the log line and the per-request report about an output
+    /// a Symphony table did not read whole.
+    parse_failures: String,
     /// `legacy` or `symphony`: which parser reads a chat completion's output.
     parser: String,
     pd_admission_wait_secs: u64,
@@ -1008,6 +1011,14 @@ impl Router {
                 reason: "expected legacy or symphony".to_string(),
             }
         })?;
+        let parse_failures =
+            config::ParseFailures::parse(&self.parse_failures).ok_or_else(|| {
+                config::ConfigError::InvalidValue {
+                    field: "parse_failures".to_string(),
+                    value: self.parse_failures.clone(),
+                    reason: "expected surface, log or silent".to_string(),
+                }
+            })?;
         let history_backend = match self.history_backend {
             HistoryBackendType::Memory => config::HistoryBackend::Memory,
             HistoryBackendType::None => config::HistoryBackend::None,
@@ -1171,6 +1182,7 @@ impl Router {
             })
             .disable_tokenizer_autoload(self.disable_tokenizer_autoload)
             .parser(parser)
+            .parse_failures(parse_failures)
             .history_backend(history_backend)
             .memory_config(config::MemoryConfig {
                 max_responses: self.history_memory_max_responses,
@@ -1392,6 +1404,7 @@ impl Router {
         otlp_traces_endpoint = String::from("localhost:4317"),
         overlap_decay = 0.0,
         overload_token_usage_threshold = 1.0,
+        parse_failures = String::from("log"),
         parser = String::from("legacy"),
         pd_admission_wait_secs = 30,
         pd_disaggregation = false,
@@ -1602,6 +1615,7 @@ impl Router {
         otlp_traces_endpoint: String,
         overlap_decay: f32,
         overload_token_usage_threshold: f32,
+        parse_failures: String,
         parser: String,
         pd_admission_wait_secs: u64,
         pd_disaggregation: bool,
@@ -1849,6 +1863,7 @@ impl Router {
             otlp_traces_endpoint,
             overlap_decay,
             overload_token_usage_threshold,
+            parse_failures,
             parser,
             pd_admission_wait_secs,
             pd_disaggregation,
