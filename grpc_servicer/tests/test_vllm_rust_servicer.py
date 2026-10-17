@@ -1792,13 +1792,14 @@ def test_the_switch_turns_the_kv_event_publisher_on_for_the_python_servicer_too(
     switched = launcher_switch.with_servicer_switch(serve_grpc)
     monkeypatch.delenv(rust.SERVICER_IMPL_ENV, raising=False)
     monkeypatch.delenv(rust.KV_EVENTS_ENV, raising=False)
-    expected = {"enable_kv_cache_events": True, "publisher": "zmq"}
     # Nothing given: the launcher builds the engine from a namespace with the
-    # publisher on, and the operator reads why and how to decide otherwise.
+    # publisher on (in whichever form the engine takes it: the typed one once
+    # vllm.config is importable, the JSON form otherwise), and the operator
+    # reads why and how to decide otherwise.
     args = argparse.Namespace(servicer_impl=None, model="org/m", kv_events_config=None)
     with caplog.at_level(logging.INFO):
         asyncio.run(switched(args))
-    assert served == [args] and args.kv_events_config == expected
+    assert served == [args] and _kv_events(args.kv_events_config) == KV_EVENTS_ON
     assert (
         "KV event publishing enabled: no --kv-events-config was given, so vLLM's ZMQ "
         "publisher is on with its default endpoint and SubscribeKvEvents relays it; pass "
