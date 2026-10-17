@@ -16,7 +16,7 @@ import httpx
 import openai
 import pytest
 import smg_client
-from infra.constants import get_parser
+from infra.constants import effective_parser
 from infra.streams import collect_streamed_chat
 
 logger = logging.getLogger(__name__)
@@ -1648,7 +1648,7 @@ class TestToolChoiceQwen(_TestToolChoiceBase):
         structural tag that carries each tool's own `$defs`, so the call's arguments follow the
         called tool's definition (a string for tool1, a number for tool2). On the legacy path the
         merged schema refuses the pair, as the base test expects."""
-        if get_parser() != "symphony":
+        if effective_parser() != "symphony":
             super().test_conflicting_defs_required_tool_choice(model, api_client)
             return
         response = api_client.chat.completions.create(
