@@ -212,6 +212,7 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
         GenerationPrompt::ModelWritesTheThought,
     ),
     // Qwen2.5: no thought at all.
+    ("qwen2.5-0.5b-instruct", GenerationPrompt::Plain),
     ("qwen2.5-7b-instruct-1m", GenerationPrompt::Plain),
     ("qwen2.5-14b-instruct-1m", GenerationPrompt::Plain),
     ("qwen2.5-vl-3b-instruct", GenerationPrompt::Plain),
