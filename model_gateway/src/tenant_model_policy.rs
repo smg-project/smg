@@ -32,7 +32,7 @@ use crate::{
     observability::log_throttle::KeyedLogThrottle,
     routers::error,
     tenant::{authenticated_tenant_key_from_sha256, is_canonical_serving_tenant_key, TenantKey},
-    worker::WorkerRegistry,
+    worker::{RuntimeType, WorkerRegistry},
 };
 
 /// The on-disk shape: a default policy and the per-tenant entries.
@@ -255,12 +255,20 @@ impl TenantModelPolicy {
         self.tenants.get(tenant).unwrap_or(&self.default)
     }
 
-    /// Whether `tenant` may name `model`. A list names models, under any of
-    /// the names `registry` knows them by: the id as the request wrote it,
-    /// the served id an alias resolves to, or another alias of that model.
-    /// So a list naming a served id admits its aliases, and a list naming an
-    /// alias admits the served id (the one `/v1/models` lists) and the
-    /// model's other aliases.
+    /// Whether `tenant` may name `model`. A list names a self-hosted model
+    /// under any of the names `registry` knows it by: the id as the request
+    /// wrote it, the served id an alias resolves to, or another alias of
+    /// that model (an alias a self-hosted worker declares is a second name
+    /// of the one model). So a list naming a served id admits its aliases,
+    /// and a list naming an alias admits the served id (the one `/v1/models`
+    /// lists) and the model's other aliases.
+    ///
+    /// An external provider's model is named by the id as written, and by
+    /// nothing else: its aliases are other models, the dated snapshots
+    /// discovery groups under the floating name (see
+    /// [`WorkerRegistry::resolve_model_alias`]), so a list naming one of
+    /// them names that one alone. A model with an external worker among
+    /// those serving it is held to that rule.
     #[must_use]
     pub fn admits(&self, tenant: &TenantKey, model: &str, registry: &WorkerRegistry) -> bool {
         let list = self.allow_list_for(tenant);
@@ -269,6 +277,14 @@ impl TenantModelPolicy {
         }
         let canonical = registry.resolve_model_alias(model);
         let canonical = canonical.as_deref().unwrap_or(model);
+        let workers = registry.get_by_model(canonical);
+        if workers.is_empty()
+            || workers
+                .iter()
+                .any(|worker| worker.metadata().spec.runtime_type == RuntimeType::External)
+        {
+            return false;
+        }
         list.admits(canonical)
             || registry
                 .model_aliases(canonical)
@@ -330,7 +346,7 @@ mod tests {
     use super::*;
     use crate::{
         config::{TenantApiKeyEntry, TenantResolutionConfig},
-        worker::{BasicWorkerBuilder, Worker, WorkerType},
+        worker::{BasicWorkerBuilder, RuntimeType, Worker, WorkerType},
     };
 
     fn config_with_tenants(tenant_ids: &[&str], trust_header: bool) -> RouterConfig {
@@ -380,11 +396,18 @@ mod tests {
         .expect_err("an invalid policy")
     }
 
+    /// A registry of one self-hosted worker serving `cards`.
     fn registry_with(cards: Vec<ModelCard>) -> WorkerRegistry {
+        registry_of(RuntimeType::Unspecified, cards)
+    }
+
+    /// A registry of one worker of `runtime_type` serving `cards`.
+    fn registry_of(runtime_type: RuntimeType, cards: Vec<ModelCard>) -> WorkerRegistry {
         let registry = WorkerRegistry::new();
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://worker.invalid:8000")
                 .worker_type(WorkerType::Regular)
+                .runtime_type(runtime_type)
                 .models(cards)
                 .health_config(HealthCheckConfig {
                     disable_health_check: true,
@@ -524,6 +547,46 @@ mod tests {
         assert!(by_alias.admits(&red, "other-short", &registry));
         assert!(!by_alias.admits(&red, "org/other", &registry));
         assert!(!by_alias.admits(&red, "org/nobody", &registry));
+    }
+
+    /// An external provider's aliases are not second names of one model:
+    /// discovery groups the provider's dated snapshots under the floating
+    /// name, and each of them is a model of its own. A list naming one of
+    /// them names that one alone: the tenant pinned to a snapshot gets
+    /// neither the floating name nor another snapshot, by exact id or by
+    /// prefix, and a list naming the floating name admits no snapshot.
+    #[test]
+    fn an_external_providers_alias_does_not_widen_the_list() {
+        let mut floating = ModelCard::new("ext/model");
+        floating.aliases = vec![
+            "ext/model-2024-05-13".to_owned(),
+            "ext/model-2024-08-06".to_owned(),
+            "ext/model-2024-11-20".to_owned(),
+        ];
+        let registry = registry_of(RuntimeType::External, vec![floating]);
+        let red = TenantKey::from("auth:team-red");
+
+        let pinned = compiled(
+            &[],
+            vec![spec(Some("auth:team-red"), &["ext/model-2024-08-06"])],
+        );
+        assert!(pinned.admits(&red, "ext/model-2024-08-06", &registry));
+        assert!(!pinned.admits(&red, "ext/model", &registry));
+        assert!(!pinned.admits(&red, "ext/model-2024-05-13", &registry));
+        assert!(!pinned.admits(&red, "ext/model-2024-11-20", &registry));
+
+        let by_prefix = compiled(
+            &[],
+            vec![spec(Some("auth:team-red"), &["ext/model-2024-*"])],
+        );
+        assert!(by_prefix.admits(&red, "ext/model-2024-05-13", &registry));
+        assert!(by_prefix.admits(&red, "ext/model-2024-11-20", &registry));
+        assert!(!by_prefix.admits(&red, "ext/model", &registry));
+
+        let floating_only = compiled(&[], vec![spec(Some("auth:team-red"), &["ext/model"])]);
+        assert!(floating_only.admits(&red, "ext/model", &registry));
+        assert!(!floating_only.admits(&red, "ext/model-2024-08-06", &registry));
+        assert!(!floating_only.admits(&red, "ext/nobody", &registry));
     }
 
     /// A tenant key that can never match a real request is a configuration

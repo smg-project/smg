@@ -174,8 +174,8 @@ fn caller_allow_list_with<'a>(
     Ok(policy.allow_list_for(&tenant))
 }
 
-/// The cards of `cards` that `allow` names, by id or by an alias; all of
-/// them without a list.
+/// The self-hosted cards of `cards` that `allow` names, by id or by an
+/// alias (a second name of the one model); all of them without a list.
 fn admitted_cards(cards: Vec<ModelCard>, allow: Option<&ModelAllowList>) -> Vec<ModelCard> {
     match allow {
         Some(allow) => cards
@@ -186,6 +186,23 @@ fn admitted_cards(cards: Vec<ModelCard>, allow: Option<&ModelAllowList>) -> Vec<
                         .chain(card.aliases.iter().map(String::as_str)),
                 )
             })
+            .collect(),
+        None => cards,
+    }
+}
+
+/// The external providers' cards of `cards` that `allow` names by id; all
+/// of them without a list. An external card's aliases are other models
+/// (the provider's dated snapshots grouped under the floating name), so
+/// they admit nothing here, as on the serving routes.
+fn admitted_external_cards(
+    cards: Vec<ModelCard>,
+    allow: Option<&ModelAllowList>,
+) -> Vec<ModelCard> {
+    match allow {
+        Some(allow) => cards
+            .into_iter()
+            .filter(|card| allow.admits(&card.id))
             .collect(),
         None => cards,
     }
@@ -217,7 +234,7 @@ pub(crate) async fn list_models_with(
     if let Some(ref token) = bearer_token {
         let upstream_cards = fetch_upstream_models(registry, client, token).await;
         if !upstream_cards.is_empty() {
-            return shape.list(admitted_cards(upstream_cards, allow));
+            return shape.list(admitted_external_cards(upstream_cards, allow));
         }
     }
 
