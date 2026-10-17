@@ -459,10 +459,11 @@ wrapper state for the block, an arguments state per call):
   a token of the vocabulary, so a `max_tokens` cut cannot split one; the table declares no
   structural token.
 - **What the table stands on.** bellwether holds a manifest for each of the six checkpoints and
-  no recorded set yet, so the table stands on the turns the templates render
-  (`tests/fixtures/rendered/kimi_k2.json`, by `scripts/render_kimi_k2_turns.py`: 36 turns, each
-  the rendering of one template, or of several that render it alike, replayed at every cut by
-  `tests/rendered_fixtures.rs`) and on the module's tests. Two things the templates taught: K2
+  no recorded set yet, so the table stands on the module's tests, which hold the turns the
+  templates render for the shapes a tool-calling conversation takes. Those shapes are hand-written
+  cases of bellwether's sets, which its recorder renders with each template at its pinned
+  revision; the corpus harness replays the recorded sets from the fixture pin, and the README rows
+  say awaiting fixtures until the pin holds them. Two things the templates taught: K2
   Thinking, K2.5 and K2.6 (without `preserve_thinking`) keep the thought of a message that calls
   and render an answer's as `<think></think>`, so the thought-and-answer turn is rendered where
   the template keeps it (K2.7-Code, K2.6 with `preserve_thinking`); and the two Instruct

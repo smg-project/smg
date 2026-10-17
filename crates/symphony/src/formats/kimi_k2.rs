@@ -25,10 +25,10 @@
 //! there, as the engine reads every table (bellwether #16), and the block's close ends a call
 //! still open with what arrived; a second `<|tool_call_begin|>` inside an open call is the
 //! call's text, since a shaped call's opener may open none and the engine cannot send it back
-//! into a state that holds calls. Every marker is one token of the vocabulary. bellwether holds the line's manifests and no recorded set yet: the table stands on
-//! the turns the six templates render (`tests/fixtures/rendered/kimi_k2.json`, written by
-//! `scripts/render_kimi_k2_turns.py`, replayed at every cut by `tests/rendered_fixtures.rs`) and on
-//! the tests below. The gateway's older `kimik2` parser reads the same spelling, with the
+//! into a state that holds calls. Every marker is one token of the vocabulary. bellwether holds
+//! the line's manifests and no recorded set yet: the table stands on the turns the six templates
+//! render, held in the tests below; the recorded sets replay from the fixture pin once bellwether
+//! has them. The gateway's older `kimik2` parser reads the same spelling, with the
 //! `kimi_thinking` and `kimi_k25` thought parsers; one departure from `kimi_thinking`, which read
 //! everything before `</think>` as the thought whether or not `<think>` came first: this table
 //! starts K2 Thinking in content, so an output that closes a thought it never opened is content
