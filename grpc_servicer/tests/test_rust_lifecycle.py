@@ -829,9 +829,10 @@ def test_the_default_publisher_port_is_a_free_one_not_the_engines_fixed_default(
     """Every engine's own configuration defaults its publisher to tcp://*:5557,
     and an engine started while another process held that port (an engine an
     earlier job left behind, a second engine on the host) died at its bind
-    with "Address already in use": the lifecycle's endpoint is a port the OS
-    hands out as free, so a held default is never chosen, and the ports after
-    it, which a data-parallel engine's other ranks publish on, are free too."""
+    with "Address already in use": the lifecycle's endpoint is a port drawn
+    from below the OS's ephemeral range and probed free, so a held default is
+    never chosen, and the ports after it, which a data-parallel engine's other
+    ranks publish on, are free too."""
     low = rust_lifecycle._ephemeral_low()
     with _listener(5557):
         assert not rust_lifecycle._bindable(5557)
@@ -844,16 +845,20 @@ def test_the_default_publisher_port_is_a_free_one_not_the_engines_fixed_default(
     assert rust_lifecycle.KV_EVENTS_PORT_FLOOR <= base and base + 3 < low
 
 
-def test_the_ports_are_drawn_from_below_the_ephemeral_range(tmp_path, monkeypatch):
+def test_the_ports_are_drawn_from_below_the_ephemeral_range(tmp_path, monkeypatch, caplog):
     """An outbound connection the engine opens while its model loads draws its
     source port from the OS's ephemeral range, and could take a port picked
     there before the engine binds it: the draw stays below the range's low
-    bound as the OS states it (32768 when it cannot be read), above the
-    well-known ports and the engines' fixed default; a host with no room below
-    the range refuses, naming the knob."""
+    bound as the OS states it, whatever it is (Linux's default when it cannot
+    be read or is garbled), above the well-known ports and the engines' fixed
+    default. A host whose range starts at or below the floor keeps the draw,
+    from the floor up to Linux's default low bound, and says once that it
+    comes from inside the range, naming the knob."""
     stated = tmp_path / "ip_local_port_range"
     stated.write_text("20000\t60999\n")
     assert rust_lifecycle._ephemeral_low(str(stated)) == 20000
+    stated.write_text("1024\t65535\n")
+    assert rust_lifecycle._ephemeral_low(str(stated)) == 1024
     assert rust_lifecycle._ephemeral_low(str(tmp_path / "missing")) == 32768
     stated.write_text("garbage\n")
     assert rust_lifecycle._ephemeral_low(str(stated)) == 32768
@@ -861,11 +866,18 @@ def test_the_ports_are_drawn_from_below_the_ephemeral_range(tmp_path, monkeypatc
     for _ in range(20):
         port = _port_of(rust_lifecycle.free_kv_events_endpoint(ranks=2))
         assert rust_lifecycle.KV_EVENTS_PORT_FLOOR <= port and port + 1 < 20000
-    monkeypatch.setattr(
-        rust_lifecycle, "_ephemeral_low", lambda: rust_lifecycle.KV_EVENTS_PORT_FLOOR
-    )
-    with pytest.raises(rust_lifecycle.ServicerConfigError, match="--kv-events-config"):
-        rust_lifecycle.free_kv_events_endpoint()
+    # The range starts at the floor or below: the draw goes on, inside the
+    # range, between the floor and Linux's default low bound; one warning.
+    rust_lifecycle._warn_inside_ephemeral_range.cache_clear()
+    monkeypatch.setattr(rust_lifecycle, "_ephemeral_low", lambda: 1024)
+    with caplog.at_level("WARNING", logger=rust_lifecycle.logger.name):
+        for _ in range(5):
+            port = _port_of(rust_lifecycle.free_kv_events_endpoint(ranks=2))
+            assert rust_lifecycle.KV_EVENTS_PORT_FLOOR <= port and port + 1 < 32768
+    warnings = [r for r in caplog.records if "inside this host's ephemeral port range" in r.message]
+    assert len(warnings) == 1 and "--kv-events-config" in warnings[0].message
+    assert "starts at 1024" in warnings[0].message
+    rust_lifecycle._warn_inside_ephemeral_range.cache_clear()
 
 
 def test_the_probe_sees_what_a_zmq_publisher_holds():

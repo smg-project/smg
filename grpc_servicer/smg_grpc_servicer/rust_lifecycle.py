@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 import dataclasses
 import faulthandler
+import functools
 import glob
 import importlib
 import logging
@@ -339,16 +340,35 @@ KV_EVENTS_PORT_RANGE_FILE = "/proc/sys/net/ipv4/ip_local_port_range"
 _port_draw = random.SystemRandom()
 
 
+# Linux's default low bound of the ephemeral port range, taken when the OS does
+# not state one.
+DEFAULT_EPHEMERAL_LOW = 32768
+
+
 def _ephemeral_low(range_file: str = KV_EVENTS_PORT_RANGE_FILE) -> int:
     """The low bound of the OS's ephemeral port range, as ``range_file``
-    (``ip_local_port_range``) states it; 32768, Linux's default, when it cannot
-    be read or makes no sense."""
+    (``ip_local_port_range``) states it, whatever it is; Linux's default when it
+    cannot be read or is garbled."""
     try:
         with open(range_file, encoding="utf-8") as f:
             low = int(f.read().split()[0])
     except (OSError, ValueError, IndexError):
-        return 32768
-    return low if KV_EVENTS_PORT_FLOOR < low <= 65536 else 32768
+        return DEFAULT_EPHEMERAL_LOW
+    return low if 1 <= low <= 65536 else DEFAULT_EPHEMERAL_LOW
+
+
+@functools.cache
+def _warn_inside_ephemeral_range(low: int) -> None:
+    """Said once per process: the OS's ephemeral range starts at or below the
+    floor the ports are drawn from, so the draw comes from inside it."""
+    logger.warning(
+        "the default KV event publisher's port is drawn from inside this host's ephemeral port "
+        "range (ip_local_port_range starts at %d, at or below %d): an outbound connection the "
+        "engine opens while its model loads could take the port before the engine binds it; "
+        "pass --kv-events-config to pin the endpoint",
+        low,
+        KV_EVENTS_PORT_FLOOR,
+    )
 
 
 def _bindable(port: int) -> bool:
@@ -380,16 +400,26 @@ def free_kv_events_endpoint(ranks: int = 1) -> str:
     rendezvous, a client) whose source ports the OS draws from its ephemeral
     range: a port picked there could be taken by one of them in that window,
     so the draw stays below the range, where only another listener could take
-    it. Two servicers starting at the same moment could draw the same base,
-    with the odds of one draw among more than twenty thousand ports; that, as
-    before, is caught at the engine's bind, which names the port.
+    it. A host whose range starts at or below the floor (one tuned for many
+    outbound connections, ``1024 65535``) leaves no room below it: the draw
+    then comes from the floor up to Linux's default low bound, inside the
+    host's range, said once in a warning that names the knob, since refusing
+    to start would be worse than the small race, which the engines' fixed
+    default had on such a host too. Two servicers starting at the same moment
+    could draw the same base, with the odds of one draw among more than twenty
+    thousand ports; that, as before, is caught at the engine's bind, which
+    names the port.
     """
     ranks = max(int(ranks), 1)
-    ceiling = _ephemeral_low() - ranks
+    low = _ephemeral_low()
+    if low - ranks < KV_EVENTS_PORT_FLOOR:
+        _warn_inside_ephemeral_range(low)
+        low = DEFAULT_EPHEMERAL_LOW
+    ceiling = low - ranks
     if ceiling < KV_EVENTS_PORT_FLOOR:
         raise ServicerConfigError(
-            f"no room for {ranks} consecutive KV event publisher ports below the ephemeral "
-            f"port range; pass --kv-events-config with an endpoint"
+            f"no room for {ranks} consecutive KV event publisher ports between "
+            f"{KV_EVENTS_PORT_FLOOR} and {low}; pass --kv-events-config with an endpoint"
         )
     for _ in range(KV_EVENTS_PORT_ATTEMPTS):
         base = _port_draw.randrange(KV_EVENTS_PORT_FLOOR, ceiling + 1)
