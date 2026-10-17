@@ -118,6 +118,11 @@ outputs, at benchmark scale, with the reference parse beside each. The parity te
 through the tables; a derived grammar is pinned in unit tests to the hand-written tag it replaces
 where one existed, and was checked in review against the recorded calls where none did.
 
+`cargo bench -p smg-symphony --bench throughput` measures what a table costs on its own: the bytes
+per second of a turn fed whole and in eight-byte pieces, one subject per call syntax, the bytes per
+second of prose with no marker in it, and the construction of an engine, which is the parser's
+per-request setup. A change to the decode path carries its rows.
+
 ## Models
 
 Symphony's target is every checkpoint group bellwether has a manifest for; a group is the

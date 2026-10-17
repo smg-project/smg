@@ -8155,6 +8155,7 @@ dependencies = [
 name = "smg-symphony"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "openai-protocol",
  "regex",
  "serde",

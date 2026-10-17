@@ -26,3 +26,11 @@ regex = "1.12"
 
 [lints]
 workspace = true
+
+[dev-dependencies.criterion]
+version = "0.8"
+features = ["html_reports"]
+
+[[bench]]
+name = "throughput"
+harness = false
