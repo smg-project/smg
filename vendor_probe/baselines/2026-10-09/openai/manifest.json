@@ -1,0 +1,41 @@
+{
+  "baseline_bytes": 167558,
+  "clusters": 44,
+  "date": "2026-10-09",
+  "exemplar_kinds": {
+    "body": 30,
+    "skeleton": 5,
+    "sse": 9
+  },
+  "max_exemplar_bytes": 8192,
+  "models": {
+    "observed": [
+      "gpt-4.1-nano-2025-04-14",
+      "gpt-5-nano-2025-08-07"
+    ],
+    "requested": [
+      "",
+      "computer-use-preview",
+      "gpt-4.1-nano",
+      "gpt-5-nano",
+      "gpt-nope"
+    ]
+  },
+  "probe_set_git_sha": "93e3b3e5",
+  "probes_distilled": 209,
+  "probes_total": 225,
+  "provider": "openai",
+  "recording": {
+    "estimated_cost_usd": 0.0113,
+    "expected_error_recorded": 59,
+    "fingerprint_clusters_total": 44,
+    "recorded": 209,
+    "skipped": 16,
+    "tokens": {
+      "input": 110705,
+      "output": 14290
+    },
+    "transport_failures": 0
+  },
+  "recording_run_id": "38001344395"
+}
