@@ -3817,7 +3817,7 @@ impl<'a> ChatStream<'a> {
             // Stop-decoder match takes precedence: pin "stop" even if
             // the backend's eventual Complete carries "length" (the
             // local stop sequence fired first). Any pre-stop text in
-            // `chunk_text` is still emitted below before the finish
+            // `chunk_text` is still emitted by `emit` before the finish
             // reason is flushed in Phase 4.
             self.finish_reasons
                 .entry(index)
