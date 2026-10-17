@@ -1776,6 +1776,16 @@ mod tests {
         assert_eq!(named_table(&pair(Some("cohere"), Some("qwen3"))), None);
         // The older `llama` parser's family (Llama 3.2) reads with the json table.
         assert_eq!(named_table(&pair(Some("llama"), None)), Some(Table::Json));
+        // The older `mistral` parser's list has a table of that name; the v13 spelling keeps its
+        // own.
+        assert_eq!(
+            named_table(&pair(Some("mistral"), None)),
+            Some(Table::Mistral)
+        );
+        assert_eq!(
+            named_table(&pair(Some("mistral_v13"), None)),
+            Some(Table::MistralV13)
+        );
         // The older `pythonic` parser's family reads with the Llama 4 table.
         assert_eq!(
             named_table(&pair(Some("pythonic"), None)),

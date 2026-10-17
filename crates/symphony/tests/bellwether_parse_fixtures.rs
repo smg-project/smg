@@ -98,8 +98,8 @@ use symphony::{
     formats::{
         deepseek_v4_1, dots3, for_model, function_gemma, gemma4, glm, glm4, groups, hy4, inkling,
         iquest, json, k2_horizon, kimi_k3, lfm2_5, ling, llama4, llama_nemotron, minicpm5,
-        minimax_m2, minimax_m3, mistral_v13, muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss,
-        xlam,
+        minimax_m2, minimax_m3, mistral, mistral_v13, muse_spark, olmo3, plain, qwen2_5, qwen3,
+        seed_oss, xlam,
     },
     tagged::{Placement, Spelling},
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
@@ -575,6 +575,13 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
     (
         "llama-xlam-2-8b-fc-r",
         Family::Xlam,
+        GenerationPrompt::Plain,
+    ),
+    // The Mistral list behind `[TOOL_CALLS]`; Mistral Small 3's template renders no tool call,
+    // so its recorded sets hold content alone, and no thought.
+    (
+        "mistral-small-24b-instruct-2501",
+        Family::Mistral,
         GenerationPrompt::Plain,
     ),
     // An XML tree of arguments behind a separator token; the model writes the thought or closes
@@ -1075,6 +1082,8 @@ enum Family {
     /// [`llama4`]: a Python list bare in the turn, every value between double quotes and typed
     /// by the request tools; no thought.
     Llama4,
+    /// [`mistral`]: the JSON list of calls behind `[TOOL_CALLS]`; no thought.
+    Mistral,
     /// [`seed_oss`]: the tagged syntax under Seed-OSS's markers, typed by the request tools.
     SeedOss,
     /// [`hy4`], [`ling`], [`iquest`], [`glm`], [`glm4`], [`k2_horizon`]: keyed arguments, typed
@@ -1184,6 +1193,7 @@ impl Family {
             Self::Qwen2_5 => qwen2_5(),
             Self::DeepSeekV4_1 => deepseek_v4_1(),
             Self::Llama4 => llama4(),
+            Self::Mistral => mistral(),
             Self::SeedOss => seed_oss(),
             Self::Hy4 => hy4(),
             Self::Ling => ling(),
@@ -1233,6 +1243,7 @@ impl Family {
             | Self::Inkling
             | Self::Gemma4
             | Self::FunctionGemma
+            | Self::Mistral
             | Self::MistralV13
             | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the

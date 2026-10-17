@@ -218,13 +218,51 @@ What the table says beyond the others:
 - **A forced call's tag has no end.** `Format::grammar` writes a tag per tool from `[TOOL_CALLS]`,
   the name and `[ARGS]` to the schema, and nothing after it, as the template writes nothing: the
   object the schema accepts ends the tag. The gateway's older `mistral` parser and its tag read
-  Mistral 7B v0.3's `[TOOL_CALLS][{…}]` list, another syntax, so nothing is pinned to it; the
-  table's name keeps that parser's apart, so `--tool-call-parser mistral` stays with it under
-  `--parser symphony`, and the registry picks this table for the v13 groups.
+  Mistral 7B v0.3's `[TOOL_CALLS][{…}]` list, another syntax, which the `mistral` table reads;
+  the names keep the two apart, `--tool-call-parser mistral` reads with that table under
+  `--parser symphony`, and the registry picks this one for the v13 groups.
 
 What the table leaves open: whether every engine takes a tag whose `end` is empty (xgrammar's
-structural tag allows it; the Symphony e2e lane says so for the engines it runs); and the older
-list syntax, which no recorded group writes.
+structural tag allows it; the Symphony e2e lane says so for the engines it runs).
+
+## Mistral, the list (`mistral`)
+
+The spelling of the Mistral tokenizers before v11, the gateway's older `mistral` parser's: the
+calls as one JSON list after `[TOOL_CALLS]`, `[TOOL_CALLS] [{"name": "get_weather", "arguments":
+{"city": "Paris"}, "id": "call00000"}]`, the content before it; no thought. Mistral 7B v0.3's
+template writes it (a space after the marker, an `id` member of nine characters after each call's
+arguments); Mistral Small 3 (2501) and the checkpoints that keep its tokenizer (Small 3.1,
+Devstral Small 2505, Magistral Small 2506) write the same list through their own tokenizer, since
+their chat templates render no tool call at all. What the table says beyond the others:
+
+- **One marker, the list behind it.** `[TOOL_CALLS]` enters the arguments state, and the list
+  assembler reads the region framed (`json::list::Assembler::framed`), as Llama Nemotron's does:
+  whitespace before the `[` is the template's, each object a call, the brackets and commas
+  wrapping, text in place of the list malformed. A second `[TOOL_CALLS]` opens another region
+  (`calls + calls_open = calls`), as the v13 table has it. The region ends with the turn: the
+  template writes no closing marker, and `</s>` is the stop the decoder hides.
+- **The `id` member is the call object's, not an argument.** The template writes it after the
+  arguments; the JSON assembler reads a member it does not name as part of the object, so the
+  call's arguments are the `arguments` value alone and the `id` is the object's bytes.
+- **The prompt ends at `[/INST]`, or after a tool result.** As the v13 table: no assistant
+  opener, no thought; after `[/TOOL_RESULTS]` the last `[/INST]` stands before the previous turn's
+  calls, the replay walks into the call state, which the prompt never enters, and the output
+  starts in content.
+- **The recorded set holds no call.** Mistral Small 3's template renders no tool call, so the
+  recorder kept its content sets alone (184,972 cases), which replay; 7B v0.3's parse sets are
+  not recorded. The calls stand on the turns 7B v0.3's template renders, held in the rendered-turn
+  fixtures and the module's tests at every cut.
+- **7B v0.3's template writes a space before the assistant's text** (`[/INST] Hello!</s>`), and
+  none before `[TOOL_CALLS]`; the table reads the space as the model's bytes, as the v13 table
+  reads what its template writes around the content, and the rendered turns expect it. Whether
+  the family's own tokenizer shows that space to a client is for the live reading to say.
+
+What the table leaves open: a forced call's tag (`Format::grammar` writes the list between the
+marker and the turn's end, as Llama Nemotron's does, with the `id` the template writes left to the
+model); the live reading on an engine (owed with the family's weights); and the v11 tokenizer's
+checkpoints (Mistral Small 3.2, Devstral Small 2507, Magistral Small 2509), whose templates write
+`[TOOL_CALLS]name[ARGS]{…}`, the v13 table's spelling without `[CALL_ID]`, and are not in the
+registry until a set records them.
 
 ## JSON (`json`)
 
