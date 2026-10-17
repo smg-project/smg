@@ -676,4 +676,87 @@ mod history_tests {
             Some(ChatMessage::Tool { tool_call_id, .. }) if tool_call_id == "call_101"
         ));
     }
+
+    /// A stored turn keeps its `item_reference`s as the client sent them, so
+    /// the call a stored result answers may sit behind a reference: the
+    /// loader resolves the references first and judges the results after,
+    /// and the pair reaches the engine intact.
+    #[tokio::test]
+    async fn a_stored_result_whose_call_sits_behind_a_reference_keeps_its_call() {
+        use openai_protocol::responses::StringOrContentParts;
+        use serde_json::json;
+
+        let stores = Stores::with_conversation().await;
+        // resp_1: the question, answered by call_1 (item fc_1).
+        stores
+            .store_turn(
+                "resp_1",
+                &ResponsesRequest {
+                    model: "deepseek-flash".to_string(),
+                    input: ResponseInput::Text("Start.".to_string()),
+                    ..Default::default()
+                },
+                json!([{
+                    "type": "function_call", "id": "fc_1", "call_id": "call_1",
+                    "name": "calc", "arguments": "{}", "status": "completed"
+                }]),
+            )
+            .await;
+        // resp_2, no chain: the client references the call and sends its
+        // result; the turn is stored with the reference unresolved.
+        let reference: ResponseInputOutputItem =
+            serde_json::from_value(json!({"type": "item_reference", "id": "fc_1"}))
+                .expect("an item reference");
+        stores
+            .store_turn(
+                "resp_2",
+                &ResponsesRequest {
+                    model: "deepseek-flash".to_string(),
+                    input: ResponseInput::Items(vec![
+                        reference,
+                        ResponseInputOutputItem::FunctionCallOutput {
+                            id: None,
+                            call_id: "call_1".to_string(),
+                            output: StringOrContentParts::String("42".to_string()),
+                            status: None,
+                        },
+                    ]),
+                    ..Default::default()
+                },
+                json!([{
+                    "type": "message", "id": "msg_2", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "42 it is.", "annotations": []}]
+                }]),
+            )
+            .await;
+        let turn_3 = ResponsesRequest {
+            model: "deepseek-flash".to_string(),
+            input: ResponseInput::Text("Thanks.".to_string()),
+            previous_response_id: Some("resp_2".to_string()),
+            ..Default::default()
+        };
+
+        let loaded = load_history(stores.history(), &turn_3, None)
+            .await
+            .expect("the chain loads");
+
+        let ResponseInput::Items(items) = &loaded.input else {
+            panic!("the loaded input is an item list");
+        };
+        assert_eq!(
+            shape(items),
+            [
+                "function_call:call_1",
+                "function_call_output:call_1",
+                "message:assistant",
+                "message:user"
+            ]
+        );
+        let chat =
+            conversions::responses_to_chat(&loaded).expect("the pair converts under the contract");
+        assert!(chat.messages.iter().any(|message| matches!(
+            message,
+            ChatMessage::Tool { tool_call_id, .. } if tool_call_id == "call_1"
+        )));
+    }
 }
