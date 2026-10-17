@@ -222,10 +222,10 @@ impl Assembler {
     /// The stream was cut: what was held comes back as `Malformed { UnterminatedRegion }`, the
     /// key held for a value that never came among it, an object still open is closed for the
     /// client, whole, and a call that started still ends, with no bytes of its own, as every
-    /// assembler ends one. A string left open stays open, since nothing is made up for a value the model never
-    /// finished: no closing token, and no closing brace inside it; the fragments stand, and the
-    /// one `Malformed` event, with the bytes held as a start of the string token or none, says
-    /// that the arguments are no whole value.
+    /// assembler ends one. A string left open stays open, since nothing is made up for a value
+    /// the model never finished: no closing token, and no closing brace inside it; the fragments
+    /// stand, and the one `Malformed` event, with the bytes held as a start of the string token
+    /// or none, says that the arguments are no whole value.
     pub fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
@@ -344,9 +344,10 @@ impl Assembler {
         }
         if matches!(first, ']' | '}') && self.in_list() {
             // The list's close, after its `[` or a comma: an object's brace closes it too, as it
-            // does after a value.
-            self.close_container(&rest[..=space], out);
-            return space + 1;
+            // does after a value. No key is held in a list.
+            debug_assert!(self.key.is_none());
+            self.close_container(&text[..=space], out);
+            return key + space + 1;
         }
         if matches!(first, ',' | '}' | ']') {
             self.key = None;
