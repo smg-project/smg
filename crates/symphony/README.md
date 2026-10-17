@@ -156,7 +156,7 @@ its group names it); whether the flags stay as aliases is an open question of th
 
 <!-- models: begin -->
 202 groups, 343 checkpoints, newest first.
-12 ready, 129 replaying a recorded set, 3 on main awaiting fixtures, 58 pending.
+12 ready, 131 replaying a recorded set, 3 on main awaiting fixtures, 56 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
@@ -178,7 +178,7 @@ its group names it); whether the flags stay as aliases is an open question of th
 | 2026-08-25 | [glm-5.3-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-5.3-flash) | zai-org/GLM-5.3-Flash | GLM-5.3-Flash-BF16 | `glm` | 503,273 | replaying the set | `glm47_moe`, `glm45` |
 | 2026-08-24 | [qwen3.8-flash-next](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.8-flash-next) | Qwen/Qwen3.8-Flash-Next |  | `qwen3`, tagged calls | 474,563 | replaying the set | `qwen_xml`, `qwen3` |
 | 2026-08-09 | [dots3-note-prev](https://github.com/smg-project/bellwether/tree/main/fixtures/dots3-note-prev) | dots-studio/dots3-note-prev |  | `dots3` | 589,296 | replaying the set | none |
-| 2026-08-09 | [muse-glimmer-30b](https://github.com/smg-project/bellwether/tree/main/fixtures/muse-glimmer-30b) | meta-models/Muse-Glimmer-30B |  | — | 494,673 | pending | none |
+| 2026-08-09 | [muse-glimmer-30b](https://github.com/smg-project/bellwether/tree/main/fixtures/muse-glimmer-30b) | meta-models/Muse-Glimmer-30B |  | `muse_spark` | 494,673 | replaying the set | none |
 | 2026-08-08 | [qwen3.8-2.4t-a95b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.8-2.4t-a95b) | Qwen/Qwen3.8-2.4T-A95B |  | `qwen3`, tagged calls | 474,553 | replaying the set | `qwen_xml`, `qwen3` |
 | 2026-08-05 | [qwen3.8-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.8-27b) | Qwen/Qwen3.8-27B | JetBrains/Qwen3.8-3.6-27B-blend | `qwen3`, tagged calls | 474,563 | replaying the set | `qwen_xml`, `qwen3` |
 | 2026-08-02 | [ling-3.0-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/ling-3.0-flash) | inclusionAI/Ling-3.0-flash | Ling-3.0-flash-fp4 | `ling` | 589,298 | replaying the set | none |
@@ -347,7 +347,7 @@ its group names it); whether the flags stay as aliases is an open question of th
 | 2025-03-04 | [llama-3.1-nemotron-8b-ultralong-1m-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.1-nemotron-8b-ultralong-1m-instruct) | nvidia/Llama-3.1-Nemotron-8B-UltraLong-1M-Instruct |  | `json` | 458,185 | replaying the set | `json`, none |
 | 2025-03-04 | [llama-3.1-nemotron-8b-ultralong-2m-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.1-nemotron-8b-ultralong-2m-instruct) | nvidia/Llama-3.1-Nemotron-8B-UltraLong-2M-Instruct |  | `json` | 458,185 | replaying the set | `json`, none |
 | 2025-03-04 | [llama-3.1-nemotron-8b-ultralong-4m-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.1-nemotron-8b-ultralong-4m-instruct) | nvidia/Llama-3.1-Nemotron-8B-UltraLong-4M-Instruct |  | `json` | 458,185 | replaying the set | `json`, none |
-| 2025-02-24 | [phi-4-multimodal-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/phi-4-multimodal-instruct) | microsoft/Phi-4-multimodal-instruct |  | — | 328,662 | pending | none |
+| 2025-02-24 | [phi-4-multimodal-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/phi-4-multimodal-instruct) | microsoft/Phi-4-multimodal-instruct |  | `plain` | 328,662 | replaying the set | none |
 | 2025-02-20 | [gemma-3-4b-it](https://github.com/smg-project/bellwether/tree/main/fixtures/gemma-3-4b-it) | google/gemma-3-4b-it | gemma-3-12b-it, gemma-3-27b-it | — | 184,969 | pending | `json`, none |
 | 2025-02-19 | [phi-4-mini-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/phi-4-mini-instruct) | microsoft/Phi-4-mini-instruct |  | `plain` | 328,662 | replaying the set | none |
 | 2025-02-17 | [cogalign-internvl2-5-mpo-4b](https://github.com/smg-project/bellwether/tree/main/fixtures/cogalign-internvl2-5-mpo-4b) | Salesforce/cogalign-internvl2_5-mpo-4b | cogalign-internvl2_5-mpo-1b | `qwen2.5` | 576,772 | replaying the set | none |

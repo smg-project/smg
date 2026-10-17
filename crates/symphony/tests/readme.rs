@@ -1524,9 +1524,9 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2026-08-09",
         smg: (None, None),
-        table: None,
+        table: Some(Table::MuseSpark),
         set: Some(494_673),
-        status: Status::Pending,
+        status: Status::Replaying,
     },
     Group {
         slug: "muse-spark-open-816b-a42b",
@@ -1768,9 +1768,9 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2025-02-24",
         smg: (None, None),
-        table: None,
+        table: Some(Table::Plain),
         set: Some(328_662),
-        status: Status::Pending,
+        status: Status::Replaying,
     },
     Group {
         slug: "qwen-agentworld-35b-a3b",

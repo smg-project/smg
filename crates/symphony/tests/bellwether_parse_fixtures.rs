@@ -408,8 +408,14 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::KimiK3,
         GenerationPrompt::AlwaysOpensTheThought,
     ),
-    // Muse Spark: the generation prompt ends at the turn's opener, and the model writes the
-    // thought's message itself.
+    // Muse Spark and Muse Glimmer: the generation prompt ends at the turn's opener, and the model
+    // writes the thought's message itself. Glimmer's template writes the same messages (to self,
+    // to the tool, to the user) and the same block; its recorded set reads with the Spark table.
+    (
+        "muse-glimmer-30b",
+        Family::MuseSpark,
+        GenerationPrompt::ModelDecides,
+    ),
     (
         "muse-spark-open-816b-a42b",
         Family::MuseSpark,
@@ -512,6 +518,11 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
     ),
     (
         "phi-4-mini-instruct",
+        Family::Plain,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "phi-4-multimodal-instruct",
         Family::Plain,
         GenerationPrompt::Plain,
     ),
