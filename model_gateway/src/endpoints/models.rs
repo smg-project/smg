@@ -264,15 +264,24 @@ pub(crate) async fn retrieve_model_with(
     let canonical = registry.resolve_model_alias(model_id);
     let wanted = canonical.as_deref().unwrap_or(model_id);
     let shape = ModelShape::from_headers(headers);
-    if allow.is_some_and(|allow| !allow.admits_any([model_id, wanted])) {
-        return shape.not_found(model_id, request_id).await;
-    }
     let card = self_hosted_cards(registry)
         .into_iter()
         .find(|card| card.id == wanted);
+    // Admitted by any of the card's names, as the list admits it: the name
+    // asked for, the served id, an alias.
     match card {
-        Some(card) => shape.single(card),
-        None => shape.not_found(model_id, request_id).await,
+        Some(card)
+            if allow.is_none_or(|allow| {
+                allow.admits_any(
+                    [model_id, card.id.as_str()]
+                        .into_iter()
+                        .chain(card.aliases.iter().map(String::as_str)),
+                )
+            }) =>
+        {
+            shape.single(card)
+        }
+        _ => shape.not_found(model_id, request_id).await,
     }
 }
 
@@ -836,6 +845,27 @@ mod tests {
         )
         .await;
         assert_eq!(ids(&json_body(everything).await).len(), 3);
+    }
+
+    /// A card the list names by an alias alone is served under its id too,
+    /// the id the list route shows for it.
+    #[tokio::test]
+    async fn a_model_listed_by_an_alias_is_served_under_its_id() {
+        let mut aliased = ModelCard::new("org/served");
+        aliased.aliases = vec!["org/small-alias".to_owned()];
+        let registry = registry_with(vec![aliased, ModelCard::new("org/b")]);
+        let (policy, _, _) = policy_for_models_tests();
+        let red = policy.allow_list_for(&crate::tenant::TenantKey::from("auth:team-red"));
+
+        for name in ["org/small-alias", "org/served"] {
+            let response =
+                retrieve_model_with(&registry, &HeaderMap::new(), name, Some(red), rid()).await;
+            assert_eq!(response.status(), StatusCode::OK, "{name}");
+            assert_eq!(json_body(response).await["id"], "org/served", "{name}");
+        }
+        let refused =
+            retrieve_model_with(&registry, &HeaderMap::new(), "org/b", Some(red), rid()).await;
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
     }
 
     /// A model outside the caller's list is the 404 of an unknown model, in

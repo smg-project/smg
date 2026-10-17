@@ -43,6 +43,7 @@ use openai_protocol::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+use smg_external_router::realtime::webrtc::parse_webrtc_request;
 use smg_mesh::{
     ClusterState, MeshServer, MeshServerBuilder, MeshServerConfig, MeshServerHandler,
     PreparedMeshServer,
@@ -73,7 +74,9 @@ use crate::{
         error as route_error,
         gateway::Gateway,
         grpc::common::responses::spawn_unstored_sweeper,
-        http::router::{stream_eligible_request_bodies, StreamBodyState},
+        http::router::{
+            stream_eligible_request_bodies, StreamBodyState, WEBRTC_REQUEST_BODY_LIMIT,
+        },
         RouterTrait,
     },
     server::{
@@ -801,12 +804,50 @@ async fn v1_realtime_webrtc(
     // Model may come from query param (application/sdp) or session body
     // (multipart/form-data). Let the handler validate per content type.
     let model = params.model.unwrap_or_default();
+    let Some(policy) = state.context.tenant_model_policy.as_ref() else {
+        return state.router.route_realtime_webrtc(req, &model).await;
+    };
+    // Under a policy the call is held on the model it names, wherever it
+    // names it: the query first, as before, then the body, read and parsed
+    // here as the router parses it, so a multipart call cannot name one
+    // model in the query and another in its session part. The parse errors
+    // are the router's own.
     if !model.is_empty() {
         if let Some(refused) = tenant_model_refusal(&state, &tenant_meta, &model) {
             return refused;
         }
     }
-    state.router.route_realtime_webrtc(req, &model).await
+    let (parts, body) = req.into_parts();
+    let body = match axum::body::to_bytes(body, WEBRTC_REQUEST_BODY_LIMIT).await {
+        Ok(body) => body,
+        Err(e) => {
+            if std::error::Error::source(&e)
+                .and_then(|s| s.downcast_ref::<http_body_util::LengthLimitError>())
+                .is_some()
+            {
+                return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+            }
+            return route_error::bad_request("invalid_body", format!("Failed to read body: {e}"));
+        }
+    };
+    let parsed = match parse_webrtc_request(&parts, &body, &model).await {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    if let Some(refused) = policy.refusal(
+        tenant_meta.tenant_key(),
+        &parsed.model,
+        &state.context.worker_registry,
+    ) {
+        return refused;
+    }
+    state
+        .router
+        .route_realtime_webrtc(
+            Request::from_parts(parts, axum::body::Body::from(body)),
+            &model,
+        )
+        .await
 }
 
 async fn v1_realtime_ws(

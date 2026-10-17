@@ -597,9 +597,9 @@ class RouterArgs:
     tenant_api_keys: list[tuple] = dataclasses.field(default_factory=list)
     # The tenant header trust_tenant_header reads
     tenant_header_name: str = "x-smg-tenant-id"
-    # Per-tenant token/request rate limiting
-    # Path to the per-tenant model allow-list YAML (--tenant-model-policy-config);
+    # Path to the per-tenant model allow-list YAML (--tenant-model-policy-config)
     tenant_model_policy_config: str | None = None
+    # Per-tenant token/request rate limiting
     tenant_rate_limit_config: str | None = None
     tenant_rate_limit_enabled: bool = False
     # Tokenizer cache configuration

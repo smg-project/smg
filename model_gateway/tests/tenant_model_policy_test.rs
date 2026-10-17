@@ -11,11 +11,17 @@ mod common;
 #[path = "common/scripted_worker.rs"]
 mod scripted_worker;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     body::{to_bytes, Body},
-    http::{header::CONTENT_TYPE, Method, Request, StatusCode},
+    extract::State,
+    http::{
+        header::{CONTENT_LENGTH, CONTENT_TYPE},
+        Method, Request, StatusCode,
+    },
+    response::Response,
+    routing::post,
     Router,
 };
 use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
@@ -23,10 +29,12 @@ use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use serde_json::{json, Value};
 use smg::{
     config::{RouterConfig, RoutingMode, TenantApiKeyEntry},
-    routers::RouterFactory,
+    routers::{
+        factory::router_ids, gateway::Gateway, http::router::Router as HttpRouter, RouterFactory,
+    },
     worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
 };
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, task::JoinHandle};
 use tower::ServiceExt;
 
 const MODEL_A: &str = "org/model-a";
@@ -44,6 +52,38 @@ tenants:
   - tenant_key: header:team-green
     models: ["org/model-b*"]
 "#;
+
+/// `team-red` may use nothing, `team-blue` has no entry and gets the
+/// default: for the single-model gateway of the streamed pass-through.
+const POLICY_HELD_RED: &str = r#"default_policy:
+  models: ["*"]
+tenants:
+  - tenant_key: auth:team-red
+    models: []
+"#;
+
+/// A well-formed WebRTC offer (one audio section), as a realtime client's
+/// first message carries it: the call's body must parse before the model it
+/// names can be read.
+const SDP_OFFER: &str = "v=0\r\n\
+o=- 5778955624436719325 2 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0\r\n\
+a=msid-semantic: WMS\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:a0mI\r\n\
+a=ice-pwd:bffBx8+rTlXkJA87Wf3dcDQD\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 7A:5F:45:C3:0A:9D:4D:D2:D9:AF:F6:63:DA:45:0A:FE:4B:9B:C4:73:9D:1D:8E:DF:63:6D:9F:6E:D4:71:0C:0A\r\n\
+a=setup:actpass\r\n\
+a=mid:0\r\n\
+a=sendrecv\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+a=fmtp:111 minptime=10;useinbandfec=1";
 
 /// The caller of a request: a tenant API key, a trusted tenant header, or
 /// nobody.
@@ -151,10 +191,14 @@ async fn call(
         request = request.header("anthropic-version", "2023-06-01");
     }
     let request = match body {
-        Some(body) => request
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_vec(&body).unwrap()))
-            .unwrap(),
+        Some(body) => {
+            let bytes = serde_json::to_vec(&body).unwrap();
+            request
+                .header(CONTENT_TYPE, "application/json")
+                .header(CONTENT_LENGTH, bytes.len())
+                .body(Body::from(bytes))
+                .unwrap()
+        }
         None => request.body(Body::empty()).unwrap(),
     };
     let response = app.clone().oneshot(request).await.unwrap();
@@ -360,4 +404,218 @@ async fn without_a_policy_every_tenant_may_name_every_model() {
         assert_eq!(status, StatusCode::OK, "{list}");
         assert_eq!(listed(&list), [MODEL_A, MODEL_B], "{list}");
     }
+}
+
+/// A worker reached over HTTP that records the chat requests it gets and
+/// answers each with one completion.
+struct Upstream {
+    url: String,
+    requests: Arc<Mutex<Vec<Value>>>,
+    task: JoinHandle<()>,
+}
+
+impl Drop for Upstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[expect(clippy::unwrap_used, reason = "test helper: failures should panic")]
+async fn record_chat(
+    State(requests): State<Arc<Mutex<Vec<Value>>>>,
+    req: axum::extract::Request,
+) -> Response {
+    let body = to_bytes(req.into_body(), 1024 * 1024).await.unwrap();
+    requests
+        .lock()
+        .unwrap()
+        .push(serde_json::from_slice(&body).unwrap());
+    let answer = json!({
+        "id": "chatcmpl-upstream", "object": "chat.completion", "created": 1, "model": MODEL_A,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    })
+    .to_string();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_LENGTH, answer.len())
+        .body(Body::from(answer))
+        .unwrap()
+}
+
+#[expect(
+    clippy::unwrap_used,
+    clippy::disallowed_methods,
+    reason = "test helper: failures should panic; the server is aborted by the owning Upstream on drop"
+)]
+async fn upstream() -> Upstream {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/v1/chat/completions", post(record_chat))
+        .with_state(Arc::clone(&requests));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    Upstream {
+        url,
+        requests,
+        task,
+    }
+}
+
+/// The app over one HTTP worker serving one model, router retries off: the
+/// shape in which the HTTP router forwards a request's body to the worker
+/// unread (the streamed pass-through) unless something must read it first.
+#[expect(clippy::unwrap_used, reason = "test helper: failures should panic")]
+async fn http_app(policy: &str) -> (Router, Upstream, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = upstream().await;
+    let worker = Arc::new(
+        BasicWorkerBuilder::new(upstream.url.clone())
+            .worker_type(WorkerType::Regular)
+            .models(vec![ModelCard::new(MODEL_A)])
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build(),
+    );
+    let mut config = RouterConfig::builder()
+        .mode(RoutingMode::Regular {
+            worker_urls: vec![],
+        })
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(1024 * 1024)
+        .build_unchecked();
+    config.health_check.disable_health_check = true;
+    config.retry.max_retries = 1;
+    config.tenant_api_keys = vec![
+        TenantApiKeyEntry {
+            tenant_id: "team-red".to_owned(),
+            key: "red-secret".to_owned(),
+        },
+        TenantApiKeyEntry {
+            tenant_id: "team-blue".to_owned(),
+            key: "blue-secret".to_owned(),
+        },
+    ];
+    let path = dir.path().join("model-policy.yaml");
+    std::fs::write(&path, policy).unwrap();
+    config.tenant_model_policy_config = Some(path.to_str().unwrap().to_owned());
+    let context = common::create_test_context_with_tokenizer_registry(
+        config,
+        Arc::new(TokenizerRegistry::new()),
+    )
+    .await;
+    context.worker_registry.register(worker).unwrap();
+    let router = Arc::new(HttpRouter::new(&context).await.unwrap());
+    let gateway = Arc::new(Gateway::new(context.worker_registry.clone()));
+    gateway.register_router(router_ids::HTTP_REGULAR, router);
+    let app = common::test_app::create_test_app_with_context(gateway, context);
+    (app, upstream, dir)
+}
+
+/// On the single-model HTTP gateway the body would be forwarded unread, past
+/// the handler that holds the tenant to its list: under a policy it is read
+/// here, a held tenant is refused before the worker sees anything, and a
+/// tenant on the default policy is served through the worker.
+#[tokio::test]
+async fn the_streamed_pass_through_holds_a_tenant_to_its_list() {
+    let (app, upstream, _dir) = http_app(POLICY_HELD_RED).await;
+
+    let (status, refused, code) = call(
+        &app,
+        Method::POST,
+        "/v1/chat/completions",
+        Caller::Key("red-secret"),
+        Some(chat(MODEL_A)),
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
+    assert_eq!(code.as_deref(), Some("model_not_found"));
+    assert!(
+        upstream.requests.lock().unwrap().is_empty(),
+        "the worker never saw the held tenant's request"
+    );
+
+    let (status, served, _) = call(
+        &app,
+        Method::POST,
+        "/v1/chat/completions",
+        Caller::Key("blue-secret"),
+        Some(chat(MODEL_A)),
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{served}");
+    let seen = upstream.requests.lock().unwrap();
+    assert_eq!(
+        seen.len(),
+        1,
+        "the worker served the tenant on the default policy"
+    );
+    assert_eq!(seen[0]["model"], MODEL_A);
+}
+
+/// A realtime call names its model in the query (an SDP body) or in its
+/// session part (a multipart body): the tenant is held to the model the call
+/// is set up with, so a held model in the session part is refused whatever
+/// the query names, and a held model in the query is refused as before.
+#[tokio::test]
+async fn a_realtime_call_is_held_to_the_model_its_session_names() {
+    let (app, _engine, _dir) = app(Some(POLICY)).await;
+    let boundary = "policy-test-boundary";
+    let multipart = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"sdp\"\r\n\r\n{SDP_OFFER}\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"session\"\r\n\r\n\
+         {{\"model\":\"{MODEL_B}\"}}\r\n--{boundary}--\r\n"
+    );
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/v1/realtime/calls?model={MODEL_A}"))
+        .header("authorization", "Bearer red-secret")
+        .header(
+            CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .header(CONTENT_LENGTH, multipart.len())
+        .body(Body::from(multipart))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-smg-error-code")
+            .and_then(|v| v.to_str().ok()),
+        Some("model_not_found")
+    );
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let refused: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        refused.to_string().contains(MODEL_B),
+        "the session's model, not the query's: {refused}"
+    );
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/v1/realtime/calls?model={MODEL_B}"))
+        .header("authorization", "Bearer red-secret")
+        .header(CONTENT_TYPE, "application/sdp")
+        .header(CONTENT_LENGTH, 4)
+        .body(Body::from("v=0\n"))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-smg-error-code")
+            .and_then(|v| v.to_str().ok()),
+        Some("model_not_found")
+    );
 }

@@ -255,16 +255,25 @@ impl TenantModelPolicy {
         self.tenants.get(tenant).unwrap_or(&self.default)
     }
 
-    /// Whether `tenant` may name `model`: by the id as the request wrote it,
-    /// or by the canonical id `registry` resolves an alias to, so a list
-    /// naming a served id admits the aliases of that model as well.
+    /// Whether `tenant` may name `model`. A list names models, under any of
+    /// the names `registry` knows them by: the id as the request wrote it,
+    /// the served id an alias resolves to, or another alias of that model.
+    /// So a list naming a served id admits its aliases, and a list naming an
+    /// alias admits the served id (the one `/v1/models` lists) and the
+    /// model's other aliases.
     #[must_use]
     pub fn admits(&self, tenant: &TenantKey, model: &str, registry: &WorkerRegistry) -> bool {
         let list = self.allow_list_for(tenant);
-        list.admits(model)
+        if list.admits(model) {
+            return true;
+        }
+        let canonical = registry.resolve_model_alias(model);
+        let canonical = canonical.as_deref().unwrap_or(model);
+        list.admits(canonical)
             || registry
-                .resolve_model_alias(model)
-                .is_some_and(|canonical| list.admits(&canonical))
+                .model_aliases(canonical)
+                .iter()
+                .any(|alias| list.admits(alias))
     }
 
     /// The refusal of a request of `tenant` naming `model`, or `None` when
@@ -493,13 +502,14 @@ mod tests {
         );
     }
 
-    /// A list naming the served id admits a request for one of its aliases;
-    /// a list naming an alias admits that alias as written, and not the
-    /// served id (the request is checked by the names it can be known by).
+    /// A list names models, under any of their names: a list naming the
+    /// served id admits a request for one of its aliases, and a list naming
+    /// an alias admits the served id (the one `/v1/models` lists) and the
+    /// model's other aliases; a name nobody serves stays refused.
     #[test]
     fn an_alias_is_admitted_through_its_canonical_id() {
         let mut card = ModelCard::new("org/served");
-        card.aliases = vec!["short".to_owned()];
+        card.aliases = vec!["short".to_owned(), "other-short".to_owned()];
         let registry = registry_with(vec![card, ModelCard::new("org/other")]);
         let red = TenantKey::from("auth:team-red");
 
@@ -510,7 +520,10 @@ mod tests {
 
         let by_alias = compiled(&[], vec![spec(Some("auth:team-red"), &["short"])]);
         assert!(by_alias.admits(&red, "short", &registry));
-        assert!(!by_alias.admits(&red, "org/served", &registry));
+        assert!(by_alias.admits(&red, "org/served", &registry));
+        assert!(by_alias.admits(&red, "other-short", &registry));
+        assert!(!by_alias.admits(&red, "org/other", &registry));
+        assert!(!by_alias.admits(&red, "org/nobody", &registry));
     }
 
     /// A tenant key that can never match a real request is a configuration
