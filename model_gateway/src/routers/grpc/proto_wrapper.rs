@@ -2262,7 +2262,8 @@ impl ProtoGenerateResponse {
     }
 
     /// The finish reason of a `Complete`, the engine's last message for a
-    /// request; `None` for a chunk or an empty message.
+    /// request, with or without an error; `None` for a chunk or an empty
+    /// message.
     fn complete_finish_reason(&self) -> Option<&str> {
         match self {
             Self::Sglang(resp) => match &resp.response {
@@ -2288,12 +2289,6 @@ impl ProtoGenerateResponse {
                 _ => None,
             },
         }
-    }
-
-    /// Whether this is a `Complete`: the engine's last message for a
-    /// request, with or without an error.
-    pub fn is_complete(&self) -> bool {
-        self.complete_finish_reason().is_some()
     }
 
     /// Whether this is a `Complete` the engine finished with reason `"error"`.
@@ -3261,7 +3256,7 @@ mod tracked_tests {
                 vllm::GenerateStreamChunk::default(),
             )),
         }));
-        assert!(!chunk.is_complete());
+        assert!(!chunk.complete_finish_reason().is_some());
         let complete = ProtoGenerateResponse::Sglang(Box::new(sglang::GenerateResponse {
             response: Some(sglang::generate_response::Response::Complete(
                 sglang::GenerateComplete {
@@ -3271,7 +3266,7 @@ mod tracked_tests {
             )),
             ..Default::default()
         }));
-        assert!(complete.is_complete() && !complete.engine_error());
+        assert!(complete.complete_finish_reason().is_some() && !complete.engine_error());
         assert!(complete.completed());
         let failed = ProtoGenerateResponse::Sglang(Box::new(sglang::GenerateResponse {
             response: Some(sglang::generate_response::Response::Complete(
@@ -3282,7 +3277,7 @@ mod tracked_tests {
             )),
             ..Default::default()
         }));
-        assert!(failed.is_complete() && failed.engine_error());
+        assert!(failed.complete_finish_reason().is_some() && failed.engine_error());
         assert!(!failed.completed());
         // An abort the engine side started is its last message too, and no
         // completion: a probe that ends this way holds the worker again.
@@ -3295,9 +3290,11 @@ mod tracked_tests {
             )),
             ..Default::default()
         }));
-        assert!(aborted.is_complete() && !aborted.engine_error());
+        assert!(aborted.complete_finish_reason().is_some() && !aborted.engine_error());
         assert!(!aborted.completed());
-        assert!(!ProtoGenerateResponse::Vllm(Box::default()).is_complete());
+        assert!(!ProtoGenerateResponse::Vllm(Box::default())
+            .complete_finish_reason()
+            .is_some());
         assert!(!chunk.completed());
     }
 
