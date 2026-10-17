@@ -132,8 +132,6 @@ pub enum MalformedReason {
     KeyCutShort,
     /// A value the call's end cut short.
     ValueCutShort,
-    /// An argument the call's end cut short.
-    ArgumentCutShort,
     /// A key with no text.
     EmptyKey,
     /// A tool-call block that closed without a complete call in it.
@@ -170,7 +168,6 @@ impl MalformedReason {
             Self::KeyWithoutAValue => "a key without a value",
             Self::KeyCutShort => "a key the call's end cut short",
             Self::ValueCutShort => "a value the call's end cut short",
-            Self::ArgumentCutShort => "an argument the call's end cut short",
             Self::EmptyKey => "a key with no text",
             Self::BlockWithoutACompleteCall => {
                 "a tool-call block that closed without a complete call"

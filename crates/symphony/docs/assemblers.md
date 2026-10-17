@@ -301,16 +301,18 @@ What the syntax says, and what the assembler does with it:
   what makes every chunking say the same.
 - **Every byte lands in exactly one event**, as in the other assemblers: the key, the `=`, the
   value and the separator after it in the fragment they produce.
-- **Two endings.** `Assembler::close` is the region's closing marker (or the next opener):
-  a call still open is closed for the client, an open argument's bytes and a name that never
-  got its `(` come back as `Malformed`, and the list's wrapping before any call is dropped.
-  `Assembler::finish` is a stream that was cut: nothing is closed, and a call that started
-  still ends, with no bytes of its own, as every assembler ends one, after the one `Malformed {
-  UnterminatedRegion }` event that says its arguments are no whole value
-  (`tagged::end_cut_call`): it carries what was held, a key, a value or a separator cut short,
-  or no bytes when the cut came right after the `(`, so that a call the end cut before its `)`
-  is never handed over as finished without a word. Outside a call, what was held, a name that
-  never got its `(` or the list's wrapping, comes back as `Malformed { UnterminatedRegion }` too.
+- **Two endings, one rule for a cut call.** `Assembler::close` is the region's closing marker
+  (or the next opener); `Assembler::finish` is a stream that was cut. A call still open at
+  either is one the model never finished, since every template writes the call's `)` before
+  the marker: nothing is closed for it, the fragments it sent stand, and it ends, with no bytes
+  of its own, after the one `Malformed` event that says its arguments are no whole value
+  (`tagged::end_cut_call`), carrying what was held, a key, a value or a separator cut short, or
+  no bytes when the cut came right after the `(`; so a cut call is never handed over as finished
+  without a word, nor with an object the reader closed for it. The reason is
+  `UnterminatedRegion` at the stream's end, and the engine names it for a region a marker
+  closed. Outside a call the two endings differ: at the close a name that never got its `(`
+  comes back as `Malformed` with its own reason and the list's wrapping before any call is
+  dropped; at the stream's end what was held comes back as `Malformed { UnterminatedRegion }`.
 - **Python's whitespace is allowed** between a name and its `(`, around the `=`, and around a
   value, as the old parser's regular expression allowed it; a name or a key is the text less
   that whitespace.
