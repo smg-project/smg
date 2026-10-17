@@ -14,7 +14,7 @@
 //! bytes before the marker are the tool's name, as the template writes it and the only place it
 //! is written: `ToolCallStart` carries them with the marker as its source once the marker has
 //! arrived. The object after the marker is the arguments, every byte of it a fragment for as long
-//! as the bytes keep it a JSON prefix ([`Prefix`]), and `Malformed { InvalidArguments }` from the
+//! as the bytes keep it a JSON prefix ([`Prefix`](super::Prefix)), and `Malformed { InvalidArguments }` from the
 //! first byte that does not; its close, found by the outline's scanner ([`Scanner`]), is the call's
 //! end, and bytes after it are not taken, so the engine routes what follows the object.
 //!
