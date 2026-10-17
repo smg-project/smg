@@ -1823,12 +1823,12 @@ const GROUPS: &[Group] = &[
         status: Status::Replaying,
     },
     Group {
-        slug: "qwen2.5-7b-instruct",
-        model: "Qwen/Qwen2.5-7B-Instruct",
+        slug: "qwen2.5-0.5b-instruct",
+        model: "Qwen/Qwen2.5-0.5B-Instruct",
         also: &[
-            "Qwen2.5-0.5B-Instruct",
             "Qwen2.5-1.5B-Instruct",
             "Qwen2.5-3B-Instruct",
+            "Qwen2.5-7B-Instruct",
             "Qwen2.5-14B-Instruct",
             "Qwen2.5-32B-Instruct",
             "Qwen2.5-72B-Instruct",
@@ -1842,8 +1842,8 @@ const GROUPS: &[Group] = &[
         released: "2024-09-16",
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen2_5),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(576_772),
+        status: Status::Replaying,
     },
     Group {
         slug: "qwen2.5-7b-instruct-1m",

@@ -288,6 +288,11 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
     ),
     // Qwen2.5: no thought at all.
     (
+        "qwen2.5-0.5b-instruct",
+        Family::Qwen2_5,
+        GenerationPrompt::Plain,
+    ),
+    (
         "qwen2.5-7b-instruct-1m",
         Family::Qwen2_5,
         GenerationPrompt::Plain,
