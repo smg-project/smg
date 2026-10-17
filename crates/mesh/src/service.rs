@@ -54,6 +54,9 @@ pub struct MeshServerHandler {
     /// namespaces (broadcast/targeted) and publish values that reach
     /// peers via the gossip loop.
     mesh_kv: Arc<crate::kv::MeshKV>,
+    /// The node's TLS identity when the mesh has one: the `Leaving`
+    /// broadcast dials the members with it, as the probes do.
+    mtls_manager: Option<Arc<MTLSManager>>,
 }
 
 impl MeshServerHandler {
@@ -81,29 +84,25 @@ impl MeshServerHandler {
         log::info!("Graceful shutdown for node {}", self.self_name);
 
         let maybe_leaving = {
-            let state = self.state.read();
-
-            if let Some(self_node) = state.get(&self.self_name) {
-                let mut self_node = self_node.clone();
-                if self_node.status == NodeStatus::Leaving as i32 {
-                    None
-                } else {
+            let mut state = self.state.write();
+            // Broadcast targets: the live members other than this node.
+            let alive_nodes = state
+                .values()
+                .filter(|node| {
+                    node.status == NodeStatus::Alive as i32 && node.name != self.self_name
+                })
+                .cloned()
+                .collect::<Vec<NodeState>>();
+            match state.get_mut(&self.self_name) {
+                Some(self_node) if self_node.status != NodeStatus::Leaving as i32 => {
+                    // Written into this node's own table first: a probe it
+                    // still answers before its loop stops says Leaving too,
+                    // instead of turning a member's view of it back to Alive.
                     self_node.status = NodeStatus::Leaving as i32;
                     self_node.version += 1;
-
-                    let alive_nodes = state
-                        .values()
-                        .filter(|node| {
-                            node.status == NodeStatus::Alive as i32 && node.name != self.self_name
-                            // exclude self from broadcast targets
-                        })
-                        .cloned()
-                        .collect::<Vec<NodeState>>();
-
-                    Some((self_node, alive_nodes))
+                    Some((self_node.clone(), alive_nodes))
                 }
-            } else {
-                None
+                _ => None,
             }
         };
         let (leaving_node, alive_nodes) = match maybe_leaving {
@@ -124,6 +123,7 @@ impl MeshServerHandler {
             vec![leaving_node],
             alive_nodes,
             Some(Duration::from_secs(3)),
+            self.mtls_manager.clone(),
         )
         .await;
 
@@ -217,6 +217,7 @@ impl MeshServerBuilder {
                 signal_tx,
                 partition_detector: Some(partition_detector),
                 mesh_kv,
+                mtls_manager: self.mtls_manager.clone(),
             },
         )
     }
@@ -399,12 +400,14 @@ impl PreparedMeshServer {
     }
 }
 
-/// Broadcast node state updates to target nodes
+/// Broadcast node state updates to target nodes, each dialed with the node's
+/// TLS identity when the mesh has one (`mtls_manager`), as the probes are.
 /// Returns (success_count, total_count)
 pub async fn broadcast_node_states(
     nodes_to_broadcast: Vec<NodeState>,
     target_nodes: Vec<NodeState>,
     timeout: Option<Duration>,
+    mtls_manager: Option<Arc<MTLSManager>>,
 ) -> (usize, usize) {
     if nodes_to_broadcast.is_empty() || target_nodes.is_empty() {
         log::debug!(
@@ -419,6 +422,7 @@ pub async fn broadcast_node_states(
     for target_node in &target_nodes {
         let target_node_clone = target_node.clone();
         let nodes_for_task = nodes_to_broadcast.clone();
+        let mtls_manager = mtls_manager.clone();
         #[expect(
             clippy::disallowed_methods,
             reason = "broadcast tasks are collected and awaited via join_all with a timeout immediately below"
@@ -430,7 +434,7 @@ pub async fn broadcast_node_states(
             let ping_payload = gossip_message::Payload::Ping(Ping {
                 state_sync: Some(state_sync),
             });
-            match try_ping(&target_node_clone, Some(ping_payload), None).await {
+            match try_ping(&target_node_clone, Some(ping_payload), mtls_manager).await {
                 Ok(_) => {
                     log::debug!("Successfully broadcasted to {}", target_node_clone.name);
                     Ok(())
@@ -935,6 +939,96 @@ mod tests {
             return;
         }
         mesh_forms_with_mtls_over(Ipv6Addr::LOCALHOST.into()).await;
+    }
+
+    /// A member that leaves tells its peers so with the node's TLS identity
+    /// on the dial: B's `Leaving` reaches A under mTLS, whose listener refuses
+    /// a dial without a certificate from the CA.
+    #[tokio::test]
+    async fn a_leaving_member_tells_its_peers_over_mtls() {
+        init();
+        let _ = ring::default_provider().install_default();
+        let certs = MtlsTestCerts::generate();
+        let ip: IpAddr = Ipv4Addr::LOCALHOST.into();
+        let (addr_a, handler_a) = mtls_node("A", ip, None, &certs).await;
+        let (_addr_b, handler_b) = mtls_node("B", ip, Some(addr_a), &certs).await;
+        wait_for(
+            || handler_a.state.read().len() == 2 && handler_b.state.read().len() == 2,
+            Duration::from_secs(20),
+            "A and B see each other over mTLS",
+        )
+        .await;
+
+        handler_b.graceful_shutdown().await.expect("B leaves");
+
+        let b_on_a = handler_a.state.read().get("B").cloned();
+        assert_eq!(
+            b_on_a.as_ref().map(|node| node.status),
+            Some(NodeStatus::Leaving as i32),
+            "A does not show B as Leaving after B's broadcast: {b_on_a:?}"
+        );
+        // B's own table says so too, so a probe B still answers before its
+        // loop stops cannot turn a member's view of B back to Alive.
+        let b_on_b = handler_b.state.read().get("B").cloned();
+        assert_eq!(
+            b_on_b.as_ref().map(|node| node.status),
+            Some(NodeStatus::Leaving as i32),
+            "B's own table does not show B as Leaving: {b_on_b:?}"
+        );
+        handler_a.shutdown();
+    }
+
+    /// The status broadcast itself, with no gossip loop on the sending side
+    /// to carry the news another way: against a member over mTLS, a dial
+    /// without the node's identity is refused and delivers nothing, a dial
+    /// with it is accepted and the member records the status.
+    #[tokio::test]
+    async fn a_status_broadcast_dials_with_the_node_tls_identity() {
+        init();
+        let _ = ring::default_provider().install_default();
+        let certs = MtlsTestCerts::generate();
+        let (addr_a, handler_a) = mtls_node("A", Ipv4Addr::LOCALHOST.into(), None, &certs).await;
+        let mut leaving_b = node_state("B", SocketAddr::from((Ipv4Addr::LOCALHOST, 1)));
+        leaving_b.status = NodeStatus::Leaving as i32;
+        let timeout = Some(Duration::from_secs(3));
+
+        let without_identity = broadcast_node_states(
+            vec![leaving_b.clone()],
+            vec![node_state("A", addr_a)],
+            timeout,
+            None,
+        )
+        .await;
+        assert_eq!(
+            without_identity,
+            (0, 1),
+            "a broadcast dialed without the identity was accepted by an mTLS member"
+        );
+        assert!(
+            handler_a.state.read().get("B").is_none(),
+            "A recorded a status from a refused dial: {:?}",
+            handler_a.state.read().get("B")
+        );
+
+        let with_identity = broadcast_node_states(
+            vec![leaving_b],
+            vec![node_state("A", addr_a)],
+            timeout,
+            Some(Arc::new(MTLSManager::new(mtls_config(&certs)))),
+        )
+        .await;
+        assert_eq!(
+            with_identity,
+            (1, 1),
+            "a broadcast dialed with the identity was refused by an mTLS member"
+        );
+        let b_on_a = handler_a.state.read().get("B").cloned();
+        assert_eq!(
+            b_on_a.as_ref().map(|node| node.status),
+            Some(NodeStatus::Leaving as i32),
+            "A did not record B's status from the broadcast: {b_on_a:?}"
+        );
+        handler_a.shutdown();
     }
 
     #[tokio::test]

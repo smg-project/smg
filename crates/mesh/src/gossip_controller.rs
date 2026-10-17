@@ -383,6 +383,7 @@ impl GossipController {
                             vec![unreachable_node],
                             target_nodes,
                             None, // Use default timeout
+                            self.mtls_manager.clone(),
                         )
                         .await;
 
