@@ -1909,6 +1909,7 @@ mod tests {
             ("nemotron", "qwen3_tagged"),
             ("deepseek_v4", "deepseek_v4"),
             ("deepseek_v41", "deepseek_v4.1"),
+            ("deepseek32", "deepseek_v3.2"),
             ("glm45_moe", "glm4"),
             ("glm47_moe", "glm"),
             ("hy_v4", "hy4"),

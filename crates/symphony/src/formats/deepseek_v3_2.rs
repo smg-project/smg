@@ -81,11 +81,11 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
+        event::{DropReason, Event, FinishReason, MalformedReason, Text},
         formats::{deepseek_v4, deepseek_v4_1},
-        input::{EngineFinish, Input},
-        parser::Parser,
+        input::EngineFinish,
         tagged::Declared,
+        testing::{self, bytes, content, drive_to, reasoning},
     };
 
     /// The generation prompt's tail in thinking mode: the turn's opener and the thought opened.
@@ -110,63 +110,12 @@ mod tests {
         finish: EngineFinish,
     ) -> Vec<Event> {
         let mut parser = Engine::new(format, Declared::default());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        for piece in pieces {
-            parser
-                .feed(
-                    Input::Delta {
-                        token_ids: &[],
-                        text: piece,
-                        spans: &[],
-                    },
-                    &mut out,
-                )
-                .expect("delta");
-        }
-        parser.feed(Input::End { finish }, &mut out).expect("end");
-        out.drain()
-    }
-
-    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
-        run_table(deepseek_v3_2(), prompt, pieces, EngineFinish::Stop)
-    }
-
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|event| match event {
-                Event::Content(text) | Event::Reasoning(text) => text.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
+        drive_to(&mut parser, prompt, pieces, finish)
     }
 
     /// The calls as (name, arguments) pairs, the arguments as the JSON value their fragments make.
     fn calls(events: &[Event]) -> Vec<(String, Value)> {
-        let mut found: Vec<(String, String)> = Vec::new();
-        for event in events {
-            match event {
-                Event::ToolCallStart { name, .. } => found.push((name.clone(), String::new())),
-                Event::ToolCallArguments { index, json, .. } => {
-                    found[*index as usize].1.push_str(json);
-                }
-                _ => {}
-            }
-        }
-        found
+        testing::calls(events)
             .into_iter()
             .map(|(name, arguments)| {
                 let value = serde_json::from_str(&arguments)
@@ -176,24 +125,8 @@ mod tests {
             .collect()
     }
 
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn reasoning(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
+    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
+        run_table(deepseek_v3_2(), prompt, pieces, EngineFinish::Stop)
     }
 
     fn finish(events: &[Event]) -> (FinishReason, u32) {
