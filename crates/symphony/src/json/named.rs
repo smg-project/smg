@@ -118,6 +118,7 @@ impl crate::engine::CallAssembler for Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::bytes;
 
     const MARKER: &str = "<|content_invoke_tool_json|>";
     const CALL: &str = concat!(
@@ -138,20 +139,6 @@ mod tests {
             assembler.close(&mut out);
         }
         (out.drain(), taken)
-    }
-
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
     }
 
     fn arguments(events: &[Event]) -> String {

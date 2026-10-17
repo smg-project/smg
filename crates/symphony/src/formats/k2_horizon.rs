@@ -48,10 +48,9 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, Events, Text},
-        input::{EngineFinish, Input},
-        parser::Parser,
+        event::{DropReason, Event, Text},
         tagged::Declared,
+        testing::{arguments_of, bytes, content, drive, reasoning},
     };
 
     fn declared() -> Declared {
@@ -83,84 +82,7 @@ mod tests {
     );
 
     fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
-        let mut parser = Engine::new(k2_horizon(), declared());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        for piece in pieces {
-            parser
-                .feed(
-                    Input::Delta {
-                        token_ids: &[],
-                        text: piece,
-                        spans: &[],
-                    },
-                    &mut out,
-                )
-                .expect("delta");
-        }
-        parser
-            .feed(
-                Input::End {
-                    finish: EngineFinish::Stop,
-                },
-                &mut out,
-            )
-            .expect("end");
-        out.drain()
-    }
-
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
-    }
-
-    fn arguments_of(events: &[Event], call: u32) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallArguments { index, json, .. } if *index == call => {
-                    Some(json.as_str())
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn reasoning(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
+        drive(&mut Engine::new(k2_horizon(), declared()), prompt, pieces)
     }
 
     fn dropped(text: &str) -> Event {

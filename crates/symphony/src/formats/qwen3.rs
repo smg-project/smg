@@ -36,7 +36,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::ids::CallIds;
+    use crate::{
+        ids::CallIds,
+        testing::{arguments_of, bytes},
+    };
 
     fn ids() -> CallIds {
         CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
@@ -72,21 +75,6 @@ mod tests {
         }
         parser.feed(Input::End { finish }, &mut out).expect("end");
         out.drain()
-    }
-
-    /// Every byte of every event, in order: the proof that nothing was lost or invented.
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
     }
 
     /// Events with adjacent text of one kind joined and argument fragments joined per call, so two
@@ -1010,18 +998,6 @@ mod tests {
         }
         parser.feed(Input::End { finish }, &mut out).expect("end");
         out.drain()
-    }
-
-    fn arguments_of(events: &[Event], call: u32) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallArguments { index, json, .. } if *index == call => {
-                    Some(json.as_str())
-                }
-                _ => None,
-            })
-            .collect()
     }
 
     #[test]

@@ -881,6 +881,7 @@ mod tests {
     use serde_json::json as value;
 
     use super::*;
+    use crate::testing::bytes;
 
     fn declared() -> Declared {
         Declared::of(&[Tool {
@@ -919,20 +920,6 @@ mod tests {
             assembler.close(tags.invoke_close, &mut out);
         }
         out.drain()
-    }
-
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
     }
 
     fn arguments(events: &[Event]) -> String {

@@ -34,70 +34,20 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, Events, FinishReason},
-        input::{EngineFinish, Input},
-        parser::Parser,
+        event::{DropReason, Event, FinishReason},
         tagged::Declared,
+        testing::{calls, content, drive},
     };
 
     /// The generation prompt's tail: the model's turn opened, and nothing more.
     const PROMPT: &str = "<start_of_turn>model\n";
 
     fn run(prompt: &str, output: &str) -> Vec<Event> {
-        let mut parser = Engine::new(function_gemma(), Declared::default());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        parser
-            .feed(
-                Input::Delta {
-                    token_ids: &[],
-                    text: output,
-                    spans: &[],
-                },
-                &mut out,
-            )
-            .expect("delta");
-        parser
-            .feed(
-                Input::End {
-                    finish: EngineFinish::Stop,
-                },
-                &mut out,
-            )
-            .expect("end");
-        out.drain()
-    }
-
-    fn calls(events: &[Event]) -> Vec<(String, String)> {
-        let mut calls: Vec<(String, String)> = Vec::new();
-        for event in events {
-            match event {
-                Event::ToolCallStart { name, .. } => calls.push((name.clone(), String::new())),
-                Event::ToolCallArguments { json, .. } => {
-                    calls.last_mut().expect("a call started").1.push_str(json);
-                }
-                _ => {}
-            }
-        }
-        calls
-    }
-
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
+        drive(
+            &mut Engine::new(function_gemma(), Declared::default()),
+            prompt,
+            &[output],
+        )
     }
 
     fn dropped(events: &[Event]) -> Vec<&str> {
