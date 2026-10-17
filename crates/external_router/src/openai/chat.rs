@@ -57,8 +57,8 @@ async fn send_attempt(
 }
 
 /// The upstream's stream relayed to the client frame by frame; an error on
-/// it ends the client's stream with the error's text. The content type is
-/// the upstream's, else `text/event-stream` on a success.
+/// it aborts the client's stream (the error's text is not delivered). The
+/// content type is the upstream's, else `text/event-stream` on a success.
 fn relayed_body(resp: reqwest::Response, status: StatusCode) -> Response {
     let content_type = resp.headers().get(CONTENT_TYPE).cloned();
     let stream = resp.bytes_stream();
