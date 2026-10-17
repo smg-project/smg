@@ -1316,6 +1316,55 @@ mod tests {
                 "cut {cut}"
             );
         }
+        // The refused bracket as an object member's value: the key held for it is reported with
+        // the bytes from the bracket on, nothing of the member is written, and the objects close
+        // whole without it; the reported bytes run from the key to the object's own close.
+        let objects = |levels: usize| {
+            format!(
+                "call:f{{{}a:1{}}}",
+                "a:{".repeat(levels),
+                "}".repeat(levels)
+            )
+        };
+        let within_objects = objects(DEEPEST - 1);
+        let events = run(&[&within_objects], false);
+        assert!(PartialJson::default()
+            .parse(&arguments(&events), false)
+            .is_ok());
+        assert!(!events.iter().any(|e| matches!(e, Event::Malformed { .. })));
+        let past_objects = objects(DEEPEST);
+        for cut in [false, true] {
+            let events = run(&[&past_objects], cut);
+            let json = arguments(&events);
+            assert!(
+                PartialJson::default().parse(&json, false).is_ok(),
+                "objects cut {cut}: a prefix the parser takes: {json}"
+            );
+            assert_eq!(
+                json,
+                format!(
+                    "{{{}{}",
+                    "\"a\": {".repeat(DEEPEST - 1),
+                    "}".repeat(DEEPEST)
+                ),
+                "objects cut {cut}: the objects close whole, the refused member not written"
+            );
+            let reported: String = events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Malformed {
+                        text,
+                        why: MalformedReason::InvalidArguments,
+                    } => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                reported,
+                format!("a:{{a:1{}}}", "}".repeat(DEEPEST)),
+                "objects cut {cut}: from the refused member's key to the object's own close"
+            );
+        }
         let past = deep(DEEPEST);
         let per_char: Vec<&str> = past
             .char_indices()
