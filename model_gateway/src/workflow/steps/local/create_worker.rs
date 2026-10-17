@@ -319,8 +319,8 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         // once, here, with the worker's address: an engine with a vision
         // encoder that does not process media references never receives an
         // image under `--mm-processing worker`. Its model's multimodal
-        // requests are refused (`no_media_ref_capable_worker`) and readiness
-        // is held while no worker of the model processes references; a
+        // requests are refused (`no_media_ref_capable_worker`) and `/readiness`
+        // names the model while no worker of it processes references; a
         // capable worker beside it lifts both, so this warns and does not
         // refuse the registration.
         if mm_settings().processing.value == MmProcessingMode::Worker {

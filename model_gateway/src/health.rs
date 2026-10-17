@@ -80,11 +80,6 @@ use crate::{
 /// land within one probe interval.
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 
-/// The `/readiness` reason while worker-side media placement has a model it
-/// cannot serve media for (see [`ReadinessSnapshot::models_without_media_processing`]).
-const MEDIA_PROCESSING_HELD_REASON: &str =
-    "no worker processes media references for a multimodal model (--mm-processing worker)";
-
 /// Result of one readiness evaluation. Field semantics are identical to the
 /// values the `/readiness` handler used to compute inline per probe.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -106,9 +101,11 @@ pub struct ReadinessSnapshot {
     /// a vision encoder and no worker of it processes media references
     /// (`multimodal::models_without_media_processing`, over every registered
     /// worker: the capability is configuration, not health). Every such
-    /// request is refused `no_media_ref_capable_worker`, so readiness is
-    /// held, naming the models, until a capable worker registers; the same
-    /// reasoning as the tokenizer gate. Empty under the other placements.
+    /// request is refused `no_media_ref_capable_worker`; the ready body names
+    /// the models (and the change is logged once) rather than holding
+    /// readiness, since the router still serves the model's text requests
+    /// and every other model, and a probe that failed would take all of them
+    /// out of rotation. Empty under the other placements.
     pub models_without_media_processing: Vec<String>,
 }
 
@@ -232,27 +229,29 @@ impl ProbeState {
                 .all(|w| tokenizer_registered(w.model_id()));
 
         // Under worker-side media placement, a model whose workers report a
-        // vision encoder and none of which processes media references would
-        // refuse every multimodal request (`no_media_ref_capable_worker`),
-        // so `/readiness` must not report ready for it either. The hold is
-        // said once per change, here, not per probe.
-        let media_held = models_without_media_processing(mm_processing, &workers);
+        // vision encoder and none of which processes media references refuses
+        // every multimodal request (`no_media_ref_capable_worker`): the ready
+        // body names it, and the change is said once, here, not per probe.
+        // Readiness itself is not held on it: the router still serves the
+        // model's text requests and every other model, and a failed probe
+        // would take the whole pod out of rotation for all of them.
+        let media_unserved = models_without_media_processing(mm_processing, &workers);
         {
             let previous = self.readiness.load();
-            if media_held != previous.models_without_media_processing {
-                if media_held.is_empty() {
+            if media_unserved != previous.models_without_media_processing {
+                if media_unserved.is_empty() {
                     info!(
                         models = ?previous.models_without_media_processing,
                         "every multimodal model has a worker that processes media references \
-                         again; readiness is no longer held for it"
+                         again; /readiness no longer names any"
                     );
                 } else {
                     warn!(
-                        models = ?media_held,
+                        models = ?media_unserved,
                         "no worker processes media references for a model whose workers report \
                          a vision encoder: under --mm-processing worker its multimodal requests \
-                         are refused (no_media_ref_capable_worker) and /readiness reports not \
-                         ready until such a worker registers"
+                         are refused (no_media_ref_capable_worker) and /readiness names the model \
+                         under models_without_media_processing until such a worker registers"
                     );
                 }
             }
@@ -263,7 +262,7 @@ impl ProbeState {
             tokenizers_ready,
             healthy_workers: healthy_workers.len(),
             total_workers: workers.len(),
-            models_without_media_processing: media_held,
+            models_without_media_processing: media_unserved,
         }));
     }
 
@@ -275,8 +274,9 @@ impl ProbeState {
     /// reason `"draining"` so load balancers stop routing new connections
     /// during shutdown (liveness intentionally stays OK — see module docs);
     /// and while worker-side media placement has a model no worker processes
-    /// media for, it reports not-ready with that reason and the `models`
-    /// held on.
+    /// media for, the ready body names it under
+    /// `models_without_media_processing` (the status stays ready: the pod
+    /// serves everything else).
     pub fn readiness_response(&self) -> Response {
         if self.inflight_tracker.is_draining() {
             return mark_probe(
@@ -292,42 +292,33 @@ impl ProbeState {
         }
 
         let snapshot = self.readiness.load();
-        if snapshot.workers_ready
-            && snapshot.tokenizers_ready
-            && snapshot.models_without_media_processing.is_empty()
-        {
+        if snapshot.workers_ready && snapshot.tokenizers_ready {
+            let mut body = json!({
+                "status": "ready",
+                "healthy_workers": snapshot.healthy_workers,
+                "total_workers": snapshot.total_workers
+            });
+            if !snapshot.models_without_media_processing.is_empty() {
+                body["models_without_media_processing"] =
+                    json!(snapshot.models_without_media_processing);
+            }
+            mark_probe((StatusCode::OK, Json(body)).into_response())
+        } else {
+            let reason = if snapshot.workers_ready {
+                "tokenizer not yet registered"
+            } else {
+                "insufficient healthy workers"
+            };
             mark_probe(
                 (
-                    StatusCode::OK,
+                    StatusCode::SERVICE_UNAVAILABLE,
                     Json(json!({
-                        "status": "ready",
-                        "healthy_workers": snapshot.healthy_workers,
-                        "total_workers": snapshot.total_workers
+                        "status": "not ready",
+                        "reason": reason
                     })),
                 )
                     .into_response(),
             )
-        } else {
-            // The pool's own holds come first: a fleet with no healthy worker
-            // or no tokenizer is not ready whatever its media placement.
-            let body = if !snapshot.workers_ready {
-                json!({
-                    "status": "not ready",
-                    "reason": "insufficient healthy workers"
-                })
-            } else if !snapshot.tokenizers_ready {
-                json!({
-                    "status": "not ready",
-                    "reason": "tokenizer not yet registered"
-                })
-            } else {
-                json!({
-                    "status": "not ready",
-                    "reason": MEDIA_PROCESSING_HELD_REASON,
-                    "models": snapshot.models_without_media_processing
-                })
-            };
-            mark_probe((StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response())
         }
     }
 }
@@ -840,14 +831,15 @@ mod tests {
     }
 
     /// Under worker-side media placement, a model whose workers report a
-    /// vision encoder and none of which processes media references holds
-    /// readiness, with its own reason and the models named, until a capable
-    /// worker registers; the other placements, and pools that say nothing
-    /// about vision, never hold it. Every multimodal request of such a model
-    /// would be refused, so reporting ready would be wrong the same way an
-    /// unregistered tokenizer's would. The pool's own holds come first.
+    /// vision encoder and none of which processes media references is named
+    /// in the ready body, until a capable worker registers; the other
+    /// placements, and pools that say nothing about vision, name nothing.
+    /// Readiness itself stays ready: the pod serves the model's text requests
+    /// and every other model, and a failed probe would take all of them out
+    /// of rotation. The pool's own holds still answer not ready, without the
+    /// field.
     #[tokio::test]
-    async fn worker_media_placement_holds_readiness_while_no_worker_processes_media() {
+    async fn worker_media_placement_names_models_without_media_processing_while_ready() {
         use crate::{routers::grpc::multimodal::SUPPORTS_VISION_LABEL, worker::RuntimeType};
 
         fn vision_worker(url: &str, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
@@ -894,21 +886,23 @@ mod tests {
             vec!["qwen-vl".to_string()]
         );
         let response = state.readiness_response();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::OK);
         assert!(response.extensions().get::<ProbeResponse>().is_some());
         let body = body_of(response).await;
-        assert_eq!(body["status"], "not ready");
-        assert_eq!(body["reason"], MEDIA_PROCESSING_HELD_REASON);
-        assert_eq!(body["models"], json!(["qwen-vl"]));
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["healthy_workers"], 1);
+        assert_eq!(body["models_without_media_processing"], json!(["qwen-vl"]));
 
         // The other placements serve such a model's media on the router.
         for placement in [MmProcessingMode::Auto, MmProcessingMode::Router] {
             state.recompute_with(&registry, &router_config, |_| true, placement);
             assert!(state.readiness().models_without_media_processing.is_empty());
-            assert_eq!(state.readiness_response().status(), StatusCode::OK);
+            let body = body_of(state.readiness_response()).await;
+            assert_eq!(body["status"], "ready");
+            assert!(body.get("models_without_media_processing").is_none());
         }
 
-        // A worker that processes media references lifts the hold.
+        // A worker that processes media references takes the model off the list.
         registry
             .register(vision_worker(
                 "grpc://v2:9000",
@@ -924,14 +918,18 @@ mod tests {
         assert!(state.readiness().models_without_media_processing.is_empty());
         let response = state.readiness_response();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(body_of(response).await["healthy_workers"], 2);
+        let body = body_of(response).await;
+        assert_eq!(body["healthy_workers"], 2);
+        assert!(body.get("models_without_media_processing").is_none());
 
-        // The pool's own hold comes first in the reason.
+        // The pool's own hold still answers not ready, without the field.
         let empty = WorkerRegistry::new();
         state.recompute_with(&empty, &router_config, |_| true, MmProcessingMode::Worker);
-        let body = body_of(state.readiness_response()).await;
+        let response = state.readiness_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_of(response).await;
         assert_eq!(body["reason"], "insufficient healthy workers");
-        assert!(body.get("models").is_none());
+        assert!(body.get("models_without_media_processing").is_none());
     }
 
     #[test]

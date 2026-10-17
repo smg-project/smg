@@ -118,9 +118,11 @@ advertises `mm_processor`, answered before any worker is chosen; a family
 without the opt-in forwards when every media-processing worker of the model
 runs `smg`, and its requests are placed on `smg` workers only, so a worker on
 the engine's own processor never receives an anchor it cannot expand; while a
-model whose workers report a vision encoder has no such worker, `/readiness`
-reports not ready and names the model, and each such worker is warned about
-once at registration); the outcome is counted in
+model whose workers report a vision encoder has no worker advertising
+`mm_processor`, the ready body of `/readiness` names the model under
+`models_without_media_processing`, the pod staying ready for its text requests
+and its other models, and each vision worker without a media processor is
+warned about once at registration); the outcome is counted in
 `smg_mm_processing_total{model,mode,reason}` (`pipeline_workers` and
 `auto_pipeline` name the forwarded-by-the-pipeline case), and the startup line
 `multimodal processing mode` names the value and its source (`flag`, `env` or

@@ -24,7 +24,7 @@ use crate::{
         error,
         grpc::context::WorkerSelection,
     },
-    worker::{ConnectionMode, RuntimeType, Worker, WorkerRegistry},
+    worker::{ConnectionMode, RuntimeType, Worker, WorkerRegistry, WorkerType},
 };
 
 /// Worker label carrying the advertised backend (`GetServerInfo.mm_processor`).
@@ -274,10 +274,10 @@ pub(crate) fn vision_worker_without_media_processing(worker: &dyn Worker) -> boo
 /// The models among `workers` whose multimodal requests worker-side placement
 /// cannot serve: a model with a worker that reports a vision encoder and no
 /// worker that processes media references, judged over every registered
-/// worker (healthy or not: the capability is configuration). What readiness
-/// is held on, sorted for a stable line and body. Empty under any other
-/// placement: `auto` processes such a model's media on the router, `router`
-/// always does.
+/// worker (healthy or not: the capability is configuration). What `/readiness`
+/// names in its ready body, sorted for a stable line and body. Empty under any
+/// other placement: `auto` processes such a model's media on the router,
+/// `router` always does.
 pub(crate) fn models_without_media_processing(
     processing: MmProcessingMode,
     workers: &[Arc<dyn Worker>],
@@ -381,16 +381,22 @@ fn router_serves(plan: &MediaPlan, placeholders: &PlaceholderTokens) -> bool {
 /// between). Every registered worker counts, healthy or not, as under `auto`:
 /// the capability is configuration, not health. A model with no worker at all
 /// is left to selection, which answers for it (the 404 of a model nobody
-/// serves, or the disaggregated leg that is missing).
+/// serves, or the disaggregated leg that is missing). So is a pool with an
+/// encode worker, the encode-prefill-decode pipeline: media references never
+/// travel on it whatever its workers advertise, and selection refuses them
+/// with the request's own 400 (`EncodeNotSupported`), which names the fix
+/// that applies there (`--mm-processing auto` or `router`, not a worker-side
+/// processor).
 fn ensure_fleet_processes_media_refs(
     registry: &WorkerRegistry,
     model_id: &str,
 ) -> Result<(), MmRefsError> {
     let workers = registry.get_by_model(model_id);
     if workers.is_empty()
-        || workers
-            .iter()
-            .any(|worker| worker_accepts_media_refs(worker.as_ref()))
+        || workers.iter().any(|worker| {
+            matches!(worker.worker_type(), WorkerType::Encode)
+                || worker_accepts_media_refs(worker.as_ref())
+        })
     {
         return Ok(());
     }
@@ -1008,6 +1014,29 @@ mod tests {
             resolve_mm_processing(&components, &other_engine, MODEL, &plan_ok, &placeholders),
             Err(MmRefsError::NoCapableWorker { workers: 1, .. })
         ));
+
+        // A pool with an encode worker runs the encode-prefill-decode
+        // pipeline, on which media references never travel whatever the
+        // workers advertise: left to selection, whose refusal is the
+        // request's own 400 and names the fix that applies there.
+        let encode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:9805")
+                .model(ModelCard::new(MODEL))
+                .worker_type(WorkerType::Encode)
+                .runtime_type(RuntimeType::Vllm)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let epd = registry_with(vec![plain("grpc://127.0.0.1:9806"), encode]);
+        assert_eq!(
+            resolve_mm_processing(&components, &epd, MODEL, &plan_ok, &placeholders)
+                .expect("an encode-prefill-decode pool is selection's to refuse"),
+            MmProcessing::Worker
+        );
 
         let mixed = registry_with(vec![
             plain("grpc://127.0.0.1:9803"),
