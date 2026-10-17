@@ -32,15 +32,15 @@ use crate::event::{Event, Events, MalformedReason, Text};
 
 /// The end of a started call that was cut, for the four assemblers of this module and the
 /// pythonic one: by the end of the stream, whatever stage the cut found, or by the call's closing
-/// marker (the region's, or the next call's opener) inside a streamed string. Each writes the arguments object itself and
-/// closes it only at the call's own end, so the fragments sent are no whole JSON value: a string
-/// left open, a value held for its close, or no member yet. The fragments stand, since a fragment
-/// passed on cannot be taken back, nothing is made up for what the model never finished (no
-/// closing quote, no closing brace), and one `Malformed` event before the call's end says that
-/// the arguments are no whole value, as the JSON assembler says it: it carries the bytes still
-/// held (the start of a tag, a value's text, the template's newline; a pythonic key or separator
-/// cut short), or none when the cut fell
-/// between events, so that a client that reads the arguments as JSON is told rather than left to
+/// marker (the region's, or the next call's opener) inside a streamed string. Each writes the
+/// arguments object itself and closes it only at the call's own end, so the fragments sent are no
+/// whole JSON value: a string left open, a value held for its close, or no member yet. The
+/// fragments stand, since a fragment passed on cannot be taken back, nothing is made up for what
+/// the model never finished (no closing quote, no closing brace), and one `Malformed` event before
+/// the call's end says that the arguments are no whole value, as the JSON assembler says it: it
+/// carries the bytes still held (the start of a tag, a value's text, the template's newline; a
+/// pythonic key or separator cut short), or none when the cut fell between events, so that a
+/// client that reads the arguments as JSON is told rather than left to
 /// find out. The reason is `UnterminatedRegion`, which the engine keeps for a region the end of
 /// the stream cut and renames for one a marker closed; `terminal` is the marker's bytes when they
 /// are the call's own end, and nothing when they are the region's or the stream ended.
