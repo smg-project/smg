@@ -146,6 +146,8 @@ def test_engine_generate_error_is_classified_by_its_cause(split_hierarchy, cause
         (HTTPStatus.NOT_FOUND, grpc.StatusCode.NOT_FOUND),
         (HTTPStatus.TOO_MANY_REQUESTS, grpc.StatusCode.RESOURCE_EXHAUSTED),
         (HTTPStatus.SERVICE_UNAVAILABLE, grpc.StatusCode.UNAVAILABLE),
+        (HTTPStatus.REQUEST_TIMEOUT, grpc.StatusCode.DEADLINE_EXCEEDED),
+        (HTTPStatus.GATEWAY_TIMEOUT, grpc.StatusCode.DEADLINE_EXCEEDED),
         (HTTPStatus.INTERNAL_SERVER_ERROR, grpc.StatusCode.INTERNAL),
         (HTTPStatus.IM_A_TEAPOT, grpc.StatusCode.INTERNAL),
     ],
