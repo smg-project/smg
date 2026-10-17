@@ -22,6 +22,7 @@
 //! beside it: the only allocations. Suppressed calls are counted and write no line.
 
 use std::{
+    borrow::Cow,
     sync::{
         atomic::{AtomicU32, Ordering},
         OnceLock,
@@ -135,7 +136,7 @@ pub(crate) struct FirstRun {
     /// Its `reason` label.
     pub reason: &'static str,
     /// The crate's reason: the label, or the text of `Other`.
-    pub why: String,
+    pub why: Cow<'static, str>,
     /// Where it starts in the output, in bytes.
     pub at: usize,
     /// Its length in bytes.
@@ -169,8 +170,8 @@ impl Tally {
                     self.first = Some(FirstRun {
                         reason: reason_label(why),
                         why: match why {
-                            MalformedReason::Other(text) => text.to_string(),
-                            typed => reason_label(typed).to_string(),
+                            MalformedReason::Other(text) => text.clone(),
+                            typed => Cow::Borrowed(reason_label(typed)),
                         },
                         at: self.at,
                         bytes: text.text.len(),
@@ -242,7 +243,7 @@ impl Tally {
         let (reason, why, at, bytes, excerpt) = match &self.first {
             Some(first) => (
                 first.reason,
-                first.why.as_str(),
+                first.why.as_ref(),
                 first.at,
                 first.bytes,
                 first.excerpt.as_str(),
