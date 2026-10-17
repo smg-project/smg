@@ -17,7 +17,7 @@ pub fn init_mesh_metrics() {
     // Peer health metrics
     describe_gauge!(
         "router_mesh_peer_connections",
-        "Number of active peer connections"
+        "Open sync streams accepted from each peer"
     );
     describe_counter!(
         "router_mesh_peer_reconnects_total",
@@ -57,12 +57,36 @@ pub fn init_mesh_metrics() {
     );
 }
 
-/// Update peer connection status
-pub fn update_peer_connections(peer: &str, connected: bool) {
+/// A sync stream accepted from `peer`, counted in
+/// `router_mesh_peer_connections` for as long as this value lives. The gauge
+/// is the number of such streams open now, so two that overlap (the dialer
+/// redialed before the handler of its old stream reached the idle timeout)
+/// add up, and the older one's close leaves the live one counted. The count
+/// goes with the drop, so a stream ends counted however its handler ends.
+#[must_use = "the stream is counted for as long as this value lives"]
+pub struct PeerConnection {
+    peer: String,
+}
+
+/// Count a sync stream accepted from `peer` as open, until the returned value
+/// is dropped.
+pub fn peer_connection_opened(peer: &str) -> PeerConnection {
     gauge!("router_mesh_peer_connections",
         "peer" => peer.to_string()
     )
-    .set(if connected { 1.0 } else { 0.0 });
+    .increment(1.0);
+    PeerConnection {
+        peer: peer.to_string(),
+    }
+}
+
+impl Drop for PeerConnection {
+    fn drop(&mut self) {
+        gauge!("router_mesh_peer_connections",
+            "peer" => self.peer.clone()
+        )
+        .decrement(1.0);
+    }
 }
 
 /// Record peer reconnection

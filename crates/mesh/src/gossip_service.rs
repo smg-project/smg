@@ -47,7 +47,7 @@ use tracing::instrument;
 
 use super::{
     crdt_kv::CrdtWatermark,
-    metrics::{record_ack, record_nack, record_peer_reconnect, update_peer_connections},
+    metrics::{peer_connection_opened, record_ack, record_nack, record_peer_reconnect},
     mtls::MTLSManager,
     partition::PartitionDetector,
     service::{
@@ -376,10 +376,12 @@ impl Gossip for GossipService {
             reason = "server-side inbound handler bound to sync_stream lifetime; terminates when the stream closes"
         )]
         tokio::spawn(async move {
-            // The dialer's name comes with its first frame; the peer gauge is
-            // written under that name only, so no series carries a
-            // placeholder for the time before the name is known.
+            // The dialer's name comes with its first frame; the stream is
+            // counted under that name only, so no series carries a
+            // placeholder for the time before the name is known. The count
+            // lives in `counted` and goes when the task ends, however it ends.
             let mut peer_id = String::new();
+            let mut counted = None;
             let mut sequence: u64 = 0;
 
             while let Some(msg) = next_frame(&mut incoming, &peer_id).await {
@@ -391,7 +393,7 @@ impl Gossip for GossipService {
                 if peer_id.is_empty() {
                     if !msg.peer_id.is_empty() {
                         peer_id = msg.peer_id.clone();
-                        update_peer_connections(&peer_id, true);
+                        counted = Some(peer_connection_opened(&peer_id));
                         *learned_peer_inbound.write() = Some(peer_id.clone());
                     }
                 } else if msg.peer_id != peer_id {
@@ -425,10 +427,11 @@ impl Gossip for GossipService {
                 }
             }
 
-            // A stream that closed before its first frame named the dialer
-            // was never a peer connection: nothing is recorded for it.
-            if !peer_id.is_empty() {
-                update_peer_connections(&peer_id, false);
+            // The stream is over: its count goes with the guard, and its end
+            // is counted under the name it was learned as. A stream that
+            // closed before its first frame named the dialer was never a peer
+            // connection: nothing is recorded for it.
+            if counted.take().is_some() {
                 record_peer_reconnect(&peer_id);
             }
             if let Some(handle) = sender_handle {
@@ -454,7 +457,8 @@ mod tests {
     use std::{future::Future, net::SocketAddr, time::Duration};
 
     use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-    use tokio_stream::StreamExt;
+    use tokio::sync::mpsc;
+    use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 
     use crate::{
         service::gossip::{gossip_client::GossipClient, StreamMessage},
@@ -473,16 +477,27 @@ mod tests {
         F: FnOnce(PrometheusHandle) -> Fut,
         Fut: Future<Output = ()>,
     {
+        let (rendered, ()) = metrics_and_result_of(scenario);
+        rendered
+    }
+
+    /// [`metrics_of`] for a scenario with a result of its own: the rendered
+    /// text and that result.
+    fn metrics_and_result_of<F, Fut, T>(scenario: F) -> (String, T)
+    where
+        F: FnOnce(PrometheusHandle) -> Fut,
+        Fut: Future<Output = T>,
+    {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
-        metrics::with_local_recorder(&recorder, || {
+        let result = metrics::with_local_recorder(&recorder, || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("runtime");
-            rt.block_on(scenario(handle.clone()));
+            rt.block_on(scenario(handle.clone()))
         });
-        handle.render()
+        (handle.render(), result)
     }
 
     /// The peer gauge's lines of a rendered scrape.
@@ -621,6 +636,84 @@ mod tests {
         assert!(
             !rendered.contains("peer=\"\""),
             "a series without a peer name:\n{rendered}"
+        );
+    }
+
+    /// The peer gauge's line for `peer` in a rendered scrape.
+    fn peer_gauge_line(rendered: &str, peer: &str) -> Option<String> {
+        let prefix = format!("{PEER_GAUGE}{{peer=\"{peer}\"}} ");
+        rendered
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .map(str::to_owned)
+    }
+
+    /// Two accepted streams from one dialer overlap, as they do when the
+    /// dialer redials before the acceptor's handler of the old stream has
+    /// timed out: the gauge counts the open streams, so it reads 2 while
+    /// both are open and 1 once the first closed, not 0 while a stream is
+    /// live.
+    #[test]
+    fn overlapping_streams_of_one_dialer_add_up() {
+        let (_, (while_both_open, after_first_closed)) =
+            metrics_and_result_of(|metrics| async move {
+                let (addr, handler) = node("A", None).await;
+                wait_for(
+                    || std::net::TcpStream::connect(addr).is_ok(),
+                    Duration::from_secs(5),
+                    "mesh listener started",
+                )
+                .await;
+                let mut client = GossipClient::connect(format!("http://{addr}"))
+                    .await
+                    .expect("connect to the mesh listener");
+                // Each stream names the dialer with one heartbeat; the acceptor's
+                // answer to it is the sign that its handler learned the name.
+                let mut open = Vec::new();
+                for _ in 0..2 {
+                    let (tx, rx) = mpsc::channel::<StreamMessage>(4);
+                    let mut inbound = client
+                        .sync_stream(ReceiverStream::new(rx))
+                        .await
+                        .expect("open the sync stream")
+                        .into_inner();
+                    tx.send(build_heartbeat(1, "probe"))
+                        .await
+                        .expect("send the heartbeat");
+                    tokio::time::timeout(Duration::from_secs(10), inbound.next())
+                        .await
+                        .expect("the acceptor answers the heartbeat")
+                        .expect("a frame")
+                        .expect("a frame, not a status");
+                    open.push((tx, inbound));
+                }
+                let while_both_open = metrics.render();
+
+                // The first stream ends; its response stream ends once the
+                // acceptor's handler has run its close path.
+                let (tx_first, mut inbound_first) = open.remove(0);
+                drop(tx_first);
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while inbound_first.next().await.is_some() {}
+                })
+                .await
+                .expect("the acceptor closes its side of a stream the dialer ended");
+                let after_first_closed = metrics.render();
+
+                drop(open);
+                handler.shutdown();
+                (while_both_open, after_first_closed)
+            });
+
+        assert_eq!(
+            peer_gauge_line(&after_first_closed, "probe").as_deref(),
+            Some("router_mesh_peer_connections{peer=\"probe\"} 1"),
+            "one stream is still open after the first closed:\n{after_first_closed}"
+        );
+        assert_eq!(
+            peer_gauge_line(&while_both_open, "probe").as_deref(),
+            Some("router_mesh_peer_connections{peer=\"probe\"} 2"),
+            "two streams were open:\n{while_both_open}"
         );
     }
 }
