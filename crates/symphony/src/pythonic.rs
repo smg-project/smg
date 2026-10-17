@@ -706,11 +706,12 @@ mod tests {
                         ),
                         "{text:?}: the word comes right before the end"
                     );
-                    // Nothing is made up: a cut call's fragments never close its object.
+                    // Nothing is made up: a cut call's fragments never close its object, so
+                    // they are no whole JSON value (a member's own `}` may end them).
                     assert!(
-                        calls(&events)
-                            .last()
-                            .is_some_and(|(_, _, arguments)| !arguments.ends_with('}')),
+                        calls(&events).last().is_some_and(|(_, _, arguments)| {
+                            serde_json::from_str::<serde_json::Value>(arguments).is_err()
+                        }),
                         "{text:?}: the cut call's arguments stay open"
                     );
                 } else if held.is_empty() {
