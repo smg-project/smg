@@ -616,3 +616,47 @@ async fn a_completions_stream_that_ends_without_a_complete_books_the_dispatch_pr
          usage chunk has it"
     );
 }
+
+#[tokio::test]
+async fn a_two_choice_stream_on_a_cumulative_engine_books_every_token_delivered_when_the_client_leaves(
+) {
+    let tenant = "auth:usage-row-two-choices-client-gone";
+    // A cumulative engine answering n=2: choice 0 streams five tokens and
+    // completes while choice 1 has streamed three; the client leaves, and
+    // choice 1's next three tokens cannot be sent.
+    let (gate, held) = oneshot::channel();
+    let (stream, server) = gated_scheduler_stream(
+        vec![
+            scheduler_chunk(0, "Hello", 5),
+            scheduler_chunk(1, "abc", 3),
+            scheduler_complete(0, 7, "Hello"),
+        ],
+        held,
+        vec![scheduler_chunk(1, "def", 6)],
+    )
+    .await;
+    let mut spec = chat_spec(false);
+    spec.expected_choices = 2;
+    let mut body = chat_response_of(stream, dispatch(tenant), spec)
+        .await
+        .into_body();
+
+    // The client reads what the engine's first messages produced ...
+    while let Ok(Some(frame)) = tokio::time::timeout(Duration::from_millis(500), body.frame()).await
+    {
+        frame.expect("an SSE frame");
+    }
+    // ... and leaves. The settle at choice 0's Complete must keep the three
+    // tokens choice 1 had streamed (its own Complete never comes), so that
+    // the row books every token the engine delivered: 5 + 3, then 3 more.
+    drop(body);
+    let _ = gate.send(());
+
+    assert_eq!(
+        counts(&booked(tenant).await),
+        (1, 7, 11),
+        "one request; the engine's prompt count; the tokens delivered on both choices, the \
+         second's running count included, not the first choice's five alone"
+    );
+    server.abort();
+}
