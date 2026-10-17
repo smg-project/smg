@@ -16,20 +16,20 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use common::grpc_harness::{build_grpc_router, grpc_router_config, grpc_worker, serve_engine};
 use metrics_exporter_prometheus::PrometheusBuilder;
-use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+use openai_protocol::model_card::ModelCard;
 use proto::generate_response::Response as GenResp;
 use smg::{
-    config::{RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
-    routers::{RouterFactory, RouterTrait},
+    routers::RouterTrait,
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
+    worker::{RuntimeType, Worker, WorkerType},
 };
 use smg_grpc_client::vllm_proto as proto;
-use tokio::{net::TcpListener, sync::mpsc};
-use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
-use tonic::{transport::Server, Request, Response, Status};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status};
 
 const MODEL: &str = "pd-kv-store-connector-test-model";
 /// Tokens every mock answers with; ids 1..=3 are in the mock tokenizer's vocabulary.
@@ -201,23 +201,8 @@ impl proto::vllm_engine_server::VllmEngine for RecordingEngine {
 }
 
 /// Serve a recording mock engine in-process; returns its port.
-#[expect(
-    clippy::expect_used,
-    clippy::disallowed_methods,
-    reason = "test helper - panicking on failure is intentional; the spawned \
-              mock server task is fire-and-forget for the test process's lifetime"
-)]
 async fn start_mock_engine(engine: RecordingEngine) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock engine");
-    let port = listener.local_addr().expect("mock engine address").port();
-    tokio::spawn(
-        Server::builder()
-            .add_service(proto::vllm_engine_server::VllmEngineServer::new(engine))
-            .serve_with_incoming(TcpListenerStream::new(listener)),
-    );
-    port
+    serve_engine(proto::vllm_engine_server::VllmEngineServer::new(engine)).await
 }
 
 /// A loopback port nothing listens on: the bootstrap port of the rendezvous
@@ -243,51 +228,29 @@ struct Leg {
 
 /// A PD gRPC router over the given legs, all of the sequential-dispatch
 /// runtime, with pairing in its default mode.
-#[expect(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
 async fn build_pd_router(legs: &[Leg]) -> Box<dyn RouterTrait> {
-    let mut config = RouterConfig::builder()
-        .mode(RoutingMode::PrefillDecode {
-            prefill_urls: vec![],
-            decode_urls: vec![],
-            prefill_policy: None,
-            decode_policy: None,
-        })
-        .grpc_connection()
+    let config = grpc_router_config()
+        .prefill_decode_mode(vec![], vec![])
         .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(1024 * 1024)
         .build_unchecked();
-    config.health_check.disable_health_check = true;
-
-    let app_context = common::create_test_context_with_mock_tokenizer(config, MODEL).await;
-    for leg in legs {
-        let mut builder = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{}", leg.port))
-            .worker_type(leg.worker_type)
-            .connection_mode(ConnectionMode::Grpc)
-            .runtime_type(RuntimeType::Vllm)
+    let workers = legs
+        .iter()
+        .map(|leg| {
+            let mut builder = grpc_worker(
+                leg.port,
+                leg.worker_type,
+                RuntimeType::Vllm,
+                ModelCard::new(MODEL),
+            )
             .kv_connector(leg.connector)
-            .bootstrap_port(leg.bootstrap_port)
-            .model(ModelCard::new(MODEL))
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            });
-        if leg.worker_type == WorkerType::Prefill {
-            builder = builder.kv_engine_id("prefill-0");
-        }
-        app_context
-            .worker_registry
-            .register(Arc::new(builder.build()))
-            .unwrap();
-    }
-    RouterFactory::create_router(&app_context)
-        .await
-        .expect("PD gRPC router should build")
+            .bootstrap_port(leg.bootstrap_port);
+            if leg.worker_type == WorkerType::Prefill {
+                builder = builder.kv_engine_id("prefill-0");
+            }
+            Arc::new(builder.build()) as Arc<dyn Worker>
+        })
+        .collect();
+    build_grpc_router(config, MODEL, workers).await
 }
 
 fn tenant() -> TenantRequestMeta {

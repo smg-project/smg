@@ -18,18 +18,19 @@ mod common;
 use std::{sync::Arc, time::Duration};
 
 use axum::http::StatusCode;
+use common::grpc_harness::{
+    build_grpc_router, grpc_router_config, grpc_worker, serve_canned_worker, Canned,
+};
 use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, model_card::ModelCard,
-    worker::HealthCheckConfig,
 };
 use smg::{
-    config::{RouterConfig, RoutingMode},
+    config::RoutingMode,
     middleware::TenantRequestMeta,
-    routers::{RouterFactory, RouterTrait},
+    routers::RouterTrait,
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
+    worker::{RuntimeType, WorkerType},
 };
-use tokio::net::TcpListener;
 
 const MODEL: &str = "context-length-test-model";
 /// Context window every worker in these tests advertises.
@@ -38,41 +39,13 @@ const CONTEXT_LENGTH_EXCEEDED: &str = "context_length_exceeded";
 const PREFILL_FAILED: &str = "prefill_worker_failed_to_start";
 
 /// Spawn an in-process mock gRPC worker that accepts any prompt length.
-#[expect(
-    clippy::expect_used,
-    clippy::disallowed_methods,
-    reason = "test helper - panicking on failure is intentional; the spawned \
-              mock server task is fire-and-forget for the test process's lifetime"
-)]
 async fn start_mock_grpc_worker() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock gRPC worker");
-    let port = listener
-        .local_addr()
-        .expect("mock gRPC worker address")
-        .port();
-    let cfg = Arc::new(mock_worker::config::Config {
-        admin_port: None,
-        context_length: 32768,
-        host: "127.0.0.1".to_string(),
-        http_base_port: 0,
-        http_count: 0,
-        grpc_base_port: port,
-        grpc_count: 1,
-        zmq_handshake: None,
-        zmq_count: 0,
-        zmq_start_index: 0,
-        model_id: MODEL.to_string(),
-        tokenizer_path: MODEL.to_string(),
+    serve_canned_worker(Canned {
+        model: MODEL,
         gen_delay: Duration::ZERO,
         output_tokens: 2,
-        realistic: false,
-        engine: mock_worker::engine::EngineParams::default(),
-        ..mock_worker::config::Config::default()
-    });
-    tokio::spawn(mock_worker::grpc::serve_with_listener(cfg, listener));
-    port
+    })
+    .await
 }
 
 fn worker(
@@ -84,46 +57,18 @@ fn worker(
     if let Some(len) = context_length {
         card = card.with_context_length(len);
     }
-    Arc::new(
-        BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
-            .worker_type(worker_type)
-            .connection_mode(ConnectionMode::Grpc)
-            .runtime_type(RuntimeType::TokenSpeed)
-            .model(card)
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
-            .build(),
-    )
+    Arc::new(grpc_worker(port, worker_type, RuntimeType::TokenSpeed, card).build())
 }
 
-#[expect(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
 async fn build_router(
     mode: RoutingMode,
     workers: Vec<Arc<dyn smg::worker::Worker>>,
 ) -> Box<dyn RouterTrait> {
-    let mut config = RouterConfig::builder()
+    let config = grpc_router_config()
         .mode(mode)
-        .grpc_connection()
         .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(1024 * 1024)
         .build_unchecked();
-    config.health_check.disable_health_check = true;
-
-    let app_context = common::create_test_context_with_mock_tokenizer(config, MODEL).await;
-    for worker in workers {
-        app_context.worker_registry.register(worker).unwrap();
-    }
-    RouterFactory::create_router(&app_context)
-        .await
-        .expect("gRPC router should build")
+    build_grpc_router(config, MODEL, workers).await
 }
 
 async fn pd_router(prefill_ctx: Option<u32>, decode_ctx: Option<u32>) -> Box<dyn RouterTrait> {

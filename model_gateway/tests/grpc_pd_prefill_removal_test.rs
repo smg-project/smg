@@ -9,19 +9,22 @@ mod common;
 
 use std::{sync::Arc, time::Duration};
 
+use common::grpc_harness::{
+    grpc_router, grpc_router_config, grpc_test_context, grpc_worker, health_checks_off,
+    serve_canned_worker, Canned,
+};
 use openai_protocol::{
     completion::CompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
 };
 use smg::{
     app_context::AppContext,
-    config::{PolicyConfig, RouterConfig, RoutingMode},
+    config::{PolicyConfig, RoutingMode},
     middleware::TenantRequestMeta,
-    routers::{RouterFactory, RouterTrait},
+    routers::RouterTrait,
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType},
+    worker::{RuntimeType, Worker, WorkerType},
     workflow::Job,
 };
-use tokio::net::TcpListener;
 
 const MODEL: &str = "pd-prefill-removal-test-model";
 /// The bucket's first split hands 4096 size units out evenly: with three
@@ -33,41 +36,13 @@ const IN_THE_MIDDLE_RANGE: usize = 2000;
 const IN_THE_LAST_RANGE: usize = 3000;
 
 /// Spawn a canned mock gRPC worker in-process.
-#[expect(
-    clippy::expect_used,
-    clippy::disallowed_methods,
-    reason = "test helper - panicking on failure is intentional; the spawned \
-              mock server task is fire-and-forget for the test process's lifetime"
-)]
 async fn start_mock_grpc_worker() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock gRPC worker");
-    let port = listener
-        .local_addr()
-        .expect("mock gRPC worker address")
-        .port();
-    let cfg = Arc::new(mock_worker::config::Config {
-        admin_port: None,
-        context_length: 32768,
-        host: "127.0.0.1".to_string(),
-        http_base_port: 0,
-        http_count: 0,
-        grpc_base_port: port,
-        grpc_count: 1,
-        zmq_handshake: None,
-        zmq_count: 0,
-        zmq_start_index: 0,
-        model_id: MODEL.to_string(),
-        tokenizer_path: MODEL.to_string(),
+    serve_canned_worker(Canned {
+        model: MODEL,
         gen_delay: Duration::ZERO,
         output_tokens: 3,
-        realistic: false,
-        engine: mock_worker::engine::EngineParams::default(),
-        ..mock_worker::config::Config::default()
-    });
-    tokio::spawn(mock_worker::grpc::serve_with_listener(cfg, listener));
-    port
+    })
+    .await
 }
 
 struct Bed {
@@ -79,13 +54,8 @@ struct Bed {
 /// A PD gRPC router with the bucket prefill policy over `prefill_ports` mock
 /// prefill workers and one mock decode worker, all registered as the
 /// rendezvous-room runtime the canned mock serves.
-#[expect(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
 async fn build_bed(prefill_ports: &[u16], decode_port: u16) -> Bed {
-    let mut config = RouterConfig::builder()
+    let config = grpc_router_config()
         .mode(RoutingMode::PrefillDecode {
             prefill_urls: vec![],
             decode_urls: vec![],
@@ -98,46 +68,37 @@ async fn build_bed(prefill_ports: &[u16], decode_port: u16) -> Bed {
             }),
             decode_policy: None,
         })
-        .grpc_connection()
         .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(1024 * 1024)
         .build_unchecked();
-    config.health_check.disable_health_check = true;
+    let app_context = grpc_test_context(config, MODEL).await;
 
-    let app_context = common::create_test_context_with_mock_tokenizer(config, MODEL).await;
-
-    let mut prefill_workers: Vec<Arc<dyn Worker>> = Vec::new();
     let roles = prefill_ports
         .iter()
         .map(|port| (*port, WorkerType::Prefill))
         .chain([(decode_port, WorkerType::Decode)]);
-    for (port, worker_type) in roles {
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
-                .worker_type(worker_type)
-                .connection_mode(ConnectionMode::Grpc)
-                .runtime_type(RuntimeType::TokenSpeed)
-                .model(ModelCard::new(MODEL))
+    let workers: Vec<Arc<dyn Worker>> = roles
+        .map(|(port, worker_type)| {
+            Arc::new(
+                grpc_worker(
+                    port,
+                    worker_type,
+                    RuntimeType::TokenSpeed,
+                    ModelCard::new(MODEL),
+                )
                 .health_config(HealthCheckConfig {
-                    disable_health_check: true,
                     drain_settle_secs: 0,
-                    ..Default::default()
+                    ..health_checks_off()
                 })
                 .build(),
-        );
-        app_context
-            .worker_registry
-            .register(Arc::clone(&worker))
-            .unwrap();
-        if matches!(worker.worker_type(), WorkerType::Prefill) {
-            prefill_workers.push(worker);
-        }
-    }
-    let router = RouterFactory::create_router(&app_context)
-        .await
-        .expect("PD gRPC router should build");
+            ) as Arc<dyn Worker>
+        })
+        .collect();
+    let prefill_workers: Vec<Arc<dyn Worker>> = workers
+        .iter()
+        .filter(|worker| matches!(worker.worker_type(), WorkerType::Prefill))
+        .cloned()
+        .collect();
+    let router = grpc_router(&app_context, workers).await;
     // What the registration workflow's policy step does once prefill workers
     // are in: the bucket policy learns their URLs and splits the sizes.
     app_context

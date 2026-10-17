@@ -20,15 +20,13 @@ mod common;
 
 use std::{sync::Arc, time::Duration};
 
-use openai_protocol::{
-    generate::GenerateRequest, model_card::ModelCard, worker::HealthCheckConfig,
-};
+use common::grpc_harness::{build_grpc_router, grpc_router_config, health_checks_off};
+use openai_protocol::{generate::GenerateRequest, model_card::ModelCard};
 use portpicker::pick_unused_port;
 use serial_test::serial;
 use smg::{
-    config::RouterConfig,
     middleware::{RouteRequestMeta, TenantKey},
-    routers::{RouterFactory, RouterTrait},
+    routers::RouterTrait,
     worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType},
 };
 
@@ -102,28 +100,16 @@ fn start_mock_zmq_engines(handshake: &str, count: u16) {
 /// Build a real gRPC-pipeline router with a single ZMQ worker registered
 /// against `fixture`. `engine_count > 1` registers a grouped worker: one
 /// worker, one socket set, N engines dialing in.
-#[expect(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
 async fn build_router(fixture: &ZmqFixture, engine_count: usize) -> Box<dyn RouterTrait> {
-    let mut config = RouterConfig::builder()
-        .grpc_connection()
+    let config = grpc_router_config()
         .regular_mode(vec![])
         .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(1024 * 1024)
         .request_timeout_secs(60)
         .worker_startup_timeout_secs(5)
         .worker_startup_check_interval_secs(1)
         .max_concurrent_requests(64)
         .queue_timeout_secs(60)
         .build_unchecked();
-    config.health_check.disable_health_check = true;
-
-    let app_context = common::create_test_context_with_mock_tokenizer(config, MODEL).await;
 
     let mut builder = BasicWorkerBuilder::new(fixture.worker_url.clone())
         .worker_type(WorkerType::Regular)
@@ -131,22 +117,13 @@ async fn build_router(fixture: &ZmqFixture, engine_count: usize) -> Box<dyn Rout
         .runtime_type(RuntimeType::Vllm)
         .zmq_handshake_address(fixture.handshake.clone())
         .model(ModelCard::new(MODEL))
-        .health_config(HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        });
+        .health_config(health_checks_off());
     if engine_count > 1 {
         builder = builder.zmq_engine_group(engine_count);
     }
     let worker = Arc::new(builder.build());
-    app_context
-        .worker_registry
-        .register(worker.clone())
-        .unwrap();
-
-    let router = RouterFactory::create_router(&app_context)
-        .await
-        .expect("router should build over a ZMQ worker");
+    let router =
+        build_grpc_router(config, MODEL, vec![Arc::clone(&worker) as Arc<dyn Worker>]).await;
 
     // Acquisition fails fast while the background driver completes the
     // handshake; wait for it to land so requests hit a connected worker. The

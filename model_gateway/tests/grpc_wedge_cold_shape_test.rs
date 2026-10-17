@@ -18,18 +18,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use openai_protocol::{
-    completion::CompletionRequest,
-    model_card::ModelCard,
-    worker::{HealthCheckConfig, WorkerStatus},
-};
+use common::grpc_harness::{grpc_router_config, grpc_test_context, grpc_worker};
+use openai_protocol::{completion::CompletionRequest, model_card::ModelCard, worker::WorkerStatus};
 use smg::{
     app_context::AppContext,
-    config::{RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
     routers::{RouterFactory, RouterTrait},
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ConnectionMode, KvEventMonitor, RuntimeType, Worker, WorkerType},
+    worker::{KvEventMonitor, RuntimeType, Worker, WorkerType},
 };
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
@@ -277,20 +273,12 @@ async fn build_bed(port: u16) -> Bed {
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .try_init();
-    let mut config = RouterConfig::builder()
-        .mode(RoutingMode::Regular {
-            worker_urls: vec![],
-        })
-        .grpc_connection()
+    let config = grpc_router_config()
+        .regular_mode(vec![])
         .random_policy()
         .disable_retries()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(1024 * 1024)
         .build_unchecked();
-    config.health_check.disable_health_check = true;
-
-    let app_context = common::create_test_context_with_mock_tokenizer(config, MODEL).await;
+    let app_context = grpc_test_context(config, MODEL).await;
     let worker_monitor = app_context
         .worker_monitor
         .clone()
@@ -299,16 +287,13 @@ async fn build_bed(port: u16) -> Bed {
     kv_monitor.set_load_sink(&worker_monitor);
 
     let worker: Arc<dyn Worker> = Arc::new(
-        BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
-            .worker_type(WorkerType::Regular)
-            .connection_mode(ConnectionMode::Grpc)
-            .runtime_type(RuntimeType::TokenSpeed)
-            .model(ModelCard::new(MODEL))
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
-            .build(),
+        grpc_worker(
+            port,
+            WorkerType::Regular,
+            RuntimeType::TokenSpeed,
+            ModelCard::new(MODEL),
+        )
+        .build(),
     );
     worker.set_status(WorkerStatus::Ready);
     app_context

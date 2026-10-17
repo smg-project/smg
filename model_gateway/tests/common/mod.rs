@@ -2,6 +2,7 @@
 #![allow(dead_code, clippy::allow_attributes, clippy::large_futures)]
 
 pub mod gateway_launch;
+pub mod grpc_harness;
 pub mod mock_mcp_server;
 #[cfg(feature = "provider-openai")]
 pub mod mock_openai_server;
@@ -632,13 +633,23 @@ pub fn create_test_context_with_mock_tokenizer(
 /// A tokenizer registry holding the mock tokenizer for `model`, loaded as
 /// `tokenizer-id` from source `test`: what the context helpers run on, for
 /// the tests that build their context some other way.
+pub async fn mock_tokenizer_registry(model: &str) -> Arc<TokenizerRegistry> {
+    tokenizer_registry_with(model, Arc::new(MockTokenizer::new())).await
+}
+
+/// A tokenizer registry holding `tokenizer` for `model`, loaded as
+/// `tokenizer-id` from source `test`: the one load behind
+/// [`mock_tokenizer_registry`] and the gRPC harness's context over a
+/// tokenizer of the binary's own.
 #[expect(
     clippy::expect_used,
     reason = "test helper - panicking on failure is intentional"
 )]
-pub async fn mock_tokenizer_registry(model: &str) -> Arc<TokenizerRegistry> {
+pub async fn tokenizer_registry_with(
+    model: &str,
+    tokenizer: Arc<dyn Tokenizer>,
+) -> Arc<TokenizerRegistry> {
     let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-    let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
     tokenizer_registry
         .load(
             "tokenizer-id",
@@ -647,7 +658,7 @@ pub async fn mock_tokenizer_registry(model: &str) -> Arc<TokenizerRegistry> {
             || async move { Ok(tokenizer) },
         )
         .await
-        .expect("the mock tokenizer loads");
+        .expect("the tokenizer loads");
     tokenizer_registry
 }
 

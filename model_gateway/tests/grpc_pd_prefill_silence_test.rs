@@ -49,29 +49,28 @@ use std::{
     time::{Duration, Instant},
 };
 
+use common::grpc_harness::{
+    build_grpc_router, grpc_router_config, grpc_worker, serve_canned_worker, serve_engine, Canned,
+};
 use futures::future::join_all;
 use metrics_exporter_prometheus::PrometheusBuilder;
-use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+use openai_protocol::model_card::ModelCard;
 use proto::generate_response::Response as GenResp;
 use smg::{
-    config::{RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
-    routers::{RouterFactory, RouterTrait},
+    routers::RouterTrait,
     tenant::TenantKey,
     worker::{
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType,
+        RuntimeType, Worker, WorkerType,
     },
 };
 use smg_grpc_client::{
     common_proto as grpc_common, tokenspeed_scheduler::tokenspeed_proto as ts, vllm_proto as proto,
 };
-use tokio::{
-    net::TcpListener,
-    sync::{mpsc, oneshot},
-};
-use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
-use tonic::{transport::Server, Request, Response, Status};
+use tokio::sync::{mpsc, oneshot};
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status};
 use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer};
 
 const MODEL: &str = "pd-prefill-silence-test-model";
@@ -532,91 +531,31 @@ impl TokenSpeedScheduler for QueuedEngine {
 
 /// Serve a queued parallel-dispatch mock engine in-process; returns its port
 /// and the engine (for its call count).
-#[expect(
-    clippy::expect_used,
-    clippy::disallowed_methods,
-    reason = "test helper - panicking on failure is intentional; the spawned \
-              mock server task is fire-and-forget for the test process's lifetime"
-)]
 async fn start_queued_grpc_worker(shape: ParallelShape) -> (u16, QueuedEngine) {
     let engine = QueuedEngine {
         gate: Gate::default(),
         shape,
         calls: Arc::new(AtomicUsize::new(0)),
     };
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind queued mock engine");
-    let port = listener
-        .local_addr()
-        .expect("queued mock engine address")
-        .port();
-    tokio::spawn(
-        Server::builder()
-            .add_service(TokenSpeedSchedulerServer::new(engine.clone()))
-            .serve_with_incoming(TcpListenerStream::new(listener)),
-    );
+    let port = serve_engine(TokenSpeedSchedulerServer::new(engine.clone())).await;
     (port, engine)
 }
 
 /// Serve a sequential-dispatch mock engine in-process; returns its port.
-#[expect(
-    clippy::expect_used,
-    clippy::disallowed_methods,
-    reason = "test helper - panicking on failure is intentional; the spawned \
-              mock server task is fire-and-forget for the test process's lifetime"
-)]
 async fn start_mock_engine(engine: Engine) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock engine");
-    let port = listener.local_addr().expect("mock engine address").port();
-    tokio::spawn(
-        Server::builder()
-            .add_service(proto::vllm_engine_server::VllmEngineServer::new(engine))
-            .serve_with_incoming(TcpListenerStream::new(listener)),
-    );
-    port
+    serve_engine(proto::vllm_engine_server::VllmEngineServer::new(engine)).await
 }
 
 /// Serve the mock-worker crate's canned worker in-process (a parallel-dispatch
 /// runtime once registered as one): one up-front `delay` before its stream is
 /// returned, then `OUTPUT_TOKENS` tokens; returns its port.
-#[expect(
-    clippy::expect_used,
-    clippy::disallowed_methods,
-    reason = "test helper - panicking on failure is intentional; the spawned \
-              mock server task is fire-and-forget for the test process's lifetime"
-)]
 async fn start_mock_grpc_worker(delay: Duration) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock gRPC worker");
-    let port = listener
-        .local_addr()
-        .expect("mock gRPC worker address")
-        .port();
-    let cfg = Arc::new(mock_worker::config::Config {
-        admin_port: None,
-        context_length: 32768,
-        host: "127.0.0.1".to_string(),
-        http_base_port: 0,
-        http_count: 0,
-        grpc_base_port: port,
-        grpc_count: 1,
-        zmq_handshake: None,
-        zmq_count: 0,
-        zmq_start_index: 0,
-        model_id: MODEL.to_string(),
-        tokenizer_path: MODEL.to_string(),
+    serve_canned_worker(Canned {
+        model: MODEL,
         gen_delay: delay,
         output_tokens: OUTPUT_TOKENS,
-        realistic: false,
-        engine: mock_worker::engine::EngineParams::default(),
-        ..mock_worker::config::Config::default()
-    });
-    tokio::spawn(mock_worker::grpc::serve_with_listener(cfg, listener));
-    port
+    })
+    .await
 }
 
 /// A parallel-dispatch mock engine (the TokenSpeed proto) that accepts every
@@ -727,26 +666,8 @@ impl TokenSpeedScheduler for CutEngine {
 }
 
 /// Serve a [`CutEngine`] in-process; returns its port.
-#[expect(
-    clippy::expect_used,
-    clippy::disallowed_methods,
-    reason = "test helper - panicking on failure is intentional; the spawned \
-              mock server task is fire-and-forget for the test process's lifetime"
-)]
 async fn start_cut_grpc_worker() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind cut mock engine");
-    let port = listener
-        .local_addr()
-        .expect("cut mock engine address")
-        .port();
-    tokio::spawn(
-        Server::builder()
-            .add_service(TokenSpeedSchedulerServer::new(CutEngine))
-            .serve_with_incoming(TcpListenerStream::new(listener)),
-    );
-    port
+    serve_engine(TokenSpeedSchedulerServer::new(CutEngine)).await
 }
 
 /// A PD gRPC router over the given legs, registered as `runtime` (which picks
@@ -760,56 +681,26 @@ async fn build_pd_router(legs: &[(u16, WorkerType)], runtime: RuntimeType) -> Bo
 
 /// [`build_pd_router`] with every worker's circuit breaker configured as
 /// `breaker`; the registered workers come back with the router.
-#[expect(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
 async fn build_pd_router_with(
     legs: &[(u16, WorkerType)],
     runtime: RuntimeType,
     breaker: CircuitBreakerConfig,
 ) -> (Box<dyn RouterTrait>, Vec<Arc<dyn Worker>>) {
-    let mut config = RouterConfig::builder()
-        .mode(RoutingMode::PrefillDecode {
-            prefill_urls: vec![],
-            decode_urls: vec![],
-            prefill_policy: None,
-            decode_policy: None,
-        })
-        .grpc_connection()
+    let config = grpc_router_config()
+        .prefill_decode_mode(vec![], vec![])
         .round_robin_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(1024 * 1024)
         .build_unchecked();
-    config.health_check.disable_health_check = true;
-
-    let app_context = common::create_test_context_with_mock_tokenizer(config, MODEL).await;
-    let mut workers = Vec::with_capacity(legs.len());
-    for (port, worker_type) in legs {
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
-                .worker_type(*worker_type)
-                .connection_mode(ConnectionMode::Grpc)
-                .runtime_type(runtime)
-                .model(ModelCard::new(MODEL))
-                .circuit_breaker_config(breaker.clone())
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
-                .build(),
-        );
-        app_context
-            .worker_registry
-            .register(Arc::clone(&worker))
-            .unwrap();
-        workers.push(worker);
-    }
-    let router = RouterFactory::create_router(&app_context)
-        .await
-        .expect("PD gRPC router should build");
+    let workers: Vec<Arc<dyn Worker>> = legs
+        .iter()
+        .map(|&(port, worker_type)| {
+            Arc::new(
+                grpc_worker(port, worker_type, runtime, ModelCard::new(MODEL))
+                    .circuit_breaker_config(breaker.clone())
+                    .build(),
+            ) as Arc<dyn Worker>
+        })
+        .collect();
+    let router = build_grpc_router(config, MODEL, workers.clone()).await;
     (router, workers)
 }
 
