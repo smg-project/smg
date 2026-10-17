@@ -3,7 +3,7 @@
 //! bellwether (smg-project/bellwether) records, per model, what a model's output must parse to: the
 //! output text, its token ids, chunk plans, and the reference assistant message from the round trip
 //! through the checkpoint's template. This test replays every Qwen3-8B parse case through the
-//! Qwen3 table ([`qwen3()`]), folds the events into the assistant message with
+//! Qwen3 table ([`Table::Qwen3`]), folds the events into the assistant message with
 //! [`adapt::chat::message`], and compares it with the reference: whole, character by character,
 //! on thirty seeded byte plans, and on the token-level chunk plans bellwether recorded with the
 //! case, each delta carrying its tokens' ids and pieces. Every replay also has to conserve the
@@ -124,8 +124,7 @@ const SLUG: &str = "qwen3-8b";
 /// Slugs the replay over [`MODELS`] leaves out for now, each with the reason
 /// and where it is tracked: a family whose parser is known to differ from the
 /// reference on whole sets, which no per-case list could carry. The slug stays
-/// in the table so its family and prompt tail are kept; the issue brings it
-/// back.
+/// in the rows so its prompt tail is kept; the issue brings it back.
 const SKIPPED: &[(&str, &str)] = &[
     // bellwether #149 recorded its sets again without the common set (the 16 cases are gone from
     // main 25b7767791), so the probes its family lists have no fixture to meet; replayed again
@@ -136,10 +135,11 @@ const SKIPPED: &[(&str, &str)] = &[
     ),
 ];
 /// bellwether's slugs for the checkpoints the tables read, in its manifests' spelling, each with
-/// the table that reads it and how its template ends the generation prompt. The fixtures carry
-/// the request and the output, not the rendered prompt, so the prompt's tail is stated here until
-/// bellwether records it. A slug bellwether has not recorded is skipped with a notice; `qwen3-8b`
-/// is the one set bellwether's main always holds, and has its own test.
+/// how its template ends the generation prompt; the table that reads it, and its turn opener, are
+/// the registry's ([`for_model`]). The fixtures carry the request and the output, not the rendered
+/// prompt, so the prompt's tail is stated here until bellwether records it. A slug bellwether has
+/// not recorded is skipped with a notice; `qwen3-8b` is the one set bellwether's main always holds,
+/// and has its own test.
 const MODELS: &[(&str, GenerationPrompt)] = &[
     // Qwen3: the model writes its own `<think>`; thinking off closes it in the prompt.
     ("qwen3-8b", GenerationPrompt::ModelWritesTheThought),
@@ -723,14 +723,74 @@ impl GenerationPrompt {
     }
 }
 
-/// Every recorded model is in the registry, so the replays below read each with the table and
-/// the opener `formats::for_model` gives it, the ones the gateway asks for; a correction to the
-/// registry reaches the replay, and the replay checks the registry.
+/// Every recorded model is in the registry, so the replays below read each with the table
+/// `formats::for_model` gives it, the one the gateway asks for; a correction to the registry
+/// reaches the replay. The replay feeds the generation prompt's tail alone, so it says nothing
+/// about a turn opener: [`MEASURED_OPENERS`] pins those.
 #[test]
 fn every_recorded_model_is_in_the_registry() {
     for (slug, _) in MODELS {
         let model = model_of(slug);
         assert!(for_model(&model).is_some(), "{slug}: not in the registry");
+    }
+}
+
+/// The turn opener a recorded model's own chat template writes where it is not its table's,
+/// measured against the templates' rendered prompts (smg #2841): K-EXAONE writes Qwen3's markers
+/// under its own template, Granite 4.1 Qwen2.5's, and the rest render their own table's opener
+/// or `<|im_start|>assistant`. An independent statement of what the registry's groups hold, so a
+/// typo in a group's opener fails here rather than in a gateway that replays the whole prompt.
+const MEASURED_OPENERS: &[(&str, &str)] = &[
+    ("k-exaone-236b-a23b", "<|assistant|>"),
+    (
+        "granite-4.1-3b",
+        "<|start_of_role|>assistant<|end_of_role|>",
+    ),
+    ("laguna-xs.2", "<assistant>"),
+    ("a.x-3.1-light", "<|im_start|><|assistant|>"),
+    ("a.x-4.0", "<|im_start|><|assistant|>"),
+    ("a.x-4.0-light", "<|im_start|><|assistant|>"),
+    (
+        "bytedance-seed-oss-36b-alternate-tokenizer",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    ("exaone-4.5-33b", "<|assistant|>"),
+    (
+        "llama-3-1-nemotron-ultra-253b-cpt-v1",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "llama-3.1-nemotron-8b-ultralong-1m-instruct",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "llama-3.1-nemotron-8b-ultralong-2m-instruct",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "llama-3.1-nemotron-8b-ultralong-4m-instruct",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "llama-3.1-nemotron-safety-guard-8b-v3",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "llama-3.3-nemotron-70b-reward-principle",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+];
+
+#[test]
+fn every_measured_opener_is_the_registrys() {
+    for (slug, opener) in MEASURED_OPENERS {
+        let model = model_of(slug);
+        let table = table_for(&model).unwrap_or_else(|| panic!("{slug}: not in the registry"));
+        assert_eq!(
+            for_model(&model),
+            Some(table.format().opens_turn(opener)),
+            "{slug}: the registry's opener"
+        );
     }
 }
 
