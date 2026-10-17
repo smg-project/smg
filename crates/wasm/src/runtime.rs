@@ -1,16 +1,9 @@
 //! WASM Runtime
 //!
 //! Manages WASM component execution using wasmtime with async support.
-//! Provides a thread pool for concurrent WASM execution and metrics tracking.
+//! Provides a thread pool for concurrent WASM execution.
 
-use std::{
-    num::NonZeroUsize,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
 use lru::LruCache;
 use tokio::sync::oneshot;
@@ -43,10 +36,6 @@ pub struct WasmThreadPool {
     sender: async_channel::Sender<WasmTask>,
     receiver: async_channel::Receiver<WasmTask>,
     workers: Vec<std::thread::JoinHandle<()>>,
-    // Metrics
-    total_tasks: AtomicU64,
-    completed_tasks: AtomicU64,
-    failed_tasks: AtomicU64,
 }
 
 pub enum WasmTask {
@@ -180,19 +169,7 @@ impl WasmThreadPool {
             sender,
             receiver,
             workers,
-            total_tasks: AtomicU64::new(0),
-            completed_tasks: AtomicU64::new(0),
-            failed_tasks: AtomicU64::new(0),
         }
-    }
-
-    /// Get current thread pool metrics
-    pub fn get_metrics(&self) -> (u64, u64, u64) {
-        (
-            self.total_tasks.load(Ordering::Relaxed),
-            self.completed_tasks.load(Ordering::Relaxed),
-            self.failed_tasks.load(Ordering::Relaxed),
-        )
     }
 
     async fn worker_loop(
