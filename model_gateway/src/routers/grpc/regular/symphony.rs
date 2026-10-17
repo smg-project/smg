@@ -19,11 +19,14 @@
 //! the legacy parsers, which is the labels' way back for one model when its table misbehaves,
 //! `passthrough` among them (the legacy parsers then take the labels' names, and from the flags
 //! only names they read: a table's name or [`TEMPLATE_PARSER`] there is nothing to them,
-//! `ParserResolver::new`); no name at all, or a reasoning name alone that no table answers to,
-//! other than `passthrough`, selects nothing. The names are checked at startup and at a worker's
-//! registration ([`check_names`]), which also says, once per model, when the registry's table
-//! sets the flags' choice aside ([`set_aside_by_the_registry`]). Every request read with `legacy`
-//! keeps the older parsers. The response names
+//! `ParserResolver::new`), the rule being that every legacy name whose format a table reads is
+//! the table's alias, so that a deployment's existing flags keep a working parser, and
+//! `Table::UNANSWERED` lists each name no table answers to with the reason (the test over both
+//! legacy registries below holds every name to one of the two); no name at all, or a reasoning
+//! name alone that no table answers to, other than `passthrough`, selects nothing. The names are
+//! checked at startup and at a worker's registration ([`check_names`]), which also says, once per
+//! model, when the registry's table sets the flags' choice aside ([`set_aside_by_the_registry`]).
+//! Every request read with `legacy` keeps the older parsers. The response names
 //! the parser that read it in `x-smg-parser`, legacy when the choice was Symphony but no table
 //! took the request, so a client comparing the two can tell which one read each answer. What a
 //! request asks of the channels takes a variant of the table rather than another reader: where the
@@ -1826,6 +1829,102 @@ mod tests {
             );
         }
         assert_eq!(launchers, ["muse"]);
+    }
+
+    /// Every name of the two legacy registries answers to the table the flip maps it to (its
+    /// own, or the one whose format it reads), so that a deployment's existing flags keep a
+    /// working parser under Symphony, or is in `Table::UNANSWERED` with its reason; never both,
+    /// never neither, so a new legacy parser's name cannot appear unmapped, and a table that
+    /// takes a listed name removes its row. In its own kind every legacy name passes the startup
+    /// check under Symphony; a tool-call name decides beside any reasoning name, and a reasoning
+    /// name alone selects its table or none.
+    #[test]
+    fn every_legacy_parser_name_answers_to_its_table_or_is_listed_as_unanswered() {
+        let tools = tool_parser::ParserFactory::new();
+        let reasoning = reasoning_parser::ParserFactory::new();
+        let symphony = ParserChoice::Symphony;
+        let mapped = [
+            ("json", "json"),
+            ("gemma4", "gemma4"),
+            ("qwen", "qwen3"),
+            ("qwen3", "qwen3"),
+            ("qwen_xml", "qwen3_tagged"),
+            ("qwen_coder", "qwen3_tagged"),
+            ("nemotron", "qwen3_tagged"),
+            ("deepseek_v4", "deepseek_v4"),
+            ("deepseek_v41", "deepseek_v4.1"),
+            ("glm45_moe", "glm4"),
+            ("glm47_moe", "glm"),
+            ("hy_v4", "hy4"),
+            ("kimi_k3", "kimi_k3"),
+            ("inkling", "inkling"),
+            ("minimax", "minimax_m2"),
+            ("minimax_m2", "minimax_m2"),
+            ("minimax_m3", "minimax_m3"),
+        ];
+        let mut legacy: Vec<(String, &str)> = tools
+            .list_parsers()
+            .into_iter()
+            .map(|name| (name, "tool-call"))
+            .chain(
+                reasoning
+                    .list_parsers()
+                    .into_iter()
+                    .map(|name| (name, "reasoning")),
+            )
+            .collect();
+        legacy.sort();
+        for (name, kind) in &legacy {
+            let as_given = match *kind {
+                "tool-call" => names(Some(name), Some("qwen3")),
+                _ => names(None, Some(name)),
+            };
+            assert_eq!(check(symphony, &as_given), Ok(()), "{kind} parser {name}");
+            let expected = mapped
+                .iter()
+                .find(|(own, _)| own == name)
+                .map(|(_, table)| *table);
+            let listed = Table::UNANSWERED.iter().find(|(own, _)| own == name);
+            match (Table::answering_to(name), listed) {
+                (Some(table), None) => {
+                    assert_eq!(
+                        Some(table.name()),
+                        expected,
+                        "{kind} parser {name} answers to {}",
+                        table.name()
+                    );
+                    assert_eq!(
+                        named_table(&as_given.labels),
+                        Some(table),
+                        "{kind} parser {name}"
+                    );
+                }
+                (None, Some((_, reason))) => {
+                    assert_eq!(expected, None, "{kind} parser {name} is listed: {reason}");
+                    assert_eq!(named_table(&as_given.labels), None, "{kind} parser {name}");
+                }
+                (Some(table), Some(_)) => panic!(
+                    "{kind} parser {name} answers to {} and is listed as unanswered: remove \
+                     its row from Table::UNANSWERED",
+                    table.name()
+                ),
+                (None, None) => panic!(
+                    "{kind} parser {name} answers to no table and is not listed: add it to \
+                     Table::ALIASES or to Table::UNANSWERED with the reason"
+                ),
+            }
+        }
+        // Neither list outlives the registries.
+        let is_legacy = |name: &str| legacy.iter().any(|(own, _)| own == name);
+        for (name, _) in mapped {
+            assert!(is_legacy(name), "{name} is no legacy parser's name");
+        }
+        for (name, _) in Table::UNANSWERED {
+            assert!(
+                is_legacy(name),
+                "{name} is no legacy parser's name: remove its row"
+            );
+        }
     }
 
     #[test]
