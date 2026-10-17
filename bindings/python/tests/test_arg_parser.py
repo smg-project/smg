@@ -1699,6 +1699,29 @@ class TestRouterArgsFieldOrder:
         assert tail == sorted(tail), out_of_place(tail)
 
 
+class TestParseFailures:
+    """``--parse-failures``: the policy on an output a Symphony table did not
+    read whole; ``log`` by default, ``surface`` or ``silent`` by choice, any
+    other word refused by the parser."""
+
+    def test_the_default_is_log(self):
+        assert parse_router_args([]).parse_failures == "log"
+
+    def test_the_three_policies_parse(self):
+        for policy in ("surface", "log", "silent"):
+            assert parse_router_args(["--parse-failures", policy]).parse_failures == policy
+
+    def test_another_word_is_refused(self):
+        with pytest.raises(SystemExit):
+            parse_router_args(["--parse-failures", "loud"])
+
+    def test_the_prefixed_flag_reaches_the_field(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        args = parser.parse_args(["--router-parse-failures", "surface"])
+        assert RouterArgs.from_cli_args(args, use_router_prefix=True).parse_failures == "surface"
+
+
 class TestConnectionTimeouts:
     """The HTTP edge's connection-level timeouts: their defaults and the
     disabling zero."""

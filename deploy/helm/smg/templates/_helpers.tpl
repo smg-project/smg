@@ -293,6 +293,10 @@ Called from the router Deployment template.
 - "--tool-call-parser"
 - {{ .Values.router.toolCallParser | quote }}
 {{- end }}
+{{- if .Values.router.parseFailures }}
+- "--parse-failures"
+- {{ .Values.router.parseFailures | quote }}
+{{- end }}
 {{- if include "smg.authSecretName" . }}
 - "--api-key-file"
 - {{ printf "/etc/smg/auth/%s" (include "smg.authSecretKey" .) | quote }}

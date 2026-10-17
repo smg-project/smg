@@ -6,8 +6,8 @@ use smg_mcp::McpConfig;
 use super::{
     AccessLogField, CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult,
     DiscoveryConfig, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig,
-    MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PolicyConfig, PostgresConfig,
-    RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
+    MetricsConfig, OracleConfig, ParseFailures, ParserChoice, PdPairingMode, PolicyConfig,
+    PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
     TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
 use crate::worker::{ConnectionMode, RuntimeType};
@@ -739,6 +739,13 @@ impl RouterConfigBuilder {
 
     pub fn disable_tokenizer_autoload(mut self, disable: bool) -> Self {
         self.config.disable_tokenizer_autoload = disable;
+        self
+    }
+
+    /// What the gateway does about an output a Symphony table did not read whole: the log
+    /// line and the per-request report (see `ParseFailures`).
+    pub fn parse_failures(mut self, policy: ParseFailures) -> Self {
+        self.config.parse_failures = policy;
         self
     }
 

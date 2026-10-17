@@ -34,7 +34,10 @@ use super::{
 };
 use crate::{
     rate_limit::test_support::RecordingBackend,
-    routers::grpc::{pipeline::RequestPipeline, regular::processor::ResponseProcessor},
+    routers::grpc::{
+        pipeline::RequestPipeline,
+        regular::{processor::ResponseProcessor, symphony::telemetry::Report},
+    },
     worker::WorkerRegistry,
 };
 
@@ -378,6 +381,8 @@ fn messages_spec(thinking: bool) -> MessagesResponseSpec {
         stop_sequences: None,
         symphony: None,
         first_tool_call_only: false,
+        parse_report: Report::Off,
+        parse_silent: false,
     }
 }
 

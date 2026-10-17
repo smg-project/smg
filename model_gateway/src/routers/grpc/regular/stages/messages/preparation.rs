@@ -73,6 +73,13 @@ impl MessagePreparationStage {
         let parser = symphony::choice(ctx.components.parser, ctx.input.headers.as_ref())
             .map_err(|why| error::bad_request("invalid_parser_header", why))?;
         ctx.state.parser = Some(parser);
+        // What the response says about how its output was read: the gateway's parse-failure
+        // policy and the request's X-SMG-Parse-Report header, decided once here too.
+        ctx.state.parse_report = symphony::telemetry::report_mode(
+            ctx.components.parse_failures,
+            ctx.input.headers.as_ref(),
+        )
+        .map_err(|why| error::bad_request("invalid_parse_report_header", why))?;
 
         // Step 1: The response spec, built here because its chat tools (the
         // custom tools, converted once) are what the template renders,
@@ -458,6 +465,7 @@ mod tests {
             tokenizer_autoload: true,
             tokenizer_load_failures: Arc::default(),
             parser: crate::config::ParserChoice::Legacy,
+            parse_failures: crate::config::ParseFailures::Log,
         });
         for (output_config, rendered) in [
             (json!({"effort": "high"}), Ok("effort=high")),

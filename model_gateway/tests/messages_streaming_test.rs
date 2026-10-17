@@ -70,6 +70,7 @@ fn make_skeleton_message(id: &str) -> Message {
             output_tokens_details: None,
         },
         container: None,
+        smg: None,
     }
 }
 
@@ -196,6 +197,7 @@ fn test_message_delta_end_turn() {
             stop_sequence: None,
             stop_details: None,
             container: None,
+            smg: None,
         },
         usage: MessageDeltaUsage {
             output_tokens: 15,
@@ -534,6 +536,7 @@ fn test_message_delta_stop_sequence() {
             stop_sequence: Some("###END###".to_string()),
             stop_details: None,
             container: None,
+            smg: None,
         },
         usage: MessageDeltaUsage {
             output_tokens: 42,

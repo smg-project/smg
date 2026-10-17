@@ -18,6 +18,7 @@ pub struct ChatCompletionResponseBuilder {
     usage: Option<Usage>,
     system_fingerprint: Option<String>,
     service_tier: String,
+    smg: Option<Box<crate::smg::SmgExtension>>,
 }
 
 impl ChatCompletionResponseBuilder {
@@ -36,6 +37,7 @@ impl ChatCompletionResponseBuilder {
             usage: None,
             system_fingerprint: None,
             service_tier: DEFAULT_SERVICE_TIER.to_string(),
+            smg: None,
         }
     }
 
@@ -99,6 +101,12 @@ impl ChatCompletionResponseBuilder {
         self
     }
 
+    /// The gateway's own members (see [`crate::smg`]), when there are any.
+    pub fn maybe_smg(mut self, smg: Option<crate::smg::SmgExtension>) -> Self {
+        self.smg = smg.map(Box::new);
+        self
+    }
+
     /// Build the ChatCompletionResponse
     pub fn build(self) -> ChatCompletionResponse {
         ChatCompletionResponse {
@@ -110,6 +118,7 @@ impl ChatCompletionResponseBuilder {
             usage: self.usage,
             system_fingerprint: self.system_fingerprint,
             service_tier: self.service_tier,
+            smg: self.smg,
         }
     }
 }

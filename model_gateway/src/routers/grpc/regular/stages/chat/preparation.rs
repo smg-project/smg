@@ -66,6 +66,13 @@ impl ChatPreparationStage {
         let parser = symphony::choice(ctx.components.parser, ctx.input.headers.as_ref())
             .map_err(|why| error::bad_request("invalid_parser_header", why))?;
         ctx.state.parser = Some(parser);
+        // What the response says about how its output was read: the gateway's parse-failure
+        // policy and the request's X-SMG-Parse-Report header, decided once here too.
+        ctx.state.parse_report = symphony::telemetry::report_mode(
+            ctx.components.parse_failures,
+            ctx.input.headers.as_ref(),
+        )
+        .map_err(|why| error::bad_request("invalid_parse_report_header", why))?;
         let (token_ids, processed_messages, tool_constraints) =
             prepare_chat_like(ctx, request, self.wire_pools).await?;
         ctx.state.preparation = Some(PreparationOutput::Chat {

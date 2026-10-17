@@ -1044,6 +1044,10 @@ pub struct ChatCompletionResponse {
     /// OpenAI API sends it; the gateway has one tier, `default`.
     #[serde(default = "default_service_tier")]
     pub service_tier: String,
+    /// The gateway's own members, present only when the request asked for them or the
+    /// gateway's policy surfaces them (see [`crate::smg`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smg: Option<Box<crate::smg::SmgExtension>>,
 }
 
 /// The one service tier the gateway serves.
@@ -1111,6 +1115,10 @@ pub struct ChatCompletionStreamResponse {
     pub system_fingerprint: Option<String>,
     pub choices: Vec<ChatStreamChoice>,
     pub usage: Option<Usage>,
+    /// The gateway's own members, on a choice's finish chunk, present only when the request
+    /// asked for them or the gateway's policy surfaces them (see [`crate::smg`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smg: Option<Box<crate::smg::SmgExtension>>,
 }
 
 impl ChatCompletionStreamResponse {
