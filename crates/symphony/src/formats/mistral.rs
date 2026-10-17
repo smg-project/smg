@@ -17,7 +17,7 @@
 //! it is malformed. The generation prompt ends at `[/INST]`, whatever the request says, so the
 //! prompt's replay starts there. Recorded as `mistral-small-24b-instruct-2501`, whose sets hold
 //! content alone; the calls stand on the turns 7B v0.3's template renders, held in the tests below
-//! and in the rendered-turn fixtures.
+//! (bellwether's hand-written sets record them once its recorder has a rule for call ids).
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
