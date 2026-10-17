@@ -428,6 +428,10 @@ pub(crate) fn init_metrics() {
         "HTTP connections closed at accept for arriving beyond the connection limit (max_connections): nothing was read from or written to them"
     );
     describe_counter!(
+        "smg_tls_client_auth_total",
+        "Connections of the HTTPS listener with client-certificate authentication on, by result: identified (a verified certificate naming an identity in the configured field), unidentified (a verified certificate without one), none (no certificate, under optional) or handshake_failed (the handshake did not complete; a missing or unacceptable client certificate among the causes)"
+    );
+    describe_counter!(
         "smg_http_rate_limit_total",
         "Rate limiting decisions by result (allowed/rejected)"
     );
@@ -1513,6 +1517,25 @@ impl Metrics {
     /// connection limit.
     pub fn record_http_connection_rejected() {
         counter!("smg_http_connections_rejected_total").increment(1);
+    }
+
+    /// The results of client-certificate authentication on the HTTPS
+    /// listener, as the `result` label of `smg_tls_client_auth_total`.
+    pub const TLS_CLIENT_AUTH_RESULTS: [&'static str; 4] =
+        ["identified", "unidentified", "none", "handshake_failed"];
+
+    /// Record one connection of the HTTPS listener under client-certificate
+    /// authentication, by `result` (one of [`Self::TLS_CLIENT_AUTH_RESULTS`]).
+    pub fn record_tls_client_auth(result: &'static str) {
+        counter!("smg_tls_client_auth_total", "result" => result).increment(1);
+    }
+
+    /// Every result of `smg_tls_client_auth_total` at zero, so the family is
+    /// on the first scrape of a listener with client authentication on.
+    pub fn init_tls_client_auth_series() {
+        for result in Self::TLS_CLIENT_AUTH_RESULTS {
+            counter!("smg_tls_client_auth_total", "result" => result).absolute(0);
+        }
     }
 
     /// Record rate limit decision.

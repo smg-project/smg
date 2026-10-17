@@ -610,6 +610,9 @@ struct Router {
     tenant_header_name: String,
     tenant_rate_limit_config: Option<String>,
     tenant_rate_limit_enabled: bool,
+    tls_client_auth: String,
+    tls_client_ca_path: Option<String>,
+    tls_client_identity: String,
     tokenizer_cache_enable_l0: bool,
     tokenizer_cache_enable_l1: bool,
     tokenizer_cache_l0_max_entries: usize,
@@ -1244,6 +1247,21 @@ impl Router {
                 self.server_cert_path.as_ref(),
                 self.server_key_path.as_ref(),
             )
+            .maybe_tls_client_ca_path(self.tls_client_ca_path.as_ref())
+            .tls_client_auth(self.tls_client_auth.parse().map_err(|reason| {
+                config::ConfigError::InvalidValue {
+                    field: "tls_client_auth".to_string(),
+                    value: self.tls_client_auth.clone(),
+                    reason,
+                }
+            })?)
+            .tls_client_identity(self.tls_client_identity.parse().map_err(|reason| {
+                config::ConfigError::InvalidValue {
+                    field: "tls_client_identity".to_string(),
+                    value: self.tls_client_identity.clone(),
+                    reason,
+                }
+            })?)
             .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler)
             .build()
     }
@@ -1430,6 +1448,9 @@ impl Router {
         tenant_header_name = String::from("x-smg-tenant-id"),
         tenant_rate_limit_config = None,
         tenant_rate_limit_enabled = false,
+        tls_client_auth = String::from("off"),
+        tls_client_ca_path = None,
+        tls_client_identity = String::from("san-uri"),
         tokenizer_cache_enable_l0 = false,
         tokenizer_cache_enable_l1 = false,
         tokenizer_cache_l0_max_entries = 10000,
@@ -1637,6 +1658,9 @@ impl Router {
         tenant_header_name: String,
         tenant_rate_limit_config: Option<String>,
         tenant_rate_limit_enabled: bool,
+        tls_client_auth: String,
+        tls_client_ca_path: Option<String>,
+        tls_client_identity: String,
         tokenizer_cache_enable_l0: bool,
         tokenizer_cache_enable_l1: bool,
         tokenizer_cache_l0_max_entries: usize,
@@ -1874,6 +1898,9 @@ impl Router {
             tenant_header_name,
             tenant_rate_limit_config,
             tenant_rate_limit_enabled,
+            tls_client_auth,
+            tls_client_ca_path,
+            tls_client_identity,
             tokenizer_cache_enable_l0,
             tokenizer_cache_enable_l1,
             tokenizer_cache_l0_max_entries,

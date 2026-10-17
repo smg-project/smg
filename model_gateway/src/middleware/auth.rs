@@ -4,6 +4,13 @@
 //! "close" to a valid token produces an unrelated hash, so there's no
 //! byte-at-a-time timing signal to recover from a plain hash-keyed lookup,
 //! unlike comparing raw secrets.
+//!
+//! With client-certificate authentication on the HTTPS listener
+//! (`--tls-client-auth`), the connection's verified certificate comes first:
+//! the identity it names (a [`ClientCertificate`] extension, attached by the
+//! listener's acceptor) is the caller's tenant and no bearer is consulted;
+//! under `required` a request without that identity is refused; under
+//! `optional` it falls through to the bearer check as before.
 
 use std::collections::HashMap;
 
@@ -21,13 +28,15 @@ use smg_auth::bearer_token;
 
 use super::logging::AccessLogRecord;
 use crate::{
-    config::TenantApiKeyEntry,
+    config::{TenantApiKeyEntry, TlsClientAuth},
+    server::client_identity::ClientCertificate,
     tenant::{authenticated_tenant_key_from_sha256, DataPlaneCaller, TenantIdentity, TenantKey},
 };
 
 #[derive(Clone)]
 pub struct AuthConfig {
     keys: HashMap<[u8; 32], TenantKey>,
+    client_auth: TlsClientAuth,
 }
 
 impl AuthConfig {
@@ -57,13 +66,28 @@ impl AuthConfig {
             );
         }
 
-        Self { keys }
+        Self {
+            keys,
+            client_auth: TlsClientAuth::Off,
+        }
     }
 
-    /// Whether any key is configured. Empty means [`auth_middleware`]
-    /// passes every request through.
+    /// The configuration with client certificates of the HTTPS listener as a
+    /// credential: a connection's verified certificate identity is the
+    /// caller's tenant; under `Required` a request without one is refused.
+    /// For the serving routes only: the admin routes' shared-key fallback
+    /// does not take certificate identities (they are tenants).
+    pub fn with_client_certificates(mut self, mode: TlsClientAuth) -> Self {
+        self.client_auth = mode;
+        self
+    }
+
+    /// Whether the serving routes require a credential: a key is configured
+    /// or client certificates are required. Neither means [`auth_middleware`]
+    /// passes every request through (an optional client certificate still
+    /// identifies the caller when presented).
     pub fn is_enabled(&self) -> bool {
-        !self.keys.is_empty()
+        !self.keys.is_empty() || self.client_auth == TlsClientAuth::Required
     }
 
     /// Whether `token` matches any configured key (shared or per-tenant).
@@ -81,13 +105,36 @@ fn hash_key(key: &str) -> [u8; 32] {
     Sha256::digest(key.as_bytes()).into()
 }
 
-/// Middleware to validate Bearer token against configured API key(s).
-/// Only active when the router has at least one key configured.
+/// Middleware to authenticate the caller: by the connection's verified
+/// client certificate when the listener requests one, else by the Bearer
+/// token against the configured API key(s). Only active when the router has
+/// at least one key configured or requests client certificates.
 pub async fn auth_middleware(
     State(auth_config): State<AuthConfig>,
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
+    if auth_config.client_auth.is_on() {
+        let certificate = request.extensions().get::<ClientCertificate>().cloned();
+        let required = auth_config.client_auth == TlsClientAuth::Required;
+        match certificate {
+            Some(ClientCertificate::Identified(identity)) => {
+                request.extensions_mut().insert(DataPlaneCaller::new(
+                    TenantIdentity::Authenticated(identity).into_key(),
+                ));
+                return next.run(request).await;
+            }
+            Some(ClientCertificate::Unidentified) if required => {
+                return forbidden_certificate();
+            }
+            None if required => {
+                return unauthorized_certificate();
+            }
+            // Optional: a connection without an identity goes on to the bearer check.
+            _ => {}
+        }
+    }
+
     if !auth_config.keys.is_empty() {
         let token_hash = request
             .headers()
@@ -119,6 +166,42 @@ pub async fn auth_middleware(
     }
 
     next.run(request).await
+}
+
+/// A verified client certificate that names no identity in the configured
+/// field, where one is required: the caller is authenticated at the TLS
+/// layer but cannot be a tenant, so 403, with the field to fix.
+fn forbidden_certificate() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": {
+                "message": "The client certificate names no identity in the configured field (see --tls-client-identity)",
+                "type": "invalid_request_error",
+                "param": null,
+                "code": "client_certificate_unidentified",
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// No client certificate on a route that requires one: a request that did
+/// not come through the listener's client authentication.
+fn unauthorized_certificate() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Bearer realm=\"data-plane\"")],
+        Json(json!({
+            "error": {
+                "message": "A client certificate is required on this route",
+                "type": "invalid_request_error",
+                "param": null,
+                "code": "client_certificate_required",
+            }
+        })),
+    )
+        .into_response()
 }
 
 /// Unconditionally rejects with 401 — for route groups that must never fall
@@ -166,6 +249,8 @@ fn unauthorized(token_presented: bool) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use axum::{
         body::Body,
         http::{header, Request, StatusCode},
@@ -419,5 +504,136 @@ mod tests {
         assert!(auth_config.contains_token("shared-secret"));
         assert!(auth_config.contains_token("team-red-secret"));
         assert!(!auth_config.contains_token("not-a-configured-key"));
+    }
+
+    fn with_certificate(certificate: Option<ClientCertificate>) -> Request<Body> {
+        let mut request = Request::builder().uri("/");
+        if let Some(certificate) = certificate {
+            request = request.extension(certificate);
+        }
+        request.body(Body::empty()).unwrap()
+    }
+
+    fn identified(identity: &str) -> ClientCertificate {
+        ClientCertificate::Identified(Arc::from(identity))
+    }
+
+    /// A verified certificate's identity is the tenant, with or without keys
+    /// and whatever bearer the request carries.
+    #[tokio::test]
+    async fn a_client_certificate_identity_is_the_tenant() {
+        for (auth_config, mode) in [
+            (AuthConfig::new(None), TlsClientAuth::Required),
+            (AuthConfig::new(None), TlsClientAuth::Optional),
+            (
+                AuthConfig::new(Some("shared-secret".to_string())),
+                TlsClientAuth::Required,
+            ),
+        ] {
+            let app = app(auth_config.with_client_certificates(mode));
+            let spiffe = "spiffe://cluster.local/ns/default/sa/team-red";
+            let mut request = with_certificate(Some(identified(spiffe)));
+            request.headers_mut().insert(
+                header::AUTHORIZATION,
+                "Bearer not-a-configured-key".parse().unwrap(),
+            );
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{mode}");
+            assert_eq!(
+                body_text(response).await,
+                format!("auth:{spiffe}"),
+                "{mode}"
+            );
+        }
+    }
+
+    /// Required: a certificate without an identity is refused as forbidden,
+    /// a request without a certificate as unauthorized, keys or no keys.
+    #[tokio::test]
+    async fn required_client_certificates_refuse_requests_without_an_identity() {
+        let auth_config = AuthConfig::new(Some("shared-secret".to_string()))
+            .with_client_certificates(TlsClientAuth::Required);
+        assert!(auth_config.is_enabled());
+        assert!(AuthConfig::new(None)
+            .with_client_certificates(TlsClientAuth::Required)
+            .is_enabled());
+
+        let response = app(auth_config.clone())
+            .oneshot(with_certificate(Some(ClientCertificate::Unidentified)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(body["error"]["code"], "client_certificate_unidentified");
+
+        let mut keyed = with_certificate(None);
+        keyed.headers_mut().insert(
+            header::AUTHORIZATION,
+            "Bearer shared-secret".parse().unwrap(),
+        );
+        let response = app(auth_config).oneshot(keyed).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "a key does not stand in for a required certificate"
+        );
+        assert_eq!(challenge(&response), "Bearer realm=\"data-plane\"");
+        let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(body["error"]["code"], "client_certificate_required");
+    }
+
+    /// Optional: without an identity the bearer check runs as before; the
+    /// mode alone does not make a credential required.
+    #[tokio::test]
+    async fn optional_client_certificates_fall_through_to_the_bearer_check() {
+        let open = AuthConfig::new(None).with_client_certificates(TlsClientAuth::Optional);
+        assert!(!open.is_enabled());
+        let response = app(open.clone())
+            .oneshot(with_certificate(None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_text(response).await, "missing");
+        let response = app(open)
+            .oneshot(with_certificate(Some(ClientCertificate::Unidentified)))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "unidentified under optional"
+        );
+
+        let keyed = AuthConfig::new(Some("shared-secret".to_string()))
+            .with_client_certificates(TlsClientAuth::Optional);
+        let response = app(keyed.clone())
+            .oneshot(with_certificate(None))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "no certificate, no key"
+        );
+        let mut with_key = with_certificate(None);
+        with_key.headers_mut().insert(
+            header::AUTHORIZATION,
+            "Bearer shared-secret".parse().unwrap(),
+        );
+        let response = app(keyed).oneshot(with_key).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "the key still works");
+    }
+
+    /// A configuration that does not take client certificates (the admin
+    /// routes' fallback) ignores a connection's certificate identity.
+    #[tokio::test]
+    async fn a_configuration_without_client_certificates_ignores_the_identity() {
+        let response = app(AuthConfig::new(Some("shared-secret".to_string())))
+            .oneshot(with_certificate(Some(identified(
+                "spiffe://cluster.local/ns/default/sa/x",
+            ))))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

@@ -525,6 +525,24 @@ class TestRouterConstructorSignature:
         assert tail == sorted(tail), out_of_place(tail)
 
 
+class TestTlsClientAuthKeywords:
+    """The client-authentication settings reach the Rust router as keyword
+    arguments after the positional ones."""
+
+    def test_keyword_arguments_are_accepted(self):
+        import inspect
+
+        params = inspect.signature(_Router).parameters
+        for name in ("tls_client_ca_path", "tls_client_auth", "tls_client_identity"):
+            assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
+        _Router(
+            worker_urls=[],
+            tls_client_ca_path="/etc/smg/client-ca.pem",
+            tls_client_auth="required",
+            tls_client_identity="cn",
+        )
+
+
 class TestControlPlaneAuthHalfJwt:
     """An issuer without an audience (or the reverse) is refused, not a silently open control plane."""
 

@@ -8,7 +8,7 @@ use super::{
     DiscoveryConfig, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig,
     MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PolicyConfig, PostgresConfig,
     RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
-    TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+    TenantApiKeyEntry, TlsClientAuth, TlsClientIdentity, TokenizerCacheConfig, TraceConfig,
 };
 use crate::worker::{ConnectionMode, RuntimeType};
 
@@ -23,6 +23,7 @@ pub struct RouterConfigBuilder {
     ca_cert_paths: Vec<String>,
     server_cert_path: Option<String>,
     server_key_path: Option<String>,
+    tls_client_ca_path: Option<String>,
     mcp_config_path: Option<String>,
 }
 
@@ -40,6 +41,7 @@ impl RouterConfigBuilder {
             ca_cert_paths: Vec::new(),
             server_cert_path: None,
             server_key_path: None,
+            tls_client_ca_path: None,
             mcp_config_path: None,
         }
     }
@@ -1034,6 +1036,31 @@ impl RouterConfigBuilder {
         self
     }
 
+    // ==================== Client certificates on the HTTPS listener ====================
+
+    /// The CA bundle client certificates must chain to; read during build()
+    pub fn tls_client_ca_path<S: Into<String>>(mut self, path: S) -> Self {
+        self.tls_client_ca_path = Some(path.into());
+        self
+    }
+
+    pub fn maybe_tls_client_ca_path(mut self, path: Option<impl Into<String>>) -> Self {
+        self.tls_client_ca_path = path.map(|p| p.into());
+        self
+    }
+
+    /// Client-certificate authentication on the HTTPS listener
+    pub fn tls_client_auth(mut self, mode: TlsClientAuth) -> Self {
+        self.config.tls_client_auth = mode;
+        self
+    }
+
+    /// The field of a verified client certificate that names the caller
+    pub fn tls_client_identity(mut self, field: TlsClientIdentity) -> Self {
+        self.config.tls_client_identity = field;
+        self
+    }
+
     // ==================== MCP ====================
 
     /// Config file loaded during build()
@@ -1064,6 +1091,9 @@ impl RouterConfigBuilder {
 
         // Read Server TLS certificates from paths if provided
         self = self.read_server_certificates()?;
+
+        // Read the client CA bundle of the HTTPS listener if provided
+        self = self.read_tls_client_ca()?;
 
         // Read MCP config from path if provided
         self = self.read_mcp_config()?;
@@ -1146,6 +1176,18 @@ impl RouterConfigBuilder {
                         .to_string(),
                 });
             }
+        }
+        Ok(self)
+    }
+
+    /// Internal method to read the client CA bundle of the HTTPS listener
+    fn read_tls_client_ca(mut self) -> ConfigResult<Self> {
+        if let Some(path) = &self.tls_client_ca_path {
+            let bundle = std::fs::read(path).map_err(|e| ConfigError::ValidationFailed {
+                reason: format!("Failed to read the client CA bundle from {path}: {e}"),
+            })?;
+            self.config.tls_client_ca = Some(bundle);
+            self.config.tls_client_ca_path = Some(path.clone());
         }
         Ok(self)
     }

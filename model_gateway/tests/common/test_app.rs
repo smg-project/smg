@@ -122,7 +122,8 @@ pub fn create_test_app(
     let serving_auth_config = AuthConfig::with_tenant_keys(
         router_config.api_key.clone(),
         &router_config.tenant_api_keys,
-    );
+    )
+    .with_client_certificates(router_config.tls_client_auth);
     let admin_auth_config = AuthConfig::new(router_config.api_key.clone());
 
     // Use the actual server's build_app function
@@ -218,7 +219,8 @@ fn build_test_apps(
     let serving_auth_config = AuthConfig::with_tenant_keys(
         router_config.api_key.clone(),
         &router_config.tenant_api_keys,
-    );
+    )
+    .with_client_certificates(router_config.tls_client_auth);
     let admin_auth_config = AuthConfig::new(router_config.api_key.clone());
 
     // Use the actual server's build_app function

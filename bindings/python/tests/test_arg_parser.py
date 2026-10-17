@@ -1699,6 +1699,51 @@ class TestRouterArgsFieldOrder:
         assert tail == sorted(tail), out_of_place(tail)
 
 
+class TestTlsClientAuthArgs:
+    """Client-certificate authentication on the HTTPS listener: off by default,
+    the mode and the identity field among their spellings, in the plain and the
+    prefixed form."""
+
+    def test_defaults(self):
+        args = parse_router_args([])
+        assert args.tls_client_ca_path is None
+        assert args.tls_client_auth == "off"
+        assert args.tls_client_identity == "san-uri"
+
+    def test_flags_parse(self):
+        args = parse_router_args(
+            [
+                "--tls-client-ca-path",
+                "/etc/smg/client-ca.pem",
+                "--tls-client-auth",
+                "required",
+                "--tls-client-identity",
+                "san-dns",
+            ]
+        )
+        assert args.tls_client_ca_path == "/etc/smg/client-ca.pem"
+        assert args.tls_client_auth == "required"
+        assert args.tls_client_identity == "san-dns"
+
+    def test_unknown_spellings_are_refused(self):
+        with pytest.raises(SystemExit):
+            parse_router_args(["--tls-client-auth", "sometimes"])
+        with pytest.raises(SystemExit):
+            parse_router_args(["--tls-client-identity", "email"])
+
+    def test_router_prefixed_flags_parse(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        args = RouterArgs.from_cli_args(
+            parser.parse_args(
+                ["--router-tls-client-auth", "optional", "--router-tls-client-identity", "cn"]
+            ),
+            use_router_prefix=True,
+        )
+        assert args.tls_client_auth == "optional"
+        assert args.tls_client_identity == "cn"
+
+
 class TestConnectionTimeouts:
     """The HTTP edge's connection-level timeouts: their defaults and the
     disabling zero."""

@@ -333,6 +333,14 @@ class Router:
             provided). Default: None
         server_cert_path: Path to server TLS certificate (PEM format). Default: None
         server_key_path: Path to server TLS private key (PEM format). Default: None
+        tls_client_ca_path: A PEM bundle of the CAs client certificates on the HTTPS
+            listener must chain to (with tls_client_auth). Default: None
+        tls_client_auth: Client-certificate authentication on the HTTPS listener:
+            'off', 'optional' (a certificate identifies the caller when presented) or
+            'required' (the handshake fails without one). A verified certificate's
+            identity is the caller's tenant. Default: 'off'
+        tls_client_identity: The field of a verified client certificate that is the
+            caller's identity: 'san-uri', 'san-dns' or 'cn'. Default: 'san-uri'
     """
 
     def __init__(self, router: _Router):

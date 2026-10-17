@@ -348,6 +348,7 @@ impl ConfigValidator {
         Self::validate_routing_key_headers(config)?;
         Self::validate_tenant_resolution(config)?;
         Self::validate_tenant_api_keys(config)?;
+        Self::validate_tls_client_auth(config)?;
         Self::validate_memory_history(config)?;
         Self::validate_model_aliases(config)?;
         Self::validate_rl(config)?;
@@ -709,6 +710,62 @@ impl ConfigValidator {
             }
         }
 
+        Ok(())
+    }
+
+    /// Validates client-certificate authentication on the HTTPS listener: a
+    /// mode other than off needs the client CA bundle and the HTTPS listener;
+    /// a bundle given with the mode off is refused rather than read and never
+    /// checked; a bundle holds at least one PEM certificate.
+    fn validate_tls_client_auth(config: &RouterConfig) -> ConfigResult<()> {
+        let mode = config.tls_client_auth;
+        let bundle = config.tls_client_ca.as_deref();
+        if mode.is_on() {
+            if bundle.is_none() {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: format!(
+                        "tls_client_auth {mode} needs the CA bundle client certificates chain to: \
+                         give --tls-client-ca-path"
+                    ),
+                });
+            }
+            if config.server_cert.is_none() || config.server_key.is_none() {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: format!(
+                        "tls_client_auth {mode} needs the HTTPS listener: give --tls-cert-path and \
+                         --tls-key-path"
+                    ),
+                });
+            }
+        } else if bundle.is_some() {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "tls_client_ca_path is set while tls_client_auth is off: client \
+                         certificates would be read and never checked; give --tls-client-auth \
+                         required (or optional), or drop the CA bundle"
+                    .to_string(),
+            });
+        }
+        if let Some(bundle) = bundle {
+            let path = config.tls_client_ca_path.clone().unwrap_or_default();
+            match rustls_pemfile::certs(&mut &*bundle).collect::<Result<Vec<_>, _>>() {
+                Ok(certificates) if !certificates.is_empty() => {}
+                Ok(_) => {
+                    return Err(ConfigError::InvalidValue {
+                        field: "tls_client_ca_path".to_string(),
+                        value: path,
+                        reason: "the file holds no certificate (PEM CERTIFICATE blocks expected)"
+                            .to_string(),
+                    })
+                }
+                Err(e) => {
+                    return Err(ConfigError::InvalidValue {
+                        field: "tls_client_ca_path".to_string(),
+                        value: path,
+                        reason: format!("not a PEM certificate bundle: {e}"),
+                    })
+                }
+            }
+        }
         Ok(())
     }
 
@@ -3135,6 +3192,66 @@ mod tests {
                     if reason.contains("routing_key_override.headers")
             ));
         }
+    }
+
+    /// A PEM certificate for the client CA bundle rules (the content is a
+    /// certificate; its chain is not checked here).
+    fn pem_certificate() -> Vec<u8> {
+        use openssl::{
+            asn1::Asn1Time, hash::MessageDigest, pkey::PKey, rsa::Rsa, x509::X509Builder,
+        };
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_pubkey(&key).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        builder.sign(&key, MessageDigest::sha256()).unwrap();
+        builder.build().to_pem().unwrap()
+    }
+
+    /// Client-certificate authentication needs its CA bundle and the HTTPS
+    /// listener; a bundle without the mode, an empty or a non-PEM bundle are
+    /// refused by name.
+    #[test]
+    fn tls_client_auth_needs_its_bundle_and_the_https_listener() {
+        use crate::config::TlsClientAuth;
+
+        let certificate = pem_certificate();
+        let with = |mode: TlsClientAuth, bundle: Option<&[u8]>, listener: bool| {
+            let mut config = regular_mode_config();
+            config.tls_client_auth = mode;
+            config.tls_client_ca = bundle.map(<[u8]>::to_vec);
+            config.tls_client_ca_path = bundle.map(|_| "client-ca.pem".to_string());
+            if listener {
+                config.server_cert = Some(certificate.clone());
+                config.server_key = Some(b"a key".to_vec());
+            }
+            ConfigValidator::validate(&config)
+        };
+        let reason = |result: ConfigResult<()>| match result {
+            Err(ConfigError::IncompatibleConfig { reason }) => reason,
+            Err(ConfigError::InvalidValue { field, reason, .. }) => format!("{field}: {reason}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+
+        assert!(with(TlsClientAuth::Off, None, false).is_ok(), "the default");
+        assert!(with(TlsClientAuth::Required, Some(&certificate), true).is_ok());
+        assert!(with(TlsClientAuth::Optional, Some(&certificate), true).is_ok());
+
+        let r = reason(with(TlsClientAuth::Required, None, true));
+        assert!(r.contains("--tls-client-ca-path"), "{r}");
+        let r = reason(with(TlsClientAuth::Optional, Some(&certificate), false));
+        assert!(r.contains("--tls-cert-path"), "{r}");
+        let r = reason(with(TlsClientAuth::Off, Some(&certificate), true));
+        assert!(r.contains("never checked"), "{r}");
+        let r = reason(with(TlsClientAuth::Required, Some(b"not pem"), true));
+        assert!(r.starts_with("tls_client_ca_path:"), "{r}");
+        let r = reason(with(TlsClientAuth::Required, Some(b""), true));
+        assert!(r.contains("no certificate"), "{r}");
     }
 
     #[test]

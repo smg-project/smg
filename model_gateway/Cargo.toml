@@ -287,6 +287,11 @@ name = "sse_rechunk"
 harness = false
 path = "benches/sse_rechunk.rs"
 
+[[bench]]
+name = "tls_client_auth"
+harness = false
+path = "benches/tls_client_auth.rs"
+
 [lints]
 workspace = true
 
