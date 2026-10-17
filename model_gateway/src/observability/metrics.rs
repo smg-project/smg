@@ -1369,23 +1369,6 @@ impl Metrics {
             error_type,
         );
     }
-    pub fn record_router_tokens(
-        router_type: &'static str,
-        backend_type: &'static str,
-        model_id: &str,
-        endpoint: &'static str,
-        token_type: &'static str,
-        count: u64,
-    ) {
-        RouterMetrics::record_router_tokens(
-            router_type,
-            backend_type,
-            model_id,
-            endpoint,
-            token_type,
-            count,
-        );
-    }
     pub fn record_worker_retry(worker_type: &'static str, endpoint: &'static str) {
         RouterMetrics::record_worker_retry(worker_type, endpoint);
     }

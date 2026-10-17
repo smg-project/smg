@@ -4,11 +4,14 @@
 //! recorded reads as a live signal on `/metrics` and never moves; a recorder
 //! nobody calls is the same promise one layer down.
 //!
-//! Both tests read the workspace's Rust sources (this crate, the library
-//! crates, the clients, the bindings and the examples) with line comments
-//! removed, so a family recorded through a wrapper type counts as recorded,
-//! not only one recorded through the `counter!`, `gauge!` and `histogram!`
-//! macros.
+//! Both tests read Rust sources with line comments removed. The first reads
+//! the whole workspace (this crate, the library crates, the clients, the
+//! bindings and the examples), so a family recorded through a wrapper type or
+//! by a library crate counts as recorded, not only one recorded through the
+//! `counter!`, `gauge!` and `histogram!` macros. The second reads only the
+//! code that can reach this crate's `Metrics` (this crate, the bindings and
+//! the examples): the library crates sit below it and have same-named
+//! recorders of their own, which must not count as callers.
 
 #![expect(clippy::expect_used, reason = "test failures should panic")]
 
@@ -21,7 +24,11 @@ use std::{
 use regex::Regex;
 
 const METRICS_SOURCE: &str = "model_gateway/src/observability/metrics.rs";
+/// Where a described family may be recorded: anywhere in the workspace.
 const SOURCE_ROOTS: &[&str] = &["model_gateway", "crates", "clients", "bindings", "examples"];
+/// Where a caller of this crate's `Metrics` may live: the crates that depend
+/// on it, not the ones it depends on.
+const CALLER_ROOTS: &[&str] = &["model_gateway", "bindings", "examples"];
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -59,11 +66,11 @@ fn code_only(text: &str) -> String {
         })
 }
 
-/// Every workspace Rust source as (path, comment-free text).
-fn workspace_sources() -> Vec<(PathBuf, String)> {
+/// Every Rust source under `roots` as (path, comment-free text).
+fn sources_under(roots: &[&str]) -> Vec<(PathBuf, String)> {
     let root = repo_root();
     let mut files = Vec::new();
-    for sub in SOURCE_ROOTS {
+    for sub in roots {
         rust_files(&root.join(sub), &mut files);
     }
     assert!(
@@ -94,7 +101,7 @@ fn metrics_source(sources: &[(PathBuf, String)]) -> &str {
 /// its name occurs in the sources outside its own description.
 #[test]
 fn every_described_family_is_recorded() {
-    let sources = workspace_sources();
+    let sources = sources_under(SOURCE_ROOTS);
     let metrics = metrics_source(&sources);
     let describe = Regex::new(r#"describe_(?:counter|gauge|histogram)!\(\s*"(smg_[a-z0-9_]+)""#)
         .expect("a valid pattern");
@@ -131,10 +138,12 @@ fn every_described_family_is_recorded() {
 
 /// Every public function of the metrics module (the recorders, the gauges'
 /// setters, the exporter's setup) is referenced by name somewhere outside
-/// its own definition.
+/// its own definition, in code that can reach it. A wrapper that only
+/// forwards to a same-named recorder of another `*Metrics` type does not
+/// count as its own caller.
 #[test]
 fn every_recorder_has_a_caller() {
-    let sources = workspace_sources();
+    let sources = sources_under(CALLER_ROOTS);
     let metrics = metrics_source(&sources);
     let definition = Regex::new(r"(?m)^\s*pub fn ([A-Za-z0-9_]+)\s*[<(]").expect("a valid pattern");
     let recorders: Vec<&str> = definition
@@ -154,16 +163,20 @@ fn every_recorder_has_a_caller() {
             .expect("a valid pattern")
             .find_iter(metrics)
             .count();
+        let forwards = Regex::new(&format!(r"[A-Za-z0-9_]Metrics::{}\b", regex::escape(name)))
+            .expect("a valid pattern")
+            .find_iter(metrics)
+            .count();
         let mentions: usize = sources
             .iter()
             .map(|(_, text)| word.find_iter(text).count())
             .sum();
-        if mentions <= definitions {
+        if mentions <= definitions + forwards {
             uncalled.push(name.to_owned());
         }
     }
     assert!(
         uncalled.is_empty(),
-        "public metrics functions with no caller anywhere in the workspace: {uncalled:?}"
+        "public metrics functions with no caller in the code that can reach them: {uncalled:?}"
     );
 }
