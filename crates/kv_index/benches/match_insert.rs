@@ -5,7 +5,9 @@
 //! Workload: 64 tenants (worker URLs) sharing a 512-token (2 KiB) system
 //! prompt, each with its own 64-token (256-char) user turn. "hit" replays a
 //! known prompt and routes it to its matched tenant, the steady state of a
-//! warm tree; "miss" appends a never-seen turn each time; "hit_8_threads"
+//! warm tree; "hit_other" routes it to another tenant, the path on which
+//! the insert replay attaches a tenant; "miss" appends a never-seen turn
+//! each time; "hit_8_threads"
 //! runs the hit path on eight threads against one tree and reports wall time
 //! divided by operations.
 #![expect(clippy::expect_used)]
@@ -119,6 +121,28 @@ fn bench_token_tree(c: &mut Criterion) {
             i += 1;
             let result =
                 tree.match_and_insert_with(prompt, |r| names.get(r.tenant.as_ref()).copied());
+            assert!(result.matched_token_count >= SYSTEM_TOKENS);
+            result.matched_token_count
+        });
+    });
+
+    // The request routes to a tenant other than the one it matched: the insert
+    // replay attaches the routed tenant on every path node (confirming each
+    // edge first) instead of taking the skip branch that "hit" measures. Its
+    // own warm tree, so the rows after it see the tree "hit" left.
+    let (other_tree, other_tenants, other_prompts) = warm_token_tree();
+    let next_names: HashMap<&str, &str> = other_tenants
+        .iter()
+        .zip(other_tenants.iter().cycle().skip(1))
+        .map(|(tenant, next)| (tenant.as_str(), next.as_str()))
+        .collect();
+    let mut j = 0usize;
+    group.bench_function("hit_other", |b| {
+        b.iter(|| {
+            let prompt = &other_prompts[j % TENANTS];
+            j += 1;
+            let result = other_tree
+                .match_and_insert_with(prompt, |r| next_names.get(r.tenant.as_ref()).copied());
             assert!(result.matched_token_count >= SYSTEM_TOKENS);
             result.matched_token_count
         });

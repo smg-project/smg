@@ -1260,6 +1260,9 @@ impl TokenTree {
         // is cloned once, into `path`; `current` indexes it (`None` = root).
         let mut path: Vec<NodeRef> = Vec::with_capacity(16);
         let mut stamped: Vec<Option<TenantId>> = Vec::with_capacity(16);
+        // The page key each edge of `path` was descended by, so the replay can
+        // confirm an edge still exists before it attaches a tenant under it.
+        let mut keys: Vec<TokenPageKey> = Vec::with_capacity(16);
         let mut current: Option<usize> = None;
         // Where the match resolved: the deepest full-match node that had a
         // tenant (an index into `path`), or the partial-match node.
@@ -1363,6 +1366,7 @@ impl TokenTree {
                     }
                     path.push(next);
                     stamped.push(tenant);
+                    keys.push(page_key);
                     remaining = &remaining[advance..];
                     current = Some(path.len() - 1);
                 }
@@ -1418,7 +1422,19 @@ impl TokenTree {
         // Replay insert's per-node work on every edge the match descended:
         // `insert_tokens` touches the inserting tenant on each full-match node
         // and counts its tokens.
-        for (node, matched) in path.iter().zip(&stamped) {
+        //
+        // Nothing held the path while `select` ran. An eviction that emptied
+        // a path node meanwhile has detached it from its parent, and a tenant
+        // attached to a detached node is credited tokens no eviction can find
+        // again. So each attach below is made under the parent's child entry
+        // (its shard read guard), after confirming the entry still names the
+        // node: the detach takes the same shard's write lock and removes the
+        // node only while it is still empty (see
+        // `cleanup_empty_ancestors_with_parent`), so the two serialize. A
+        // detach that came first shows here as a lost edge; an attach that
+        // came first leaves a node the detach keeps.
+        let mut lost_edge = false;
+        for (i, (node, matched)) in path.iter().zip(&stamped).enumerate() {
             // The match stamped this very tenant on this node a moment ago (the
             // common hit: the request routes to the worker it matched). While
             // it is still attached there is nothing to re-stamp or credit: the
@@ -1440,6 +1456,15 @@ impl TokenTree {
                 }
                 continue;
             }
+            let parent = if i == 0 { &self.root } else { &path[i - 1] };
+            let edge = parent.children.get(&keys[i]);
+            if !edge
+                .as_ref()
+                .is_some_and(|edge| Arc::ptr_eq(edge.value(), node))
+            {
+                lost_edge = true;
+                break;
+            }
             // Credit the live length under the `tokens` read guard: a
             // concurrent split truncates the node and clones its tenant map in
             // one `tokens` write section, so this ordering decides both what
@@ -1450,16 +1475,34 @@ impl TokenTree {
             if node.touch_tenant(&tenant_id, ts, track_lfu) {
                 tokens_added += node_tokens.len();
             }
+            drop(node_tokens);
+            drop(edge);
         }
 
-        // Splice only the unmatched suffix at the fall-off node (`current`),
-        // reusing insert_tokens' exact descent loop. It re-probes `current`'s
-        // children for `remaining` (a single child-map op, not a re-walk of the
-        // matched prefix) and handles the vacant / split / — and, under a
-        // concurrent split race, full-match-continue — cases identically to a
-        // standalone `insert_tokens`. The matched prefix above `current` was
-        // already re-attached by the loop above and is never re-walked.
-        if remaining.len() >= page_size {
+        if lost_edge {
+            // A path node left the tree between the match and the replay. The
+            // nodes credited above are attached and live; descend again from
+            // the root for the whole aligned sequence. `insert_from` credits
+            // only the edges it newly attaches, so nothing is counted twice,
+            // and it splices the suffix under live nodes, so the prompt is
+            // cached. One extra descent, in the rare case.
+            tokens_added += Self::insert_from(
+                Arc::clone(&self.root),
+                tokens,
+                Arc::clone(&tenant_id),
+                ts,
+                track_lfu,
+                page_size,
+            );
+        } else if remaining.len() >= page_size {
+            // Splice only the unmatched suffix at the fall-off node
+            // (`current`), reusing insert_tokens' exact descent loop. It
+            // re-probes `current`'s children for `remaining` (a single
+            // child-map op, not a re-walk of the matched prefix) and handles
+            // the vacant / split / — and, under a concurrent split race,
+            // full-match-continue — cases identically to a standalone
+            // `insert_tokens`. The matched prefix above `current` was already
+            // re-attached by the loop above and is never re-walked.
             let fall_off = match current {
                 Some(i) => Arc::clone(&path[i]),
                 None => Arc::clone(&self.root),
@@ -1708,16 +1751,20 @@ impl TokenTree {
             };
             drop(page_key_guard);
 
-            // Detach only if the parent still holds this exact node under the key.
-            // The children map is concurrent and this walk runs during eviction, so a
-            // store can install a different node under the same page key after the
-            // emptiness check above. Removing the key unconditionally would drop that
-            // live replacement and every descendant it owns, silently shrinking the
-            // index. `remove_if` evaluates the predicate under the shard lock, so the
-            // check and the removal cannot be split.
-            parent
-                .children
-                .remove_if(&page_key, |_, child| Arc::ptr_eq(child, &current));
+            // Detach only if the parent still holds this exact node under the key,
+            // and only while the node is still empty. The children map is concurrent
+            // and this walk runs during eviction, so a store can install a different
+            // node under the same page key after the emptiness check above, and the
+            // fused walk's insert replay can attach a tenant to this very node under
+            // this entry's shard read guard (it confirms the edge first, see
+            // `match_and_insert_dyn`). Removing the key unconditionally would drop
+            // that live replacement, or a node whose tenant was just credited for
+            // it, with every descendant it owns: the index silently shrinks or the
+            // credit leaks. `remove_if` evaluates the predicate under the shard
+            // lock, so the checks and the removal cannot be split.
+            parent.children.remove_if(&page_key, |_, child| {
+                Arc::ptr_eq(child, &current) && child.is_empty()
+            });
 
             if parent_leaf_info.is_none() && self.is_tenant_leaf(&parent, tenant_id) {
                 if let Some(ts) = parent.tenant_last_access_time.get(tenant_id.as_ref()) {
@@ -4425,6 +4472,79 @@ mod tests {
             "the prompt must be cached for w1"
         );
         assert_eq!(cached.tenant.as_ref(), "w1");
+    }
+
+    /// Seeded traffic with an eviction injected between the match and the
+    /// insert replay of every request (the `select` seam): per-tenant
+    /// eviction, tree-wide eviction or a tenant purge, on prompts drawn from a
+    /// small page alphabet so paths share, split and fall empty often. After
+    /// every request each tenant's count equals the tokens it holds on nodes
+    /// the root still reaches, the tree-wide total equals the sum of the
+    /// counts, and the prompt is cached for the tenant it was routed to.
+    #[test]
+    fn test_match_and_insert_with_counts_stay_reachable_under_injected_evictions() {
+        // splitmix64: the same sequence on every platform and toolchain.
+        fn next(state: &mut u64) -> u64 {
+            *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        const TENANTS: usize = 4;
+        const PAGE_ALPHABET: u32 = 6;
+        const MAX_PAGES: u64 = 4;
+        const REQUESTS: usize = 2_000;
+
+        let names: Vec<String> = (0..TENANTS).map(|i| format!("w{i}")).collect();
+        let tree = TokenTree::new();
+        let mut rng = 0x5EED_u64;
+        for request in 0..REQUESTS {
+            let pages = 1 + (next(&mut rng) % MAX_PAGES) as usize;
+            let mut prompt = Vec::with_capacity(pages * PAGE_SIZE);
+            for _ in 0..pages {
+                let page = (next(&mut rng) % u64::from(PAGE_ALPHABET)) as u32;
+                prompt.extend(make_tokens(1 + page * 1_000, 1));
+            }
+            let route = &names[(next(&mut rng) % TENANTS as u64) as usize];
+            let victim = intern_tenant(&names[(next(&mut rng) % TENANTS as u64) as usize]);
+            let budget = (next(&mut rng) % 5) as usize * PAGE_SIZE;
+            let eviction = next(&mut rng) % 4;
+
+            tree.match_and_insert_with(&prompt, |_| {
+                match eviction {
+                    0 => tree.evict_tenant(&victim, budget),
+                    1 => tree.evict_tenant_by_size(budget * TENANTS),
+                    2 => tree.remove_tenant_all(&victim),
+                    _ => {}
+                }
+                Some(route.as_str())
+            });
+
+            for name in &names {
+                assert_eq!(
+                    tree.tenant_token_size(&intern_tenant(name)),
+                    reachable_tokens(&tree, name),
+                    "request {request}: {name}'s count vs the tokens it holds on reachable nodes"
+                );
+            }
+            assert_eq!(
+                tree.total_token_size(),
+                tree.get_tenant_token_counts().values().sum::<usize>(),
+                "request {request}: total vs the per-tenant sum"
+            );
+            assert_eq!(
+                tree.match_prefix_with_counts(&prompt).matched_token_count,
+                prompt.len(),
+                "request {request}: the prompt is cached"
+            );
+            for node in path_nodes(&tree, &prompt) {
+                assert!(
+                    node.tenant_last_access_time.contains_key(route.as_str()),
+                    "request {request}: {route} owns the whole prompt"
+                );
+            }
+        }
     }
 
     /// `touch_any_tenant` reports only a tenant it stamped in this call. The
