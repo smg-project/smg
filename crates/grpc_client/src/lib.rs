@@ -279,16 +279,22 @@ impl TraceInjector for NoopTraceInjector {
 pub type BoxedTraceInjector = Arc<dyn TraceInjector>;
 
 /// Generates the boilerplate that every engine client shares: the two
-/// `connect` constructors, `with_trace_injector`, and the three "standard"
-/// RPCs (`health_check`, `get_model_info`, `get_server_info`) whose
-/// request/response types are uniform across the generated proto crates.
+/// `connect` constructors, `with_trace_injector`, `generate` (the streaming
+/// call whose response aborts the request when dropped), and the three
+/// "standard" RPCs (`health_check`, `get_model_info`, `get_server_info`)
+/// whose request/response types are uniform across the generated proto
+/// crates.
 ///
-/// `$proto_client` is the fully-qualified path of the generated tonic
-/// client type (which `Self` wraps). `$display_name` is the human-readable
-/// name used in the connect log line.
+/// `$proto` is the invoking module's generated proto module (`proto`, or
+/// another name), where `GenerateRequest`, `HealthCheckRequest` and the
+/// other request types are read from. `$proto_client` is the fully-qualified
+/// path of the generated tonic client type (which `Self` wraps).
+/// `$display_name` is the human-readable name used in the connect log line.
+/// The invoking module defines the `AbortOnDropStream` alias `generate`
+/// returns (`crate::AbortOnDropStream<$proto::GenerateResponse, Self>`).
 ///
 /// Each engine's `impl` block invokes this once and then adds engine-
-/// specific RPCs (`generate`, `embed`, etc.) below.
+/// specific RPCs (`abort_request`, `embed`, etc.) below.
 macro_rules! impl_engine_client_basics {
     ($proto:ident, $proto_client:path, $display_name:literal) => {
         /// Create a new client and connect to the backend.
