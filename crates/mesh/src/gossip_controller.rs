@@ -28,6 +28,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    future::Future,
     net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -131,153 +132,202 @@ impl GossipController {
 
     #[instrument(fields(name = %self.self_name), skip(self, signal))]
     pub async fn event_loop(self, mut signal: watch::Receiver<bool>) -> Result<()> {
-        let init_state = self.state.clone();
-        let read_state = self.state.clone();
-        let mut cnt: u64 = 0;
-
-        // Track retry managers for each peer
-        use std::collections::HashMap;
+        let mut round: u64 = 0;
         let mut retry_managers: HashMap<String, RetryManager> = HashMap::new();
 
         loop {
-            log::info!("Round {} Status:{:?}", cnt, read_state.read());
-
-            // Clean up finished sync_stream connections
-            {
-                let mut connections = self.sync_connections.lock().await;
-                connections.retain(|peer_name, handle| {
-                    if handle.is_finished() {
-                        log::info!(
-                            "Sync stream connection to {} has finished, removing",
-                            peer_name
-                        );
-                        false
-                    } else {
-                        true
-                    }
-                });
-            }
-
-            // Get available peers from cluster state
-            let mut map = init_state.read().clone();
-            map.retain(|name, node| self.is_probe_target(name, node));
-
-            // The configured join peer is dialed while the table holds nobody
-            // else: at the start, and again should every other member be
-            // gone, under its backoff like any peer. Members a service
-            // discovery wrote into the table take precedence.
-            let peer = if map.is_empty() {
-                self.init_peer.map(|init_peer| NodeState {
-                    name: INIT_PEER_NAME.to_string(),
-                    address: init_peer.to_string(),
-                    status: NodeStatus::Suspected as i32,
-                    version: 1,
-                    metadata: HashMap::new(),
-                })
-            } else {
-                // Use nodes from cluster state (from service discovery or gossip)
-                let random_nodes = get_random_values_refs(&map, 1);
-                random_nodes.first().map(|&node| node.clone())
-            };
-            cnt += 1;
-
-            // Chunk assembler GC: every 5 rounds (~5s), drop partial
-            // assemblies older than 30s. Partial chunks the receiver has
-            // been holding for a full assembly timeout are assumed lost;
-            // the sender will re-publish on its own retry cycle with a
-            // fresh generation.
-            if cnt.is_multiple_of(5) {
-                if let Some(mesh_kv) = &self.mesh_kv {
-                    mesh_kv.chunk_assembler().gc(Duration::from_secs(30));
-                }
-            }
-
-            // Periodic retry-manager cleanup every 60 rounds (~60s). The join
-            // peer's entry stays: it is never in the table under its
-            // placeholder name, and its backoff must not restart every minute.
-            if cnt.is_multiple_of(60) {
-                retry_managers.retain(|peer_name, _| {
-                    map.contains_key(peer_name) || peer_name == INIT_PEER_NAME
-                });
-            }
-
-            // Stream round collection: drain stream namespace buffers and
-            // drain callbacks exactly once per round (destructive). Per-peer
-            // senders filter targeted_entries by their own peer_id and
-            // broadcast drain_entries to all peers. Empty batch if no
-            // MeshKV is attached (legacy path pre-Step 3).
-            if let Some(mesh_kv) = &self.mesh_kv {
-                let stream_batch = mesh_kv.collect_round_batch();
-                *self.current_stream_batch.write() = Arc::new(stream_batch);
-            }
+            log::info!("Round {} Status:{:?}", round, self.state.read());
+            self.reap_finished_streams().await;
+            let targets = self.probe_targets();
+            let peer = self.peer_to_dial(&targets);
+            round += 1;
+            self.periodic_gc(round, &targets, &mut retry_managers);
+            self.collect_stream_batch();
 
             tokio::select! {
-
                 _ = signal.changed() => {
                     log::info!("Gossip app_server {} at {} is shutting down", self.self_name, self.self_addr);
                     break;
                 }
 
                 () = tokio::time::sleep(Duration::from_secs(1)) => {
-                    if let Some(peer) = peer {
-                        let peer_name = peer.name.clone();
-
-                        // Get or create retry manager for this peer
-                        let retry_manager = retry_managers
-                            .entry(peer_name.clone())
-                            .or_default();
-
-                        // Check if we should retry based on backoff
-                        if retry_manager.should_retry() {
-                            match self.connect_to_peer(peer.clone()).await {
-                                Ok(()) if peer_name == INIT_PEER_NAME
-                                    && !self.has_another_member() =>
-                                {
-                                    // The join peer answered without adding a
-                                    // member: it is this node itself, or it is
-                                    // leaving. An attempt, so the next dial waits
-                                    // out the backoff instead of coming every round.
-                                    retry_manager.record_attempt();
-                                    log::debug!(
-                                        "The join peer answered but the table has nobody else to probe; next dial in {:?}",
-                                        retry_manager.next_delay()
-                                    );
-                                }
-                                Ok(()) => {
-                                    // Success - reset retry state
-                                    retry_manager.reset();
-                                    log::info!("Successfully connected to peer {}", peer_name);
-                                }
-                                Err(e) => {
-                                    // Failure - record attempt and calculate next delay
-                                    retry_manager.record_attempt();
-                                    let next_delay = retry_manager.next_delay();
-                                    let attempt = retry_manager.attempt_count();
-                                    log::warn!(
-                                        "Error connecting to peer {} (attempt {}): {}. Next retry in {:?}",
-                                        peer_name,
-                                        attempt,
-                                        e,
-                                        next_delay
-                                    );
-                                }
-                            }
-                        } else {
-                            // Still in backoff period, skip this attempt
-                            let next_delay = retry_manager.next_delay();
+                    let Some(peer) = peer else {
+                        log::info!("No peer address available to connect");
+                        continue;
+                    };
+                    let outcome = Self::dial_with_backoff(
+                        &mut retry_managers,
+                        &peer,
+                        |peer| self.connect_to_peer(peer),
+                        || self.has_another_member(),
+                    )
+                    .await;
+                    match outcome {
+                        DialOutcome::Connected => {
+                            log::info!("Successfully connected to peer {}", peer.name);
+                        }
+                        DialOutcome::JoinPeerAlone { next_delay } => {
                             log::debug!(
-                                "Skipping connection to peer {} (backoff: {:?} remaining)",
-                                peer_name,
+                                "The join peer answered but the table has nobody else to probe; next dial in {:?}",
                                 next_delay
                             );
                         }
-                    } else {
-                        log::info!("No peer address available to connect");
+                        DialOutcome::Failed {
+                            error,
+                            attempt,
+                            next_delay,
+                        } => {
+                            log::warn!(
+                                "Error connecting to peer {} (attempt {}): {}. Next retry in {:?}",
+                                peer.name,
+                                attempt,
+                                error,
+                                next_delay
+                            );
+                        }
+                        DialOutcome::BackingOff { next_delay } => {
+                            log::debug!(
+                                "Skipping connection to peer {} (backoff: {:?} remaining)",
+                                peer.name,
+                                next_delay
+                            );
+                        }
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    // ---- The round's phases ----
+
+    /// Drop the handles of sync-stream tasks that have ended, so a peer whose
+    /// stream closed is dialled again.
+    async fn reap_finished_streams(&self) {
+        let mut connections = self.sync_connections.lock().await;
+        connections.retain(|peer_name, handle| {
+            if handle.is_finished() {
+                log::info!(
+                    "Sync stream connection to {} has finished, removing",
+                    peer_name
+                );
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    /// The members this round may dial: the table without this node and
+    /// without the members marked Down or Leaving (see `is_probe_target`).
+    fn probe_targets(&self) -> BTreeMap<String, NodeState> {
+        let mut targets = self.state.read().clone();
+        targets.retain(|name, node| self.is_probe_target(name, node));
+        targets
+    }
+
+    /// The peer this round dials: a random probe target, or, while the table
+    /// holds nobody else, the configured join peer as a Suspected placeholder
+    /// named `init_peer`: at the start, and again should every other member
+    /// be gone, under its backoff like any peer. Members a service discovery
+    /// wrote into the table take precedence.
+    fn peer_to_dial(&self, targets: &BTreeMap<String, NodeState>) -> Option<NodeState> {
+        if targets.is_empty() {
+            return self.init_peer.map(|init_peer| NodeState {
+                name: INIT_PEER_NAME.to_string(),
+                address: init_peer.to_string(),
+                status: NodeStatus::Suspected as i32,
+                version: 1,
+                metadata: HashMap::new(),
+            });
+        }
+        let random_nodes = get_random_values_refs(targets, 1);
+        random_nodes.first().map(|&node| node.clone())
+    }
+
+    /// The round's housekeeping. Every fifth round (~5 s) the chunk
+    /// assembler drops partial assemblies older than 30 s: partial chunks
+    /// the receiver has held for a full assembly timeout are assumed lost,
+    /// and the sender re-publishes on its own retry cycle with a fresh
+    /// generation. Every sixtieth round (~60 s) the retry managers of peers
+    /// no longer in the table go; the join peer's entry stays, as it is never
+    /// in the table under its placeholder name and its backoff must not
+    /// restart every minute.
+    fn periodic_gc(
+        &self,
+        round: u64,
+        targets: &BTreeMap<String, NodeState>,
+        retry_managers: &mut HashMap<String, RetryManager>,
+    ) {
+        if round.is_multiple_of(5) {
+            if let Some(mesh_kv) = &self.mesh_kv {
+                mesh_kv.chunk_assembler().gc(Duration::from_secs(30));
+            }
+        }
+        if round.is_multiple_of(60) {
+            retry_managers.retain(|peer_name, _| {
+                targets.contains_key(peer_name) || peer_name == INIT_PEER_NAME
+            });
+        }
+    }
+
+    /// Stream round collection: drain the stream namespace buffers and the
+    /// drain callbacks exactly once per round (destructive) into the slot
+    /// the per-peer senders read. Per-peer senders filter the targeted
+    /// entries by their own peer id and broadcast the drained entries to all
+    /// peers. Nothing is collected without a MeshKV attached.
+    fn collect_stream_batch(&self) {
+        if let Some(mesh_kv) = &self.mesh_kv {
+            let stream_batch = mesh_kv.collect_round_batch();
+            *self.current_stream_batch.write() = Arc::new(stream_batch);
+        }
+    }
+
+    /// One dial of `peer` under its retry manager's backoff: nothing is
+    /// dialled while the manager still backs off from an earlier failure;
+    /// otherwise `connect` runs. Its success resets the manager, unless the
+    /// peer is the join peer and `has_another_member` finds the table still
+    /// without a member to probe (the join peer is this node itself, or it
+    /// is leaving): that counts as an attempt, so the next dial waits out
+    /// the backoff instead of coming every round. A failure records the
+    /// attempt and lengthens the next wait. The outcome is what the round
+    /// logs.
+    async fn dial_with_backoff<F, Fut>(
+        retry_managers: &mut HashMap<String, RetryManager>,
+        peer: &NodeState,
+        connect: F,
+        has_another_member: impl FnOnce() -> bool,
+    ) -> DialOutcome
+    where
+        F: FnOnce(NodeState) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        let retry_manager = retry_managers.entry(peer.name.clone()).or_default();
+        if !retry_manager.should_retry() {
+            return DialOutcome::BackingOff {
+                next_delay: retry_manager.next_delay(),
+            };
+        }
+        match connect(peer.clone()).await {
+            Ok(()) if peer.name == INIT_PEER_NAME && !has_another_member() => {
+                retry_manager.record_attempt();
+                DialOutcome::JoinPeerAlone {
+                    next_delay: retry_manager.next_delay(),
+                }
+            }
+            Ok(()) => {
+                retry_manager.reset();
+                DialOutcome::Connected
+            }
+            Err(error) => {
+                retry_manager.record_attempt();
+                DialOutcome::Failed {
+                    error,
+                    attempt: retry_manager.attempt_count(),
+                    next_delay: retry_manager.next_delay(),
+                }
+            }
+        }
     }
 
     async fn connect_to_peer(&self, peer: NodeState) -> Result<()> {
@@ -700,6 +750,28 @@ fn get_random_values_refs<K, V>(map: &BTreeMap<K, V>, k: usize) -> Vec<&V> {
     values.sample(&mut rng, k).copied().collect()
 }
 
+/// What one round's dial of a peer came to (see
+/// `GossipController::dial_with_backoff`).
+#[derive(Debug)]
+enum DialOutcome {
+    /// The peer answered; its retry state is reset.
+    Connected,
+    /// The join peer answered but added no member to probe; the attempt is
+    /// recorded and the next dial waits `next_delay`.
+    JoinPeerAlone { next_delay: Duration },
+    /// The dial failed; the attempt is recorded and the next one waits
+    /// `next_delay`.
+    Failed {
+        error: anyhow::Error,
+        attempt: u32,
+        next_delay: Duration,
+    },
+    /// Still inside the backoff of an earlier failure; nothing was dialled.
+    /// `next_delay` is the slot's whole wait, not what is left of it (the
+    /// round's line has always reported it as the backoff remaining).
+    BackingOff { next_delay: Duration },
+}
+
 /// Exponential backoff calculator used by the per-peer reconnect loop.
 #[derive(Debug, Clone)]
 struct ExponentialBackoff {
@@ -829,5 +901,200 @@ mod retry_manager_tests {
     fn should_retry_before_any_attempt() {
         let mgr = RetryManager::default();
         assert!(mgr.should_retry());
+    }
+}
+
+#[cfg(test)]
+mod dial_tests {
+    use std::{
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::{Duration, Instant},
+    };
+
+    use super::{
+        DialOutcome, GossipController, NodeState, NodeStatus, RetryManager, INIT_PEER_NAME,
+    };
+
+    fn node(name: &str) -> NodeState {
+        NodeState {
+            name: name.to_string(),
+            address: "127.0.0.1:1".to_string(),
+            status: NodeStatus::Alive as i32,
+            version: 1,
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// A connect that answers or refuses, counting its calls.
+    fn connect(
+        calls: &Arc<AtomicUsize>,
+        answer: bool,
+    ) -> impl FnOnce(NodeState) -> std::future::Ready<anyhow::Result<()>> {
+        let calls = Arc::clone(calls);
+        move |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            std::future::ready(if answer {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("refused"))
+            })
+        }
+    }
+
+    /// A member answering resets its retry state; a failure records the
+    /// attempt and backs off; a dial inside that backoff runs no connect at
+    /// all; the backoff over, the next dial runs and its success starts the
+    /// peer afresh.
+    #[tokio::test]
+    async fn a_dial_connects_fails_or_backs_off_and_the_retry_state_follows() {
+        let mut retry_managers: HashMap<String, RetryManager> = HashMap::new();
+        let peer = node("peer-a");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let member_present = || true;
+
+        let outcome = GossipController::dial_with_backoff(
+            &mut retry_managers,
+            &peer,
+            connect(&calls, true),
+            member_present,
+        )
+        .await;
+        assert!(matches!(outcome, DialOutcome::Connected), "{outcome:?}");
+        assert_eq!(retry_managers["peer-a"].attempt_count(), 0);
+
+        let outcome = GossipController::dial_with_backoff(
+            &mut retry_managers,
+            &peer,
+            connect(&calls, false),
+            member_present,
+        )
+        .await;
+        match outcome {
+            DialOutcome::Failed {
+                attempt,
+                next_delay,
+                ..
+            } => {
+                assert_eq!(attempt, 1);
+                assert_eq!(next_delay, Duration::from_secs(1));
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+        let outcome = GossipController::dial_with_backoff(
+            &mut retry_managers,
+            &peer,
+            connect(&calls, true),
+            member_present,
+        )
+        .await;
+        assert!(
+            matches!(outcome, DialOutcome::BackingOff { next_delay } if next_delay == Duration::from_secs(1)),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "a dial in backoff runs no connect"
+        );
+        assert_eq!(retry_managers["peer-a"].attempt_count(), 1);
+
+        retry_managers.get_mut("peer-a").unwrap().last_attempt =
+            Some(Instant::now() - Duration::from_secs(2));
+        let outcome = GossipController::dial_with_backoff(
+            &mut retry_managers,
+            &peer,
+            connect(&calls, true),
+            member_present,
+        )
+        .await;
+        assert!(matches!(outcome, DialOutcome::Connected), "{outcome:?}");
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert_eq!(retry_managers["peer-a"].attempt_count(), 0);
+        assert!(retry_managers["peer-a"].should_retry());
+    }
+
+    /// The join peer answering with nobody else in the table counts as an
+    /// attempt (the next dial waits out the backoff); answering with a
+    /// member in the table is a connection like any other.
+    #[tokio::test]
+    async fn the_join_peer_answering_alone_records_an_attempt() {
+        let mut retry_managers: HashMap<String, RetryManager> = HashMap::new();
+        let join_peer = node(INIT_PEER_NAME);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let outcome = GossipController::dial_with_backoff(
+            &mut retry_managers,
+            &join_peer,
+            connect(&calls, true),
+            || false,
+        )
+        .await;
+        assert!(
+            matches!(outcome, DialOutcome::JoinPeerAlone { next_delay } if next_delay == Duration::from_secs(1)),
+            "{outcome:?}"
+        );
+        assert_eq!(retry_managers[INIT_PEER_NAME].attempt_count(), 1);
+        assert!(!retry_managers[INIT_PEER_NAME].should_retry());
+
+        retry_managers.get_mut(INIT_PEER_NAME).unwrap().last_attempt =
+            Some(Instant::now() - Duration::from_secs(2));
+        let outcome = GossipController::dial_with_backoff(
+            &mut retry_managers,
+            &join_peer,
+            connect(&calls, true),
+            || true,
+        )
+        .await;
+        assert!(matches!(outcome, DialOutcome::Connected), "{outcome:?}");
+        assert_eq!(retry_managers[INIT_PEER_NAME].attempt_count(), 0);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    /// Two failures in a row double the wait, and each peer keeps its own
+    /// retry state.
+    #[tokio::test]
+    async fn repeated_failures_lengthen_the_wait_per_peer() {
+        let mut retry_managers: HashMap<String, RetryManager> = HashMap::new();
+        let peer_a = node("peer-a");
+        let peer_b = node("peer-b");
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        GossipController::dial_with_backoff(
+            &mut retry_managers,
+            &peer_a,
+            connect(&calls, false),
+            || true,
+        )
+        .await;
+        retry_managers.get_mut("peer-a").unwrap().last_attempt =
+            Some(Instant::now() - Duration::from_secs(5));
+        let outcome = GossipController::dial_with_backoff(
+            &mut retry_managers,
+            &peer_a,
+            connect(&calls, false),
+            || true,
+        )
+        .await;
+        assert!(
+            matches!(outcome, DialOutcome::Failed { attempt: 2, next_delay, .. } if next_delay == Duration::from_secs(2)),
+            "{outcome:?}"
+        );
+
+        let outcome = GossipController::dial_with_backoff(
+            &mut retry_managers,
+            &peer_b,
+            connect(&calls, true),
+            || true,
+        )
+        .await;
+        assert!(matches!(outcome, DialOutcome::Connected), "{outcome:?}");
+        assert_eq!(retry_managers["peer-b"].attempt_count(), 0);
+        assert_eq!(retry_managers["peer-a"].attempt_count(), 2);
     }
 }
