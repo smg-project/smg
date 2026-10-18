@@ -1477,6 +1477,9 @@ const LLAMA4_OUTPUTS: &[&str] = &[
 /// content before it; two markers; one cut short; prose with the marker's look; a list that is
 /// not one.
 const MISTRAL_LIST_OUTPUTS: &[&str] = &[
+    // Arguments that are not JSON, with the `id` member after them: the call carries them as
+    // written, says once that they are no JSON, and the `id` stays the object's.
+    "[TOOL_CALLS] [{\"name\": \"plot_sine_wave\", \"arguments\": {\"start_range\": 0, \"end_range\": 2.0 * Math.PI, \"frequency\": 5}, \"id\": \"call00000\"}]",
     "[TOOL_CALLS] [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}, \"id\": \"call00000\"}]",
     "[TOOL_CALLS][{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"days\": [1, 2.5, true, null]}}, {\"name\": \"get_stock_price\", \"arguments\": {}}]",
     "Let me check.[TOOL_CALLS] [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}, \"id\": \"call00000\"}]",
