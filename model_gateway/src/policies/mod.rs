@@ -70,7 +70,9 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Get policy name for metrics and debugging
     fn name(&self) -> &'static str;
 
-    /// Check if this policy needs request text for routing decisions
+    /// Check if this policy needs request text for routing decisions. A
+    /// policy's answer is a constant for its lifetime: the registry reads
+    /// it where the policy is registered, not per request.
     fn needs_request_text(&self) -> bool {
         false // Default: most policies don't need request text
     }
@@ -80,7 +82,8 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// back to the text only without them answers `false`, so a tokenized
     /// request's selection snapshot carries the ids alone instead of a copy
     /// of the whole rendered prompt next to them. Defaults to
-    /// [`Self::needs_request_text`].
+    /// [`Self::needs_request_text`]; a constant for the policy's lifetime
+    /// as well.
     fn needs_request_text_with_tokens(&self) -> bool {
         self.needs_request_text()
     }
