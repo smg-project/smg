@@ -250,52 +250,13 @@ fn render_xtml(
     // Effort directive (`thinking-effort` internal system message). Only emitted
     // while thinking is on, mirroring the Python reference (both the validation
     // and the emit are gated on `thinking`).
-    //
-    // Precedence:
-    //   1. An explicit `thinking_effort` (via `chat_template_kwargs`) wins and is
-    //      validated strictly — a provided-but-unsupported value is a hard error,
-    //      matching the reference `assert thinking_effort in _VALID_THINKING_EFFORTS`.
-    //   2. Otherwise the OpenAI-standard top-level `reasoning_effort` level is
-    //      used, but only when it names a supported K3 effort (`low`/`high`/`max`).
-    //      `minimal`/`none` already switch thinking off upstream and `medium` has
-    //      no K3 equivalent, so such values emit no directive rather than erroring
-    //      on an otherwise-valid OpenAI field.
-    //   3. Absent both, `default_effort` — `None` for the bare port, `Some("max")`
-    //      for the served entry point. See [`DEFAULT_THINKING_EFFORT`].
-    //
-    // `preserve_thinking` is not read by the reference renderer and is ignored.
     if thinking {
-        if let Some(effort_val) = params
-            .template_kwargs
-            .and_then(|k| k.get("thinking_effort"))
-            .filter(|v| !v.is_null())
-        {
-            match effort_val.as_str() {
-                Some(effort @ ("low" | "high" | "max")) => {
-                    push_thinking_effort(&mut out, effort);
-                }
-                _ => {
-                    return Err(anyhow!(
-                        "Unsupported thinking_effort={effort_val}; \
-                         supported values are [\"high\", \"low\", \"max\"]."
-                    ));
-                }
-            }
-        } else if let Some(effort) = params
-            .template_kwargs
-            .and_then(|k| k.get("reasoning_effort"))
-            .and_then(Value::as_str)
-            .filter(|e| matches!(*e, "low" | "high" | "max"))
-            .or(default_effort)
-        {
-            push_thinking_effort(&mut out, effort);
-        }
+        push_effort_directive(&mut out, params.template_kwargs, default_effort)?;
     }
 
     // Tracks the most recent assistant `tool_calls` so tool messages can resolve
     // a missing name by position, mirroring the Python module-local state.
-    let mut current_tool_calls: Option<&Vec<Value>> = None;
-    let mut tool_index: usize = 0;
+    let mut cursor = ToolCallCursor::default();
 
     for message in &normalized {
         let obj = match message.as_object() {
@@ -304,84 +265,12 @@ fn render_xtml(
         };
         let role = obj.get("role").and_then(Value::as_str).unwrap_or("");
         match role {
-            "user" => {
-                let mut attrs = vec![("role", "user".to_string())];
-                if let Some(name) = nonempty_name(obj) {
-                    attrs.push(("name", name));
-                }
-                push_open_tag(&mut out, "message", &attrs);
-                push_content(&mut out, obj.get("content"));
-                push_close_tag(&mut out, "message");
-                push_end_of_msg(&mut out);
-            }
-            "system" => {
-                if let Some(tools) = obj
-                    .get("tools")
-                    .filter(|t| t.as_array().is_some_and(|a| !a.is_empty()))
-                {
-                    // Dynamic tool declaration; already deep-sorted by
-                    // `normalize_message`.
-                    push_tool_declare(&mut out, tools, true)?;
-                } else {
-                    let mut attrs = vec![("role", "system".to_string())];
-                    if let Some(name) = nonempty_name(obj) {
-                        attrs.push(("name", name));
-                    }
-                    push_open_tag(&mut out, "message", &attrs);
-                    push_content(&mut out, obj.get("content"));
-                    push_close_tag(&mut out, "message");
-                    push_end_of_msg(&mut out);
-                }
-            }
-            "tool" => {
-                tool_index += 1;
-                let mut tool_name = obj
-                    .get("tool")
-                    .and_then(Value::as_str)
-                    .or_else(|| obj.get("name").and_then(Value::as_str))
-                    .map(str::to_string);
-                if tool_name.is_none() {
-                    if let Some(tcs) = current_tool_calls {
-                        if tool_index <= tcs.len() {
-                            let tc = &tcs[tool_index - 1];
-                            let fnobj = function_or_self(tc);
-                            tool_name = fnobj
-                                .get("name")
-                                .and_then(Value::as_str)
-                                .map(str::to_string);
-                        }
-                    }
-                }
-                let tool_name = tool_name.ok_or_else(|| {
-                    anyhow!(
-                        "Kimi K3 tool messages need a resolvable tool name: carry `tool`/`name`, \
-                         or match a preceding assistant tool_call by order."
-                    )
-                })?;
-                push_open_tag(
-                    &mut out,
-                    "message",
-                    &[
-                        ("role", "tool".to_string()),
-                        ("tool", tool_name),
-                        ("index", tool_index.to_string()),
-                    ],
-                );
-                push_content(&mut out, obj.get("content"));
-                push_close_tag(&mut out, "message");
-                push_end_of_msg(&mut out);
-            }
+            "user" => push_user_message(&mut out, obj),
+            "system" => push_system_message(&mut out, obj)?,
+            "tool" => push_tool_message(&mut out, obj, &mut cursor)?,
             "assistant" => {
-                current_tool_calls = obj.get("tool_calls").and_then(Value::as_array);
-                tool_index = 0;
-                let mut attrs = vec![("role", "assistant".to_string())];
-                if let Some(name) = nonempty_name(obj) {
-                    attrs.push(("name", name));
-                }
-                push_open_tag(&mut out, "message", &attrs);
-                render_assistant_segments(&mut out, obj, thinking)?;
-                push_close_tag(&mut out, "message");
-                push_end_of_msg(&mut out);
+                cursor.start_turn(obj);
+                push_assistant_message(&mut out, obj, thinking)?;
             }
             // Unknown roles produce no output, matching the Python loop's lack
             // of a matching branch.
@@ -392,25 +281,7 @@ fn render_xtml(
     // Post-loop `tool_choice` / `response_format` internal system messages,
     // emitted after the conversation and before the generation-prompt tail to
     // mirror `build_chat_segments`.
-    match params
-        .template_kwargs
-        .and_then(|kwargs| kwargs.get("tool_choice"))
-        .and_then(Value::as_str)
-    {
-        Some("required") => push_internal_system_message(
-            &mut out,
-            "tool-choice",
-            "The system is invoked with `tool_choice=required`.\n\
-             You MUST call tools in the next message.",
-        ),
-        Some("none") => push_internal_system_message(
-            &mut out,
-            "tool-choice",
-            "The system is invoked with `tool_choice=none`.\n\
-             You MUST NOT call any tools in the next message.",
-        ),
-        _ => {}
-    }
+    push_tool_choice(&mut out, params.template_kwargs);
 
     if let Some(response_format) = params
         .template_kwargs
@@ -419,18 +290,226 @@ fn render_xtml(
         push_response_format(&mut out, response_format, params.template_kwargs)?;
     }
 
-    let mut pending = 0..0;
-    if params.add_generation_prompt {
-        push_open_tag(&mut out, "message", &[("role", "assistant".to_string())]);
-        let start = out.len();
-        push_open_tag(&mut out, if thinking { "think" } else { "response" }, &[]);
-        pending = start..out.len();
-    }
+    let pending = if params.add_generation_prompt {
+        push_generation_prompt(&mut out, thinking)
+    } else {
+        0..0
+    };
 
     Ok(RenderedXtml {
         segments: out,
         pending,
     })
+}
+
+/// The `thinking-effort` directive of a request, when it names an effort or
+/// the entry point has a default (the caller emits it only while thinking is
+/// on).
+///
+/// Precedence:
+///   1. An explicit `thinking_effort` (via `chat_template_kwargs`) wins and is
+///      validated strictly — a provided-but-unsupported value is a hard error,
+///      matching the reference `assert thinking_effort in _VALID_THINKING_EFFORTS`.
+///   2. Otherwise the OpenAI-standard top-level `reasoning_effort` level is
+///      used, but only when it names a supported K3 effort (`low`/`high`/`max`).
+///      `minimal`/`none` already switch thinking off upstream and `medium` has
+///      no K3 equivalent, so such values emit no directive rather than erroring
+///      on an otherwise-valid OpenAI field.
+///   3. Absent both, `default_effort` — `None` for the bare port, `Some("max")`
+///      for the served entry point. See [`DEFAULT_THINKING_EFFORT`].
+///
+/// `preserve_thinking` is not read by the reference renderer and is ignored.
+fn push_effort_directive(
+    out: &mut Vec<PromptSegment>,
+    template_kwargs: Option<&HashMap<String, Value>>,
+    default_effort: Option<&str>,
+) -> Result<()> {
+    if let Some(effort_val) = template_kwargs
+        .and_then(|k| k.get("thinking_effort"))
+        .filter(|v| !v.is_null())
+    {
+        match effort_val.as_str() {
+            Some(effort @ ("low" | "high" | "max")) => {
+                push_thinking_effort(out, effort);
+            }
+            _ => {
+                return Err(anyhow!(
+                    "Unsupported thinking_effort={effort_val}; \
+                     supported values are [\"high\", \"low\", \"max\"]."
+                ));
+            }
+        }
+    } else if let Some(effort) = template_kwargs
+        .and_then(|k| k.get("reasoning_effort"))
+        .and_then(Value::as_str)
+        .filter(|e| matches!(*e, "low" | "high" | "max"))
+        .or(default_effort)
+    {
+        push_thinking_effort(out, effort);
+    }
+    Ok(())
+}
+
+/// A `message` tag's attributes: the role and, when the message carries a
+/// non-empty `name`, the name.
+fn message_attrs(role: &str, obj: &Map<String, Value>) -> Vec<(&'static str, String)> {
+    let mut attrs = vec![("role", role.to_string())];
+    if let Some(name) = nonempty_name(obj) {
+        attrs.push(("name", name));
+    }
+    attrs
+}
+
+/// A whole `message` element: the open tag with `attrs`, the content, the
+/// close tag and the end-of-message marker.
+fn push_message(out: &mut Vec<PromptSegment>, attrs: &[(&str, String)], content: Option<&Value>) {
+    push_open_tag(out, "message", attrs);
+    push_content(out, content);
+    push_close_tag(out, "message");
+    push_end_of_msg(out);
+}
+
+/// A user message: a `message` element with its role and name.
+fn push_user_message(out: &mut Vec<PromptSegment>, obj: &Map<String, Value>) {
+    push_message(out, &message_attrs("user", obj), obj.get("content"));
+}
+
+/// A system message: a dynamic tool declaration when it carries tools
+/// (already deep-sorted by `normalize_message`), a `message` element with its
+/// role and name otherwise.
+fn push_system_message(out: &mut Vec<PromptSegment>, obj: &Map<String, Value>) -> Result<()> {
+    if let Some(tools) = obj
+        .get("tools")
+        .filter(|t| t.as_array().is_some_and(|a| !a.is_empty()))
+    {
+        push_tool_declare(out, tools, true)?;
+    } else {
+        push_message(out, &message_attrs("system", obj), obj.get("content"));
+    }
+    Ok(())
+}
+
+/// The most recent assistant turn's `tool_calls` and how many tool results
+/// have followed it, so a tool message without a name resolves one by
+/// position (the Python module-local state).
+#[derive(Default)]
+struct ToolCallCursor<'a> {
+    current_tool_calls: Option<&'a Vec<Value>>,
+    tool_index: usize,
+}
+
+impl<'a> ToolCallCursor<'a> {
+    /// An assistant turn: its tool calls are the current ones, the result
+    /// count starts over.
+    fn start_turn(&mut self, assistant: &'a Map<String, Value>) {
+        self.current_tool_calls = assistant.get("tool_calls").and_then(Value::as_array);
+        self.tool_index = 0;
+    }
+
+    /// The next tool result's index among the turn's results, from one.
+    fn next_index(&mut self) -> usize {
+        self.tool_index += 1;
+        self.tool_index
+    }
+
+    /// The name of the call the result at `index` answers, by position, when
+    /// the current turn made that many calls and the call names a function.
+    fn name_by_position(&self, index: usize) -> Option<String> {
+        let tcs = self.current_tool_calls?;
+        if index <= tcs.len() {
+            let tc = &tcs[index - 1];
+            let fnobj = function_or_self(tc);
+            fnobj
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        } else {
+            None
+        }
+    }
+}
+
+/// A tool message: a `message` element with the tool's name (its own `tool`
+/// or `name`, else the call it answers by position) and its index among the
+/// turn's results.
+fn push_tool_message(
+    out: &mut Vec<PromptSegment>,
+    obj: &Map<String, Value>,
+    cursor: &mut ToolCallCursor<'_>,
+) -> Result<()> {
+    let tool_index = cursor.next_index();
+    let tool_name = obj
+        .get("tool")
+        .and_then(Value::as_str)
+        .or_else(|| obj.get("name").and_then(Value::as_str))
+        .map(str::to_string)
+        .or_else(|| cursor.name_by_position(tool_index))
+        .ok_or_else(|| {
+            anyhow!(
+                "Kimi K3 tool messages need a resolvable tool name: carry `tool`/`name`, \
+                 or match a preceding assistant tool_call by order."
+            )
+        })?;
+    push_message(
+        out,
+        &[
+            ("role", "tool".to_string()),
+            ("tool", tool_name),
+            ("index", tool_index.to_string()),
+        ],
+        obj.get("content"),
+    );
+    Ok(())
+}
+
+/// An assistant message: a `message` element with its role and name whose
+/// body is the turn's channels ([`render_assistant_segments`]).
+fn push_assistant_message(
+    out: &mut Vec<PromptSegment>,
+    obj: &Map<String, Value>,
+    thinking: bool,
+) -> Result<()> {
+    push_open_tag(out, "message", &message_attrs("assistant", obj));
+    render_assistant_segments(out, obj, thinking)?;
+    push_close_tag(out, "message");
+    push_end_of_msg(out);
+    Ok(())
+}
+
+/// The `tool-choice` internal system message a `required` or `none` tool
+/// choice in the kwargs asks for.
+fn push_tool_choice(
+    out: &mut Vec<PromptSegment>,
+    template_kwargs: Option<&HashMap<String, Value>>,
+) {
+    match template_kwargs
+        .and_then(|kwargs| kwargs.get("tool_choice"))
+        .and_then(Value::as_str)
+    {
+        Some("required") => push_internal_system_message(
+            out,
+            "tool-choice",
+            "The system is invoked with `tool_choice=required`.\n\
+             You MUST call tools in the next message.",
+        ),
+        Some("none") => push_internal_system_message(
+            out,
+            "tool-choice",
+            "The system is invoked with `tool_choice=none`.\n\
+             You MUST NOT call any tools in the next message.",
+        ),
+        _ => {}
+    }
+}
+
+/// The generation-prompt tail: the assistant message opened and the channel
+/// the turn starts in (`think` or `response`) opened; the span of that
+/// opener is what the reference bills as pending.
+fn push_generation_prompt(out: &mut Vec<PromptSegment>, thinking: bool) -> std::ops::Range<usize> {
+    push_open_tag(out, "message", &[("role", "assistant".to_string())]);
+    let start = out.len();
+    push_open_tag(out, if thinking { "think" } else { "response" }, &[]);
+    start..out.len()
 }
 
 // ---------------------------------------------------------------------------
