@@ -867,12 +867,6 @@ mod tests {
     }
 
     #[test]
-    fn test_proto_types_compilation() {
-        let _health_req = proto::HealthCheckRequest {};
-        // HealthCheckRequest is now empty - no fields to test
-    }
-
-    #[test]
     fn test_scheduler_load_maps_disagg_section() {
         let load = proto::SchedulerLoad {
             dp_rank: 0,
@@ -947,12 +941,6 @@ mod tests {
         assert_eq!(params.temperature, 0.7);
         assert_eq!(params.max_new_tokens, Some(128));
         assert_eq!(params.stop, vec!["</s>"]);
-    }
-
-    #[test]
-    fn test_health_check_request() {
-        let _health_req = proto::HealthCheckRequest {};
-        // HealthCheckRequest is now empty - server generates its own test internally
     }
 
     #[test]

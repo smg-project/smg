@@ -743,11 +743,6 @@ mod tests {
     }
 
     #[test]
-    fn test_proto_types_compilation() {
-        let _health_req = proto::HealthCheckRequest {};
-    }
-
-    #[test]
     fn test_generate_request_construction() {
         let sampling_config = proto::SamplingConfig {
             temperature: Some(0.7),
@@ -787,11 +782,6 @@ mod tests {
         let config = gen_req.sampling_config.unwrap();
         assert_eq!(config.temperature, Some(0.7));
         assert_eq!(config.top_p, Some(0.9));
-    }
-
-    #[test]
-    fn test_health_check_request() {
-        let _health_req = proto::HealthCheckRequest {};
     }
 
     #[test]

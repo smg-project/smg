@@ -707,12 +707,6 @@ mod tests {
     }
 
     #[test]
-    fn test_proto_types_compilation() {
-        let _health_req = proto::HealthCheckRequest {};
-        // HealthCheckRequest is now empty - no fields to test
-    }
-
-    #[test]
     fn test_generate_request_construction() {
         let sampling_params = proto::SamplingParams {
             temperature: Some(0.7),
@@ -751,12 +745,6 @@ mod tests {
         assert_eq!(params.temperature, Some(0.7));
         assert_eq!(params.max_tokens, Some(128));
         assert_eq!(params.stop, vec!["</s>"]);
-    }
-
-    #[test]
-    fn test_health_check_request() {
-        let _health_req = proto::HealthCheckRequest {};
-        // HealthCheckRequest is now empty - server generates its own test internally
     }
 
     #[test]
