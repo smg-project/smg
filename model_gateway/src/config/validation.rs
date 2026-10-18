@@ -1237,13 +1237,13 @@ impl ConfigValidator {
         if config.background_lease_ttl_secs != 0
             && config.background_lease_ttl_secs < MIN_BACKGROUND_LEASE_TTL_SECS
         {
-            return Err(ConfigError::InvalidValue {
-                field: "background_lease_ttl_secs".to_string(),
-                value: config.background_lease_ttl_secs.to_string(),
-                reason: format!(
+            return Err(ConfigError::invalid_value(
+                "background_lease_ttl_secs",
+                config.background_lease_ttl_secs,
+                format!(
                     "Must be 0 (no lease, no reaper) or at least {MIN_BACKGROUND_LEASE_TTL_SECS} seconds"
                 ),
-            });
+            ));
         }
 
         if config.mm_per_request_image_limit == Some(0) {
