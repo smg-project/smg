@@ -59,42 +59,13 @@ pub struct BasicWorkerBuilder {
 impl BasicWorkerBuilder {
     /// Create a new builder with only the URL (uses default WorkerSpec)
     pub fn new(url: impl Into<String>) -> Self {
-        Self {
-            spec: WorkerSpec::new(url),
-            health_config: None,
-            health_endpoint: "/health".to_string(),
-            circuit_breaker_config: CircuitBreakerConfig::default(),
-            backend_client: None,
-            http_client: None,
-            http2: false,
-            resilience: None,
-            initial_status: None,
-            connect_signal_tx: None,
-            overload_defaults: OverloadThresholds::default(),
-        }
+        Self::from_spec(WorkerSpec::new(url))
     }
 
-    /// Create a builder from an existing WorkerSpec.
+    /// Create a builder from an existing WorkerSpec, every other field at its default: no health
+    /// config and `/health` as the endpoint, the default circuit breaker and overload thresholds,
+    /// no clients, HTTP/1, no resilience, no initial status, no connect signal.
     pub fn from_spec(spec: WorkerSpec) -> Self {
-        Self {
-            spec,
-            health_config: None,
-            health_endpoint: "/health".to_string(),
-            circuit_breaker_config: CircuitBreakerConfig::default(),
-            backend_client: None,
-            http_client: None,
-            http2: false,
-            resilience: None,
-            initial_status: None,
-            connect_signal_tx: None,
-            overload_defaults: OverloadThresholds::default(),
-        }
-    }
-
-    /// Create a new builder with URL and worker type (for backwards compatibility)
-    pub fn new_with_type(url: impl Into<String>, worker_type: WorkerType) -> Self {
-        let mut spec = WorkerSpec::new(url);
-        spec.worker_type = worker_type;
         Self {
             spec,
             health_config: None,
@@ -441,6 +412,29 @@ mod tests {
 
     use super::*;
     use crate::worker::worker::Worker;
+
+    /// `new(url)` is `from_spec` of the default spec for `url`: the two constructors give the same
+    /// worker, every default written once.
+    #[test]
+    fn a_builder_from_a_url_is_the_builder_from_its_default_spec() {
+        let from_url = BasicWorkerBuilder::new("http://w:1").build();
+        let from_spec = BasicWorkerBuilder::from_spec(WorkerSpec::new("http://w:1")).build();
+        assert_eq!(
+            format!("{:?}", from_url.metadata().spec),
+            format!("{:?}", from_spec.metadata().spec)
+        );
+        assert_eq!(
+            format!("{:?}", from_url.metadata().health_config),
+            format!("{:?}", from_spec.metadata().health_config)
+        );
+        assert_eq!(from_url.metadata().health_endpoint, "/health");
+        assert_eq!(
+            from_url.metadata().health_endpoint,
+            from_spec.metadata().health_endpoint
+        );
+        assert_eq!(from_url.worker_type(), from_spec.worker_type());
+        assert_eq!(from_url.is_healthy(), from_spec.is_healthy());
+    }
 
     #[test]
     fn zmq_engine_group_sets_size_without_rank_or_url_rewrite() {
