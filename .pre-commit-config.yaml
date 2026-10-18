@@ -25,6 +25,9 @@ repos:
       - id: detect-private-key
         exclude: .*tests/.*_test\.rs$
       - id: mixed-line-ending
+        # Recorded SSE streams carry a CRLF-terminated frame on purpose, and
+        # the relay tests compare them with the relayed bytes byte for byte.
+        exclude: \.sse$
       - id: no-commit-to-branch
 
   - repo: https://github.com/codespell-project/codespell
