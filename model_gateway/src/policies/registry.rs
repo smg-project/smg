@@ -388,26 +388,27 @@ impl PolicyRegistry {
             .map(|(selected, _)| selected)
     }
 
-    /// [`Self::select_worker_for_model`] for one leg of a request, reporting
+    /// [`Self::select_worker_for_model`] for one side of a request (its only
+    /// one when it is not disaggregated), reporting
     /// the group the pick is in: the one the split confined it to, or, when
     /// the split did not run (exempt, or one group among `workers`), the
     /// pick's own group if it is a named one; `None` for the default group,
-    /// and whenever the split is off. `follow` is the group an earlier leg
-    /// reported (the decode leg after the prefill's): under `--traffic-split`
+    /// and whenever the split is off. `follow` is the group an earlier side
+    /// reported (the decode side after the prefill's): under `--traffic-split`
     /// the choice stays in it while it has an available member of positive
     /// weight among `workers`, so a prefill-decode pair never spans two
     /// groups (two engine builds, which lenient pairing would otherwise
-    /// pair). A first leg picked unsplit from the default group reports
-    /// `None`, and the later leg then decides for itself, so a canary only
+    /// pair). A first side picked unsplit from the default group reports
+    /// `None`, and the later side then decides for itself, so a canary only
     /// the decode pool carries keeps its share; one picked unsplit from a
     /// named group (its slice shrunk to that group, the others unavailable
-    /// or at capacity) still pins the later leg to it; a followed group
+    /// or at capacity) still pins the later side to it; a followed group
     /// absent or drained among `workers` leaves the key or the draw to decide
-    /// as for a first leg. A slice whose groups all weigh 0 (a drained group
+    /// as for a first side. A slice whose groups all weigh 0 (a drained group
     /// left alone by availability or capacity) selects nothing under the
     /// split, so the caller reports the miss rather than serve from the
     /// drained build. Every confined selection counts in
-    /// `smg_traffic_split_selections_total`, one per leg.
+    /// `smg_traffic_split_selections_total`, one per side.
     pub fn select_worker_for_model_split<'w>(
         &self,
         policy: &Arc<dyn LoadBalancingPolicy>,
@@ -418,7 +419,7 @@ impl PolicyRegistry {
     ) -> Option<(usize, Option<&'w str>)> {
         if self.traffic_split && Self::traffic_split_applies(policy.name(), info) {
             if let Some(split) = Split::plan(workers) {
-                // The group an earlier leg was split into is followed;
+                // The group an earlier side was split into is followed;
                 // otherwise the same key the sticky override would pin by
                 // keeps a session in one group, and a keyless request draws
                 // at random.
@@ -449,8 +450,8 @@ impl PolicyRegistry {
         }
         let selected = self.select_within(policy, model_id, workers, info)?;
         // Not split: a pick in a named group still reports it, so a later
-        // leg stays in that group when the slice shrank to it; a pick in the
-        // default group reports nothing and leaves the later leg to decide
+        // side stays in that group when the slice shrank to it; a pick in the
+        // default group reports nothing and leaves the later side to decide
         // for itself. Off, the labels are inert and nothing is reported.
         let group = self
             .traffic_split
@@ -3295,8 +3296,8 @@ mod tests {
             assert!(picks(&reg, &workers, 50).iter().all(|&idx| idx != 1));
         }
 
-        /// Under a disaggregated pair the decode leg follows the group the
-        /// prefill leg was split into: the pair never spans two groups while
+        /// Under a disaggregated pair the decode side follows the group the
+        /// prefill side was split into: the pair never spans two groups while
         /// the decode pool has that group live, and a group drained on the
         /// decode side is not followed into.
         #[test]
@@ -3313,7 +3314,7 @@ mod tests {
                 let (prefill_idx, group) = reg
                     .select_worker_for_model_split(&policy, "m", &prefill, &info, None)
                     .expect("a prefill worker is selected");
-                let group = group.expect("the prefill leg was split");
+                let group = group.expect("the prefill side was split");
                 assert_eq!(group_of(prefill[prefill_idx].as_ref()), group);
                 let (decode_idx, followed) = reg
                     .select_worker_for_model_split(&policy, "m", &decode, &info, Some(group))
@@ -3340,7 +3341,7 @@ mod tests {
 
         /// A prefill slice that has shrunk to one named group (its other
         /// groups unavailable or at capacity) is not split, yet still pins
-        /// the decode leg to that group: a canary prefill keeps a canary
+        /// the decode side to that group: a canary prefill keeps a canary
         /// decode rather than pairing across two builds. Off, no group is
         /// reported.
         #[test]
@@ -3359,7 +3360,7 @@ mod tests {
                 let (decode_idx, followed) = reg
                     .select_worker_for_model_split(&policy, "m", &decode, &info, group)
                     .expect("a decode worker is selected");
-                assert_eq!(decode_idx, 1, "the decode leg left the canary");
+                assert_eq!(decode_idx, 1, "the decode side left the canary");
                 assert_eq!(followed, Some("canary"));
             }
             let off = registry(false);
@@ -3376,7 +3377,7 @@ mod tests {
         }
 
         /// A prefill pool of the default group alone is not split and reports
-        /// no group, so the decode leg decides for itself: a canary only the
+        /// no group, so the decode side decides for itself: a canary only the
         /// decode pool carries keeps its share next to an unlabelled fleet.
         #[test]
         fn a_decode_only_canary_keeps_its_share_next_to_an_unsplit_prefill_pool() {
