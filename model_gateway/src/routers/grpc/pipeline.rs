@@ -930,6 +930,18 @@ impl RequestPipeline {
     /// successful attempt's start. A stream books itself at its last token.
     /// A request is one engine round trip: a Responses call whose tool loop
     /// runs several iterations books each of them, buffered or streamed.
+    /// What a buffered chat or Messages answer books: the engine's prompt and
+    /// completion counts the response stage recorded, the counts the streams
+    /// book at their last token and the settlement charges, not the usage
+    /// shown to the client (which drops the unbilled prompt stub), so a
+    /// request's row does not depend on its `stream` flag; zeros when none
+    /// were recorded.
+    fn engine_counts_booked(response: &ResponseState) -> (u32, u32) {
+        response
+            .engine_counts
+            .map_or((0, 0), |counts| (counts.prompt, counts.completion))
+    }
+
     fn record_usage(
         dctx: &DispatchContext,
         prompt_tokens: u32,
@@ -1144,13 +1156,9 @@ impl RequestPipeline {
                         Self::recorded_settlement(&dctx.response),
                     )
                     .await;
-                    let usage = response.usage.as_ref();
-                    Self::record_usage(
-                        &dctx,
-                        usage.map_or(0, |u| u.prompt_tokens),
-                        usage.map_or(0, |u| u.completion_tokens),
-                        start,
-                    );
+                    let (prompt_tokens, completion_tokens) =
+                        Self::engine_counts_booked(&dctx.response);
+                    Self::record_usage(&dctx, prompt_tokens, completion_tokens, start);
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
@@ -1315,12 +1323,9 @@ impl RequestPipeline {
                         Self::recorded_settlement(&dctx.response),
                     )
                     .await;
-                    Self::record_usage(
-                        &dctx,
-                        response.usage.input_tokens,
-                        response.usage.output_tokens,
-                        start,
-                    );
+                    let (prompt_tokens, completion_tokens) =
+                        Self::engine_counts_booked(&dctx.response);
+                    Self::record_usage(&dctx, prompt_tokens, completion_tokens, start);
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
@@ -1540,13 +1545,9 @@ impl RequestPipeline {
             }
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Chat(response)) => {
-                    let usage = response.usage.as_ref();
-                    Self::record_usage(
-                        &dctx,
-                        usage.map_or(0, |u| u.prompt_tokens),
-                        usage.map_or(0, |u| u.completion_tokens),
-                        start,
-                    );
+                    let (prompt_tokens, completion_tokens) =
+                        Self::engine_counts_booked(&dctx.response);
+                    Self::record_usage(&dctx, prompt_tokens, completion_tokens, start);
                     Ok(response)
                 }
                 Some(_) => {
@@ -5334,6 +5335,31 @@ mod model_label_tests {
         assert!(
             has("smg_router_request_errors_total", r#"model="other""#),
             "{rendered}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod usage_booking_tests {
+    use super::*;
+
+    /// A buffered answer books the engine's counts, the ones the settlement
+    /// charges and the streams book, not the client-visible usage; nothing
+    /// when none were recorded.
+    #[test]
+    fn a_buffered_answer_books_the_engines_counts() {
+        let state = ResponseState {
+            engine_counts: Some(TokenCounts {
+                prompt: 120,
+                completion: 30,
+                ..TokenCounts::default()
+            }),
+            ..ResponseState::default()
+        };
+        assert_eq!(RequestPipeline::engine_counts_booked(&state), (120, 30));
+        assert_eq!(
+            RequestPipeline::engine_counts_booked(&ResponseState::default()),
+            (0, 0)
         );
     }
 }

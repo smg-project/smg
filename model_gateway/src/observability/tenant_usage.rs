@@ -12,10 +12,17 @@
 //! anonymous deployment) can grow neither the table nor the scrape. Rows
 //! under `other` are the sign that the cap is too small for the fleet.
 //!
-//! The table is process-wide, installed once at start-up like the Prometheus
-//! recorder, and read two ways: rendered into the `/metrics` scrape as its
-//! own families (`smg_tenant_usage_*`), and served as a JSON snapshot by
-//! `GET /v1/usage/tenants` under control-plane auth.
+//! The table is process-wide, installed once the start-up has built the
+//! router (like the Prometheus recorder, nothing when accounting is off), and
+//! read two ways: rendered into the `/metrics` scrape as its own families
+//! (`smg_tenant_usage_*`), and served as a JSON snapshot by
+//! `GET /v1/usage/tenants` under control-plane auth. The metrics listener is
+//! the unauthenticated one, so a row's `tenant` label there is a digest of
+//! the key with the key's kind kept (`ip:4f3a…`, see [`metrics_label`]): a
+//! scrape names no tenant ID and no client address (a pseudonym, not
+//! anonymity: a guessed key can be hashed and compared), while the snapshot
+//! carries the key and the label side by side, so an operator matches a row
+//! on a dashboard to a tenant from the admin side only.
 //!
 //! The request path does one lookup by tenant key, one by model and four
 //! atomic adds; no label is interned and no exporter series is touched per
@@ -43,6 +50,7 @@ use metrics_exporter_prometheus::formatting::{
 };
 use parking_lot::RwLock;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 /// The row every tenant past the tracked maximum is booked under.
 pub const OTHER_TENANT: &str = "other";
@@ -50,6 +58,34 @@ pub const OTHER_TENANT: &str = "other";
 /// serving paths always resolve one (the anonymous key at the least), so this
 /// is the resolver's own catch-all, reused rather than a second one.
 pub const UNRESOLVED_TENANT: &str = "anonymous";
+
+/// Hex digits of the key's digest in a `/metrics` label: 64 bits, enough that
+/// two tenants of one fleet do not share a row by accident.
+const LABEL_DIGEST_HEX: usize = 16;
+
+/// The `tenant` label a row carries on `/metrics`: the key's kind (`auth`,
+/// `header`, `ip`) and a fixed-width prefix of the SHA-256 of the whole key,
+/// so a scrape names no tenant ID and no client address while an operator
+/// still reads which kind of identity a row is; the snapshot carries the key
+/// and this label together. The two literal rows (`other`, `anonymous`) are
+/// not identities and render as they are. The label is a pseudonym, not
+/// anonymity: whoever can guess a key can hash it and compare; what it
+/// prevents is the scrape listing addresses and IDs in the clear.
+pub fn metrics_label(tenant: &str) -> String {
+    if tenant == OTHER_TENANT || tenant == UNRESOLVED_TENANT {
+        return tenant.to_string();
+    }
+    let digest = Sha256::digest(tenant.as_bytes());
+    let mut label = String::with_capacity(8 + LABEL_DIGEST_HEX);
+    if let Some((kind, _)) = tenant.split_once(':') {
+        label.push_str(kind);
+        label.push(':');
+    }
+    for byte in &digest[..LABEL_DIGEST_HEX / 2] {
+        let _ = write!(label, "{byte:02x}");
+    }
+    label
+}
 
 const REQUESTS: &str = "smg_tenant_usage_requests_total";
 const TOKENS: &str = "smg_tenant_usage_tokens_total";
@@ -185,6 +221,7 @@ impl TenantEntry {
         }
         TenantUsageSnapshot {
             tenant: tenant.to_string(),
+            label: metrics_label(tenant),
             totals,
             models,
         }
@@ -202,7 +239,10 @@ pub struct ModelUsageSnapshot {
 /// One tenant's sums and its per-model rows, in the snapshot.
 #[derive(Clone, Debug, Serialize)]
 pub struct TenantUsageSnapshot {
+    /// The tenant key the row is booked under.
     pub tenant: String,
+    /// The `tenant` label the row carries on `/metrics` (`metrics_label`).
+    pub label: String,
     #[serde(flatten)]
     pub totals: Totals,
     pub models: Vec<ModelUsageSnapshot>,
@@ -330,7 +370,7 @@ impl TenantUsage {
                 write_sample(
                     out,
                     REQUESTS,
-                    &row.tenant,
+                    &row.label,
                     &model.model,
                     None,
                     model.totals.requests,
@@ -351,7 +391,7 @@ impl TenantUsage {
                 write_sample(
                     out,
                     TOKENS,
-                    &row.tenant,
+                    &row.label,
                     &model.model,
                     Some(TOKEN_INPUT),
                     model.totals.prompt_tokens,
@@ -359,7 +399,7 @@ impl TenantUsage {
                 write_sample(
                     out,
                     TOKENS,
-                    &row.tenant,
+                    &row.label,
                     &model.model,
                     Some(TOKEN_OUTPUT),
                     model.totals.completion_tokens,
@@ -380,7 +420,7 @@ impl TenantUsage {
                 write_sample(
                     out,
                     SECONDS,
-                    &row.tenant,
+                    &row.label,
                     &model.model,
                     None,
                     model.totals.request_seconds,
@@ -545,11 +585,16 @@ mod tests {
     #[test]
     fn render_writes_the_families_with_help_type_and_escaped_labels() {
         let table = TenantUsage::new(4);
-        table.record("header:acme \"east\"\\1", "org/model", usage(120, 30, 1500));
-        table.record("header:acme \"east\"\\1", "org/model", usage(80, 20, 500));
+        table.record("header:acme", "org/model \"east\"\\1", usage(120, 30, 1500));
+        table.record("header:acme", "org/model \"east\"\\1", usage(80, 20, 500));
+        let tenant = metrics_label("header:acme");
 
         let mut out = String::new();
         table.render_into(&mut out);
+        assert!(
+            !out.contains("header:acme"),
+            "no raw key in the scrape:\n{out}"
+        );
         let line = |needle: &str| {
             out.lines()
                 .find(|l| l.starts_with(needle))
@@ -564,17 +609,17 @@ mod tests {
         assert!(out.contains("# TYPE smg_tenant_usage_max_tenants gauge\n"));
         assert_eq!(
             line("smg_tenant_usage_requests_total{"),
-            "smg_tenant_usage_requests_total{tenant=\"header:acme \\\"east\\\"\\\\1\",model=\"org/model\"} 2"
+            format!("smg_tenant_usage_requests_total{{tenant=\"{tenant}\",model=\"org/model \\\"east\\\"\\\\1\"}} 2")
         );
-        assert!(out.contains(
-            "smg_tenant_usage_tokens_total{tenant=\"header:acme \\\"east\\\"\\\\1\",model=\"org/model\",token_type=\"input\"} 200\n"
-        ));
-        assert!(out.contains(
-            "smg_tenant_usage_tokens_total{tenant=\"header:acme \\\"east\\\"\\\\1\",model=\"org/model\",token_type=\"output\"} 50\n"
-        ));
+        assert!(out.contains(&format!(
+            "smg_tenant_usage_tokens_total{{tenant=\"{tenant}\",model=\"org/model \\\"east\\\"\\\\1\",token_type=\"input\"}} 200\n"
+        )));
+        assert!(out.contains(&format!(
+            "smg_tenant_usage_tokens_total{{tenant=\"{tenant}\",model=\"org/model \\\"east\\\"\\\\1\",token_type=\"output\"}} 50\n"
+        )));
         assert_eq!(
             line("smg_tenant_usage_request_seconds_total{"),
-            "smg_tenant_usage_request_seconds_total{tenant=\"header:acme \\\"east\\\"\\\\1\",model=\"org/model\"} 2"
+            format!("smg_tenant_usage_request_seconds_total{{tenant=\"{tenant}\",model=\"org/model \\\"east\\\"\\\\1\"}} 2")
         );
         assert_eq!(
             line("smg_tenant_usage_tracked_tenants "),
@@ -613,6 +658,7 @@ mod tests {
         assert_eq!(json["max_tenants"], 2);
         assert_eq!(json["tracked_tenants"], 1);
         assert_eq!(json["tenants"][0]["tenant"], "auth:one");
+        assert_eq!(json["tenants"][0]["label"], metrics_label("auth:one"));
         assert_eq!(json["tenants"][0]["requests"], 1);
         assert_eq!(json["tenants"][0]["prompt_tokens"], 3);
         assert_eq!(json["tenants"][0]["completion_tokens"], 4);
@@ -620,7 +666,35 @@ mod tests {
         assert_eq!(json["tenants"][0]["models"][0]["model"], "m");
         assert_eq!(json["tenants"][0]["models"][0]["requests"], 1);
         assert_eq!(json["other"]["tenant"], "other");
+        assert_eq!(json["other"]["label"], "other");
         assert_eq!(json["other"]["requests"], 0);
+    }
+
+    /// The scrape's label keeps the key's kind and hides the identity: the
+    /// same key renders the same label, different keys different ones, and
+    /// the two literal rows render as they are.
+    #[test]
+    fn the_metrics_label_keeps_the_kind_and_hides_the_identity() {
+        let label = metrics_label("ip:203.0.113.9");
+        assert!(label.starts_with("ip:"), "{label}");
+        assert_eq!(label.len(), "ip:".len() + LABEL_DIGEST_HEX, "{label}");
+        assert!(!label.contains("203.0.113.9"), "{label}");
+        assert!(label["ip:".len()..].chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(label, metrics_label("ip:203.0.113.9"), "stable");
+        assert_ne!(label, metrics_label("ip:203.0.113.10"));
+        assert_ne!(
+            metrics_label("auth:team-red"),
+            metrics_label("header:team-red")
+        );
+        assert!(!metrics_label("auth:team-red").contains("team-red"));
+        assert_eq!(metrics_label(OTHER_TENANT), OTHER_TENANT);
+        assert_eq!(metrics_label(UNRESOLVED_TENANT), UNRESOLVED_TENANT);
+
+        let table = TenantUsage::new(1);
+        table.record("auth:team-red", "m", usage(1, 1, 1));
+        let snapshot = table.snapshot();
+        assert_eq!(snapshot.tenants[0].tenant, "auth:team-red");
+        assert_eq!(snapshot.tenants[0].label, metrics_label("auth:team-red"));
     }
 
     #[test]

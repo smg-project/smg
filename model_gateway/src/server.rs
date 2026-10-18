@@ -1999,15 +1999,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.max_payload_size / (1024 * 1024)
     );
 
-    // The per-tenant usage table, before the first request can be booked to
-    // it: process-wide, like the recorder; nothing when accounting is off.
-    if config.router_config.tenant_usage_accounting_enabled {
-        tenant_usage::install(Arc::new(tenant_usage::TenantUsage::new(
-            usize::try_from(config.router_config.tenant_usage_accounting_max_tenants)
-                .unwrap_or(usize::MAX),
-        )));
-    }
-
     let app_context = Arc::new(
         AppContext::from_config(
             config.router_config.clone(),
@@ -2120,6 +2111,18 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // among them bind now, before the admin and HTTP listeners; the mesh TLS
     // material, the apps and the listener addresses can still fail the start
     // after this point, with these two bound.
+    // The per-tenant usage table, now that the app context and the router
+    // are built (what can refuse a configuration is behind us) and before the
+    // metrics listener that renders it binds: process-wide, like the
+    // recorder; nothing when accounting is off; a start that fails before
+    // this point installs none.
+    if config.router_config.tenant_usage_accounting_enabled {
+        tenant_usage::install(Arc::new(tenant_usage::TenantUsage::new(
+            usize::try_from(config.router_config.tenant_usage_accounting_max_tenants)
+                .unwrap_or(usize::MAX),
+        )));
+    }
+
     let probe_state = start_observability(&config, &app_context, metrics_handle).await?;
 
     let app_state = Arc::new(AppState {

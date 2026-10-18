@@ -1,5 +1,6 @@
 //! The per-tenant usage families reach `/metrics` through the metrics server,
-//! with their `# HELP` and `# TYPE` lines, bounded by the configured maximum.
+//! with their `# HELP` and `# TYPE` lines, bounded by the configured maximum,
+//! the tenant labels digests of the keys.
 //!
 //! Installs the process-wide usage table the way start-up does, drives the
 //! real exporter and metrics server, and reads the scrape as Prometheus
@@ -75,24 +76,38 @@ async fn usage_families_render_in_the_scrape_with_help_text_and_the_other_row() 
             "{line} is in the scrape:\n{body}"
         );
     };
-    has("smg_tenant_usage_requests_total{tenant=\"header:acme\",model=\"model-a\"} 2");
-    has("smg_tenant_usage_tokens_total{tenant=\"header:acme\",model=\"model-a\",token_type=\"input\"} 150");
-    has("smg_tenant_usage_tokens_total{tenant=\"header:acme\",model=\"model-a\",token_type=\"output\"} 30");
-    has("smg_tenant_usage_request_seconds_total{tenant=\"header:acme\",model=\"model-a\"} 0.5");
-    has("smg_tenant_usage_requests_total{tenant=\"header:bravo\",model=\"model-b\"} 1");
+    let acme = tenant_usage::metrics_label("header:acme");
+    let bravo = tenant_usage::metrics_label("header:bravo");
+    has(&format!(
+        "smg_tenant_usage_requests_total{{tenant=\"{acme}\",model=\"model-a\"}} 2"
+    ));
+    has(&format!("smg_tenant_usage_tokens_total{{tenant=\"{acme}\",model=\"model-a\",token_type=\"input\"}} 150"));
+    has(&format!("smg_tenant_usage_tokens_total{{tenant=\"{acme}\",model=\"model-a\",token_type=\"output\"}} 30"));
+    has(&format!(
+        "smg_tenant_usage_request_seconds_total{{tenant=\"{acme}\",model=\"model-a\"}} 0.5"
+    ));
+    has(&format!(
+        "smg_tenant_usage_requests_total{{tenant=\"{bravo}\",model=\"model-b\"}} 1"
+    ));
     has("smg_tenant_usage_requests_total{tenant=\"other\",model=\"model-a\"} 1");
     has("smg_tenant_usage_tokens_total{tenant=\"other\",model=\"model-a\",token_type=\"input\"} 1000");
     has("smg_tenant_usage_tracked_tenants 2");
     has("smg_tenant_usage_max_tenants 2");
     assert!(
-        !body.contains("tenant=\"ip:203.0.113.9\""),
+        !body.contains(&tenant_usage::metrics_label("ip:203.0.113.9")),
         "a tenant past the maximum has no row of its own:\n{body}"
     );
+    // The scrape is read from the unauthenticated listener: no key in it.
+    for raw in ["header:acme", "header:bravo", "203.0.113.9"] {
+        assert!(!body.contains(raw), "{raw} is not in the scrape:\n{body}");
+    }
 
     // The snapshot the admin route serves agrees with the scrape.
     let snapshot = table.snapshot();
     assert_eq!(snapshot.tracked_tenants, 2);
     assert_eq!(snapshot.tenants.len(), 2);
+    assert_eq!(snapshot.tenants[0].tenant, "header:acme");
+    assert_eq!(snapshot.tenants[0].label, acme);
     assert_eq!(snapshot.other.totals.requests, 1);
     assert_eq!(snapshot.other.totals.prompt_tokens, 1000);
 }
