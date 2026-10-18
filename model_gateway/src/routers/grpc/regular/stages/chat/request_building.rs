@@ -46,27 +46,21 @@ impl ChatRequestBuildingStage {
 
 /// Whether the rendered prompt leaves the model inside its thought, as the
 /// request's grammar, the plan's reasoning state and the response spec all
-/// read it: native Gemma4 channels follow the rendered prompt when that
-/// parser decides; other parsers keep their tokenizer-driven preference for
-/// the engine's reasoning gate; and where a Symphony table reads the
-/// response, the table's own replay of the prompt (a turn the prompt leaves
-/// unopened starts inside the thought: `regular::symphony::reasoning_open`).
+/// read it: where a Symphony table reads the response, the table's own replay
+/// of the prompt (a turn the prompt leaves unopened starts inside the thought:
+/// `regular::symphony::reasoning_open`) with the tokenizer-driven switch, or
+/// alone where the family's rule sets the switch aside (Gemma 4 prefills an
+/// open channel only after a tool response), and no legacy parser is built to
+/// be asked; otherwise native Gemma4 channels follow the rendered prompt when
+/// that parser decides, and other parsers keep their tokenizer-driven
+/// preference for the engine's reasoning gate.
 fn reasoning_decision(
     ctx: &RequestContext,
     chat_request: &openai_protocol::chat::ChatCompletionRequest,
     processed_text: &str,
     continued_final_message: bool,
 ) -> bool {
-    let switch = utils::rendered_prompt_reasoning_in_prefill(
-        &ctx.components.reasoning_parser_factory,
-        ctx.components
-            .parser_resolver
-            .reasoning_parser(&chat_request.model)
-            .as_deref(),
-        &chat_request.model,
-        processed_text,
-    )
-    .unwrap_or_else(|| {
+    let switch = || {
         ctx.tokenizer_arc().is_some_and(|tokenizer| {
             utils::chat_reasoning_starts_in_rendered_prefill(
                 chat_request,
@@ -74,15 +68,26 @@ fn reasoning_decision(
                 tokenizer.as_ref(),
             )
         })
-    });
-    switch
-        || symphony::reasoning_open(
-            ctx.state.parser.unwrap_or_default(),
-            &ctx.components.parser_resolver.names(&chat_request.model),
+    };
+    match symphony::reasoning_open(
+        ctx.state.parser.unwrap_or_default(),
+        &ctx.components.parser_resolver.names(&chat_request.model),
+        &chat_request.model,
+        &ctx.components.templates,
+        processed_text,
+    ) {
+        Some(thought) => thought.or_switch(switch),
+        None => utils::rendered_prompt_reasoning_in_prefill(
+            &ctx.components.reasoning_parser_factory,
+            ctx.components
+                .parser_resolver
+                .reasoning_parser(&chat_request.model)
+                .as_deref(),
             &chat_request.model,
-            &ctx.components.templates,
             processed_text,
         )
+        .unwrap_or_else(switch),
+    }
 }
 
 /// Build the backend `GenerateRequest` from a chat-shaped request, shared by

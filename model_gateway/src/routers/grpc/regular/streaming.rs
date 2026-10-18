@@ -1810,14 +1810,19 @@ impl StreamingProcessor {
 
         // Check parser availability once upfront. Run parser when the user explicitly
         // enabled thinking, or when the selected parser needs structural special tokens.
-        let reasoning_requires_special_tokens = utils::reasoning_parser_requires_special_tokens(
-            &self.reasoning_parser_factory,
-            reasoning_parser_name.as_deref(),
-            model,
-        );
+        // Where a Symphony table reads the message its reader takes the thought, and no
+        // legacy parser is built to be asked.
+        let legacy_reads = original_request.symphony.is_none();
+        let reasoning_requires_special_tokens = legacy_reads
+            && utils::reasoning_parser_requires_special_tokens(
+                &self.reasoning_parser_factory,
+                reasoning_parser_name.as_deref(),
+                model,
+            );
         let separate_reasoning =
             reasoning_requires_special_tokens || original_request.thinking_requested;
         let reasoning_parser_available = separate_reasoning
+            && legacy_reads
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
                 reasoning_parser_name.as_deref(),
@@ -3572,7 +3577,10 @@ impl<'a> ChatStream<'a> {
         let reasoning_parser_name = processor.parser_resolver.reasoning_parser(model);
         let tool_parser_name = processor.parser_resolver.tool_parser(model);
 
+        // Where a Symphony table reads the response its reader takes the thought, and no
+        // legacy parser is built to be asked whether one is available.
         let reasoning_parser_available = spec.separate_reasoning
+            && spec.symphony.is_none()
             && utils::check_reasoning_parser_availability(
                 &processor.reasoning_parser_factory,
                 reasoning_parser_name.as_deref(),
@@ -3604,7 +3612,7 @@ impl<'a> ChatStream<'a> {
                 model,
             );
 
-        if spec.separate_reasoning && !reasoning_parser_available {
+        if spec.separate_reasoning && spec.symphony.is_none() && !reasoning_parser_available {
             debug!(
                 "No reasoning parser found for model '{}', skipping reasoning parsing",
                 model

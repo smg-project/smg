@@ -260,7 +260,8 @@ impl MessagePreparationStage {
             &request.model,
             &ctx.components.templates,
             &processed_messages.text,
-        );
+        )
+        .is_some_and(|thought| thought.open);
         let workers = ctx
             .components
             .worker_registry
@@ -296,24 +297,31 @@ impl MessagePreparationStage {
             (prepared, _) => prepared,
         };
 
-        let legacy_parser_needs_special_tokens = utils::reasoning_parser_requires_special_tokens(
-            &ctx.components.reasoning_parser_factory,
-            ctx.components
-                .parser_resolver
-                .reasoning_parser(&request.model)
-                .as_deref(),
-            &request.model,
-        );
+        let json_schema_constraint =
+            matches!(&tool_call_constraint, Ok(Some(c)) if c.is_json_schema());
         // A Symphony table whose markers the decoder would drop as special tokens needs them
-        // kept: without them the table reads neither the thought nor the calls.
-        let preserve_reasoning_special_tokens = legacy_parser_needs_special_tokens
-            || symphony::keeps_special_tokens(
-                parser,
-                &names,
+        // kept: without them the table reads neither the thought nor the calls. Where a table
+        // reads the message its markers alone decide, and no legacy reasoning parser is built to
+        // be asked; under a JSON-schema constraint no table reads (request building makes no
+        // assignment: `regular::symphony::assign_messages`), so the legacy parsers answer for
+        // themselves, as they do where no table reads at all.
+        let preserve_reasoning_special_tokens = match symphony::keeps_special_tokens(
+            parser,
+            &names,
+            &request.model,
+            &ctx.components.templates,
+            &tokenizer,
+        ) {
+            Some(kept) if !json_schema_constraint => kept,
+            _ => utils::reasoning_parser_requires_special_tokens(
+                &ctx.components.reasoning_parser_factory,
+                ctx.components
+                    .parser_resolver
+                    .reasoning_parser(&request.model)
+                    .as_deref(),
                 &request.model,
-                &ctx.components.templates,
-                &tokenizer,
-            );
+            ),
+        };
 
         // Derive skip_special_tokens from parser and constraint type:
         // - typed reasoning parsers need their control tokens preserved

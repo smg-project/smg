@@ -510,8 +510,11 @@ impl ResponseProcessor {
 
         let history_tool_calls_count = chat_request.history_tool_calls_count;
 
-        // Check parser availability once upfront (not per choice)
+        // Check parser availability once upfront (not per choice). Where a Symphony table
+        // reads the response its reader takes the thought, and no legacy parser is built to
+        // be asked whether one is available.
         let reasoning_parser_available = chat_request.separate_reasoning
+            && chat_request.symphony.is_none()
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
                 reasoning_parser_name.as_deref(),
@@ -532,7 +535,10 @@ impl ResponseProcessor {
             );
 
         // Log once per request (not per choice)
-        if chat_request.separate_reasoning && !reasoning_parser_available {
+        if chat_request.separate_reasoning
+            && chat_request.symphony.is_none()
+            && !reasoning_parser_available
+        {
             tracing::debug!(
                 "No reasoning parser found for model '{model}', skipping reasoning parsing"
             );

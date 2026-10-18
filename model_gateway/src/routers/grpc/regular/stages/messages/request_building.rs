@@ -91,19 +91,16 @@ impl BuildStage for MessageRequestBuildingStage {
 
         let continued_final_message = processed_messages.continued_final_message;
         // Whether the rendered prompt leaves the model inside its thought:
-        // native Gemma4 channels follow the rendered prompt when that parser
-        // decides; other parsers keep their tokenizer-driven preference for
-        // the engine's reasoning gate.
-        let require_reasoning = utils::rendered_prompt_reasoning_in_prefill(
-            &ctx.components.reasoning_parser_factory,
-            ctx.components
-                .parser_resolver
-                .reasoning_parser(&messages_request.model)
-                .as_deref(),
-            &messages_request.model,
-            &processed_messages.text,
-        )
-        .unwrap_or_else(|| {
+        // where a Symphony table reads the message, its replay of the prompt
+        // (a turn the prompt leaves unopened starts inside the thought
+        // whatever the switch says: `regular::symphony::reasoning_open`) with
+        // the tokenizer-driven switch, or alone where the family's rule sets
+        // the switch aside (Gemma 4 prefills an open channel only after a
+        // tool response), and no legacy parser is built to be asked;
+        // otherwise native Gemma4 channels follow the rendered prompt when
+        // that parser decides, and other parsers keep their tokenizer-driven
+        // preference for the engine's reasoning gate.
+        let switch = || {
             ctx.tokenizer_arc().is_some_and(|tokenizer| {
                 utils::messages_reasoning_starts_in_prefill(
                     &messages_request,
@@ -111,17 +108,28 @@ impl BuildStage for MessageRequestBuildingStage {
                     tokenizer.as_ref(),
                 )
             })
-        })
-            // Where a Symphony table reads the message, its replay of the
-            // prompt: a turn the prompt leaves unopened starts inside the
-            // thought whatever the switch says (`regular::symphony::reasoning_open`).
-            || symphony::reasoning_open(
-                ctx.state.parser.unwrap_or_default(),
-                &ctx.components.parser_resolver.names(&messages_request.model),
+        };
+        let require_reasoning = match symphony::reasoning_open(
+            ctx.state.parser.unwrap_or_default(),
+            &ctx.components
+                .parser_resolver
+                .names(&messages_request.model),
+            &messages_request.model,
+            &ctx.components.templates,
+            &processed_messages.text,
+        ) {
+            Some(thought) => thought.or_switch(switch),
+            None => utils::rendered_prompt_reasoning_in_prefill(
+                &ctx.components.reasoning_parser_factory,
+                ctx.components
+                    .parser_resolver
+                    .reasoning_parser(&messages_request.model)
+                    .as_deref(),
                 &messages_request.model,
-                &ctx.components.templates,
                 &processed_messages.text,
-            );
+            )
+            .unwrap_or_else(switch),
+        };
 
         // Now that the worker is known, a forced call's grammar takes the
         // shape its engine needs: the bare calls behind a reasoning parser's
