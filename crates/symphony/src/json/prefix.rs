@@ -761,7 +761,7 @@ mod tests {
         // A word cut short before a delimiter, from its first letter.
         ("[nu]", 1),
         (r#"{"a": nu}"#, 6),
-        (r#"{"a": tru, "b": 1}"#, 6),
+        (r#"{"a": tr, "b": 1}"#, 6),
     ];
 
     /// The texts of both tables.
