@@ -1636,14 +1636,13 @@ impl StringOrContentParts {
             Self::Array(parts) => {
                 let mut text = String::new();
                 for part in parts {
-                    match part {
-                        ResponseContentPart::InputText { text: part }
-                        | ResponseContentPart::OutputText { text: part, .. } => text.push_str(part),
-                        _ => return Err(
+                    let Some(part) = part.text() else {
+                        return Err(
                             "Multimodal function output is not supported by this text-only backend"
                                 .to_string(),
-                        ),
-                    }
+                        );
+                    };
+                    text.push_str(part);
                 }
                 Ok(text)
             }
@@ -2204,6 +2203,17 @@ pub enum ResponseContentPart {
     /// `ResponseOutputRefusal`).
     #[serde(rename = "refusal")]
     Refusal { refusal: String },
+}
+
+impl ResponseContentPart {
+    /// The text a part carries toward the prompt: an input or output text
+    /// part's text; none for an image, a file or a refusal.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::OutputText { text, .. } | Self::InputText { text } => Some(text),
+            Self::InputImage { .. } | Self::InputFile { .. } | Self::Refusal { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -3378,47 +3388,17 @@ impl GenerationRequest for ResponsesRequest {
 
                 for item in items {
                     match item {
-                        ResponseInputOutputItem::Message { content, .. } => {
-                            for part in content {
-                                let text = match part {
-                                    ResponseContentPart::OutputText { text, .. } => {
-                                        Some(text.as_str())
-                                    }
-                                    ResponseContentPart::InputText { text } => Some(text.as_str()),
-                                    // Non-text parts (images, files, refusals) contribute no
-                                    // prompt text; skip without appending.
-                                    ResponseContentPart::InputImage { .. }
-                                    | ResponseContentPart::InputFile { .. }
-                                    | ResponseContentPart::Refusal { .. } => None,
-                                };
-                                if let Some(t) = text {
-                                    append_text(t);
-                                }
-                            }
-                        }
+                        ResponseInputOutputItem::Message { content, .. } => content
+                            .iter()
+                            .filter_map(ResponseContentPart::text)
+                            .for_each(&mut append_text),
                         ResponseInputOutputItem::SimpleInputMessage { content, .. } => {
                             match content {
-                                StringOrContentParts::String(s) => {
-                                    append_text(s.as_str());
-                                }
-                                StringOrContentParts::Array(parts) => {
-                                    for part in parts {
-                                        let text = match part {
-                                            ResponseContentPart::OutputText { text, .. } => {
-                                                Some(text.as_str())
-                                            }
-                                            ResponseContentPart::InputText { text } => {
-                                                Some(text.as_str())
-                                            }
-                                            ResponseContentPart::InputImage { .. }
-                                            | ResponseContentPart::InputFile { .. }
-                                            | ResponseContentPart::Refusal { .. } => None,
-                                        };
-                                        if let Some(t) = text {
-                                            append_text(t);
-                                        }
-                                    }
-                                }
+                                StringOrContentParts::String(s) => append_text(s.as_str()),
+                                StringOrContentParts::Array(parts) => parts
+                                    .iter()
+                                    .filter_map(ResponseContentPart::text)
+                                    .for_each(&mut append_text),
                             }
                         }
                         ResponseInputOutputItem::Reasoning { content, .. } => {
@@ -4467,5 +4447,112 @@ mod tests {
         }
         let param: ResponseReasoningParam = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(param.effort, Some(ReasoningEffort::Medium));
+    }
+
+    /// The routing text of a Responses request: a text input as is; the
+    /// items' text parts in order, joined by one space, images, files and
+    /// refusals skipped; a simple message's string or its parts; a reasoning
+    /// item's text.
+    #[test]
+    fn the_routing_text_reads_every_text_part_once_in_order() {
+        let request = ResponsesRequest {
+            input: ResponseInput::Items(vec![
+                ResponseInputOutputItem::Message {
+                    id: "m1".to_string(),
+                    role: "user".to_string(),
+                    content: vec![
+                        ResponseContentPart::InputText {
+                            text: "one".to_string(),
+                        },
+                        ResponseContentPart::InputImage {
+                            detail: None,
+                            file_id: None,
+                            image_url: Some("https://a/1.png".to_string()),
+                        },
+                        ResponseContentPart::OutputText {
+                            text: "two".to_string(),
+                            annotations: vec![],
+                            logprobs: None,
+                        },
+                        ResponseContentPart::Refusal {
+                            refusal: "no".to_string(),
+                        },
+                    ],
+                    status: None,
+                    phase: None,
+                },
+                ResponseInputOutputItem::SimpleInputMessage {
+                    content: StringOrContentParts::String("three".to_string()),
+                    role: "user".to_string(),
+                    r#type: None,
+                    phase: None,
+                },
+                ResponseInputOutputItem::SimpleInputMessage {
+                    content: StringOrContentParts::Array(vec![
+                        ResponseContentPart::InputFile {
+                            detail: None,
+                            file_data: None,
+                            file_id: Some("f".to_string()),
+                            file_url: None,
+                            filename: None,
+                        },
+                        ResponseContentPart::InputText {
+                            text: "four".to_string(),
+                        },
+                    ]),
+                    role: "user".to_string(),
+                    r#type: None,
+                    phase: None,
+                },
+                ResponseInputOutputItem::Reasoning {
+                    id: "r1".to_string(),
+                    summary: vec![],
+                    content: vec![ResponseReasoningContent::ReasoningText {
+                        text: "five".to_string(),
+                    }],
+                    encrypted_content: None,
+                    status: None,
+                },
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(
+            request.extract_text_for_routing(),
+            "one two three four five"
+        );
+
+        let text = ResponsesRequest {
+            input: ResponseInput::Text("plain".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(text.extract_text_for_routing(), "plain");
+    }
+
+    /// Text-only content takes the text parts and refuses any other part.
+    #[test]
+    fn text_only_content_refuses_a_part_without_text() {
+        let with_image = StringOrContentParts::Array(vec![
+            ResponseContentPart::InputText {
+                text: "a".to_string(),
+            },
+            ResponseContentPart::InputImage {
+                detail: None,
+                file_id: None,
+                image_url: Some("https://a/1.png".to_string()),
+            },
+        ]);
+        assert!(with_image.to_text_only().is_err());
+
+        let text = StringOrContentParts::Array(vec![
+            ResponseContentPart::InputText {
+                text: "a".to_string(),
+            },
+            ResponseContentPart::OutputText {
+                text: "b".to_string(),
+                annotations: vec![],
+                logprobs: None,
+            },
+        ]);
+        assert_eq!(text.to_text_only().unwrap(), "ab");
     }
 }
