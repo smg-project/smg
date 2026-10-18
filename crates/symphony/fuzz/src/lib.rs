@@ -560,6 +560,12 @@ fn closes_an_open_string(so_far: &str, fragment: &str) -> bool {
 /// alone (`city=`). The model's own empty value leaves its quotes or its tags in the source
 /// (`city=""`, `<parameter=city></parameter>`), and the JSON syntaxes' source is the member itself.
 fn made_up_empty_string(json: &str, source: &str) -> bool {
+    // A whole member may close its object or carry the next separator (`{"key": ""}`,
+    // `"key": "",`): the empty string is judged without that trailing byte.
+    let json = json
+        .strip_suffix('}')
+        .or_else(|| json.strip_suffix(','))
+        .unwrap_or(json);
     if !json.ends_with("\"\"") {
         return false;
     }

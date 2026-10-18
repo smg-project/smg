@@ -2032,7 +2032,7 @@ fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event]) {
                     // no source is one no byte of the output accounts for, made up for a value the
                     // model never closed.
                     assert!(
-                        !closes_an_open_string(so_far, json) || !source.text.is_empty(),
+                        !closes_an_open_string(so_far, json) || !source.text.trim().is_empty(),
                         "{}: the fragment {json:?} closes an open string with no byte of the output behind it, a made-up closing quote",
                         place()
                     );
