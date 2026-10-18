@@ -193,7 +193,7 @@ impl TrtllmServiceClient {
             ignore_eos: plain.ignore_eos,
             guided_decoding,
             multimodal_input: None,
-            include_stop_token_in_output: false,
+            include_stop_token_in_output: plain.no_stop_trim,
             ..Default::default()
         };
 

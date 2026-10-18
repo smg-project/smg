@@ -506,10 +506,11 @@ impl VllmEngineClient {
             skip_special_tokens: plain.skip_special_tokens,
             spaces_between_special_tokens: true,
             ignore_eos: plain.ignore_eos,
+            include_stop_str_in_output: plain.no_stop_trim,
             n: plain.n,
             // The proto seed is i32; the plain seed is u64. Fold the high half into
             // the low so distinct seeds stay distinct (a saturating cast would send
-            // every seed >= 2^31 to one value). no_stop_trim has no field in this proto.
+            // every seed >= 2^31 to one value).
             seed: plain
                 .sampling_seed
                 .map(|seed| ((seed ^ (seed >> 32)) as u32) as i32),
