@@ -535,10 +535,12 @@ impl Bucket {
     /// range ends at the last class it took; the last worker takes the open
     /// end, as after the first split. Every bound is a size seen, the size
     /// after one, or the open end. A class is never split between two
-    /// workers, so with few distinct sizes the shares stay coarse, and a
-    /// worker that finds the classes used up owns no range until the next
-    /// adjustment; the load spill of [`BucketPolicy::select_worker`] feeds
-    /// it meanwhile.
+    /// workers, so with few distinct sizes the shares stay coarse; a worker
+    /// stops short of its share when the classes left are no more than the
+    /// workers after it, so each of them owns a seen size while classes
+    /// remain, and only with fewer classes than workers does a worker own
+    /// no range until the next adjustment; the load spill of
+    /// [`BucketPolicy::select_worker`] evens the load out meanwhile.
     pub fn adjust_boundary(&mut self) {
         if self.t_req_loads.is_empty() {
             return;
@@ -569,6 +571,7 @@ impl Bucket {
         }
         let worker_urls = self.prefill_worker_urls.lock().clone();
         let mut classes = histogram.iter();
+        let mut classes_left = histogram.len();
         let mut new_boundary = Vec::with_capacity(worker_urls.len());
         let mut lower = 0;
         for (i, url) in worker_urls.iter().enumerate() {
@@ -576,17 +579,27 @@ impl Bucket {
                 new_boundary.push(Boundary::new(url.clone(), [lower, usize::MAX]));
                 break;
             }
+            // The workers after this one, each owed a class while classes
+            // remain.
+            let workers_after = worker_urls.len() - i - 1;
             let mut share = 0;
             let mut upper = None;
             for (&size, &load) in classes.by_ref() {
                 share += load;
                 upper = Some(size);
-                if share >= new_single_bucket_load {
+                classes_left -= 1;
+                // The class that crosses the share goes whole to this worker,
+                // but not the classes the workers after it are owed: with no
+                // more classes left than workers after this one, each of
+                // them takes one, and the last worker holds the largest size
+                // instead of an open end no seen size reaches. The spill
+                // evens the load out from there.
+                if share >= new_single_bucket_load || classes_left <= workers_after {
                     break;
                 }
             }
-            // A worker that finds the classes used up owns no range until
-            // the next adjustment.
+            // A worker that finds the classes used up (fewer classes than
+            // workers) owns no range until the next adjustment.
             if let Some(size) = upper {
                 new_boundary.push(Boundary::new(url.clone(), [lower, size]));
                 lower = size.saturating_add(1);
@@ -1434,14 +1447,15 @@ mod tests {
 
         policy.remove_worker("http://w2:8000");
         assert_eq!(bucket.read().bucket_load, 0);
-        // The first rebuild gave w1 the three sizes and w3 the open end: w2
-        // owned no range, so its removal moves no range.
+        // The first rebuild gave each worker a size (w1 [0, 100], w2
+        // [101, 200], w3 the open end from 201): w2's removal hands its
+        // range to w1.
         let merged = boundaries(&policy, &workers);
         assert_eq!(
             merged,
             [
-                ("http://w1:8000".to_string(), [0, 3000]),
-                ("http://w3:8000".to_string(), [3001, usize::MAX]),
+                ("http://w1:8000".to_string(), [0, 200]),
+                ("http://w3:8000".to_string(), [201, usize::MAX]),
             ]
         );
 
@@ -1449,8 +1463,8 @@ mod tests {
         assert_eq!(
             boundaries(&policy, &workers),
             [
-                ("http://w1:8000".to_string(), [0, 3000]),
-                ("http://w3:8000".to_string(), [3001, usize::MAX]),
+                ("http://w1:8000".to_string(), [0, 200]),
+                ("http://w3:8000".to_string(), [201, usize::MAX]),
             ],
             "the tick after a removal re-partitions among the survivors"
         );
@@ -1619,7 +1633,9 @@ mod tests {
     /// adjustment rebuilds the partition from the sizes seen, as the first
     /// adjustment does, without waiting for the per-worker load to double.
     /// The sizes seen are 100, 200, 300, 2000, 2100 and 2200; with three
-    /// workers a third of their sum, 2300, is one worker's share.
+    /// workers a third of their sum, 2300, is one worker's share, and the
+    /// second worker stops short of its share at 2100 so that the third
+    /// holds the largest size instead of an open end no size reaches.
     #[test]
     fn a_changed_membership_lets_the_next_adjustment_re_split_from_the_sizes_seen() {
         let url = |n: usize| format!("http://w{n}:8000");
@@ -1656,8 +1672,8 @@ mod tests {
             bucket_ranges(&bucket),
             [
                 (url(1), [0, 2000]),
-                (url(2), [2001, 2200]),
-                (url(3), [2201, usize::MAX]),
+                (url(2), [2001, 2100]),
+                (url(3), [2101, usize::MAX]),
             ]
         );
     }
@@ -1694,10 +1710,10 @@ mod tests {
     }
 
     /// The adjustment walks the size histogram and every bound it writes is
-    /// a size: four workers over four equally frequent sizes own the first
-    /// three classes, the fourth class, nothing, and the open end (the last
-    /// worker's, as after the first split); the third worker owns no range
-    /// until the next adjustment. No bound is a load sum.
+    /// a size: four workers over four equally frequent sizes own one class
+    /// each, the last of them as the open end (the last worker's, as after
+    /// the first split), the first three stopping short of their share for
+    /// the workers after them. No bound is a load sum.
     #[test]
     fn an_adjusted_partitions_bounds_are_sizes_once_the_classes_run_out() {
         let url = |n: usize| format!("http://w{n}:8000");
@@ -1713,9 +1729,10 @@ mod tests {
         assert_eq!(
             bucket_ranges(&bucket),
             [
-                (url(1), [0, 3001]),
-                (url(2), [3002, 4001]),
-                (url(4), [4002, usize::MAX]),
+                (url(1), [0, 101]),
+                (url(2), [102, 2001]),
+                (url(3), [2002, 3001]),
+                (url(4), [3002, usize::MAX]),
             ]
         );
     }
