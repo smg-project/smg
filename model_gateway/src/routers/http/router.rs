@@ -299,15 +299,10 @@ impl Router {
     /// Uses the shared [`WorkerSelector`] (least-loaded) filtered to regular
     /// HTTP workers advertising the `realtime` label, so realtime traffic
     /// never lands on a worker that can't serve it.
-    async fn select_realtime_worker(
-        &self,
-        model_id: &str,
-        headers: Option<&HeaderMap>,
-    ) -> Result<Arc<dyn Worker>, Response> {
+    async fn select_realtime_worker(&self, model_id: &str) -> Result<Arc<dyn Worker>, Response> {
         WorkerSelector::new(&self.worker_registry)
             .select_worker(&SelectWorkerRequest {
                 model_id,
-                headers,
                 worker_type: Some(WorkerType::Regular),
                 connection_mode: Some(ConnectionMode::Http),
                 require_realtime_capable: true,
@@ -326,7 +321,7 @@ impl Router {
         let requested_model = body.model().unwrap_or_default();
         let canonical_model = self.worker_registry.resolve_model_alias(requested_model);
         let model = canonical_model.as_deref().unwrap_or(requested_model);
-        let worker = self.select_realtime_worker(model, headers).await;
+        let worker = self.select_realtime_worker(model).await;
 
         if let Some(canonical_model) = canonical_model.as_deref() {
             let mut body = body.clone();
@@ -2316,9 +2311,7 @@ impl RouterTrait for Router {
         );
 
         let auth_header = header_utils::extract_auth_header(Some(&parts.headers), None);
-        let worker = self
-            .select_realtime_worker(model, Some(&parts.headers))
-            .await;
+        let worker = self.select_realtime_worker(model).await;
 
         handle_realtime_ws(
             RealtimeLabels::HTTP,
@@ -2361,9 +2354,7 @@ impl RouterTrait for Router {
         );
 
         let auth_header = header_utils::extract_auth_header(Some(&parts.headers), None);
-        let worker = self
-            .select_realtime_worker(&parsed.model, Some(&parts.headers))
-            .await;
+        let worker = self.select_realtime_worker(&parsed.model).await;
 
         let bind_addr = self
             .webrtc_bind_addr

@@ -137,7 +137,6 @@ pub(super) async fn route_chat(
         .workers
         .select(&SelectWorkerRequest {
             model_id: model,
-            headers,
             router: Some(known::OPENAI),
             ..Default::default()
         })

@@ -29,17 +29,14 @@ pub trait ExternalWorker: Send + Sync + Debug {
 
 /// What a worker selection asks for.
 ///
-/// Combines the model to resolve with optional registry filters and
-/// the caller's HTTP headers (used for auth passthrough during
-/// upstream model refresh).
+/// The model to resolve with optional registry filters. Nothing else of the
+/// caller's request takes part: a miss re-discovers the external workers'
+/// models with the keys the operator configured for them, never with a
+/// credential the caller sent.
 #[derive(Debug, Default)]
 pub struct SelectWorkerRequest<'a> {
     /// Model ID to select a worker for (required).
     pub model_id: &'a str,
-
-    /// Caller's HTTP headers — used to extract the auth token for
-    /// upstream `/v1/models` refresh on cache miss.
-    pub headers: Option<&'a HeaderMap>,
 
     /// The router selecting, so only workers it takes are candidates: a
     /// caller's credentials must not reach a worker of another provider.

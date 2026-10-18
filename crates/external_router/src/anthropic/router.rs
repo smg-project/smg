@@ -133,7 +133,6 @@ impl ExternalRouter for AnthropicRouter {
             .workers
             .select(&SelectWorkerRequest {
                 model_id,
-                headers,
                 router: Some(known::ANTHROPIC),
                 ..Default::default()
             })

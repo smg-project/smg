@@ -2,7 +2,10 @@
 
 #![allow(dead_code, clippy::allow_attributes)]
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 
 use axum::{
     body::Body,
@@ -22,13 +25,15 @@ use tokio::net::TcpListener;
 /// Mock OpenAI API server for testing
 pub struct MockOpenAIServer {
     addr: SocketAddr,
+    state: Arc<MockServerState>,
     _handle: tokio::task::JoinHandle<()>,
 }
 
-#[derive(Clone)]
 struct MockServerState {
     require_auth: bool,
     expected_auth: Option<String>,
+    /// The `Authorization` value of every `/v1/models` request, in order.
+    models_requests: Mutex<Vec<Option<String>>>,
 }
 
 impl MockOpenAIServer {
@@ -50,13 +55,14 @@ impl MockOpenAIServer {
         let state = Arc::new(MockServerState {
             require_auth: expected_auth.is_some(),
             expected_auth,
+            models_requests: Mutex::default(),
         });
 
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_chat_completions))
             .route("/v1/completions", post(mock_completions))
             .route("/v1/models", post(mock_models).get(mock_models))
-            .with_state(state);
+            .with_state(Arc::clone(&state));
 
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -67,6 +73,7 @@ impl MockOpenAIServer {
 
         Self {
             addr,
+            state,
             _handle: handle,
         }
     }
@@ -74,6 +81,16 @@ impl MockOpenAIServer {
     /// Get the base URL for this mock server
     pub fn base_url(&self) -> String {
         format!("http://{}", self.addr)
+    }
+
+    /// The `Authorization` value each `/v1/models` request carried so far, in
+    /// order (`None` for a request without one).
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test helper - a poisoned lock is a failed test"
+    )]
+    pub fn models_requests(&self) -> Vec<Option<String>> {
+        self.state.models_requests.lock().unwrap().clone()
     }
 }
 
@@ -191,15 +208,21 @@ async fn mock_completions(req: Request<Body>) -> Response {
 }
 
 /// Mock models endpoint
+#[expect(
+    clippy::unwrap_used,
+    reason = "test helper - a poisoned lock is a failed test"
+)]
 async fn mock_models(State(state): State<Arc<MockServerState>>, req: Request<Body>) -> Response {
+    let auth = req
+        .headers()
+        .get("authorization")
+        .or_else(|| req.headers().get("Authorization"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    state.models_requests.lock().unwrap().push(auth.clone());
+
     // Optionally enforce Authorization header
     if state.require_auth {
-        let auth = req
-            .headers()
-            .get("authorization")
-            .or_else(|| req.headers().get("Authorization"))
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
         let auth_ok = match (&state.expected_auth, auth) {
             (Some(expected), Some(got)) => &got == expected,
             (None, Some(_)) => true,
