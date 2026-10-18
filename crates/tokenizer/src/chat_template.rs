@@ -1870,21 +1870,6 @@ impl ChatTemplateProcessor {
     }
 }
 
-/// Load chat template from tokenizer config JSON
-pub fn load_chat_template_from_config(config_path: &str) -> Result<Option<String>> {
-    let content = fs::read_to_string(config_path)?;
-    let config: serde_json::Value = serde_json::from_str(&content)?;
-
-    // Look for chat_template in the config
-    if let Some(template) = config.get("chat_template") {
-        if let Some(template_str) = template.as_str() {
-            return Ok(Some(template_str.to_string()));
-        }
-    }
-
-    Ok(None)
-}
-
 /// Load chat template from a file (.jinja or .json containing Jinja).
 /// Shared between all tokenizer backends.
 pub fn load_chat_template_from_file(template_path: &str) -> Result<Option<String>> {

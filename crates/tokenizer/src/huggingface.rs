@@ -314,15 +314,9 @@ impl HuggingFaceTokenizer {
 
     /// Create a Qwen2-compatible byte-level BPE tokenizer from a Hugging Face
     /// directory containing `vocab.json`, `merges.txt`, and
-    /// `tokenizer_config.json` but no `tokenizer.json`. The special-token
-    /// rule of [`Self::from_file`] applies to the configuration here too.
-    pub fn from_vocab_and_merges_dir(dir: &Path) -> Result<Self> {
-        let chat_template_path = crate::factory::discover_chat_template_in_dir(dir);
-        Self::from_vocab_and_merges_dir_with_chat_template(dir, chat_template_path.as_deref())
-    }
-
-    /// Create a Qwen2-compatible byte-level BPE tokenizer with an optional
-    /// explicit chat template.
+    /// `tokenizer_config.json` but no `tokenizer.json`, with an optional
+    /// explicit chat template. The special-token rule of [`Self::from_file`]
+    /// applies to the configuration here too.
     pub fn from_vocab_and_merges_dir_with_chat_template(
         dir: &Path,
         chat_template_path: Option<&str>,
