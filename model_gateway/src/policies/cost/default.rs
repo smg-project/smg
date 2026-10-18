@@ -5,7 +5,7 @@
 //! score group otherwise. The host then resolves that group exactly as it always has: the
 //! per-request pressure gate, then LeastLoad's expected-wait selection and credit. An empty group
 //! is the miss path. Decisions are therefore identical to the pre-policy code; the tests in
-//! `cache_aware.rs` compare the two at zero temperature and under a temperature.
+//! `cache_aware/tests.rs` compare the two at zero temperature and under a temperature.
 
 use super::{
     inputs::{CandidateInputs, RequestInputs},
