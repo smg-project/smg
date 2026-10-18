@@ -43,7 +43,10 @@ use openai_protocol::{
 };
 use serde::Deserialize;
 use serde_json::Value;
-use smg_mesh::{ClusterState, MeshServerBuilder, MeshServerConfig, MeshServerHandler};
+use smg_mesh::{
+    ClusterState, MeshServer, MeshServerBuilder, MeshServerConfig, MeshServerHandler,
+    PreparedMeshServer,
+};
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
@@ -1606,6 +1609,169 @@ async fn start_discovery(
     discovery_tasks
 }
 
+/// The job queue and the typed workflow engines, then the start-up jobs on
+/// them, in this order: the tokenizer (when a tokenizer or model path is
+/// configured and autoload is on; before the workers, so the tokenizer is
+/// there when they arrive), the workers from the configuration, and the MCP
+/// servers when an MCP configuration is given (the orchestrator then refreshes
+/// its inventory on its own channel, by `inventory.refresh_interval`). Each
+/// job completes in the background; a job the queue refuses fails the start.
+async fn start_workflow_engines(
+    app_context: &Arc<AppContext>,
+    config: &ServerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let weak_context = Arc::downgrade(app_context);
+    let worker_job_queue = JobQueue::new(
+        JobQueueConfig {
+            queue_capacity: config.router_config.job_queue_capacity,
+            max_concurrent_jobs: config.router_config.job_queue_concurrency,
+        },
+        weak_context,
+    );
+    #[expect(
+        clippy::expect_used,
+        reason = "OnceLock initialization during startup; double-init is a fatal bug"
+    )]
+    app_context
+        .worker_job_queue
+        .set(worker_job_queue)
+        .expect("JobQueue should only be initialized once");
+
+    // Initialize typed workflow engines
+    let engines = WorkflowEngines::new(&config.router_config);
+
+    // Subscribe logging to all workflow engines
+    engines.subscribe_all(Arc::new(LoggingSubscriber)).await;
+
+    #[expect(
+        clippy::expect_used,
+        reason = "OnceLock initialization during startup; double-init is a fatal bug"
+    )]
+    app_context
+        .workflow_engines
+        .set(engines)
+        .expect("WorkflowEngines should only be initialized once");
+    debug!(
+        "Workflow engines initialized (health check timeout: {}s)",
+        config.router_config.health_check.timeout_secs
+    );
+
+    // Submit startup tokenizer job if tokenizer path is configured
+    // This runs before worker initialization to ensure tokenizer is available
+    if config.router_config.disable_tokenizer_autoload {
+        info!("Tokenizer autoload disabled via config; skipping startup tokenizer load");
+    } else if let Some(tokenizer_source) = config
+        .router_config
+        .tokenizer_path
+        .as_ref()
+        .or(config.router_config.model_path.as_ref())
+    {
+        info!("Loading startup tokenizer from: {}", tokenizer_source);
+
+        #[expect(
+            clippy::expect_used,
+            reason = "JobQueue was just initialized above; absence is unreachable"
+        )]
+        let job_queue = app_context
+            .worker_job_queue
+            .get()
+            .expect("JobQueue should be initialized");
+
+        let tokenizer_config = TokenizerConfigRequest {
+            id: TokenizerRegistry::generate_id(),
+            name: tokenizer_source.clone(),
+            source: tokenizer_source.clone(),
+            chat_template_path: config.router_config.chat_template.clone(),
+            cache_config: config.router_config.tokenizer_cache.to_option(),
+            fail_on_duplicate: false,
+        };
+
+        let job = Job::AddTokenizer {
+            config: Box::new(tokenizer_config),
+        };
+
+        job_queue
+            .submit(job)
+            .await
+            .map_err(|e| format!("Failed to submit startup tokenizer job: {e}"))?;
+
+        info!("Startup tokenizer job submitted (will complete in background)");
+    }
+
+    info!(
+        "Initializing workers for routing mode: {:?}",
+        config.router_config.mode
+    );
+
+    // Submit worker initialization job to queue
+    #[expect(
+        clippy::expect_used,
+        reason = "JobQueue was initialized above; absence is unreachable"
+    )]
+    let job_queue = app_context
+        .worker_job_queue
+        .get()
+        .expect("JobQueue should be initialized");
+    let job = Job::InitializeWorkersFromConfig {
+        router_config: Box::new(config.router_config.clone()),
+    };
+    job_queue
+        .submit(job)
+        .await
+        .map_err(|e| format!("Failed to submit worker initialization job: {e}"))?;
+
+    info!("Worker initialization job submitted (will complete in background)");
+
+    if let Some(mcp_config) = &config.router_config.mcp_config {
+        info!("Found {} MCP server(s) in config", mcp_config.servers.len());
+        let mcp_job = Job::InitializeMcpServers {
+            mcp_config: Box::new(mcp_config.clone()),
+        };
+        job_queue
+            .submit(mcp_job)
+            .await
+            .map_err(|e| format!("Failed to submit MCP initialization job: {e}"))?;
+    } else {
+        info!("No MCP config provided, skipping MCP server initialization");
+    }
+    Ok(())
+}
+
+/// The mesh server bound and prepared, before the admin and HTTP listeners
+/// bind; `None` without a mesh: the listener against the configured address,
+/// the TLS configuration from the mesh TLS material (the mesh TLS flags check
+/// only that their files exist), the gossip service and its controller. It
+/// runs before the other listeners bind because a failure here, a held port
+/// or bad material, used to be one error line from the mesh server's task a
+/// second after the gateway was already serving (`Mesh server failed: ...`
+/// once, `/readiness` ready), as a node outside the mesh with its rate limits
+/// and worker state shared with nobody; now it fails the start. The prepared
+/// server serves once every listener is bound.
+async fn prepare_mesh_server(
+    mesh_server: Option<MeshServer>,
+    mesh_server_config: Option<&MeshServerConfig>,
+) -> Result<Option<PreparedMeshServer>, Box<dyn std::error::Error>> {
+    let Some((mesh_server, mesh_server_config)) = mesh_server.zip(mesh_server_config) else {
+        return Ok(None);
+    };
+    let mesh_addr = mesh_server_config.bind_addr;
+    let mesh_listener = tokio::net::TcpListener::bind(mesh_addr)
+        .await
+        .map_err(|e| {
+            format!("Failed to bind the mesh listener on {mesh_addr} (--mesh-port): {e}")
+        })?;
+    let flags = if mesh_server_config.mtls_config.is_some() {
+        "--enable-mesh with --mesh-tls-ca-cert, --mesh-tls-cert and --mesh-tls-key"
+    } else {
+        "--enable-mesh"
+    };
+    let prepared = mesh_server
+        .prepare_with_listener(mesh_listener)
+        .await
+        .map_err(|e| format!("Failed to start the mesh server ({flags}): {e:#}"))?;
+    Ok(Some(prepared))
+}
+
 /// [`startup`] on `runtime` to its end, then the process-wide observability
 /// closed behind it, on every exit alike: the log writers are flushed and
 /// stopped, then the tracer is flushed and shut down (a bounded wait, see
@@ -1834,120 +2000,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         app_context.inflight_tracker.start_sampler(20);
     }
 
-    let weak_context = Arc::downgrade(&app_context);
-    let worker_job_queue = JobQueue::new(
-        JobQueueConfig {
-            queue_capacity: config.router_config.job_queue_capacity,
-            max_concurrent_jobs: config.router_config.job_queue_concurrency,
-        },
-        weak_context,
-    );
-    #[expect(
-        clippy::expect_used,
-        reason = "OnceLock initialization during startup; double-init is a fatal bug"
-    )]
-    app_context
-        .worker_job_queue
-        .set(worker_job_queue)
-        .expect("JobQueue should only be initialized once");
-
-    // Initialize typed workflow engines
-    let engines = WorkflowEngines::new(&config.router_config);
-
-    // Subscribe logging to all workflow engines
-    engines.subscribe_all(Arc::new(LoggingSubscriber)).await;
-
-    #[expect(
-        clippy::expect_used,
-        reason = "OnceLock initialization during startup; double-init is a fatal bug"
-    )]
-    app_context
-        .workflow_engines
-        .set(engines)
-        .expect("WorkflowEngines should only be initialized once");
-    debug!(
-        "Workflow engines initialized (health check timeout: {}s)",
-        config.router_config.health_check.timeout_secs
-    );
-
-    // Submit startup tokenizer job if tokenizer path is configured
-    // This runs before worker initialization to ensure tokenizer is available
-    if config.router_config.disable_tokenizer_autoload {
-        info!("Tokenizer autoload disabled via config; skipping startup tokenizer load");
-    } else if let Some(tokenizer_source) = config
-        .router_config
-        .tokenizer_path
-        .as_ref()
-        .or(config.router_config.model_path.as_ref())
-    {
-        info!("Loading startup tokenizer from: {}", tokenizer_source);
-
-        #[expect(
-            clippy::expect_used,
-            reason = "JobQueue was just initialized above; absence is unreachable"
-        )]
-        let job_queue = app_context
-            .worker_job_queue
-            .get()
-            .expect("JobQueue should be initialized");
-
-        let tokenizer_config = TokenizerConfigRequest {
-            id: TokenizerRegistry::generate_id(),
-            name: tokenizer_source.clone(),
-            source: tokenizer_source.clone(),
-            chat_template_path: config.router_config.chat_template.clone(),
-            cache_config: config.router_config.tokenizer_cache.to_option(),
-            fail_on_duplicate: false,
-        };
-
-        let job = Job::AddTokenizer {
-            config: Box::new(tokenizer_config),
-        };
-
-        job_queue
-            .submit(job)
-            .await
-            .map_err(|e| format!("Failed to submit startup tokenizer job: {e}"))?;
-
-        info!("Startup tokenizer job submitted (will complete in background)");
-    }
-
-    info!(
-        "Initializing workers for routing mode: {:?}",
-        config.router_config.mode
-    );
-
-    // Submit worker initialization job to queue
-    #[expect(
-        clippy::expect_used,
-        reason = "JobQueue was initialized above; absence is unreachable"
-    )]
-    let job_queue = app_context
-        .worker_job_queue
-        .get()
-        .expect("JobQueue should be initialized");
-    let job = Job::InitializeWorkersFromConfig {
-        router_config: Box::new(config.router_config.clone()),
-    };
-    job_queue
-        .submit(job)
-        .await
-        .map_err(|e| format!("Failed to submit worker initialization job: {e}"))?;
-
-    info!("Worker initialization job submitted (will complete in background)");
-
-    if let Some(mcp_config) = &config.router_config.mcp_config {
-        info!("Found {} MCP server(s) in config", mcp_config.servers.len());
-        let mcp_job = Job::InitializeMcpServers {
-            mcp_config: Box::new(mcp_config.clone()),
-        };
-        job_queue
-            .submit(mcp_job)
-            .await
-            .map_err(|e| format!("Failed to submit MCP initialization job: {e}"))?;
-    } else {
-        info!("No MCP config provided, skipping MCP server initialization");
-    }
+    // The job queue, the typed workflow engines and the start-up jobs on
+    // them: the tokenizer, the workers from the configuration, the MCP
+    // servers; the jobs complete in the background.
+    start_workflow_engines(&app_context, &config).await?;
 
     // Note: MCP orchestrator handles background refresh internally via refresh channel
     // configured by inventory.refresh_interval in mcp.yaml
@@ -2129,53 +2185,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // One bind-host rule for every listener: IPv6 with or without brackets.
     let addr = crate::config::bind_socket_addr(&config.host, config.port)
         .map_err(|e| format!("Invalid address: {e}"))?;
-    // The mesh listener binds now too, eagerly, before the HTTP listener: a
-    // mesh port another process holds used to surface as one error line from
-    // the mesh server's task after the gateway was already serving, as a node
-    // outside the mesh, its rate limits and worker state shared with nobody.
-    // The bound socket is handed to the mesh server below.
-    let mesh_listener = match &config.mesh_server_config {
-        Some(mesh_server_config) => {
-            let mesh_addr = mesh_server_config.bind_addr;
-            Some(
-                tokio::net::TcpListener::bind(mesh_addr)
-                    .await
-                    .map_err(|e| {
-                        format!(
-                            "Failed to bind the mesh listener on {mesh_addr} (--mesh-port): {e}"
-                        )
-                    })?,
-            )
-        }
-        None => None,
-    };
-    // Everything the mesh server does before it serves happens now, before
-    // the HTTP listener binds: the listener against the configured address,
-    // the TLS configuration from the mesh TLS material, the gossip service
-    // and its controller. A failure here used to be one error line from the
-    // mesh server's task a second after the gateway was serving, as a node
-    // outside the mesh (`Mesh server failed: ...` once, `/readiness` ready);
-    // the mesh TLS flags check only that their files exist.
-    let mesh_server = match (mesh_server, mesh_listener) {
-        (Some(mesh_server), Some(mesh_listener)) => {
-            let with_tls = config
-                .mesh_server_config
-                .as_ref()
-                .is_some_and(|mesh| mesh.mtls_config.is_some());
-            let flags = if with_tls {
-                "--enable-mesh with --mesh-tls-ca-cert, --mesh-tls-cert and --mesh-tls-key"
-            } else {
-                "--enable-mesh"
-            };
-            Some(
-                mesh_server
-                    .prepare_with_listener(mesh_listener)
-                    .await
-                    .map_err(|e| format!("Failed to start the mesh server ({flags}): {e:#}"))?,
-            )
-        }
-        _ => None,
-    };
+    // The mesh listener binds and the mesh server prepares now, eagerly,
+    // before the admin and HTTP listeners bind (see `prepare_mesh_server`).
+    let mesh_server = prepare_mesh_server(mesh_server, config.mesh_server_config.as_ref()).await?;
     // The admin listener binds now, before the HTTP listener, for the reason
     // the mesh listener did: a port another process holds fails the start
     // here, before anything serves.
