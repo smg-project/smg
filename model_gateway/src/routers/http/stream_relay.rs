@@ -1,6 +1,6 @@
 //! One relay of a worker's streaming body to the client, for the HTTP
 //! routers: the regular router's answer and the disaggregated router's decode
-//! leg read through the same task. The head's success is the worker's before
+//! side read through the same task. The head's success is the worker's before
 //! the task can sample the body's failure; a body the worker ends with an
 //! error after a successful head is accounted to its source and, when the
 //! head was SSE, ended with the typed error event on its own frame; the load
@@ -30,7 +30,7 @@ use crate::{
 };
 
 /// What a chunk became through the relay's hook, and whether it ends the
-/// relay (the decode leg ends at the `[DONE]` sentinel).
+/// relay (the decode side ends at the `[DONE]` sentinel).
 pub(crate) struct ChunkStep {
     pub(crate) bytes: Bytes,
     pub(crate) last: bool,
@@ -38,7 +38,7 @@ pub(crate) struct ChunkStep {
 
 /// How the relay reads each upstream chunk: as it is; through the SSE
 /// re-chunker the regular router's provider profile asks for; or through
-/// the decode leg's hook (the prefill log-probability merge and the
+/// the decode side's hook (the prefill log-probability merge and the
 /// `[DONE]` cut). One of the three, so a re-chunker's held text can never be
 /// cut short by a hook that ends the relay.
 pub(crate) enum ChunkMode {
@@ -161,7 +161,7 @@ where
                                         break;
                                     }
                                 }
-                                // The hook ended the stream (the decode leg's
+                                // The hook ended the stream (the decode side's
                                 // sentinel), or the observer did: its error
                                 // event was the last frame, and letting go of
                                 // the upstream cancels the engine's work.
@@ -297,7 +297,7 @@ mod tests {
     }
 
     /// An empty upstream chunk becomes no frame at all, on the plain path and
-    /// through the decode leg's hook alike; the bytes around it are relayed as
+    /// through the decode side's hook alike; the bytes around it are relayed as
     /// they came.
     #[tokio::test]
     async fn an_empty_upstream_chunk_is_no_frame_toward_the_client() {

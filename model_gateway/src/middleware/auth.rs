@@ -12,7 +12,7 @@
 //! middleware reads the gateway's key as the caller's credential for an
 //! upstream. Those upstreams (a self-hosted worker, a third-party provider)
 //! get their own configured key, as they do for a request that carried no
-//! header: the HTTP and PD routers' legs and the external providers apply
+//! header: the HTTP and PD routers' upstream calls and the external providers apply
 //! the caller's header, else the configured key; an upstream configured
 //! without a key is reached with none. A bearer that is not a gateway key is
 //! refused before that, so a request that reaches a route with its

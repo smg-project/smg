@@ -116,10 +116,10 @@ impl RelaySource {
         )
     }
 
-    /// The response to `route` for `model`, read from the decode leg `worker`
+    /// The response to `route` for `model`, read from the decode side `worker`
     /// of a disaggregated prefill/decode pair: a cut is the decode worker's
     /// failure, counted under the disaggregated router's labels.
-    pub(crate) fn decode_leg(model: &str, route: &'static str, worker: Arc<dyn Worker>) -> Self {
+    pub(crate) fn decode_side(model: &str, route: &'static str, worker: Arc<dyn Worker>) -> Self {
         Self::with_labels(
             model,
             route,
@@ -163,7 +163,7 @@ impl RelaySource {
     /// purpose: the relay task outlives the attempt that produced the head.
     /// The shared relay (`routers::http::stream_relay`) records a
     /// successful head before it spawns its task, for the regular router and
-    /// the PD router's decode leg alike, so the cut is sampled after the
+    /// the PD router's decode side alike, so the cut is sampled after the
     /// head's success and never erased by it. A request retried onto the same worker
     /// after a failed head is charged for that head and for the cut.
     pub(crate) fn account(&self, cut: &UpstreamCut, bytes_relayed: u64) {
@@ -380,15 +380,15 @@ mod tests {
         );
     }
 
-    /// The decode leg of a disaggregated pair is charged as the decode
+    /// The decode side of a disaggregated pair is charged as the decode
     /// worker's failure, under the disaggregated router's labels.
     #[test]
-    fn a_cut_on_the_decode_leg_is_counted_under_the_disaggregated_router_s_labels() {
+    fn a_cut_on_the_decode_side_is_counted_under_the_disaggregated_router_s_labels() {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let worker = worker();
         let source =
-            RelaySource::decode_leg("relay-test", "/v1/chat/completions", Arc::clone(&worker));
+            RelaySource::decode_side("relay-test", "/v1/chat/completions", Arc::clone(&worker));
 
         metrics::with_local_recorder(&recorder, || {
             source.account(&cut(StatusCode::BAD_GATEWAY), 839);

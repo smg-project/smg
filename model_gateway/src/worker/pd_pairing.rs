@@ -71,18 +71,18 @@ impl PairingMismatch {
     }
 }
 
-/// How a KV transport moves blocks between the legs of a pair.
+/// How a KV transport moves blocks between the workers of a pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KvTransferProfile {
     /// A rendezvous or side channel per pair: the prefill hands its blocks
     /// to the one decode the request names (a bootstrap address, a peer's
-    /// side channel, a transfer id), so the gateway tags the legs and probes
+    /// side channel, a transfer id), so the gateway tags the sides and probes
     /// the port the partners meet on.
     P2p,
     /// A store the deployment shares, keyed by prefix hash: the prefill
     /// writes its blocks to the store and whichever decode follows reads
     /// them back. Nothing is agreed per pair and nothing listens for a
-    /// partner, so the gateway mints nothing: it tags no leg, hands no
+    /// partner, so the gateway mints nothing: it tags no side, hands no
     /// bootstrap port and probes none; it only runs the decode after the
     /// prefill. Whether the blocks arrive is the store's business.
     Store,
@@ -188,7 +188,7 @@ impl PdPairing {
         self.transport.as_deref()
     }
 
-    /// How the transport moves blocks between the legs, when the transport
+    /// How the transport moves blocks between the workers, when the transport
     /// is known.
     pub fn profile(&self) -> Option<KvTransferProfile> {
         self.profile
@@ -337,7 +337,7 @@ fn profile_of(spec: &WorkerSpec, transport_known: bool) -> Option<KvTransferProf
     }
 }
 
-/// The connectors whose legs meet in a store the deployment shares, by
+/// The connectors whose workers meet in a store the deployment shares, by
 /// exact name or family prefix: the Mooncake store, the shared-storage
 /// connector, the FlexKV and 3FS families. Connectors whose blocks stay in
 /// the engine (offloading) or whose disaggregated mode is a per-pair push
@@ -397,7 +397,7 @@ fn transport_of(spec: &WorkerSpec) -> Option<String> {
 const CONNECTOR_TRANSPORTS: [&str; 3] = ["nixl", "mooncake", "moriio"];
 
 /// A connector name folded to its transport, and a store variant to
-/// `<transport>-store`: legs that meet in a store cannot hand KV to legs
+/// `<transport>-store`: workers that meet in a store cannot hand KV to workers
 /// that rendezvous, so the two never pair. A name that carries no known
 /// transport is kept lower-cased, so two workers naming the same unknown
 /// connector still pair.
@@ -471,12 +471,12 @@ mod tests {
         assert_eq!(PdPairing::derive(&s).transport(), Some("mooncake-store"));
     }
 
-    /// The connector's name says how its legs meet: the P2P connectors
+    /// The connector's name says how its workers meet: the P2P connectors
     /// rendezvous per pair, the store connectors meet in a shared store; the
     /// other runtimes' transfer backends all rendezvous, and a worker with no
     /// known transport has no profile.
     #[test]
-    fn a_connectors_name_says_whether_its_legs_rendezvous_or_meet_in_a_store() {
+    fn a_connectors_name_says_whether_its_workers_rendezvous_or_meet_in_a_store() {
         let vllm = |connector: &str| {
             let mut s = spec(RuntimeType::Vllm, &[]);
             s.kv_connector = Some(connector.to_string());
@@ -525,10 +525,10 @@ mod tests {
     }
 
     /// A store variant of a rendezvous connector family is its own transport:
-    /// a store leg and a rendezvous leg cannot hand KV to each other, so they
+    /// a store worker and a rendezvous worker cannot hand KV to each other, so they
     /// never pair in a mode that compares transports.
     #[test]
-    fn a_store_connector_is_its_own_transport_and_never_pairs_with_a_rendezvous_leg() {
+    fn a_store_connector_is_its_own_transport_and_never_pairs_with_a_rendezvous_worker() {
         let vllm = |connector: &str| {
             let mut s = spec(RuntimeType::Vllm, &[]);
             s.kv_connector = Some(connector.to_string());

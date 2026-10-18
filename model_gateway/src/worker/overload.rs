@@ -44,7 +44,7 @@ pub const BRANCH_ALL_OVERLOADED_FALLBACK: &str = "all_overloaded_fallback";
 /// it never empties the pool.
 pub const BRANCH_ALL_STALLED_FALLBACK: &str = "all_stalled_fallback";
 
-/// Decision-log branch: the decode leg of a disaggregated pair was already
+/// Decision-log branch: the decode side of a disaggregated pair was already
 /// running its full engine window and no slot freed inside the admission wait.
 /// The pair is not overloaded by the threshold predicate above — the gateway
 /// simply has nowhere to put another bootstrap room.

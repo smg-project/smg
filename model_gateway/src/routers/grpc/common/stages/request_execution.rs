@@ -23,7 +23,7 @@ use crate::{
     },
     routers::{
         common::{
-            attempt_ledger::{mark_failed_leg, mark_upstream_answer, AttemptLedger},
+            attempt_ledger::{mark_failed_side, mark_upstream_answer, AttemptLedger},
             kv_transfer::{
                 connector_mode_for_worker, is_moriio_worker, mooncake_decode_params,
                 mooncake_prefill_params, KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
@@ -1648,7 +1648,7 @@ fn decode_silence_response(status: &tonic::Status, decode: &Arc<dyn Worker>) -> 
         "decode_worker_silent",
         format!("Decode worker silent: {}", status.message()),
     );
-    mark_failed_leg(&mut response, decode.as_ref());
+    mark_failed_side(&mut response, decode.as_ref());
     response
 }
 
@@ -1703,13 +1703,13 @@ fn record_silence_outcome(
 /// code, replayable on another prefill worker. The leg's worker is marked on
 /// the response so the retry window closes on it alone (its decode partner
 /// stays selectable) and the answer stands when no other prefill worker is
-/// available (see `attempt_ledger::FailedLeg`).
+/// available (see `attempt_ledger::FailedSide`).
 fn prefill_silence_response(status: &tonic::Status, prefill: &Arc<dyn Worker>) -> Response {
     let mut response = error::gateway_timeout(
         "prefill_worker_silent",
         format!("Prefill worker silent: {}", status.message()),
     );
-    mark_failed_leg(&mut response, prefill.as_ref());
+    mark_failed_side(&mut response, prefill.as_ref());
     response
 }
 
@@ -2749,7 +2749,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        routers::common::{attempt_ledger::FailedLeg, retry::is_retryable_response},
+        routers::common::{attempt_ledger::FailedSide, retry::is_retryable_response},
         worker::{
             BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, RuntimeType, Worker,
             WorkerType,
@@ -3263,7 +3263,7 @@ mod tests {
             Some("prefill_worker_silent")
         );
         assert!(
-            response.extensions().get::<FailedLeg>().is_some(),
+            response.extensions().get::<FailedSide>().is_some(),
             "the retry window closes on the prefill worker alone"
         );
         assert!(
@@ -3497,7 +3497,7 @@ mod tests {
                     Some("decode_worker_silent")
                 );
                 assert!(
-                    response.extensions().get::<FailedLeg>().is_some(),
+                    response.extensions().get::<FailedSide>().is_some(),
                     "the retry window closes on the decode worker alone"
                 );
                 assert!(
@@ -3701,7 +3701,7 @@ mod tests {
             Some("decode_worker_silent")
         );
         assert!(
-            response.extensions().get::<FailedLeg>().is_some(),
+            response.extensions().get::<FailedSide>().is_some(),
             "the retry window closes on the decode worker alone"
         );
         assert!(

@@ -146,7 +146,7 @@ fn value_request_body<T: Serialize>(
 /// A body built here is therefore byte-identical to one built through a
 /// `Value`, which the tests use as the oracle. Cloning copies field names
 /// and slice pointers, not the payload, which is what the PD router's two
-/// legs need.
+/// sides need.
 #[derive(Clone)]
 pub(crate) struct RawBody<'a> {
     fields: Vec<(String, Cow<'a, RawValue>)>,
@@ -661,7 +661,7 @@ mod tests {
         assert!(RawBody::parse(b"[1,2]").is_err());
     }
 
-    /// The prefill leg always sets `stream: false`; a non-streaming request
+    /// The prefill side always sets `stream: false`; a non-streaming request
     /// already carries it, and marking the body mutated for that re-serialized
     /// a body the parsed bytes could have served as they were.
     #[test]
