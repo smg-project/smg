@@ -327,6 +327,12 @@ pub(crate) async fn execute_plan(
         Some(decode) => pd_admission::admit_decode(decode, &ctx.model_id, sub_requests).await?,
         None => None,
     };
+    // The admission is through: the dispatch begins here, and with it the
+    // time the request's usage row books (`DispatchMetadata::dispatched_at`),
+    // as the streams' own clocks start past this point.
+    if let Some(dispatch) = ctx.dispatch.as_mut() {
+        dispatch.mark_dispatched();
+    }
 
     // `None` for non-EPD, text-only EPD, or an EPD retry (the first dispatch
     // consumed it). Taking it transfers the encode jobs' SHM Drop guards

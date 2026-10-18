@@ -829,11 +829,12 @@ pub(crate) struct DispatchMetadata {
     /// The caller's tenant key, carried to the end of the response (the last
     /// token of a stream) for the usage row the request is booked to.
     pub tenant_key: Option<TenantKey>,
-    /// The instant the attempt was dispatched: taken as this metadata is
-    /// prepared, right before the dispatch (a retry's metadata takes its
-    /// own). The usage row's time runs from here to the last token; what
-    /// came before, admission and worker selection, is the router's time,
-    /// which the router's duration metric keeps.
+    /// The instant the attempt's dispatch began: past the admission, right
+    /// before the first request goes out (`mark_dispatched`, from
+    /// `execute_plan`); the metadata's preparation until then, and a retry's
+    /// metadata takes its own. The usage row's time runs from here to the
+    /// last token; what came before, admission and worker selection, is the
+    /// router's time, which the router's duration metric keeps.
     pub dispatched_at: Instant,
 }
 
@@ -841,6 +842,12 @@ impl DispatchMetadata {
     /// The tenant the request's usage is booked to.
     pub fn usage_tenant(&self) -> &str {
         usage_tenant(self.tenant_key.as_ref())
+    }
+
+    /// The admission is through and the first request is about to go out:
+    /// the usage row's time starts now.
+    pub fn mark_dispatched(&mut self) {
+        self.dispatched_at = Instant::now();
     }
 
     /// The attempt's entry in its tenant's usage row: the counts given and
