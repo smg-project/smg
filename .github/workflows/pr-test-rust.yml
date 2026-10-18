@@ -1059,10 +1059,11 @@ jobs:
               ("model_gateway/**",                               FULL),
               # the crates: test trees, benches, fuzzers, examples and tooling none (the
               # WASM fixtures directory builds the storage-hook guests); crates no lane's
-              # binary links none; the tokenizer none, its oracle being the fixture
-              # parity gate (the render and encode of every registered model against
-              # the reference fixtures, in its own workflow on every pull request that
-              # touches the crate) and the crate's tests
+              # binary links none; the tokenizer the Go lane alone (the Go library links it
+              # directly), its oracle for the gateway's lanes being the fixture parity gate
+              # (the render and encode of every registered model against the reference
+              # fixtures, in its own workflow on every pull request that touches the crate)
+              # and the crate's tests
               ("crates/wasm/tests/fixtures/**",                  "agentic vendor"),
               ("crates/*/tests/**",                              NONE),
               ("crates/*/benches/**",                            NONE),
