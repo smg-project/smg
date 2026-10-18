@@ -264,11 +264,13 @@ impl JobQueue {
     }
 
     /// Submit unless a job of any type is pending or processing for this URL.
-    /// For a best-effort submission that must not replace an in-flight job's
+    /// For a best-effort submission that must not take an in-flight job's
     /// status under the key: a label refresh while the worker's registration
     /// is still processing would take that job's entry (and let the in-flight
     /// guard admit a second registration). Returns `Ok(false)` when one is in
-    /// flight; the caller's next occasion submits again.
+    /// flight; the caller's next occasion submits again. A job of another type
+    /// submitted after the claim keeps its entry too: a job's later status
+    /// writes touch only its own entry (`record_own_status`).
     pub async fn submit_unless_in_flight(&self, job: Job) -> Result<bool, String> {
         let worker_url = job.worker_url().to_string();
         if !Self::claim_unless_in_flight(&self.status_map, &worker_url, job.job_type()) {
@@ -368,10 +370,13 @@ impl JobQueue {
         let worker_url = job.worker_url().to_string();
         let start = std::time::Instant::now();
 
-        // Update to processing
-        status_map.insert(
-            worker_url.clone(),
-            JobStatus::processing(job_type, &worker_url),
+        // Update to processing: this job's entry only (a job of another type
+        // submitted for the URL since this one was queued keeps its status).
+        Self::record_own_status(
+            &status_map,
+            &worker_url,
+            job_type,
+            Some(JobStatus::processing(job_type, &worker_url)),
         );
 
         debug!("Processing job: type={}, worker={}", job_type, worker_url);
@@ -866,21 +871,59 @@ impl JobQueue {
     ) {
         match result {
             Ok(message) => {
-                status_map.remove(worker_url);
+                Self::record_own_status(status_map, worker_url, job_type, None);
                 debug!(
                     "Completed job: type={}, worker={}, result={}",
                     job_type, worker_url, message
                 );
             }
             Err(error) => {
-                status_map.insert(
-                    worker_url.to_string(),
-                    JobStatus::failed(job_type, worker_url, error.clone()),
+                Self::record_own_status(
+                    status_map,
+                    worker_url,
+                    job_type,
+                    Some(JobStatus::failed(job_type, worker_url, error.clone())),
                 );
                 warn!(
                     "Failed job: type={}, worker={}, error={}",
                     job_type, worker_url, error
                 );
+            }
+        }
+    }
+
+    /// Writes a job's status under its URL (`None` removes it) unless the
+    /// entry there is another job's: a job of another type submitted for the
+    /// URL after this one was queued keeps its status for its lifetime, since
+    /// the in-flight guards (the reconciler's, `submit_unless_in_flight`) read
+    /// that entry. A vacant entry is written as before.
+    fn record_own_status(
+        status_map: &DashMap<String, JobStatus>,
+        url: &str,
+        job_type: &'static str,
+        status: Option<JobStatus>,
+    ) {
+        match status_map.entry(url.to_string()) {
+            Entry::Occupied(entry) if entry.get().job_type != job_type => {
+                debug!(
+                    "Job status of type={} for worker={} left to the {} job under the key",
+                    job_type,
+                    url,
+                    entry.get().job_type
+                );
+            }
+            Entry::Occupied(mut entry) => match status {
+                Some(status) => {
+                    entry.insert(status);
+                }
+                None => {
+                    entry.remove();
+                }
+            },
+            Entry::Vacant(entry) => {
+                if let Some(status) = status {
+                    entry.insert(status);
+                }
             }
         }
     }
@@ -1152,6 +1195,56 @@ mod tests {
             map.get("http://w:8000").unwrap().job_type,
             "RefreshWorkerLabels"
         );
+    }
+
+    /// A job's processing and completion writes touch only its own entry: a
+    /// job of another type that took the URL after it was queued keeps its
+    /// status through the first job's processing, failure and success.
+    #[test]
+    fn a_jobs_status_writes_leave_another_jobs_entry_alone() {
+        let map: DashMap<String, JobStatus> = DashMap::new();
+        let url = "http://w:8000";
+        map.insert(url.to_string(), JobStatus::processing("RemoveWorker", url));
+        for status in [
+            Some(JobStatus::processing("RefreshWorkerLabels", url)),
+            Some(JobStatus::failed(
+                "RefreshWorkerLabels",
+                url,
+                "boom".to_string(),
+            )),
+            None,
+        ] {
+            JobQueue::record_own_status(&map, url, "RefreshWorkerLabels", status);
+            let entry = map.get(url).expect("the other job's entry stays");
+            assert_eq!(entry.job_type, "RemoveWorker");
+            assert_eq!(entry.status, "processing");
+        }
+
+        // The job's own entry takes its writes, and a vacant one is written.
+        map.insert(
+            url.to_string(),
+            JobStatus::pending("RefreshWorkerLabels", url),
+        );
+        JobQueue::record_own_status(
+            &map,
+            url,
+            "RefreshWorkerLabels",
+            Some(JobStatus::processing("RefreshWorkerLabels", url)),
+        );
+        assert_eq!(map.get(url).unwrap().status, "processing");
+        JobQueue::record_own_status(&map, url, "RefreshWorkerLabels", None);
+        assert!(map.get(url).is_none());
+        JobQueue::record_own_status(
+            &map,
+            url,
+            "RefreshWorkerLabels",
+            Some(JobStatus::failed(
+                "RefreshWorkerLabels",
+                url,
+                "boom".to_string(),
+            )),
+        );
+        assert_eq!(map.get(url).unwrap().status, "failed");
     }
 
     /// A submission that fails must not leave its claim behind, or the next
