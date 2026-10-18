@@ -242,6 +242,24 @@ mod tests {
 
     /// A media context for one image, under multimodal components in `mode`.
     fn media(mode: MmProcessingMode, placeholders: PlaceholderTokens) -> MediaContext {
+        media_for(
+            MediaPlan::new([MediaContentPart::ImageUrl {
+                url: "https://a/1.png".to_string(),
+                detail: None,
+                uuid: None,
+                max_long_side_pixel: None,
+            }]),
+            mode,
+            placeholders,
+        )
+    }
+
+    /// A media context for `plan`, under multimodal components in `mode`.
+    fn media_for(
+        plan: MediaPlan,
+        mode: MmProcessingMode,
+        placeholders: PlaceholderTokens,
+    ) -> MediaContext {
         let mut components = MultimodalComponents::new(
             Arc::new(MultimodalConfigRegistry::new()),
             None,
@@ -251,12 +269,7 @@ mod tests {
         .unwrap();
         components.processing = mode;
         MediaContext {
-            plan: MediaPlan::new([MediaContentPart::ImageUrl {
-                url: "https://a/1.png".to_string(),
-                detail: None,
-                uuid: None,
-                max_long_side_pixel: None,
-            }]),
+            plan,
             placeholders,
             components: Arc::new(components),
             tokenizer_id: "tokenizer-id".to_string(),
@@ -299,13 +312,27 @@ mod tests {
 
     /// Media a worker processes itself leaves as references: the tokens are
     /// the renderer's, no intermediate is built, and the pipeline pin the
-    /// worker selection reads is set from the plan.
+    /// worker selection reads is set from the plan. The plan is an audio
+    /// reference, whose pin is not the state's default, so a pin left
+    /// unwritten fails the test.
     #[tokio::test]
     async fn media_a_worker_processes_itself_leaves_as_references_with_the_pin_set() {
         let (mut ctx, tokenizer) = context().await;
         let placeholders = PlaceholderTokens::worker_only();
-        let media = media(MmProcessingMode::Worker, placeholders.clone());
+        let media = media_for(
+            MediaPlan::new([MediaContentPart::AudioUrl {
+                url: "https://a/1.wav".to_string(),
+                uuid: None,
+            }]),
+            MmProcessingMode::Worker,
+            placeholders.clone(),
+        );
         let expected_pin = media_refs_pipeline_pin(&media.plan, &placeholders);
+        assert_ne!(
+            expected_pin,
+            PipelinePin::default(),
+            "the plan must pin a pipeline the default does not"
+        );
 
         let Ok(rendered) = prepare_rendered_prompt(
             &mut ctx,
