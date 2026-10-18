@@ -831,7 +831,9 @@ mod tests {
 
     /// A loopback HTTP/1.1 server that answers one request with a chunked
     /// body (no declared length) of `chunks` times 64 KiB of JSON-looking
-    /// text, then hangs up. Returns its origin.
+    /// text, then hangs up. Returns its origin. A refusal that comes within
+    /// one chunk past the limit shows the body was stopped as it was read; a
+    /// read-then-check would report the whole body.
     #[expect(
         clippy::disallowed_methods,
         reason = "the server lives exactly as long as the test"
@@ -874,7 +876,7 @@ mod tests {
         let provider = JwksProvider::new(format!("{origin}/jwks.json"), TTL).unwrap();
         let err = provider.get_jwks().await.unwrap_err();
         assert!(
-            matches!(err, JwksError::ResponseTooLarge(read, max) if read > max && max == MAX_JWKS_RESPONSE_SIZE),
+            matches!(err, JwksError::ResponseTooLarge(read, max) if read > max && read <= max + 64 * 1024 && max == MAX_JWKS_RESPONSE_SIZE),
             "{err:?}"
         );
     }
@@ -886,7 +888,7 @@ mod tests {
             panic!("a chunked discovery document past the limit must be refused");
         };
         assert!(
-            matches!(err, JwksError::ResponseTooLarge(read, max) if read > max && max == MAX_JWKS_RESPONSE_SIZE),
+            matches!(err, JwksError::ResponseTooLarge(read, max) if read > max && read <= max + 64 * 1024 && max == MAX_JWKS_RESPONSE_SIZE),
             "{err:?}"
         );
     }
