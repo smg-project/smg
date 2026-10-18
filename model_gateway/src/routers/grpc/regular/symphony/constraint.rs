@@ -43,7 +43,7 @@ fn answer_schema(response_format: Option<&ResponseFormat>) -> Option<Value> {
 
 /// The constraint `grammar` gives, written straight from the tree as the request carries it
 /// ([`Grammar::payload_text`], the bytes of `payload().to_string()` without the JSON tree in
-/// between), for the response template's table too (`compiled`, [`TEMPLATE_PARSER`]): a registry
+/// between), for the response template's table too (`compiled`, [`TEMPLATE_PARSER`](crate::config::TEMPLATE_PARSER)): a registry
 /// table with no tag leaves the older registry to decide, as before; the template's table refuses
 /// instead, since its output has no other syntax the older path could constrain and the table
 /// still read, and so does a prompt that `continues` the assistant's message, since the tag
@@ -633,7 +633,7 @@ pub(crate) fn worker_constraint(
 }
 
 /// The whole turn's grammar for a request ([`Format::turn_grammar`]), where the response
-/// template's table reads the response ([`TEMPLATE_PARSER`]); `declared` is the tools the template
+/// template's table reads the response ([`TEMPLATE_PARSER`](crate::config::TEMPLATE_PARSER)); `declared` is the tools the template
 /// sees (a chat request's effective tool list, a Messages request's chat tools) and `prompt` the
 /// rendered prompt. `Ok(None)` for any other table, and where the turn's grammar does not start;
 /// an error refuses what it cannot hold.

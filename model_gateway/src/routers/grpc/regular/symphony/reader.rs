@@ -48,7 +48,7 @@ pub(super) fn assignment(
 
 /// The table as the request's asks make it: without its calls when the legacy path would run no
 /// tool parser (the request asks for none, or its response is not scanned for calls:
-/// [`scans_for_tool_calls`]), so a table that reads calls from the output's first byte (`json`,
+/// [`scans_for_tool_calls`](crate::routers::grpc::spec::scans_for_tool_calls)), so a table that reads calls from the output's first byte (`json`,
 /// `xlam`) is content from it; without its thought when the request keeps the reasoning in the
 /// content, as the legacy path runs no reasoning parser then. A variant is a copy of the shared
 /// table; a request that asks for neither reads with the shared table itself.

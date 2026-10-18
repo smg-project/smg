@@ -1,8 +1,6 @@
 //! The seam's test support: the requests, names, templates and tables the tests of its modules
 //! build, and the wrappers that read with no templates.
 
-#![allow(clippy::wildcard_imports)]
-
 pub(super) use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -99,7 +97,7 @@ pub(super) fn assign(
     .expect("no hf")
 }
 
-/// [`super::constraint`] with no templates, as [`assign`].
+/// [`super::constraint`](fn@super::constraint) with no templates, as [`assign`].
 pub(super) fn constraint(
     parser: ParserChoice,
     names: &ModelNames<'_>,

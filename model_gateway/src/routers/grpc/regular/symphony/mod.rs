@@ -1,9 +1,9 @@
 //! Symphony reading a chat response or a message: the opt-in path that parses a model's output
-//! with one [`Engine`] per choice in place of the tool and reasoning parser crates.
+//! with one [`Engine`](::symphony::Engine) per choice in place of the tool and reasoning parser crates.
 //!
 //! The switch is the gateway's `--parser` flag (`RouterConfig::parser`, `legacy` by default),
 //! which a request's `X-SMG-Parser` header overrides for that one request ([`choice`]). With
-//! `symphony` on, one precedence decides what reads a model ([`reads`]), among the parser names
+//! `symphony` on, one precedence decides what reads a model ([`reads`](names::reads)), among the parser names
 //! set for it (`ParserResolver::names`: the `tool_parser` and `reasoning_parser` of the model's
 //! card, its workers' labels, apart from the gateway's `--tool-call-parser` and
 //! `--reasoning-parser` flags) and the registry: the labels, when they select anything; else the
@@ -13,16 +13,16 @@
 //! it answers to them (`utils::answering_to`: its own name, a legacy parser's
 //! that reads its format, `qwen` for `qwen3`, `qwen_xml` for `qwen3_tagged`, or a launcher's name
 //! for a family whose table has no older parser, `muse` for `muse_spark`), the tool-call name
-//! deciding, and the table then reads every request for the model; [`TEMPLATE_PARSER`] selects
+//! deciding, and the table then reads every request for the model; [`TEMPLATE_PARSER`](crate::config::TEMPLATE_PARSER) selects
 //! the table the model's tokenizer's `response_template` compiles into ([`template`]), which
 //! refuses the request when the model has none; any other legacy tool-call parser's name selects
 //! the legacy parsers, which is the labels' way back for one model when its table misbehaves,
 //! `passthrough` among them (the legacy parsers then take the labels' names, and from the flags
-//! only names they read: a table's name or [`TEMPLATE_PARSER`] there is nothing to them,
+//! only names they read: a table's name or [`TEMPLATE_PARSER`](crate::config::TEMPLATE_PARSER) there is nothing to them,
 //! `ParserResolver::new`), the rule being that every legacy name whose format a table reads is
 //! the table's alias, so that a deployment's existing flags keep a working parser, and
 //! `utils::UNANSWERED` lists each name no table answers to with the reason (the test over both
-//! legacy registries below holds every name to one of the two); no name at all, or a reasoning
+//! legacy registries in `names` holds every name to one of the two); no name at all, or a reasoning
 //! name alone that no table answers to, other than `passthrough`, selects nothing. The names are
 //! checked at startup and at a worker's registration ([`check_names`]), which also says, once per
 //! model, when the registry's table sets the flags' choice aside ([`set_aside_by_the_registry`]).
@@ -37,7 +37,7 @@
 //! Request building assigns Symphony to a request ([`assign`]) and stores
 //! the [`Assignment`] in the response spec: the table, and the part of the rendered prompt the
 //! engine replays to find the state the generation starts in. Preparation asks the table for the
-//! structural tag of a forced or required call, or of a JSON `response_format` ([`constraint`])
+//! structural tag of a forced or required call, or of a JSON `response_format` ([`constraint`](fn@constraint))
 //! before the older registry. Both decide with one predicate, so the
 //! output a table's tag constrains is read by that table and never by the older parsers, which
 //! expect another syntax. Request building decides what constrains the output on the worker

@@ -31,7 +31,7 @@ pub enum ParserChoice {
     /// The tool-call and reasoning parser crates, one parser per model family.
     #[default]
     Legacy,
-    /// Symphony's tables, by one precedence per model (`routers::grpc::regular::symphony::reads`):
+    /// Symphony's tables, by one precedence per model (`routers::grpc::regular::symphony::names::reads`):
     /// the table its worker labels select, when they select anything; else the registry's table
     /// for a model it knows; else the one the `--tool-call-parser` and `--reasoning-parser` flags
     /// select, for a model the registry does not know. Names select a table when it answers to

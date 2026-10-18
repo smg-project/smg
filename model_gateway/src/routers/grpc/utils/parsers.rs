@@ -35,7 +35,7 @@ use crate::{
 /// no legacy parser reads) → `None`, which lets the factory helpers fall back
 /// to their name-based auto-detection, unchanged. Symphony takes the two
 /// sources apart ([`Self::names`]), the flags as set, with its registry
-/// between them (`regular::symphony::reads`).
+/// between them (`regular::symphony::names::reads`).
 ///
 /// Lookups borrow straight from worker metadata (no card clones); only the
 /// resolved name is cloned.
@@ -145,7 +145,7 @@ impl ParserResolver {
 
     /// The parser names set for `model`, apart by who set them: its card's
     /// (its workers' labels), and the gateway's flags as set. Symphony reads
-    /// them in that order with its registry between (`regular::symphony::reads`);
+    /// them in that order with its registry between (`regular::symphony::names::reads`);
     /// the legacy parsers take each kind's first, from the flags only a name
     /// they read ([`Self::tool_parser`], [`Self::reasoning_parser`],
     /// [`Self::legacy_tool`]).
@@ -224,7 +224,7 @@ static NO_NAMES: Names = Names {
 /// The parser names set for one model, apart by who set them ([`ParserResolver::names`]): the
 /// names of its card, which its workers' labels (or the operator's card) set for the one model,
 /// and the gateway's flags, which every model shares. Symphony reads the two in that order with
-/// its registry between them (`regular::symphony::reads`): the card's names when they select
+/// its registry between them (`regular::symphony::names::reads`): the card's names when they select
 /// anything, else the registry's table for a model it knows, else the flags; the legacy parsers
 /// take each kind's first name, from the flags only one a legacy parser of the kind has
 /// ([`ParserResolver::tool_parser`], [`ParserResolver::legacy_tool`]).

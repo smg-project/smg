@@ -149,7 +149,7 @@ pub(super) fn table_reading(
 /// The table that reads `model`'s responses under `parser`, if one does: the response template's,
 /// the registry's, or the one the parser names select, by the precedence [`decision`] states; `None`
 /// under `legacy`, and when the legacy parsers read the response. What a request asks of the
-/// channels takes a variant of the table ([`assign`]). Preparation and request building both
+/// channels takes a variant of the table ([`assign`](super::assign)). Preparation and request building both
 /// decide with this one predicate. The table comes shared, built once for every request and
 /// engine that reads with it; a variant is a copy.
 pub(crate) fn reads(

@@ -98,7 +98,7 @@ fn reasoning_decision(
 /// `continued_final_message` is the rendered prompt's
 /// (`ProcessedMessages::continued_final_message`). `auto_tag` derives the
 /// table's `auto` tag for a worker's grammar start when `tool_constraints` is
-/// that tag (`regular::symphony::WorkerConstraint::auto`).
+/// that tag (`regular::symphony::constraint::WorkerConstraint::auto`).
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn build_chat_backed_plan(
     ctx: &mut RequestContext,

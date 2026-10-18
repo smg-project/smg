@@ -129,7 +129,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
 
         // Under Symphony the registry's table reads a model it knows for a
         // worker whose labels select no reader, whatever the gateway's flags
-        // name (`regular::symphony::reads`): the model's first such worker
+        // name (`regular::symphony::names::reads`): the model's first such worker
         // says so.
         if let Some(message) = registry_reads_over_the_flags(
             &model_card,
@@ -477,7 +477,7 @@ pub(super) fn validate_parser_overrides(
 
 /// Under `--parser symphony`, the registry's table reads a model it knows for every worker whose
 /// labels select no reader (none, or a reasoning name alone that no table answers to), whatever the
-/// gateway's `--tool-call-parser` and `--reasoning-parser` name (`regular::symphony::reads`). When
+/// gateway's `--tool-call-parser` and `--reasoning-parser` name (`regular::symphony::names::reads`). When
 /// they name another reader, the registration of the model's first worker says so: `Some(message)`
 /// while no worker of the model is registered, naming the model, both readers and the one used;
 /// `None` for the model's later workers, a worker whose labels select a reader, a model the
