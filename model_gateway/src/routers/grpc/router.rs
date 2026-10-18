@@ -1,4 +1,4 @@
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{borrow::Cow, future::Future, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use axum::{
@@ -290,6 +290,29 @@ impl GrpcRouter {
         }
     }
 
+    /// Run a pipeline call for the canonical `model_id` under a tenant
+    /// rate-limit reservation: the cell the pipeline reserves into, the
+    /// model's retry config (keyed by the canonical id, see
+    /// [`Self::resolve_retry_config_for_canonical`]), `run` with those and
+    /// the id, then the close of a reservation a non-2xx answer never
+    /// settled. The routes that reserve nothing call their pipelines
+    /// directly; the reserve stage's doc (`common/stages/rate_limit.rs`)
+    /// names the endpoints that opt in and the ones that do not.
+    async fn execute_reserved<Fut>(
+        &self,
+        model_id: String,
+        run: impl FnOnce(String, Arc<RateLimitCell>, RetryConfig) -> Fut,
+    ) -> Response
+    where
+        Fut: Future<Output = Response>,
+    {
+        let rate_limit_cell = Arc::new(RateLimitCell::new());
+        let retry_config = self.resolve_retry_config_for_canonical(&model_id);
+        let response = run(model_id, rate_limit_cell.clone(), retry_config).await;
+        Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
+        response
+    }
+
     /// Main route_chat implementation
     async fn route_chat_impl(
         &self,
@@ -327,26 +350,27 @@ impl GrpcRouter {
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let mut canonical_body = body;
         canonical_body.model = model_id_cloned.clone();
-        let rate_limit_cell = Arc::new(RateLimitCell::new());
-        let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
 
         // The request Arc moves into the pipeline: no handle survives out
         // here, so the parsed request frees at the build boundary.
-        let response = pipeline
-            .execute_chat(
-                Arc::new(canonical_body),
-                headers.cloned(),
-                model_id_cloned,
-                self.shared_components.clone(),
-                Some(tenant_meta.clone()),
-                Some(rate_limit_cell.clone()),
-                Some(&retry_config),
-                None,
-            )
-            .await;
-
-        Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
-        response
+        self.execute_reserved(
+            model_id_cloned,
+            |model_id, rate_limit_cell, retry_config| async move {
+                pipeline
+                    .execute_chat(
+                        Arc::new(canonical_body),
+                        headers.cloned(),
+                        model_id,
+                        self.shared_components.clone(),
+                        Some(tenant_meta.clone()),
+                        Some(rate_limit_cell),
+                        Some(&retry_config),
+                        None,
+                    )
+                    .await
+            },
+        )
+        .await
     }
 
     /// Main route_generate implementation
@@ -365,24 +389,24 @@ impl GrpcRouter {
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let mut canonical_body = body;
         canonical_body.model = model_id_cloned.clone();
-        let rate_limit_cell = Arc::new(RateLimitCell::new());
-        let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
 
-        let response = self
-            .pipeline
-            .execute_generate(
-                Arc::new(canonical_body),
-                headers.cloned(),
-                model_id_cloned,
-                self.shared_components.clone(),
-                Some(tenant_meta.clone()),
-                Some(rate_limit_cell.clone()),
-                Some(&retry_config),
-            )
-            .await;
-
-        Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
-        response
+        self.execute_reserved(
+            model_id_cloned,
+            |model_id, rate_limit_cell, retry_config| async move {
+                self.pipeline
+                    .execute_generate(
+                        Arc::new(canonical_body),
+                        headers.cloned(),
+                        model_id,
+                        self.shared_components.clone(),
+                        Some(tenant_meta.clone()),
+                        Some(rate_limit_cell),
+                        Some(&retry_config),
+                    )
+                    .await
+            },
+        )
+        .await
     }
 
     /// Main route_responses implementation
@@ -694,24 +718,24 @@ impl GrpcRouter {
             }
             return response;
         }
-        let rate_limit_cell = Arc::new(RateLimitCell::new());
-        let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
 
-        let response = self
-            .messages_pipeline
-            .execute_messages(
-                canonical_body,
-                headers.cloned(),
-                model_id_cloned,
-                self.shared_components.clone(),
-                Some(tenant_meta.clone()),
-                Some(rate_limit_cell.clone()),
-                Some(&retry_config),
-            )
-            .await;
-
-        Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
-        response
+        self.execute_reserved(
+            model_id_cloned,
+            |model_id, rate_limit_cell, retry_config| async move {
+                self.messages_pipeline
+                    .execute_messages(
+                        canonical_body,
+                        headers.cloned(),
+                        model_id,
+                        self.shared_components.clone(),
+                        Some(tenant_meta.clone()),
+                        Some(rate_limit_cell),
+                        Some(&retry_config),
+                    )
+                    .await
+            },
+        )
+        .await
     }
 
     /// `/v1/messages/count_tokens`, answered from the gateway's own
@@ -925,24 +949,24 @@ impl GrpcRouter {
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let mut canonical_body = body;
         canonical_body.model = model_id_cloned.clone();
-        let rate_limit_cell = Arc::new(RateLimitCell::new());
-        let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
 
-        let response = self
-            .completion_pipeline
-            .execute_completion(
-                Arc::new(canonical_body),
-                headers.cloned(),
-                model_id_cloned,
-                self.shared_components.clone(),
-                Some(tenant_meta.clone()),
-                Some(rate_limit_cell.clone()),
-                Some(&retry_config),
-            )
-            .await;
-
-        Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
-        response
+        self.execute_reserved(
+            model_id_cloned,
+            |model_id, rate_limit_cell, retry_config| async move {
+                self.completion_pipeline
+                    .execute_completion(
+                        Arc::new(canonical_body),
+                        headers.cloned(),
+                        model_id,
+                        self.shared_components.clone(),
+                        Some(tenant_meta.clone()),
+                        Some(rate_limit_cell),
+                        Some(&retry_config),
+                    )
+                    .await
+            },
+        )
+        .await
     }
 
     /// Score Decisions through the regular SGLang pipeline.
@@ -977,21 +1001,23 @@ impl GrpcRouter {
             );
         }
         body.model = canonical.clone();
-        let rate_limit_cell = Arc::new(RateLimitCell::new());
-        let retry_config = self.resolve_retry_config_for_canonical(&canonical);
-        let response = pipeline
-            .execute_decisions(
-                Arc::new(body),
-                headers.cloned(),
-                canonical,
-                self.shared_components.clone(),
-                Some(tenant_meta.clone()),
-                Some(rate_limit_cell.clone()),
-                Some(&retry_config),
-            )
-            .await;
-        Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
-        response
+        self.execute_reserved(
+            canonical,
+            |model_id, rate_limit_cell, retry_config| async move {
+                pipeline
+                    .execute_decisions(
+                        Arc::new(body),
+                        headers.cloned(),
+                        model_id,
+                        self.shared_components.clone(),
+                        Some(tenant_meta.clone()),
+                        Some(rate_limit_cell),
+                        Some(&retry_config),
+                    )
+                    .await
+            },
+        )
+        .await
     }
 
     /// Main route_classify implementation
@@ -1235,7 +1261,10 @@ fn canonicalize_responses_request<'a>(
 mod pd_tests {
     use std::{
         fs,
-        sync::{Arc, OnceLock},
+        sync::{
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+            Arc, OnceLock,
+        },
         time::{Duration, Instant},
     };
 
@@ -1259,6 +1288,10 @@ mod pd_tests {
     use crate::{
         config::{ParserChoice, PolicyConfig, RouterConfig, RoutingMode},
         policies::PolicyRegistry,
+        rate_limit::{
+            RateLimitBackend, ReserveOutcome, ReserveRequest, SharedReservationHandle,
+            UsageSettlement,
+        },
         tenant::TenantKey,
         worker::{BasicWorker, BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerRegistry},
         workflow::{
@@ -2045,6 +2078,68 @@ mod pd_tests {
                     "{output_config}"
                 );
             }
+        }
+    }
+
+    /// A rate-limit backend that counts the reservations closed unsettled.
+    #[derive(Default)]
+    struct ClosingBackend {
+        closed: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RateLimitBackend for ClosingBackend {
+        async fn reserve(&self, _request: ReserveRequest) -> ReserveOutcome {
+            ReserveOutcome::Admitted
+        }
+        async fn settle_success(&self, _request_charge_id: Uuid, _usage: UsageSettlement) {}
+        async fn close_reserved_only(&self, _request_charge_id: Uuid) {
+            self.closed.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+        async fn abandon(&self, _request_charge_id: Uuid) {}
+    }
+
+    /// The reserved execution hands the run the canonical id, a fresh cell
+    /// and the model's retry config; the reservation the run made is closed
+    /// when the answer is not a 2xx and left to its own settlement when it is.
+    #[tokio::test]
+    async fn execute_reserved_closes_the_reservation_of_a_failed_answer() {
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("router");
+        let override_retries = router.retry_config.max_retries + 3;
+        ctx.worker_registry.set_model_retry_config(
+            "canonical-model",
+            RetryConfig {
+                max_retries: override_retries,
+                ..RetryConfig::default()
+            },
+            true,
+        );
+
+        for (status, closed) in [(StatusCode::INTERNAL_SERVER_ERROR, 1), (StatusCode::OK, 0)] {
+            let backend = Arc::new(ClosingBackend::default());
+            let handle = Arc::new(SharedReservationHandle::new(
+                backend.clone() as Arc<dyn RateLimitBackend>,
+                Uuid::now_v7(),
+            ));
+            let response = router
+                .execute_reserved(
+                    "canonical-model".to_string(),
+                    |model_id, cell, retry_config| async move {
+                        assert_eq!(model_id, "canonical-model");
+                        assert_eq!(retry_config.max_retries, override_retries);
+                        assert!(cell.peek().is_none(), "the cell starts empty");
+                        cell.set_for_test(RateLimitOutcome::Admitted(handle));
+                        status.into_response()
+                    },
+                )
+                .await;
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                backend.closed.load(AtomicOrdering::SeqCst),
+                closed,
+                "reservation closed after a {status} answer"
+            );
         }
     }
 
