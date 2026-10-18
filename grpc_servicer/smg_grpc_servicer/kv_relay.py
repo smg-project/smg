@@ -8,15 +8,17 @@ Rust relay applies (``crates/engine_servicer/src/kv_wire.rs``; the relay tests
 on both sides build the same engine wire shapes in code and expect the same
 output of them).
 
-What the gateway sees is one stream with its own contiguous sequence numbers
-and the rank on every batch. Recovery is the relay's: a gap on a rank is
-filled from that rank's replay endpoint before anything later is forwarded;
-a replay that cannot be verified (history truncated, timeout, malformed) and
-a publisher restart (its counter starts over) end the stream with
-``DATA_LOSS``, which the gateway answers by clearing the worker and
-resubscribing from zero. A non-zero ``start_sequence_number`` is refused with
-``OUT_OF_RANGE`` for the same reason: the relay's numbering is per call. A
-zero cursor is live only: nothing is kept between calls, so there is no
+What the gateway sees is one stream carrying every rank's batches under
+that rank's own sequence numbers, the rank on every batch: the gateway keeps
+one admission cursor per rank, so a numbering shared across the ranks would
+read as a gap on every rank whenever they interleave. Recovery is the
+relay's: a gap on a rank is filled from that rank's replay endpoint before
+anything later is forwarded; a replay that cannot be verified (history
+truncated, timeout, malformed) and a publisher restart (its counter starts
+over) end the stream with ``DATA_LOSS``, which the gateway answers by
+clearing the worker and resubscribing from zero. A non-zero
+``start_sequence_number`` is refused with ``OUT_OF_RANGE``: nothing is kept
+between calls to resume from. A zero cursor is live only: there is no
 history and no state snapshot to serve (the Rust relay in
 ``crates/engine_servicer`` keeps both for the servicer's lifetime and serves a
 ``KvSnapshotChunk`` snapshot once its history window has rolled).
@@ -26,7 +28,9 @@ keys: batches are ``[ts, events, rank]``, events are tagged maps (``type``) or
 the legacy tag-first arrays, unknown keys are ignored, missing or unreadable
 fields cost that event and not the batch, and ``token_ids`` cells may be an
 int or a ``[token, next_token]`` bigram (Eagle-family speculative decoding),
-folded to their tokens.
+folded to their tokens. A payload that does not decode at all is relayed as
+an empty batch under its sequence, as the Rust relay relays it, so the
+gateway sees no gap for it.
 
 Hash identity: an integer hash is used as is (vLLM sends the low 64 bits of
 the digest unsigned, SGLang the high 64 bits signed; both are 64-bit patterns
@@ -151,6 +155,7 @@ class Engine(Enum):
 
     VLLM = "vllm"
     SGLANG = "sglang"
+    TOKENSPEED = "tokenspeed"
 
 
 # ---------------------------------------------------------------------------
@@ -1083,7 +1088,6 @@ async def relay(
         )
     streams: dict[Any, _RankStream] = {}
     poller = zmq.asyncio.Poller()
-    relay_seq = 0
     sent_headers = False
     recorder = LoadRecorder.optional(
         load_source,
@@ -1097,20 +1101,21 @@ async def relay(
         return recorder.stamp(proto) if recorder is not None else proto
 
     def forward(payload: bytes, stream: _RankStream, seq: int, kind: str):
-        nonlocal relay_seq
         try:
             batch = decode_batch(payload)
         except Exception as error:  # noqa: BLE001 - one bad payload must not end the stream
             logger.warning(
-                "Failed to decode %s KV event batch %d from rank %d: %s",
+                "Failed to decode %s KV event batch %d from rank %d; relaying it empty: %s",
                 kind,
                 seq,
                 stream.source.rank,
                 error,
             )
-            return None
-        relay_seq += 1
-        return normalizer.normalize_batch(batch, relay_seq, stream.source.rank)
+            empty = common_pb2.KvEventBatch(sequence_number=seq)
+            empty.dp_rank = stream.source.rank
+            return empty
+        # The rank's own sequence, as the publisher numbered it.
+        return normalizer.normalize_batch(batch, seq, stream.source.rank)
 
     try:
         for source in sources:

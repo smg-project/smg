@@ -27,11 +27,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import grpc
-import msgspec
 import numpy as np
 import torch
-import zmq
-import zmq.asyncio
 from google.protobuf.struct_pb2 import Struct
 from google.protobuf.timestamp_pb2 import Timestamp
 from smg_grpc_proto import tokenspeed_scheduler_pb2_grpc
@@ -42,15 +39,16 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalInputs,
 )
 from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
-from tokenspeed.runtime.pd.kv_events import KVEventBatch
 
 from smg_grpc_servicer import mm_shm
-from smg_grpc_servicer.kv_events import endpoint_for_rank, stream_kv_events
 from smg_grpc_servicer.mm_rdma import RdmaPixelPuller
 from smg_grpc_servicer.tokenizer_bundle import build_tokenizer_zip, tokenizer_chunks
 from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
-from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
+from smg_grpc_servicer.tokenspeed.kv_events import (
+    resolve_kv_events_config,
+    subscribe_kv_events,
+)
 from smg_grpc_servicer.tokenspeed.loads import (
     convert_load_to_protobuf,
     convert_snapshot_to_protobuf,
@@ -923,20 +921,13 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
     async def SubscribeKvEvents(
         self,
-        _request: common_pb2.SubscribeKvEventsRequest,
+        request: common_pb2.SubscribeKvEventsRequest,
         context: grpc.aio.ServicerContext,
     ) -> AsyncIterator[common_pb2.KvEventBatch]:
-        """Bridge TokenSpeed's in-process ZMQ KV cache events to a gRPC stream.
-
-        The scheduler subprocess publishes msgpack ``BlockStored`` /
-        ``BlockRemoved`` / ``AllBlocksCleared`` batches on a ZMQ PUB socket
-        (enabled via ``--kv-events-config``); we re-publish them as the
-        engine-neutral ``common.KvEventBatch`` stream SMG already consumes,
-        using the publisher's sequence numbers directly.
-
-        ``start_sequence_number`` (replay) is not honored — the stream starts
-        from the current ZMQ position, matching the other engine bridges.
-        """
+        """Relay the scheduler's ZMQ KV cache events, every attention
+        data-parallel rank's publisher, as one gRPC stream (see
+        :mod:`smg_grpc_servicer.tokenspeed.kv_events` and
+        :mod:`smg_grpc_servicer.kv_relay`)."""
         if self._kv_events_config is None:
             await context.abort(
                 grpc.StatusCode.UNIMPLEMENTED,
@@ -944,43 +935,16 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 "--kv-events-config "
                 '\'{"enable_kv_cache_events": true, "publisher": "zmq"}\'',
             )
-            return  # defensive: context.abort() raises, but keep config non-None below
+            return  # defensive: context.abort() raises
 
-        config = self._kv_events_config
-
-        # DP attention publishes one PUB socket per rank (port + rank) with
-        # independent sequence counters; subscribing to several on one socket
-        # interleaves them and breaks gap detection. Subscribe to rank 0 only.
-        pub_endpoint = endpoint_for_rank(config.endpoint, 0)
-
-        zmq_ctx = zmq.asyncio.Context.instance()
-        sub_socket = zmq_ctx.socket(zmq.SUB)
-        try:
-            # subscribe/connect can raise on a malformed endpoint; keep them in
-            # the try so the finally below always closes the socket.
-            sub_socket.subscribe(config.topic.encode("utf-8"))
-            sub_socket.connect(pub_endpoint)
-            logger.info("SubscribeKvEvents: connected to ZMQ endpoint %s", pub_endpoint)
-
-            decoder = msgspec.msgpack.Decoder(KVEventBatch)
-            async for proto_batch in stream_kv_events(
-                sub_socket,
-                decoder.decode,
-                lambda: context.send_initial_metadata(()),
-                context.cancelled,
-                load_source=self._load_record,
-            ):
-                yield proto_batch
-        except asyncio.CancelledError:
-            pass
-        except grpc.aio.AbortError:
-            raise
-        except Exception as e:  # noqa: BLE001
-            logger.exception("SubscribeKvEvents failed")
-            await context.abort(grpc.StatusCode.INTERNAL, str(e))
-        finally:
-            sub_socket.close(linger=0)
-            logger.info("SubscribeKvEvents: stream closed")
+        async for batch in subscribe_kv_events(
+            self._kv_events_config,
+            self.server_args,
+            request.start_sequence_number,
+            context,
+            load_source=self._load_record,
+        ):
+            yield batch
 
     async def FlushCache(
         self,

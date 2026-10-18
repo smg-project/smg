@@ -1,4 +1,6 @@
-"""Unit tests for the TokenSpeed KV-events config resolver + shared conversion.
+"""Unit tests for the TokenSpeed KV-events config resolver, its rank sources
+and the shared conversion; the relay's protocol has its own tests in
+``test_kv_relay.py``.
 
 Engine-free: no TokenSpeed install required. Modules are loaded by file path so
 the ``tokenspeed`` package ``__init__`` (which imports the engine-bound
@@ -7,13 +9,20 @@ servicer) is never triggered.
 Run with: pytest grpc_servicer/tests/test_tokenspeed_kv_events.py -v
 """
 
+import asyncio
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 pytest.importorskip("smg_grpc_proto")
+grpc = pytest.importorskip("grpc")
+zmq = pytest.importorskip("zmq")
+msgspec = pytest.importorskip("msgspec")
+import zmq.asyncio  # noqa: E402, F811
+from smg_grpc_proto.generated import common_pb2  # noqa: E402
 
 _SERVICER_ROOT = Path(__file__).parents[1] / "smg_grpc_servicer"
 
@@ -29,10 +38,13 @@ ts_kv_events = _load("tokenspeed/kv_events.py", "ts_kv_events")
 shared = _load("kv_events.py", "shared_kv_events")
 
 
-def test_tokenspeed_servicer_imports_current_kv_events_path():
+def test_tokenspeed_servicer_relays_through_the_shared_relay():
+    """The servicer opens no SUB socket of its own: every rank's publisher
+    goes through the transport module and the shared relay."""
     source = (_SERVICER_ROOT / "tokenspeed" / "servicer.py").read_text()
 
-    assert "from tokenspeed.runtime.pd.kv_events import KVEventBatch" in source
+    assert "subscribe_kv_events," in source
+    assert "zmq.SUB" not in source and "stream_kv_events" not in source
     assert "tokenspeed.runtime.disaggregation.kv.kv_events" not in source
 
 
@@ -194,6 +206,32 @@ class TestConvertBatchAttnDpRank:
         assert proto.dp_rank == 0
 
 
+def _dp_args(dp_size):
+    return SimpleNamespace(mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=dp_size)))
+
+
+def test_one_source_per_attention_dp_rank():
+    """A worker with attention data parallelism publishes one stream per rank
+    on ``port + rank`` (its replay socket likewise): one source each."""
+    assert ts_kv_events.dp_rank_count(_dp_args(3)) == 3
+    assert ts_kv_events.dp_rank_count(_dp_args(None)) == 1
+    assert ts_kv_events.dp_rank_count(SimpleNamespace()) == 1
+    config = ts_kv_events.ResolvedKvEventsConfig(
+        endpoint="tcp://*:5557", topic="", replay_endpoint="tcp://*:5600"
+    )
+    sources = ts_kv_events.sources(config, _dp_args(2))
+    assert [(s.rank, s.endpoint, s.replay_endpoint) for s in sources] == [
+        (0, "tcp://127.0.0.1:5557", "tcp://127.0.0.1:5600"),
+        (1, "tcp://127.0.0.1:5558", "tcp://127.0.0.1:5601"),
+    ]
+    without_replay = ts_kv_events.sources(
+        ts_kv_events.ResolvedKvEventsConfig(endpoint="tcp://*:6000", topic=""), _dp_args(1)
+    )
+    assert [(s.rank, s.endpoint, s.replay_endpoint) for s in without_replay] == [
+        (0, "tcp://127.0.0.1:6000", None)
+    ]
+
+
 class TestResolvedReplayEndpoint:
     def test_replay_endpoint_is_carried_when_configured(self):
         cfg = ts_kv_events.resolve_kv_events_config(
@@ -226,12 +264,8 @@ def _subscribe_method(namespace):
     """The real ``SubscribeKvEvents`` method of the TokenSpeed servicer,
     compiled on its own (the servicer module imports the engine)."""
     import ast
-    import asyncio
     import logging
     from collections.abc import AsyncIterator
-
-    import grpc
-    from smg_grpc_proto.generated import common_pb2
 
     source_path = _SERVICER_ROOT / "tokenspeed" / "servicer.py"
     tree = ast.parse(source_path.read_text())
@@ -254,61 +288,152 @@ def _subscribe_method(namespace):
 
 
 @pytest.mark.asyncio
-async def test_servicer_hands_its_load_record_to_the_stream_loop():
-    from types import SimpleNamespace
-
-    from smg_grpc_proto.generated import common_pb2
-
+async def test_servicer_hands_config_server_args_and_cursor_to_the_relay():
     calls = []
 
-    async def fake_stream(sub_socket, decode, send_initial_metadata, is_cancelled, **options):
-        calls.append((decode, options))
-        yield common_pb2.KvEventBatch(sequence_number=3)
+    async def fake_subscribe(config, server_args, start, context, *, load_source=None):
+        calls.append((config, server_args, start, context, load_source))
+        yield common_pb2.KvEventBatch(sequence_number=1)
 
-    class Socket:
-        def subscribe(self, topic):
-            pass
-
-        def connect(self, endpoint):
-            self.endpoint = endpoint
-
-        def close(self, linger=0):
-            pass
-
-    class Context:
-        def socket(self, kind):
-            return Socket()
-
-    decoder = SimpleNamespace(decode=lambda payload: payload)
-    method = _subscribe_method(
-        {
-            "stream_kv_events": fake_stream,
-            "endpoint_for_rank": lambda endpoint, rank: endpoint,
-            "zmq": SimpleNamespace(
-                asyncio=SimpleNamespace(Context=SimpleNamespace(instance=Context)), SUB=2
-            ),
-            "msgspec": SimpleNamespace(msgpack=SimpleNamespace(Decoder=lambda kind: decoder)),
-            "KVEventBatch": object,
-        }
-    )
-    config = SimpleNamespace(endpoint="tcp://127.0.0.1:5557", topic="kv")
+    method = _subscribe_method({"subscribe_kv_events": fake_subscribe})
+    config = SimpleNamespace(endpoint="tcp://*:5557", topic="kv")
+    server_args = _dp_args(2)
 
     def load_record(dp_rank):
         return None
 
-    servicer = SimpleNamespace(_kv_events_config=config, _load_record=load_record)
+    servicer = SimpleNamespace(
+        _kv_events_config=config, server_args=server_args, _load_record=load_record
+    )
+    context = SimpleNamespace()
+    request = common_pb2.SubscribeKvEventsRequest(start_sequence_number=7)
+    batches = [batch async for batch in method(servicer, request, context)]
+    assert [b.sequence_number for b in batches] == [1]
+    # The servicer's load record rides the stream: its source goes to the relay.
+    assert calls == [(config, server_args, 7, context, load_record)]
 
-    class RpcContext:
-        def cancelled(self):
-            return False
 
-        async def send_initial_metadata(self, metadata):
+@pytest.mark.asyncio
+async def test_servicer_without_a_publisher_is_unimplemented():
+    aborted = []
+
+    class Context:
+        async def abort(self, code, message):
+            aborted.append((code, message))
+            raise asyncio.CancelledError  # grpc's abort never returns
+
+    method = _subscribe_method({"subscribe_kv_events": None})
+    servicer = SimpleNamespace(_kv_events_config=None, server_args=_dp_args(1))
+    with pytest.raises(asyncio.CancelledError):
+        async for _ in method(servicer, common_pb2.SubscribeKvEventsRequest(), Context()):
             pass
+    assert aborted[0][0] == grpc.StatusCode.UNIMPLEMENTED
+    assert "--kv-events-config" in aborted[0][1]
 
-    batches = [
-        batch
-        async for batch in method(servicer, common_pb2.SubscribeKvEventsRequest(), RpcContext())
-    ]
-    assert [b.sequence_number for b in batches] == [3]
-    ((decode, options),) = calls
-    assert decode is decoder.decode and options["load_source"] is load_record
+
+# --- Two ranks, two endpoints, through the transport module -----------------
+
+
+# The engine's wire structs (array_like + tagged union), as the publisher
+# encodes them; the tag is the engine's class name.
+class WireStored(msgspec.Struct, array_like=True, omit_defaults=True, tag="BlockStored"):
+    block_hashes: list[int]
+    parent_block_hash: int | None
+    token_ids: list[int]
+    block_size: int
+
+
+class WireBatch(msgspec.Struct, array_like=True, omit_defaults=True):
+    ts: float
+    events: list[WireStored]
+    attn_dp_rank: int | None = None
+
+
+def _bind_consecutive(ctx, count, attempts=20):
+    """``count`` XPUB sockets on consecutive ports, as the engine lays out its ranks."""
+    for _ in range(attempts):
+        sockets = []
+        try:
+            first = ctx.socket(zmq.XPUB)
+            first.setsockopt(zmq.XPUB_VERBOSE, 1)
+            base = first.bind_to_random_port("tcp://127.0.0.1")
+            sockets.append(first)
+            for offset in range(1, count):
+                sock = ctx.socket(zmq.XPUB)
+                sock.setsockopt(zmq.XPUB_VERBOSE, 1)
+                sock.bind(f"tcp://127.0.0.1:{base + offset}")
+                sockets.append(sock)
+            return base, sockets
+        except zmq.ZMQError:
+            for sock in sockets:
+                sock.close(linger=0)
+    raise RuntimeError("no consecutive ports available")
+
+
+class _RpcContext:
+    """What the relay asks of the gRPC context: headers, cancellation, abort."""
+
+    def __init__(self, stop_after):
+        self.stop_after = stop_after
+        self.delivered = 0
+        self.aborted = None
+
+    def cancelled(self):
+        return self.delivered >= self.stop_after
+
+    async def send_initial_metadata(self, metadata):
+        pass
+
+    async def abort(self, code, message):
+        self.aborted = (code, message)
+        raise asyncio.CancelledError
+
+
+@pytest.mark.asyncio
+async def test_a_two_rank_worker_is_relayed_from_both_endpoints():
+    """A two-rank configuration subscribes to two endpoints (``port`` and
+    ``port + 1``), and the stream carries both ranks' batches, each tagged
+    with its publisher's rank."""
+    ctx = zmq.asyncio.Context()
+    base, pubs = _bind_consecutive(ctx, 2)
+    config = ts_kv_events.ResolvedKvEventsConfig(endpoint=f"tcp://127.0.0.1:{base}", topic="kv")
+    encoder = msgspec.msgpack.Encoder()
+    rpc = _RpcContext(stop_after=2)
+    seen = []
+    try:
+
+        async def consume():
+            async for batch in ts_kv_events.subscribe_kv_events(config, _dp_args(2), 0, rpc):
+                seen.append(batch)
+                rpc.delivered += 1
+
+        consumer = asyncio.create_task(consume())
+        # XPUB acknowledges each actual subscription: both ranks were connected.
+        for pub in pubs:
+            while await asyncio.wait_for(pub.recv(), 5) != b"\x01kv":
+                pass
+        for rank, pub in enumerate(pubs):
+            payload = encoder.encode(
+                WireBatch(
+                    ts=1.0,
+                    events=[
+                        WireStored(
+                            block_hashes=[100 + rank],
+                            parent_block_hash=None,
+                            token_ids=[1, 2],
+                            block_size=2,
+                        )
+                    ],
+                    attn_dp_rank=rank,
+                )
+            )
+            await pub.send_multipart([b"kv", (0).to_bytes(8, "big"), payload])
+        await asyncio.wait_for(consumer, timeout=10)
+    finally:
+        for pub in pubs:
+            pub.close(linger=0)
+        ctx.term()
+
+    assert rpc.aborted is None
+    by_rank = {batch.dp_rank: batch.events[0].stored.blocks[0].block_hash for batch in seen}
+    assert by_rank == {0: 100, 1: 101}

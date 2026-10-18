@@ -1,21 +1,41 @@
-"""TokenSpeed-specific KV-events config resolution.
-
-The wire-format conversion + ZMQ streaming helpers live in the engine-neutral
-``smg_grpc_servicer.kv_events`` module; this module only resolves whether (and
-where) TokenSpeed is publishing ZMQ KV events.
+"""TokenSpeed KV-event transport: the config resolution, and every attention
+data-parallel rank's publisher relayed through :mod:`smg_grpc_servicer.kv_relay`,
+independent of engine imports.
 
 TokenSpeed's ``--kv-events-config`` is a raw JSON string on ``ServerArgs``
 (``server_args.kv_events_config``), unlike vLLM's already-parsed config object.
 We parse it with stdlib ``json`` (not TokenSpeed's pydantic ``KVEventsConfig``)
 so this resolver stays unit-testable without TokenSpeed installed; the defaults
 below mirror ``tokenspeed.runtime.pd.kv_events.KVEventsConfig``.
+
+Under attention data parallelism the engine runs one publisher per attention
+rank (each rank's event loop creates its own with ``attn_dp_rank=rank``), on
+``endpoint_port + rank`` with its own sequence counter and, when configured,
+its own replay ROUTER on ``replay_endpoint_port + rank``; the rank is what the
+batches carry (``attn_dp_rank``). :func:`dp_rank_count` reads that width
+(``mapping.attn.dp_size``) off the server args, the figure the Rust servicer's
+launcher reports as its ``data_parallel_size``.
 """
 
 import json
 import logging
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
+import grpc
+from smg_grpc_proto.generated import common_pb2
+
+from smg_grpc_servicer.kv_relay import Engine, RankSource, rank_sources, relay
+from smg_grpc_servicer.load_record import LoadSource
 from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
+
+__all__ = [
+    "ResolvedKvEventsConfig",
+    "dp_rank_count",
+    "resolve_kv_events_config",
+    "sources",
+    "subscribe_kv_events",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -97,3 +117,36 @@ def resolve_kv_events_config(server_args: object) -> ResolvedKvEventsConfig | No
         replay_endpoint or "(none)",
     )
     return ResolvedKvEventsConfig(endpoint=endpoint, topic=topic, replay_endpoint=replay_endpoint)
+
+
+def dp_rank_count(server_args: object) -> int:
+    """How many KV-event publishers this engine runs: one per attention
+    data-parallel rank (``mapping.attn.dp_size``), 1 when the args carry none."""
+    return EngineConfigView(server_args).server_args.attention_dp_size or 1
+
+
+def sources(config: object, server_args: object) -> list[RankSource]:
+    """One source per rank of the publisher ``config`` describes."""
+    return rank_sources(config, range(dp_rank_count(server_args)))
+
+
+async def subscribe_kv_events(
+    config: object,
+    server_args: object,
+    start_sequence_number: int,
+    context: grpc.aio.ServicerContext,
+    *,
+    load_source: LoadSource | None = None,
+) -> AsyncIterator[common_pb2.KvEventBatch]:
+    """Relay every rank's events, with the servicer's load record on each
+    when ``load_source`` is given; see :func:`smg_grpc_servicer.kv_relay.relay`."""
+    async for batch in relay(
+        sources(config, server_args),
+        Engine.TOKENSPEED,
+        start_sequence_number,
+        context,
+        topic=str(getattr(config, "topic", "") or ""),
+        hwm=getattr(config, "hwm", None),
+        load_source=load_source,
+    ):
+        yield batch
