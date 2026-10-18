@@ -344,9 +344,19 @@ impl PDRouter {
         let url = format!("{}/{endpoint}", worker.url());
         let mut request_builder = worker.http_client().get(&url);
 
+        // The caller's headers as copied, and the worker's configured key when
+        // the caller sent no credential (this route sits outside the auth
+        // middleware, so a caller's header travels as it did).
+        let mut callers_credential = false;
         if let Some(headers) = headers {
             for (name, value) in headers {
+                callers_credential |= name.eq_ignore_ascii_case("authorization");
                 request_builder = request_builder.header(name, value);
+            }
+        }
+        if !callers_credential {
+            if let Some(key) = worker.api_key() {
+                request_builder = request_builder.bearer_auth(key);
             }
         }
 
@@ -2415,6 +2425,11 @@ impl PDRouter {
         Ok((prefill_status, prefill_body))
     }
 
+    /// One leg's POST: the body, the allow-listed caller headers, and the
+    /// credential with the precedence every other upstream call has (the
+    /// caller's `Authorization`, else the worker's configured key), so a leg
+    /// behind a key-protected gateway, whose caller key ends at the
+    /// middleware, still carries the key the worker requires.
     #[expect(
         clippy::unused_self,
         reason = "method on PDRouter for consistent API; may use self.api_key in future"
@@ -2440,16 +2455,7 @@ impl PDRouter {
         if connection_close {
             request = request.header("Connection", "close");
         }
-        if let Some(headers) = headers {
-            for (name, value) in headers {
-                if header_utils::should_forward_request_header(name.as_str()) {
-                    if let Ok(val) = value.to_str() {
-                        request = request.header(name, val);
-                    }
-                }
-            }
-        }
-        request
+        header_utils::apply_forwarded_request_headers(request, headers, worker.api_key())
     }
 
     /// Route a MoRI-IO leg to the data-parallel rank both legs are pinned to.
@@ -2863,7 +2869,7 @@ impl RouterTrait for PDRouter {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::header::RETRY_AFTER;
+    use axum::http::header::{AUTHORIZATION, RETRY_AFTER};
     use openai_protocol::model_card::ModelCard;
     use tokio::sync::{mpsc, oneshot};
     use tokio_stream::wrappers::ReceiverStream;
@@ -3161,6 +3167,61 @@ mod tests {
             "http://127.0.0.1:30000/generate"
         );
         assert_eq!(request.url().as_str(), "http://127.0.0.1:30000/generate");
+    }
+
+    /// A leg behind a key-protected gateway: the caller's gateway key ended at
+    /// the middleware, so the leg carries the worker's configured key; a
+    /// caller's own credential, when one reaches the router, wins, once.
+    #[test]
+    fn the_legs_carry_the_workers_configured_key_when_the_caller_sent_none() {
+        let router = create_test_pd_router();
+        let worker = BasicWorkerBuilder::new("http://127.0.0.1:30000")
+            .worker_type(WorkerType::Prefill)
+            .api_key("worker-key")
+            .build();
+        let built = |headers: Option<&HeaderMap>| {
+            router
+                .build_post_with_headers(
+                    &worker,
+                    "/generate",
+                    Bytes::from(r#"{"text":"hello"}"#),
+                    headers,
+                    false,
+                )
+                .build()
+                .expect("request should build")
+        };
+
+        let without = built(None);
+        assert_eq!(
+            without
+                .headers()
+                .get_all(AUTHORIZATION)
+                .iter()
+                .collect::<Vec<_>>(),
+            vec!["Bearer worker-key"]
+        );
+
+        let mut callers = HeaderMap::new();
+        callers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer callers-own-key"),
+        );
+        callers.insert("x-request-id", HeaderValue::from_static("r-1"));
+        let with = built(Some(&callers));
+        assert_eq!(
+            with.headers()
+                .get_all(AUTHORIZATION)
+                .iter()
+                .collect::<Vec<_>>(),
+            vec!["Bearer callers-own-key"]
+        );
+        assert_eq!(
+            with.headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok()),
+            Some("r-1")
+        );
     }
 
     #[tokio::test]

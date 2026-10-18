@@ -472,9 +472,10 @@ impl WorkerService {
 
         if self.router_config.api_key.is_some() && config.api_key.is_none() {
             warn!(
-                "Adding worker {} without API key while router has API key configured. \
-                Worker will be accessible without authentication. \
-                If the worker requires the same API key as the router, please specify it explicitly.",
+                "Adding worker {} without an API key while the gateway has one configured: \
+                the gateway's key ends at its auth middleware, so requests reach this worker \
+                with no credential. If the worker requires a key (the gateway's or its own), \
+                register it with that key explicitly.",
                 config.url
             );
         }

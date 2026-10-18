@@ -7,7 +7,7 @@
 use std::time::{Duration, Instant};
 
 use axum::{
-    http::HeaderMap,
+    http::{HeaderMap, HeaderValue},
     response::{IntoResponse, Response},
 };
 use openai_protocol::messages::{CreateMessageRequest, Message};
@@ -27,6 +27,17 @@ pub(crate) fn build_request(
     headers: Option<&HeaderMap>,
 ) -> (String, HeaderMap) {
     let url = format!("{}/v1/messages", worker.url());
+    let propagated = propagated_headers(headers, worker.api_key());
+    debug!(url = %url, header_count = %propagated.len(), "Request built");
+    (url, propagated)
+}
+
+/// The headers a worker request carries: the caller's propagated ones, and,
+/// when the caller sent neither `authorization` nor `x-api-key` (a gateway
+/// key ends at the gateway's auth middleware), the worker's configured key
+/// as `x-api-key` with the API version the provider requires, as the
+/// provider's own header rule applies it.
+fn propagated_headers(headers: Option<&HeaderMap>, configured_key: Option<&String>) -> HeaderMap {
     let mut propagated = HeaderMap::new();
     if let Some(input_headers) = headers {
         for (key, value) in input_headers {
@@ -35,8 +46,15 @@ pub(crate) fn build_request(
             }
         }
     }
-    debug!(url = %url, header_count = %propagated.len(), "Request built");
-    (url, propagated)
+    if !propagated.contains_key("authorization") && !propagated.contains_key("x-api-key") {
+        if let Some(value) = configured_key.and_then(|key| HeaderValue::from_str(key).ok()) {
+            propagated.insert("x-api-key", value);
+            if !propagated.contains_key("anthropic-version") {
+                propagated.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+            }
+        }
+    }
+    propagated
 }
 
 /// Send the HTTP request to the worker.
@@ -255,5 +273,45 @@ mod tests {
         assert!(!text.contains("org-abc123"), "{text}");
         assert!(!text.contains("proj_xyz789"), "{text}");
         assert!(text.contains("Rate limit reached for model"), "{text}");
+    }
+
+    fn header(headers: &HeaderMap, name: &str) -> Option<&str> {
+        headers.get(name).and_then(|value| value.to_str().ok())
+    }
+
+    /// The configured key goes out as `x-api-key` with the version header when
+    /// the caller sent no credential; a caller's own `x-api-key` or
+    /// `authorization` wins and the configured key stays home; without either
+    /// nothing is added.
+    #[test]
+    fn the_configured_key_goes_out_when_the_caller_sent_none() {
+        let configured = "provider-key".to_string();
+
+        let none = propagated_headers(None, Some(&configured));
+        assert_eq!(header(&none, "x-api-key"), Some("provider-key"));
+        assert_eq!(header(&none, "anthropic-version"), Some("2023-06-01"));
+
+        let mut callers = HeaderMap::new();
+        callers.insert("x-api-key", HeaderValue::from_static("callers-key"));
+        callers.insert("anthropic-version", HeaderValue::from_static("2024-01-01"));
+        callers.insert("x-request-id", HeaderValue::from_static("r-1"));
+        let own = propagated_headers(Some(&callers), Some(&configured));
+        assert_eq!(header(&own, "x-api-key"), Some("callers-key"));
+        assert_eq!(header(&own, "anthropic-version"), Some("2024-01-01"));
+        assert!(own.get("x-request-id").is_none());
+
+        let mut bearer = HeaderMap::new();
+        bearer.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer callers-key"),
+        );
+        let with_bearer = propagated_headers(Some(&bearer), Some(&configured));
+        assert_eq!(
+            header(&with_bearer, "authorization"),
+            Some("Bearer callers-key")
+        );
+        assert!(with_bearer.get("x-api-key").is_none());
+
+        assert!(propagated_headers(None, None).is_empty());
     }
 }

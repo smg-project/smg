@@ -7,12 +7,16 @@
 //!
 //! A bearer that is one of the gateway's own keys ends here: once the caller
 //! is identified ([`DataPlaneCaller`]) the `Authorization` header is removed
-//! from the request, so no route downstream reads the gateway's key as the
-//! caller's credential for an upstream (a self-hosted worker, a third-party
-//! provider): those get their own configured key, as they do for a request
-//! that carried no header. A bearer that is not a gateway key is refused
+//! from the request, so no route behind this middleware reads the gateway's
+//! key as the caller's credential for an upstream. Those upstreams (a
+//! self-hosted worker, a third-party provider) get their own configured key,
+//! as they do for a request that carried no header: the HTTP and PD routers'
+//! legs, the external providers and the public GET proxies all apply the
+//! caller's header, else the configured key; an upstream configured without
+//! a key is reached with none. A bearer that is not a gateway key is refused
 //! before that, so a request that reaches a route with its `Authorization`
-//! still on it was not authenticated by this middleware (auth disabled).
+//! still on it was not authenticated by this middleware (auth disabled, or a
+//! public route outside it, which forwards the caller's header as it did).
 
 use std::collections::HashMap;
 
@@ -270,6 +274,13 @@ mod tests {
             .unwrap_or_else(|| "none".to_string())
     }
 
+    /// The same credential for an upstream configured without a key.
+    async fn upstream_credential_without_a_key(request: Request<Body>) -> impl IntoResponse {
+        extract_auth_header(Some(request.headers()), None)
+            .and_then(|value| value.to_str().ok().map(str::to_string))
+            .unwrap_or_else(|| "none".to_string())
+    }
+
     async fn upstream_credential_after(auth_config: AuthConfig, bearer: Option<&str>) -> String {
         let mut request = Request::builder().uri("/");
         if let Some(bearer) = bearer {
@@ -277,6 +288,7 @@ mod tests {
         }
         let response = Router::new()
             .route("/", get(upstream_credential))
+            .route("/without-a-key", get(upstream_credential_without_a_key))
             .route_layer(from_fn_with_state(auth_config, auth_middleware))
             .oneshot(request.body(Body::empty()).unwrap())
             .await
@@ -315,6 +327,35 @@ mod tests {
             upstream_credential_after(AuthConfig::new(None), None).await,
             "Bearer provider-key"
         );
+        // An upstream configured without a key is reached with none under
+        // gateway auth: a worker that served on the forwarded gateway key is
+        // registered with its own key from now.
+        assert_eq!(
+            upstream_credential_without_a_key_after(
+                AuthConfig::new(Some("shared-secret".to_string())),
+                Some("shared-secret")
+            )
+            .await,
+            "none"
+        );
+    }
+
+    async fn upstream_credential_without_a_key_after(
+        auth_config: AuthConfig,
+        bearer: Option<&str>,
+    ) -> String {
+        let mut request = Request::builder().uri("/without-a-key");
+        if let Some(bearer) = bearer {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+        }
+        let response = Router::new()
+            .route("/without-a-key", get(upstream_credential_without_a_key))
+            .route_layer(from_fn_with_state(auth_config, auth_middleware))
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        body_text(response).await
     }
 
     /// With no key configured the middleware authenticates nothing and leaves
