@@ -226,7 +226,7 @@ its parser resolution), so a deployment's existing flags keep a working parser w
 default parser changes; a legacy name no table answers to keeps the legacy parsers as a tool-call
 name and selects nothing as a reasoning name alone, and the gateway lists each such name with the
 reason (`utils::UNANSWERED`); its test over both legacy registries holds every legacy name to one of
-the two lists. The crate knows a table by its own name only (`Table::named`). The Harmony family (gpt-oss) has no
+three: a table's own name (`qwen3`, `gemma4`), a row of `ALIASES`, or a row of `UNANSWERED`. The crate knows a table by its own name only (`Table::named`). The Harmony family (gpt-oss) has no
 table and no alias: it stays on the Harmony pipeline, by the maintainers' decision of 2026-10-17.
 
 <!-- models: begin -->

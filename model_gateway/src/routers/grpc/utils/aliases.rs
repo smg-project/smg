@@ -32,7 +32,6 @@ pub fn answering_to(name: &str) -> Option<Table> {
 /// the name a downstream launcher passes for a model family whose table has no older parser
 /// (`muse` for `muse_spark`), so that the launcher's flags read with the table.
 pub const ALIASES: [(&str, Table); 14] = [
-    ("deepseek32", Table::DeepSeekV3_2),
     ("qwen", Table::Qwen3),
     ("qwen_xml", Table::Qwen3Tagged),
     ("qwen_coder", Table::Qwen3Tagged),
@@ -40,6 +39,7 @@ pub const ALIASES: [(&str, Table); 14] = [
     ("glm47_moe", Table::Glm),
     ("glm45_moe", Table::Glm4),
     ("hy_v4", Table::Hy4),
+    ("deepseek32", Table::DeepSeekV3_2),
     ("deepseek_v41", Table::DeepSeekV4_1),
     ("minimax", Table::MinimaxM2),
     ("muse", Table::MuseSpark),
