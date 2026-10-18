@@ -874,7 +874,13 @@ pub(crate) async fn execute_tool_loop(
             .await
             .map_err(|e| format!("parse response: {e}"))?;
 
-        let function_calls = extract_function_calls(&response_json);
+        // Only calls the MCP session exposes are ours to run. Every other
+        // `function_call` is a caller-declared function tool: it stays in the
+        // output for the caller to answer, exactly as the gRPC router does.
+        let (function_calls, caller_calls): (Vec<_>, Vec<_>) =
+            extract_function_calls(&response_json)
+                .into_iter()
+                .partition(|call| session.has_exposed_tool(&call.name));
         if function_calls.is_empty() {
             info!(
                 "Tool loop completed: {} iterations, {} total calls",
@@ -1053,12 +1059,46 @@ pub(crate) async fn execute_tool_loop(
             );
         }
 
+        if !caller_calls.is_empty() {
+            // The model also asked for caller functions. Answering MCP calls
+            // alone and resuming would drop those requests, so hand control
+            // back: the executed calls plus the caller's pending calls.
+            info!(
+                "Tool loop returning to caller: {} caller function call(s) pending",
+                caller_calls.len()
+            );
+            strip_exposed_function_calls(&mut response_json, session);
+            inject_mcp_metadata_streaming(&mut response_json, &state, session);
+            return Ok(response_json);
+        }
+
         current_payload = build_resume_payload(
             &base_payload,
             &state.conversation_history,
             &tools_json,
             false,
         )?;
+    }
+}
+
+/// Remove `function_call` items for MCP tools the router already executed.
+///
+/// The router reports those as `mcp_call` items; the upstream's `function_call`
+/// copies would otherwise show up a second time, and the caller would be asked
+/// to answer calls that it never declared.
+pub(crate) fn strip_exposed_function_calls(response: &mut Value, session: &McpToolSession<'_>) {
+    if let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) {
+        output.retain(|item| {
+            let is_call = item
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(is_function_call_type);
+            let exposed = item
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| session.has_exposed_tool(name));
+            !(is_call && exposed)
+        });
     }
 }
 

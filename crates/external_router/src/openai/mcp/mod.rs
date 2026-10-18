@@ -12,5 +12,6 @@ pub(crate) use tool_handler::{StreamAction, StreamingToolHandler};
 pub(crate) use tool_loop::{
     build_resume_payload, execute_streaming_tool_calls, execute_tool_loop,
     inject_mcp_metadata_streaming, mcp_list_tools_bindings_to_emit, prepare_mcp_tools_as_functions,
-    send_mcp_list_tools_events, ToolLoopExecutionContext, ToolLoopState,
+    send_mcp_list_tools_events, strip_exposed_function_calls, ToolLoopExecutionContext,
+    ToolLoopState,
 };

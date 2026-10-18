@@ -37,3 +37,6 @@ fn record_error(model: &str, kind: &'static str) {
         kind,
     );
 }
+
+#[cfg(test)]
+mod function_tool_tests;

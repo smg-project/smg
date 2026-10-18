@@ -158,6 +158,13 @@ pub(crate) struct StreamingToolHandler {
     /// path and drop the duplicate/mis-ordered umbrella without kicking the
     /// tool loop.
     native_passthrough_tool_call_indices: HashSet<usize>,
+    /// Names of the tools the MCP session exposes. `None` treats every
+    /// function call as an MCP call (no session to ask).
+    exposed_tools: Option<HashSet<String>>,
+    /// Output indices of caller-declared function calls. The caller answers
+    /// these, so they are neither buffered nor executed and their events pass
+    /// through unchanged.
+    caller_call_indices: HashSet<usize>,
 }
 
 impl StreamingToolHandler {
@@ -168,7 +175,26 @@ impl StreamingToolHandler {
             output_index_mapper: OutputIndexMapper::with_start(start),
             original_response_id: None,
             native_passthrough_tool_call_indices: HashSet::new(),
+            exposed_tools: None,
+            caller_call_indices: HashSet::new(),
         }
+    }
+
+    /// Only function calls named in `names` are MCP calls; any other is a
+    /// caller-declared function call and is passed through.
+    pub fn with_exposed_tools(mut self, names: HashSet<String>) -> Self {
+        self.exposed_tools = Some(names);
+        self
+    }
+
+    /// True when the event's output item is a caller function call.
+    pub fn is_caller_call_index(&self, upstream_index: usize) -> bool {
+        self.caller_call_indices.contains(&upstream_index)
+    }
+
+    /// True when the stream carried at least one caller function call.
+    pub fn has_caller_calls(&self) -> bool {
+        !self.caller_call_indices.is_empty()
     }
 
     pub fn ensure_output_index(&mut self, upstream_index: usize) -> usize {
@@ -362,6 +388,15 @@ impl StreamingToolHandler {
         let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
         let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
+        if self
+            .exposed_tools
+            .as_ref()
+            .is_some_and(|exposed| !exposed.contains(name))
+        {
+            self.caller_call_indices.insert(output_index);
+            return StreamAction::Forward;
+        }
+
         let call = self.get_or_create_call(output_index, item);
         call.call_id = call_id.to_string();
         call.name = name.to_string();
@@ -397,6 +432,9 @@ impl StreamingToolHandler {
 
     fn handle_arguments_done(&mut self, parsed: &Value) -> StreamAction {
         if let Some(output_index) = extract_output_index(parsed) {
+            if self.is_caller_call_index(output_index) {
+                return StreamAction::Forward;
+            }
             let assigned_index = self.ensure_output_index(output_index);
             if let Some(call) = self.find_call_mut(output_index) {
                 if call.assigned_output_index.is_none() {

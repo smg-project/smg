@@ -7,7 +7,7 @@
 //! - MCP tool execution loops within streaming responses
 //! - Event transformation and output index remapping
 
-use std::{borrow::Cow, io, sync::Arc};
+use std::{borrow::Cow, collections::HashSet, io, sync::Arc};
 
 use axum::{
     body::Body,
@@ -55,7 +55,8 @@ use crate::{
         mcp::{
             build_resume_payload, execute_streaming_tool_calls, inject_mcp_metadata_streaming,
             mcp_list_tools_bindings_to_emit, prepare_mcp_tools_as_functions,
-            send_mcp_list_tools_events, StreamAction, StreamingToolHandler, ToolLoopState,
+            send_mcp_list_tools_events, strip_exposed_function_calls, StreamAction,
+            StreamingToolHandler, ToolLoopState,
         },
     },
     persistence_utils::persist_conversation_items,
@@ -340,21 +341,31 @@ pub(super) async fn forward_streaming_event(
         pre_parsed,
     } = event;
 
-    if event_name == Some(FunctionCallEvent::ARGUMENTS_DELTA) {
-        return true;
-    }
-
     // Use pre-parsed value or parse JSON data
     let mut parsed_data: Value = match pre_parsed {
         Some(v) => v,
         None => match serde_json::from_str(data) {
             Ok(v) => v,
+            Err(_) if event_name == Some(FunctionCallEvent::ARGUMENTS_DELTA) => return true,
             Err(_) => {
                 let chunk = format!("{raw_block}\n\n");
                 return tx.send(Ok(Bytes::from(chunk))).await.is_ok();
             }
         },
     };
+
+    // Argument events of a caller-declared function call are not ours to
+    // rewrite: they go out as `function_call_arguments.*`, on the remapped
+    // output index only.
+    let is_caller_call_event = matches!(
+        event_name,
+        Some(FunctionCallEvent::ARGUMENTS_DELTA | FunctionCallEvent::ARGUMENTS_DONE)
+    ) && extract_output_index(&parsed_data)
+        .is_some_and(|idx| handler.is_caller_call_index(idx));
+
+    if event_name == Some(FunctionCallEvent::ARGUMENTS_DELTA) && !is_caller_call_event {
+        return true;
+    }
 
     let event_type = get_event_type(event_name, &parsed_data);
     if event_type == ResponseEvent::COMPLETED {
@@ -364,6 +375,7 @@ pub(super) async fn forward_streaming_event(
     // Handle function_call_arguments.done - send buffered args first
     let mut mapped_output_index: Option<usize> = None;
     if event_name == Some(FunctionCallEvent::ARGUMENTS_DONE)
+        && !is_caller_call_event
         && !send_buffered_arguments(
             &mut parsed_data,
             handler,
@@ -386,7 +398,9 @@ pub(super) async fn forward_streaming_event(
         parsed_data["output_index"] = json!(mapped);
     }
 
-    apply_event_transformations_inplace(&mut parsed_data, ctx);
+    if !is_caller_call_event {
+        apply_event_transformations_inplace(&mut parsed_data, ctx);
+    }
 
     if let Some(response_obj) = parsed_data
         .get_mut("response")
@@ -406,6 +420,7 @@ pub(super) async fn forward_streaming_event(
     // `String`). On the (practically impossible) serialization error, fall
     // back to forwarding the original raw block unchanged.
     let final_bytes = match event_name {
+        Some(evt) if is_caller_call_event => enc.encode_event(evt, &parsed_data),
         Some(evt) => enc.encode_event(map_event_name(evt), &parsed_data),
         None => enc.encode_data(&parsed_data),
     };
@@ -491,6 +506,7 @@ pub(super) async fn send_final_response_event(
     }
 
     if let Some(session) = ctx.session {
+        strip_exposed_function_calls(&mut final_response, session);
         inject_mcp_metadata_streaming(&mut final_response, state, session);
     }
 
@@ -729,6 +745,20 @@ pub(super) fn handle_streaming_with_tool_interception(
         prepare_mcp_tools_as_functions(&mut current_payload, &session);
         let tools_json = current_payload.get("tools").cloned().unwrap_or(json!([]));
         let base_payload = current_payload.clone();
+        let exposed_tools: HashSet<String> = session
+            .exposed_name_by_qualified()
+            .values()
+            .cloned()
+            .collect();
+        // With caller function tools declared, the model may ask for an MCP
+        // call and a caller call in the same turn. Read the whole turn before
+        // running the MCP calls so the caller's calls are not cut off.
+        let has_caller_tools = original_request
+            .tools
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .any(|tool| matches!(tool, ResponseTool::Function(_)));
         let mut mcp_list_tools_sent = false;
         let mut is_first_iteration = true;
         let mut sequence_number: u64 = 0;
@@ -785,7 +815,8 @@ pub(super) fn handle_streaming_with_tool_interception(
             }
 
             let mut upstream_stream = response.bytes_stream();
-            let mut handler = StreamingToolHandler::with_starting_index(next_output_index);
+            let mut handler = StreamingToolHandler::with_starting_index(next_output_index)
+                .with_exposed_tools(exposed_tools.clone());
             if let Some(ref id) = preserved_response_id {
                 handler.original_response_id = Some(id.clone());
             }
@@ -929,12 +960,14 @@ pub(super) fn handle_streaming_with_tool_interception(
                                         return;
                                     }
                                     tool_calls_detected = true;
-                                    break; // Exit stream processing to execute tools
+                                    if !has_caller_tools {
+                                        break; // Exit stream processing to execute tools
+                                    }
                                 }
                             }
                         }
 
-                        if tool_calls_detected {
+                        if tool_calls_detected && !has_caller_tools {
                             break;
                         }
                     }
@@ -956,8 +989,63 @@ pub(super) fn handle_streaming_with_tool_interception(
                 preserved_response_id = Some(id);
             }
 
-            // If no tool calls, we're done - stream is complete
-            if !tool_calls_detected {
+            // Execute tools
+            if tool_calls_detected {
+                let pending_calls = handler.take_pending_calls();
+
+                // Check iteration limit
+                state.iteration += 1;
+                state.total_calls += pending_calls.len();
+
+                // Record tool loop iteration metric
+                Metrics::record_mcp_tool_iteration(&original_request.model);
+
+                let effective_limit = match max_tool_calls {
+                    Some(user_max) => user_max.min(DEFAULT_MAX_ITERATIONS),
+                    None => DEFAULT_MAX_ITERATIONS,
+                };
+
+                if state.total_calls > effective_limit {
+                    warn!(
+                        "Reached tool call limit during streaming: {}",
+                        effective_limit
+                    );
+                    send_sse_event(
+                        &tx,
+                        &mut sse_encoder,
+                        "error",
+                        &json!({"error": {"message": "Exceeded max_tool_calls limit"}}),
+                    )
+                    .await;
+                    let _ = tx.send(Ok(Bytes::from_static(SSE_DONE.as_bytes()))).await;
+                    return;
+                }
+
+                // Execute all pending tool calls. Pass the caller-declared tools so
+                // hosted-tool overrides (e.g. image_generation size/quality) are
+                // merged into dispatch args before MCP execution. The request-level
+                // `user` is also forwarded into hosted-tool dispatch args.
+                if !execute_streaming_tool_calls(
+                    pending_calls,
+                    &session,
+                    &format_registry,
+                    &tx,
+                    &mut state,
+                    &mut sequence_number,
+                    &original_request.model,
+                    original_request.tools.as_deref().unwrap_or(&[]),
+                    original_request.user.as_deref(),
+                )
+                .await
+                {
+                    return;
+                }
+            }
+
+            // Done when the turn had no MCP calls, or when it also carried
+            // caller function calls: those go back to the caller to answer,
+            // so the model is not resumed.
+            if !tool_calls_detected || handler.has_caller_calls() {
                 if !send_final_response_event(
                     &handler,
                     &tx,
@@ -983,6 +1071,7 @@ pub(super) fn handle_streaming_with_tool_interception(
                             obj.insert("id".to_string(), Value::String(id.clone()));
                         }
                     }
+                    strip_exposed_function_calls(&mut response_json, &session);
                     inject_mcp_metadata_streaming(&mut response_json, &state, &session);
 
                     restore_original_tools(&mut response_json, &original_request, Some(&session));
@@ -1012,57 +1101,6 @@ pub(super) fn handle_streaming_with_tool_interception(
                 }
 
                 let _ = tx.send(Ok(Bytes::from_static(SSE_DONE.as_bytes()))).await;
-                return;
-            }
-
-            // Execute tools
-            let pending_calls = handler.take_pending_calls();
-
-            // Check iteration limit
-            state.iteration += 1;
-            state.total_calls += pending_calls.len();
-
-            // Record tool loop iteration metric
-            Metrics::record_mcp_tool_iteration(&original_request.model);
-
-            let effective_limit = match max_tool_calls {
-                Some(user_max) => user_max.min(DEFAULT_MAX_ITERATIONS),
-                None => DEFAULT_MAX_ITERATIONS,
-            };
-
-            if state.total_calls > effective_limit {
-                warn!(
-                    "Reached tool call limit during streaming: {}",
-                    effective_limit
-                );
-                send_sse_event(
-                    &tx,
-                    &mut sse_encoder,
-                    "error",
-                    &json!({"error": {"message": "Exceeded max_tool_calls limit"}}),
-                )
-                .await;
-                let _ = tx.send(Ok(Bytes::from_static(SSE_DONE.as_bytes()))).await;
-                return;
-            }
-
-            // Execute all pending tool calls. Pass the caller-declared tools so
-            // hosted-tool overrides (e.g. image_generation size/quality) are
-            // merged into dispatch args before MCP execution. The request-level
-            // `user` is also forwarded into hosted-tool dispatch args.
-            if !execute_streaming_tool_calls(
-                pending_calls,
-                &session,
-                &format_registry,
-                &tx,
-                &mut state,
-                &mut sequence_number,
-                &original_request.model,
-                original_request.tools.as_deref().unwrap_or(&[]),
-                original_request.user.as_deref(),
-            )
-            .await
-            {
                 return;
             }
 
