@@ -84,9 +84,20 @@ async fn decode_audio_with_symphonia_blocking(
         .map_err(audio_decode)
 }
 
-/// What a decoder said about the clip: the media's fault.
+/// What a decoder said about the clip: the media's fault; a clip over the decoded-size cap is the
+/// size refusal, told apart from a decode failure by its code.
 fn audio_decode(error: TransformError) -> MediaConnectorError {
-    MediaConnectorError::AudioDecode(error.to_string())
+    match error {
+        TransformError::DecodedTooLarge { bytes, limit, knob } => {
+            MediaConnectorError::DecodedTooLarge {
+                media: "audio",
+                bytes,
+                limit,
+                knob,
+            }
+        }
+        other => MediaConnectorError::AudioDecode(other.to_string()),
+    }
 }
 
 pub(crate) fn decode_audio_mono_f32_symphonia(
@@ -284,9 +295,11 @@ fn ensure_decoded_byte_limit(
     max_decoded_bytes: usize,
 ) -> Result<(), TransformError> {
     if decoded_bytes > max_decoded_bytes {
-        return Err(TransformError::ShapeError(format!(
-            "decoded audio payload is {decoded_bytes} bytes, exceeding SMG_AUDIO_MAX_DECODED_BYTES={max_decoded_bytes}"
-        )));
+        return Err(TransformError::DecodedTooLarge {
+            bytes: decoded_bytes,
+            limit: max_decoded_bytes,
+            knob: "SMG_AUDIO_MAX_DECODED_BYTES",
+        });
     }
     Ok(())
 }
@@ -533,6 +546,25 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("SMG_AUDIO_MAX_DECODED_BYTES=8"));
+        assert!(
+            matches!(
+                error,
+                TransformError::DecodedTooLarge {
+                    bytes: 12,
+                    limit: 8,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        // The size refusal keeps its code through the decoder's mapping, on the symphonia path
+        // here and on the ffmpeg path, which maps its own check the same way.
+        let refused = audio_decode(error);
+        assert_eq!(refused.code(), crate::error::MediaErrorCode::TooLarge);
+        assert_eq!(
+            refused.to_string(),
+            "decoded audio payload would be 12 bytes, exceeding SMG_AUDIO_MAX_DECODED_BYTES=8"
+        );
     }
 
     #[test]

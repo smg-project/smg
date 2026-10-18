@@ -873,11 +873,12 @@ fn start_failure_response(
     code: &str,
 ) -> Response {
     // The request's media failed, not the worker (see `TonicStatusExt::media_fault`):
-    // the answer is for the media, and another worker fetching the same URL
+    // the answer is for the media, under the code the worker names (see
+    // `TonicStatusExt::media_code`), and another worker fetching the same URL
     // would meet the same host, so the request is not replayed.
     if let Some(fault) = e.media_fault() {
         warn!(function = function, error = %e, ?fault, "{}: the request's media failed", description);
-        let mut response = e.to_http_error("media_fetch_failed", e.message().to_string());
+        let mut response = e.to_http_error(e.media_code().as_str(), e.message().to_string());
         mark_non_retryable(&mut response);
         return response;
     }

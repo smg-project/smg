@@ -5,15 +5,18 @@ use tonic::{metadata::MetadataValue, Status};
 
 /// Whose fault the request's media failure is, as a worker reports it on the
 /// status of the `Generate` it refused, in the trailer [`Self::METADATA_KEY`].
-/// A router that reads the trailer answers the client for the media (a 4xx
-/// for the request's own fault, a 5xx that is not the worker's for the media
-/// host's) and records no circuit-breaker sample against a worker that is
-/// healthy; a status without the trailer is read as before.
+/// A router that reads the trailer answers the client for the media (a 400
+/// for either fault: an origin that does not deliver is the request's input
+/// as much as a reference it got wrong, under the code the worker names in
+/// [`MEDIA_CODE_METADATA_KEY`]) and records no circuit-breaker sample
+/// against a worker that is healthy; a status without the trailer is read
+/// as before. The fault tells the logs whether the origin or the reference
+/// failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerMediaFault {
     /// The request's own: a host that cannot be resolved or refuses the
     /// connection, a 4xx answer, a payload that is not the media it claims to
-    /// be, a media parameter out of range.
+    /// be or is over a size cap, a media parameter out of range.
     Client,
     /// The media host's, for now: a fetch that ran out of its budget, a 5xx
     /// answer, a transfer that broke while the body arrived.
@@ -51,6 +54,31 @@ impl WorkerMediaFault {
     }
 }
 
+/// The trailer that carries the code the public API answers for the
+/// request's media failure (`media_fetch_failed`, `media_too_large`), next
+/// to the fault's: the worker names the code, the router answers it under
+/// the 400. A router that reads none (a worker that predates the trailer, a
+/// code it does not know) answers `media_fetch_failed`, the code every
+/// failure of the media had before the trailer.
+pub const MEDIA_CODE_METADATA_KEY: &str = "smg-media-code";
+
+/// `status` with `code` on it; see [`MEDIA_CODE_METADATA_KEY`].
+pub fn stamp_media_code(mut status: Status, code: &'static str) -> Status {
+    status
+        .metadata_mut()
+        .insert(MEDIA_CODE_METADATA_KEY, MetadataValue::from_static(code));
+    status
+}
+
+/// The code `status` carries, if any; see [`MEDIA_CODE_METADATA_KEY`].
+pub fn media_code(status: &Status) -> Option<&str> {
+    status
+        .metadata()
+        .get(MEDIA_CODE_METADATA_KEY)?
+        .to_str()
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use tonic::Code;
@@ -65,6 +93,21 @@ mod tests {
             assert_eq!(status.message(), "media fetch timed out after 10s");
             assert_eq!(WorkerMediaFault::from_status(&status), Some(fault));
         }
+    }
+
+    #[test]
+    fn a_code_survives_the_status_it_is_stamped_on() {
+        let status = stamp_media_code(
+            WorkerMediaFault::Client.stamp(Status::invalid_argument("over the cap")),
+            "media_too_large",
+        );
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(media_code(&status), Some("media_too_large"));
+        assert_eq!(
+            WorkerMediaFault::from_status(&status),
+            Some(WorkerMediaFault::Client)
+        );
+        assert_eq!(media_code(&Status::invalid_argument("plain")), None);
     }
 
     #[test]

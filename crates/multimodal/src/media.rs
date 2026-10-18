@@ -2343,9 +2343,12 @@ fn decode_budget_exceeded(
 fn ensure_decoded_byte_limit(bytes: usize) -> Result<(), MediaConnectorError> {
     let limit = video_max_decoded_bytes();
     if bytes > limit {
-        return Err(MediaConnectorError::VideoDecode(format!(
-            "decoded video RGB payload would be {bytes} bytes, exceeding {VIDEO_DECODED_BYTES_KNOB}={limit}"
-        )));
+        return Err(MediaConnectorError::DecodedTooLarge {
+            media: "video RGB",
+            bytes,
+            limit,
+            knob: VIDEO_DECODED_BYTES_KNOB,
+        });
     }
     Ok(())
 }
@@ -2378,8 +2381,7 @@ const VIDEO_DECODED_BYTES_KNOB: &str = "SMG_VIDEO_MAX_DECODED_BYTES";
 /// time: a budget no other runner over the same stream, and no resampling of
 /// it, can answer, so it ends the decode instead of starting the next runner.
 fn is_video_budget_error(error: &MediaConnectorError) -> bool {
-    is_video_command_timeout(error)
-        || matches!(error, MediaConnectorError::VideoDecode(message) if message.contains(VIDEO_DECODED_BYTES_KNOB))
+    is_video_command_timeout(error) || matches!(error, MediaConnectorError::DecodedTooLarge { .. })
 }
 
 /// Runs a decoder command to completion under the video process timeout. A

@@ -643,14 +643,16 @@ mod tests {
     #[test]
     fn a_failure_of_the_requests_media_takes_no_breaker_sample() {
         // A worker that predates the media-fault trailer reports the media
-        // host's failure on UNAVAILABLE, in the connector's words.
+        // host's failure on UNAVAILABLE, in the connector's words. It is
+        // answered as the request's own input (a 400), so the router counts
+        // it as the request's error, and the worker's breaker never sees it.
         let status = tonic::Status::unavailable(
             "media fetch of https://media.example/a.png timed out after 10s",
         );
         assert_eq!(UpstreamClass::of(&status).breaker_sample, None);
         let (worker, handle) = account_on_a_fresh_worker(status);
         assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
-        assert_eq!(router_error_type(&handle.render()), "backend_error");
+        assert_eq!(router_error_type(&handle.render()), "validation_error");
     }
 
     #[test]
@@ -1001,7 +1003,7 @@ mod tests {
                 tonic::Status::invalid_argument("bad"),
                 tonic::Status::not_found("no such model"),
                 tonic::Status::cancelled("gone away"),
-                // The request's own media failed at the worker (a 502 to the
+                // The request's own media failed at the worker (a 400 to the
                 // client, nothing for the breaker): not the worker's failure.
                 tonic::Status::unavailable("HTTP error while fetching media: 503 from the origin"),
             ] {

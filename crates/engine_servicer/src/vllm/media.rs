@@ -18,7 +18,9 @@ use std::{
 };
 
 pub use engine_zmq_adapter::ProcessedMedia as MediaFeatures;
-use smg_grpc_client::{common_proto as common, vllm_proto as vllm, WorkerMediaFault};
+use smg_grpc_client::{
+    common_proto as common, stamp_media_code, vllm_proto as vllm, WorkerMediaFault,
+};
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tonic::Status;
 
@@ -83,12 +85,17 @@ pub enum MediaError {
     Internal(String),
     /// The media the request names failed, by whose fault: the request's
     /// own or its host's for now, never this worker's. The status carries
-    /// the report as a trailer (see [`WorkerMediaFault`]) under the code the
-    /// fault would have had without it (`INVALID_ARGUMENT`, `UNAVAILABLE`),
-    /// so a Router that reads the trailer answers for the media and records
-    /// no worker failure, and one that does not reads the code as before.
+    /// the report as trailers (see [`WorkerMediaFault`] and the code's,
+    /// `smg_grpc_client::MEDIA_CODE_METADATA_KEY`) under the gRPC code the
+    /// fault would have had without them (`INVALID_ARGUMENT`,
+    /// `UNAVAILABLE`), so a Router that reads the trailers answers a 400 for
+    /// the media under `code` and records no worker failure, and one that
+    /// does not reads the gRPC code as before.
     Media {
         fault: WorkerMediaFault,
+        /// The code the public API answers: `media_fetch_failed` or
+        /// `media_too_large`.
+        code: &'static str,
         message: String,
     },
 }
@@ -99,10 +106,17 @@ impl MediaError {
             Self::Invalid(message) => Status::invalid_argument(message),
             Self::Unavailable(message) => Status::unavailable(message),
             Self::Internal(message) => Status::internal(message),
-            Self::Media { fault, message } => fault.stamp(match fault {
-                WorkerMediaFault::Client => Status::invalid_argument(message),
-                WorkerMediaFault::Transient => Status::unavailable(message),
-            }),
+            Self::Media {
+                fault,
+                code,
+                message,
+            } => stamp_media_code(
+                fault.stamp(match fault {
+                    WorkerMediaFault::Client => Status::invalid_argument(message),
+                    WorkerMediaFault::Transient => Status::unavailable(message),
+                }),
+                code,
+            ),
         }
     }
 }

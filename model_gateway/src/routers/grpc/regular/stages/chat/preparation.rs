@@ -345,13 +345,12 @@ pub(crate) async fn prepare_chat_like(
                         multimodal_intermediate = Some(output.intermediate);
                     }
                     Err(e) => {
-                        let message = multimodal::processing_failed_message(&e);
                         error!(
                             function = "ChatPreparationStage::execute",
-                            error = %message,
+                            error = %multimodal::processing_failed_message(&e),
                             "Multimodal processing failed"
                         );
-                        return Err(error::bad_request("multimodal_processing_failed", message));
+                        return Err(multimodal::processing_failed_response(&e));
                     }
                 }
             }

@@ -25,7 +25,8 @@ pub use encoder_inputs::{
     ModelSpecificValue, PixelNorm, PreprocessedEncoderInputs,
 };
 pub use error::{
-    MediaConnectorError, MediaFault, MultiModalError, MultiModalResult, TransformError,
+    MediaConnectorError, MediaErrorCode, MediaFault, MultiModalError, MultiModalResult,
+    TransformError,
 };
 pub use media::{
     init_log_video_decode_timing, FrameSampling, ImageFetchConfig, MediaConnector,

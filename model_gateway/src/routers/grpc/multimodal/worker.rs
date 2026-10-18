@@ -14,8 +14,9 @@ use anyhow::Context;
 use llm_multimodal::{
     configure_parallelism, data_url::data_url_payload_bytes, registry::modality_limit_override,
     vision::PreProcessorConfig, FrameSampling, MediaConnector, MediaConnectorConfig,
-    MediaConnectorError, MediaContentPart, MediaFault, Modality, ModelMetadata, ModelRegistry,
-    MultiModalError, Parallelism, TransparencyPolicy, VisionProcessorRegistry, POOL_THREADS_ENV,
+    MediaConnectorError, MediaContentPart, MediaErrorCode, MediaFault, Modality, ModelMetadata,
+    ModelRegistry, MultiModalError, Parallelism, TransparencyPolicy, VisionProcessorRegistry,
+    POOL_THREADS_ENV,
 };
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
@@ -26,7 +27,7 @@ use super::{
     assemble::{assemble_vllm_batches_with, VllmAssembly},
     capability::runtime_reads_format,
     config::{MultimodalComponents, MultimodalConfigRegistry, MultimodalModelConfig},
-    mm_settings,
+    media_verdict, mm_settings,
     pixel_cache::pixel_cache_with_budget,
     plan::{prepare_placeholder_tokens, validate_rendered_media_anchors, MediaPlan},
     process::process_multimodal_plan,
@@ -270,11 +271,14 @@ pub enum WorkerMediaError {
     /// The media the request names failed, by whose fault (see
     /// [`WorkerMediaFault`]): the request's own (a host that cannot be
     /// resolved or refuses the connection, its 4xx, a payload that is not the
-    /// media it claims to be) or its host's for now (a fetch that ran out of
-    /// its budget, a 5xx, a broken transfer). Neither is this worker's.
+    /// media it claims to be or is over a size cap) or its host's for now (a
+    /// fetch that ran out of its budget, a 5xx, a broken transfer). Neither
+    /// is this worker's; the Router answers a 400 for either under `code`.
     #[error("{message}")]
     Media {
         fault: WorkerMediaFault,
+        /// How the public API names the failure (see [`MediaErrorCode`]).
+        code: MediaErrorCode,
         message: String,
     },
     /// This worker's own: a pipeline failure, a decode task that died, a
@@ -700,25 +704,27 @@ fn apply_processor_kwargs(
 
 /// Whose fault a pipeline failure is, from the typed error in its chain: a
 /// fetch or decode failure is the media's, by the connector's own reading of
-/// it (the request's, or its host's for now); a bad part or a prompt the
+/// it (the request's, or its host's for now) and under the connector's code
+/// (the verdict the router-side pipeline answers directly, see
+/// `multimodal::processing_failed_response`); a bad part or a prompt the
 /// anchors do not fit the caller's; anything else ours.
 fn classify(error: anyhow::Error) -> WorkerMediaError {
     let message = format!("{error:#}");
-    for cause in error.chain() {
-        if let Some(fetch) = cause.downcast_ref::<MediaConnectorError>() {
-            return classify_fetch(fetch, message);
+    if let Some(fetch) = media_verdict(&error) {
+        return classify_fetch(fetch, message);
+    }
+    match error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<MultiModalError>())
+    {
+        Some(MultiModalError::UnsupportedContent(_) | MultiModalError::Validation(_)) => {
+            WorkerMediaError::Invalid(message)
         }
-        if let Some(media) = cause.downcast_ref::<MultiModalError>() {
-            return match media {
-                MultiModalError::Media(fetch) => classify_fetch(fetch, message),
-                MultiModalError::Join(_) => WorkerMediaError::Internal(message),
-                MultiModalError::UnsupportedContent(_) | MultiModalError::Validation(_) => {
-                    WorkerMediaError::Invalid(message)
-                }
-            };
+        // A tracker task that died, or nothing typed at all.
+        Some(MultiModalError::Join(_) | MultiModalError::Media(_)) | None => {
+            WorkerMediaError::Internal(message)
         }
     }
-    WorkerMediaError::Internal(message)
 }
 
 fn classify_fetch(error: &MediaConnectorError, message: String) -> WorkerMediaError {
@@ -727,7 +733,11 @@ fn classify_fetch(error: &MediaConnectorError, message: String) -> WorkerMediaEr
         MediaFault::Transient => WorkerMediaFault::Transient,
         MediaFault::Internal => return WorkerMediaError::Internal(message),
     };
-    WorkerMediaError::Media { fault, message }
+    WorkerMediaError::Media {
+        fault,
+        code: error.code(),
+        message,
+    }
 }
 
 #[cfg(test)]
@@ -956,10 +966,11 @@ mod tests {
     }
 
     /// A fetch that ran out of its budget is the media host's fault for now,
-    /// a reference the request got wrong the request's, neither the worker's;
-    /// a scratch file that failed on this side and a decoder this side cannot
-    /// start are the worker's own, as is a failure with no connector error in
-    /// its chain.
+    /// a reference the request got wrong the request's, neither the worker's,
+    /// both fetch failures to the client; a clip over the decoded-size cap is
+    /// the request's own under the size code; a scratch file that failed on
+    /// this side and a decoder this side cannot start are the worker's own,
+    /// as is a failure with no connector error in its chain.
     #[test]
     fn fetch_failures_are_classified_by_fault() {
         let timeout = anyhow::Error::new(MultiModalError::Media(MediaConnectorError::Timeout {
@@ -971,6 +982,7 @@ mod tests {
             classify(timeout),
             WorkerMediaError::Media {
                 fault: WorkerMediaFault::Transient,
+                code: MediaErrorCode::FetchFailed,
                 ..
             }
         ));
@@ -979,6 +991,24 @@ mod tests {
             classify(scheme),
             WorkerMediaError::Media {
                 fault: WorkerMediaFault::Client,
+                code: MediaErrorCode::FetchFailed,
+                ..
+            }
+        ));
+        let over_cap = anyhow::Error::new(MultiModalError::Media(
+            MediaConnectorError::DecodedTooLarge {
+                media: "video RGB",
+                bytes: 2_208_384_000,
+                limit: 1_073_741_824,
+                knob: "SMG_VIDEO_MAX_DECODED_BYTES",
+            },
+        ))
+        .context("Failed to finalize multimodal tracker");
+        assert!(matches!(
+            classify(over_cap),
+            WorkerMediaError::Media {
+                fault: WorkerMediaFault::Client,
+                code: MediaErrorCode::TooLarge,
                 ..
             }
         ));

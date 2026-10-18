@@ -2638,43 +2638,62 @@ async fn malformed_media_refs_are_refused_before_processing() {
 /// A processor's verdict becomes the Python servicer's status: a caller
 /// error INVALID_ARGUMENT, a retryable one UNAVAILABLE (the Router re-selects
 /// a worker), a failure INTERNAL; a failure of the request's media keeps the
-/// code its fault would have had and carries the fault as a trailer; a
-/// refused PD decode leg still notifies the engine.
+/// code its fault would have had and carries the fault and the API's code as
+/// trailers; a refused PD decode leg still notifies the engine.
 #[tokio::test]
 async fn media_processor_errors_map_to_statuses() {
-    for (outcome, code, fault) in [
+    for (outcome, code, fault, media_code) in [
         (
             MediaError::Invalid("media_refs[0]: unsupported image".to_string()),
             Code::InvalidArgument,
+            None,
             None,
         ),
         (
             MediaError::Unavailable("sidecar_timeout: no result".to_string()),
             Code::Unavailable,
             None,
+            None,
         ),
         (
             MediaError::Internal("boom".to_string()),
             Code::Internal,
             None,
+            None,
         ),
         (
             MediaError::Media {
                 fault: WorkerMediaFault::Client,
+                code: "media_fetch_failed",
                 message: "HTTP error while fetching media: HTTP status client error (404 Not \
                           Found) for url (https://media.example/missing.png)"
                     .to_string(),
             },
             Code::InvalidArgument,
             Some(WorkerMediaFault::Client),
+            Some("media_fetch_failed"),
         ),
         (
             MediaError::Media {
                 fault: WorkerMediaFault::Transient,
+                code: "media_fetch_failed",
                 message: "media fetch timed out after 10s".to_string(),
             },
             Code::Unavailable,
             Some(WorkerMediaFault::Transient),
+            Some("media_fetch_failed"),
+        ),
+        (
+            MediaError::Media {
+                fault: WorkerMediaFault::Client,
+                code: "media_too_large",
+                message: "decoded video RGB payload would be 2208384000 bytes, exceeding \
+                          SMG_VIDEO_MAX_DECODED_BYTES=1073741824"
+                    .to_string(),
+            },
+            Code::InvalidArgument,
+            Some(WorkerMediaFault::Client),
+            Some("media_too_large"),
         ),
     ] {
         let processor = MockMediaProcessor::answering(Err(outcome.clone()));
@@ -2686,6 +2705,11 @@ async fn media_processor_errors_map_to_statuses() {
         let status = h.client.generate(request).await.expect_err("refused");
         assert_eq!(status.code(), code, "{outcome:?}");
         assert_eq!(WorkerMediaFault::from_status(&status), fault, "{outcome:?}");
+        assert_eq!(
+            smg_grpc_client::media_code(&status),
+            media_code,
+            "{outcome:?}"
+        );
         let notice = recv_add(&mut h.engine_in).await;
         assert_eq!(notice.request_id, "mr6");
         assert!(notice.abort_immediately);

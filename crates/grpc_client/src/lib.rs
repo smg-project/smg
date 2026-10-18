@@ -38,7 +38,7 @@ pub use channel::{
 /// The HTTP/2 layer under the channels, re-exported for callers that build
 /// or classify the transport faults [`is_transport_failure`] recognises.
 pub use h2;
-pub use media_fault::WorkerMediaFault;
+pub use media_fault::{media_code, stamp_media_code, WorkerMediaFault, MEDIA_CODE_METADATA_KEY};
 pub use mlx_engine::{proto as mlx_proto, MlxEngineClient};
 pub use sglang_scheduler::{
     proto as sglang_proto, SglangGenerateRequestOptions, SglangSchedulerClient,

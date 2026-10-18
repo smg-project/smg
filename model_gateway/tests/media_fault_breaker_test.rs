@@ -1,7 +1,8 @@
 //! A worker's report that the request's media failed is answered for the
-//! media and sampled by no circuit breaker: twenty requests whose image
-//! cannot be fetched leave the only worker in rotation, and the next request
-//! is served. A worker's own failure still opens the breaker.
+//! media (a 400 under the code the worker names) and sampled by no circuit
+//! breaker: twenty requests whose image cannot be fetched leave the only
+//! worker in rotation, and the next request is served. A worker's own
+//! failure still opens the breaker.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -37,7 +38,7 @@ use smg::{
     },
 };
 use smg_grpc_client::{
-    common_proto, tokenspeed_scheduler::tokenspeed_proto as ts, WorkerMediaFault,
+    common_proto, stamp_media_code, tokenspeed_scheduler::tokenspeed_proto as ts, WorkerMediaFault,
 };
 use tokio::{net::TcpListener, time::timeout};
 use tonic::{transport::Server, Request, Response, Status};
@@ -258,8 +259,11 @@ async fn answers_of(
 }
 
 /// Twenty requests whose media the worker could not fetch, in each of the
-/// forms the worker reports it, are each answered for the media and leave
-/// the worker's breaker closed and the worker in rotation; the request after
+/// forms the worker reports it, are each answered for the media (a 400
+/// `invalid_request_error`: the request's own reference and an origin that
+/// does not deliver alike, under the code the worker names, and
+/// `media_fetch_failed` from a worker that names none) and leave the
+/// worker's breaker closed and the worker in rotation; the request after
 /// them is served.
 #[tokio::test]
 async fn media_faults_are_answered_for_the_media_and_leave_the_worker_in_rotation() {
@@ -270,8 +274,7 @@ async fn media_faults_are_answered_for_the_media_and_leave_the_worker_in_rotatio
                 "Failed to finalize multimodal tracker: HTTP error while fetching media: HTTP \
                  status client error (404 Not Found) for url (https://media.example/missing.png)",
             )),
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            "media_fetch_failed",
         ),
         (
             "the media host's fault, reported in the trailer",
@@ -279,8 +282,18 @@ async fn media_faults_are_answered_for_the_media_and_leave_the_worker_in_rotatio
                 "Failed to finalize multimodal tracker: media fetch of \
                  https://media.example/picture.png timed out after 10s",
             )),
-            StatusCode::BAD_GATEWAY,
-            "server_error",
+            "media_fetch_failed",
+        ),
+        (
+            "a size refusal, with its code in the trailer",
+            stamp_media_code(
+                WorkerMediaFault::Client.stamp(Status::invalid_argument(
+                    "Failed to finalize multimodal tracker: decoded video RGB payload would be \
+                     2208384000 bytes, exceeding SMG_VIDEO_MAX_DECODED_BYTES=1073741824",
+                )),
+                "media_too_large",
+            ),
+            "media_too_large",
         ),
         (
             "a worker that predates the trailer",
@@ -288,33 +301,29 @@ async fn media_faults_are_answered_for_the_media_and_leave_the_worker_in_rotatio
                 "Failed to finalize multimodal tracker: HTTP error while fetching media: error \
                  sending request for url (https://media.example/picture.png)",
             ),
-            StatusCode::BAD_GATEWAY,
-            "server_error",
+            "media_fetch_failed",
         ),
     ];
-    for (name, refusal, expected, error_type) in cases {
+    for (name, refusal, code) in cases {
         let (answers, worker) = answers_of(refusal, 20, 21).await;
         for (index, answer) in answers[..20].iter().enumerate() {
             assert_eq!(
-                answer.status, expected,
+                answer.status,
+                StatusCode::BAD_REQUEST,
                 "{name}: request {index}: {}",
                 answer.body
             );
             assert_eq!(
-                answer.body["error"]["code"], "media_fetch_failed",
+                answer.body["error"]["code"], code,
                 "{name}: {}",
                 answer.body
             );
             assert_eq!(
-                answer.body["error"]["type"], error_type,
+                answer.body["error"]["type"], "invalid_request_error",
                 "{name}: {}",
                 answer.body
             );
-            assert_eq!(
-                answer.code_header.as_deref(),
-                Some("media_fetch_failed"),
-                "{name}"
-            );
+            assert_eq!(answer.code_header.as_deref(), Some(code), "{name}");
         }
         assert_eq!(
             worker.circuit_breaker_state(),

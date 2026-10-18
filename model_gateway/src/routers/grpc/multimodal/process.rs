@@ -722,7 +722,7 @@ async fn preprocess_batch(
         }
     })
     .await
-    .map_err(|e| anyhow::anyhow!("Preprocessing task panicked: {e}"))?
+    .map_err(|e| anyhow::Error::new(e).context("Preprocessing task panicked"))?
 }
 
 /// The preprocessor config for one clip: its sampled frame rate and, when the
@@ -838,7 +838,7 @@ async fn preprocess_image_batch(
         preprocess_images(processor, &raw_images, &pp_config, image_wire_dtype)
     })
     .await
-    .map_err(|e| anyhow::anyhow!("Preprocessing task panicked: {e}"))?
+    .map_err(|e| anyhow::Error::new(e).context("Preprocessing task panicked"))?
 }
 
 /// The images preprocessed: laid out in `wire_dtype` in one pass when the

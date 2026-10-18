@@ -19,8 +19,8 @@ use std::{collections::HashSet, sync::Arc};
 
 use axum::response::Response;
 use llm_multimodal::{
-    AudioClip, EncoderFieldLayouts, EncoderInputFormat, ImageFrame, Modality, PlaceholderRange,
-    PreprocessedEncoderInputs, VideoClip,
+    AudioClip, EncoderFieldLayouts, EncoderInputFormat, ImageFrame, MediaConnectorError,
+    MediaFault, Modality, MultiModalError, PlaceholderRange, PreprocessedEncoderInputs, VideoClip,
 };
 use llm_tokenizer::{Encoding, TokenizerTrait};
 
@@ -110,9 +110,6 @@ pub(crate) fn assembly_error_response(error: &anyhow::Error) -> Response {
     }
 }
 
-/// Whether verbose multimodal timing logs are enabled (`--log-mm-timing` /
-/// `SMG_LOG_MM_TIMING`). Resolved once at startup; called on every multimodal
-/// request.
 /// The client-facing message for a media pipeline failure: the whole error
 /// chain, so the cause (the URL whose fetch ran out of its budget, the clip
 /// the decoder refused) reaches the caller, not only the outermost context.
@@ -120,6 +117,58 @@ pub(crate) fn processing_failed_message(error: &anyhow::Error) -> String {
     format!("Multimodal processing failed: {error:#}")
 }
 
+/// The media connector's own error in a pipeline failure's chain, if any:
+/// the verdict both pipelines answer the client by, the router-side one
+/// directly ([`processing_failed_response`]) and the worker-side one through
+/// the trailers of the worker's refusal (`worker::classify`).
+pub(crate) fn media_verdict(error: &anyhow::Error) -> Option<&MediaConnectorError> {
+    error.chain().find_map(|cause| {
+        if let Some(media) = cause.downcast_ref::<MediaConnectorError>() {
+            return Some(media);
+        }
+        match cause.downcast_ref::<MultiModalError>() {
+            Some(MultiModalError::Media(media)) => Some(media),
+            _ => None,
+        }
+    })
+}
+
+/// The client's answer for a failure of the router-side media pipeline, by
+/// the connector's verdict on it, the same the worker-side pipeline reports
+/// for the same failure: a failure of the request's media (a reference it got
+/// wrong, an origin that does not deliver within the fetch budget, a clip
+/// over a size cap) is a 400 under the media's code (`media_fetch_failed`,
+/// `media_too_large`); this process's own fault (a scratch file, a decoder it
+/// cannot run, a decode task that died) a 500; a failure with no verdict in
+/// its chain (a part the pipeline does not take, a model it has no spec for)
+/// stays a 400 `multimodal_processing_failed`.
+pub(crate) fn processing_failed_response(error: &anyhow::Error) -> Response {
+    const PIPELINE_CODE: &str = "multimodal_processing_failed";
+    let message = processing_failed_message(error);
+    if let Some(media) = media_verdict(error) {
+        return match media.fault() {
+            MediaFault::Client | MediaFault::Transient => {
+                error::bad_request(media.code().as_str(), message)
+            }
+            MediaFault::Internal => error::internal_error(PIPELINE_CODE, message),
+        };
+    }
+    let ours = error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<MultiModalError>(),
+            Some(MultiModalError::Join(_))
+        ) || cause.downcast_ref::<tokio::task::JoinError>().is_some()
+    });
+    if ours {
+        error::internal_error(PIPELINE_CODE, message)
+    } else {
+        error::bad_request(PIPELINE_CODE, message)
+    }
+}
+
+/// Whether verbose multimodal timing logs are enabled (`--log-mm-timing` /
+/// `SMG_LOG_MM_TIMING`). Resolved once at startup; called on every multimodal
+/// request.
 pub(crate) fn log_mm_timing_enabled() -> bool {
     mm_settings().log_mm_timing.value
 }
@@ -301,9 +350,11 @@ pub(crate) fn report_jpeg_decoder() {
 mod tests {
     use std::time::Duration;
 
+    use axum::body::to_bytes;
+    use http::StatusCode;
     use llm_multimodal::{MediaConnectorError, MultiModalError};
 
-    use super::processing_failed_message;
+    use super::{processing_failed_message, processing_failed_response, Response};
 
     /// A fetch that ran out of its budget is reported with its URL and the
     /// budget, not as the bare "failed to finalize" context around it.
@@ -319,5 +370,116 @@ mod tests {
             "Multimodal processing failed: Failed to finalize multimodal tracker: media fetch of \
              https://media.example/clip.mp4 timed out after 30s"
         );
+    }
+
+    /// The status, the `x-smg-error-code` header and the JSON body of an answer.
+    async fn answer(response: Response) -> (StatusCode, String, serde_json::Value) {
+        let status = response.status();
+        let header = response
+            .headers()
+            .get("x-smg-error-code")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let bytes = to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("the answer's body");
+        let body = serde_json::from_slice(&bytes).expect("a JSON envelope");
+        (status, header, body)
+    }
+
+    /// A fetch that ran out of its budget and a host that cannot be resolved
+    /// are the request's own input, a 400 `invalid_request_error` under
+    /// `media_fetch_failed`; a clip over the decoded-size cap and an item
+    /// over the input cap are 400s under `media_too_large`; a scratch file
+    /// that failed on this side and a preprocessing task that died are 500
+    /// `server_error`s; a failure with no connector verdict keeps the
+    /// pipeline's own 400 code. The message is the whole chain in every case.
+    #[tokio::test]
+    async fn a_pipeline_failure_is_answered_by_the_connectors_verdict() {
+        let finalize = |media: MediaConnectorError| {
+            anyhow::Error::new(MultiModalError::Media(media))
+                .context("Failed to finalize multimodal tracker")
+        };
+        let died = tokio::task::spawn_blocking(|| panic!("the preprocessor died"))
+            .await
+            .expect_err("the task panicked");
+        let died = anyhow::Error::new(died).context("Preprocessing task panicked");
+        let cases = [
+            (
+                finalize(MediaConnectorError::Timeout {
+                    url: "https://media.example/video_251mb.mp4".to_string(),
+                    budget: Duration::from_secs(30),
+                }),
+                StatusCode::BAD_REQUEST,
+                "media_fetch_failed",
+                "invalid_request_error",
+            ),
+            (
+                finalize(MediaConnectorError::UnresolvableHost {
+                    host: "media.invalid".to_string(),
+                    source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                }),
+                StatusCode::BAD_REQUEST,
+                "media_fetch_failed",
+                "invalid_request_error",
+            ),
+            (
+                finalize(MediaConnectorError::DecodedTooLarge {
+                    media: "video RGB",
+                    bytes: 2_208_384_000,
+                    limit: 1_073_741_824,
+                    knob: "SMG_VIDEO_MAX_DECODED_BYTES",
+                }),
+                StatusCode::BAD_REQUEST,
+                "media_too_large",
+                "invalid_request_error",
+            ),
+            (
+                finalize(MediaConnectorError::PayloadTooLarge {
+                    media: "video",
+                    limit: 268_435_456,
+                }),
+                StatusCode::BAD_REQUEST,
+                "media_too_large",
+                "invalid_request_error",
+            ),
+            (
+                finalize(MediaConnectorError::DecodeIo(std::io::Error::other(
+                    "No space left on device (os error 28)",
+                ))),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "multimodal_processing_failed",
+                "server_error",
+            ),
+            (
+                died,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "multimodal_processing_failed",
+                "server_error",
+            ),
+            (
+                anyhow::Error::new(MultiModalError::UnsupportedContent("image_embeds"))
+                    .context("Failed to push content part"),
+                StatusCode::BAD_REQUEST,
+                "multimodal_processing_failed",
+                "invalid_request_error",
+            ),
+            (
+                anyhow::anyhow!("Multimodal not supported for model: m"),
+                StatusCode::BAD_REQUEST,
+                "multimodal_processing_failed",
+                "invalid_request_error",
+            ),
+        ];
+        for (error, status, code, kind) in cases {
+            let message = processing_failed_message(&error);
+            let (answered, header, body) = answer(processing_failed_response(&error)).await;
+            assert_eq!(answered, status, "{message}: {body}");
+            assert_eq!(header, code, "{message}");
+            assert_eq!(body["error"]["code"], code, "{message}: {body}");
+            assert_eq!(body["error"]["type"], kind, "{message}: {body}");
+            assert_eq!(body["error"]["message"], message, "{body}");
+        }
     }
 }

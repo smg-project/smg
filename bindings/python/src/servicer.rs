@@ -472,9 +472,15 @@ impl MediaProcessor for SmgMediaProcessor {
                 .await
                 .map_err(|error| match error {
                     WorkerMediaError::Invalid(message) => MediaError::Invalid(message),
-                    WorkerMediaError::Media { fault, message } => {
-                        MediaError::Media { fault, message }
-                    }
+                    WorkerMediaError::Media {
+                        fault,
+                        code,
+                        message,
+                    } => MediaError::Media {
+                        fault,
+                        code: code.as_str(),
+                        message,
+                    },
                     WorkerMediaError::Internal(message) => MediaError::Internal(message),
                 })?;
             Ok(ProcessedMedia {

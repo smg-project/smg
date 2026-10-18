@@ -21,6 +21,16 @@ pub enum TransformError {
 
     #[error("Shape error: {0}")]
     ShapeError(String),
+
+    /// The bytes the audio would decode to are over the cap `knob` sets: a
+    /// size refusal, which the decoder reports as
+    /// [`MediaConnectorError::DecodedTooLarge`].
+    #[error("decoded audio payload is {bytes} bytes, exceeding {knob}={limit}")]
+    DecodedTooLarge {
+        bytes: usize,
+        limit: usize,
+        knob: &'static str,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -86,6 +96,18 @@ pub enum MediaConnectorError {
     DataUrl(String),
     #[error("{media} input payload exceeds the maximum size of {limit} bytes")]
     PayloadTooLarge { media: &'static str, limit: usize },
+    /// The bytes the media would decode to are over the cap `knob` sets
+    /// (`SMG_VIDEO_MAX_DECODED_BYTES`, `SMG_AUDIO_MAX_DECODED_BYTES`): a size
+    /// refusal, the request's own
+    /// ([`MediaFault::Client`]), told apart from a fetch failure by its code
+    /// ([`MediaErrorCode::TooLarge`]).
+    #[error("decoded {media} payload would be {bytes} bytes, exceeding {knob}={limit}")]
+    DecodedTooLarge {
+        media: &'static str,
+        bytes: usize,
+        limit: usize,
+        knob: &'static str,
+    },
     #[error("media decode task failed: {0}")]
     Blocking(#[from] tokio::task::JoinError),
     /// This process's own I/O after the bytes arrived: the scratch file a
@@ -139,7 +161,10 @@ pub enum MediaFault {
     /// worker's breaker.
     Client,
     /// The media host's, for now: a fetch that ran out of its budget, a 5xx
-    /// answer, a transfer that broke while the body arrived.
+    /// answer, a transfer that broke while the body arrived. Answered as the
+    /// request's own is ([`Self::Client`], a 400): an origin that does not
+    /// deliver is the request's input, which the reference APIs answer a
+    /// 4xx for; the fault stays told apart for the logs.
     Transient,
     /// This process's: a decode task that panicked or was cancelled, a
     /// scratch file or a decoder process that failed on this side (a
@@ -150,7 +175,79 @@ pub enum MediaFault {
     Internal,
 }
 
+/// How the public API names a failure of the request's media: the `code` of
+/// the error envelope the client is answered with, next to whose fault the
+/// failure is ([`MediaFault`]). A failure of this process's own
+/// ([`MediaFault::Internal`]) is answered as a server error and names no
+/// media code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaErrorCode {
+    /// `media_fetch_failed`: the media could not be fetched or read: a URL
+    /// that cannot be parsed or is not allowed, a host that cannot be
+    /// resolved or does not deliver within the fetch budget, an origin that
+    /// refuses or fails, a transfer that broke, a payload that is not the
+    /// media it claims to be, a media parameter out of range.
+    FetchFailed,
+    /// `media_too_large`: the media is over a size cap: its input bytes
+    /// ([`MediaConnectorError::PayloadTooLarge`]), the bytes it would decode
+    /// to ([`MediaConnectorError::DecodedTooLarge`]: a video's frames, an
+    /// audio clip's samples), or the image decoder's own limits. A bound on
+    /// decode work rather than on size (`SMG_VIDEO_MAX_DECODE_FRAMES`) is
+    /// not one: a clip over it is a fetch failure.
+    TooLarge,
+}
+
+impl MediaErrorCode {
+    /// The code as the envelope spells it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FetchFailed => "media_fetch_failed",
+            Self::TooLarge => "media_too_large",
+        }
+    }
+
+    /// The code spelled `code`, if it is one.
+    pub fn parse(code: &str) -> Option<Self> {
+        [Self::FetchFailed, Self::TooLarge]
+            .into_iter()
+            .find(|candidate| candidate.as_str() == code)
+    }
+}
+
 impl MediaConnectorError {
+    /// How the public API names this error; see [`MediaErrorCode`]. A size
+    /// refusal is told apart from every other failure of the media, so a
+    /// client can tell what to shrink from what to re-host.
+    pub fn code(&self) -> MediaErrorCode {
+        match self {
+            Self::PayloadTooLarge { .. }
+            | Self::DecodedTooLarge { .. }
+            | Self::Image(image::ImageError::Limits(_)) => MediaErrorCode::TooLarge,
+            Self::InvalidMaxLongSidePixel { .. }
+            | Self::InvalidSampleFps { .. }
+            | Self::InvalidVideoLongSideCap { .. }
+            | Self::UnsupportedScheme(_)
+            | Self::InvalidUrl(_)
+            | Self::DisallowedDomain(_)
+            | Self::DisallowedAddress { .. }
+            | Self::UnresolvableHost { .. }
+            | Self::DisallowedRedirect { .. }
+            | Self::TooManyRedirects { .. }
+            | Self::DisallowedLocalPath(_)
+            | Self::Http(_)
+            | Self::Io(_)
+            | Self::Base64Decode(_)
+            | Self::DataUrl(_)
+            | Self::Blocking(_)
+            | Self::DecodeIo(_)
+            | Self::DecoderUnavailable(_)
+            | Self::Image(_)
+            | Self::AudioDecode(_)
+            | Self::VideoDecode(_)
+            | Self::Timeout { .. } => MediaErrorCode::FetchFailed,
+        }
+    }
+
     /// Whose fault this error is; see [`MediaFault`]. An I/O error is judged
     /// by where it happened, never by its kind: on the local file the request
     /// names it is the request's ([`Self::Io`]), on this process's scratch
@@ -178,6 +275,7 @@ impl MediaConnectorError {
             | Self::Base64Decode(_)
             | Self::DataUrl(_)
             | Self::PayloadTooLarge { .. }
+            | Self::DecodedTooLarge { .. }
             | Self::Image(_)
             | Self::AudioDecode(_)
             | Self::VideoDecode(_) => MediaFault::Client,
@@ -203,7 +301,10 @@ impl MediaConnectorError {
     /// first decoder's verdict stands. A verdict of this process's own I/O or
     /// task keeps the error this process's ([`Self::DecodeIo`]); two decoders
     /// that could not start leave it unavailable, so a decode that runs this
-    /// one as its fallback reads it the same way.
+    /// one as its fallback reads it the same way. A verdict that refused the
+    /// clip for its size ([`Self::DecodedTooLarge`]) stands as it is: it
+    /// names the cap itself, and the words of the decoder that ran before it
+    /// add nothing a client can act on.
     pub fn fallback_failed(
         first: Self,
         fallback: Self,
@@ -219,6 +320,7 @@ impl MediaConnectorError {
                 Self::DecoderUnavailable(std::io::Error::new(io.kind(), message))
             }
             Self::DecodeIo(io) => Self::DecodeIo(std::io::Error::new(io.kind(), message)),
+            verdict @ Self::DecodedTooLarge { .. } => verdict,
             verdict if verdict.fault() == MediaFault::Internal => {
                 Self::DecodeIo(std::io::Error::other(message))
             }
@@ -286,6 +388,12 @@ mod tests {
                 media: "image",
                 limit: 1,
             },
+            MediaConnectorError::DecodedTooLarge {
+                media: "video RGB",
+                bytes: 2_208_384_000,
+                limit: 1_073_741_824,
+                knob: "SMG_VIDEO_MAX_DECODED_BYTES",
+            },
             MediaConnectorError::Image(image::ImageError::Decoding(
                 image::error::DecodingError::new(
                     image::error::ImageFormatHint::Unknown,
@@ -297,6 +405,60 @@ mod tests {
         ] {
             assert_eq!(error.fault(), MediaFault::Client, "{error}");
         }
+    }
+
+    /// A size refusal has a code of its own, whatever stage refused: the
+    /// input bytes, the bytes the clip would decode to, the image decoder's
+    /// limits. Every other failure of the media is a fetch failure to the
+    /// client, and the codes spell and parse the same.
+    #[test]
+    fn a_size_refusal_has_its_own_code() {
+        for error in [
+            MediaConnectorError::PayloadTooLarge {
+                media: "video",
+                limit: 1,
+            },
+            MediaConnectorError::DecodedTooLarge {
+                media: "video RGB",
+                bytes: 2_208_384_000,
+                limit: 1_073_741_824,
+                knob: "SMG_VIDEO_MAX_DECODED_BYTES",
+            },
+            MediaConnectorError::DecodedTooLarge {
+                media: "audio",
+                bytes: 12,
+                limit: 8,
+                knob: "SMG_AUDIO_MAX_DECODED_BYTES",
+            },
+            MediaConnectorError::Image(image::ImageError::Limits(
+                image::error::LimitError::from_kind(
+                    image::error::LimitErrorKind::InsufficientMemory,
+                ),
+            )),
+        ] {
+            assert_eq!(error.code(), MediaErrorCode::TooLarge, "{error}");
+            assert_eq!(error.fault(), MediaFault::Client, "{error}");
+        }
+        for error in [
+            MediaConnectorError::Timeout {
+                url: "https://media.example/clip.mp4".to_string(),
+                budget: Duration::from_secs(30),
+            },
+            MediaConnectorError::UnresolvableHost {
+                host: "media.invalid".to_string(),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            },
+            MediaConnectorError::VideoDecode("not a video".to_string()),
+            MediaConnectorError::DecodeIo(std::io::Error::other("no space left on device")),
+        ] {
+            assert_eq!(error.code(), MediaErrorCode::FetchFailed, "{error}");
+        }
+        for code in [MediaErrorCode::FetchFailed, MediaErrorCode::TooLarge] {
+            assert_eq!(MediaErrorCode::parse(code.as_str()), Some(code));
+        }
+        assert_eq!(MediaErrorCode::FetchFailed.as_str(), "media_fetch_failed");
+        assert_eq!(MediaErrorCode::TooLarge.as_str(), "media_too_large");
+        assert_eq!(MediaErrorCode::parse("media_ref_too_large"), None);
     }
 
     /// A decode task that never answers is this process's fault.
@@ -406,6 +568,19 @@ mod tests {
             assert_eq!(neither.fault(), MediaFault::Internal);
             let outer = compose(bad_clip(), neither, media);
             assert_eq!(outer.fault(), MediaFault::Client, "{outer}");
+            // The fallback refused the clip for its size: that refusal, typed.
+            let too_large = || MediaConnectorError::DecodedTooLarge {
+                media: "video RGB",
+                bytes: 2_208_384_000,
+                limit: 1_073_741_824,
+                knob: "SMG_VIDEO_MAX_DECODED_BYTES",
+            };
+            let refused = compose(bad_clip(), too_large(), media);
+            assert!(
+                matches!(refused, MediaConnectorError::DecodedTooLarge { .. }),
+                "{refused}"
+            );
+            assert_eq!(refused.code(), MediaErrorCode::TooLarge);
         }
     }
 }
