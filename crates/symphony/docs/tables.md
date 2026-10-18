@@ -116,9 +116,9 @@ Beyond that:
   the thought, or in the content, as the tail says.
 - **Each DSML checkpoint reads with its own table.** The V4 block name and the V4.1 spaced tags are
   content under this table and this block is content under theirs; the registry reads V3.2 and
-  V3.2-Speciale here, V3.2-Exp (it writes the earlier V3.1 spelling) with no table yet, so the
-  older `deepseek31` parser, and the V4 checkpoints with theirs, and the `deepseek32` alias takes a deployment that names the older
-  parser to this table.
+  V3.2-Speciale here, V3.2-Exp (it writes the earlier V3.1 spelling) with `deepseek_v3.1`, and
+  the V4 checkpoints with theirs, and the `deepseek32` alias takes a deployment that names the
+  older parser to this table.
 - **A string value that holds a closing tag is two parameters.** DSML writes a string raw, so a
   value holding `</｜DSML｜parameter>` and another parameter's opening tag reads as two parameters,
   to the encoder's own parser (it splits at the first closing tag) and to this table alike; the
@@ -136,6 +136,7 @@ which its recorder renders through the encoder once the group has a manifest the
 harness replays them from the fixture pin, and until then nothing in this repository checks what
 they parse to; the README row says awaiting fixtures until the pin holds it. What the table
 leaves open: the recorded set, and the live reading against the engine's own server.
+
 ## DeepSeek V3.1 (`deepseek_v3.1`)
 
 What the table says beyond the DSML ones:

@@ -1990,6 +1990,7 @@ mod tests {
             ("minimax_m3", "minimax_m3"),
             ("deepseek", "deepseek_v3"),
             ("deepseek31", "deepseek_v3.1"),
+            ("deepseek_v31", "deepseek_v3.1"),
         ];
         let mut legacy: Vec<(String, &str)> = tools
             .list_parsers()

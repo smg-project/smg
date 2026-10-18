@@ -31,7 +31,7 @@ pub fn answering_to(name: &str) -> Option<Table> {
 /// among them, which leaves its channel as written, which no table reads for. A row may also be
 /// the name a downstream launcher passes for a model family whose table has no older parser
 /// (`muse` for `muse_spark`), so that the launcher's flags read with the table.
-pub const ALIASES: [(&str, Table); 17] = [
+pub const ALIASES: [(&str, Table); 18] = [
     ("qwen", Table::Qwen3),
     ("qwen_xml", Table::Qwen3Tagged),
     ("qwen_coder", Table::Qwen3Tagged),
@@ -40,6 +40,7 @@ pub const ALIASES: [(&str, Table); 17] = [
     ("glm45_moe", Table::Glm4),
     ("hy_v4", Table::Hy4),
     ("deepseek31", Table::DeepSeekV3_1),
+    ("deepseek_v31", Table::DeepSeekV3_1),
     ("deepseek", Table::DeepSeekV3),
     ("deepseek32", Table::DeepSeekV3_2),
     ("deepseek_v41", Table::DeepSeekV4_1),
@@ -65,7 +66,7 @@ pub const ALIASES: [(&str, Table); 17] = [
 /// the next source decides: after a worker's labels the registry's table for a model it
 /// knows, else the gateway's flags, else the legacy parsers (`passthrough` excepted, which
 /// keeps the legacy parsers either way).
-pub const UNANSWERED: [(&str, &str); 14] = [
+pub const UNANSWERED: [(&str, &str); 13] = [
     (
         "passthrough",
         "leaves its channel as written, which no table reads for: the way back to the \
@@ -94,13 +95,9 @@ pub const UNANSWERED: [(&str, &str); 14] = [
          registry decides",
     ),
     (
-        "deepseek_v31",
-        "DeepSeek V3.1's thought, whose table does not exist yet; the table takes the name",
-    ),
-    (
         "deepseek_r1",
-        "DeepSeek R1's thought; the R1 line reads with DeepSeek V3's table, which does not \
-         exist yet and takes the name",
+        "DeepSeek R1's thought, which the R1 distills share; the tool-call name decides: \
+         deepseek reads the R1 line with DeepSeek V3's table",
     ),
     (
         "pythonic",

@@ -11,15 +11,16 @@
 //!
 //! The templates of DeepSeek V3.1, V3.1-Terminus and V3.2-Exp write this spelling (the gateway's
 //! older `deepseek31` parser's); DeepSeek V3's puts `function<｜tool▁sep｜>` before the name and a
-//! `json` code fence around the arguments ([`deepseek_v3`]), and V3.2 and V4 write DSML
-//! ([`deepseek_v4`]). Recorded as `deepseek-v3.1`, whose parse sets hold content alone: the
-//! template takes a call's arguments as a string, so the recorder, whose corpus holds them as an
-//! object, refused every call case; the calls stand on the turns the template renders, held in the
-//! tests below.
+//! `json` code fence around the arguments ([`deepseek_v3`]), and V3.2 and V4 write DSML, each with
+//! a table of its own ([`deepseek_v3_2`], [`deepseek_v4`]). Recorded as `deepseek-v3.1`, whose
+//! parse sets hold content alone: the template takes a call's arguments as a string, so the
+//! recorder, whose corpus holds them as an object, refused every call case; the calls stand on
+//! the turns the template renders, held in the tests below.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 //!
 //! [`deepseek_v3`]: super::deepseek_v3()
+//! [`deepseek_v3_2`]: super::deepseek_v3_2()
 //! [`deepseek_v4`]: super::deepseek_v4()
 
 use crate::format::{CallSyntax, Emits, Format};
