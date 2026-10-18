@@ -3045,6 +3045,7 @@ impl StreamingProcessor {
                     }
 
                     let is_first = is_firsts.entry(index).or_insert(true);
+                    let should_emit_first_chunk = *is_first;
                     total_completion.record_chunk(&chunk);
 
                     let stop_decoder = stop_decoders.entry(index).or_insert_with(|| {
@@ -3075,7 +3076,7 @@ impl StreamingProcessor {
                         *is_first = false;
                     }
 
-                    if !text.is_empty() {
+                    if should_emit_first_chunk || !text.is_empty() {
                         Self::send_completion_chunk(
                             tx,
                             &mut sse_buffer,
