@@ -44,7 +44,7 @@ pub(super) async fn generate(
     submit(state, client, req, trace_headers).await
 }
 
-/// The rejection notice a refused PD decode leg owes its prefill side, so the
+/// The rejection notice a refused PD decode side owes its prefill side, so the
 /// connector releases the blocks that side pinned: what vLLM's own frontend
 /// sends, an immediately aborted one-token request under the refused id.
 struct RejectionNotice {
@@ -114,7 +114,7 @@ async fn submit(
     mut req: vllm::GenerateRequest,
     trace_headers: Option<BTreeMap<String, String>>,
 ) -> Result<BoxStream<vllm::GenerateResponse>, Status> {
-    // A PD decode leg refused before admission still owes its prefill side
+    // A PD decode side refused before admission still owes its prefill side
     // the notice: armed from the first refusal below until the engine can
     // hold the request.
     let mut notice = ArmedNotice(RejectionNotice::owed_by(client, &req));
@@ -131,7 +131,7 @@ async fn submit(
     let (registration, cancel) = state.registry.register(&request_id).inspect_err(|_| {
         // The id names a request that is still live; a notice under it would
         // reuse it (and, past an `n > 1` fan-out, get in and free the live
-        // leg's blocks).
+        // side's blocks).
         notice.disarm();
     })?;
     // Worker-side media: the request's references become engine features
@@ -266,8 +266,8 @@ struct ChoiceStream {
     pending: Option<vllm::GenerateResponse>,
     /// Whether this request's prompt tokens went into the stats counters.
     prompt_counted: bool,
-    /// A PD prefill leg's account of the media it processed, stamped on
-    /// every `Complete` of the request for the decode leg.
+    /// A PD prefill side's account of the media it processed, stamped on
+    /// every `Complete` of the request for the decode side.
     media_identity: Option<Arc<vllm::MediaIdentity>>,
     /// The request this choice belongs to, for the load tracker.
     request_id: String,

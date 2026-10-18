@@ -54,7 +54,7 @@ use crate::{
 const SUPPORTED_TASKS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The connector params a refused request must still release: NIXL's
-/// `do_remote_prefill` marks a PD decode leg whose prefill side holds blocks
+/// `do_remote_prefill` marks a PD decode side whose prefill side holds blocks
 /// for it until told otherwise. `None` for every other request.
 pub fn kv_transfer_rejection_params(req: &vllm::GenerateRequest) -> Option<serde_json::Value> {
     let params = kv_transfer_params(req).ok().flatten()?;

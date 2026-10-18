@@ -1,14 +1,14 @@
-//! A disaggregated decode leg whose start the worker's side cancelled (its
+//! A disaggregated decode call whose start the worker's side cancelled (its
 //! connection closed under the call: a worker dying as the request arrived)
 //! is a failure of that worker, not a rejection of the request: with another
 //! decode worker available the request is retried there and answered in
 //! full, the cancelled worker is charged a backend error, and nothing counts
 //! as a validation error; with no other decode worker the client reads a
-//! 502 under the leg's own code, never a 400 it would take for its own
+//! 502 under the side's own code, never a 400 it would take for its own
 //! mistake and not retry.
 //!
 //! The mock engines speak the vLLM proto (sequential dispatch): the prefill
-//! leg completes, one decode leg cancels every call before its stream.
+//! side completes, one decode worker cancels every call before its stream.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -216,13 +216,18 @@ async fn start_mock_engine(engine: Engine) -> u16 {
     serve_engine(proto::vllm_engine_server::VllmEngineServer::new(engine)).await
 }
 
-/// A PD gRPC router over the given legs (sequential dispatch).
-async fn build_pd_router(legs: &[(u16, WorkerType)]) -> Box<dyn RouterTrait> {
+/// A PD gRPC router over the given workers (sequential dispatch).
+async fn build_pd_router(workers: &[(u16, WorkerType)]) -> Box<dyn RouterTrait> {
     let config = grpc_router_config()
         .prefill_decode_mode(vec![], vec![])
         .round_robin_policy()
         .build_unchecked();
-    build_grpc_router(config, MODEL, grpc_workers(legs, RuntimeType::Vllm, MODEL)).await
+    build_grpc_router(
+        config,
+        MODEL,
+        grpc_workers(workers, RuntimeType::Vllm, MODEL),
+    )
+    .await
 }
 
 fn tenant() -> TenantRequestMeta {
@@ -321,7 +326,7 @@ fn router_errors(rendered: &str, error_type: &str) -> f64 {
     )
 }
 
-/// The first decode worker cancels the leg's start; the request is retried
+/// The first decode worker cancels the side's start; the request is retried
 /// on the second and answered in full. The cancelled worker is charged one
 /// backend error and never asked again; nothing counts as a validation
 /// error.
@@ -375,7 +380,7 @@ fn a_decode_start_the_worker_cancelled_is_retried_on_another_decode_worker() {
 }
 
 /// With no other decode worker, the cancelled start reaches the client as
-/// an upstream failure under the leg's own code: a 502 it may retry, never a
+/// an upstream failure under the side's own code: a 502 it may retry, never a
 /// 400 it would take for its own mistake.
 #[test]
 fn a_decode_start_the_worker_cancelled_with_no_other_worker_is_a_502_not_a_400() {

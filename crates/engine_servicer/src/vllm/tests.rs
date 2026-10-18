@@ -825,11 +825,11 @@ async fn trace_context_metadata_reaches_the_engine_request() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// A PD decode leg refused before admission (here: string stops with no
+/// A PD decode side refused before admission (here: string stops with no
 /// tokenizer) still tells the engine, so the connector releases the blocks
 /// the prefill side pinned: vLLM's immediately aborted one-token request.
 #[tokio::test]
-async fn a_refused_decode_leg_notifies_the_engine() {
+async fn a_refused_decode_side_notifies_the_engine() {
     let mut h = harness(model_info(), None).await;
     let mut request = generate_request("pd2", false, vec!["STOP".to_string()]);
     request.kv_transfer_params_json =
@@ -849,10 +849,10 @@ async fn a_refused_decode_leg_notifies_the_engine() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// A decode leg refused as a duplicate id sends no rejection notice: the id
+/// A decode side refused as a duplicate id sends no rejection notice: the id
 /// names a request that is still live, and the notice would reuse it.
 #[tokio::test]
-async fn a_duplicate_decode_leg_sends_no_rejection_notice() {
+async fn a_duplicate_decode_side_sends_no_rejection_notice() {
     let mut h = harness(model_info(), None).await;
     let mut request = generate_request("pd3", true, Vec::new());
     request.kv_transfer_params_json =
@@ -965,7 +965,7 @@ async fn media_refs_are_refused_and_extra_batches_translated() {
     );
     assert_engine_idle(&mut h.engine_in).await;
 
-    // A tensor-less identity batch (a grid-less PD decode leg) rides the
+    // A tensor-less identity batch (a grid-less PD decode side) rides the
     // cache salt; an empty extra batch is simply nothing to attach.
     let mut request = generate_request("mm2", false, Vec::new());
     request.mm_inputs = Some(vllm::MultimodalInputs {
@@ -2797,7 +2797,7 @@ async fn malformed_media_refs_are_refused_before_processing() {
 /// error INVALID_ARGUMENT, a retryable one UNAVAILABLE (the Router re-selects
 /// a worker), a failure INTERNAL; a failure of the request's media keeps the
 /// code its fault would have had and carries the fault and the API's code as
-/// trailers; a refused PD decode leg still notifies the engine.
+/// trailers; a refused PD decode side still notifies the engine.
 #[tokio::test]
 async fn media_processor_errors_map_to_statuses() {
     for (outcome, code, fault, media_code) in [
@@ -2920,10 +2920,10 @@ async fn media_processing_is_capped_and_sheds_beyond_the_cap() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// A PD prefill leg asks the processor for the media identity and returns
-/// it on every `Complete`, so the decode leg is served without pixels.
+/// A PD prefill side asks the processor for the media identity and returns
+/// it on every `Complete`, so the decode side is served without pixels.
 #[tokio::test]
-async fn a_pd_prefill_leg_returns_the_media_identity() {
+async fn a_pd_prefill_side_returns_the_media_identity() {
     let identity = vllm::MediaIdentity {
         prompt_token_ids: vec![7, 8, 9, 10],
         mm_inputs: Some(vllm::MultimodalInputs {
@@ -3159,11 +3159,11 @@ async fn an_abandoned_request_keeps_its_slot_until_the_processor_finishes() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// A PD decode leg abandoned while its media is still being fetched sends
+/// A PD decode side abandoned while its media is still being fetched sends
 /// the rejection notice all the same, as the Python servicer shields it
 /// through cancellation.
 #[tokio::test]
-async fn a_cancelled_decode_leg_still_notifies_the_engine() {
+async fn a_cancelled_decode_side_still_notifies_the_engine() {
     let processor = MockMediaProcessor::slow(Ok(processed_media()), Duration::from_millis(1500), 4);
     let mut h = harness_with(model_info(), None, Some(processor)).await;
     let mut request = media_request("mr19");
@@ -3205,10 +3205,10 @@ async fn greedy_sampling_with_several_choices_is_refused_before_the_fan_out() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// A PD decode leg refused past its media stage (here: by the engine wire's
+/// A PD decode side refused past its media stage (here: by the engine wire's
 /// sampling validation) still owes the notice: the engine never held it.
 #[tokio::test]
-async fn a_decode_leg_refused_after_its_media_still_notifies_the_engine() {
+async fn a_decode_side_refused_after_its_media_still_notifies_the_engine() {
     let processor = MockMediaProcessor::answering(Ok(processed_media()));
     let mut h = harness_with(model_info(), None, Some(processor)).await;
     let mut request = media_request("mr20");
@@ -3230,10 +3230,10 @@ async fn a_decode_leg_refused_after_its_media_still_notifies_the_engine() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// Once admitted, a decode leg whose caller leaves is aborted, not refused:
+/// Once admitted, a decode side whose caller leaves is aborted, not refused:
 /// the engine holds it, and a notice under its id would reuse it.
 #[tokio::test]
-async fn a_caller_leaving_an_admitted_decode_leg_sends_no_notice() {
+async fn a_caller_leaving_an_admitted_decode_side_sends_no_notice() {
     let processor = MockMediaProcessor::answering(Ok(processed_media()));
     let mut h = harness_with(model_info(), None, Some(processor)).await;
     let mut request = media_request("mr21");

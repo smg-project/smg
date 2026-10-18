@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .extern_path(".smg.grpc.common", "crate::common_proto")
         // The inline tensor payloads are `Bytes`: a multi-megabyte pixel
         // tensor is then shared, not copied, by every clone of the request
-        // that carries it (a retry attempt's, a disaggregated leg's). The
+        // that carries it (a retry attempt's, a disaggregated side's). The
         // wire encoding is the same `bytes` field.
         .bytes(".tokenspeed.grpc.scheduler.TensorData.inline")
         .bytes(".vllm.grpc.engine.TensorData.inline")

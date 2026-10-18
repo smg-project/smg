@@ -118,13 +118,13 @@ async fn build_pd_router(prefill_port: u16, decode_port: u16) -> Box<dyn RouterT
         .build_unchecked();
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(CannedTokenizer(MockTokenizer::new()));
     let app_context = grpc_test_context_with_tokenizer(config, MODEL, tokenizer).await;
-    let legs = [
+    let workers = [
         (prefill_port, WorkerType::Prefill),
         (decode_port, WorkerType::Decode),
     ];
     grpc_router(
         &app_context,
-        grpc_workers(&legs, RuntimeType::TokenSpeed, MODEL),
+        grpc_workers(&workers, RuntimeType::TokenSpeed, MODEL),
     )
     .await
 }

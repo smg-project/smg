@@ -2,11 +2,11 @@
 //! itself, checked against mock prefill and decode workers whose delays are
 //! known.
 //!
-//! Sequential dispatch (the gateway relays the legs): the prefill, relay and
+//! Sequential dispatch (the gateway relays the sides): the prefill, relay and
 //! decode phases add up to `smg_pd_ttft_seconds` exactly and each phase carries
 //! the delay its own worker added, whether the decode worker returns its
 //! response headers at once or holds them until its first token. Parallel
-//! dispatch (both legs sent together): the decode phase is the whole TTFT.
+//! dispatch (both sides sent together): the decode phase is the whole TTFT.
 //!
 //! Each case runs on a current-thread runtime under a thread-local Prometheus
 //! recorder, so the request path's emissions land in the rendered text.
@@ -220,11 +220,11 @@ async fn build_pd_router(
         .prefill_decode_mode(vec![], vec![])
         .random_policy()
         .build_unchecked();
-    let legs = [
+    let workers = [
         (prefill_port, WorkerType::Prefill),
         (decode_port, WorkerType::Decode),
     ];
-    build_grpc_router(config, MODEL, grpc_workers(&legs, runtime, MODEL)).await
+    build_grpc_router(config, MODEL, grpc_workers(&workers, runtime, MODEL)).await
 }
 
 fn tenant() -> TenantRequestMeta {
@@ -393,7 +393,7 @@ fn sequential_dispatch_phases_add_up_to_the_pd_ttft() {
 /// A decode worker that holds its response headers until its first token puts
 /// that wait in the decode phase, not in the relay phase.
 #[test]
-fn a_held_header_decode_leg_stays_in_the_decode_phase() {
+fn a_held_header_decode_side_stays_in_the_decode_phase() {
     let rendered = render_after(|| async {
         let prefill = start_mock_engine(DelayedEngine {
             delay: PREFILL_DELAY,
@@ -427,7 +427,7 @@ fn a_held_header_decode_leg_stays_in_the_decode_phase() {
     );
 }
 
-/// Parallel dispatch sends both legs together: the decode phase is the TTFT
+/// Parallel dispatch sends both sides together: the decode phase is the TTFT
 /// itself, and the prefill and relay phases of the sequential shape are not
 /// recorded.
 #[test]

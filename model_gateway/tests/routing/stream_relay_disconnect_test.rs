@@ -88,7 +88,7 @@ async fn spawn_stalling_upstream(send_first_chunk: bool) -> (String, oneshot::Re
 }
 
 /// Upstream that answers any chat request at once with a small JSON body:
-/// the prefill leg of a disaggregated pair, whose answer the router reads
+/// the prefill side of a disaggregated pair, whose answer the router reads
 /// before it relays the decode stream.
 #[expect(
     clippy::disallowed_methods,
@@ -285,8 +285,8 @@ async fn transcription_relay_closes_upstream_when_client_disconnects() {
         .expect("drop signal sender vanished without firing");
 }
 
-/// The decode leg of a disaggregated pair: the client disconnects while the
-/// decode worker has produced no chunk yet (the prefill leg answered at
+/// The decode side of a disaggregated pair: the client disconnects while the
+/// decode worker has produced no chunk yet (the prefill side answered at
 /// once). The decode relay must end its upstream read, as the regular relay
 /// does, instead of waiting for a first token that may never come.
 #[tokio::test]

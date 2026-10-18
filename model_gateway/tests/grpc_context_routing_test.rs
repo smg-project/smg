@@ -240,8 +240,8 @@ async fn regular_routes_by_exact_context_without_retries() {
     assert!(statuses.iter().all(|status| *status == StatusCode::OK));
 }
 
-/// Both PD legs independently need room for the input; selection still uses
-/// real compatible pairs, and each accepted request reaches each leg once.
+/// Both PD sides independently need room for the input; selection still uses
+/// real compatible pairs, and each accepted request reaches each side once.
 #[tokio::test]
 #[expect(clippy::print_stderr, reason = "reproducible A/B diagnostics")]
 async fn pd_filters_both_context_windows() {
@@ -338,7 +338,7 @@ async fn unknown_window_remains_eligible() {
     }
 }
 
-/// Large legs on incompatible protocols cannot be combined into a false fit.
+/// Large workers on incompatible protocols cannot be combined into a false fit.
 #[tokio::test]
 async fn pd_capacity_is_checked_over_compatible_pairs() {
     let dir = tempfile::tempdir().unwrap();

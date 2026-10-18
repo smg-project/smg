@@ -134,14 +134,15 @@ pub fn grpc_worker(
         .health_config(health_checks_off())
 }
 
-/// The records of the workers at `legs`, every one of `runtime` and serving
+/// The records of the workers at `workers`, every one of `runtime` and serving
 /// `model`.
 pub fn grpc_workers(
-    legs: &[(u16, WorkerType)],
+    workers: &[(u16, WorkerType)],
     runtime: RuntimeType,
     model: &str,
 ) -> Vec<Arc<dyn Worker>> {
-    legs.iter()
+    workers
+        .iter()
         .map(|&(port, worker_type)| {
             Arc::new(grpc_worker(port, worker_type, runtime, ModelCard::new(model)).build())
                 as Arc<dyn Worker>

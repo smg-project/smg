@@ -54,15 +54,15 @@ pub struct MediaRequest {
     pub prompt_text: Option<String>,
     pub items: Vec<MediaRefItem>,
     pub arrival_time: f64,
-    /// Whether to also build the identity a PD prefill leg returns on its
-    /// `Complete`, so the decode leg is served without pixels or references.
+    /// Whether to also build the identity a PD prefill side returns on its
+    /// `Complete`, so the decode side is served without pixels or references.
     pub want_identity: bool,
 }
 
 /// What a processor produced: the prompt with its placeholders expanded, the
 /// engine-side features in the shape its pipeline makes them (vLLM's own
 /// encoding of `mm_features`, or the Router's batches for smg's pipeline),
-/// and, when asked, the identity a PD prefill leg returns.
+/// and, when asked, the identity a PD prefill side returns.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProcessedMedia {
     pub prompt_token_ids: Vec<u32>,
@@ -264,7 +264,7 @@ fn parse_media_refs(
 
 /// Resolve a request's `media_refs` through the configured processor. The
 /// request leaves with its references consumed and its prompt expanded; what
-/// comes back is the engine-side media to attach and, for a PD prefill leg,
+/// comes back is the engine-side media to attach and, for a PD prefill side,
 /// the identity its `Complete` carries. `None` when the request named no
 /// media.
 pub(super) async fn process_media_refs(

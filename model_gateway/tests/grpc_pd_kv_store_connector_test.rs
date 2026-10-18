@@ -1,8 +1,8 @@
-//! A disaggregated pair whose legs run a KV-store connector: the prefill
+//! A disaggregated pair whose workers run a KV-store connector: the prefill
 //! writes its blocks to a shared store and the decode reads them back by
-//! prefix hash, so the gateway tags neither leg, mints no handoff and runs
-//! the decode after the prefill. A store leg never pairs with a rendezvous
-//! leg of the same connector family.
+//! prefix hash, so the gateway tags neither side, mints no handoff and runs
+//! the decode after the prefill. A store worker never pairs with a rendezvous
+//! worker of the same connector family.
 //!
 //! Each case runs on a current-thread runtime under a thread-local Prometheus
 //! recorder, so the request path's mode decision lands in the rendered text.
@@ -206,7 +206,7 @@ async fn start_mock_engine(engine: RecordingEngine) -> u16 {
 }
 
 /// A loopback port nothing listens on: the bootstrap port of the rendezvous
-/// recipe, registered on a leg that never rendezvous.
+/// recipe, registered on a worker that never rendezvous.
 #[expect(
     clippy::expect_used,
     reason = "test helper - panicking on failure is intentional"
@@ -216,35 +216,35 @@ fn closed_port() -> u16 {
     listener.local_addr().expect("address").port()
 }
 
-/// One leg of the pair as it is registered: its mock engine's port, its type
-/// and its KV connector; a prefill leg also carries the engine id and the
+/// One worker of the pair as it is registered: its mock engine's port, its type
+/// and its KV connector; a prefill worker also carries the engine id and the
 /// bootstrap port the rendezvous recipe registers.
-struct Leg {
+struct PairWorker {
     port: u16,
     worker_type: WorkerType,
     connector: &'static str,
     bootstrap_port: Option<u16>,
 }
 
-/// A PD gRPC router over the given legs, all of the sequential-dispatch
+/// A PD gRPC router over the given workers, all of the sequential-dispatch
 /// runtime, with pairing in its default mode.
-async fn build_pd_router(legs: &[Leg]) -> Box<dyn RouterTrait> {
+async fn build_pd_router(workers: &[PairWorker]) -> Box<dyn RouterTrait> {
     let config = grpc_router_config()
         .prefill_decode_mode(vec![], vec![])
         .random_policy()
         .build_unchecked();
-    let workers = legs
+    let workers = workers
         .iter()
-        .map(|leg| {
+        .map(|worker| {
             let mut builder = grpc_worker(
-                leg.port,
-                leg.worker_type,
+                worker.port,
+                worker.worker_type,
                 RuntimeType::Vllm,
                 ModelCard::new(MODEL),
             )
-            .kv_connector(leg.connector)
-            .bootstrap_port(leg.bootstrap_port);
-            if leg.worker_type == WorkerType::Prefill {
+            .kv_connector(worker.connector)
+            .bootstrap_port(worker.bootstrap_port);
+            if worker.worker_type == WorkerType::Prefill {
                 builder = builder.kv_engine_id("prefill-0");
             }
             Arc::new(builder.build()) as Arc<dyn Worker>
@@ -315,8 +315,8 @@ fn mode_count(rendered: &str, mode: &str) -> Option<u64> {
         .and_then(|value| value.parse().ok())
 }
 
-/// Both legs on the store, the prefill registered with the bootstrap port
-/// the rendezvous recipe carries: the pair is placed, neither leg's request
+/// Both workers on the store, the prefill registered with the bootstrap port
+/// the rendezvous recipe carries: the pair is placed, neither worker's request
 /// carries KV-transfer params (the decode reads the store by prefix hash),
 /// the answer streams, and the mode is counted as `store`.
 #[test]
@@ -328,13 +328,13 @@ fn a_store_pair_runs_prefill_then_decode_with_no_handoff_params() {
         let prefill_port = start_mock_engine(prefill_engine).await;
         let decode_port = start_mock_engine(decode_engine).await;
         let router = build_pd_router(&[
-            Leg {
+            PairWorker {
                 port: prefill_port,
                 worker_type: WorkerType::Prefill,
                 connector: STORE_CONNECTOR,
                 bootstrap_port: Some(closed_port()),
             },
-            Leg {
+            PairWorker {
                 port: decode_port,
                 worker_type: WorkerType::Decode,
                 connector: STORE_CONNECTOR,
@@ -346,18 +346,18 @@ fn a_store_pair_runs_prefill_then_decode_with_no_handoff_params() {
         assert_eq!(status, http::StatusCode::OK, "{body}");
         assert!(body.contains("data: [DONE]"), "{body}");
     });
-    assert_eq!(prefill.seen(), [SeenParams::none()], "the prefill leg");
-    assert_eq!(decode.seen(), [SeenParams::none()], "the decode leg");
+    assert_eq!(prefill.seen(), [SeenParams::none()], "the prefill side");
+    assert_eq!(decode.seen(), [SeenParams::none()], "the decode side");
     assert_eq!(mode_count(&rendered, "store"), Some(1), "{rendered}");
     assert_eq!(mode_count(&rendered, "passthrough"), None, "{rendered}");
 }
 
 /// A rendezvous prefill and a store decode of the same connector family
 /// cannot hand KV to each other: the pair is refused at placement, instead of
-/// the decode leg being handed a bootstrap address its connector never dials
+/// the decode side being handed a bootstrap address its connector never dials
 /// while the prefill pins its blocks for a pull that never comes.
 #[test]
-fn a_store_leg_never_pairs_with_a_rendezvous_leg_of_the_same_family() {
+fn a_store_worker_never_pairs_with_a_rendezvous_worker_of_the_same_family() {
     let prefill = RecordingEngine::default();
     let decode = RecordingEngine::default();
     let (prefill_engine, decode_engine) = (prefill.clone(), decode.clone());
@@ -365,13 +365,13 @@ fn a_store_leg_never_pairs_with_a_rendezvous_leg_of_the_same_family() {
         let prefill_port = start_mock_engine(prefill_engine).await;
         let decode_port = start_mock_engine(decode_engine).await;
         let router = build_pd_router(&[
-            Leg {
+            PairWorker {
                 port: prefill_port,
                 worker_type: WorkerType::Prefill,
                 connector: RENDEZVOUS_CONNECTOR,
                 bootstrap_port: Some(closed_port()),
             },
-            Leg {
+            PairWorker {
                 port: decode_port,
                 worker_type: WorkerType::Decode,
                 connector: STORE_CONNECTOR,

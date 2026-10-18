@@ -3,7 +3,7 @@
 //!
 //! The deferral contract: with `defer_abort_until_first_item`, dropping the
 //! stream before the backend produced any response holds the abort until the
-//! first response arrives (the disaggregated decode leg uses this so a client
+//! first response arrives (the disaggregated decode side uses this so a client
 //! disconnect can never tear down a request mid-KV-handoff); dropping after
 //! the first response — or without the deferral — aborts promptly, and
 //! `mark_completed` suppresses the abort entirely. The dropped stream itself

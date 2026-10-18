@@ -71,7 +71,7 @@ pub struct AbortOnDropStream<T: Send + 'static, C: AbortOnDropClient> {
     /// item drains the stream in the background until that first item (or a
     /// terminal event / [`DEFERRED_ABORT_MAX_WAIT`]) before sending the
     /// abort. For workers whose request must not be torn down mid-handoff —
-    /// e.g. a disaggregated decode leg receiving KV state from its prefill
+    /// e.g. a disaggregated decode side receiving KV state from its prefill
     /// peer — an early abort can kill the transfer while the peer is still
     /// writing; the first generated item is the proof the handoff completed.
     defer_abort_until_first_item: bool,

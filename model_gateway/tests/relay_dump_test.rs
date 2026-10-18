@@ -1,6 +1,6 @@
 //! The bytes the HTTP routers relay from a streaming worker, byte for byte:
 //! the regular router (with and without the provider re-chunking) and the
-//! disaggregated prefill/decode router (its decode leg's stream), over the
+//! disaggregated prefill/decode router (its decode side's stream), over the
 //! same scripted upstream bodies, compared with the dumps recorded under
 //! `tests/fixtures/relay_dumps`. `RELAY_DUMP_RECORD=1` rewrites the dumps.
 //!

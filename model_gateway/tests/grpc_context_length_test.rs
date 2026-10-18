@@ -232,10 +232,10 @@ async fn pd_prompt_within_the_window_is_forwarded() {
     }
 }
 
-/// A disaggregated prompt must fit both engines; the decode leg's tighter
-/// window governs even when the prefill leg would have taken it.
+/// A disaggregated prompt must fit both engines; the decode side's tighter
+/// window governs even when the prefill side would have taken it.
 #[tokio::test]
-async fn pd_is_bounded_by_the_tighter_leg() {
+async fn pd_is_bounded_by_the_tighter_side() {
     let router = pd_router(Some(CONTEXT_LENGTH * 8), Some(CONTEXT_LENGTH)).await;
 
     let response = router
