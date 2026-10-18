@@ -659,7 +659,7 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                         !made_up_empty_string(json, &source.text),
                         || {
                             format!(
-                                "{}: the fragment {json:?} writes an empty string with no byte of the output behind it",
+                                "{}: the fragment {json:?} writes an empty string with no byte of a value behind it",
                                 place()
                             )
                         },
