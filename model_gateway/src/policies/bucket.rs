@@ -471,13 +471,24 @@ impl Bucket {
 
     /// The worker that serves a size of `char_count` among the workers
     /// `is_offered` admits: the owner of its range, or, when the owner is not
-    /// offered (draining before its removal, unhealthy, or tried already on
-    /// a retry), the nearest offered worker below it in the partition, else
+    /// offered, the nearest offered worker below it in the partition, else
     /// the nearest above. The worker below is the one
     /// [`Self::remove_prefill_worker_url`] hands the range to, so a draining
     /// worker's range moves once, at the first request it cannot take, and
     /// is where the removal leaves it. `None` when the size has no range or
     /// no listed worker is offered.
+    ///
+    /// "Offered" is the caller's word, and it covers more than a drain before
+    /// a removal, an unhealthy worker or one tried already on a retry: the
+    /// overload veto, a stall and an open circuit breaker take a worker out
+    /// of the offer too, for as long as they last. The walk treats those the
+    /// same way, so an overloaded owner's whole range goes to its neighbour
+    /// for that while, where the spread over every offered worker scattered
+    /// it before. With the imbalance spill at its defaults the neighbour's
+    /// extra load is spread again almost at once; a deployment that turns
+    /// the spill off for strict size affinity (a large absolute threshold)
+    /// trades that correction for the affinity, and an overloaded owner's
+    /// range then rests on its neighbour until the owner is offered again.
     pub fn find_offered_boundary(
         &self,
         char_count: usize,
