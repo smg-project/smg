@@ -1209,6 +1209,10 @@ const KIMI_K2_OUTPUTS: &[&str] = &[
     "Hello!",
     "<|tool_calls_section_begin|><|tool_call_begin|>functions.save_note:0<|tool_call_argument_begin|>{\"body\": \"a <|tool_call_end|> b\"}<|tool_call_end|><|tool_calls_section_end|>",
     "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Par",
+    // A call the end cuts right after the marker that opens its arguments, and one the model closed
+    // with none: neither is handed over as a whole call with an empty string for its arguments.
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>",
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|><|tool_call_end|><|tool_calls_section_end|>",
     "<|tool_calls_section_begin|><|tool_call_begin|>get_weather:0<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_calls_section_end|>",
     "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_calls_section_end|>",
     "<|tool_calls_section_begin|><|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>not json<|tool_call_end|><|tool_calls_section_end|>",

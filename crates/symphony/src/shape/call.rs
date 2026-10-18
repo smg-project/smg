@@ -44,7 +44,11 @@
 //! template's reader closes a region at the end of its text: the arguments' object is closed over
 //! the parameters that finished, and the text of one the cut left unfinished is dropped as
 //! wrapping. One JSON value or object is not closed for the client, and what was held after it
-//! comes back as `Malformed` with `UnterminatedRegion`, its whitespace dropped.
+//! comes back as `Malformed` with `UnterminatedRegion`, its whitespace dropped. A value that never
+//! began, the cut or the region's close right after the header, is said to be none the same way a
+//! value cut short is, by a `Malformed` event of no bytes before the call's end
+//! ([`json::Arguments::finish`]), so that a call is never handed over whole with an empty string
+//! for its arguments.
 //!
 //! [`CallSyntax::Shaped`]: crate::CallSyntax::Shaped
 
@@ -408,9 +412,10 @@ impl Assembler {
 
     /// The stream was cut inside the region: the call ends with what arrived. One JSON value or
     /// object is not closed for the client, and what was held after it comes back as `Malformed`
-    /// with `UnterminatedRegion`, its whitespace dropped. Tagged parameters close as at the end of
-    /// the text: those still undecided are decided there, the bytes no parameter took are dropped
-    /// as wrapping, and the arguments' object is closed.
+    /// with `UnterminatedRegion`, its whitespace dropped; a value that never began is said to be
+    /// none before the end, as one cut short is. Tagged parameters close as at the end of the
+    /// text: those still undecided are decided there, the bytes no parameter took are dropped as
+    /// wrapping, and the arguments' object is closed.
     pub fn finish(mut self, declared: &Declared, out: &mut Events) {
         let Stage::Body(body) = std::mem::replace(&mut self.stage, Stage::Done) else {
             return;
@@ -940,6 +945,10 @@ mod tests {
             [
                 wrapper("<c>"),
                 start("f", "<n=f>"),
+                Event::Malformed {
+                    text: Text::default(),
+                    why: MalformedReason::UnterminatedRegion,
+                },
                 end(""),
                 Event::Finish {
                     reason: crate::event::FinishReason::Length,
@@ -947,7 +956,46 @@ mod tests {
                     reasoning_tokens: 0,
                 },
             ],
-            "a header that matched at the end starts a call the end cut"
+            "a header that matched at the end starts a call the end cut, which says so before its end"
+        );
+    }
+
+    #[test]
+    fn a_call_whose_value_never_began_says_so_before_its_end() {
+        // The region's close right after the header: the call ends with the region's reason, and
+        // its arguments are no empty string handed over as whole.
+        let format = table(named(Pattern::default()));
+        assert_eq!(
+            run(&format, "<c><n=f></c>"),
+            [
+                wrapper("<c>"),
+                start("f", "<n=f>"),
+                Event::Malformed {
+                    text: Text::default(),
+                    why: MalformedReason::BlockWithoutACompleteCall,
+                },
+                end("</c>"),
+                finish(1),
+            ]
+        );
+        // The same with the whitespace the value allows before it, which is the region's wrapping
+        // when no value comes.
+        assert_eq!(
+            run(&format, "<c><n=f>\n</c>"),
+            [
+                wrapper("<c>"),
+                start("f", "<n=f>"),
+                Event::Dropped {
+                    text: Text::uncounted("\n"),
+                    why: DropReason::Whitespace,
+                },
+                Event::Malformed {
+                    text: Text::default(),
+                    why: MalformedReason::BlockWithoutACompleteCall,
+                },
+                end("</c>"),
+                finish(1),
+            ]
         );
     }
 
