@@ -263,16 +263,36 @@ fn http_client() -> Result<reqwest::Client, JwksError> {
         .map_err(|e| JwksError::HttpClientError(e.to_string()))
 }
 
-/// Refuses a response whose declared length is over [`MAX_JWKS_RESPONSE_SIZE`]
-/// before its body is read. A response without a declared length is not
-/// stopped here; the caller has to bound the body itself.
-fn within_size_limit(response: &reqwest::Response) -> Result<(), JwksError> {
-    match response.content_length() {
-        Some(content_length) if content_length > MAX_JWKS_RESPONSE_SIZE => Err(
-            JwksError::ResponseTooLarge(content_length, MAX_JWKS_RESPONSE_SIZE),
-        ),
-        _ => Ok(()),
+/// The response body, bounded by [`MAX_JWKS_RESPONSE_SIZE`] as it is read: a
+/// declared length over the limit is refused before the read, and a body that
+/// declares no length (a chunked response) is refused the moment the bytes
+/// read pass the limit, so no fetch holds more than the limit in memory.
+/// `fetch_error` wraps a transport failure in the caller's variant.
+async fn bounded_body(
+    mut response: reqwest::Response,
+    fetch_error: fn(String) -> JwksError,
+) -> Result<Vec<u8>, JwksError> {
+    if let Some(content_length) = response.content_length() {
+        if content_length > MAX_JWKS_RESPONSE_SIZE {
+            return Err(JwksError::ResponseTooLarge(
+                content_length,
+                MAX_JWKS_RESPONSE_SIZE,
+            ));
+        }
     }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| fetch_error(e.to_string()))?
+    {
+        let read = body.len() as u64 + chunk.len() as u64;
+        if read > MAX_JWKS_RESPONSE_SIZE {
+            return Err(JwksError::ResponseTooLarge(read, MAX_JWKS_RESPONSE_SIZE));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 impl JwksProvider {
@@ -328,12 +348,9 @@ impl JwksProvider {
             )));
         }
 
-        within_size_limit(&response)?;
-
-        let discovery: OidcDiscovery = response
-            .json()
-            .await
-            .map_err(|e| JwksError::DiscoveryParse(e.to_string()))?;
+        let body = bounded_body(response, JwksError::DiscoveryFetch).await?;
+        let discovery: OidcDiscovery =
+            serde_json::from_slice(&body).map_err(|e| JwksError::DiscoveryParse(e.to_string()))?;
 
         // The document's issuer must be identical to the issuer it was requested
         // for (Discovery 1.0, section 4.3): a document for another issuer names
@@ -379,21 +396,7 @@ impl JwksProvider {
             return Err(JwksError::JwksFetch(format!("HTTP {}", response.status())));
         }
 
-        within_size_limit(&response)?;
-
-        // Read body with size limit
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| JwksError::JwksFetch(e.to_string()))?;
-
-        if bytes.len() as u64 > MAX_JWKS_RESPONSE_SIZE {
-            return Err(JwksError::ResponseTooLarge(
-                bytes.len() as u64,
-                MAX_JWKS_RESPONSE_SIZE,
-            ));
-        }
-
+        let bytes = bounded_body(response, JwksError::JwksFetch).await?;
         let jwks: JwkSet =
             serde_json::from_slice(&bytes).map_err(|e| JwksError::JwksParse(e.to_string()))?;
 
@@ -825,6 +828,68 @@ mod tests {
     }
 
     const TTL: Duration = Duration::from_secs(3600);
+
+    /// A loopback HTTP/1.1 server that answers one request with a chunked
+    /// body (no declared length) of `chunks` times 64 KiB of JSON-looking
+    /// text, then hangs up. Returns its origin.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the server lives exactly as long as the test"
+    )]
+    async fn chunked_server(chunks: usize) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = vec![0u8; 4096];
+            let _ = socket.read(&mut head).await;
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .await;
+            let chunk = vec![b'['; 64 * 1024];
+            for _ in 0..chunks {
+                // The client may hang up once it has refused the body: a write
+                // error ends the server, as it should.
+                if socket
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .is_err()
+                    || socket.write_all(&chunk).await.is_err()
+                    || socket.write_all(b"\r\n").await.is_err()
+                {
+                    return;
+                }
+            }
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        });
+        origin
+    }
+
+    #[tokio::test]
+    async fn a_chunked_key_set_past_the_limit_is_refused_as_it_is_read() {
+        let origin = chunked_server(20).await; // 1.25 MiB over a 1 MiB limit
+        let provider = JwksProvider::new(format!("{origin}/jwks.json"), TTL).unwrap();
+        let err = provider.get_jwks().await.unwrap_err();
+        assert!(
+            matches!(err, JwksError::ResponseTooLarge(read, max) if read > max && max == MAX_JWKS_RESPONSE_SIZE),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chunked_discovery_document_past_the_limit_is_refused_as_it_is_read() {
+        let origin = chunked_server(20).await;
+        let Err(err) = JwksProvider::from_issuer(&origin, TTL).await else {
+            panic!("a chunked discovery document past the limit must be refused");
+        };
+        assert!(
+            matches!(err, JwksError::ResponseTooLarge(read, max) if read > max && max == MAX_JWKS_RESPONSE_SIZE),
+            "{err:?}"
+        );
+    }
 
     #[tokio::test]
     async fn a_discovery_document_for_another_issuer_is_refused() {
