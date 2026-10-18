@@ -53,7 +53,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use super::{
-    config::{BuiltinToolType, McpConfig, McpProxyConfig, McpServerConfig, McpTransport},
+    config::{
+        BuiltinToolType, McpConfig, McpProxyConfig, McpServerConfig, McpTransport, Prompt,
+        RawResource,
+    },
     handler::{HandlerRequestContext, RefreshRequest, SmgClientHandler},
     metrics::McpMetrics,
     pool::{McpConnectionPool, PoolKey, UrlLookup},
@@ -94,6 +97,166 @@ async fn tools_of<S: rmcp::service::Service<RoleClient>>(
         Err(e) => {
             warn!("Failed to list tools from '{}': {}", server_key, e);
             None
+        }
+    }
+}
+
+/// What a server lists: its tools as inventory entries (`None` when the tool
+/// listing failed, after one warning), its prompts and its resources (empty,
+/// after a debug line, when their listing failed).
+struct Listed {
+    tools: Option<Vec<ToolEntry>>,
+    prompts: Vec<(String, Prompt)>,
+    resources: Vec<(String, RawResource)>,
+}
+
+/// A server's listing: the three round-trips, logged as before.
+async fn listed<S: rmcp::service::Service<RoleClient>>(
+    client: &RunningService<RoleClient, S>,
+    server_key: &str,
+    category: ToolCategory,
+) -> Listed {
+    let tools = tools_of(client, server_key, category).await;
+    let prompts = match client.peer().list_all_prompts().await {
+        Ok(prompts) => {
+            info!("Discovered {} prompts from '{}'", prompts.len(), server_key);
+            prompts
+                .into_iter()
+                .map(|prompt| (prompt.name.clone(), prompt))
+                .collect()
+        }
+        Err(e) => {
+            debug!("No prompts from '{}': {}", server_key, e);
+            Vec::new()
+        }
+    };
+    let resources = match client.peer().list_all_resources().await {
+        Ok(resources) => {
+            info!(
+                "Discovered {} resources from '{}'",
+                resources.len(),
+                server_key
+            );
+            resources
+                .into_iter()
+                .map(|resource| (resource.uri.clone(), resource.raw))
+                .collect()
+        }
+        Err(e) => {
+            debug!("No resources from '{}': {}", server_key, e);
+            Vec::new()
+        }
+    };
+    Listed {
+        tools,
+        prompts,
+        resources,
+    }
+}
+
+/// Puts a listing into the inventory under `server_key`.
+fn install(inventory: &ToolInventory, server_key: &str, listed: Listed) {
+    for entry in listed.tools.unwrap_or_default() {
+        inventory.insert_entry(entry);
+    }
+    for (name, prompt) in listed.prompts {
+        inventory.insert_prompt(name, server_key.to_string(), prompt);
+    }
+    for (uri, resource) in listed.resources {
+        inventory.insert_resource(uri, server_key.to_string(), resource);
+    }
+}
+
+/// Registers `alias_name` for `target_server:target_tool` in the inventory,
+/// with its argument mapping; the target must be in the inventory.
+fn register_alias(
+    inventory: &ToolInventory,
+    alias_name: &str,
+    target_server: &str,
+    target_tool: &str,
+    arg_mapping: Option<ArgMapping>,
+) -> McpResult<()> {
+    // Verify target exists
+    let target_entry = inventory
+        .get_entry(target_server, target_tool)
+        .ok_or_else(|| McpError::ToolNotFound(format!("{target_server}:{target_tool}")))?;
+
+    // Create alias entry
+    let alias_target = AliasTarget {
+        target: QualifiedToolName::new(target_server, target_tool),
+        arg_mapping,
+    };
+
+    let alias_entry = ToolEntry::new(
+        QualifiedToolName::new(ALIAS_SERVER_KEY, alias_name),
+        target_entry.tool.clone(),
+    )
+    .with_alias(alias_target);
+
+    inventory.insert_entry(alias_entry);
+
+    // Also register in the aliases index
+    inventory.register_alias(
+        alias_name.to_string(),
+        QualifiedToolName::new(target_server, target_tool),
+    );
+
+    info!(
+        "Registered alias '{}' → '{}:{}'",
+        alias_name, target_server, target_tool
+    );
+    Ok(())
+}
+
+/// Applies a server config's tool settings (aliases and argument mappings) to
+/// the server's entries in the inventory.
+fn apply_tool_configs(inventory: &ToolInventory, config: &McpServerConfig) {
+    let Some(tools) = &config.tools else {
+        return;
+    };
+    for (tool_name, tool_config) in tools {
+        // Check if the tool exists
+        if !inventory.has_tool_qualified(&config.name, tool_name) {
+            warn!(
+                "Tool config for '{}:{}' but tool not found on server",
+                config.name, tool_name
+            );
+            continue;
+        }
+        let arg_mapping = tool_config.arg_mapping.as_ref().map(|cfg| {
+            let mut mapping = ArgMapping::new();
+            for (from, to) in &cfg.renames {
+                mapping = mapping.with_rename(from, to);
+            }
+            for (key, value) in &cfg.defaults {
+                mapping = mapping.with_default(key, value.clone());
+            }
+            for (key, value) in &cfg.overrides {
+                mapping = mapping.with_override(key, value.clone());
+            }
+            mapping
+        });
+        // If there's an alias, register it
+        if let Some(alias_name) = &tool_config.alias {
+            if let Err(e) =
+                register_alias(inventory, alias_name, &config.name, tool_name, arg_mapping)
+            {
+                warn!(
+                    "Failed to register alias '{}' for '{}:{}': {}",
+                    alias_name, config.name, tool_name, e
+                );
+            } else {
+                info!(
+                    "Registered alias '{}' → '{}:{}'",
+                    alias_name, config.name, tool_name
+                );
+            }
+        } else if let Some(mapping) = arg_mapping {
+            // No alias but has arg_mapping - update entry directly
+            if let Some(mut entry) = inventory.get_entry(&config.name, tool_name) {
+                entry.arg_mapping = Some(mapping);
+                inventory.insert_entry(entry);
+            }
         }
     }
 }
@@ -516,60 +679,7 @@ impl McpOrchestrator {
 
     /// Apply tool configurations from server config (aliases and arg mappings).
     fn apply_tool_configs(&self, config: &McpServerConfig) {
-        let Some(tools) = &config.tools else {
-            return;
-        };
-
-        for (tool_name, tool_config) in tools {
-            // Check if the tool exists
-            if !self
-                .tool_inventory
-                .has_tool_qualified(&config.name, tool_name)
-            {
-                warn!(
-                    "Tool config for '{}:{}' but tool not found on server",
-                    config.name, tool_name
-                );
-                continue;
-            }
-
-            let arg_mapping = tool_config.arg_mapping.as_ref().map(|cfg| {
-                let mut mapping = ArgMapping::new();
-                for (from, to) in &cfg.renames {
-                    mapping = mapping.with_rename(from, to);
-                }
-                for (key, value) in &cfg.defaults {
-                    mapping = mapping.with_default(key, value.clone());
-                }
-                for (key, value) in &cfg.overrides {
-                    mapping = mapping.with_override(key, value.clone());
-                }
-                mapping
-            });
-
-            // If there's an alias, register it
-            if let Some(alias_name) = &tool_config.alias {
-                if let Err(e) =
-                    self.register_alias(alias_name, &config.name, tool_name, arg_mapping)
-                {
-                    warn!(
-                        "Failed to register alias '{}' for '{}:{}': {}",
-                        alias_name, config.name, tool_name, e
-                    );
-                } else {
-                    info!(
-                        "Registered alias '{}' → '{}:{}'",
-                        alias_name, config.name, tool_name
-                    );
-                }
-            } else if let Some(mapping) = arg_mapping {
-                // No alias but has arg_mapping - update entry directly
-                if let Some(mut entry) = self.tool_inventory.get_entry(&config.name, tool_name) {
-                    entry.arg_mapping = Some(mapping);
-                    self.tool_inventory.insert_entry(entry);
-                }
-            }
-        }
+        apply_tool_configs(&self.tool_inventory, config);
     }
 
     /// Internal server connection logic.
@@ -630,47 +740,8 @@ impl McpOrchestrator {
 
     /// Load tools, prompts, and resources from a server into the inventory.
     async fn load_server_inventory(&self, server_key: &str, client: &Arc<McpClientWithHandler>) {
-        // Load tools
-        for entry in tools_of(client.as_ref(), server_key, ToolCategory::Static)
-            .await
-            .unwrap_or_default()
-        {
-            self.tool_inventory.insert_entry(entry);
-        }
-
-        // Load prompts
-        match client.peer().list_all_prompts().await {
-            Ok(prompts) => {
-                info!("Discovered {} prompts from '{}'", prompts.len(), server_key);
-                for prompt in prompts {
-                    self.tool_inventory.insert_prompt(
-                        prompt.name.clone(),
-                        server_key.to_string(),
-                        prompt,
-                    );
-                }
-            }
-            Err(e) => debug!("No prompts from '{}': {}", server_key, e),
-        }
-
-        // Load resources
-        match client.peer().list_all_resources().await {
-            Ok(resources) => {
-                info!(
-                    "Discovered {} resources from '{}'",
-                    resources.len(),
-                    server_key
-                );
-                for resource in resources {
-                    self.tool_inventory.insert_resource(
-                        resource.uri.clone(),
-                        server_key.to_string(),
-                        resource.raw,
-                    );
-                }
-            }
-            Err(e) => debug!("No resources from '{}': {}", server_key, e),
-        }
+        let listed = listed(client.as_ref(), server_key, ToolCategory::Static).await;
+        install(&self.tool_inventory, server_key, listed);
     }
 
     /// Spawn background handler for inventory refresh requests.
@@ -695,24 +766,27 @@ impl McpOrchestrator {
                     Some(request) = rx.recv() => {
                         debug!("Processing refresh request for '{}'", request.server_key);
 
-                        // The client out of the map's guard before the
-                        // listing's round-trip: a removal or an insert on the
-                        // same shard must not wait behind it.
-                        let client = static_servers
+                        // The client and the config out of the map's guard
+                        // before the listings' round-trips: a removal or an
+                        // insert on the same shard must not wait behind them.
+                        let found = static_servers
                             .get(&request.server_key)
-                            .map(|entry| Arc::clone(&entry.client));
-                        if let Some(client) = client {
-                            // The listing first: a failed one keeps the
-                            // server's previous entries instead of leaving it
-                            // with none until its next notification.
-                            if let Some(entries) =
-                                tools_of(client.as_ref(), &request.server_key, ToolCategory::Static)
-                                    .await
-                            {
+                            .map(|entry| (Arc::clone(&entry.client), entry.config.clone()));
+                        if let Some((client, config)) = found {
+                            // The listings first: a failed tool listing keeps
+                            // everything the server had instead of leaving it
+                            // with nothing until its next notification. A
+                            // clear drops the server's tools, prompts,
+                            // resources and aliases, so the rebuild is what a
+                            // connect does: install all three, then the
+                            // config's aliases and argument mappings.
+                            let listed =
+                                listed(client.as_ref(), &request.server_key, ToolCategory::Static)
+                                    .await;
+                            if listed.tools.is_some() {
                                 tool_inventory.clear_server_tools(&request.server_key);
-                                for entry in entries {
-                                    tool_inventory.insert_entry(entry);
-                                }
+                                install(&tool_inventory, &request.server_key, listed);
+                                apply_tool_configs(&tool_inventory, &config);
                                 info!(
                                     "Refreshed '{}'; the inventory now holds {} tools",
                                     request.server_key,
@@ -1372,37 +1446,13 @@ impl McpOrchestrator {
         target_tool: &str,
         arg_mapping: Option<ArgMapping>,
     ) -> McpResult<()> {
-        // Verify target exists
-        let target_entry = self
-            .tool_inventory
-            .get_entry(target_server, target_tool)
-            .ok_or_else(|| McpError::ToolNotFound(format!("{target_server}:{target_tool}")))?;
-
-        // Create alias entry
-        let alias_target = AliasTarget {
-            target: QualifiedToolName::new(target_server, target_tool),
+        register_alias(
+            &self.tool_inventory,
+            alias_name,
+            target_server,
+            target_tool,
             arg_mapping,
-        };
-
-        let alias_entry = ToolEntry::new(
-            QualifiedToolName::new(ALIAS_SERVER_KEY, alias_name),
-            target_entry.tool.clone(),
         )
-        .with_alias(alias_target);
-
-        self.tool_inventory.insert_entry(alias_entry);
-
-        // Also register in the aliases index
-        self.tool_inventory.register_alias(
-            alias_name.to_string(),
-            QualifiedToolName::new(target_server, target_tool),
-        );
-
-        info!(
-            "Registered alias '{}' → '{}:{}'",
-            alias_name, target_server, target_tool
-        );
-        Ok(())
     }
 
     // ========================================================================
