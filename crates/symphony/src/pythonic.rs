@@ -624,9 +624,16 @@ impl Assembler {
     }
 
     /// The value's extent is complete: `"key": <json>` with the key, the `=`, the value and the
-    /// whitespace before them as its source.
+    /// whitespace before them as its source. An extent with no value in it (`key=` right before
+    /// the comma or the close) is a member Python refuses and the templates never write: its
+    /// bytes are reported whole under `KeyWithoutAValue` and nothing is written for it, so the
+    /// object closes whole without it and no empty string is made up for a value the model did
+    /// not write.
     fn write_value(&mut self, key: &str, start: usize, declared: &Declared, out: &mut Events) {
         let text = self.carried[start..].trim().to_string();
+        if text.is_empty() {
+            return self.skip_member_without_a_value(out);
+        }
         let value = match self.values {
             Values::Quoted => quoted_value(&text, declared.kind(&self.name, key)),
             Values::Python | Values::Json => python_literal(&text)
@@ -659,6 +666,15 @@ impl Assembler {
             index: self.index,
             source: Text::uncounted(")"),
         });
+    }
+
+    /// `key=` with nothing before the comma or the close: the member's bytes come back as
+    /// `Malformed { KeyWithoutAValue }` and nothing is written for it. Out of line: the templates
+    /// never write the shape, and the value path stays as it is for the values they do write.
+    #[cold]
+    #[inline(never)]
+    fn skip_member_without_a_value(&mut self, out: &mut Events) {
+        self.report(MalformedReason::KeyWithoutAValue, out);
     }
 
     fn report(&mut self, why: MalformedReason, out: &mut Events) {
@@ -1071,6 +1087,86 @@ mod tests {
                 r#"{"city": "Paris", "days": 3}"#.to_string()
             )]
         );
+    }
+
+    /// A parameter whose value is missing before the comma or the close is a member Python
+    /// refuses and the templates never write: its bytes, the key and the `=` with the whitespace
+    /// around them, come back under the one reason, nothing is written for it, and the object
+    /// closes whole without it, whole and by the character alike; no empty string stands for the
+    /// value the model did not write.
+    #[test]
+    fn a_parameter_without_a_value_is_reported_and_skipped_and_the_object_closes_whole() {
+        let cases: &[(&str, &str, &[&str])] = &[
+            ("[get_weather(city=, days=3)]", r#"{"days": 3}"#, &["city="]),
+            ("[get_weather(city=)]", "{}", &["city="]),
+            (
+                "[get_weather(city= , days=3)]",
+                r#"{"days": 3}"#,
+                &["city= "],
+            ),
+            (
+                "[get_weather(city='Paris', days=)]",
+                r#"{"city": "Paris"}"#,
+                &[", days="],
+            ),
+            (
+                "[get_weather(city='Paris', days= )]",
+                r#"{"city": "Paris"}"#,
+                &[", days= "],
+            ),
+            ("[get_weather(a=, b=)]", "{}", &["a=", ", b="]),
+            ("get_weather(city=, days=3)\nget_stock_price(q=)", "", &[]),
+        ];
+        for (text, arguments, reported) in cases {
+            let pieces: Vec<String> = text.chars().map(String::from).collect();
+            let whole = run(&[text]);
+            let by_char = run(&pieces.iter().map(String::as_str).collect::<Vec<_>>());
+            for events in [whole, by_char] {
+                assert_eq!(bytes(&events), *text);
+                let words: Vec<&str> = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        Event::Malformed {
+                            text,
+                            why: MalformedReason::KeyWithoutAValue,
+                        } => Some(&*text.text),
+                        _ => None,
+                    })
+                    .collect();
+                if arguments.is_empty() {
+                    // Olmo's bare calls, one per line: each call keeps its own members.
+                    assert_eq!(
+                        calls(&events),
+                        [
+                            (0, "get_weather".to_string(), r#"{"days": 3}"#.to_string()),
+                            (1, "get_stock_price".to_string(), "{}".to_string()),
+                        ],
+                        "{text}"
+                    );
+                    assert_eq!(words, ["city=", "q="], "{text}");
+                } else {
+                    assert_eq!(
+                        calls(&events),
+                        [(0, "get_weather".to_string(), arguments.to_string())],
+                        "{text}"
+                    );
+                    assert_eq!(words, *reported, "{text}");
+                }
+                for (_, _, arguments) in calls(&events) {
+                    assert!(
+                        serde_json::from_str::<serde_json::Value>(&arguments).is_ok(),
+                        "{text}: {arguments} is whole"
+                    );
+                }
+                assert!(
+                    !events.iter().any(|event| matches!(
+                        event,
+                        Event::ToolCallArguments { json, .. } if json.contains("\"\"")
+                    )),
+                    "{text}: no empty string is written"
+                );
+            }
+        }
     }
 
     #[test]

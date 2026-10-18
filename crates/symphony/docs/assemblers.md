@@ -405,6 +405,11 @@ What the syntax says, and what the assembler does with it:
   decoded, is typed by the kind the request's tool declares for the parameter, through the value
   module's `json`, or by its text where none is declared; a bare value, a single-quoted Python
   string included, reads as under the other dialects.
+- **A parameter without a value is reported and skipped.** `key=` followed by the comma or the
+  call's `)` is a member Python refuses and the templates never write: its bytes, the key, the
+  `=` and the whitespace around them, come back as `Malformed { KeyWithoutAValue }`, nothing is
+  written for it, and the object closes whole without it, as the Gemma reader leaves a member
+  without a value; no empty string stands for a value the model did not write.
 
 Ported in spirit from the old crate's pythonic parser, which compiled a regular expression per call
 and read the arguments with a Python-literal evaluator at the end; here the arguments are read as

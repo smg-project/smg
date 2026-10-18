@@ -1422,6 +1422,7 @@ const OLMO3_OUTPUTS: &[&str] = &[
     "<function_calls>get_weather(</function_calls>",
     "<function_calls>get_weather(city=\"Paris\",</function_calls>",
     "<function_calls>get_weather(city=\"Par</function_calls>\nDone.",
+    "<function_calls>get_weather(city=, days=3)\nget_stock_price(q= )</function_calls>",
     "<function_calls>I will call:\nget_weather(city=\"a)b\", n=-1.5e3)</function_calls>\nDone.",
     "<function_calls></function_calls>",
     "Hello!",
@@ -1441,6 +1442,8 @@ const LFM_OUTPUTS: &[&str] = &[
     "<|tool_call_start|>[get_weather(ci<|tool_call_end|>",
     "<|tool_call_start|>[get_weather(city='Paris', <|tool_call_end|>",
     "<|tool_call_start|>[get_weather(city='Par<|tool_call_end|>Then text.",
+    "<|tool_call_start|>[get_weather(city=), get_stock_price(city='Paris', days= )]\
+     <|tool_call_end|>",
     "<think>The user asks.</think><|tool_call_start|>[get_weather(city='計画 🌍 \"q\"')]\
      <|tool_call_end|>",
     "<|tool_call_start|>[]<|tool_call_end|>Nothing to call.",
