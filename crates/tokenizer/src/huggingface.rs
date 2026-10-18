@@ -35,6 +35,7 @@ use crate::{
     word_cache::{LateBoundModel, LoadingTokenizer, ModelView, TokenizerOf},
 };
 
+mod deepseek_v31;
 mod glm;
 
 #[derive(Debug, Clone, Copy)]
@@ -74,6 +75,14 @@ pub struct HuggingFaceTokenizer {
     /// Checkpoint identity and media policy resolved when binding the template.
     glm: Option<glm::Checkpoint>,
     media_handling: crate::traits::MediaHandling,
+    /// Checkpoint identity of the V3 architecture family, resolved when the
+    /// template is bound (see `deepseek_v31`).
+    deepseek_v31: Option<deepseek_v31::Checkpoint>,
+    /// Whether the active template gets the request's tools as a system
+    /// message block it does not write itself (the V3.1 template, see
+    /// `deepseek_v31`); resolved with the template and refreshed when the
+    /// template is replaced.
+    tools_block: bool,
     /// What that renderer answers around a render when it has an encoder of
     /// its own ([`Renderer::profile`]), built once with it.
     profile: Option<RendererProfile>,
@@ -521,6 +530,11 @@ impl HuggingFaceTokenizer {
         let media_handling = glm.as_ref().map_or_else(Default::default, |_| {
             glm::Checkpoint::media_handling(&chat_template)
         });
+        let deepseek_v31 = tokenizer_path
+            .parent()
+            .and_then(deepseek_v31::Checkpoint::load);
+        let tools_block =
+            deepseek_v31.is_some() && deepseek_v31::Checkpoint::renders_tools_block(&chat_template);
         Ok(HuggingFaceTokenizer {
             byte_level: ByteLevelTable::build(&tokenizer),
             pieces: PieceTable::build(&tokenizer),
@@ -534,6 +548,8 @@ impl HuggingFaceTokenizer {
             chat_template,
             glm,
             media_handling,
+            deepseek_v31,
+            tools_block,
             response_template,
             eos_token_ids,
             profile: renderer.profile(),
@@ -696,6 +712,8 @@ impl HuggingFaceTokenizer {
             renderer: Renderer::Jinja,
             glm: None,
             media_handling: Default::default(),
+            deepseek_v31: None,
+            tools_block: false,
             profile: None,
             has_byte_fallback,
             byte_fallback_values,
@@ -820,6 +838,13 @@ impl HuggingFaceTokenizer {
             special_tokens: params.special_tokens.or(Some(&self.special_tokens)),
             ..params
         };
+        // A template that writes nothing for the request's tools gets them
+        // as a system message block (the V3.1 template, see `deepseek_v31`).
+        let with_block = self
+            .tools_block
+            .then(|| deepseek_v31::messages_with_tools_block(messages, params.tools))
+            .flatten();
+        let messages = with_block.as_deref().unwrap_or(messages);
         self.chat_template.apply_with_continuation(messages, params)
     }
 }
@@ -1511,12 +1536,15 @@ impl TokenizerTrait for HuggingFaceTokenizer {
             .map(|resolve| resolve(template_kwargs, thinking))
     }
 
-    /// Refresh media handling only after a replacement template compiles successfully.
+    /// Refresh media handling and the tools block only after a replacement
+    /// template compiles successfully.
     fn set_chat_template(&mut self, template: String) -> Result<()> {
         self.chat_template.set(template)?;
         self.media_handling = self.glm.as_ref().map_or_else(Default::default, |_| {
             glm::Checkpoint::media_handling(&self.chat_template)
         });
+        self.tools_block = self.deepseek_v31.is_some()
+            && deepseek_v31::Checkpoint::renders_tools_block(&self.chat_template);
         Ok(())
     }
 }
