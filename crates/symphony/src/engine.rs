@@ -802,7 +802,27 @@ impl Engine {
             return;
         }
         let Some(next) = self.format.next(self.state, index) else {
+            // No row leads out on it: the marker is the state's text, as the model wrote it.
+            // Where that text is the table's own content, a `Malformed` event of no bytes stands
+            // before it, so a reader counts a frame the table did not read and no byte moves; in
+            // a thought the marker is the thought's text alone, as a table may read a thought's
+            // opener there (a turn anchor's table), and so it stays in a state a request's
+            // variant made content, where the table counted none (a thought's marker is the
+            // thought's text, a call's header the call's); where the template discards the
+            // state's text it is dropped as the text is. The run the stay holds (a lead, a
+            // trimmed tail) is the text's, as the marker's text would release it: released
+            // first, so the event stands right before the marker.
             let text = self.format.terminal_text(index).to_string();
+            if self.emits() == Emits::Content
+                && !self.format.is_framing(self.state)
+                && !self.format.is_remade(self.state)
+            {
+                self.release_stay(out);
+                out.push(Event::Malformed {
+                    text: self.tokens.text(""),
+                    why: MalformedReason::MarkerOutOfPlace,
+                });
+            }
             self.text(&text, out);
             return;
         };
@@ -1685,6 +1705,92 @@ mod tests {
             "<response>\nHi\n</response><think>More.</think>",
         ));
         assert_eq!([content, reasoning], ["Hi\n", "More."]);
+    }
+
+    #[test]
+    fn a_terminal_with_no_row_is_the_states_text_and_content_says_so() {
+        // In the answer, a marker the table has no row for stays as the model wrote it, and a
+        // `Malformed` event of no bytes before it says a frame was not read; in the thought it is
+        // the thought's text alone, as the opener read there is; where the template discards the
+        // text it is dropped as the text is.
+        let events = run_after(
+            ernie(),
+            "Assistant:",
+            "<think>Plan <think>more</think>\n<response>\nHi<response>\nthere</response></response>",
+        );
+        let [content, reasoning, dropped, malformed] = kinds(&events);
+        assert_eq!(content, "Hi<response>\nthere");
+        assert_eq!(reasoning, "<think>Plan <think>more");
+        assert_eq!(dropped, "</think>\n<response>\n</response></response>");
+        assert_eq!(malformed, "");
+        let said: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(at, event)| match event {
+                Event::Malformed { text, why } => {
+                    assert_eq!(*why, MalformedReason::MarkerOutOfPlace, "{event:?}");
+                    assert!(text.text.is_empty(), "{event:?}");
+                    Some(at)
+                }
+                _ => None,
+            })
+            .collect();
+        let [at] = said[..] else {
+            panic!("one event of no bytes, not {said:?}: {events:?}");
+        };
+        assert!(
+            matches!(&events[at + 1], Event::Content(text) if text.text.starts_with("<response>\n")),
+            "{events:?}"
+        );
+        // A request that does not separate reasoning reads the thought as content, and counts
+        // the same: the marker written again inside the answer, not the ones in the thought.
+        let variant = run_after(
+            ernie().without_reasoning(),
+            "Assistant:",
+            "<think>Plan <think>more</think>\n<response>\nHi<response>\nthere</response></response>",
+        );
+        assert_eq!(
+            variant
+                .iter()
+                .filter(|event| matches!(event, Event::Malformed { .. }))
+                .count(),
+            1,
+            "{variant:?}"
+        );
+        let variant = run_after(
+            ernie().without_reasoning(),
+            "Assistant:",
+            "<think>\nPlan.\n</think>\n<response>\nHi\n</response>",
+        );
+        assert!(
+            !variant
+                .iter()
+                .any(|event| matches!(event, Event::Malformed { .. })),
+            "{variant:?}"
+        );
+    }
+
+    #[test]
+    fn the_run_a_trimmed_stay_holds_comes_out_before_the_event_for_a_marker_with_no_row() {
+        // The thought's close with no thought open, in a trimmed content stay: the tail the stay
+        // held is the text's, as the marker's text would make it, released before the event of
+        // no bytes, so the event stands right before the marker.
+        let events = run_after(gemma_trimmed(), "<|turn>model\n", "Hi \n<channel|>there");
+        let [content, reasoning, dropped, malformed] = kinds(&events);
+        assert_eq!(content, "Hi \n<channel|>there");
+        assert_eq!([reasoning, dropped, malformed], ["", "", ""]);
+        let at = events
+            .iter()
+            .position(|event| matches!(event, Event::Malformed { .. }))
+            .expect("the event of no bytes");
+        assert!(
+            matches!(&events[at - 1], Event::Content(text) if text.text.ends_with(" \n")),
+            "{events:?}"
+        );
+        assert!(
+            matches!(&events[at + 1], Event::Content(text) if text.text.starts_with("<channel|>")),
+            "{events:?}"
+        );
     }
 
     #[test]

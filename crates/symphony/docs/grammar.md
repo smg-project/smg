@@ -101,6 +101,19 @@ and newlines the schema's grammar otherwise admits without end. LFM2.5's table b
 thirty-two, which leaves four-space indentation seven levels deep; the calls' values are never
 bounded.
 
+Where the thought is a message of its own before an answer that is another (Inkling's: the
+thought's close ends every message alike, and the next message's opener says what it is), and the
+prompt opens no thought, the tag admits the thought first, closed and the next message opened, and
+leaves the way into the answer optional (`Format::thought_message`). An engine that starts the
+grammar after its reasoning parser hands over at the answer's opener, not at the thought's close,
+and has consumed the way in when the grammar starts; one that starts at the first token writes it.
+The engine's start (`GrammarStart`) says where the grammar starts on a prompt that opens the
+thought; on one that opens none it tells the two apart only when it names the first token, when the
+way in is written outright: an engine that says it starts after its parser may gate on that parser
+whatever the prompt (one engine) or only when the request asks for reasoning (another), and the tag
+fits both. Before this, the tag wrote the way in as its `begin`, and an engine that had consumed
+the model's own opener forced it again: the answer reached the client as `<|content_text|>{...}`.
+
 Whether a thought comes before the call or the answer is the table's, not the syntax's: a table
 whose template writes the thought before every call and answer (`Format::thinks_first`) gets it
 written first, its opener, its text and its close, where the prompt has not opened it; every other

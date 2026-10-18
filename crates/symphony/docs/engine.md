@@ -107,6 +107,16 @@ is a later step).
   Face's null sink, the space around a response template's fields. Every byte of text there, a
   terminal with no row from the state and what the scanner held at the end included, is
   `Dropped { Wrapper }` at every finish; the state's rows still move the engine.
+- A terminal with no row from the state is the state's text, as the model wrote it (dropped where
+  the template discards the state's text). Where that text is the table's own content, a
+  `Malformed { MarkerOutOfPlace }` event of no bytes stands before it, so a reader counts a frame
+  the table did not read (an answer's opener written again inside the answer, a close with nothing
+  open) without a byte moving; in a thought the marker is the thought's text alone, as a table may
+  read a thought's opener as its text (a turn anchor's table), and so it stays in a state a
+  request's variant made content (`Format::is_remade`: the thought of a request that does not
+  separate reasoning, the calls of one without tools), where the table counted none: a thought
+  reads the same whether the request separates reasoning or not, and a call's header is the
+  call syntax's to judge; text in a wrapper state is malformed as text between calls, as before.
 - A table can trim a state's text stay by stay (`Format::trims`), as Hugging Face's `text` parser
   strips a field's value: whitespace before a stay's first other character is
   `Dropped { Whitespace }` as it arrives, and a run of it after the last one is held, with any

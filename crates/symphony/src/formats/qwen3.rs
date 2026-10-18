@@ -511,8 +511,20 @@ mod tests {
 
     #[test]
     fn a_closing_marker_with_nothing_open_is_content_and_a_fenced_marker_is_a_marker() {
+        // The close stays in the content where the model put it; the event of no bytes before it
+        // says the table read no frame there.
         let events = run(&["a</think>b"], EngineFinish::Stop);
-        assert_eq!(events[0], Event::Content(Text::uncounted("a</think>b")));
+        assert_eq!(
+            events[..3],
+            [
+                Event::Content(Text::uncounted("a")),
+                Event::Malformed {
+                    text: Text::uncounted(""),
+                    why: MalformedReason::MarkerOutOfPlace,
+                },
+                Event::Content(Text::uncounted("</think>b")),
+            ]
+        );
         let fenced = format!("The syntax is:\n```\n{CALL}\n```");
         let events = run(&[&fenced], EngineFinish::Stop);
         assert!(

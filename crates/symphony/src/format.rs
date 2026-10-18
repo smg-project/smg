@@ -339,6 +339,11 @@ struct State {
     kept: bool,
     /// The stream's stop closes the call open in the state (the stop row).
     closes_at_stop: bool,
+    /// A request's variant made the state content ([`Format::without_reasoning`],
+    /// [`Format::without_calls`]): a marker with no row out of it is its text and adds no
+    /// malformed run of its own, as the table the variant was made of added none there (a
+    /// thought's marker is the thought's text; a call's header is the call's to judge).
+    remade: bool,
 }
 
 /// What the replay of a prompt leaves ([`Format::replayed`]): the state the output starts in,
@@ -464,6 +469,7 @@ impl Format {
             trimmed: false,
             kept: false,
             closes_at_stop: false,
+            remade: false,
         });
         self
     }
@@ -749,7 +755,9 @@ impl Format {
     /// stay with it: a trimmed stay is still trimmed, a framing state's text still dropped; and a
     /// tag the end cut short is still dropped, as the legacy parsers drop it on both their paths.
     /// A table without a thought changes only in what it shows; the thought-first mark and the
-    /// layout, which serve the tags alone, go.
+    /// layout, which serve the tags alone, go. A marker with no row out of the thought's state is
+    /// its text and counts no malformed run, as in the table ([`Self::is_remade`]), so an output
+    /// counts the same whether the request separates reasoning or not.
     #[must_use]
     pub fn without_reasoning(mut self) -> Self {
         let calls = self.terminals_of_calls();
@@ -761,6 +769,7 @@ impl Format {
         for state in &mut self.states {
             if state.emits == Emits::Reasoning {
                 state.emits = Emits::Content;
+                state.remade = true;
             }
         }
         self.thinks_first = false;
@@ -784,7 +793,9 @@ impl Format {
     /// (Inkling's ended message), whose whitespace is the template's with or without tools. A
     /// table whose output starts in its calls (`json`, `xlam`, `forced`) becomes content from
     /// its first byte. A state's own text rows stay with it, as in [`Self::without_reasoning`].
-    /// A stop that closed a call closes nothing; the layout goes.
+    /// A stop that closed a call closes nothing; the layout goes. A marker with no row out of a
+    /// state made content here is its text and adds no malformed run of its own
+    /// ([`Self::is_remade`]): in the table the call's syntax reads it and says what it is.
     #[must_use]
     pub fn without_calls(mut self) -> Self {
         let frame = self.message_frame();
@@ -818,6 +829,7 @@ impl Format {
             if demoted[index] {
                 state.emits = Emits::Content;
                 state.closes_at_stop = false;
+                state.remade = true;
             }
         }
         self.calls = None;
@@ -1252,6 +1264,14 @@ impl Format {
     /// Whether the text of state `index` stands as written, whitespace alone included.
     pub(crate) fn is_kept(&self, index: usize) -> bool {
         self.states[index].kept
+    }
+
+    /// Whether a request's variant made state `index` content: the thought of a request that
+    /// does not separate reasoning ([`Self::without_reasoning`]), the calls of one without tools
+    /// ([`Self::without_calls`]). The engine counts no marker out of place there, as the table
+    /// counted none: a thought's marker is the thought's text, a call's header the call's.
+    pub(crate) fn is_remade(&self, index: usize) -> bool {
+        self.states[index].remade
     }
 
     /// What every table must hold before an engine runs it: a state to start in, which does not

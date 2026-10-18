@@ -71,8 +71,9 @@ start inside one, an ignored terminal would break its header, or a row from one 
 another's where the header may not match). The error text names the table and the row, so a table
 that fails is a programming error caught by the crate's tests, never a request's failure.
 
-**The engine.** A terminal with no row from the current state is text, as the model wrote it; a
-terminal with a row is `Dropped { Wrapper }` (or content, where a table's variant shows the markers
+**The engine.** A terminal with no row from the current state is text, as the model wrote it,
+and where that text is the table's own content a `Malformed { MarkerOutOfPlace }` event of no
+bytes says so; a terminal with a row is `Dropped { Wrapper }` (or content, where a table's variant shows the markers
 of a channel the request does not separate) and moves the engine. A call region the model closes
 early is closed for the client (an open string gets its quote, the object closes); a region the
 stream cuts is left open, so cut arguments never look complete. The whitespace a content stay begins

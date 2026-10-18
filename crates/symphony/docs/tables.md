@@ -284,6 +284,17 @@ What the table says beyond the others:
 - **The turn's end token is ignored.** The template writes `<|content_model_end_sampling|>`
   after the turn; an engine that passes it through has it dropped wherever it stands, inside
   a message's header or its call included, where its bytes keep their place.
+- **A JSON answer's tag leaves the way in to the engine.** The thought is a message of its own
+  and the answer another, so an engine that starts a grammar after its reasoning parser hands
+  over at `<|content_text|>`, not at the thought's `<|end_message|>`, which ends every message
+  alike. `Format::answer_grammar` writes the thought the model may write first (its message,
+  closed, and `<|message_model|>`), then `<|content_text|>` as optional, unless the engine says
+  it starts at the first token, then the schema and `<|end_message|>`: an engine that consumed the
+  model's own marker writes the JSON at once, one that starts before the thought writes the
+  marker itself. Before this, the tag's `begin` wrote the marker again after the model's own on
+  such an engine, and the answer came back as `<|content_text|>{...}`; the table reads that second
+  marker as the answer's text, where no row leads, and says so with a `Malformed` event of no
+  bytes (`MarkerOutOfPlace`), so a reader counts it.
 - **A forced call's tag is the gateway's.** `Format::grammar` writes the tag the gateway's old
   Inkling parser hand-writes: the call marker triggers it inside whatever message the model is
   writing, the first one included, then `{"name":"NAME","args":`, the schema, `}` and

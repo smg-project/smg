@@ -155,6 +155,11 @@ pub enum MalformedReason {
     BlockWithoutACompleteCall,
     /// Arguments with no forced function to name them.
     NoForcedFunction,
+    /// A marker of the table in a content state no row leads out of on it, kept as that state's
+    /// text where the model put it (an answer's opener written again inside the answer, a close
+    /// with nothing open). The event carries no bytes and stands before the marker's text: a frame
+    /// the table did not read is counted without a byte moving.
+    MarkerOutOfPlace,
 }
 
 impl MalformedReason {
@@ -191,6 +196,7 @@ impl MalformedReason {
                 "a tool-call block that closed without a complete call"
             }
             Self::NoForcedFunction => "arguments with no forced function to name them",
+            Self::MarkerOutOfPlace => "a marker of the table where no row leads, kept as text",
         }
     }
 }

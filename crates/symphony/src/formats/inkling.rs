@@ -294,7 +294,8 @@ mod tests {
     #[test]
     fn without_tools_a_recorded_json_answer_carries_no_message_framing() {
         // The second text marker stands inside the answer, where the table has no row for it,
-        // and is the answer's text as any marker out of place is; the message's framing is not.
+        // and is the answer's text as any marker out of place is, said by one `Malformed` event
+        // of no bytes before it; the message's framing is not.
         for pieces in [
             vec![RECORDED_JSON_ANSWER.to_string()],
             characters(RECORDED_JSON_ANSWER),
@@ -312,7 +313,15 @@ mod tests {
                 content.ends_with("\"population\": \"13.9 million\"}"),
                 "{content}"
             );
-            assert_eq!(malformed_count(&events), 0);
+            assert_eq!(malformed_count(&events), 1);
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    Event::Malformed { text, why: crate::event::MalformedReason::MarkerOutOfPlace }
+                        if text.text.is_empty()
+                )),
+                "{events:?}"
+            );
         }
     }
 
@@ -335,5 +344,244 @@ mod tests {
     #[test]
     fn the_table_validates() {
         inkling().validate().expect("a sound table");
+    }
+}
+
+/// The JSON answer of a request without tools, from the outputs a live cell recorded: what the
+/// table reads back of the answer tag's output, before and after the tag left the text marker to
+/// the engine ([`Format::answer_grammar`]).
+#[cfg(test)]
+mod answer_tests {
+    use super::*;
+    use crate::{
+        engine::Engine,
+        event::{Event, MalformedReason},
+        testing::{bytes, content, drive, reasoning},
+        Declared,
+    };
+
+    /// The generation prompt's tail: the turn's first message opened, and nothing more.
+    const PROMPT: &str = "<|message_model|>";
+
+    /// The thought of a recorded JSON-schema answer (a bug-report triage), as the model wrote it.
+    const TRIAGE_THOUGHT: &str = concat!(
+        "The user wants me to triage a bug report: \"A typo in the footer: ",
+        "Copyrigth.\"\n\nTriage means assessing severity, priority, category, and action ", // codespell:ignore copyrigth
+        "needed.\n\nLet's analyze:\n- Issue: Typo in footer text \"Copyrigth\" instead of ", // codespell:ignore copyrigth
+        "\"Copyright\"\n- Impact: Very low. Cosmetic/text error. Doesn't break functionality.\n- ",
+        "Severity: Trivial/Minor (cosmetic)\n- Priority: Low\n- Category: UI/Text/Copy\n- ",
+        "Action: Fix typo, likely quick win.\n\nI should provide a structured triage response ",
+        "with:\n- Severity/Impact\n- Priority\n- Category/Component\n- Notes/Recommendation\n- ",
+        "Maybe suggested fix\n\nKeep it concise and professional."
+    );
+
+    /// The answer the schema shaped, as recorded.
+    const TRIAGE_JSON: &str = concat!(
+        "{\"severity\": \"low\", \"summary\": \"Typo in footer: 'Copyrigth' should be ", // codespell:ignore copyrigth
+        "'Copyright'\", \"needs_followup\": true, \"owner\": \"frontend/content\"}"
+    );
+
+    /// The thought of a recorded `json_object` answer (facts about a city), as the model wrote it.
+    const CITY_THOUGHT: &str = concat!(
+        "The user asks: \"Give the facts about Nairobi.\" The system instruction says: \"Answer ",
+        "with a JSON object with the keys city, country and population.\"\n\nSo I need to ",
+        "provide facts about Nairobi, but specifically format the answer as a JSON object with ",
+        "keys: city, country, population.\n\nI should include the relevant values:\n- city: ",
+        "Nairobi\n- country: Kenya\n- population: approximately 4.4 million (city proper) or 5.3 ",
+        "million (metro). I should provide a common figure, maybe ~4.4 million (2023 estimate) ",
+        "or ~5.3 million for the greater area. Let's use a standard figure like 4,397,073 (2023 ",
+        "census) or approximate 4.4 million. To be safe, I can put \"4.4 million\" or the exact ",
+        "number. The instruction just says keys city, country and population. It doesn't specify ",
+        "exact format for population value, but JSON should have values. I can use a number or ",
+        "string. Let's use a number with approximate: 4397073 or \"approximately 4.4 million\". ",
+        "Since it's JSON, maybe string is safer for approximate, but number is fine. Let's ",
+        "provide \"4.4 million\" as string, or 4397073. Actually, the user asked \"Give the ",
+        "facts about Nairobi.\" The constraint is to answer with a JSON object with those keys. ",
+        "I should probably include only those keys? The instruction says \"Answer with a JSON ",
+        "object with the keys city, country and population.\" It implies the answer should be ",
+        "that JSON object. I will provide exactly that.\n\nLet's choose:\n{\n  \"city\": ",
+        "\"Nairobi\",\n  \"country\": \"Kenya\",\n  \"population\": 4397073\n}\n\nOr maybe ",
+        "include more context? The instruction is strict: \"Answer with a JSON object with the ",
+        "keys city, country and population.\" So I will output just the JSON.\n\nWait, is there ",
+        "any hidden instruction? The system message is just that. The user asks for facts. I ",
+        "must comply with the format.\n\nI'll provide:\n{\n  \"city\": \"Nairobi\",\n  ",
+        "\"country\": \"Kenya\",\n  \"population\": \"4.4 million (approx.)\"\n}\n\nBut to be ",
+        "precise, let's use the 2019 census figure: 4,397,073. Actually 2023 might be different. ",
+        "Let's use \"approximately 4.4 million\". As a JSON value, string is okay.\n\nI'll ",
+        "output:\n{\n  \"city\": \"Nairobi\",\n  \"country\": \"Kenya\",\n  \"population\": ",
+        "4397073\n}\n\nThis is clean."
+    );
+
+    /// The object the request asked for, as recorded.
+    const CITY_JSON: &str =
+        "{\n  \"city\": \"Nairobi\",\n  \"country\": \"Kenya\",\n  \"population\": 4397073\n}";
+
+    /// A recorded output: the thought's message, then the answer's with the text marker written
+    /// twice, as the answer tag had it before it left the marker to the engine: the engine
+    /// started the grammar after the model's own marker, and the tag's `begin` wrote it again.
+    fn recorded(thought: &str, json: &str) -> String {
+        format!(
+            "<|content_thinking|>{thought}<|end_message|><|message_model|><|content_text|>\
+             <|content_text|>{json}<|end_message|>"
+        )
+    }
+
+    /// `output` whole, and one character at a time.
+    fn chunkings(output: &str) -> [Vec<String>; 2] {
+        [
+            vec![output.to_string()],
+            output.chars().map(String::from).collect(),
+        ]
+    }
+
+    fn run(format: Format, pieces: &[String]) -> Vec<Event> {
+        let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
+        drive(
+            &mut Engine::new(format, Declared::default()),
+            PROMPT,
+            &pieces,
+        )
+    }
+
+    /// The `Malformed` events, as (reason, bytes) pairs.
+    fn malformed(events: &[Event]) -> Vec<(MalformedReason, &str)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Malformed { text, why } => Some((*why, text.text.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_recorded_answer_whose_text_marker_was_written_twice_keeps_its_bytes_and_says_so() {
+        // The second marker stands inside the answer, where no row leads: it is the answer's
+        // text, as any marker out of place is, and the event of no bytes before it counts the
+        // frame the table did not read; the framing around it is read and dropped as always.
+        for (thought, json) in [(TRIAGE_THOUGHT, TRIAGE_JSON), (CITY_THOUGHT, CITY_JSON)] {
+            let output = recorded(thought, json);
+            for pieces in chunkings(&output) {
+                let events = run(inkling(), &pieces);
+                assert_eq!(bytes(&events), output);
+                assert_eq!(reasoning(&events), thought);
+                assert_eq!(content(&events), format!("<|content_text|>{json}"));
+                assert_eq!(
+                    malformed(&events),
+                    [(MalformedReason::MarkerOutOfPlace, "")],
+                    "{events:?}"
+                );
+                let at = events
+                    .iter()
+                    .position(|event| matches!(event, Event::Malformed { .. }))
+                    .expect("the event");
+                assert!(
+                    matches!(&events[at + 1], Event::Content(text) if text.text.starts_with("<|content_text|>")),
+                    "{events:?}"
+                );
+                assert!(matches!(
+                    events.last(),
+                    Some(Event::Finish { tool_calls: 0, .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn without_tools_the_second_text_marker_is_said_the_same() {
+        // The variant a request without tools reads with keeps the bytes and says so too.
+        let output = recorded(TRIAGE_THOUGHT, TRIAGE_JSON);
+        for pieces in chunkings(&output) {
+            let events = run(inkling().without_calls(), &pieces);
+            assert_eq!(bytes(&events), output);
+            assert_eq!(reasoning(&events), TRIAGE_THOUGHT);
+            let content = content(&events);
+            assert!(
+                content.contains(&format!("<|content_text|>{TRIAGE_JSON}")),
+                "{content}"
+            );
+            assert_eq!(
+                malformed(&events),
+                [(MalformedReason::MarkerOutOfPlace, "")],
+                "{events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_text_marker_after_whitespace_is_said_right_before_it() {
+        // The whitespace the answer's stay holds before its first text is the text's once the
+        // marker follows: it comes out first, then the event of no bytes, then the marker, whole
+        // and one character at a time; so the event stands where the marker does.
+        let output = "<|content_text|>\n<|content_text|>{}<|end_message|>";
+        for pieces in chunkings(output) {
+            let events = run(inkling(), &pieces);
+            assert_eq!(bytes(&events), output);
+            assert_eq!(content(&events), "\n<|content_text|>{}");
+            assert_eq!(
+                malformed(&events),
+                [(MalformedReason::MarkerOutOfPlace, "")]
+            );
+            let at = events
+                .iter()
+                .position(|event| matches!(event, Event::Malformed { .. }))
+                .expect("the event");
+            assert!(
+                matches!(&events[at - 1], Event::Content(text) if text.text == "\n"),
+                "{events:?}"
+            );
+            assert!(
+                matches!(&events[at + 1], Event::Content(text) if text.text.starts_with("<|content_text|>")),
+                "{events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_tools_a_marker_in_the_header_is_no_marker_out_of_place() {
+        // The header is a state the no-tools variant made content: a marker with no row out of
+        // it is its text and adds no count of its own; the table feeds it to the call's header,
+        // which says what it is.
+        let output = "<|message_model|><|content_text|>Hi<|end_message|>";
+        for pieces in chunkings(output) {
+            let events = run(inkling().without_calls(), &pieces);
+            assert_eq!(bytes(&events), output);
+            assert_eq!(malformed(&events), []);
+            assert_eq!(
+                malformed(&run(inkling(), &pieces)),
+                [(MalformedReason::NameWithoutACall, "<|message_model|>")],
+                "the table feeds the marker to the call's header"
+            );
+        }
+    }
+
+    #[test]
+    fn the_answer_the_tag_leaves_the_model_reads_as_the_bare_answer() {
+        // What the tag admits once the marker is the engine's to write or to have consumed: the
+        // thought first or not, one text marker, the JSON, the message's close; each reads as the
+        // bare answer, whole and one character at a time.
+        let thought =
+            format!("<|content_thinking|>{TRIAGE_THOUGHT}<|end_message|><|message_model|>");
+        for (output, json) in [
+            (
+                format!("{thought}<|content_text|>{TRIAGE_JSON}<|end_message|>"),
+                TRIAGE_JSON,
+            ),
+            (
+                format!("<|content_text|>{CITY_JSON}<|end_message|>"),
+                CITY_JSON,
+            ),
+        ] {
+            for pieces in chunkings(&output) {
+                let events = run(inkling(), &pieces);
+                assert_eq!(bytes(&events), output);
+                assert_eq!(content(&events), json);
+                assert_eq!(malformed(&events), []);
+                assert!(matches!(
+                    events.last(),
+                    Some(Event::Finish { tool_calls: 0, .. })
+                ));
+            }
+        }
     }
 }
