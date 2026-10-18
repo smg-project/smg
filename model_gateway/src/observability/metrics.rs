@@ -549,7 +549,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_pd_rendezvous_failures_total",
-        "PD rendezvous failures by leg (the worker type of the leg whose rendezvous failed) and phase: a bootstrap port that refused the registration probe (probe) or the same probe run when a decode leg's engine failed a request without a reason (request, on the prefill leg whose port it is), and the failures the engines report on the gRPC path when the legs never met (bootstrap) or the KV handoff after they met failed (transfer)"
+        "PD rendezvous failures by side (the worker type of the side whose rendezvous failed) and phase: a bootstrap port that refused the registration probe (probe) or the same probe run when a decode side's engine failed a request without a reason (request, on the prefill side whose port it is), and the failures the engines report on the gRPC path when the sides never met (bootstrap) or the KV handoff after they met failed (transfer)"
     );
     describe_counter!(
         "smg_pd_kv_transfer_failures_total",

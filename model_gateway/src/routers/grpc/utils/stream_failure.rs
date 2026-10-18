@@ -350,7 +350,7 @@ impl StreamSource {
         self
     }
 
-    /// `failure` explained, when the gateway can explain it: the decode leg
+    /// `failure` explained, when the gateway can explain it: the decode side
     /// of a disaggregated pair the engine failed before its first token, with
     /// no reason of its own, is read against the pair's bootstrap port,
     /// probed now (see [`dead_rendezvous_of`]). The failure with the dead
@@ -414,8 +414,8 @@ impl StreamSource {
                 bootstrap_port = port.port,
                 bootstrap_port_source = port.source.label(),
                 probe_error = %port.error,
-                "Stream ended by the engine before completion, and the prefill leg's bootstrap \
-                 port did not accept a connection: the legs could not rendezvous: {}",
+                "Stream ended by the engine before completion, and the prefill side's bootstrap \
+                 port did not accept a connection: the sides could not rendezvous: {}",
                 status.message()
             ),
             None => warn!(
@@ -462,7 +462,7 @@ impl StreamSource {
 /// End a failed streaming response: the accounting, then the SSE error event
 /// typed for the failure (the caller's `[DONE]` follows). A client that has
 /// already gone is told nothing, and a failure of the gateway's own processing
-/// is logged only when there was a client to fail. A decode leg the engine
+/// is logged only when there was a client to fail. A decode side the engine
 /// failed without a reason is first read against the pair's bootstrap port
 /// (see [`StreamSource::explain`]), so the line, the counts and the event
 /// name the dead rendezvous when there is one.
@@ -918,7 +918,7 @@ mod tests {
         port
     }
 
-    /// A prefill leg on the loopback host whose partners are handed `port`,
+    /// A prefill side on the loopback host whose partners are handed `port`,
     /// its breaker opening on the first failure like [`worker`]'s.
     fn prefill_on(port: u16) -> Arc<dyn Worker> {
         Arc::new(
@@ -934,8 +934,8 @@ mod tests {
         )
     }
 
-    /// The source of a disaggregated chat answer whose prefill leg is
-    /// `prefill`, with the decode leg it is read from.
+    /// The source of a disaggregated chat answer whose prefill side is
+    /// `prefill`, with the decode side it is read from.
     fn pd_source_with(prefill: Arc<dyn Worker>) -> (StreamSource, Arc<dyn Worker>) {
         let decode = worker();
         let selection = WorkerSelection::Disaggregated {
@@ -955,13 +955,13 @@ mod tests {
         StreamFailure::upstream(tonic::Status::internal(ENGINE_ERROR_MESSAGE), 0)
     }
 
-    /// A decode leg the engine failed before its first token, with no reason
-    /// of its own, behind a prefill leg whose bootstrap port nothing listens
+    /// A decode side the engine failed before its first token, with no reason
+    /// of its own, behind a prefill side whose bootstrap port nothing listens
     /// on: the failure is explained by the dead port, the client's message
     /// names it after the engine's report, the class stays the engine's
     /// error (the decode worker's breaker and error family, the router
     /// family), and the rendezvous family counts it under the request phase
-    /// on the prefill leg.
+    /// on the prefill side.
     #[tokio::test]
     async fn a_decode_leg_failed_before_its_first_token_is_explained_by_the_dead_bootstrap_port() {
         let (source, decode) = pd_source_with(prefill_on(closed_port()));
@@ -987,9 +987,9 @@ mod tests {
         let message = explained.to_string();
         assert!(
             message.starts_with(&format!(
-                "Stream error: {ENGINE_ERROR_MESSAGE}; the prefill leg's bootstrap port did not \
+                "Stream error: {ENGINE_ERROR_MESSAGE}; the prefill side's bootstrap port did not \
                  accept a connection ("
-            )) && message.ends_with("), so the legs could not rendezvous"),
+            )) && message.ends_with("), so the sides could not rendezvous"),
             "{message}"
         );
         assert_eq!(explained.error_type(), "stream_error");
@@ -1028,8 +1028,8 @@ mod tests {
     }
 
     /// Nothing explains a failure that is not a reasonless report of the
-    /// decode leg before its first token: a port that accepts, a leg past
-    /// its first token, the prefill leg's own failure, a status with the
+    /// decode side before its first token: a port that accepts, a side past
+    /// its first token, the prefill side's own failure, a status with the
     /// engine's words, a single worker. Each keeps its message, and the
     /// rendezvous family counts no request phase.
     #[tokio::test]

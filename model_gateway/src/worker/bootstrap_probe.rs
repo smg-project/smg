@@ -34,8 +34,8 @@ pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const PROBE_PHASE: &str = "probe";
 
 /// The `phase` label the same probe counts under when the request path runs
-/// it: a decode leg's engine failed the request without a reason, and the
-/// port that leg had to reach, its prefill partner's, did not accept a
+/// it: a decode side's engine failed the request without a reason, and the
+/// port that side had to reach, its prefill partner's, did not accept a
 /// connection (see `routers::grpc::utils::pd_bootstrap`).
 pub(crate) const REQUEST_PHASE: &str = "request";
 
@@ -119,8 +119,9 @@ pub(crate) fn effective_bootstrap_port(worker: &dyn Worker) -> Option<(u16, Boot
     default_applies.then_some((DEFAULT_BOOTSTRAP_PORT, BootstrapPortSource::Default))
 }
 
-/// The address the partners of `worker` are handed: the host the leg was
-/// registered under and the port of [`effective_bootstrap_port`], with where
+/// The address the probes check for `worker`: the host the side was
+/// registered under and the port of [`effective_bootstrap_port`] (the one it
+/// was registered with, or the default its partners are handed), with where
 /// the port came from. `None` for a worker no partner is handed a port for,
 /// or whose transport carries no host.
 fn partners_bootstrap_address(worker: &dyn Worker) -> Option<(String, u16, BootstrapPortSource)> {
@@ -129,14 +130,34 @@ fn partners_bootstrap_address(worker: &dyn Worker) -> Option<(String, u16, Boots
     (!host.is_empty()).then(|| (host.to_string(), port, source))
 }
 
+/// Whether the port of [`effective_bootstrap_port`] is one the request path
+/// hands the decode partner of `worker`. A vLLM prefill side's is on the
+/// Mooncake connector alone, whose decode-side `remote_bootstrap_addr` is
+/// minted with it: a port registered on a side whose connector carries its own
+/// side channel (NIXL, MoRI-IO) or meets its partners in a store plays no
+/// part in the handoff, so it is the registration probe's concern alone and
+/// never turns a request's failure into a rendezvous failure. Every other
+/// side's port is handed whenever one is.
+fn handed_on_the_request_path(worker: &dyn Worker) -> bool {
+    let spec = &worker.metadata().spec;
+    !(matches!(worker.worker_type(), WorkerType::Prefill)
+        && matches!(spec.runtime_type, RuntimeType::Vllm)
+        && spec.kv_connector.as_deref() != Some(MOONCAKE_CONNECTOR))
+}
+
 /// Probe, now, the bootstrap port the partners of `worker` are handed: the
-/// registration probe's port decision, connection and bound, run by the
-/// request path once a leg has failed. `None` for a worker that is not
-/// probed (see [`partners_bootstrap_address`]); otherwise whether the port
+/// registration probe's connection and bound, run by the request path once a
+/// side has failed, on a port the request path really hands the decode
+/// partner. `None` for a worker that is not probed (see
+/// [`partners_bootstrap_address`]) or whose port is not handed on the request
+/// path (see [`handed_on_the_request_path`]); otherwise whether the port
 /// accepted the connection, with the port and the error when it did not.
 pub(crate) async fn probe_partners_bootstrap_port(
     worker: &dyn Worker,
 ) -> Option<Result<(), DeadBootstrapPort>> {
+    if !handed_on_the_request_path(worker) {
+        return None;
+    }
     let (host, port, source) = partners_bootstrap_address(worker)?;
     let probed = probe_bootstrap_port(&host, port, PROBE_TIMEOUT).await;
     Some(probed.map_err(|error| DeadBootstrapPort {
@@ -473,7 +494,7 @@ mod tests {
         );
     }
 
-    /// A prefill leg on the loopback host, registered with `bootstrap_port`.
+    /// A prefill side on the loopback host, registered with `bootstrap_port`.
     fn loopback_prefill(bootstrap_port: u16) -> impl Worker {
         BasicWorkerBuilder::new("grpc://127.0.0.1:30000")
             .worker_type(WorkerType::Prefill)
@@ -482,15 +503,67 @@ mod tests {
             .build()
     }
 
-    /// The request path's probe of a leg's port: a port nothing listens on
+    /// A loopback prefill side of one runtime and connector, registered with a
+    /// bootstrap port.
+    fn loopback_leg(runtime: RuntimeType, kv_connector: Option<&str>, port: u16) -> impl Worker {
+        let mut builder = BasicWorkerBuilder::new("grpc://127.0.0.1:30000")
+            .worker_type(WorkerType::Prefill)
+            .runtime_type(runtime)
+            .bootstrap_port(Some(port));
+        if let Some(connector) = kv_connector {
+            builder = builder.kv_connector(connector);
+        }
+        builder.build()
+    }
+
+    /// A port the request path does not hand the decode partner is not
+    /// probed for a request, whatever port the side was registered with: a
+    /// vLLM prefill side on a connector with its own side channel, or on none.
+    /// The registration probe keeps the operator's port for it. The Mooncake
+    /// side's port, and a runtime's whose rendezvous travels in the request,
+    /// are probed.
+    #[tokio::test]
+    async fn a_port_the_request_path_does_not_hand_is_not_probed_for_a_request() {
+        let port = closed_port();
+        for connector in [None, Some("NixlConnector"), Some("MoRIIOConnector")] {
+            let worker = loopback_leg(RuntimeType::Vllm, connector, port);
+            assert_eq!(
+                effective_bootstrap_port(&worker),
+                Some((port, BootstrapPortSource::Registered)),
+                "{connector:?}"
+            );
+            assert_eq!(
+                probe_partners_bootstrap_port(&worker).await,
+                None,
+                "{connector:?}"
+            );
+        }
+        for (runtime, connector) in [
+            (RuntimeType::Vllm, Some(MOONCAKE_CONNECTOR)),
+            (RuntimeType::Sglang, None),
+            (RuntimeType::TokenSpeed, None),
+        ] {
+            let dead = probe_partners_bootstrap_port(&loopback_leg(runtime, connector, port))
+                .await
+                .expect("the port is handed on the request path")
+                .expect_err("nothing listens there");
+            assert_eq!(
+                (dead.port, dead.source),
+                (port, BootstrapPortSource::Registered),
+                "{runtime} {connector:?}"
+            );
+        }
+    }
+
+    /// The request path's probe of a side's port: a port nothing listens on
     /// is the dead port, with its address and the error; a listening one
-    /// accepted; a leg no partner is handed a port for is not probed.
+    /// accepted; a side no partner is handed a port for is not probed.
     #[tokio::test]
     async fn the_partners_port_probe_names_a_dead_port_and_passes_a_live_one() {
         let port = closed_port();
         let dead = probe_partners_bootstrap_port(&loopback_prefill(port))
             .await
-            .expect("a prefill leg is probed")
+            .expect("a prefill side is probed")
             .expect_err("nothing listens there");
         assert_eq!(
             (dead.host.as_str(), dead.port, dead.source),

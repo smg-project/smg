@@ -27,7 +27,7 @@ use crate::{
 const REQUEST_ID: &str = "chatcmpl-failure";
 const PREFILL_URL: &str = "grpc://prefill-1:30000";
 const DECODE_URL: &str = "grpc://decode-1:30000";
-/// A prefill leg on the loopback host, whose bootstrap port a test can hold
+/// A prefill side on the loopback host, whose bootstrap port a test can hold
 /// or leave closed.
 const LOOPBACK_PREFILL_URL: &str = "grpc://127.0.0.1:30000";
 
@@ -65,7 +65,7 @@ fn pd_source() -> StreamSource {
     pd_source_with(worker(PREFILL_URL))
 }
 
-/// The accounting source of a disaggregated dispatch whose prefill leg is
+/// The accounting source of a disaggregated dispatch whose prefill side is
 /// `prefill`.
 fn pd_source_with(prefill: Arc<dyn Worker>) -> StreamSource {
     let selection = WorkerSelection::Disaggregated {
@@ -78,7 +78,7 @@ fn pd_source_with(prefill: Arc<dyn Worker>) -> StreamSource {
         .with_backend(metrics_labels::BACKEND_PD)
 }
 
-/// The prefill leg on the loopback host, registered with `bootstrap_port`.
+/// The prefill side on the loopback host, registered with `bootstrap_port`.
 fn loopback_prefill(bootstrap_port: u16) -> Arc<dyn Worker> {
     Arc::new(
         BasicWorkerBuilder::new(LOOPBACK_PREFILL_URL)
@@ -100,7 +100,7 @@ fn closed_port() -> u16 {
     port
 }
 
-/// The decode leg of a disaggregated chat answer, ended by the engine's own
+/// The decode side of a disaggregated chat answer, ended by the engine's own
 /// report before its first token, as the streaming layer reports it.
 fn decode_leg_failed_before_its_first_token(rt: &tokio::runtime::Runtime) -> StreamFailure {
     let failure = rt.block_on(stream_pd(
@@ -278,12 +278,12 @@ fn a_decode_side_the_engine_fails_is_an_engine_error_of_the_decode_worker() {
     });
 }
 
-/// A decode leg the engine fails before its first token, with no reason of
-/// its own, behind a prefill leg whose bootstrap port nothing listens on: the
+/// A decode side the engine fails before its first token, with no reason of
+/// its own, behind a prefill side whose bootstrap port nothing listens on: the
 /// client's error event keeps its type and names the dead rendezvous after
 /// the engine's report, the WARN names the port, the failure stays the
 /// decode worker's engine error, and the rendezvous family counts it under
-/// the request phase on the prefill leg.
+/// the request phase on the prefill side.
 #[test]
 #[traced_test]
 fn a_decode_leg_failed_before_its_first_token_names_the_pairs_dead_bootstrap_port() {
@@ -296,9 +296,9 @@ fn a_decode_leg_failed_before_its_first_token_names_the_pairs_dead_bootstrap_por
     let message = event["error"]["message"].as_str().unwrap_or_default();
     assert!(
         message.starts_with(&format!(
-            "Stream error: {ENGINE_ERROR_MESSAGE}; the prefill leg's bootstrap port did not \
+            "Stream error: {ENGINE_ERROR_MESSAGE}; the prefill side's bootstrap port did not \
              accept a connection ("
-        )) && message.ends_with("), so the legs could not rendezvous"),
+        )) && message.ends_with("), so the sides could not rendezvous"),
         "{message}"
     );
     assert!(
@@ -330,7 +330,7 @@ fn a_decode_leg_failed_before_its_first_token_names_the_pairs_dead_bootstrap_por
             &[r#"worker_type="decode""#, r#"error_type="engine_error""#],
         )
         .is_some_and(|line| line.ends_with(" 1")),
-        "the decode leg carries the failure:\n{rendered}"
+        "the decode side carries the failure:\n{rendered}"
     );
     let port_field = format!("bootstrap_port={port}");
     logs_assert(|lines: &[&str]| {

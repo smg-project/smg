@@ -218,9 +218,10 @@ fn stream_failed(
 /// Collect all `Complete` frames of a gRPC stream; chunks carry nothing a
 /// collected answer needs. `side` names the disaggregated side the stream
 /// belongs to, whose rendezvous failures are counted before they become the
-/// client's answer: the engine's words by phase, and, for a decode leg the
-/// engine failed without a reason, the `prefill` leg's bootstrap port probed
-/// now (see [`dead_rendezvous_of`]); a single worker's stream has none. A
+/// client's answer: the engine's words by phase, and, for a decode side the
+/// engine failed without a reason before anything was read from its stream,
+/// the `prefill` side's bootstrap port probed now (see [`dead_rendezvous_of`]);
+/// a single worker's stream has none. A
 /// failed stream is not marked completed, so its drop sends the abort.
 async fn collect_stream_responses<S: FanoutChild>(
     stream: &mut S,
@@ -237,7 +238,10 @@ async fn collect_stream_responses<S: FanoutChild>(
                 let rendezvous = match side {
                     Some(side) => {
                         account_pd_side_failure(side, &status);
-                        if side == metrics_labels::WORKER_DECODE {
+                        // Before anything was read from the decode stream, as the
+                        // streamed path reads it before its first token: once a
+                        // response came, the sides met.
+                        if side == metrics_labels::WORKER_DECODE && all_responses.is_empty() {
                             dead_rendezvous_of(prefill, &status).await
                         } else {
                             None
@@ -292,6 +296,7 @@ mod tests {
     };
 
     use axum::http::StatusCode;
+    use smg_grpc_client::sglang_proto as sglang;
 
     use super::*;
     use crate::{
@@ -320,6 +325,32 @@ mod tests {
 
     impl FanoutChild for FailingStream {
         async fn next_item(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+            self.0.take().map(Err)
+        }
+
+        fn mark_completed(&mut self) {}
+
+        fn defer_abort_until_first_item(self) -> Self {
+            self
+        }
+    }
+
+    /// A stream that yields one `Complete`, then the engine's report.
+    struct CompleteThenFailing(Option<tonic::Status>, bool);
+
+    impl FanoutChild for CompleteThenFailing {
+        async fn next_item(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+            if !self.1 {
+                self.1 = true;
+                return Some(Ok(ProtoGenerateResponse::Sglang(Box::new(
+                    sglang::GenerateResponse {
+                        response: Some(sglang::generate_response::Response::Complete(
+                            sglang::GenerateComplete::default(),
+                        )),
+                        ..Default::default()
+                    },
+                ))));
+            }
             self.0.take().map(Err)
         }
 
@@ -406,6 +437,58 @@ mod tests {
                 && counted[0].contains(r#"phase="bootstrap""#)
                 && counted[0].ends_with(" 1"),
             "{rendered}"
+        );
+    }
+
+    /// The engine's reasonless report after a `Complete` already came from
+    /// the decode stream (a later choice of an `n > 1` request) is the
+    /// engine's report alone: the sides met, so the port is not probed and
+    /// nothing is counted under the request phase, dead port or not.
+    #[tokio::test]
+    async fn a_decode_leg_failed_after_a_response_came_keeps_the_engines_report() {
+        let dead = {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("address").port();
+            drop(listener);
+            port
+        };
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:30000")
+                .worker_type(WorkerType::Prefill)
+                .connection_mode(ConnectionMode::Grpc)
+                .bootstrap_port(Some(dead))
+                .build(),
+        );
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let answer = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            collect_stream_responses(
+                &mut CompleteThenFailing(
+                    Some(tonic::Status::internal(ENGINE_ERROR_MESSAGE)),
+                    false,
+                ),
+                "Decode",
+                Some(metrics_labels::WORKER_DECODE),
+                Some(&prefill),
+            )
+            .await
+            .err()
+            .expect("the failure becomes the answer")
+        };
+        assert_eq!(
+            answer
+                .headers()
+                .get("X-SMG-Error-Code")
+                .and_then(|code| code.to_str().ok()),
+            Some("worker_stream_failed")
+        );
+        let rendered = handle.render();
+        assert!(
+            !rendered
+                .lines()
+                .any(|line| line.starts_with("smg_pd_rendezvous_failures_total{")),
+            "nothing is probed once a response came:\n{rendered}"
         );
     }
 

@@ -1699,7 +1699,12 @@ impl StreamingProcessor {
                         .await;
 
                     if let Err(failure) = result {
-                        source.account(&failure);
+                        // A decode side the engine failed without a reason is read against
+                        // the pair's bootstrap port first, as the chat event is (see
+                        // `StreamSource::explain`), so the event names a dead rendezvous.
+                        let explained = source.explain(&failure).await;
+                        let failure = explained.as_ref().unwrap_or(&failure);
+                        source.account(failure);
                         let error_event = MessageStreamEvent::Error {
                             error: messages::ErrorResponse {
                                 error_type: failure.messages_error_type().to_string(),
