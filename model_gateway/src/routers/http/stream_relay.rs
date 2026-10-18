@@ -249,3 +249,94 @@ where
     }
     response
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::http::{HeaderMap, StatusCode};
+    use bytes::Bytes;
+    use futures_util::stream;
+    use http_body_util::BodyExt;
+
+    use super::{relay_streaming_body, ChunkMode, ChunkStep, Relay};
+    use crate::{
+        routers::http::stream_failure::RelaySource,
+        worker::{BasicWorkerBuilder, Worker, WorkerLoadGuard},
+    };
+
+    /// The frames the client gets when the upstream yields `chunks` through
+    /// the relay in `mode`.
+    async fn frames_through(chunks: Vec<&'static [u8]>, mode: ChunkMode) -> Vec<Bytes> {
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("http://127.0.0.1:1").build());
+        let upstream = stream::iter(
+            chunks
+                .into_iter()
+                .map(|chunk| Ok::<_, reqwest::Error>(Bytes::from_static(chunk))),
+        );
+        let response = relay_streaming_body(
+            upstream,
+            Relay {
+                status: StatusCode::OK,
+                upstream_sse: true,
+                source: RelaySource::new("m", "/v1/chat/completions", Arc::clone(&worker)),
+                guard: WorkerLoadGuard::new(worker, None),
+                headers: HeaderMap::new(),
+                mode,
+            },
+        );
+        let mut body = response.into_body();
+        let mut frames = Vec::new();
+        while let Some(frame) = body.frame().await {
+            if let Ok(data) = frame.expect("a relayed frame").into_data() {
+                frames.push(data);
+            }
+        }
+        frames
+    }
+
+    /// An empty upstream chunk becomes no frame at all, on the plain path and
+    /// through the decode leg's hook alike; the bytes around it are relayed as
+    /// they came.
+    #[tokio::test]
+    async fn an_empty_upstream_chunk_is_no_frame_toward_the_client() {
+        let chunks: Vec<&'static [u8]> = vec![b"data: a\n\n", b"", b"data: [DONE]\n\n"];
+        let plain = frames_through(chunks.clone(), ChunkMode::Plain).await;
+        assert_eq!(
+            plain,
+            [
+                Bytes::from_static(b"data: a\n\n"),
+                Bytes::from_static(b"data: [DONE]\n\n")
+            ]
+        );
+
+        let hook: Box<dyn FnMut(Bytes) -> ChunkStep + Send> = Box::new(|bytes: Bytes| ChunkStep {
+            last: bytes.as_ref() == b"data: [DONE]\n\n",
+            bytes,
+        });
+        let hooked = frames_through(chunks, ChunkMode::Hook(hook)).await;
+        assert_eq!(hooked, plain);
+    }
+
+    /// The hook's `last` ends the relay: a chunk after it is not read.
+    #[tokio::test]
+    async fn the_hooks_last_chunk_ends_the_relay() {
+        let hook: Box<dyn FnMut(Bytes) -> ChunkStep + Send> = Box::new(|bytes: Bytes| ChunkStep {
+            last: bytes.as_ref() == b"data: [DONE]\n\n",
+            bytes,
+        });
+        let frames = frames_through(
+            vec![b"data: a\n\n", b"data: [DONE]\n\n", b"data: after\n\n"],
+            ChunkMode::Hook(hook),
+        )
+        .await;
+        assert_eq!(
+            frames,
+            [
+                Bytes::from_static(b"data: a\n\n"),
+                Bytes::from_static(b"data: [DONE]\n\n")
+            ]
+        );
+    }
+}
