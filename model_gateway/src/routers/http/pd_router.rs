@@ -344,19 +344,12 @@ impl PDRouter {
         let url = format!("{}/{endpoint}", worker.url());
         let mut request_builder = worker.http_client().get(&url);
 
-        // The caller's headers as copied, and the worker's configured key when
-        // the caller sent no credential (this route sits outside the auth
-        // middleware, so a caller's header travels as it did).
-        let mut callers_credential = false;
+        // A public route outside the auth middleware: the caller's headers go
+        // as they are and nothing is added (a configured worker key here would
+        // authenticate an anonymous caller as the worker).
         if let Some(headers) = headers {
             for (name, value) in headers {
-                callers_credential |= name.eq_ignore_ascii_case("authorization");
                 request_builder = request_builder.header(name, value);
-            }
-        }
-        if !callers_credential {
-            if let Some(key) = worker.api_key() {
-                request_builder = request_builder.bearer_auth(key);
             }
         }
 
@@ -3221,6 +3214,61 @@ mod tests {
                 .get("x-request-id")
                 .and_then(|v| v.to_str().ok()),
             Some("r-1")
+        );
+    }
+
+    /// A public GET (the routes outside the auth middleware) adds no
+    /// credential of its own: an anonymous caller behind a key-protected
+    /// gateway reaches a keyed worker with no `Authorization`, and a caller's
+    /// own header goes as it is.
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn a_public_get_adds_no_credential_for_an_anonymous_caller() {
+        let seen: Arc<std::sync::Mutex<Vec<Option<String>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let app = axum::Router::new().fallback(axum::routing::any(move |req: Request| {
+            let log = Arc::clone(&log);
+            async move {
+                let authorization = req
+                    .headers()
+                    .get(AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                log.lock().unwrap().push(authorization);
+                ([(CONTENT_TYPE, "application/json")], "{}")
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(format!("http://{addr}"))
+                .worker_type(WorkerType::Prefill)
+                .api_key("worker-key")
+                .build(),
+        );
+
+        let anonymous = PDRouter::proxy_to_worker(&worker, "get_server_info", None).await;
+        assert_eq!(anonymous.status(), StatusCode::OK);
+        let own = PDRouter::proxy_to_worker(
+            &worker,
+            "get_server_info",
+            Some(vec![(
+                "authorization".to_string(),
+                "Bearer callers-own-key".to_string(),
+            )]),
+        )
+        .await;
+        assert_eq!(own.status(), StatusCode::OK);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![None, Some("Bearer callers-own-key".to_string())]
         );
     }
 

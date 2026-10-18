@@ -7,16 +7,19 @@
 //!
 //! A bearer that is one of the gateway's own keys ends here: once the caller
 //! is identified ([`DataPlaneCaller`]) the `Authorization` header is removed
-//! from the request, so no route behind this middleware reads the gateway's
-//! key as the caller's credential for an upstream. Those upstreams (a
-//! self-hosted worker, a third-party provider) get their own configured key,
-//! as they do for a request that carried no header: the HTTP and PD routers'
-//! legs, the external providers and the public GET proxies all apply the
-//! caller's header, else the configured key; an upstream configured without
-//! a key is reached with none. A bearer that is not a gateway key is refused
-//! before that, so a request that reaches a route with its `Authorization`
-//! still on it was not authenticated by this middleware (auth disabled, or a
-//! public route outside it, which forwards the caller's header as it did).
+//! from the request, and so is the same key presented under a provider's own
+//! header name (`x-api-key`, `x-goog-api-key`), so no route behind this
+//! middleware reads the gateway's key as the caller's credential for an
+//! upstream. Those upstreams (a self-hosted worker, a third-party provider)
+//! get their own configured key, as they do for a request that carried no
+//! header: the HTTP and PD routers' legs and the external providers apply
+//! the caller's header, else the configured key; an upstream configured
+//! without a key is reached with none. A bearer that is not a gateway key is
+//! refused before that, so a request that reaches a route with its
+//! `Authorization` still on it was not authenticated by this middleware (auth
+//! disabled). The public GET proxies (model and server info, the health
+//! probe) sit outside it: they forward the caller's header as they did and
+//! add no credential of their own, since there "no header" means anonymous.
 
 use std::collections::HashMap;
 
@@ -94,6 +97,11 @@ fn hash_key(key: &str) -> [u8; 32] {
     Sha256::digest(key.as_bytes()).into()
 }
 
+/// The header names a provider reads its own key from, which an SDK may fill
+/// with the gateway's key beside the bearer (`x-api-key` for the Messages
+/// API's providers, `x-goog-api-key` for Gemini's).
+const PROVIDER_KEY_HEADERS: [&str; 2] = ["x-api-key", "x-goog-api-key"];
+
 /// Middleware to validate Bearer token against configured API key(s).
 /// Only active when the router has at least one key configured. A matched
 /// key leaves the request with the caller's identity in its place (see the
@@ -132,8 +140,20 @@ pub async fn auth_middleware(
             .extensions_mut()
             .insert(DataPlaneCaller::new(tenant_key.clone()));
         // The gateway's key is spent: it identifies the caller and nothing
-        // else, and it must not travel on as an upstream's credential.
+        // else, and it must not travel on as an upstream's credential; a
+        // gateway key presented a second time under a provider's own header
+        // name goes with it, where a caller's own provider key there stays.
         request.headers_mut().remove(header::AUTHORIZATION);
+        for name in PROVIDER_KEY_HEADERS {
+            let is_a_gateway_key = request
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| auth_config.contains_token(value.trim()));
+            if is_a_gateway_key {
+                request.headers_mut().remove(name);
+            }
+        }
     }
 
     next.run(request).await
@@ -225,6 +245,56 @@ mod tests {
         Router::new()
             .route("/", get(authorization_seen))
             .route_layer(from_fn_with_state(auth_config, auth_middleware))
+    }
+
+    /// The provider key headers the route still sees, by name and value.
+    async fn provider_keys_seen(request: Request<Body>) -> impl IntoResponse {
+        PROVIDER_KEY_HEADERS
+            .iter()
+            .filter_map(|name| {
+                request
+                    .headers()
+                    .get(*name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| format!("{name}={value}"))
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// A gateway key presented under a provider's own header name beside the
+    /// bearer ends at the middleware too; a caller's own provider key in
+    /// those headers (bring your own key) stays.
+    #[tokio::test]
+    async fn a_gateway_key_under_a_providers_header_name_ends_at_the_middleware_too() {
+        let app = || {
+            Router::new()
+                .route("/", get(provider_keys_seen))
+                .route_layer(from_fn_with_state(
+                    AuthConfig::new(Some("shared-secret".to_string())),
+                    auth_middleware,
+                ))
+        };
+        let twice = Request::builder()
+            .uri("/")
+            .header(header::AUTHORIZATION, "Bearer shared-secret")
+            .header("x-api-key", "shared-secret")
+            .header("x-goog-api-key", "shared-secret")
+            .body(Body::empty())
+            .unwrap();
+        let response = app().oneshot(twice).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_text(response).await, "");
+
+        let own = Request::builder()
+            .uri("/")
+            .header(header::AUTHORIZATION, "Bearer shared-secret")
+            .header("x-api-key", "providers-own-key")
+            .body(Body::empty())
+            .unwrap();
+        let response = app().oneshot(own).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_text(response).await, "x-api-key=providers-own-key");
     }
 
     async fn authorization_after(auth_config: AuthConfig, bearer: Option<&str>) -> String {

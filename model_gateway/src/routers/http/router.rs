@@ -219,20 +219,13 @@ impl Router {
                 let mut request_builder = worker
                     .http_client()
                     .get(format!("{}/{endpoint}", worker.url()));
-                // The allow-listed caller headers, and the worker's configured
-                // key when the caller sent no credential (this route sits
-                // outside the auth middleware, so a caller's header travels
-                // as it did).
-                let mut callers_credential = false;
+                // A public route outside the auth middleware: the allow-listed
+                // caller headers go as they are and nothing is added (a
+                // configured worker key here would authenticate an anonymous
+                // caller as the worker).
                 for (name, value) in headers {
                     if header_utils::should_forward_request_header(&name) {
-                        callers_credential |= name.eq_ignore_ascii_case("authorization");
                         request_builder = request_builder.header(name, value);
-                    }
-                }
-                if !callers_credential {
-                    if let Some(key) = worker.api_key() {
-                        request_builder = request_builder.bearer_auth(key);
                     }
                 }
 
