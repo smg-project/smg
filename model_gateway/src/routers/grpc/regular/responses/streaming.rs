@@ -40,7 +40,7 @@ use super::{
     common::{
         apply_mcp_tool_call_limit, build_next_request, convert_mcp_tools_to_chat_tools,
         dispatch_arguments, extract_all_tool_calls_from_chat, has_unfinished_mcp_call,
-        prepare_chat_tools_and_choice, record_mcp_call, ExtractedToolCall, McpToolCallLimit,
+        prepare_tool_choice, record_mcp_call, ExtractedToolCall, McpToolCallLimit,
         ResponsesCallContext, ToolLoopState,
     },
     conversions,
@@ -890,8 +890,11 @@ async fn execute_tool_loop_streaming_internal(
             mcp_list_tools_emitted = true;
         }
 
-        // Convert to chat request
-        let mut chat_request = match conversions::responses_to_chat(&current_request) {
+        // Convert to chat request, the MCP tools in its tool list
+        let mut chat_request = match conversions::responses_to_chat_with_mcp_tools(
+            &current_request,
+            &mcp_chat_tools,
+        ) {
             Ok(request) => request,
             Err(e) => {
                 let message = format!("Failed to convert request: {e}");
@@ -904,8 +907,8 @@ async fn execute_tool_loop_streaming_internal(
             }
         };
 
-        // Prepare tools and tool_choice for this iteration (same logic as non-streaming)
-        prepare_chat_tools_and_choice(&mut chat_request, &mcp_chat_tools, state.iteration);
+        // Prepare tool_choice for this iteration (same logic as non-streaming)
+        prepare_tool_choice(&mut chat_request, state.iteration);
         state.iteration += 1;
         Metrics::record_mcp_tool_iteration(&current_request.model);
 

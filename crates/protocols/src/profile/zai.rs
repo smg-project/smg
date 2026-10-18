@@ -170,7 +170,8 @@ fn validate_efforts(
 fn validate_tools(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
     if let Some(tool) = req
         .tools
-        .iter()
+        .as_deref()
+        .into_iter()
         .flatten()
         .find(|tool| tool.tool_type != TOOL_TYPE)
     {

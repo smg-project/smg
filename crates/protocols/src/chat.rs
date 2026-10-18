@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::HashMap};
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -274,7 +274,10 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<ToolChoice>,
 
     /// A list of tools the model may call
-    pub tools: Option<Vec<Tool>>,
+    // Shared, not copied, with what reads the set on the serving path (the
+    // response spec, the readers that type the calls): the parser allocates
+    // the list once and hands it over (`Self::shared_tool_list`).
+    pub tools: Option<Arc<[Tool]>>,
 
     /// An integer between 0 and 20 specifying the number of most likely tokens to return
     #[validate(range(min = 0, max = 20))]
@@ -660,7 +663,7 @@ fn validate_chat_cross_parameters(
 
     // 8. A function's `parameters` is a JSON Schema object (null was already
     //    read as the empty schema)
-    for (index, tool) in req.tools.iter().flatten().enumerate() {
+    for (index, tool) in req.tools.as_deref().into_iter().flatten().enumerate() {
         if !tool.function.parameters.is_object() {
             return Err(invalid(
                 "invalid_type",
@@ -803,7 +806,11 @@ impl ChatCompletionRequest {
     /// tool-call parsing first of all, must work from this set rather than
     /// from `tools` alone, or a call to a dynamic tool comes back as text.
     pub fn effective_tools(&self) -> impl Iterator<Item = &Tool> {
-        self.tools.iter().flatten().chain(self.dynamic_tools())
+        self.tools
+            .as_deref()
+            .into_iter()
+            .flatten()
+            .chain(self.dynamic_tools())
     }
 
     /// [`Self::effective_tools`] as one list: the request's own `tools`,
@@ -818,12 +825,34 @@ impl ChatCompletionRequest {
         }
         Cow::Owned(
             self.tools
-                .iter()
+                .as_deref()
+                .into_iter()
                 .flatten()
                 .chain(dynamic)
                 .cloned()
                 .collect(),
         )
+    }
+
+    /// [`Self::effective_tool_list`] for a holder that outlives the request's
+    /// borrow (the response spec, and through it every reader of the
+    /// response): the request's own `tools`, the one list the parser made,
+    /// shared, when no message declares a tool; a list that chains both
+    /// otherwise; an empty list when the request declares none.
+    pub fn shared_tool_list(&self) -> Arc<[Tool]> {
+        let mut dynamic = self.dynamic_tools().peekable();
+        match (&self.tools, dynamic.peek()) {
+            (Some(tools), None) => Arc::clone(tools),
+            (None, None) => Arc::default(),
+            (_, Some(_)) => self
+                .tools
+                .as_deref()
+                .into_iter()
+                .flatten()
+                .chain(dynamic)
+                .cloned()
+                .collect(),
+        }
     }
 
     /// The tools a `tool_choice` may force: [`Self::effective_tool_list`]

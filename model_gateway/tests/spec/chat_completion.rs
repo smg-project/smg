@@ -33,7 +33,7 @@ fn tool_choice_request(tools: Vec<Tool>, tool_choice: ToolChoice) -> ChatComplet
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
-        tools: Some(tools),
+        tools: Some(tools.into()),
         tool_choice: Some(tool_choice),
         ..Default::default()
     }
@@ -215,16 +215,19 @@ fn test_function_call_function_variant_normalizes() {
             name: "my_function".to_string(),
         }),
         tool_choice: None,
-        tools: Some(vec![Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "my_function".to_string(),
-                description: None,
-                parameters: json!({}),
-                strict: None,
-                extra: Default::default(),
-            },
-        }]),
+        tools: Some(
+            vec![Tool {
+                tool_type: "function".to_string(),
+                function: Function {
+                    name: "my_function".to_string(),
+                    description: None,
+                    parameters: json!({}),
+                    strict: None,
+                    extra: Default::default(),
+                },
+            }]
+            .into(),
+        ),
         ..Default::default()
     };
 

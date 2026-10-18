@@ -10,8 +10,8 @@
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent},
     common::{
-        ContentPart, FunctionCallResponse, ImageUrl, JsonSchemaFormat, ResponseFormat, ToolCall,
-        ToolChoice, ToolChoiceValue, UsageInfo,
+        ContentPart, FunctionCallResponse, ImageUrl, JsonSchemaFormat, ResponseFormat, Tool,
+        ToolCall, ToolChoice, ToolChoiceValue, UsageInfo,
     },
     profile::ProviderProfile,
     responses::{
@@ -44,6 +44,25 @@ use crate::routers::grpc::common::responses::{
 /// - `tool_choice` → passed through from request
 /// - Response-specific fields (previous_response_id, conversation) are handled by router
 pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest, String> {
+    responses_to_chat_with_tools(req, None)
+}
+
+/// [`responses_to_chat`] for the MCP tool loop: the MCP tools the loop offers
+/// join the request's function tools while that list is being built, so the
+/// request holds one list, wrapped once, and no iteration copies the schemas
+/// again. The list is present even when both are empty, as the loop has
+/// always sent it.
+pub(super) fn responses_to_chat_with_mcp_tools(
+    req: &ResponsesRequest,
+    mcp_chat_tools: &[Tool],
+) -> Result<ChatCompletionRequest, String> {
+    responses_to_chat_with_tools(req, Some(mcp_chat_tools))
+}
+
+fn responses_to_chat_with_tools(
+    req: &ResponsesRequest,
+    mcp_chat_tools: Option<&[Tool]>,
+) -> Result<ChatCompletionRequest, String> {
     let mut messages = Vec::new();
 
     // 1. Add system message if instructions provided
@@ -278,19 +297,27 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
         return Err("Request must contain at least one message".to_string());
     }
 
-    // 3. Extract function tools from ResponseTools.
-    // MCP tools are merged later by the tool loop (see tool_loop.rs:prepare_chat_tools_and_choice).
+    // 3. Extract function tools from ResponseTools; the tool loop's MCP tools
+    // join them here, while the list is still being built (see
+    // `responses_to_chat_with_mcp_tools`).
     // `tool_choice: none` forbids calls; offering the schemas anyway makes the
     // model re-issue calls on replayed histories, and with parsing disabled the
     // raw call markup leaks into the message text.
     let tool_choice = req.tool_choice.as_ref().map(|tc| tc.to_chat_tool_choice());
     let function_tools = extract_tools_from_response_tools(req.tools.as_deref());
-    let tools = if function_tools.is_empty()
-        || matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)))
-    {
-        None
+    let function_tools = if matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None))) {
+        Vec::new()
     } else {
-        Some(function_tools)
+        function_tools
+    };
+    let tools = match mcp_chat_tools {
+        Some(mcp_chat_tools) => {
+            let mut all_tools = function_tools;
+            all_tools.extend(mcp_chat_tools.iter().cloned());
+            Some(all_tools.into())
+        }
+        None if function_tools.is_empty() => None,
+        None => Some(function_tools.into()),
     };
 
     // 4. Build ChatCompletionRequest
@@ -1392,5 +1419,50 @@ mod tests {
         assert_eq!(wire["status"], "incomplete");
         assert_eq!(wire["output"][0]["status"], "completed");
         assert_eq!(wire["output"][0]["arguments"], "{}");
+    }
+
+    /// The MCP tool loop's conversion: the request's function tools and the
+    /// MCP tools are one list (nothing is wrapped twice), `tool_choice: none`
+    /// withholds the request's own tools and keeps the MCP tools offered, and a
+    /// request without either still carries an (empty) list, as the loop has
+    /// always sent one; the plain conversion carries none.
+    #[test]
+    fn the_tool_loop_offers_the_mcp_tools_in_one_list_with_the_request_s_function_tools() {
+        use openai_protocol::responses::{ResponsesToolChoice, ToolChoiceOptions};
+        let mcp: Tool = serde_json::from_value(serde_json::json!({
+            "type": "function",
+            "function": {"name": "mcp_echo", "parameters": {"type": "object", "properties": {}}}
+        }))
+        .unwrap();
+        let names = |chat: &ChatCompletionRequest| {
+            chat.tools.as_deref().map(|tools| {
+                tools
+                    .iter()
+                    .map(|tool| tool.function.name.clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        let request = namespace_test_request();
+        let chat = responses_to_chat_with_mcp_tools(&request, std::slice::from_ref(&mcp)).unwrap();
+        assert_eq!(
+            names(&chat).unwrap(),
+            ["weather.lookup", "travel.lookup", "mcp_echo"]
+        );
+
+        let mut forbidden = namespace_test_request();
+        forbidden.tool_choice = Some(ResponsesToolChoice::Options(ToolChoiceOptions::None));
+        let chat =
+            responses_to_chat_with_mcp_tools(&forbidden, std::slice::from_ref(&mcp)).unwrap();
+        assert_eq!(names(&chat).unwrap(), ["mcp_echo"]);
+
+        let bare: ResponsesRequest =
+            serde_json::from_value(serde_json::json!({"model": "test-model", "input": "hi"}))
+                .unwrap();
+        assert_eq!(
+            names(&responses_to_chat_with_mcp_tools(&bare, &[]).unwrap()),
+            Some(Vec::new())
+        );
+        assert_eq!(names(&responses_to_chat(&bare).unwrap()), None);
     }
 }

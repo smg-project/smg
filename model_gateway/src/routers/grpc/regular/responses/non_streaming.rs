@@ -19,7 +19,7 @@ use super::{
     common::{
         apply_mcp_tool_call_limit, build_next_request, convert_mcp_tools_to_chat_tools,
         dispatch_arguments, extract_all_tool_calls_from_chat, has_unfinished_mcp_call,
-        prepare_chat_tools_and_choice, record_mcp_call, ExtractedToolCall, McpToolCallLimit,
+        prepare_tool_choice, record_mcp_call, ExtractedToolCall, McpToolCallLimit,
         ResponsesCallContext, ToolLoopState,
     },
     conversions,
@@ -183,22 +183,24 @@ pub(super) async fn execute_tool_loop(
     );
 
     loop {
-        // Convert to chat request
-        let mut chat_request = conversions::responses_to_chat(&current_request).map_err(|e| {
-            error!(
-                function = "tool_loop",
-                iteration = state.iteration,
-                error = %e,
-                "Failed to convert ResponsesRequest to ChatCompletionRequest in tool loop"
-            );
-            error::bad_request(
-                "convert_request_failed",
-                format!("Failed to convert request: {e}"),
-            )
-        })?;
+        // Convert to chat request, the MCP tools in its tool list
+        let mut chat_request =
+            conversions::responses_to_chat_with_mcp_tools(&current_request, &mcp_chat_tools)
+                .map_err(|e| {
+                    error!(
+                        function = "tool_loop",
+                        iteration = state.iteration,
+                        error = %e,
+                        "Failed to convert ResponsesRequest to ChatCompletionRequest in tool loop"
+                    );
+                    error::bad_request(
+                        "convert_request_failed",
+                        format!("Failed to convert request: {e}"),
+                    )
+                })?;
 
-        // Prepare tools and tool_choice for this iteration
-        prepare_chat_tools_and_choice(&mut chat_request, &mcp_chat_tools, state.iteration);
+        // Prepare tool_choice for this iteration
+        prepare_tool_choice(&mut chat_request, state.iteration);
 
         // Execute chat pipeline (errors already have proper HTTP status codes)
         let chat_response = ctx

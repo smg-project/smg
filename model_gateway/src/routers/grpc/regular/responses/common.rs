@@ -140,17 +140,9 @@ impl ToolLoopState {
 // Tool Preparation and Extraction
 // ============================================================================
 
-/// Merge function tools from request with MCP tools and set tool_choice based on iteration
-pub(super) fn prepare_chat_tools_and_choice(
-    chat_request: &mut ChatCompletionRequest,
-    mcp_chat_tools: &[Tool],
-    iteration: usize,
-) {
-    // Merge function tools from request with MCP tools
-    let mut all_tools = chat_request.tools.take().unwrap_or_default();
-    all_tools.extend(mcp_chat_tools.iter().cloned());
-    chat_request.tools = Some(all_tools);
-
+/// Set tool_choice based on iteration (the MCP tools join the request's tools
+/// where the chat request is built: `conversions::responses_to_chat_with_mcp_tools`)
+pub(super) fn prepare_tool_choice(chat_request: &mut ChatCompletionRequest, iteration: usize) {
     // Set tool_choice based on iteration
     // - Iteration 0: Use user's tool_choice or default to auto
     // - Iteration 1+: Always use auto to avoid infinite loops

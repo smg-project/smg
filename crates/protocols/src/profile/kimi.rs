@@ -86,7 +86,8 @@ fn validate_message_tools(req: &ChatCompletionRequest) -> Result<(), validator::
     // Request-level names only seed the duplicate set; their shape is not judged.
     let mut seen: HashSet<&str> = req
         .tools
-        .iter()
+        .as_deref()
+        .into_iter()
         .flatten()
         .map(|t| t.function.name.as_str())
         .collect();

@@ -682,7 +682,7 @@ pub(crate) fn filter_chat_request_by_tool_choice(
         if let Some(filtered_tools) = filter_tools_by_tool_choice(tools, body.tool_choice.as_ref())
         {
             let mut filtered_body = body.clone();
-            filtered_body.tools = Some(filtered_tools);
+            filtered_body.tools = Some(filtered_tools.into());
             return std::borrow::Cow::Owned(filtered_body);
         }
     }
@@ -1793,7 +1793,8 @@ mod tests {
         let names = |request: &ChatCompletionRequest| -> Vec<String> {
             request
                 .tools
-                .iter()
+                .as_deref()
+                .into_iter()
                 .flatten()
                 .map(|tool| tool.function.name.clone())
                 .collect()
@@ -1866,7 +1867,7 @@ mod tests {
         );
         assert!(matches!(rendered, std::borrow::Cow::Borrowed(_)));
         assert_eq!(
-            rendered.tools.as_ref().map(Vec::len),
+            rendered.tools.as_deref().map(<[_]>::len),
             Some(1),
             "the tool declaration stays for the renderer to write"
         );

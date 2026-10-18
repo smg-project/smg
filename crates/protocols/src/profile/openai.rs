@@ -187,7 +187,7 @@ fn validate_strict_schemas(req: &ChatCompletionRequest) -> Result<(), validator:
             }
         }
     }
-    for (index, tool) in req.tools.iter().flatten().enumerate() {
+    for (index, tool) in req.tools.as_deref().into_iter().flatten().enumerate() {
         if tool.function.strict != Some(true) {
             continue;
         }

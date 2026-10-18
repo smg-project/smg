@@ -127,12 +127,13 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             separate_reasoning: request.separate_reasoning,
             tool_choice: request.tool_choice.clone(),
             // Every tool the model may call, dynamic tools declared on messages
-            // included. `None` when the response is not scanned for tool calls:
-            // the request declares no tools anywhere
+            // included: the request's own list shared, not copied (a new list
+            // only when a message declares a tool). `None` when the response is
+            // not scanned for tool calls: the request declares no tools anywhere
             // (`ChatCompletionRequest::declares_tools`, the one answer every
             // gate reads) and the provider does not parse tool calls without
             // them (`scans_for_tool_calls`).
-            tools: scans_for_tool_calls(request).then(|| Arc::from(request.effective_tool_list())),
+            tools: scans_for_tool_calls(request).then(|| request.shared_tool_list()),
             history_tool_calls_count: request.history_tool_calls_count(),
             stream_options: request.stream_options.clone(),
             first_tool_call_only: request.disables_parallel_tool_calls(),
@@ -311,6 +312,24 @@ mod tests {
         let spec = ChatResponseSpec::from(&request);
 
         assert_eq!(tool_names(&spec), ["get_weather"]);
+    }
+
+    /// The point of sharing: with request tools and no message-declared tool,
+    /// the spec holds the request's own list, not a copy of it.
+    #[test]
+    fn chat_spec_shares_the_request_s_tool_list() {
+        let request = chat_request(json!({
+            "model": "kimi-k3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [tool("get_weather")]
+        }));
+
+        let spec = ChatResponseSpec::from(&request);
+
+        assert!(Arc::ptr_eq(
+            request.tools.as_ref().expect("the request's tools"),
+            spec.tools.as_ref().expect("the spec's tools")
+        ));
     }
 
     #[test]
