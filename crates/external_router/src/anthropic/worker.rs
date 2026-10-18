@@ -275,7 +275,7 @@ mod tests {
         assert!(text.contains("Rate limit reached for model"), "{text}");
     }
 
-    fn header(headers: &HeaderMap, name: &str) -> Option<&str> {
+    fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         headers.get(name).and_then(|value| value.to_str().ok())
     }
 
