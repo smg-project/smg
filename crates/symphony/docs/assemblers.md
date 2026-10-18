@@ -377,8 +377,9 @@ What the syntax says, and what the assembler does with it:
   which enters the arguments state, as it picks the bare JSON list): a `[` is held with the name
   after it until a `(` says it opens a list, or anything else gives it back as content. At the
   turn's start, after whitespace alone, the list then reads as between markers, as it arrives.
-  After content, the list is held until the `]` that closes it (strings and nested brackets
-  scanned) and read whole by an assembler of its own: when every byte is a call's or the list's
+  After content, a list whose first name no tool declares is content from its `(`; any other list
+  is held until the `]` that closes it (strings and nested brackets scanned, given back as content
+  past 256 KiB) and read whole by an assembler of its own: when every byte is a call's or the list's
   wrapping and every call names a tool the request declares, its events are the turn's; when any
   byte is malformed (a positional argument, an operator, prose between calls) or a name is no
   tool's, the whole is content, since code holds `[name(` of its own. After the

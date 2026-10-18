@@ -2087,8 +2087,9 @@ fn get_available_tool_call_parsers() -> Vec<String> {
 /// The choices of one parser flag: the names `legacy` picks from the two legacy registries (the
 /// flag's own kind), Symphony's tables' (`symphony::formats::Table::name`), which `--parser
 /// symphony` reads with when both flags name one, the names a table answers to that no legacy
-/// parser of either kind has (the gateway's `utils::ALIASES`: a launcher's name for a model
-/// family whose table has no older parser, which the gateway takes in either flag), and `hf`,
+/// parser of either kind has (the gateway's `utils::ALIASES`: an engine's exact parser name for a
+/// family, or a launcher's name for one whose table has no older parser, which the gateway takes
+/// in either flag), and `hf`,
 /// the table a model's response template compiles into, sorted, each once.
 fn parser_choices(
     legacy: impl FnOnce(&tool_parser::ParserFactory, &reasoning_parser::ParserFactory) -> Vec<String>,

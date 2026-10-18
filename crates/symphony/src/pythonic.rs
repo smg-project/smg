@@ -445,9 +445,9 @@ impl Assembler {
             Stage::Holding(extent) => {
                 self.carried.push(c);
                 match extent.read(c) {
-                    // A real list of calls is short: a hold that outgrows the cap is content
-                    // (`[f(` of the content's own with a lone quote after it would otherwise
-                    // hold the rest of the turn), and the stream goes on.
+                    // The backstop for a declared name followed by a stray quote: a hold that
+                    // outgrows the cap (far above any real call's arguments) is content, and the
+                    // stream goes on; an undeclared first name ended at its `(` already.
                     ListEnd::Open if self.carried.len() > HOLD_CAP_BYTES => {
                         self.stage = Stage::Prose;
                     }
