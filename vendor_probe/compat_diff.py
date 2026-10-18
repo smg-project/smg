@@ -80,6 +80,9 @@ from pathlib import Path
 _VOLATILE_RES = [
     (re.compile(r"\b(resp|msg|conv|rs|fc|ws|ig|cu|lc|mcp|msg_batch)_[A-Za-z0-9_-]{6,}"), "<id>"),
     (re.compile(r"\breq_[A-Za-z0-9]{6,}"), "<req>"),
+    (re.compile(r"\bchatcmpl-[A-Za-z0-9_-]{6,}"), "<id>"),
+    (re.compile(r"\bcall_[A-Za-z0-9_-]{6,}"), "<id>"),
+    (re.compile(r"\bfp_[a-f0-9]{6,}"), "<fp>"),
     (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"), "<uuid>"),
     (re.compile(r"\b\d{9,}\b"), "<ts>"),
     (re.compile(r"\b(gpt|claude|codex|computer-use|o[134])[A-Za-z0-9.\-]*"), "<model>"),
@@ -100,6 +103,15 @@ _CONTENT_DEPENDENT_PATH_PREFIXES = {
     "anthropic": (
         "content[]",  # block mix: text / tool_use / thinking
         "usage.server_tool_use",  # present only when server tools ran
+    ),
+    "openai-chat": (
+        "choices[].message.tool_calls",  # whether the model called a tool
+        "choices[].message.function_call",
+        "choices[].message.reasoning",
+        "choices[].message.reasoning_content",
+        "choices[].message.annotations",
+        "choices[].logprobs.content[]",  # one entry per generated token
+        "choices[].logprobs.refusal",
     ),
 }
 
@@ -158,11 +170,24 @@ _CONTENT_DEPENDENT_EVENTS = {
         "thinking_delta",
         "input_json_delta",
     ),
+    # Chat Completions chunks are named by content (runner.chat_chunk_name);
+    # which kinds appear and how often is the model's choice.
+    "openai-chat": (
+        "delta.content",
+        "delta.tool_calls",
+        "delta.reasoning",
+        "delta.refusal",
+        "delta.content+usage",
+        "delta.content+reasoning",
+        "delta.empty",
+    ),
 }
 
 # Event names whose *repetition count* is token-count-bound. Runs are collapsed
 # for everyone; these are also deduped against arity mismatches entirely.
-_DELTAISH = re.compile(r"(\.delta$|^ping$|^content_block_delta$)")
+_DELTAISH = re.compile(
+    r"(\.delta$|^ping$|^content_block_delta$|^delta\.(content|tool_calls|reasoning|refusal)$)"
+)
 
 _SEVERITY_ORDER = ["S1", "S2", "S3", "S4", "benign", "mock-limited", "exact"]
 _SEV_RANK = {s: i for i, s in enumerate(_SEVERITY_ORDER)}
@@ -215,6 +240,10 @@ def event_names(record, provider) -> list:
         if provider == "anthropic":
             parsed = ev.get("parsed") or {}
             name = parsed.get("type") or ev.get("event")
+        elif provider == "openai-chat":
+            # recorded chunks have no event: line and are named by content; a
+            # baseline-synthesized event carries the stored name in "event"
+            name = ev.get("event") or chat_chunk_name(ev)
         else:
             name = ev.get("event")
         if not name:
@@ -230,6 +259,114 @@ def event_names(record, provider) -> list:
 # naturally (completed). Both collapse to <terminal> in the core comparison;
 # response.failed / error do NOT — failing differently is structural.
 _TERMINAL_EQUIV = {"response.completed", "response.incomplete"}
+# The same for a Chat Completions finish chunk: stop vs length is content-bound,
+# and so is whether the model ended its turn with tool calls (function_call for
+# the legacy surface) or with text.
+_CHAT_FINISH_EQUIV = re.compile(r"\.finish:(stop|length|tool_calls|function_call)\b")
+# Chat delta parts that are the model's choice: which kinds a chunk carries,
+# and whether the first one rides along with ``role``.
+_CHAT_CONTENT_PARTS = {"content", "tool_calls", "reasoning", "refusal"}
+
+
+def chat_core_name(name: str, multi_choice: bool = False) -> str | None:
+    """The structural part of a chat chunk name, or ``None`` when nothing
+    structural is left: content-bound delta parts are dropped (``role`` stays),
+    the finish reason keeps its class with stop/length/tool_calls collapsed to
+    ``<terminal>``, ``usage`` stays. A collapsed run (trailing ``+``) that still
+    carries ``role`` is ``delta.role.repeated``: a stream sends the role once
+    per choice, and a client that accumulates deltas concatenates a repeated
+    one. A multi-choice stream (``multi_choice``) sends one role chunk per
+    choice index, so its run keeps reading as ``delta.role``."""
+    run = name.endswith("+")
+    base = name.rstrip("+")
+    usage = base.endswith("+usage")
+    if usage:
+        base = base[: -len("+usage")]
+    finish = ""
+    m = re.search(r"\.finish:[a-z_]+$", base)
+    if m:
+        finish = _CHAT_FINISH_EQUIV.sub(".finish:<terminal>", m.group(0))
+        base = base[: m.start()]
+    if base.startswith("delta."):
+        parts = [p for p in base[len("delta.") :].split("+") if p not in _CHAT_CONTENT_PARTS]
+        if run and "role" in parts and not multi_choice:
+            parts = ["role.repeated"]
+        base = "delta." + "+".join(parts) if parts else ""
+        if finish:
+            base = "finish"
+    if not base and not finish and not usage:
+        return None
+    return base + finish + ("+usage" if usage else "")
+
+
+def chat_chunk_name(ev):
+    """Chat Completions chunk naming, identical to ``runner.chat_chunk_name``
+    (kept self-contained so the differ needs no runner import)."""
+    if (ev.get("data") or "").strip() == "[DONE]":
+        return "[DONE]"
+    parsed = ev.get("parsed")
+    if not isinstance(parsed, dict):
+        return "?"
+    if "error" in parsed:
+        return "error"
+    choices = parsed.get("choices") or []
+    if not choices:
+        return "usage" if parsed.get("usage") else "chunk.empty"
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    delta = choice.get("delta") or {}
+    parts = []
+    if "role" in delta:
+        parts.append("role")
+    if delta.get("content"):
+        parts.append("content")
+    if delta.get("tool_calls") or delta.get("function_call"):
+        parts.append("tool_calls")
+    if delta.get("reasoning_content") or delta.get("reasoning"):
+        parts.append("reasoning")
+    if delta.get("refusal"):
+        parts.append("refusal")
+    name = "delta." + "+".join(parts) if parts else "delta.empty"
+    if choice.get("finish_reason"):
+        name += f".finish:{choice['finish_reason']}"
+    if parsed.get("usage"):
+        name += "+usage"
+    return name
+
+
+def request_choices(record) -> int:
+    """``n`` of the recorded request (1 when absent): a multi-choice stream
+    sends one ``role`` chunk per choice index."""
+    body = ((record or {}).get("request") or {}).get("body")
+    n = body.get("n") if isinstance(body, dict) else None
+    return n if isinstance(n, int) and not isinstance(n, bool) and n > 1 else 1
+
+
+_CHAT_ROLE_CHUNK = re.compile(r"^delta\.([a-z_]+(?:\+[a-z_]+)*)")
+
+
+def role_chunks(names) -> int:
+    """How many chunks of a chat stream carry ``role`` (``names`` are the raw
+    chunk names, one per chunk): one per choice index in a conforming stream,
+    whatever order the indexes' chunks come in."""
+    count = 0
+    for n in names:
+        m = _CHAT_ROLE_CHUNK.match(n)
+        if m and "role" in m.group(1).split("+"):
+            count += 1
+    return count
+
+
+def fold_role_cores(core: tuple) -> tuple:
+    """Adjacent ``delta.role`` cores as one: a multi-choice stream's opening
+    role chunks sit next to each other once the content-bound parts are gone,
+    whether the vendor interleaved the indexes' chunks or a gateway sent the
+    opening chunks back to back."""
+    out: list = []
+    for n in core:
+        if n == "delta.role" and out and out[-1] == "delta.role":
+            continue
+        out.append(n)
+    return tuple(out)
 
 
 def collapse_runs(names: list) -> tuple:
@@ -592,8 +729,15 @@ def split_paths(vendor_paths, smg_paths, provider):
     return missing_struct, extra_struct, missing_mock, extra_mock
 
 
-def compare_events(v_names, s_names, provider):
-    """Compare collapsed event sequences; returns (divergent, detail)."""
+def compare_events(v_names, s_names, provider, multi_choice: bool = False):
+    """Compare collapsed event sequences; returns (divergent, detail).
+    ``multi_choice``: the request asked for several choices, whose chat stream
+    sends one ``role`` chunk per choice index (see ``chat_core_name``): the
+    vendor interleaves the indexes' chunks and a gateway may open the indexes
+    back to back, so adjacent ``delta.role`` cores fold on both sides
+    (``fold_role_cores``) and the number of chunks carrying ``role`` has to
+    agree instead (``role_chunks``), which keeps a role repeated on every
+    chunk of such a stream structural."""
     v_seq, s_seq = collapse_runs(v_names), collapse_runs(s_names)
     if v_seq == s_seq:
         return False, None
@@ -605,16 +749,35 @@ def compare_events(v_names, s_names, provider):
             base = n.rstrip("+")
             if base in content_events:
                 continue
-            out.append("<terminal>" if base in _TERMINAL_EQUIV else n)
+            if base in _TERMINAL_EQUIV:
+                out.append("<terminal>")
+            elif provider == "openai-chat":
+                # every chunk's delta parts are content-bound (the vendor sends
+                # role together with the first tool_calls delta, a text model
+                # sends it alone): keep role, the finish class and usage; a
+                # role that rides on every chunk of a run stays structural
+                core = chat_core_name(n, multi_choice=multi_choice)
+                if core is not None:
+                    out.append(core)
+            else:
+                out.append(n)
         return tuple(out)
 
     v_core, s_core = strip(v_seq), strip(s_seq)
+    chat_choices = multi_choice and provider == "openai-chat"
+    if chat_choices:
+        v_core, s_core = fold_role_cores(v_core), fold_role_cores(s_core)
     detail = {
         "vendor_events": list(v_seq),
         "smg_events": list(s_seq),
         "vendor_core": list(v_core),
         "smg_core": list(s_core),
     }
+    if chat_choices:
+        v_roles, s_roles = role_chunks(v_names), role_chunks(s_names)
+        if v_roles != s_roles:
+            detail["role_chunks"] = {"vendor": v_roles, "smg": s_roles}
+            return True, detail
     if v_core == s_core:
         return False, detail  # differences confined to content-bound events
 
@@ -705,7 +868,10 @@ def classify(pid, vrec, srec, provider, extension_allowlist):
     elif v_stream:
         # --- (c) SSE event-type sequence ---------------------------------
         divergent, detail = compare_events(
-            event_names(vrec, provider), event_names(srec, provider), provider
+            event_names(vrec, provider),
+            event_names(srec, provider),
+            provider,
+            multi_choice=max(request_choices(vrec), request_choices(srec)) > 1,
         )
         if detail:
             entry["events"] = detail
@@ -1004,7 +1170,7 @@ def main(argv=None):
     ap.add_argument(
         "--provider",
         required=True,
-        choices=["openai", "anthropic"],
+        choices=["openai", "anthropic", "openai-chat"],
         help="protocol family (drives SSE parsing + content-dependence tables)",
     )
     ap.add_argument("--out", required=True, help="output dir (report.md + diff.jsonl)")

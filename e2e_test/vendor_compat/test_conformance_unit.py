@@ -86,7 +86,7 @@ def test_representative_volume_is_bounded():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+@pytest.mark.parametrize("provider", ["openai", "anthropic", "openai-chat"])
 def test_skeletons_round_trip_field_paths(provider):
     for c in conformance.clusters(provider):
         if c["kind"] != "json":
@@ -96,7 +96,7 @@ def test_skeletons_round_trip_field_paths(provider):
         assert got == set(c["field_paths"]), c["cluster_id"]
 
 
-@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+@pytest.mark.parametrize("provider", ["openai", "anthropic", "openai-chat"])
 def test_synth_records_reproduce_cluster_keys(provider):
     clusters = list(conformance.clusters(provider))
     records = compat_diff.synth_vendor_records(clusters)
@@ -106,8 +106,161 @@ def test_synth_records_reproduce_cluster_keys(provider):
         assert list(key[2]) == (c.get("event_types") or c.get("field_paths") or []), c["cluster_id"]
 
 
+def test_chat_stream_core_ignores_how_the_model_filled_its_chunks():
+    # the vendor sends role with the first tool_calls delta and ends with
+    # finish_reason tool_calls; a text model sends role alone and ends with stop
+    vendor = [
+        "delta.role+tool_calls",
+        "delta.tool_calls",
+        "delta.tool_calls",
+        "delta.empty.finish:tool_calls",
+        "usage",
+        "[DONE]",
+    ]
+    text = [
+        "delta.role",
+        "delta.content",
+        "delta.content",
+        "delta.empty.finish:stop",
+        "usage",
+        "[DONE]",
+    ]
+    divergent, detail = compat_diff.compare_events(vendor, text, "openai-chat")
+    assert not divergent, detail
+    assert (
+        detail["vendor_core"]
+        == detail["smg_core"]
+        == ["delta.role", "finish.finish:<terminal>", "usage", "[DONE]"]
+    )
+    # a chunk that carries content and reasoning at once is content-bound too
+    mixed = [
+        "delta.role",
+        "delta.reasoning",
+        "delta.content+reasoning",
+        "delta.content",
+        "delta.empty.finish:stop",
+        "[DONE]",
+    ]
+    assert not compat_diff.compare_events(mixed, text[:4] + ["[DONE]"], "openai-chat")[0]
+
+
+def test_chat_stream_core_keeps_structural_differences():
+    vendor = ["delta.role", "delta.content", "delta.empty.finish:stop", "usage", "[DONE]"]
+    # a finish class outside stop/length/tool_calls is structural, so is a missing usage chunk
+    assert compat_diff.compare_events(
+        vendor,
+        ["delta.role", "delta.content", "delta.empty.finish:content_filter", "usage", "[DONE]"],
+        "openai-chat",
+    )[0]
+    assert compat_diff.compare_events(
+        vendor, ["delta.role", "delta.content", "delta.empty.finish:stop", "[DONE]"], "openai-chat"
+    )[0]
+    assert compat_diff.chat_core_name("delta.content+usage") == "+usage"
+    assert compat_diff.chat_core_name("delta.content+") is None
+
+
+def test_chat_stream_core_flags_a_role_repeated_on_every_chunk():
+    vendor = [
+        "delta.role",
+        "delta.content",
+        "delta.content",
+        "delta.empty.finish:stop",
+        "usage",
+        "[DONE]",
+    ]
+    # role on every content chunk collapses to one run that still carries role;
+    # a client accumulating the deltas concatenates the repeated role strings
+    repeated = ["delta.role+content"] * 3 + ["delta.empty.finish:stop", "usage", "[DONE]"]
+    divergent, detail = compat_diff.compare_events(vendor, repeated, "openai-chat")
+    assert divergent, detail
+    assert detail["vendor_core"][0] == "delta.role"
+    assert detail["smg_core"][0] == "delta.role.repeated"
+    assert compat_diff.chat_core_name("delta.role+") == "delta.role.repeated"
+    assert compat_diff.chat_core_name("delta.role+tool_calls+") == "delta.role.repeated"
+    # a multi-choice stream sends one role chunk per choice index: the vendor
+    # interleaves the indexes' chunks (its n=2 recording), a gateway may open
+    # both indexes back to back (the first output of index 0 decoded to no
+    # text); the request's n tells a multi-choice stream from a single-choice
+    # one, and in one the chunks carrying role are counted instead
+    vendor_n2 = [
+        "delta.role",
+        "delta.content",
+        "delta.role",
+        "delta.content",
+        "delta.content",
+        "delta.empty.finish:stop",
+        "delta.empty.finish:stop",
+        "usage",
+        "[DONE]",
+    ]
+    back_to_back = [
+        "delta.role",
+        "delta.role",
+        "delta.content",
+        "delta.content",
+        "delta.empty.finish:stop",
+        "delta.empty.finish:stop",
+        "usage",
+        "[DONE]",
+    ]
+    assert compat_diff.compare_events(vendor_n2, back_to_back, "openai-chat")[0]
+    multi = compat_diff.compare_events(vendor_n2, back_to_back, "openai-chat", multi_choice=True)
+    assert not multi[0], multi[1]
+    assert compat_diff.role_chunks(vendor_n2) == 2
+    assert (
+        compat_diff.role_chunks(["delta.role+content", "delta.content", "delta.role+tool_calls"])
+        == 2
+    )
+    # a role on every chunk of an n=2 stream is still drift: five chunks carry
+    # role where the vendor's two do
+    on_every = ["delta.role+content"] * 5 + [
+        "delta.empty.finish:stop",
+        "delta.empty.finish:stop",
+        "usage",
+        "[DONE]",
+    ]
+    repeated_n2 = compat_diff.compare_events(vendor_n2, on_every, "openai-chat", multi_choice=True)
+    assert repeated_n2[0], repeated_n2[1]
+    assert repeated_n2[1]["role_chunks"] == {"vendor": 2, "smg": 5}
+    # one role chunk for two choices is one index short, not a pass
+    one_choice = ["delta.role", "delta.content", "delta.empty.finish:stop", "usage", "[DONE]"]
+    short = compat_diff.compare_events(vendor_n2, one_choice, "openai-chat", multi_choice=True)
+    assert short[0], short[1]
+    assert short[1]["role_chunks"] == {"vendor": 2, "smg": 1}
+    assert compat_diff.request_choices({"request": {"body": {"n": 2}}}) == 2
+    assert compat_diff.request_choices({"request": {"body": {"n": 1}}}) == 1
+    assert compat_diff.request_choices({"request": {"body": None}}) == 1
+    assert compat_diff.request_choices(None) == 1
+
+    # classify reads n from the replayed request
+    def sse(names):
+        return {
+            "status": 200,
+            "sse_events": [{"event": n, "data": "", "parsed": {}} for n in names],
+        }
+
+    vrec = {"probe_id": "t.stream", "response": sse(vendor_n2)}
+    srec = {
+        "probe_id": "t.stream",
+        "recorded": True,
+        "request": {"body": {"n": 2}},
+        "response": sse(back_to_back),
+    }
+    assert (
+        compat_diff.classify("t.stream", vrec, srec, "openai-chat", frozenset())["severity"] != "S3"
+    )
+    srec["response"] = sse(on_every)
+    assert (
+        compat_diff.classify("t.stream", vrec, srec, "openai-chat", frozenset())["severity"] == "S3"
+    )
+    srec["request"]["body"]["n"] = 1
+    assert (
+        compat_diff.classify("t.stream", vrec, srec, "openai-chat", frozenset())["severity"] == "S3"
+    )
+
+
 def test_allowlist_covers_only_known_sigs():
-    for provider in ("openai", "anthropic"):
+    for provider in ("openai", "anthropic", "openai-chat"):
         sigs = {c["sig_hash"] for c in conformance.clusters(provider)}
         for sig, entry in conformance.allowlist(provider).items():
             assert sig in sigs, f"allowlist entry {entry['cluster_id']} orphaned"

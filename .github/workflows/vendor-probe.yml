@@ -1,7 +1,7 @@
 name: Vendor Probe
 
-# Record ground-truth behavior of the real OpenAI Responses and Anthropic
-# Messages APIs for SMG compatibility audits. Recordings (bodies, SSE
+# Record ground-truth behavior of the real OpenAI Responses, OpenAI Chat
+# Completions and Anthropic Messages APIs for SMG compatibility audits. Recordings (bodies, SSE
 # transcripts, error shapes, structural fingerprints) upload as artifacts;
 # full workflow_dispatch runs additionally archive them as assets on a
 # vendor-truth-<date> release so they outlive the artifact window (they feed
@@ -16,7 +16,7 @@ on:
       provider:
         description: Which vendor(s) to probe
         type: choice
-        options: [all, openai, anthropic]
+        options: [all, openai, anthropic, openai-chat]
         default: all
       openai_model:
         description: OpenAI @MODEL override
@@ -97,8 +97,9 @@ jobs:
       # The OpenAI key is a repository secret, which pull requests from forks do
       # not receive. Without it every probe records a 401, which the health
       # gate (transport failures only) would not catch, so fail fast instead.
+      # The Chat Completions step reads the same key.
       - name: Check OpenAI API key
-        if: ${{ env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'openai' }}
+        if: ${{ env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'openai' || env.PROVIDER_SEL == 'openai-chat' }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
@@ -164,10 +165,37 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
+      # Chat Completions has a curated tier only: a generated-tier run has
+      # nothing to record for this family (the runner would exit with "no
+      # probes matched" and no summary), so the step and its upload are skipped
+      # and the health gate below leaves the family out.
+      - name: Probe OpenAI Chat Completions
+        id: openai-chat
+        if: ${{ (env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'openai-chat') && env.PROBE_TIER != 'generated' }}
+        continue-on-error: true
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          FILTER_ARGS=()
+          [ -n "$PROBE_FILTER" ] && FILTER_ARGS=(--filter "$PROBE_FILTER")
+          python -m vendor_probe.runner --provider openai-chat \
+            --tier "$PROBE_TIER" --budget "$PROBE_BUDGET" \
+            --concurrency "$PROBE_CONCURRENCY" \
+            --out results/openai-chat "${FILTER_ARGS[@]}"
+
+      - name: Upload OpenAI Chat Completions artifact
+        if: ${{ always() && (env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'openai-chat') && env.PROBE_TIER != 'generated' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: vendor-probe-openai-chat
+          path: results/openai-chat
+          retention-days: 14
+          if-no-files-found: warn
+
       - name: Print summaries
         if: always()
         run: |
-          for d in results/openai results/anthropic; do
+          for d in results/openai results/anthropic results/openai-chat; do
             if [ -f "$d/summary.json" ]; then
               echo "===== $d/summary.json ====="
               cat "$d/summary.json"
@@ -183,6 +211,7 @@ jobs:
         env:
           OPENAI_OUTCOME: ${{ steps.openai.outcome }}
           ANTHROPIC_OUTCOME: ${{ steps.anthropic.outcome }}
+          OPENAI_CHAT_OUTCOME: ${{ steps.openai-chat.outcome }}
         run: |
           python3 - <<'PY'
           import json, os, sys
@@ -194,6 +223,10 @@ jobs:
           if sel in ("all", "anthropic"):
               checks.append(("anthropic", "results/anthropic/summary.json",
                              os.environ.get("ANTHROPIC_OUTCOME")))
+          # Chat Completions has no generated tier: nothing to gate on such a run
+          if sel in ("all", "openai-chat") and os.environ.get("PROBE_TIER") != "generated":
+              checks.append(("openai-chat", "results/openai-chat/summary.json",
+                             os.environ.get("OPENAI_CHAT_OUTCOME")))
           failed = False
           for name, path, outcome in checks:
               if not os.path.exists(path):
@@ -266,7 +299,7 @@ jobs:
               --notes "Raw vendor ground-truth recordings from the full probe matrix (vendor-probe workflow run ${RUN_ID}, commit ${SHA}). Inputs for vendor_probe/baselines/ refreshes — see vendor_probe/README.md."
           fi
           assets=()
-          for prov in openai anthropic; do
+          for prov in openai anthropic openai-chat; do
             dir="recordings/vendor-probe-${prov}"
             [ -d "$dir" ] || continue
             for f in results.jsonl fingerprints.jsonl; do
