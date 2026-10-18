@@ -16,15 +16,17 @@
 //! the caller's header, else the configured key; an upstream configured
 //! without a key is reached with none. A bearer that is not a gateway key is
 //! refused before that, so a request that reaches a route with its
-//! `Authorization` still on it was not authenticated by this middleware (auth
-//! disabled). The public GET proxies (model and server info, the health
+//! `Authorization` still on it was not authenticated by this middleware by a
+//! bearer (auth disabled, or a certificate-identified connection carrying the
+//! caller's own key). The public GET proxies (model and server info, the health
 //! probe) sit outside it: they forward the caller's header as they did and
 //! add no credential of their own, since there "no header" means anonymous.
 //!
 //! With client-certificate authentication on the HTTPS listener
 //! (`--tls-client-auth`), the connection's verified certificate comes first:
 //! the identity it names (a [`ClientCertificate`] extension, attached by the
-//! listener's acceptor) is the caller's tenant and no bearer is consulted;
+//! listener's acceptor) is the caller's tenant; a bearer is not consulted for
+//! the identity, and a gateway key among the headers is spent as above;
 //! under `required` a request without that identity is refused; under
 //! `optional` it falls through to the bearer check as before.
 
@@ -207,11 +209,14 @@ pub async fn auth_middleware(
 /// of a repeated header is read, since the removal takes the whole name),
 /// where a caller's own provider key there stays.
 fn spend_gateway_keys(auth_config: &AuthConfig, request: &mut Request<Body>) {
+    // With or without its scheme: a hand-rolled client may send the key
+    // bare, which the bearer path refuses and the identified path would
+    // otherwise forward.
     let bearer_is_a_gateway_key = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(bearer_token)
+        .map(|value| bearer_token(value).unwrap_or(value).trim())
         .is_some_and(|token| auth_config.contains_token(token));
     if bearer_is_a_gateway_key {
         request.headers_mut().remove(header::AUTHORIZATION);
@@ -931,6 +936,19 @@ mod tests {
         );
         let response = header_reporting_app(auth_config.clone())
             .oneshot(gateway_key)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_text(response).await, "absent");
+
+        // The key sent bare, without its scheme (the bearer path refuses
+        // that; here it must not ride on).
+        let mut bare_key = with_certificate(Some(identified(spiffe)));
+        bare_key
+            .headers_mut()
+            .insert(header::AUTHORIZATION, "shared-secret".parse().unwrap());
+        let response = header_reporting_app(auth_config.clone())
+            .oneshot(bare_key)
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
