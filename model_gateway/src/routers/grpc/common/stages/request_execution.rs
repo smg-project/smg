@@ -33,6 +33,7 @@ use crate::{
         },
         error,
         grpc::{
+            backend_client::BackendClient,
             common::stages::encode::EncodeDispatchPlan,
             context::{
                 stage_output, ClientSelection, DispatchContext, ExecutionPlan, ExecutionPlanKind,
@@ -41,8 +42,8 @@ use crate::{
             multimodal::worker_language_model_only,
             proto_wrapper::{
                 DispatchBooking, FanoutStream, FirstItem, PrefillCachedTokens, PrefillTicket,
-                ProtoEmbedRequest, ProtoGenerateRequest, ProtoRequest, ProtoResponseVariant,
-                ProtoStream,
+                ProtoEmbedRequest, ProtoGenerateRequest, ProtoInputLogProbs, ProtoRequest,
+                ProtoResponseVariant, ProtoStream,
             },
             utils::{
                 account_pd_leg_failure,
@@ -938,6 +939,42 @@ async fn execute_single_embed(
     Ok(ExecutionResult::Embedding { response: complete })
 }
 
+/// What addresses both legs of a disaggregated dispatch: the pair and the
+/// request's ledger, each leg's transport label, the request id both legs
+/// carry, and the prompt's size, which bounds each leg's silence.
+struct PdLegs<'a> {
+    workers: &'a WorkerSelection,
+    ledger: &'a AttemptLedger,
+    prefill_label: &'static str,
+    decode_label: &'static str,
+    request_id: String,
+    prompt_tokens: u64,
+}
+
+impl<'a> PdLegs<'a> {
+    fn of(
+        workers: &'a WorkerSelection,
+        ledger: &'a AttemptLedger,
+        prefill_request: &ProtoGenerateRequest,
+    ) -> Self {
+        let (prefill_label, decode_label) = pd_leg_labels(workers);
+        let prompt_tokens = u64::try_from(prefill_request.prompt_len()).unwrap_or(u64::MAX);
+        let request_id = prefill_request.request_id().to_string();
+        Self {
+            workers,
+            ledger,
+            prefill_label,
+            decode_label,
+            request_id,
+            prompt_tokens,
+        }
+    }
+}
+
+/// Execute a parallel PD dispatch: both legs are sent together and rendezvous
+/// on the bootstrap info the request carries; the first failure answers, and
+/// the pair that answered is handed to the response with the decode's abort
+/// deferred until its first item proves the handoff finished.
 async fn execute_parallel_pd(
     proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
@@ -952,7 +989,85 @@ async fn execute_parallel_pd(
         .unwrap_or("");
     let (prefill_client, decode_client) =
         clients.disaggregated_or_mismatch("execute_parallel_pd")?;
+    let (prefill_request, decode_request) = parallel_pd_requests(proto_request, workers, protocol);
 
+    // `generate` only establishes the prefill stream here (SMG does not drain
+    // it on this path), so prefill duration cannot be measured — only TTFT,
+    // recorded at the first decode token in streaming. prefill_start anchors it.
+    let prefill_start = Instant::now();
+    let legs = PdLegs::of(workers, ledger, &prefill_request);
+    // The prefill leg's silence is bounded from its dispatch: a call that
+    // returns no stream, or a stream with nothing on it, within the bound
+    // fails the attempt instead of holding the request (and the decode room
+    // the admission gate claimed for it) until its own timeout.
+    let prefill_worker = workers.prefill_worker();
+    let bound = prefill_worker
+        .and_then(|worker| PrefillLegBound::at(worker, legs.prompt_tokens, prefill_start));
+    // Each leg owns its client handle (a cheap channel clone, the same one
+    // batched dispatch takes per sub-request) so the leg still in flight when
+    // its partner fails can be moved off the request path.
+    let mut prefill_client = prefill_client.clone();
+    let mut decode_client = decode_client.clone();
+    for worker in [workers.prefill_worker(), workers.decode_worker()]
+        .into_iter()
+        .flatten()
+    {
+        Metrics::record_worker_request(worker.url(), worker.model_id());
+    }
+    // The leg is booked on its worker here, before its call is polled: a
+    // servicer that sends its headers with the first message answers the
+    // call only once the prefill is done, so a booking at the call's return
+    // would time nothing (see `PrefillTicket::book`). The bound above was
+    // read before the booking, so the leg's own prompt is not counted twice.
+    let prefill_ticket =
+        prefill_worker.and_then(|worker| PrefillTicket::book(worker, legs.prompt_tokens));
+    let prefill_dispatch: PdLegDispatch = Box::pin(dispatch_prefill_within(
+        bound,
+        Box::pin(async move { prefill_client.generate(prefill_request).await }),
+        prefill_worker.cloned(),
+        workers.decode_worker().cloned(),
+        legs.prefill_label,
+        legs.request_id.clone(),
+        legs.prompt_tokens,
+    ));
+    let decode_dispatch: PdLegDispatch =
+        Box::pin(async move { decode_client.generate(decode_request).await });
+
+    match dispatch_pd_legs(prefill_dispatch, decode_dispatch).await {
+        PdDispatchOutcome::Both(prefill_result, decode_result) => {
+            parallel_legs_answered(
+                &legs,
+                prefill_result,
+                decode_result,
+                bound,
+                prefill_ticket,
+                prefill_guard,
+                // Both legs were dispatched together, so the decode leg's
+                // time to first token is the end-to-end one.
+                PdTiming {
+                    prefill_start,
+                    decode_sent: prefill_start,
+                    runtime,
+                },
+            )
+            .await
+        }
+        PdDispatchOutcome::FailedFirst {
+            leg,
+            error,
+            partner,
+        } => Err(parallel_leg_failed_first(&legs, leg, &error, partner)),
+    }
+}
+
+/// The parallel dispatch's two requests from the client's: the prefill leg is
+/// the request itself, the decode leg its pixel-free clone, each pinned to its
+/// worker's DP rank where the engine reads placement from the request.
+fn parallel_pd_requests(
+    proto_request: ProtoGenerateRequest,
+    workers: &WorkerSelection,
+    protocol: PdProtocol,
+) -> (ProtoGenerateRequest, ProtoGenerateRequest) {
     // Decode consumes the KV handoff from prefill, but TokenSpeed still
     // needs multimodal metadata to pad placeholders and compute MRoPE in
     // the same way as prefill. Drop raw pixels and prefill-only encode
@@ -973,193 +1088,175 @@ async fn execute_parallel_pd(
             decode_request.set_data_parallel_rank(rank as i32);
         }
     }
+    (prefill_request, decode_request)
+}
 
-    // `generate` only establishes the prefill stream here (SMG does not drain
-    // it on this path), so prefill duration cannot be measured — only TTFT,
-    // recorded at the first decode token in streaming. prefill_start anchors it.
-    let prefill_start = Instant::now();
-    let (prefill_label, decode_label) = pd_leg_labels(workers);
-    // The prefill leg's silence is bounded from its dispatch: a call that
-    // returns no stream, or a stream with nothing on it, within the bound
-    // fails the attempt instead of holding the request (and the decode room
-    // the admission gate claimed for it) until its own timeout.
+/// Both legs answered their dispatch: each verdict is translated before either
+/// is propagated, the prefill leg's first response is waited for within what is
+/// left of its bound, and the pair goes to the response with the decode's abort
+/// deferred until its first item.
+async fn parallel_legs_answered(
+    legs: &PdLegs<'_>,
+    prefill_result: StreamResult,
+    decode_result: StreamResult,
+    bound: Option<PrefillLegBound>,
+    prefill_ticket: Option<PrefillTicket>,
+    prefill_guard: PrefillLoadGuard,
+    pd_timing: PdTiming,
+) -> Result<ExecutionResult, Response> {
+    let workers = legs.workers;
+    record_pd_dispatch_outcomes(workers, legs.ledger, &prefill_result, &decode_result);
+
+    // Both legs are translated before either is propagated: a
+    // decode-side failure is logged and counted even when the prefill
+    // error is the one the client sees.
+    let prefill_silence = prefill_result
+        .as_ref()
+        .is_err_and(|e| is_prefill_silence(e) || is_decode_silence(e));
+    let prefill =
+        prefill_result.map_err(|e| pd_leg_error(PdLeg::Prefill, legs.prefill_label, &e, workers));
+    let decode =
+        decode_result.map_err(|e| pd_leg_error(PdLeg::Decode, legs.decode_label, &e, workers));
+    let (prefill_stream, decode_stream) = match (prefill, decode) {
+        (Ok(prefill), Ok(decode)) => (prefill, decode),
+        // A prefill given up on for a silence verdict (its own, or
+        // its stalled decode partner's) may yet start the handoff
+        // into the decode's room: the decode's abort is deferred
+        // until its first item, as the other two paths of the
+        // verdict defer it (30 s at most), not fired by the drop.
+        (Err(response), Ok(decode)) if prefill_silence => {
+            drop(decode.defer_abort_until_first_item());
+            return Err(response);
+        }
+        // Any other failure: the surviving leg's stream drops here,
+        // which aborts its room on the worker.
+        (Err(response), _) | (Ok(_), Err(response)) => return Err(response),
+    };
+
+    // The prefill leg's prompt has been pending prefill on its worker
+    // since its dispatch, until its first response (which teaches the
+    // worker's rate); the stream takes the booking over. What is left
+    // of the leg's bound is spent waiting for that response here,
+    // before the response to the client begins, so a silent prefill
+    // fails the attempt where the retry layer can still take the
+    // request to another prefill worker.
     let prefill_worker = workers.prefill_worker();
-    let prompt_tokens = u64::try_from(prefill_request.prompt_len()).unwrap_or(u64::MAX);
-    let request_id = prefill_request.request_id().to_string();
-    let bound =
-        prefill_worker.and_then(|worker| PrefillLegBound::at(worker, prompt_tokens, prefill_start));
-    // Each leg owns its client handle (a cheap channel clone, the same one
-    // batched dispatch takes per sub-request) so the leg still in flight when
-    // its partner fails can be moved off the request path.
-    let mut prefill_client = prefill_client.clone();
-    let mut decode_client = decode_client.clone();
-    for worker in [workers.prefill_worker(), workers.decode_worker()]
-        .into_iter()
-        .flatten()
-    {
-        Metrics::record_worker_request(worker.url(), worker.model_id());
-    }
-    // The leg is booked on its worker here, before its call is polled: a
-    // servicer that sends its headers with the first message answers the
-    // call only once the prefill is done, so a booking at the call's return
-    // would time nothing (see `PrefillTicket::book`). The bound above was
-    // read before the booking, so the leg's own prompt is not counted twice.
-    let prefill_ticket =
-        prefill_worker.and_then(|worker| PrefillTicket::book(worker, prompt_tokens));
-    let prefill_dispatch: PdLegDispatch = Box::pin(dispatch_prefill_within(
+    let mut prefill_stream = match prefill_worker {
+        Some(worker) => {
+            prefill_stream.tracked_prefill_leg_booked(Arc::clone(worker), prefill_ticket)
+        }
+        None => prefill_stream,
+    };
+    match first_prefill_response_within(
+        &mut prefill_stream,
         bound,
-        Box::pin(async move { prefill_client.generate(prefill_request).await }),
-        prefill_worker.cloned(),
-        workers.decode_worker().cloned(),
-        prefill_label,
-        request_id.clone(),
-        prompt_tokens,
-    ));
-    let decode_dispatch: PdLegDispatch =
-        Box::pin(async move { decode_client.generate(decode_request).await });
-
-    match dispatch_pd_legs(prefill_dispatch, decode_dispatch).await {
-        PdDispatchOutcome::Both(prefill_result, decode_result) => {
-            record_pd_dispatch_outcomes(workers, ledger, &prefill_result, &decode_result);
-
-            // Both legs are translated before either is propagated: a
-            // decode-side failure is logged and counted even when the prefill
-            // error is the one the client sees.
-            let prefill_silence = prefill_result
-                .as_ref()
-                .is_err_and(|e| is_prefill_silence(e) || is_decode_silence(e));
-            let prefill = prefill_result
-                .map_err(|e| pd_leg_error(PdLeg::Prefill, prefill_label, &e, workers));
-            let decode =
-                decode_result.map_err(|e| pd_leg_error(PdLeg::Decode, decode_label, &e, workers));
-            let (prefill_stream, decode_stream) = match (prefill, decode) {
-                (Ok(prefill), Ok(decode)) => (prefill, decode),
-                // A prefill given up on for a silence verdict (its own, or
-                // its stalled decode partner's) may yet start the handoff
-                // into the decode's room: the decode's abort is deferred
-                // until its first item, as the other two paths of the
-                // verdict defer it (30 s at most), not fired by the drop.
-                (Err(response), Ok(decode)) if prefill_silence => {
-                    drop(decode.defer_abort_until_first_item());
-                    return Err(response);
-                }
-                // Any other failure: the surviving leg's stream drops here,
-                // which aborts its room on the worker.
-                (Err(response), _) | (Ok(_), Err(response)) => return Err(response),
-            };
-
-            // The prefill leg's prompt has been pending prefill on its worker
-            // since its dispatch, until its first response (which teaches the
-            // worker's rate); the stream takes the booking over. What is left
-            // of the leg's bound is spent waiting for that response here,
-            // before the response to the client begins, so a silent prefill
-            // fails the attempt where the retry layer can still take the
-            // request to another prefill worker.
-            let mut prefill_stream = match prefill_worker {
-                Some(worker) => {
-                    prefill_stream.tracked_prefill_leg_booked(Arc::clone(worker), prefill_ticket)
-                }
-                None => prefill_stream,
-            };
-            match first_prefill_response_within(
-                &mut prefill_stream,
-                bound,
-                prefill_worker,
-                workers.decode_worker(),
-                prefill_label,
-                &request_id,
-                prompt_tokens,
-            )
-            .await
-            {
-                Err(e) => {
-                    // Dropping the prefill stream aborts its room. The
-                    // decode's abort waits for its first response (30 s at
-                    // most): a handoff the silent prefill may yet start must
-                    // not be torn down mid-write.
-                    drop(prefill_stream);
-                    drop(decode_stream.defer_abort_until_first_item());
-                    record_silence_outcome(workers, ledger, &e);
-                    return Err(pd_leg_error(PdLeg::Prefill, prefill_label, &e, workers));
-                }
-                // The leg answered: the success its dispatch's sample waited
-                // for. A leg whose first item is a failure is charged once,
-                // where its reader meets it (the streaming layer's
-                // accounting); a stream that ended with nothing on it is no
-                // success of the leg either.
-                Ok(FirstItem::Response) => workers.record_outcome_prefill(ledger, 200),
-                Ok(FirstItem::Failure | FirstItem::End) => {}
-            }
-
-            // A client disconnect drops both leg streams, which normally fires an
-            // immediate abort to each worker. The decode leg must not be aborted
-            // while it is still receiving the KV handoff from prefill — tearing
-            // the request down mid-transfer can crash or leak on the engine — so
-            // its abort is deferred until the first decode response (the proof
-            // the handoff completed). The prefill leg keeps the immediate abort:
-            // if prefill is still running there is nothing to hand off yet, and
-            // stopping it promptly frees capacity.
-            let decode_stream = decode_stream.defer_abort_until_first_item();
-
-            Ok(ExecutionResult::PrefillDecode {
-                prefill: prefill_stream,
-                decode: Box::new(decode_stream),
-                prefill_guards: vec![Some(prefill_guard)],
-                // Both legs were dispatched together, so the decode leg's
-                // time to first token is the end-to-end one.
-                pd_timing: PdTiming {
-                    prefill_start,
-                    decode_sent: prefill_start,
-                    runtime,
-                },
-                // The streaming layer drains the live prefill stream itself.
-                prefill_input_logprobs: None,
-            })
+        prefill_worker,
+        workers.decode_worker(),
+        legs.prefill_label,
+        &legs.request_id,
+        legs.prompt_tokens,
+    )
+    .await
+    {
+        Err(e) => {
+            // Dropping the prefill stream aborts its room. The
+            // decode's abort waits for its first response (30 s at
+            // most): a handoff the silent prefill may yet start must
+            // not be torn down mid-write.
+            drop(prefill_stream);
+            drop(decode_stream.defer_abort_until_first_item());
+            record_silence_outcome(workers, legs.ledger, &e);
+            return Err(pd_leg_error(
+                PdLeg::Prefill,
+                legs.prefill_label,
+                &e,
+                workers,
+            ));
         }
-        PdDispatchOutcome::FailedFirst {
-            leg,
-            error,
-            partner,
-        } => {
-            let status = error.breaker_status();
-            // Only the leg that answered is recorded: the abandoned one has
-            // said nothing about its worker yet, and `retire_pd_leg` records
-            // it when it finally does.
-            let (label, partner_label, partner_worker) = match leg {
-                PdLeg::Prefill => {
-                    record_silence_outcome(workers, ledger, &error);
-                    (prefill_label, decode_label, workers.decode_worker())
-                }
-                PdLeg::Decode => {
-                    if let Some(status) = status {
-                        workers.record_outcome_decode(ledger, status);
-                    }
-                    (decode_label, prefill_label, workers.prefill_worker())
-                }
-            };
-            if let Some(worker) = partner_worker {
-                // The partner of a prefill that fell silent is retired with
-                // its abort deferred (that prefill may yet start the handoff
-                // the decode is waiting for) and uncharged: a late failure
-                // of a handoff that never came is not the decode's fault.
-                // The decode partner the verdict charged for stalling is
-                // retired the same way: charged once, at the verdict.
-                let retirement = if is_prefill_silence(&error) || is_decode_silence(&error) {
-                    Retirement::PartnerSilent
-                } else {
-                    Retirement::PartnerFailed
-                };
-                retire_pd_leg(
-                    leg.partner(),
-                    partner_label,
-                    Arc::clone(worker),
-                    partner,
-                    retirement,
-                );
-            }
-            Err(pd_leg_error(leg, label, &error, workers))
-        }
+        // The leg answered: the success its dispatch's sample waited
+        // for. A leg whose first item is a failure is charged once,
+        // where its reader meets it (the streaming layer's
+        // accounting); a stream that ended with nothing on it is no
+        // success of the leg either.
+        Ok(FirstItem::Response) => workers.record_outcome_prefill(legs.ledger, 200),
+        Ok(FirstItem::Failure | FirstItem::End) => {}
     }
+
+    // A client disconnect drops both leg streams, which normally fires an
+    // immediate abort to each worker. The decode leg must not be aborted
+    // while it is still receiving the KV handoff from prefill — tearing
+    // the request down mid-transfer can crash or leak on the engine — so
+    // its abort is deferred until the first decode response (the proof
+    // the handoff completed). The prefill leg keeps the immediate abort:
+    // if prefill is still running there is nothing to hand off yet, and
+    // stopping it promptly frees capacity.
+    let decode_stream = decode_stream.defer_abort_until_first_item();
+
+    Ok(ExecutionResult::PrefillDecode {
+        prefill: prefill_stream,
+        decode: Box::new(decode_stream),
+        prefill_guards: vec![Some(prefill_guard)],
+        pd_timing,
+        // The streaming layer drains the live prefill stream itself.
+        prefill_input_logprobs: None,
+    })
+}
+
+/// One leg failed while its partner was still dispatching: the verdict is
+/// recorded against the leg that answered and becomes the response, and the
+/// partner is retired off the request path.
+fn parallel_leg_failed_first(
+    legs: &PdLegs<'_>,
+    leg: PdLeg,
+    error: &tonic::Status,
+    partner: PdLegDispatch,
+) -> Response {
+    let workers = legs.workers;
+    let status = error.breaker_status();
+    // Only the leg that answered is recorded: the abandoned one has
+    // said nothing about its worker yet, and `retire_pd_leg` records
+    // it when it finally does.
+    let (label, partner_label, partner_worker) = match leg {
+        PdLeg::Prefill => {
+            record_silence_outcome(workers, legs.ledger, error);
+            (
+                legs.prefill_label,
+                legs.decode_label,
+                workers.decode_worker(),
+            )
+        }
+        PdLeg::Decode => {
+            if let Some(status) = status {
+                workers.record_outcome_decode(legs.ledger, status);
+            }
+            (
+                legs.decode_label,
+                legs.prefill_label,
+                workers.prefill_worker(),
+            )
+        }
+    };
+    if let Some(worker) = partner_worker {
+        // The partner of a prefill that fell silent is retired with
+        // its abort deferred (that prefill may yet start the handoff
+        // the decode is waiting for) and uncharged: a late failure
+        // of a handoff that never came is not the decode's fault.
+        // The decode partner the verdict charged for stalling is
+        // retired the same way: charged once, at the verdict.
+        let retirement = if is_prefill_silence(error) || is_decode_silence(error) {
+            Retirement::PartnerSilent
+        } else {
+            Retirement::PartnerFailed
+        };
+        retire_pd_leg(
+            leg.partner(),
+            partner_label,
+            Arc::clone(worker),
+            partner,
+            retirement,
+        );
+    }
+    pd_leg_error(leg, label, error, workers)
 }
 
 /// Dispatch both legs together and answer with the first failure.
@@ -2023,43 +2120,45 @@ fn sequential_pd_decode_form(
     Ok(SequentialPdDecodeForm::TextPlusHashes)
 }
 
-/// Execute vLLM PD: send to prefill with max_tokens=1 first, wait for completion,
-/// then send original request to decode.
-///
-/// For Mooncake: injects bootstrap_host/port from prefill worker metadata into
-/// the decode request. For NIXL: tags the prefill request with do_remote_decode,
-/// then relays the kv_transfer_params returned by the prefill engine to decode.
-async fn execute_sequential_pd(
-    mut proto_request: ProtoGenerateRequest,
-    clients: &mut ClientSelection,
-    workers: &WorkerSelection,
-    model: &str,
-    prefill_guard: PrefillLoadGuard,
-    ledger: &AttemptLedger,
-) -> Result<ExecutionResult, Response> {
-    let streaming = proto_request.stream();
-    let runtime = workers
-        .disaggregated_runtime_type()
-        .map(|r| r.as_str())
-        .unwrap_or("");
-    let (prefill_client, decode_client) =
-        clients.disaggregated_or_mismatch("execute_sequential_pd")?;
+/// What the sequential dispatch decides before either leg is sent: the pair's
+/// KV connector mode, whether the KV handoff is relayed through the router,
+/// the transfer id the router mints for Mooncake, and the decode leg's form.
+struct SequentialPlan {
+    mode: KvConnectorMode,
+    /// The KV handoff is single-consumer: with n>1 each fan-out child on decode
+    /// would pull, and the first completion frees the prefill blocks under its
+    /// siblings (same hazard for NIXL and Mooncake)
+    relay_kv_params: bool,
+    /// Mooncake is push-based: the engine returns nothing, so the router mints
+    /// the transfer correlation id and synthesizes decode params from metadata
+    mooncake_transfer_id: Option<String>,
+    decode_form: SequentialPdDecodeForm,
+    /// A stripped multimodal leg has no local-recompute fallback: the image
+    /// KV exists only on the prefill worker. Text requests strip to a no-op
+    /// and keep the fallback, so only mm requests need the handoff checked.
+    stripped_mm_decode: bool,
+}
 
-    let mode = match workers.decode_worker() {
-        // A MoRI-IO decode engine never recomputes the prompt, whatever the
-        // prefill leg runs.
-        Some(decode) if is_moriio_worker(decode.as_ref()) => KvConnectorMode::MoriIo,
-        _ => workers
-            .prefill_worker()
-            .map(|w| connector_mode_for_worker(w.as_ref()))
-            .unwrap_or(KvConnectorMode::Passthrough),
-    };
+impl SequentialPlan {
+    /// Decide the plan from the pair and the request; a pairing this pipeline
+    /// cannot serve (a MoRI-IO decode, a language-model-only decode the
+    /// request's multimodal payload needs more of) is refused here, before
+    /// either leg is sent.
+    fn decide(
+        proto_request: &ProtoGenerateRequest,
+        workers: &WorkerSelection,
+    ) -> Result<Self, Response> {
+        let mode = match workers.decode_worker() {
+            // A MoRI-IO decode engine never recomputes the prompt, whatever the
+            // prefill leg runs.
+            Some(decode) if is_moriio_worker(decode.as_ref()) => KvConnectorMode::MoriIo,
+            _ => workers
+                .prefill_worker()
+                .map(|w| connector_mode_for_worker(w.as_ref()))
+                .unwrap_or(KvConnectorMode::Passthrough),
+        };
 
-    // Recorded on the success path (after decode established) so failed
-    // requests don't pollute success metrics; captured here before use of mode.
-    let kv_connector_label = mode.metrics_label();
-
-    match &mode {
+        match &mode {
             KvConnectorMode::Mooncake {
                 host,
                 port,
@@ -2098,80 +2197,227 @@ async fn execute_sequential_pd(
             }
         }
 
-    // The KV handoff is single-consumer: with n>1 each fan-out child on decode
-    // would pull, and the first completion frees the prefill blocks under its
-    // siblings (same hazard for NIXL and Mooncake)
-    let relay_kv_params = proto_request.sampling_n() <= 1;
+        let relay_kv_params = proto_request.sampling_n() <= 1;
 
-    // Mooncake is push-based: the engine returns nothing, so the router mints
-    // the transfer correlation id and synthesizes decode params from metadata
-    let mooncake_transfer_id = match &mode {
-        KvConnectorMode::Mooncake {
-            engine_id: Some(_), ..
-        } if relay_kv_params => Some(format!("xfer-{}", uuid::Uuid::now_v7())),
-        _ => None,
-    };
+        let mooncake_transfer_id = match &mode {
+            KvConnectorMode::Mooncake {
+                engine_id: Some(_), ..
+            } if relay_kv_params => Some(format!("xfer-{}", uuid::Uuid::now_v7())),
+            _ => None,
+        };
 
-    // Decode normally reuses the request minus pixels: it receives KV via
-    // the P/D transfer, and prefill reads and unlinks any /dev/shm
-    // segments, so a reused ShmHandle would be unreadable. Same request_id
-    // on both legs is load-bearing for NIXL P/D correlation on vLLM <
-    // 0.13. The pixel-free leg is the clone, so pixel tensors are never
-    // duplicated and die with the prefill send; the per-image mm identity
-    // and grid tensors survive for decode-side hashing and positions.
-    // Media references are resolved by the prefill leg and relayed to
-    // decode as that same identity once prefill completes.
-    // Without a KV handoff (n>1) decode recomputes the prompt locally and
-    // must run the vision encoder, so that leg keeps the full multimodal
-    // payload (SHM-backed tensors cannot serve both legs and fail loudly
-    // on the decode read).
-    //
-    // A decode worker started with `--language-model-only` (the production
-    // vLLM P/D shape) has no vision encoder and
-    // an encoder-cache budget of 0, so even the identity payload fails to
-    // schedule there. Its model info reports supports_vision=false; for such
-    // a worker the decode leg is stripped down to what such an engine takes: the
-    // prefill-expanded input_ids, the KV handoff, and the per-image content
-    // hashes that the servicer folds into cache_salt so different images
-    // cannot alias in the decode prefix cache.
-    let decode_language_model_only = proto_request.is_vllm()
-        && workers
-            .decode_worker()
-            .is_some_and(|worker| worker_language_model_only(worker.as_ref()));
-    let decode_form =
-        sequential_pd_decode_form(&proto_request, decode_language_model_only, relay_kv_params)?;
-    // A stripped multimodal leg has no local-recompute fallback: the image
-    // KV exists only on the prefill worker. Text requests strip to a no-op
-    // and keep the fallback, so only mm requests need the handoff checked.
-    let stripped_mm_decode = matches!(decode_form, SequentialPdDecodeForm::TextPlusHashes)
-        && proto_request.has_mm_inputs();
-    let mut decode_request = match decode_form {
-        SequentialPdDecodeForm::Full => proto_request.clone(),
-        SequentialPdDecodeForm::TextPlusHashes => proto_request.clone_without_mm(),
-        SequentialPdDecodeForm::IdentityOnly => proto_request.clone_without_mm_pixels(),
-    };
-    // Sanitize prefill sampling (max_tokens=1, n=1), stream=false.
-    let mut prefill_request = proto_request;
-    prefill_request.sanitize_sampling_for_prefill(1);
-    prefill_request.set_stream(false);
-    if let Some(rank) = workers.prefill_worker().and_then(|w| w.dp_rank()) {
-        prefill_request.set_data_parallel_rank(rank as i32);
+        // A decode worker started with `--language-model-only` (the production
+        // vLLM P/D shape) has no vision encoder and
+        // an encoder-cache budget of 0, so even the identity payload fails to
+        // schedule there. Its model info reports supports_vision=false; for such
+        // a worker the decode leg is stripped down to what such an engine takes: the
+        // prefill-expanded input_ids, the KV handoff, and the per-image content
+        // hashes that the servicer folds into cache_salt so different images
+        // cannot alias in the decode prefix cache.
+        let decode_language_model_only = proto_request.is_vllm()
+            && workers
+                .decode_worker()
+                .is_some_and(|worker| worker_language_model_only(worker.as_ref()));
+        let decode_form =
+            sequential_pd_decode_form(proto_request, decode_language_model_only, relay_kv_params)?;
+        let stripped_mm_decode = matches!(decode_form, SequentialPdDecodeForm::TextPlusHashes)
+            && proto_request.has_mm_inputs();
+        Ok(Self {
+            mode,
+            relay_kv_params,
+            mooncake_transfer_id,
+            decode_form,
+            stripped_mm_decode,
+        })
     }
-    if mode == KvConnectorMode::Nixl {
-        if relay_kv_params {
-            prefill_request.set_kv_transfer_params_json(NIXL_PREFILL_KV_PARAMS.to_string());
-        } else {
-            debug!(
-                request_id = %prefill_request.request_id(),
-                "vLLM PD (NIXL): n>1 request, skipping kv_transfer_params relay \
-                 (decode recomputes the prompt locally)"
-            );
+
+    /// The prefill request carried KV params, so the servicer was asked for
+    /// the media identity.
+    fn identity_solicited(&self) -> bool {
+        self.mooncake_transfer_id.is_some()
+            || (self.mode == KvConnectorMode::Nixl && self.relay_kv_params)
+    }
+
+    /// The two legs' requests from the client's: the decode leg in the form
+    /// the plan decided, the prefill leg sanitized to one token, one sample
+    /// and no stream, pinned to its worker's DP rank and tagged for the
+    /// connector's handoff.
+    fn requests(
+        &self,
+        mut proto_request: ProtoGenerateRequest,
+        workers: &WorkerSelection,
+    ) -> (ProtoGenerateRequest, ProtoGenerateRequest) {
+        // Decode normally reuses the request minus pixels: it receives KV via
+        // the P/D transfer, and prefill reads and unlinks any /dev/shm
+        // segments, so a reused ShmHandle would be unreadable. Same request_id
+        // on both legs is load-bearing for NIXL P/D correlation on vLLM <
+        // 0.13. The pixel-free leg is the clone, so pixel tensors are never
+        // duplicated and die with the prefill send; the per-image mm identity
+        // and grid tensors survive for decode-side hashing and positions.
+        // Media references are resolved by the prefill leg and relayed to
+        // decode as that same identity once prefill completes.
+        // Without a KV handoff (n>1) decode recomputes the prompt locally and
+        // must run the vision encoder, so that leg keeps the full multimodal
+        // payload (SHM-backed tensors cannot serve both legs and fail loudly
+        // on the decode read).
+        let decode_request = match self.decode_form {
+            SequentialPdDecodeForm::Full => proto_request.clone(),
+            SequentialPdDecodeForm::TextPlusHashes => proto_request.clone_without_mm(),
+            SequentialPdDecodeForm::IdentityOnly => proto_request.clone_without_mm_pixels(),
+        };
+        // Sanitize prefill sampling (max_tokens=1, n=1), stream=false.
+        let mut prefill_request = proto_request;
+        prefill_request.sanitize_sampling_for_prefill(1);
+        prefill_request.set_stream(false);
+        if let Some(rank) = workers.prefill_worker().and_then(|w| w.dp_rank()) {
+            prefill_request.set_data_parallel_rank(rank as i32);
         }
+        if self.mode == KvConnectorMode::Nixl {
+            if self.relay_kv_params {
+                prefill_request.set_kv_transfer_params_json(NIXL_PREFILL_KV_PARAMS.to_string());
+            } else {
+                debug!(
+                    request_id = %prefill_request.request_id(),
+                    "vLLM PD (NIXL): n>1 request, skipping kv_transfer_params relay \
+                     (decode recomputes the prompt locally)"
+                );
+            }
+        }
+        if let Some(ref transfer_id) = self.mooncake_transfer_id {
+            prefill_request.set_kv_transfer_params_json(mooncake_prefill_params(transfer_id));
+        }
+        (prefill_request, decode_request)
     }
-    if let Some(ref transfer_id) = mooncake_transfer_id {
-        prefill_request.set_kv_transfer_params_json(mooncake_prefill_params(transfer_id));
-    }
+}
 
+/// What the drained prefill leg hands on: its completed stream, the connector
+/// params and the processed media identity its Complete frame carried, the
+/// input logprobs and the prefix-cache hit, and the leg's start and end.
+struct PrefillHarvest {
+    stream: ProtoStream,
+    kv_params: Option<String>,
+    media_identity: Option<vllm::MediaIdentity>,
+    input_logprobs: Option<ProtoInputLogProbs>,
+    cached_tokens: PrefillCachedTokens,
+    started: Instant,
+    done: Instant,
+}
+
+/// Execute vLLM PD: send to prefill with max_tokens=1 first, wait for completion,
+/// then send original request to decode.
+///
+/// For Mooncake: injects bootstrap_host/port from prefill worker metadata into
+/// the decode request. For NIXL: tags the prefill request with do_remote_decode,
+/// then relays the kv_transfer_params returned by the prefill engine to decode.
+async fn execute_sequential_pd(
+    proto_request: ProtoGenerateRequest,
+    clients: &mut ClientSelection,
+    workers: &WorkerSelection,
+    model: &str,
+    prefill_guard: PrefillLoadGuard,
+    ledger: &AttemptLedger,
+) -> Result<ExecutionResult, Response> {
+    let streaming = proto_request.stream();
+    let runtime = workers
+        .disaggregated_runtime_type()
+        .map(|r| r.as_str())
+        .unwrap_or("");
+    let (prefill_client, decode_client) =
+        clients.disaggregated_or_mismatch("execute_sequential_pd")?;
+
+    let plan = SequentialPlan::decide(&proto_request, workers)?;
+    // Recorded on the success path (after decode established) so failed
+    // requests don't pollute success metrics; captured here before use of mode.
+    let kv_connector_label = plan.mode.metrics_label();
+    let (prefill_request, mut decode_request) = plan.requests(proto_request, workers);
+    let legs = PdLegs::of(workers, ledger, &prefill_request);
+
+    let PrefillHarvest {
+        stream: prefill_stream,
+        kv_params,
+        media_identity,
+        input_logprobs: prefill_input_logprobs,
+        cached_tokens: prefill_cached_tokens,
+        started: prefill_start,
+        done: prefill_done,
+    } = sequential_prefill_leg(
+        &legs,
+        prefill_request,
+        prefill_client.clone(),
+        prefill_guard,
+    )
+    .await?;
+
+    debug!("vLLM PD: prefill completed, sending decode request");
+
+    let handed_off = relay_to_decode(
+        &plan,
+        workers,
+        &mut decode_request,
+        kv_params,
+        media_identity.as_ref(),
+    )?;
+    let (decode_stream, decode_sent) = sequential_decode_leg(
+        &legs,
+        decode_request,
+        decode_client.clone(),
+        streaming,
+        handed_off,
+        plan.relay_kv_params,
+    )
+    .await?;
+    // Decode established: record the success-only PD metrics here.
+    Metrics::record_pd_kv_connector_mode(kv_connector_label);
+    Metrics::record_pd_prefill_duration(
+        metrics_labels::BACKEND_PD,
+        model,
+        runtime,
+        prefill_done.duration_since(prefill_start),
+    );
+    Metrics::record_pd_kv_transfer_duration(
+        metrics_labels::BACKEND_PD,
+        model,
+        runtime,
+        decode_sent.duration_since(prefill_done),
+    );
+
+    // The client's prompt-side usage is the prefill leg's: the decode leg's
+    // responses carry the prefix-cache hit the prefill leg reported, not the
+    // transfer the decode leg counts as cached.
+    let decode_stream = decode_stream.decode_leg(prefill_cached_tokens);
+
+    // Surface the PD shape (not `Single`) so the streaming layer anchors TTFT
+    // at prefill dispatch. Without this, the decode stream is established only
+    // after prefill completes, and — because the servicer flushes response
+    // headers lazily with the first message — the first decode chunk is
+    // already buffered when the stream task starts, so a task-local timer
+    // measures ~0. The prefill stream is fully drained and its load guard
+    // already released, so the prefill leg carries no live guard.
+    Ok(ExecutionResult::PrefillDecode {
+        prefill: prefill_stream,
+        decode: Box::new(decode_stream),
+        prefill_guards: vec![None],
+        pd_timing: PdTiming {
+            prefill_start,
+            decode_sent,
+            runtime,
+        },
+        prefill_input_logprobs,
+    })
+}
+
+/// The prefill leg of the sequential dispatch: sent and answered within its
+/// bound, booked on its worker, then drained for what the decode leg needs;
+/// its admission slot is released once it is drained. A failure anywhere is
+/// the attempt's, where the retry layer can still take the request to another
+/// prefill worker.
+async fn sequential_prefill_leg(
+    legs: &PdLegs<'_>,
+    prefill_request: ProtoGenerateRequest,
+    mut prefill_client: BackendClient,
+    prefill_guard: PrefillLoadGuard,
+) -> Result<PrefillHarvest, Response> {
+    let workers = legs.workers;
     debug!(
         request_id = %prefill_request.request_id(),
         "vLLM PD: sending prefill request (max_tokens=1)"
@@ -2183,33 +2429,29 @@ async fn execute_sequential_pd(
     // front of a frozen engine), or a stream with nothing on it, within the
     // bound fails the attempt here, where the retry layer can still take
     // the request to another prefill worker.
-    let (prefill_label, decode_label) = pd_leg_labels(workers);
     let prefill_worker = workers.prefill_worker();
-    let prompt_tokens = u64::try_from(prefill_request.prompt_len()).unwrap_or(u64::MAX);
-    let request_id = prefill_request.request_id().to_string();
     let prefill_start = Instant::now();
-    let bound =
-        prefill_worker.and_then(|worker| PrefillLegBound::at(worker, prompt_tokens, prefill_start));
+    let bound = prefill_worker
+        .and_then(|worker| PrefillLegBound::at(worker, legs.prompt_tokens, prefill_start));
     if let Some(prefill) = prefill_worker {
         Metrics::record_worker_request(prefill.url(), prefill.model_id());
     }
-    let mut prefill_client = prefill_client.clone();
     // Booked before the call is polled, for the servicers that send their
     // headers with the first message (see `PrefillTicket::book`); the bound
     // above was read before the booking.
     let prefill_ticket =
-        prefill_worker.and_then(|worker| PrefillTicket::book(worker, prompt_tokens));
+        prefill_worker.and_then(|worker| PrefillTicket::book(worker, legs.prompt_tokens));
     let prefill_stream = dispatch_prefill_within(
         bound,
         Box::pin(async move { prefill_client.generate(prefill_request).await }),
         prefill_worker.cloned(),
         None,
-        prefill_label,
-        request_id.clone(),
-        prompt_tokens,
+        legs.prefill_label,
+        legs.request_id.clone(),
+        legs.prompt_tokens,
     )
     .await
-    .map_err(|e| sequential_prefill_failure(&e, workers, ledger, prefill_label))?;
+    .map_err(|e| sequential_prefill_failure(&e, workers, legs.ledger, legs.prefill_label))?;
     // The prompt has been pending prefill on its worker since the dispatch,
     // until the first response, which teaches the worker's rate; the stream
     // takes the booking over.
@@ -2224,9 +2466,9 @@ async fn execute_sequential_pd(
         bound,
         prefill_worker,
         None,
-        prefill_label,
-        &request_id,
-        prompt_tokens,
+        legs.prefill_label,
+        &legs.request_id,
+        legs.prompt_tokens,
     )
     .await
     {
@@ -2235,41 +2477,41 @@ async fn execute_sequential_pd(
         return Err(sequential_prefill_failure(
             &e,
             workers,
-            ledger,
-            prefill_label,
+            legs.ledger,
+            legs.prefill_label,
         ));
     }
 
     // Drain prefill response, harvesting connector params, the processed
     // media identity, input logprobs and the prefix-cache hit from the
     // Complete frame
-    let mut prefill_kv_params: Option<String> = None;
-    let mut prefill_media_identity: Option<vllm::MediaIdentity> = None;
-    let mut prefill_input_logprobs = None;
-    let mut prefill_cached_tokens = PrefillCachedTokens::default();
+    let mut kv_params: Option<String> = None;
+    let mut media_identity: Option<vllm::MediaIdentity> = None;
+    let mut input_logprobs = None;
+    let mut cached_tokens = PrefillCachedTokens::default();
     while let Some(result) = prefill_stream.next().await {
         match result {
             Ok(response) => {
                 if let ProtoResponseVariant::Complete(complete) = response.into_response() {
-                    prefill_cached_tokens.note(&complete);
+                    cached_tokens.note(&complete);
                     if let Some(json) = complete.kv_transfer_params_json() {
-                        prefill_kv_params = Some(json.to_owned());
+                        kv_params = Some(json.to_owned());
                     }
                     if let Some(identity) = complete.media_identity() {
-                        prefill_media_identity = Some(identity.clone());
+                        media_identity = Some(identity.clone());
                     }
                     if let Some(logprobs) = complete.input_logprobs() {
-                        prefill_input_logprobs = Some(logprobs);
+                        input_logprobs = Some(logprobs);
                     }
                 }
             }
             Err(e) => {
                 if let Some(status) = e.breaker_status() {
-                    workers.record_outcome_prefill(ledger, status);
+                    workers.record_outcome_prefill(legs.ledger, status);
                 }
                 UpstreamClass::account_dispatch_failure(
                     metrics_labels::WORKER_PREFILL,
-                    prefill_label,
+                    legs.prefill_label,
                     &e,
                 );
                 account_pd_leg_failure(metrics_labels::WORKER_PREFILL, &e);
@@ -2284,22 +2526,39 @@ async fn execute_sequential_pd(
     prefill_stream.mark_completed();
     // Prefill is drained: its admission slot is free while decode runs.
     drop(prefill_guard);
-    workers.record_outcome_prefill(ledger, 200);
-    // The prefill phase ends at the drain; recorded below only once decode is
-    // established.
-    let prefill_done = Instant::now();
+    workers.record_outcome_prefill(legs.ledger, 200);
+    // The prefill phase ends at the drain; recorded by the executor only once
+    // decode is established.
+    let done = Instant::now();
+    Ok(PrefillHarvest {
+        stream: prefill_stream,
+        kv_params,
+        media_identity,
+        input_logprobs,
+        cached_tokens,
+        started: prefill_start,
+        done,
+    })
+}
 
-    debug!("vLLM PD: prefill completed, sending decode request");
-
+/// Complete the decode leg's request from the prefill leg's harvest: its
+/// worker's DP rank, the KV handoff in the connector's form (minted for
+/// Mooncake, relayed for the others) and the media identity the prefill
+/// resolved. Returns whether a handoff is on the request. A stripped
+/// multimodal leg without one is refused rather than sent.
+fn relay_to_decode(
+    plan: &SequentialPlan,
+    workers: &WorkerSelection,
+    decode_request: &mut ProtoGenerateRequest,
+    prefill_kv_params: Option<String>,
+    prefill_media_identity: Option<&vllm::MediaIdentity>,
+) -> Result<bool, Response> {
     if let Some(rank) = workers.decode_worker().and_then(|w| w.dp_rank()) {
         decode_request.set_data_parallel_rank(rank as i32);
     }
-    // The prefill request carried KV params, so the servicer was asked for
-    // the media identity; and whether decode ends up holding a handoff.
-    let identity_solicited =
-        mooncake_transfer_id.is_some() || (mode == KvConnectorMode::Nixl && relay_kv_params);
+    let relay_kv_params = plan.relay_kv_params;
     let mut handed_off = false;
-    match (&mode, prefill_kv_params) {
+    match (&plan.mode, prefill_kv_params) {
         // Modern Mooncake: synthesized params under the minted transfer_id
         (
             KvConnectorMode::Mooncake {
@@ -2308,8 +2567,8 @@ async fn execute_sequential_pd(
                 engine_id: Some(engine_id),
             },
             _,
-        ) if mooncake_transfer_id.is_some() => {
-            let transfer_id = mooncake_transfer_id.as_deref().unwrap_or_default();
+        ) if plan.mooncake_transfer_id.is_some() => {
+            let transfer_id = plan.mooncake_transfer_id.as_deref().unwrap_or_default();
             debug!(
                 request_id = %decode_request.request_id(),
                 transfer_id = %transfer_id,
@@ -2357,18 +2616,18 @@ async fn execute_sequential_pd(
         _ => {}
     }
     apply_prefill_media_identity(
-        &mut decode_request,
+        decode_request,
         handed_off,
         relay_kv_params,
-        identity_solicited,
-        prefill_media_identity.as_ref(),
+        plan.identity_solicited(),
+        prefill_media_identity,
     );
 
     // A stripped multimodal leg cannot fall back to a local recompute: the
     // image KV exists only on the prefill worker, so without a handoff the
     // decode engine would recompute the prompt as pure text and answer
     // image-blind. Fail instead of dispatching.
-    if stripped_mm_decode && !decode_request.has_kv_transfer_params() {
+    if plan.stripped_mm_decode && !decode_request.has_kv_transfer_params() {
         error!(
             function = "execute_sequential_pd",
             request_id = %decode_request.request_id(),
@@ -2385,7 +2644,23 @@ async fn execute_sequential_pd(
         mark_non_retryable(&mut response);
         return Err(response);
     }
+    Ok(handed_off)
+}
 
+/// The decode leg of the sequential dispatch: sent once the handoff is on its
+/// request, bounded to its first token when the request streams, its abort
+/// deferred until that first item proves the handoff finished, tracked on its
+/// worker. Returns the established stream and the instant of the dispatch,
+/// where the relay phase ends and the decode leg's time to first token begins.
+async fn sequential_decode_leg(
+    legs: &PdLegs<'_>,
+    decode_request: ProtoGenerateRequest,
+    mut decode_client: BackendClient,
+    streaming: bool,
+    handed_off: bool,
+    relay_kv_params: bool,
+) -> Result<(ProtoStream, Instant), Response> {
+    let workers = legs.workers;
     // Send request to decode
     if let Some(decode) = workers.decode_worker() {
         Metrics::record_worker_request(decode.url(), decode.model_id());
@@ -2410,22 +2685,21 @@ async fn execute_sequential_pd(
     // first token (see `worker_prefilling_before_decode`).
     let decode_bound = if streaming {
         worker_prefilling_before_decode(workers, handed_off, relay_kv_params)
-            .and_then(|worker| DecodeLegBound::at(worker, prompt_tokens, decode_sent))
+            .and_then(|worker| DecodeLegBound::at(worker, legs.prompt_tokens, decode_sent))
     } else {
         None
     };
     let decode_worker = workers.decode_worker().cloned();
-    let mut decode_client = decode_client.clone();
     let decode_stream = dispatch_decode_within(
         decode_bound,
         Box::pin(async move { decode_client.generate(decode_request).await }),
         decode_worker.clone(),
-        decode_label,
-        request_id.clone(),
-        prompt_tokens,
+        legs.decode_label,
+        legs.request_id.clone(),
+        legs.prompt_tokens,
     )
     .await
-    .map_err(|e| sequential_decode_failure(&e, workers, ledger, decode_label))?;
+    .map_err(|e| sequential_decode_failure(&e, workers, legs.ledger, legs.decode_label))?;
 
     // Prefill has completed and its KV blocks are held pending decode's
     // transfer; aborting decode mid-transfer on a client disconnect can
@@ -2450,52 +2724,20 @@ async fn execute_sequential_pd(
         &mut decode_stream,
         decode_bound,
         decode_worker.as_ref(),
-        decode_label,
-        &request_id,
-        prompt_tokens,
+        legs.decode_label,
+        &legs.request_id,
+        legs.prompt_tokens,
     )
     .await
     {
-        return Err(sequential_decode_failure(&e, workers, ledger, decode_label));
+        return Err(sequential_decode_failure(
+            &e,
+            workers,
+            legs.ledger,
+            legs.decode_label,
+        ));
     }
-    // Decode established: record the success-only PD metrics here.
-    Metrics::record_pd_kv_connector_mode(kv_connector_label);
-    Metrics::record_pd_prefill_duration(
-        metrics_labels::BACKEND_PD,
-        model,
-        runtime,
-        prefill_done.duration_since(prefill_start),
-    );
-    Metrics::record_pd_kv_transfer_duration(
-        metrics_labels::BACKEND_PD,
-        model,
-        runtime,
-        decode_sent.duration_since(prefill_done),
-    );
-
-    // The client's prompt-side usage is the prefill leg's: the decode leg's
-    // responses carry the prefix-cache hit the prefill leg reported, not the
-    // transfer the decode leg counts as cached.
-    let decode_stream = decode_stream.decode_leg(prefill_cached_tokens);
-
-    // Surface the PD shape (not `Single`) so the streaming layer anchors TTFT
-    // at prefill dispatch. Without this, the decode stream is established only
-    // after prefill completes, and — because the servicer flushes response
-    // headers lazily with the first message — the first decode chunk is
-    // already buffered when the stream task starts, so a task-local timer
-    // measures ~0. The prefill stream is fully drained and its load guard
-    // already released, so the prefill leg carries no live guard.
-    Ok(ExecutionResult::PrefillDecode {
-        prefill: prefill_stream,
-        decode: Box::new(decode_stream),
-        prefill_guards: vec![None],
-        pd_timing: PdTiming {
-            prefill_start,
-            decode_sent,
-            runtime,
-        },
-        prefill_input_logprobs,
-    })
+    Ok((decode_stream, decode_sent))
 }
 
 #[cfg(test)]
