@@ -2730,8 +2730,9 @@ mod tests {
         }
     }
 
-    /// One table for both completion paths: the engine's word or its JSON
-    /// `type` when the API knows it, else "stop"; a local stop beats all.
+    /// One table for both completion paths: the API's words and the engines'
+    /// own signals pass, as a word or as a JSON `type`; anything else is
+    /// "stop"; a local stop beats all.
     #[test]
     fn the_completion_finish_reason_is_one_table() {
         for (local_stop, engine, expected) in [
