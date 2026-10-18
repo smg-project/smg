@@ -427,7 +427,8 @@ impl AppContextBuilder {
             .router_config
             .ok_or(AppContextBuildError::MissingField("router_config"))?;
         // The configuration's liveness budgets (the stall, wedge and stale
-        // thresholds and the warm-up slice, see `worker::liveness`) take
+        // thresholds, the wedge drain and the warm-up slice, see
+        // `worker::liveness`) take
         // effect for every context built from it, the server's and a test's
         // alike, here and nowhere else. They are process-wide and the first
         // call wins, so the first context built in a process sets them.

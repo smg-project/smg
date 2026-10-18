@@ -1318,13 +1318,12 @@ impl ConfigValidator {
         // (`worker_wedge_secs` 0) there is nothing to escalate, and the drain
         // would silently never run.
         if config.worker_wedge_drain_secs > 0 && config.worker_wedge_secs == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "worker_wedge_drain_secs".to_string(),
-                value: config.worker_wedge_drain_secs.to_string(),
-                reason: "The wedge drain escalates the wedged veto, which worker_wedge_secs = 0 \
-                         turns off; set worker_wedge_secs or leave the drain at 0"
-                    .to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "worker_wedge_drain_secs",
+                config.worker_wedge_drain_secs,
+                "The wedge drain escalates the wedged veto, which worker_wedge_secs = 0 \
+                 turns off; set worker_wedge_secs or leave the drain at 0",
+            ));
         }
 
         if config.queue_size > 0 && config.queue_timeout_secs == 0 {

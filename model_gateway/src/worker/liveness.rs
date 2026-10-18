@@ -528,7 +528,7 @@ pub(crate) fn configure(stall: Duration, wedge: Duration, stale: Duration) {
 }
 
 /// Apply every liveness budget the configuration carries: the stall, wedge
-/// and stale thresholds and the warm-up slice. The one place the budgets
+/// and stale thresholds, the wedge drain and the warm-up slice. The one place the budgets
 /// are read from a configuration, for the server's start-up and for a
 /// context built by hand (the test harness); the first call in a process
 /// wins, as for [`configure`].
