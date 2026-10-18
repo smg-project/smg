@@ -63,7 +63,6 @@ pub(in crate::openai) async fn route_responses(
         .workers
         .select(&SelectWorkerRequest {
             model_id: model,
-            headers,
             router: Some(known::OPENAI),
             ..Default::default()
         })

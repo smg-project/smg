@@ -4,20 +4,14 @@
 
 use std::{sync::Arc, time::Duration};
 
-use axum::{http::HeaderValue, response::Response};
+use axum::response::Response;
 use futures_util::future::join_all;
-use openai_protocol::models::ListModelsResponse;
 use smg_external_router::ExternalRouterSpec;
 
 use crate::{
-    routers::{
-        common::{
-            header_utils::{apply_provider_headers, extract_auth_header},
-            overload,
-        },
-        error,
-    },
+    routers::{common::overload, error, provider_support},
     worker::{overload::STAGE_SELECTION, ProviderType, RuntimeType, Worker, WorkerRegistry},
+    workflow::steps::external::{fetch_models, resolve_discovery_api_key},
 };
 
 /// Holds references to shared infrastructure needed for worker selection.
@@ -50,8 +44,9 @@ impl<'a> WorkerSelector<'a> {
     ///
     /// 1. Filter available workers by the request criteria.
     /// 2. Pick the least-loaded worker that supports the model.
-    /// 3. On miss, refresh external model lists by calling `/v1/models`
-    ///    on all external workers (vendor-aware parsing), then retry.
+    /// 3. On miss, re-discover the external workers' models with the key the
+    ///    operator configured for each (registration's discovery, run again),
+    ///    then retry.
     /// 4. Return an error distinguishing "model not found" from "all
     ///    workers circuit-broken".
     pub async fn select_worker(
@@ -78,9 +73,7 @@ impl<'a> WorkerSelector<'a> {
             "No worker found, refreshing external worker models"
         );
 
-        let auth = extract_auth_header(req.headers, None);
-        self.refresh_external_models(auth.as_ref(), req.router.as_ref())
-            .await;
+        self.refresh_external_models(req.router.as_ref()).await;
 
         self.find_best_worker(req).ok_or_else(|| {
             if self.any_worker_supports_model(req) {
@@ -170,16 +163,13 @@ impl<'a> WorkerSelector<'a> {
         })
     }
 
-    /// Refresh model lists for healthy external workers in parallel.
+    /// Re-discover the models of the healthy external workers in parallel,
+    /// each with the key the operator configured for it.
     ///
-    /// When `router` is set, only workers it takes are refreshed, so a caller's
-    /// key never reaches another provider's workers. Each worker falls back to
-    /// its own configured API key when the caller provides no auth.
-    async fn refresh_external_models(
-        &self,
-        auth_header: Option<&HeaderValue>,
-        router: Option<&ExternalRouterSpec>,
-    ) {
+    /// When `router` is set, only workers it takes are refreshed: the others
+    /// cannot serve this request, so re-reading their catalogues would be a
+    /// wasted call. Nothing of the caller's request takes part.
+    async fn refresh_external_models(&self, router: Option<&ExternalRouterSpec>) {
         let mut external_workers: Vec<_> = self
             .registry
             .get_routing_workers()
@@ -190,8 +180,9 @@ impl<'a> WorkerSelector<'a> {
             .cloned()
             .collect();
 
-        // Only refresh workers matching the request's provider to avoid sending
-        // e.g. an OpenAI key to Anthropic workers during model discovery.
+        // Only refresh the workers the request's router takes: the others
+        // cannot serve this request, so re-reading their catalogues would be
+        // a wasted call (each worker is asked with its own configured key).
         if let Some(router) = router {
             external_workers.retain(|w| router.takes(w.default_provider()));
         }
@@ -205,10 +196,7 @@ impl<'a> WorkerSelector<'a> {
             external_workers.len()
         );
 
-        let futures: Vec<_> = external_workers
-            .iter()
-            .map(|w| refresh_worker_models(w, auth_header))
-            .collect();
+        let futures: Vec<_> = external_workers.iter().map(refresh_worker_models).collect();
 
         // Timeout prevents a slow/unresponsive worker from blocking all
         // requests that trigger refresh-on-miss.
@@ -245,70 +233,52 @@ fn filter_by_router(
     }
 }
 
-/// Refresh a single worker's model list by calling its `/v1/models` endpoint.
+/// Re-discover one external worker's models and store them: the registration
+/// discovery run again, with the key the operator configured for the worker
+/// (the provider's admin key from the environment, else the worker's
+/// `api_key`), the cards grouped as registration groups them and narrowed to
+/// the providers this build routes. A worker without a configured key was
+/// registered as a wildcard, which admits every model and had nothing to
+/// discover, and is left alone.
 ///
-/// Auth headers are adapted per-vendor via [`apply_provider_headers`] (e.g.
-/// Anthropic uses `x-api-key`, OpenAI uses `Authorization: Bearer`). The
-/// response is parsed via [`ListModelsResponse::parse_upstream`].
-async fn refresh_worker_models(
-    worker: &Arc<dyn Worker>,
-    auth_header: Option<&HeaderValue>,
-) -> bool {
-    let url = format!("{}/v1/models", worker.url());
-    let mut backend_req = worker.http_client().get(&url);
+/// No credential of the caller's request takes part: the cards are shared by
+/// every caller, so only the operator's view of the provider may be written
+/// to them.
+async fn refresh_worker_models(worker: &Arc<dyn Worker>) {
+    let spec = &worker.metadata().spec;
+    let provider = ProviderType::from_url(&spec.url);
+    let Some(api_key) =
+        resolve_discovery_api_key(provider.as_ref(), &spec.url, spec.api_key.as_deref())
+    else {
+        return;
+    };
 
-    // Use caller's auth if provided, otherwise fall back to worker's configured API key.
-    // This matches how auth is handled in request routing (e.g. openai/router.rs).
-    let worker_auth = auth_header.cloned().or_else(|| {
-        worker
-            .api_key()
-            .and_then(|k| HeaderValue::from_str(&format!("Bearer {k}")).ok())
-    });
-    if let Some(ref auth) = worker_auth {
-        backend_req = apply_provider_headers(backend_req, &url, Some(auth));
-    }
-
-    match backend_req.send().await {
-        Ok(response) if response.status().is_success() => {
-            match response.json::<serde_json::Value>().await {
-                Ok(json) => {
-                    let provider = ProviderType::from_url(&url);
-                    let model_cards = ListModelsResponse::parse_upstream(&json, provider);
-
-                    if !model_cards.is_empty() {
-                        tracing::info!(
-                            "Model refresh: found {} models from {}",
-                            model_cards.len(),
-                            url
-                        );
-                        worker.set_models(model_cards);
-                        return true;
-                    }
-                    false
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to parse models response: {}", e);
-                    false
-                }
-            }
-        }
-        Ok(response) => {
-            tracing::debug!(
-                "Model refresh returned non-success status {} from {}",
-                response.status(),
-                url
-            );
-            false
-        }
+    let cards = match fetch_models(&spec.url, Some(&api_key), provider.as_ref()).await {
+        Ok(cards) => cards,
         Err(e) => {
-            tracing::warn!("Failed to fetch models from backend: {}", e);
-            false
+            tracing::warn!("Model refresh from {} failed: {}", spec.url, e);
+            return;
         }
+    };
+    let (cards, unroutable) = provider_support::partition_routable(spec, cards);
+    if !unroutable.is_empty() {
+        tracing::debug!(
+            "Model refresh: {} of the models {} lists need a router this build does not carry",
+            unroutable.len(),
+            spec.url
+        );
     }
+    if cards.is_empty() {
+        return;
+    }
+    tracing::info!("Model refresh: {} models from {}", cards.len(), spec.url);
+    worker.set_models(cards);
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use openai_protocol::worker::{HealthCheckConfig, WorkerSpec};
     use smg_external_router::known;
 
@@ -477,5 +447,166 @@ mod tests {
             error::extract_error_code_from_response(&refused),
             "worker_overload_protection_shed"
         );
+    }
+
+    type Seen = Arc<Mutex<Vec<Option<String>>>>;
+
+    /// What a provider stub answers on `/v1/models` under an `Authorization`
+    /// value: a catalogue of model ids, or a refusal.
+    type Catalogue = fn(Option<&str>) -> Option<Vec<&'static str>>;
+
+    /// A provider stub whose `/v1/models` records the `Authorization` it is
+    /// shown and answers `catalogue`. Returns its URL, the record and the
+    /// server task to abort.
+    async fn stub_provider(catalogue: Catalogue) -> (String, Seen, tokio::task::JoinHandle<()>) {
+        use axum::{
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::get,
+            Json, Router,
+        };
+        use tokio::net::TcpListener;
+
+        async fn models(
+            State((seen, catalogue)): State<(Seen, Catalogue)>,
+            headers: HeaderMap,
+        ) -> Response {
+            let auth = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            seen.lock().expect("record").push(auth.clone());
+            match catalogue(auth.as_deref()) {
+                Some(ids) => {
+                    let data: Vec<_> = ids
+                        .iter()
+                        .map(|id| serde_json::json!({"id": id, "object": "model"}))
+                        .collect();
+                    Json(serde_json::json!({"object": "list", "data": data})).into_response()
+                }
+                None => StatusCode::UNAUTHORIZED.into_response(),
+            }
+        }
+
+        let seen: Seen = Arc::default();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let app = Router::new()
+            .route("/v1/models", get(models))
+            .with_state((Arc::clone(&seen), catalogue));
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only provider stub; the handle is aborted at test end"
+        )]
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        (url, seen, server)
+    }
+
+    /// An external worker as registration builds it: with the key the
+    /// operator configured, if any, and the cards discovered with it (none
+    /// for a wildcard worker, which admits every model).
+    fn external_worker(url: &str, api_key: Option<&str>, models: &[&str]) -> Arc<dyn Worker> {
+        let models: Vec<_> = models
+            .iter()
+            .map(|id| serde_json::json!({"id": id}))
+            .collect();
+        let spec: WorkerSpec = serde_json::from_value(serde_json::json!({
+            "url": url,
+            "runtime_type": "external",
+            "api_key": api_key,
+            "models": models,
+        }))
+        .expect("worker spec");
+        Arc::new(
+            BasicWorkerBuilder::from_spec(spec)
+                .health_config(no_health_check())
+                .build(),
+        )
+    }
+
+    /// The refresh on a miss is the registration's discovery run again: the
+    /// key the operator configured for the worker goes out and no other, and
+    /// the cards come back as registration shapes them, a dated variant an
+    /// alias of its base model. A model the provider added since
+    /// registration is admitted after it.
+    #[tokio::test]
+    async fn the_refresh_on_a_miss_rediscovers_with_the_operators_key() {
+        let (url, seen, server) = stub_provider(|auth| {
+            (auth == Some("Bearer operator-key")).then(|| {
+                vec![
+                    "operator-model",
+                    "released-later",
+                    "released-later-2026-01-01",
+                ]
+            })
+        })
+        .await;
+        let registry = WorkerRegistry::new();
+        let keyed = external_worker(&url, Some("operator-key"), &["operator-model"]);
+        registry.register_or_replace(Arc::clone(&keyed));
+
+        let picked = WorkerSelector::new(&registry)
+            .select_worker(&SelectWorkerRequest {
+                model_id: "released-later-2026-01-01",
+                ..Default::default()
+            })
+            .await
+            .expect("a model the operator's key sees is admitted after the refresh");
+        server.abort();
+        assert_eq!(picked.url(), url);
+        assert_eq!(
+            *seen.lock().expect("record"),
+            vec![Some("Bearer operator-key".to_owned())],
+            "the configured key, once"
+        );
+
+        let mut cards = keyed.models();
+        cards.sort_by(|a, b| a.id.cmp(&b.id));
+        let ids: Vec<&str> = cards.iter().map(|card| card.id.as_str()).collect();
+        assert_eq!(ids, ["operator-model", "released-later"]);
+        assert_eq!(cards[1].aliases, ["released-later-2026-01-01"]);
+    }
+
+    /// A worker registered without a key is a wildcard: registration
+    /// discovered nothing for it and admits every model, and a miss discovers
+    /// nothing either. Before, the miss fetched its catalogue without a
+    /// credential and the wildcard collapsed into that answer for every
+    /// caller.
+    #[tokio::test]
+    async fn a_worker_without_a_configured_key_is_not_refreshed_on_a_miss() {
+        let (url, seen, server) = stub_provider(|_| Some(vec!["one-model"])).await;
+        let registry = WorkerRegistry::new();
+        let wildcard = external_worker(&url, None, &[]);
+        registry.register_or_replace(Arc::clone(&wildcard));
+
+        // A realtime request no worker can take is a miss, and the miss path
+        // refreshes every external worker.
+        let refused = WorkerSelector::new(&registry)
+            .select_worker(&SelectWorkerRequest {
+                model_id: "any-model",
+                require_realtime_capable: true,
+                ..Default::default()
+            })
+            .await;
+        assert!(refused.is_err(), "no realtime-capable worker");
+        server.abort();
+        assert!(
+            seen.lock().expect("record").is_empty(),
+            "no configured key, no request"
+        );
+
+        assert!(wildcard.models().is_empty());
+        assert!(wildcard.supports_model("any-model"), "the wildcard stands");
+        let picked = WorkerSelector::new(&registry)
+            .select_worker(&SelectWorkerRequest {
+                model_id: "any-model",
+                ..Default::default()
+            })
+            .await
+            .expect("the wildcard worker serves any model");
+        assert_eq!(picked.url(), url);
     }
 }

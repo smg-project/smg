@@ -119,15 +119,10 @@ impl OpenAIRouter {
         })
     }
 
-    async fn select_worker(
-        &self,
-        model_id: &str,
-        headers: Option<&HeaderMap>,
-    ) -> Result<Arc<dyn ExternalWorker>, Response> {
+    async fn select_worker(&self, model_id: &str) -> Result<Arc<dyn ExternalWorker>, Response> {
         self.workers
             .select(&SelectWorkerRequest {
                 model_id,
-                headers,
                 router: Some(known::OPENAI),
                 ..Default::default()
             })
@@ -193,7 +188,7 @@ impl ExternalRouter for OpenAIRouter {
     ) -> Response {
         // TODO(Phase 3): Inject MCP tool definitions into body.tools
         let model = body.model.as_deref().unwrap_or_default();
-        let worker = self.select_worker(model, headers).await;
+        let worker = self.select_worker(model).await;
         forward_realtime_rest(
             RealtimeLabels::OPENAI,
             worker,
@@ -213,7 +208,7 @@ impl ExternalRouter for OpenAIRouter {
     ) -> Response {
         // TODO(Phase 3): Inject MCP tool definitions into body.session.tools
         let model = body.session.model.as_deref().unwrap_or_default();
-        let worker = self.select_worker(model, headers).await;
+        let worker = self.select_worker(model).await;
         forward_realtime_rest(
             RealtimeLabels::OPENAI,
             worker,
@@ -232,7 +227,7 @@ impl ExternalRouter for OpenAIRouter {
         body: &RealtimeTranscriptionSessionCreateRequest,
     ) -> Response {
         let model = body.model.as_deref().unwrap_or_default();
-        let worker = self.select_worker(model, headers).await;
+        let worker = self.select_worker(model).await;
         forward_realtime_rest(
             RealtimeLabels::OPENAI,
             worker,
@@ -258,7 +253,7 @@ impl ExternalRouter for OpenAIRouter {
         );
 
         let auth_header = extract_auth_header(Some(&parts.headers), None);
-        let worker = self.select_worker(model, Some(&parts.headers)).await;
+        let worker = self.select_worker(model).await;
 
         handle_realtime_ws(
             RealtimeLabels::OPENAI,
@@ -307,9 +302,7 @@ impl ExternalRouter for OpenAIRouter {
         );
 
         let auth_header = extract_auth_header(Some(&parts.headers), None);
-        let worker = self
-            .select_worker(&parsed.model, Some(&parts.headers))
-            .await;
+        let worker = self.select_worker(&parsed.model).await;
 
         let bind_addr = self
             .webrtc_bind_addr

@@ -38,7 +38,6 @@ pub(crate) async fn worker_selection(ctx: &mut RequestContext) -> Result<StepRes
         .workers
         .select(&SelectWorkerRequest {
             model_id: model,
-            headers: ctx.input.headers.as_ref(),
             router: Some(known::GEMINI),
             ..Default::default()
         })
