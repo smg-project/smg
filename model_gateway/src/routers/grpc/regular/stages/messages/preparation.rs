@@ -185,11 +185,12 @@ impl MessagePreparationStage {
                 multimodal_refs = Some(media_plan);
             } else {
                 // The dtype every worker the selection can pick reads image
-                // pixels in, when they agree and the one-pass write is opted
-                // in (`ONE_PASS_WIRE_ENV`): the preprocessor then writes it
-                // directly; otherwise `None`, and the write happens at
-                // assembly. Resolved over the pools of this pipeline's mode,
-                // the legs the pixels can reach, as the selection draws them.
+                // pixels in, when they agree (and the one-pass write is not
+                // switched off, `SMG_MM_ONE_PASS_WIRE=0`): the preprocessor
+                // then writes it directly; otherwise `None`, and the write
+                // happens at assembly. Resolved over the pools of this
+                // pipeline's mode, the legs the pixels can reach, as the
+                // selection draws them.
                 let image_wire_dtype = multimodal::mm_shared_image_wire_dtype_over(
                     &ctx.components.worker_registry,
                     model_id,
@@ -265,14 +266,16 @@ impl MessagePreparationStage {
             .components
             .worker_registry
             .get_by_model(&ctx.input.model_id);
-        let symphony_constraint = symphony::constraint_messages(
+        let symphony_constraint = symphony::constraint(
             parser,
             &names,
-            request,
+            symphony::Asks::Messages {
+                request,
+                continues: request.continues_final_assistant(),
+            },
             &filtered_tools,
             reasoning,
             symphony::grammar_start_of(&workers),
-            request.continues_final_assistant(),
             &ctx.components.templates,
         );
         let tool_call_constraint = match (symphony_constraint, chat_tool_choice.as_ref()) {
@@ -281,7 +284,7 @@ impl MessagePreparationStage {
                 .tool_parser_factory
                 .registry()
                 .generate_tool_constraint(
-                    names.tool.as_deref(),
+                    ctx.components.parser_resolver.legacy_tool(&names),
                     &filtered_tools,
                     tool_choice,
                     reasoning,

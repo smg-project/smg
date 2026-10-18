@@ -36,7 +36,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::ids::CallIds;
+    use crate::{
+        ids::CallIds,
+        testing::{arguments_of, bytes, content, reasoning},
+    };
 
     fn ids() -> CallIds {
         CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
@@ -51,7 +54,7 @@ mod tests {
         event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
         input::{EngineFinish, Input, TokenSpan},
         parser::{ParseError, Parser},
-        tagged::Declared,
+        Declared,
     };
 
     const CALL: &str = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>";
@@ -72,21 +75,6 @@ mod tests {
         }
         parser.feed(Input::End { finish }, &mut out).expect("end");
         out.drain()
-    }
-
-    /// Every byte of every event, in order: the proof that nothing was lost or invented.
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
     }
 
     /// Events with adjacent text of one kind joined and argument fragments joined per call, so two
@@ -258,16 +246,6 @@ mod tests {
     }
 
     /// The content text of the events, in order.
-    fn content_of(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// The whitespace the engine dropped as the template's spacing, event by event.
     fn spacing(events: &[Event]) -> Vec<&str> {
         events
@@ -299,7 +277,7 @@ mod tests {
         let mut deltas = Vec::new();
         for piece in pieces {
             parser.feed(delta(piece), &mut out).expect("delta");
-            deltas.push(content_of(&out.drain()));
+            deltas.push(content(&out.drain()));
         }
         parser
             .feed(
@@ -309,7 +287,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        deltas.push(content_of(&out.drain()));
+        deltas.push(content(&out.drain()));
         deltas.retain(|delta| !delta.is_empty());
         deltas
     }
@@ -339,7 +317,7 @@ mod tests {
         let output = format!("<think>\nplan\n</think>\n\n{CALL}\n{second}");
         let whole = run(&[&output], EngineFinish::Stop);
         assert_eq!(bytes(&whole), output);
-        assert_eq!(content_of(&whole), "");
+        assert_eq!(content(&whole), "");
         assert_eq!(spacing(&whole), ["\n\n", "\n"]);
         assert!(matches!(
             whole.last(),
@@ -373,7 +351,7 @@ mod tests {
         let output = format!("\n</think>\n\n{TAGGED_CALL}\n{TAGGED_CALL}");
         let whole = after_prompt(prompt, &output);
         assert_eq!(bytes(&whole), output);
-        assert_eq!(content_of(&whole), "");
+        assert_eq!(content(&whole), "");
         assert_eq!(spacing(&whole), ["\n\n", "\n"]);
         assert_eq!(arguments_of(&whole, 1), r#"{"city": "Paris", "days": 3}"#);
         let tagged = || qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine));
@@ -392,7 +370,7 @@ mod tests {
         // the stream shows the spacing with the text it belongs to.
         let output = format!("\n</think>\n\nSure.\n{TAGGED_CALL}");
         let events = after_prompt(prompt, &output);
-        assert_eq!(content_of(&events), "\n\nSure.\n");
+        assert_eq!(content(&events), "\n\nSure.\n");
         assert_eq!(spacing(&events), Vec::<&str>::new());
         assert_eq!(
             content_deltas(tagged(), prompt, &tokens_of(&output)),
@@ -1012,18 +990,6 @@ mod tests {
         out.drain()
     }
 
-    fn arguments_of(events: &[Event], call: u32) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallArguments { index, json, .. } if *index == call => {
-                    Some(json.as_str())
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
     #[test]
     fn a_tagged_call_after_thinking_streams_its_string_and_writes_its_integer() {
         let output = format!("<think>\nThe user asks.\n</think>\n\n{TAGGED_CALL}");
@@ -1290,16 +1256,6 @@ mod tests {
         out.drain()
     }
 
-    fn reasoning_of(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
     #[test]
     fn the_prompt_is_replayed_from_the_turn_the_model_writes_not_from_its_start() {
         // A stray `<tool_call>` in the user's turn, and the generation prompt opens the thought:
@@ -1319,7 +1275,7 @@ mod tests {
             ] {
                 assert_eq!(events[0], Event::ReasoningStart, "{prompt:?}");
                 assert_eq!(
-                    reasoning_of(&events),
+                    reasoning(&events),
                     "The user asks about the marker.\n",
                     "{prompt:?}"
                 );
@@ -1408,7 +1364,7 @@ mod tests {
             .expect("delta");
         let events = out.drain();
         assert_eq!(events[0], Event::ReasoningStart);
-        assert_eq!(reasoning_of(&events), "The user asks about the marker.\n");
+        assert_eq!(reasoning(&events), "The user asks about the marker.\n");
     }
 
     /// The table with the tagged syntax at `placement`, for a `submit_patch` tool whose `patch`

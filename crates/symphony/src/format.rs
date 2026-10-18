@@ -116,7 +116,7 @@ use crate::{
     gemma,
     markers::{Piece, Scanner},
     pythonic,
-    shape::{CallShape, Layout, ValueRead, Values},
+    shape::{CallShape, Layout, NameSource, ValueRead, Values},
     tagged::{self, attributed::TagEnd, keyed},
 };
 
@@ -258,6 +258,22 @@ pub enum Whitespace {
     Bounded(u32),
 }
 
+/// Where a call's id comes from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CallId {
+    /// The engine's: the request's nonce the call's index steps on (`ids.rs`), the shape the
+    /// gateway's older parsers mint.
+    #[default]
+    Minted,
+    /// The call's header as the model wrote it, its surrounding whitespace and the literal that
+    /// ends the header left out (`functions.get_weather:0` for the Kimi K2 line): a family whose
+    /// templates render a turn's ids back into the prompt keeps the id the model will see again,
+    /// and a tool result pairs with its call by the id the model gave. A header whose id repeats
+    /// one already given in the response takes the minted id instead, so a response's ids stay
+    /// distinct. Only a call given as data whose header names the call has one.
+    Header,
+}
+
 /// One format's table. Built with [`Format::new`] and the methods that add a row each; the
 /// first state added is the initial one.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -267,6 +283,8 @@ pub struct Format {
     states: Vec<State>,
     transitions: Vec<Transition>,
     calls: Option<CallSyntax>,
+    /// Where a call's id comes from.
+    call_id: CallId,
     turn_opener: Option<String>,
     /// The turn anchors, in the order a match at one place prefers them.
     anchors: Vec<Anchor>,
@@ -371,6 +389,7 @@ impl Format {
             states: Vec::new(),
             transitions: Vec::new(),
             calls: None,
+            call_id: CallId::Minted,
             turn_opener: None,
             anchors: Vec::new(),
             start: None,
@@ -454,6 +473,14 @@ impl Format {
     #[must_use]
     pub fn calls(mut self, syntax: CallSyntax) -> Self {
         self.calls = Some(syntax);
+        self
+    }
+
+    /// Where a call's id comes from: the engine's nonce, or the call's header as the model wrote
+    /// it ([`CallId::Header`]).
+    #[must_use]
+    pub fn call_id(mut self, source: CallId) -> Self {
+        self.call_id = source;
         self
     }
 
@@ -1124,6 +1151,11 @@ impl Format {
         self.calls.as_ref()
     }
 
+    /// Where a call's id comes from.
+    pub fn call_id_source(&self) -> CallId {
+        self.call_id
+    }
+
     /// Whether the stream's stop closes the call in state `index`.
     pub(crate) fn stop_closes(&self, index: usize) -> bool {
         self.states[index].closes_at_stop
@@ -1316,6 +1348,18 @@ impl Format {
                 self.name
             ));
         }
+        if self.call_id == CallId::Header
+            && self
+                .calls
+                .as_ref()
+                .is_some_and(|syntax| !matches!(syntax, CallSyntax::Shaped(_)))
+        {
+            return Err(format!(
+                "format {}: the call's id comes from its header, which only a call given as data \
+                 has",
+                self.name
+            ));
+        }
         if let Some(CallSyntax::Shaped(shape)) = self.calls {
             self.validate_shaped(shape)?;
         }
@@ -1331,6 +1375,14 @@ impl Format {
     fn validate_shaped(&self, shape: &CallShape) -> Result<(), String> {
         if let Err(why) = shape.check() {
             return Err(format!("format {}: the call's shape: {why}", self.name));
+        }
+        if self.call_id == CallId::Header
+            && (shape.header.0.is_empty() || shape.name != NameSource::Header)
+        {
+            return Err(format!(
+                "format {}: the call's id comes from its header, but the header names no call",
+                self.name
+            ));
         }
         let calls = |index: usize| self.states[index].emits == Emits::Arguments;
         let anchored = self.anchors.iter().any(|anchor| calls(anchor.state));
@@ -1463,7 +1515,7 @@ mod tests {
             event::Events,
             input::{EngineFinish, Input},
             parser::Parser,
-            tagged::Declared,
+            Declared,
         };
         let mut parser = Engine::new(format, Declared::default());
         let mut out = Events::new();
@@ -2315,7 +2367,7 @@ mod tests {
             );
         }
         let unnamed = CallSyntax::Shaped(crate::shape::intern(CallShape {
-            name: crate::shape::NameSource::Body,
+            name: NameSource::Body,
             ..shape(true)
         }));
         assert_eq!(

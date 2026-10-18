@@ -291,6 +291,8 @@ mod tests {
                 ptr::null(),
                 ptr::null(),
                 1,
+                0,
+                ptr::null(),
                 &mut error_out,
             )
         };

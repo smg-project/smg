@@ -27,7 +27,7 @@ use crate::{
             common::responses::{
                 await_stream_startup, ensure_mcp_connection, load_history,
                 persist_response_if_needed, stream_startup_channel,
-                streaming::{failure_reason, ResponseStreamEventEmitter, StreamStartupSender},
+                streaming::{ResponseStreamEventEmitter, StreamStartupSender},
                 BackgroundStream, ResponsesContext,
             },
             harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
@@ -471,19 +471,7 @@ async fn execute_mcp_tool_loop_streaming(
                     .await
                     .err()
                     .map(|e| e.error_object());
-                    let usage_json = json!(ResponseUsage::from(&usage));
-                    let event = match &not_stored {
-                        Some(error) => emitter.emit_failed(Some(&usage_json), error),
-                        None => emitter.emit_completed(Some(&usage_json)),
-                    };
-                    // Counted only once the terminal reached the client, as emit_terminal counts.
-                    let delivered = emitter.send_event_best_effort(&event, tx).await;
-                    if delivered && not_stored.is_some() {
-                        Metrics::record_responses_stream_failure(
-                            &original_request.model,
-                            failure_reason(not_stored.as_ref()),
-                        );
-                    }
+                    emitter.finish_stream(&usage, not_stored.as_ref(), tx).await;
                     return;
                 }
 
@@ -529,22 +517,9 @@ async fn execute_mcp_tool_loop_streaming(
                 .err()
                 .map(|e| e.error_object());
 
-                // Emit response.completed (or response.failed) with the usage
-                // the non-streamed response (and the stored final response)
-                // carries
-                let usage_json = json!(ResponseUsage::from(&usage));
-                let event = match &not_stored {
-                    Some(error) => emitter.emit_failed(Some(&usage_json), error),
-                    None => emitter.emit_completed(Some(&usage_json)),
-                };
-                // Counted only once the terminal reached the client, as emit_terminal counts.
-                let delivered = emitter.send_event_best_effort(&event, tx).await;
-                if delivered && not_stored.is_some() {
-                    Metrics::record_responses_stream_failure(
-                        &original_request.model,
-                        failure_reason(not_stored.as_ref()),
-                    );
-                }
+                // The terminal with the usage the non-streamed response (and
+                // the stored final response) carries
+                emitter.finish_stream(&usage, not_stored.as_ref(), tx).await;
                 return;
             }
         }
@@ -640,20 +615,7 @@ async fn execute_without_mcp_streaming(
     .err()
     .map(|e| e.error_object());
 
-    // Emit response.completed (or response.failed) with the usage
-    // the non-streamed response (and the stored final response)
-    // carries
-    let usage_json = json!(ResponseUsage::from(&usage));
-    let event = match &not_stored {
-        Some(error) => emitter.emit_failed(Some(&usage_json), error),
-        None => emitter.emit_completed(Some(&usage_json)),
-    };
-    // Counted only once the terminal reached the client, as emit_terminal counts.
-    let delivered = emitter.send_event_best_effort(&event, tx).await;
-    if delivered && not_stored.is_some() {
-        Metrics::record_responses_stream_failure(
-            &original_request.model,
-            failure_reason(not_stored.as_ref()),
-        );
-    }
+    // The terminal with the usage the non-streamed response (and the stored
+    // final response) carries
+    emitter.finish_stream(&usage, not_stored.as_ref(), tx).await;
 }

@@ -25,6 +25,7 @@ use smg_grpc_client::sglang_proto::{self as proto, generate_complete::MatchedSto
 use tool_parser::{types::ToolCallItem, ToolParser};
 
 use super::{
+    chat_stream::fingerprint_of,
     error::{clear_error_message, set_error_message, SglErrorCode},
     forced_tool_choice::tool_parser_for,
     proto_parse::parse_proto_response,
@@ -65,7 +66,15 @@ pub struct GrpcResponseConverterHandle {
 /// * `stop` - Optional stop sequences (JSON array)
 /// * `stop_token_ids` - Optional stop token IDs (JSON array)
 /// * `skip_special_tokens` - Whether to skip special tokens
+/// * `initial_prompt_tokens` - The prompt's token count from preprocessing
+///   (the usage fallback when a chunk reports none); 0 for none
+/// * `weight_version` - The engine's weight version (its model information),
+///   the chunks' `system_fingerprint`; may be null or blank for the gateway's
+///   `default`
 /// * `error_out` - Optional pointer to receive error message
+///
+/// The parameter order is the Go prototype's (`internal/ffi/grpc_converter.go`);
+/// the two must change together.
 ///
 /// # Returns
 /// * Pointer to GrpcResponseConverterHandle on success, null on failure
@@ -86,6 +95,8 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_create(
     stop: *const c_char,
     stop_token_ids: *const c_char,
     skip_special_tokens: c_int,
+    initial_prompt_tokens: c_int,
+    weight_version: *const c_char,
     error_out: *mut *mut c_char,
 ) -> *mut GrpcResponseConverterHandle {
     if tokenizer_handle.is_null() || model.is_null() || request_id.is_null() {
@@ -154,7 +165,12 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_create(
         serde_json::from_str::<Vec<u32>>(ids_str).ok()
     };
 
-    Box::into_raw(Box::new(GrpcResponseConverterHandle::new(
+    let weight_version = if weight_version.is_null() {
+        None
+    } else {
+        CStr::from_ptr(weight_version).to_str().ok()
+    };
+    let mut handle = GrpcResponseConverterHandle::new(
         tokenizer,
         model_str.to_string(),
         request_id_str.to_string(),
@@ -163,7 +179,10 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_create(
         tool_choice,
         stop,
         stop_token_ids,
-    )))
+    );
+    handle.initial_prompt_tokens = u32::try_from(initial_prompt_tokens).ok().filter(|n| *n > 0);
+    handle.system_fingerprint = Some(fingerprint_of(weight_version));
+    Box::into_raw(Box::new(handle))
 }
 
 impl GrpcResponseConverterHandle {
@@ -195,8 +214,9 @@ impl GrpcResponseConverterHandle {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            // TODO: Get actual fingerprint
-            system_fingerprint: Some("fp_placeholder".to_string()),
+            // The engine's weight version, set by the stream or the FFI
+            // constructor that knows it.
+            system_fingerprint: None,
             tools,
             tool_choice,
             history_tool_calls_count: 0,
@@ -952,6 +972,32 @@ mod tests {
         }
     }
 
+    /// A chunk carries the fingerprint the stream set from the engine's
+    /// weight version: the version itself, or the gateway's `default`.
+    #[tokio::test]
+    async fn a_chunk_carries_the_engines_weight_version_as_its_fingerprint() {
+        let tokenizer = byte_fallback_tokenizer();
+        for fingerprint in [Some("default".to_string()), Some("v7".to_string())] {
+            let mut handle = tool_test_handle(tokenizer.clone(), None);
+            handle.system_fingerprint = fingerprint.clone();
+            let chunk = proto::GenerateResponse {
+                request_id: String::new(),
+                response: Some(proto::generate_response::Response::Chunk(
+                    proto::GenerateStreamChunk {
+                        token_ids: vec![0xC3 + 1, 0xA9 + 1],
+                        completion_tokens: 2,
+                        ..Default::default()
+                    },
+                )),
+            };
+            let first = convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer)
+                .await
+                .unwrap()
+                .expect("the first chunk is sent");
+            assert_eq!(first.system_fingerprint, fingerprint, "{first:?}");
+        }
+    }
+
     fn tool_test_handle(
         tokenizer: Arc<dyn Tokenizer>,
         tool_choice: Option<ToolChoice>,
@@ -1596,6 +1642,8 @@ mod tests {
                     as_ptr(&stop),
                     as_ptr(&stop_token_ids),
                     c_int::from(request.skip_special_tokens),
+                    0,
+                    ptr::null(),
                     ptr::null_mut(),
                 );
                 assert!(!raw.is_null());

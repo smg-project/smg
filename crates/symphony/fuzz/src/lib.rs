@@ -11,19 +11,23 @@
 //! - conservation: the bytes of the events, in order, are the output, with `Finish` last;
 //! - what the parser says does not depend on the cuts: the whole replay and the pieces agree on
 //!   the content, each reasoning region, the dropped and malformed text by reason, the calls with
-//!   their arguments and the finish;
+//!   their ids and arguments and the finish (both replays count their call ids from one nonce,
+//!   as one request's engine does);
 //! - well-formedness: one start and one end per call, arguments only between them and a valid
 //!   JSON prefix after every fragment, reasoning text only inside a region, one `Finish` that
-//!   counts the calls; and a call its own terminal closed has arguments that are whole JSON,
-//!   unless the engine said `Malformed` while the call was open;
+//!   counts the calls; a fragment of the arguments that closes a string, writes a member under an
+//!   empty key or writes an empty string carries the output bytes that wrote it (a reader makes
+//!   no byte up); and a call that ended, at its own terminal or at the stream's end, has
+//!   arguments that are whole JSON, unless the engine said `Malformed` while the call was open;
 //! - the adapters render any event sequence without a panic, and the Chat Completions stream,
 //!   concatenated, says what the whole message says.
 //!
 //! Every breach message starts with `breach <name>:`, the invariant's name, so that the artifacts
 //! of a campaign group by class.
 //!
-//! The seeds `prepare` writes from the crate's recorded output slices are cases in this layout,
-//! so a seed replays as its table's own output and every mutation of it stays a case.
+//! The seeds `prepare` writes from the recorded output slices of bellwether's hand-written sets
+//! ([`slices`], read from the tree `BELLWETHER_FIXTURES` names) are cases in this layout, so a
+//! seed replays as its table's own output and every mutation of it stays a case.
 
 #![forbid(unsafe_code)]
 
@@ -32,15 +36,20 @@ use std::{fs, io::Write, path::Path, sync::OnceLock};
 /// The macro a target is written with, so that the targets and the harness share one dependency.
 pub use libfuzzer_sys::fuzz_target;
 use openai_protocol::common::{Function, Tool};
-use serde::Deserialize;
 use serde_json::{json, Value};
 use symphony::{
     adapt::{chat, messages, responses},
     formats::Table,
     json::PartialJson,
-    Declared, DropReason, Engine, EngineFinish, Event, Events, FinishReason, Input,
+    CallIds, Declared, DropReason, Engine, EngineFinish, Event, Events, FinishReason, Input,
     MalformedReason, Parser,
 };
+
+/// The recorded output slices the seeds are made from, one definition with the crate's bench.
+#[path = "../../tests/common/slices.rs"]
+pub mod slices;
+
+pub use slices::{Recorded, Slice};
 
 /// The targets and the table each fuzzes; `None` lets the input's last byte pick one of
 /// [`Table::ALL`]. `prepare` writes one dictionary per entry; a test keeps the entries and the
@@ -57,19 +66,21 @@ pub const TARGETS: &[(&str, Option<Table>)] = &[
     ("pythonic_calls", Some(Table::Lfm2_5)),
 ];
 
+/// The breach names this run looks past: `SYMPHONY_FUZZ_ALLOW`, comma separated, read once.
+fn allowances() -> &'static [String] {
+    static ALLOWED: OnceLock<Vec<String>> = OnceLock::new();
+    ALLOWED.get_or_init(|| {
+        std::env::var("SYMPHONY_FUZZ_ALLOW")
+            .map(|list| list.split(',').map(|n| n.trim().to_string()).collect())
+            .unwrap_or_default()
+    })
+}
+
 /// Whether the breach named `name` is allowed for this run: `SYMPHONY_FUZZ_ALLOW` lists, comma
 /// separated, the names the breach messages carry, so that a class already reported does not stop
 /// the fuzzer from finding the next one. Every check honors it, through [`breach`].
 pub fn allowed(name: &str) -> bool {
-    static ALLOWED: OnceLock<Vec<String>> = OnceLock::new();
-    ALLOWED
-        .get_or_init(|| {
-            std::env::var("SYMPHONY_FUZZ_ALLOW")
-                .map(|list| list.split(',').map(|n| n.trim().to_string()).collect())
-                .unwrap_or_default()
-        })
-        .iter()
-        .any(|allowed| allowed == name)
+    allowances().iter().any(|allowed| allowed == name)
 }
 
 /// The check named `name`: a panic whose message starts with `breach <name>:` unless `holds`, or
@@ -287,46 +298,13 @@ pub fn declared_names() -> Vec<&'static str> {
     ]
 }
 
-/// One recorded output slice of a table family, as the crate's fixtures record it.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub struct Slice {
-    pub family: String,
-    pub prompt: String,
-    pub output: String,
-}
-
-/// The slices under `dir`: one `<table>.jsonl` per table, one slice per line.
-pub fn slices(dir: &Path) -> Result<Vec<(Table, String, Slice)>, String> {
-    let mut out = Vec::new();
-    let entries = fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let mut paths: Vec<_> = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
-        .collect();
-    paths.sort();
-    for path in paths {
-        let name = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .ok_or_else(|| format!("{}: no table name", path.display()))?;
-        let table = Table::named(name)
-            .ok_or_else(|| format!("{}: no table is named {name}", path.display()))?;
-        let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        for (line, json) in text.lines().enumerate() {
-            let slice: Slice = serde_json::from_str(json)
-                .map_err(|e| format!("{}:{}: {e}", path.display(), line + 1))?;
-            out.push((table, slice.family.clone(), slice));
-        }
-    }
-    Ok(out)
-}
-
-/// What a run starts from, as [`prepare`] counts it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a run starts from, as [`prepare`] counts it, and the groups the tree had not recorded,
+/// each a notice for the caller to print.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Prepared {
     pub dictionaries: usize,
     pub seeds: usize,
+    pub missing: Vec<String>,
 }
 
 /// libFuzzer's longest dictionary word, in bytes: a longer entry it skips without a word.
@@ -335,8 +313,9 @@ pub const DICTIONARY_WORD_MAX: usize = 64;
 /// Writes what a run starts from under `out`: `dict/<target>.dict`, a dictionary per target in
 /// libFuzzer's syntax (every terminal of its table, of every table for `any_table`, the declared
 /// names and the atoms of the call syntaxes), and `seeds/<table>/<family>`, a seed per recorded
-/// slice under `fixtures`, each the case that replays the slice ([`encode`]).
-pub fn prepare(fixtures: &Path, out: &Path) -> Result<Prepared, String> {
+/// slice of the groups recorded under `root`, the tree `BELLWETHER_FIXTURES` names
+/// ([`slices::recorded`]), each the case that replays the slice ([`encode`]).
+pub fn prepare(root: &Path, out: &Path) -> Result<Prepared, String> {
     let dict = out.join("dict");
     fs::create_dir_all(&dict).map_err(|e| format!("{}: {e}", dict.display()))?;
     for (target, table) in TARGETS {
@@ -366,18 +345,20 @@ pub fn prepare(fixtures: &Path, out: &Path) -> Result<Prepared, String> {
             writeln!(file, "{}", quoted(&entry)).map_err(|e| format!("{}: {e}", path.display()))?;
         }
     }
+    let recorded = slices::recorded(root)?;
     let mut seeds = 0;
-    for (table, family, slice) in slices(fixtures)? {
+    for (table, slice) in &recorded.slices {
         let dir = out.join("seeds").join(table.name());
         fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let path = dir.join(family);
-        let seed = encode(table, &slice.prompt, &slice.output)?;
+        let path = dir.join(&slice.family);
+        let seed = encode(*table, &slice.prompt, &slice.output)?;
         fs::write(&path, seed).map_err(|e| format!("{}: {e}", path.display()))?;
         seeds += 1;
     }
     Ok(Prepared {
         dictionaries: TARGETS.len(),
         seeds,
+        missing: recorded.missing,
     })
 }
 
@@ -426,16 +407,25 @@ fn quoted(entry: &str) -> String {
     out
 }
 
-/// The events of one replay and how many of them came before the end of the stream.
+/// The events of one replay.
 struct Replayed {
     events: Vec<Event>,
-    before_end: usize,
 }
+
+/// The nonce both replays of a case count their call ids from: an engine draws its own at random
+/// (one request, one nonce), so two engines over one output would name the same call differently
+/// and the chunking check could never compare them.
+const NONCE: &str = "0123456789abcdef00000000";
 
 /// `case` through a new engine, its output cut at `cuts`, the events drained after every feed as
 /// a stream's reader drains them.
 fn replay(case: &Case, cuts: &[usize]) -> Replayed {
-    let mut engine = Engine::shared(case.table.shared(), declared_shared());
+    // The nonce is this module's constant; `the_nonce_is_one_the_engine_takes` holds it valid, so
+    // an invalid one fails that test rather than falling back to a random nonce in silence.
+    let Some(ids) = CallIds::from_nonce(NONCE) else {
+        unreachable!("NONCE is not 24 hex characters")
+    };
+    let mut engine = Engine::with_call_ids(case.table.shared(), declared_shared(), ids);
     let mut out = Events::new();
     let mut events = Vec::new();
     let delta = |text: &'static str| Input::Delta {
@@ -476,7 +466,6 @@ fn replay(case: &Case, cuts: &[usize]) -> Replayed {
     if case.empty_between {
         feed(case, &mut engine, delta(""), &mut out, &mut events);
     }
-    let before_end = events.len();
     feed(
         case,
         &mut engine,
@@ -486,7 +475,7 @@ fn replay(case: &Case, cuts: &[usize]) -> Replayed {
         &mut out,
         &mut events,
     );
-    Replayed { events, before_end }
+    Replayed { events }
 }
 
 fn feed(
@@ -533,6 +522,65 @@ fn bytes_of(event: &Event) -> &str {
     }
 }
 
+/// Whether `fragment`, appended to the arguments `so_far`, closes a JSON string `so_far` left
+/// open: the quote that ends a value the reader was streaming.
+fn closes_an_open_string(so_far: &str, fragment: &str) -> bool {
+    let mut inside = false;
+    let mut escaped = false;
+    for c in so_far.chars() {
+        if !inside {
+            inside = c == '"';
+        } else if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            inside = false;
+        }
+    }
+    if !inside {
+        return false;
+    }
+    for c in fragment.chars() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `json`, a fragment of the arguments, writes an empty string for a value the model left
+/// out: the fragment alone (`""`, `, ""`, `[""`) with no byte of the output behind it (none, or
+/// whitespace), or a whole member (`{"city": ""`, `, "city": ""`) whose source holds nothing of a
+/// value once the key's own text is taken out: whitespace and the separators `=`, `:` and `,`
+/// alone (`city=`). The model's own empty value leaves its quotes or its tags in the source
+/// (`city=""`, `<parameter=city></parameter>`), and the JSON syntaxes' source is the member itself.
+fn made_up_empty_string(json: &str, source: &str) -> bool {
+    if !json.ends_with("\"\"") {
+        return false;
+    }
+    let member = json
+        .strip_prefix('{')
+        .or_else(|| json.strip_prefix(", "))
+        .unwrap_or(json);
+    let key = member
+        .strip_prefix('"')
+        .and_then(|rest| rest.split_once("\": "))
+        .map(|(key, _)| key)
+        .filter(|key| !key.is_empty());
+    match key {
+        Some(key) => source
+            .replacen(key, "", 1)
+            .chars()
+            .all(|c| c.is_whitespace() || matches!(c, '=' | ':' | ',')),
+        None => source.trim().is_empty(),
+    }
+}
+
 /// Whether `text` is a JSON prefix the prefix parser takes whole.
 fn valid_json_prefix(text: &str) -> bool {
     matches!(PartialJson::default().parse(text, true), Ok((_, consumed)) if consumed == text.len())
@@ -559,7 +607,11 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                 started.push(*index);
                 arguments.push((*index, String::new()));
             }
-            Event::ToolCallArguments { index, json, .. } => {
+            Event::ToolCallArguments {
+                index,
+                json,
+                source,
+            } => {
                 breach("arguments-before-start", started.contains(index), || {
                     format!("{}: arguments before the call's start", place())
                 });
@@ -567,6 +619,51 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                     format!("{}: arguments after the call's end", place())
                 });
                 if let Some((_, so_far)) = arguments.iter_mut().find(|(i, _)| i == index) {
+                    // A fragment that closes a string the arguments so far left open carries the
+                    // bytes that closed it, the model's quote, closing tag or token: a closing
+                    // quote with no byte of the output behind it (none, or whitespace alone) is
+                    // one the reader made up for a value the model never closed.
+                    breach(
+                        "made-up-quote",
+                        !closes_an_open_string(so_far, json) || !source.text.trim().is_empty(),
+                        || {
+                            format!(
+                                "{}: the fragment {json:?} closes a string with no byte of the output behind it",
+                                place()
+                            )
+                        },
+                    );
+                    // A member under an empty key is the model's to write (`{"": 1}` in a JSON
+                    // syntax: the source carries the key's quotes); a reader that spells one for
+                    // a key the model left out made the key up, whether it writes the key as a
+                    // fragment of its own or opens the member with it (`{"": "`, `, "": 1`).
+                    let member = json
+                        .strip_prefix('{')
+                        .or_else(|| json.strip_prefix(", "))
+                        .unwrap_or(json);
+                    breach(
+                        "empty-key-member",
+                        !(member.starts_with("\"\": ") && !source.text.contains("\"\"")),
+                        || {
+                            format!(
+                                "{}: the fragment {json:?} writes a member under an empty key the output did not write",
+                                place()
+                            )
+                        },
+                    );
+                    // An empty string no byte of the output wrote: the reader quoted an empty bare
+                    // value where the model left one out before a comma or a close, as a
+                    // fragment of its own or at the end of a whole member (`, "city": ""`).
+                    breach(
+                        "made-up-empty-string",
+                        !made_up_empty_string(json, &source.text),
+                        || {
+                            format!(
+                                "{}: the fragment {json:?} writes an empty string with no byte of a value behind it",
+                                place()
+                            )
+                        },
+                    );
                     so_far.push_str(json);
                     breach("json-prefix", valid_json_prefix(so_far), || {
                         format!(
@@ -584,7 +681,11 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                     format!("{}: a second end", place())
                 });
                 ended.push(*index);
-                if at < replayed.before_end && !malformed_inside.contains(index) {
+                // The stream's end closes an open call too, and the promise holds there as at a
+                // marker's close: a call the end cut says `Malformed` before its end, or its
+                // arguments are whole. A reader that ends a cut call there without a word is a
+                // breach, whichever its syntax.
+                if !malformed_inside.contains(index) {
                     let so_far = arguments
                         .iter()
                         .find(|(i, _)| i == index)
@@ -834,25 +935,93 @@ fn check_adapters(case: &Case, whole: &[Event], pieces: &[Event]) {
 
 #[cfg(test)]
 mod tests {
+    use symphony::Text;
+
     use super::*;
 
-    fn fixtures() -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/slices")
+    /// The tree `BELLWETHER_FIXTURES` names, or None with the notice a skipped test prints: the
+    /// seeds are read from bellwether's recorded sets, which the repository does not hold.
+    fn fixtures() -> Option<std::path::PathBuf> {
+        let root = slices::root();
+        if root.is_none() {
+            eprintln!(
+                "skipping: {} is not set; point it at the tree `bellwether unpack` writes",
+                slices::ENV
+            );
+        }
+        root
+    }
+
+    /// The recorded slices under `root`, every group the tree lacks named, and every recorded
+    /// group checked to yield the families a seed set needs: plain text, one call, parallel calls
+    /// and the malformed call cut from the one call's (a thought and a call where the group's
+    /// template has a thought).
+    fn recorded_slices(root: &Path) -> Result<Recorded, String> {
+        let recorded = slices::recorded(root)?;
+        for notice in &recorded.missing {
+            eprintln!("skipping {notice}");
+        }
+        if recorded.slices.is_empty() {
+            return Err(format!(
+                "none of the eight groups is recorded under {}",
+                root.display()
+            ));
+        }
+        for group in &slices::GROUPS {
+            let families: Vec<&str> = recorded
+                .slices
+                .iter()
+                .filter(|(table, _)| table.name() == group.table)
+                .map(|(_, slice)| slice.family.as_str())
+                .collect();
+            if families.is_empty() {
+                continue;
+            }
+            println!("{}: {}", group.table, families.join(", "));
+            for family in ["plain", "one_call", "parallel_calls", "malformed"] {
+                if !families.contains(&family) {
+                    return Err(format!(
+                        "{}: no {family} slice among {families:?}",
+                        group.table
+                    ));
+                }
+            }
+        }
+        Ok(recorded)
     }
 
     #[test]
     fn every_recorded_slice_holds_the_contract() -> Result<(), String> {
-        let slices = slices(&fixtures())?;
-        assert_eq!(slices.len(), 40, "eight tables, five families each");
-        for (table, family, slice) in &slices {
+        let Some(root) = fixtures() else {
+            return Ok(());
+        };
+        for (table, slice) in &recorded_slices(&root)?.slices {
             let data = encode(*table, &slice.prompt, &slice.output)?;
             let case = decode(&data, None);
-            assert_eq!(case.table, *table, "{family}");
-            assert_eq!(case.prompt, slice.prompt, "{family}");
-            assert_eq!(case.output, slice.output, "{family}");
-            assert!(!case.cuts.is_empty(), "{family}: a seed replays in pieces");
+            assert_eq!(case.table, *table, "{}", slice.family);
+            assert_eq!(case.prompt, slice.prompt, "{}", slice.family);
+            assert_eq!(case.output, slice.output, "{}", slice.family);
+            assert!(
+                !case.cuts.is_empty(),
+                "{}: a seed replays in pieces",
+                slice.family
+            );
             check(&case);
             check(&decode(&data, Some(*table)));
+            // The malformed slice is the one call's with its body cut short before the call's
+            // close: the table says so, where a cut before another terminal would read whole.
+            if slice.family == "malformed" {
+                let whole = replay(&case, &[]);
+                assert!(
+                    whole.events.iter().any(|event| matches!(
+                        event,
+                        Event::Malformed { why, .. } if *why != MalformedReason::UnknownTool
+                    )),
+                    "{}: the malformed slice reads whole: {:?}",
+                    table.name(),
+                    slice.output
+                );
+            }
         }
         Ok(())
     }
@@ -874,30 +1043,45 @@ mod tests {
     }
 
     #[test]
-    fn the_seeds_prepare_writes_decode_as_the_slices_and_its_words_fit() -> Result<(), String> {
+    fn the_seeds_prepare_writes_decode_as_the_slices() -> Result<(), String> {
+        let Some(root) = fixtures() else {
+            return Ok(());
+        };
+        let recorded = recorded_slices(&root)?;
         let out =
             std::env::temp_dir().join(format!("symphony-fuzz-prepare-{}", std::process::id()));
-        let prepared = prepare(&fixtures(), &out)?;
-        assert_eq!(
-            prepared,
-            Prepared {
-                dictionaries: TARGETS.len(),
-                seeds: 40
-            }
-        );
-        for (table, family, slice) in slices(&fixtures())? {
-            let path = out.join("seeds").join(table.name()).join(&family);
+        let prepared = prepare(&root, &out)?;
+        assert_eq!(prepared.dictionaries, TARGETS.len());
+        assert_eq!(prepared.seeds, recorded.slices.len());
+        assert_eq!(prepared.missing, recorded.missing);
+        for (table, slice) in &recorded.slices {
+            let family = slice.family.as_str();
+            let path = out.join("seeds").join(table.name()).join(family);
             let data = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-            for case in [decode(&data, None), decode(&data, Some(table))] {
-                assert_eq!(case.table, table, "{family}");
+            for case in [decode(&data, None), decode(&data, Some(*table))] {
+                assert_eq!(case.table, *table, "{family}");
                 assert_eq!(case.prompt, slice.prompt, "{family}");
                 assert_eq!(case.output, slice.output, "{family}");
                 assert_eq!(case.finish, EngineFinish::Stop, "{family}");
                 assert!(!case.cuts.is_empty(), "{family}: a seed replays in pieces");
             }
         }
+        fs::remove_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+        Ok(())
+    }
+
+    #[test]
+    fn the_dictionaries_prepare_writes_fit_libfuzzers_words() -> Result<(), String> {
+        // A tree with no group recorded: the dictionaries come from the tables alone.
+        let out = std::env::temp_dir().join(format!("symphony-fuzz-dict-{}", std::process::id()));
+        let empty = out.join("empty-tree");
+        fs::create_dir_all(&empty).map_err(|e| format!("{}: {e}", empty.display()))?;
+        let prepared = prepare(&empty, &out.join("prepared"))?;
+        assert_eq!((prepared.dictionaries, prepared.seeds), (TARGETS.len(), 0));
+        assert_eq!(prepared.missing.len(), slices::GROUPS.len());
+        let out_dir = out.join("prepared");
         for (target, _) in TARGETS {
-            let path = out.join("dict").join(format!("{target}.dict"));
+            let path = out_dir.join("dict").join(format!("{target}.dict"));
             let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
             assert!(text.lines().count() > 1, "{target}: an empty dictionary");
             for line in text.lines() {
@@ -911,6 +1095,277 @@ mod tests {
         Ok(())
     }
 
+    /// The name of the breach `check_well_formed` reports on `events`, as the stream of one
+    /// replay, or None when it holds: the checks on the shape of a stream, without a parser
+    /// behind it, so that a check is tried on the event list it is about.
+    fn breach_in(table: Table, events: Vec<Event>) -> Option<String> {
+        // An allowance would turn a breach into a hold and the assertion into a riddle.
+        assert!(
+            allowances().is_empty(),
+            "the harness's own tests run with SYMPHONY_FUZZ_ALLOW unset; it allows {:?}",
+            allowances()
+        );
+        let case = Case {
+            table,
+            prompt: String::new(),
+            output: String::new(),
+            cuts: Vec::new(),
+            empty_between: false,
+            finish: EngineFinish::Stop,
+        };
+        let replayed = Replayed { events };
+        let outcome = std::panic::catch_unwind(|| check_well_formed(&case, "synthetic", &replayed));
+        let payload = outcome.err()?;
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()));
+        match message.as_deref().and_then(|m| m.strip_prefix("breach ")) {
+            Some(rest) => rest.split(':').next().map(str::to_string),
+            // Any other panic is no answer of the checks: it is raised again, not read as a hold.
+            None => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn start(index: u32) -> Event {
+        Event::ToolCallStart {
+            index,
+            id: format!("call_{index}"),
+            name: "get_weather".to_string(),
+            source: Text::uncounted("<tool_call>"),
+        }
+    }
+
+    fn arguments(index: u32, json: &str, source: &str) -> Event {
+        Event::ToolCallArguments {
+            index,
+            json: json.to_string(),
+            source: Text::uncounted(source),
+        }
+    }
+
+    fn end(index: u32, source: &str) -> Event {
+        Event::ToolCallEnd {
+            index,
+            source: Text::uncounted(source),
+        }
+    }
+
+    fn malformed() -> Event {
+        Event::Malformed {
+            text: Text::uncounted(""),
+            why: MalformedReason::UnterminatedRegion,
+        }
+    }
+
+    fn finish(tool_calls: u32) -> Event {
+        Event::Finish {
+            reason: FinishReason::ToolCalls,
+            tool_calls,
+            reasoning_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn a_call_the_streams_end_closed_keeps_the_whole_json_promise() {
+        // The end of the stream closed a call whose arguments are a prefix: without a word it is
+        // a breach, as it is for a call a marker closed; with `Malformed` before the end it holds.
+        let cut = || {
+            vec![
+                start(0),
+                arguments(0, "{\"city\": \"Par", "{\"city\": \"Par"),
+            ]
+        };
+        let mut without_a_word = cut();
+        without_a_word.extend([end(0, ""), finish(1)]);
+        assert_eq!(
+            breach_in(Table::Qwen3Tagged, without_a_word).as_deref(),
+            Some("whole-json")
+        );
+        let mut said = cut();
+        said.extend([malformed(), end(0, ""), finish(1)]);
+        assert_eq!(breach_in(Table::Qwen3Tagged, said), None);
+        let mut whole = cut();
+        whole.extend([
+            arguments(0, "is\"}", "is</parameter>"),
+            end(0, ""),
+            finish(1),
+        ]);
+        assert_eq!(breach_in(Table::Qwen3Tagged, whole), None);
+    }
+
+    #[test]
+    fn a_quote_that_closes_a_value_carries_a_byte_of_the_output() {
+        // The arguments so far leave a string open; a closing quote with no source behind it is
+        // the reader's, one with the closing tag behind it is the model's.
+        let open = || {
+            vec![
+                start(0),
+                arguments(0, "{\"city\": \"Par", "{\"city\": \"Par"),
+            ]
+        };
+        for source in ["", "\n"] {
+            let mut made_up = open();
+            made_up.extend([arguments(0, "\"}", source), end(0, ""), finish(1)]);
+            assert_eq!(
+                breach_in(Table::Qwen3Tagged, made_up).as_deref(),
+                Some("made-up-quote"),
+                "source {source:?}"
+            );
+        }
+        let mut closed = open();
+        closed.extend([
+            arguments(0, "\"}", "</parameter>\n</function>"),
+            end(0, "</tool_call>"),
+            finish(1),
+        ]);
+        assert_eq!(breach_in(Table::Qwen3Tagged, closed), None);
+        assert!(closes_an_open_string("{\"a\": \"x", "\""));
+        assert!(closes_an_open_string("{\"a\": \"x\\\"", "y\""));
+        assert!(!closes_an_open_string("{\"a\": \"x\"", "}"));
+        assert!(!closes_an_open_string("{\"a\": \"x", "\\\""));
+    }
+
+    #[test]
+    fn a_member_under_an_empty_key_is_the_models_or_a_breach() {
+        // The JSON syntaxes' own `{"": "Paris"}`: the fragment's source carries the key's quotes.
+        let models = vec![
+            start(0),
+            arguments(0, "{", "{"),
+            arguments(0, "\"\": ", "\"\": "),
+            arguments(0, "\"Paris\"}", "\"Paris\"}"),
+            end(0, "</tool_call>"),
+            finish(1),
+        ];
+        assert_eq!(breach_in(Table::Qwen3, models), None);
+        let whole = vec![
+            start(0),
+            arguments(0, "{\"\": \"Paris\"}", "{\"\": \"Paris\"}"),
+            end(0, "</tool_call>"),
+            finish(1),
+        ];
+        assert_eq!(breach_in(Table::Qwen3, whole), None);
+        // A reader that spells the member for a key-less value: the source has no quotes,
+        // whether the key comes as a fragment of its own or opens the member.
+        for (json, source) in [
+            ("\"\": ", ":"),
+            ("\"\": ", "<parameter=>"),
+            ("\"\": ", ""),
+            ("{\"\": \"", "<parameter=>"),
+            (", \"\": 1", "<arg_key></arg_key><arg_value>1</arg_value>"),
+        ] {
+            let readers = vec![
+                start(0),
+                arguments(0, "{\"a\": 1", "{\"a\": 1"),
+                arguments(0, json, source),
+                arguments(0, "}", "}"),
+                end(0, ""),
+                finish(1),
+            ];
+            assert_eq!(
+                breach_in(Table::Gemma4, readers).as_deref(),
+                Some("empty-key-member"),
+                "fragment {json:?} with source {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_string_carries_a_byte_of_the_output() {
+        // A value the model left out: the lone fragment with nothing behind it, a list's first
+        // item alike, or a whole member whose source holds the key and its separator alone (the
+        // pythonic reader's `city=`); the model's own empty value leaves its quotes or its tags.
+        let first = || {
+            vec![
+                start(0),
+                arguments(0, "{\"city\": \"Paris\"", "city='Paris'"),
+            ]
+        };
+        for (json, source) in [
+            (", \"days\": \"\"", ", days="),
+            (", \"days\": \"\"", "days:"),
+            (", \"days\": \"\"", "\n"),
+        ] {
+            let mut made_up = first();
+            made_up.extend([
+                arguments(0, json, source),
+                arguments(0, "}", ""),
+                end(0, ")"),
+                finish(1),
+            ]);
+            assert_eq!(
+                breach_in(Table::Lfm2_5, made_up).as_deref(),
+                Some("made-up-empty-string"),
+                "fragment {json:?} with source {source:?}"
+            );
+        }
+        for (json, source) in [
+            (", \"days\": \"\"", ", days=\"\""),
+            (", \"days\": \"\"", ", days=''"),
+            (", \"days\": \"\"", "\n<parameter=days>\n</parameter>"),
+            (
+                ", \"days\": \"\"",
+                "<arg_key>days</arg_key><arg_value></arg_value>",
+            ),
+            (", \"days\": \"\"", ", \"days\": \"\""),
+        ] {
+            let mut written = first();
+            written.extend([
+                arguments(0, json, source),
+                arguments(0, "}", ")"),
+                end(0, "]"),
+                finish(1),
+            ]);
+            assert_eq!(
+                breach_in(Table::Lfm2_5, written),
+                None,
+                "fragment {json:?} with source {source:?}"
+            );
+        }
+        for (before, json, source, close) in [
+            ("{\"city\": ", "\"\"", "", "}"),
+            ("{\"city\": ", "\"\"", " ", "}"),
+            ("{\"tags\": ", "[\"\"", "", "]}"),
+        ] {
+            let lone = vec![
+                start(0),
+                arguments(0, before, before),
+                arguments(0, json, source),
+                arguments(0, close, close),
+                end(0, ""),
+                finish(1),
+            ];
+            assert_eq!(
+                breach_in(Table::Gemma4, lone).as_deref(),
+                Some("made-up-empty-string"),
+                "fragment {json:?} with source {source:?}"
+            );
+        }
+        let written = vec![
+            start(0),
+            arguments(0, "{\"city\": ", "{\"city\": "),
+            arguments(0, "\"\"", "</parameter>"),
+            arguments(0, "}", "</function>"),
+            end(0, "</tool_call>"),
+            finish(1),
+        ];
+        assert_eq!(breach_in(Table::Qwen3Tagged, written), None);
+        assert!(made_up_empty_string("{\"city\": \"\"", "city="));
+        assert!(!made_up_empty_string("{\"city\": \"\"", "city=\"\""));
+        assert!(!made_up_empty_string("{\"city\": \"x\"", ""));
+    }
+
+    #[test]
+    fn the_json_syntaxes_own_empty_key_holds_in_pieces() -> Result<(), String> {
+        // The seed a first draft of the empty-key check flagged: the model's own member.
+        let output = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"\": \"Paris\"}}\n</tool_call>";
+        let data = encode(Table::Qwen3, "", output)?;
+        let case = decode(&data, Some(Table::Qwen3));
+        assert!(!case.cuts.is_empty());
+        check(&case);
+        Ok(())
+    }
+
     #[test]
     fn short_bytes_are_an_output_read_whole() {
         let case = decode(b"Hello", Some(Table::Qwen3));
@@ -919,6 +1374,11 @@ mod tests {
         assert_eq!(case.finish, EngineFinish::Stop);
         check(&case);
         check(&decode(b"", None));
+    }
+
+    #[test]
+    fn the_nonce_is_one_the_engine_takes() {
+        assert!(CallIds::from_nonce(NONCE).is_some(), "{NONCE}");
     }
 
     #[test]

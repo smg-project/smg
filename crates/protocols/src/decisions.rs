@@ -9,7 +9,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use validator::{Validate, ValidationError, ValidationErrors};
 
-use crate::{common::GenerationRequest, validated::Normalizable};
+use crate::{
+    common::{invalid, GenerationRequest},
+    validated::Normalizable,
+};
 
 /// A non-streaming request to classify or score shared text/image evidence.
 #[serde_with::skip_serializing_none]
@@ -256,9 +259,10 @@ impl Validate for DecisionsRequest {
 
 fn check_length(value: &str, max: usize) -> Result<(), ValidationError> {
     if value.len() > max && value.chars().take(max + 1).count() > max {
-        let mut error = ValidationError::new("length");
-        error.message = Some(format!("must be at most {max} characters").into());
-        return Err(error);
+        return Err(invalid(
+            "length",
+            format!("must be at most {max} characters"),
+        ));
     }
     Ok(())
 }
@@ -278,10 +282,10 @@ fn validate_input(input: &DecisionInput) -> Result<(), ValidationError> {
                     DecisionInputPart::InputImage { image_url, .. } => {
                         image_count += 1;
                         if image_count > 128 {
-                            let mut error = ValidationError::new("too_many_images");
-                            error.message =
-                                Some("at most 128 images are allowed per request".into());
-                            return Err(error);
+                            return Err(invalid(
+                                "too_many_images",
+                                "at most 128 images are allowed per request",
+                            ));
                         }
                         check_length(image_url, 1_073_741_824)?;
                         let valid = image_url.split_once(',').is_some_and(|(header, data)| {
@@ -293,10 +297,10 @@ fn validate_input(input: &DecisionInput) -> Result<(), ValidationError> {
                                 })
                         });
                         if !valid {
-                            let mut error = ValidationError::new("invalid_image_url");
-                            error.message =
-                                Some("images must be inline base64 image data URLs".into());
-                            return Err(error);
+                            return Err(invalid(
+                                "invalid_image_url",
+                                "images must be inline base64 image data URLs",
+                            ));
                         }
                     }
                 }

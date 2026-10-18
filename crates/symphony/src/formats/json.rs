@@ -21,7 +21,8 @@ mod tests {
         event::{DropReason, Event, Events, MalformedReason},
         input::{EngineFinish, Input},
         parser::Parser,
-        tagged::Declared,
+        testing::calls,
+        Declared,
     };
 
     fn run(pieces: &[&str]) -> Vec<Event> {
@@ -57,22 +58,6 @@ mod tests {
             )
             .expect("end");
         out.drain()
-    }
-
-    fn calls(events: &[Event]) -> Vec<(String, String)> {
-        let mut calls: Vec<(String, String)> = Vec::new();
-        for event in events {
-            match event {
-                Event::ToolCallStart { name, .. } => calls.push((name.clone(), String::new())),
-                Event::ToolCallArguments { json, .. } => {
-                    if let Some(last) = calls.last_mut() {
-                        last.1.push_str(json);
-                    }
-                }
-                _ => {}
-            }
-        }
-        calls
     }
 
     #[test]

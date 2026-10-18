@@ -13,9 +13,19 @@
 use serde_json::{json, Value};
 use thiserror::Error;
 
-const DSML_TOKEN: &str = "｜DSML｜";
-const THINKING_START_TOKEN: &str = "<think>";
-const THINKING_END_TOKEN: &str = "</think>";
+// ---------------------------------------------------------------------------
+// The family's special tokens, shared by the V3.2, V4 and V4.1 renderers (each
+// re-exports the public ones under its own path). Copied verbatim from the
+// Python sources, which agree on them; a version's own markers stay with it.
+// ---------------------------------------------------------------------------
+pub const BOS_TOKEN: &str = "<｜begin▁of▁sentence｜>";
+pub const EOS_TOKEN: &str = "<｜end▁of▁sentence｜>";
+pub const THINKING_START_TOKEN: &str = "<think>";
+pub const THINKING_END_TOKEN: &str = "</think>";
+pub const DSML_TOKEN: &str = "｜DSML｜";
+pub(super) const USER_SP_TOKEN: &str = "<｜User｜>";
+pub(super) const ASSISTANT_SP_TOKEN: &str = "<｜Assistant｜>";
+pub(super) const LATEST_REMINDER_SP_TOKEN: &str = "<｜latest_reminder｜>";
 
 /// DSML tag strings that differ between the V4-family DSML dialects.
 ///
@@ -433,6 +443,20 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
+
+    /// The family's special tokens, as the three renderers' Python sources
+    /// spell them; each renderer re-exports these, so one value serves all.
+    #[test]
+    fn the_familys_special_tokens_are_the_ones_the_renderers_share() {
+        assert_eq!(BOS_TOKEN, "<｜begin▁of▁sentence｜>");
+        assert_eq!(EOS_TOKEN, "<｜end▁of▁sentence｜>");
+        assert_eq!(THINKING_START_TOKEN, "<think>");
+        assert_eq!(THINKING_END_TOKEN, "</think>");
+        assert_eq!(DSML_TOKEN, "｜DSML｜");
+        assert_eq!(USER_SP_TOKEN, "<｜User｜>");
+        assert_eq!(ASSISTANT_SP_TOKEN, "<｜Assistant｜>");
+        assert_eq!(LATEST_REMINDER_SP_TOKEN, "<｜latest_reminder｜>");
+    }
 
     /// V4.1's dialect (a leading space on both tags), the one the fixture
     /// cases `assistant_tool_call_array_string_args` and

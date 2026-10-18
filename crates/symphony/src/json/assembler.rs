@@ -63,6 +63,7 @@ impl Assembler {
     }
 
     /// Whether the arguments stopped being a JSON prefix.
+    #[cfg(test)]
     pub fn refused(&self) -> bool {
         self.fragments.refused()
     }
@@ -333,7 +334,7 @@ impl Assembler {
 }
 
 impl crate::engine::CallAssembler for Assembler {
-    fn feed(&mut self, text: &str, _declared: &crate::tagged::Declared, out: &mut Events) -> usize {
+    fn feed(&mut self, text: &str, _declared: &crate::Declared, out: &mut Events) -> usize {
         self.feed(text, out)
     }
 

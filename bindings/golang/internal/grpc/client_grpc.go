@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,6 +41,35 @@ type GrpcClient struct {
 	bufferSizes     ChannelBufferSizes
 	timeouts        Timeouts
 	requestCounter  uint64 // Atomic counter to ensure unique request IDs
+	// The engine's weight version, the chunks' system_fingerprint (the
+	// gateway's value); read once from the engine's model information at
+	// the first stream, blank when the engine reports none or does not
+	// answer in time (the converter then uses the gateway's default).
+	weightVersion     string
+	weightVersionOnce sync.Once
+}
+
+// modelInfoBound is how long the first stream waits for the engine's model
+// information before going on without a weight version.
+const modelInfoBound = 2 * time.Second
+
+// weightVersionOf reads the engine's weight version once, under its own
+// bound: the first caller's cancellation or deadline must not pin the value
+// for the client's lifetime, so the lookup detaches from the request context
+// and keeps only its values. A failure is logged, and the converter uses the
+// gateway's default from then on.
+func (c *GrpcClient) weightVersionOf(ctx context.Context) string {
+	c.weightVersionOnce.Do(func() {
+		infoCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), modelInfoBound)
+		defer cancel()
+		info, err := c.client.GetModelInfo(infoCtx, &proto.GetModelInfoRequest{})
+		if err != nil {
+			log.Printf("smg: model info lookup failed; system_fingerprint is the default: %v", err)
+			return
+		}
+		c.weightVersion = info.GetWeightVersion()
+	})
+	return c.weightVersion
 }
 
 type ChannelBufferSizes struct {
@@ -265,6 +295,7 @@ func (c *GrpcClient) CreateChatCompletionStream(ctx context.Context, reqJSON str
 		stopTokenIDs,
 		preprocessed.SkipSpecialTokens,
 		preprocessed.PromptTokens, // Pass initial prompt tokens from preprocessing
+		c.weightVersionOf(ctx),
 	)
 	if err != nil {
 		stream.CloseSend()

@@ -619,14 +619,7 @@ impl ConversationStorage for PostgresConversationStorage {
             params.push(val);
         }
 
-        let placeholders: String = (1..=params.len())
-            .map(|i| format!("${i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "INSERT INTO {table} ({}) VALUES ({placeholders})",
-            col_names.join(", ")
-        );
+        let sql = insert_sql(&table, &col_names);
 
         let client = self
             .store
@@ -877,14 +870,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             params.push(val);
         }
 
-        let placeholders: String = (1..=params.len())
-            .map(|i| format!("${i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "INSERT INTO {table} ({}) VALUES ({placeholders})",
-            col_names.join(", ")
-        );
+        let sql = insert_sql(&table, &col_names);
 
         let client = self
             .store
@@ -1107,10 +1093,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
         conversation_id: &ConversationId,
         item_id: &ConversationItemId,
     ) -> ConversationItemResult<bool> {
-        let sl = &self.store.schema.conversation_item_links;
-        let table = sl.qualified_table(self.store.schema.owner.as_deref());
-        let col_conv = sl.col("conversation_id");
-        let col_item = sl.col("item_id");
+        let (table, col_conv, col_item) = link_table(&self.store.schema);
 
         let sql = format!("SELECT COUNT(*) FROM {table} WHERE {col_conv} = $1 AND {col_item} = $2");
 
@@ -1136,10 +1119,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
         conversation_id: &ConversationId,
         item_id: &ConversationItemId,
     ) -> ConversationItemResult<()> {
-        let sl = &self.store.schema.conversation_item_links;
-        let table = sl.qualified_table(self.store.schema.owner.as_deref());
-        let col_conv = sl.col("conversation_id");
-        let col_item = sl.col("item_id");
+        let (table, col_conv, col_item) = link_table(&self.store.schema);
 
         let sql = format!("DELETE FROM {table} WHERE {col_conv} = $1 AND {col_item} = $2");
 
@@ -1568,6 +1548,27 @@ fn param_placeholders(n: usize) -> String {
         .map(|i| format!("${i}"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// `INSERT INTO table (columns) VALUES ($1, ..., $n)`: one placeholder per
+/// column, the binds in the columns' order.
+fn insert_sql(table: &str, col_names: &[&str]) -> String {
+    format!(
+        "INSERT INTO {table} ({}) VALUES ({})",
+        col_names.join(", "),
+        param_placeholders(col_names.len())
+    )
+}
+
+/// The conversation-item link table, qualified, with its conversation and
+/// item columns: the key the link readers filter on.
+fn link_table(schema: &SchemaConfig) -> (String, &str, &str) {
+    let sl = &schema.conversation_item_links;
+    (
+        sl.qualified_table(schema.owner.as_deref()),
+        sl.col("conversation_id"),
+        sl.col("item_id"),
+    )
 }
 
 /// The statement of a link: the row is inserted, or, for an item the
@@ -2115,6 +2116,37 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn an_insert_numbers_one_placeholder_per_column() {
+        assert_eq!(
+            insert_sql("conversations", &["id", "created_at", "tenant"]),
+            "INSERT INTO conversations (id, created_at, tenant) VALUES ($1, $2, $3)"
+        );
+    }
+
+    /// The link table is read from the schema: its owner qualifies the
+    /// table, its column overrides rename the key columns.
+    #[test]
+    fn the_link_table_comes_from_the_schema_with_its_key_columns() {
+        let mut schema = SchemaConfig::default();
+        let (table, col_conv, col_item) = link_table(&schema);
+        assert_eq!(
+            (table.as_str(), col_conv, col_item),
+            ("conversation_item_links", "conversation_id", "item_id")
+        );
+
+        schema.owner = Some("app".to_string());
+        schema
+            .conversation_item_links
+            .columns
+            .insert("item_id".to_string(), "item".to_string());
+        let (table, _, col_item) = link_table(&schema);
+        assert_eq!(
+            (table.as_str(), col_item),
+            ("app.\"conversation_item_links\"", "item")
+        );
+    }
 
     /// The replacement's literals are dollar-quoted, so the index expression,
     /// the sweep and the lookup read the same under

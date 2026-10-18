@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+};
 
 use serde::{
     de::{self, value::SeqAccessDeserializer, SeqAccess, Visitor},
@@ -254,7 +257,10 @@ impl<'a> Iterator for StringOrArrayIter<'a> {
 impl<'a> ExactSizeIterator for StringOrArrayIter<'a> {}
 
 /// A validation error with the public API's `code` and message.
-pub(crate) fn invalid(code: &'static str, message: String) -> validator::ValidationError {
+pub(crate) fn invalid(
+    code: &'static str,
+    message: impl Into<Cow<'static, str>>,
+) -> validator::ValidationError {
     let mut e = validator::ValidationError::new(code);
     e.message = Some(message.into());
     e
@@ -446,9 +452,7 @@ pub fn validate_json_schema_shape(
     } else {
         return Ok(());
     };
-    let mut e = validator::ValidationError::new(code);
-    e.message = Some(message.into());
-    Err(e)
+    Err(invalid(code, message))
 }
 
 // ============================================================================
@@ -768,7 +772,7 @@ impl<'de> Deserialize<'de> for FunctionCall {
 }
 
 impl schemars::JsonSchema for FunctionCall {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
+    fn schema_name() -> Cow<'static, str> {
         "FunctionCall".into()
     }
     fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {

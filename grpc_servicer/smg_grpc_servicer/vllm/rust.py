@@ -64,6 +64,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     resolve_tokenizer_dir,
     servicer_switch,
 )
+from smg_grpc_servicer.vllm import MULTIPROC_METHOD_ENV
 from smg_grpc_servicer.vllm.config_view import (
     EngineConfigView,
     mm_processor_kwargs,
@@ -91,9 +92,6 @@ STARTUP_CEILING_SECS_ENV = "SMG_VLLM_SERVICER_STARTUP_CEILING_SECS"
 # Set to 0/false/no/off to keep vLLM's KV event publisher off when the
 # launcher was given no --kv-events-config (see `default_kv_events_config`).
 KV_EVENTS_ENV = "SMG_VLLM_SERVICER_KV_EVENTS"
-# vLLM's own knob for how it starts its processes; the engine cores launched
-# from this process are spawned unless the deployment chose otherwise.
-MULTIPROC_METHOD_ENV = "VLLM_WORKER_MULTIPROC_METHOD"
 # What upstream's gRPC entrypoint references when it carries the switch.
 HOOK_SYMBOL = "resolve_servicer_impl"
 # The launcher files the switch binds when they are imported, by module name

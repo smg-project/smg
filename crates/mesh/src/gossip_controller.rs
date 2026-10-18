@@ -65,6 +65,10 @@ use crate::{
     },
 };
 
+/// The name the configured join peer (`--mesh-peer-urls`) goes by until
+/// its answer names it: in the dial's log lines and in the retry table.
+const INIT_PEER_NAME: &str = "init_peer";
+
 /// The per-node event loop driver. Holds the cluster-state reference,
 /// self-identity, init-peer address, mTLS config, the live set of
 /// outbound sync_stream task handles, and the shared `RoundBatch` slot.
@@ -156,16 +160,15 @@ impl GossipController {
 
             // Get available peers from cluster state
             let mut map = init_state.read().clone();
-            map.retain(|k, v| {
-                k.ne(&self.self_name.to_string())
-                    && v.status != NodeStatus::Down as i32
-                    && v.status != NodeStatus::Leaving as i32
-            });
+            map.retain(|name, node| self.is_probe_target(name, node));
 
-            let peer = if cnt == 0 && map.is_empty() {
-                // Only use init_peer if cluster state is empty (no service discovery)
+            // The configured join peer is dialed while the table holds nobody
+            // else: at the start, and again should every other member be
+            // gone, under its backoff like any peer. Members a service
+            // discovery wrote into the table take precedence.
+            let peer = if map.is_empty() {
                 self.init_peer.map(|init_peer| NodeState {
-                    name: "init_peer".to_string(),
+                    name: INIT_PEER_NAME.to_string(),
                     address: init_peer.to_string(),
                     status: NodeStatus::Suspected as i32,
                     version: 1,
@@ -189,9 +192,13 @@ impl GossipController {
                 }
             }
 
-            // Periodic retry-manager cleanup every 60 rounds (~60s).
+            // Periodic retry-manager cleanup every 60 rounds (~60s). The join
+            // peer's entry stays: it is never in the table under its
+            // placeholder name, and its backoff must not restart every minute.
             if cnt.is_multiple_of(60) {
-                retry_managers.retain(|peer_name, _| map.contains_key(peer_name));
+                retry_managers.retain(|peer_name, _| {
+                    map.contains_key(peer_name) || peer_name == INIT_PEER_NAME
+                });
             }
 
             // Stream round collection: drain stream namespace buffers and
@@ -223,6 +230,19 @@ impl GossipController {
                         // Check if we should retry based on backoff
                         if retry_manager.should_retry() {
                             match self.connect_to_peer(peer.clone()).await {
+                                Ok(()) if peer_name == INIT_PEER_NAME
+                                    && !self.has_another_member() =>
+                                {
+                                    // The join peer answered without adding a
+                                    // member: it is this node itself, or it is
+                                    // leaving. An attempt, so the next dial waits
+                                    // out the backoff instead of coming every round.
+                                    retry_manager.record_attempt();
+                                    log::debug!(
+                                        "The join peer answered but the table has nobody else to probe; next dial in {:?}",
+                                        retry_manager.next_delay()
+                                    );
+                                }
                                 Ok(()) => {
                                     // Success - reset retry state
                                     retry_manager.reset();
@@ -402,6 +422,22 @@ impl GossipController {
         log::info!("Successfully connected to peer {}", peer_addr);
 
         Ok(())
+    }
+
+    /// Whether `node` is one to probe: another node, neither `Down` nor
+    /// `Leaving`.
+    fn is_probe_target(&self, name: &str, node: &NodeState) -> bool {
+        name != self.self_name
+            && node.status != NodeStatus::Down as i32
+            && node.status != NodeStatus::Leaving as i32
+    }
+
+    /// Whether the membership table holds a node to probe.
+    fn has_another_member(&self) -> bool {
+        self.state
+            .read()
+            .iter()
+            .any(|(name, node)| self.is_probe_target(name, node))
     }
 
     /// Determine if this node should initiate sync_stream connection

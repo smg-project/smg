@@ -6,7 +6,7 @@ use llm_tokenizer::{create_tokenizer_from_file, traits::Tokenizer};
 use smg_grpc_client::sglang_scheduler::SglangSchedulerClient;
 
 use super::{
-    chat_stream::{prepare_chat, start_chat_stream},
+    chat_stream::{prepare_chat, start_chat_stream, weight_version_of},
     error::{set_error_message, SglErrorCode},
     runtime::RUNTIME,
     stream::SglangStreamHandle,
@@ -17,6 +17,8 @@ use super::{
 pub struct SglangClientHandle {
     pub(crate) client: Arc<SglangSchedulerClient>,
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
+    /// The engine's weight version at creation, the chunks' `system_fingerprint`.
+    pub(crate) weight_version: String,
 }
 
 /// Create a new SGLang client handle
@@ -79,7 +81,12 @@ pub unsafe extern "C" fn sgl_client_create(
             }
         };
 
-    Box::into_raw(Box::new(SglangClientHandle { client, tokenizer }))
+    let weight_version = RUNTIME.block_on(weight_version_of(&client));
+    Box::into_raw(Box::new(SglangClientHandle {
+        client,
+        tokenizer,
+        weight_version,
+    }))
 }
 
 /// Free a client handle
@@ -146,6 +153,7 @@ pub unsafe extern "C" fn sgl_client_chat_completion_stream(
         &client_ref.tokenizer,
         prepared,
         None,
+        &client_ref.weight_version,
         error_out,
     ) {
         Ok(handle) => {

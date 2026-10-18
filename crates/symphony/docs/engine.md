@@ -47,7 +47,9 @@ What the engine decides for every format, and what it leaves open:
   the call is closed for the client first, as `tagged::Assembler::close` says, unless the close
   fell inside a streamed string. A JSON call whose arguments value the close cut ends with the
   fragments it sent and a `Malformed` event of no bytes, with the region's reason, before its
-  end: a cut call is never handed over as a whole one without a word (`json::assembler`). A tagged
+  end: a cut call is never handed over as a whole one without a word (`json::assembler`), and
+  neither is a shaped call whose value never began, the cut or the close right after its header
+  (`json::Arguments::finish`). A tagged
   call the end of the stream cut ends the same way whatever stage the cut found, since the object
   the assembler writes closes only at the call's own end, and so does one whose close cut a streamed
   string, in every tag-based syntax (`tagged::end_cut_call`): no closing quote and no closing brace
@@ -64,8 +66,12 @@ What the engine decides for every format, and what it leaves open:
   values by one) and the output's call `index` is the nonce `index` steps on: an id repeats in
   no other request, since a client pairs its tool results with its calls by id across a
   conversation, and is the same for one output however its stream is cut.
-  `Engine::with_call_ids` names the nonce for a replay that wants the ids reproducible. No table
-  or assembler chooses an id (`ids.rs`).
+  `Engine::with_call_ids` names the nonce for a replay that wants the ids reproducible. No
+  assembler chooses an id (`ids.rs`); a table whose call header writes the id and whose
+  templates render it back into the prompt (Kimi K2) carries the model's own id on the call
+  instead (`Format::call_id(CallId::Header)`: the header's text without its ending literal); a
+  header id that repeats one already given in the response falls back to the minted id, so a
+  response's ids stay distinct either way.
 - Every text event says how many tokens it carries, counted by the `Ledger` from the deltas'
   spans: a token in the event that carries its first byte, a byte-less span (a held half of a
   character, or a hidden special token) into the run that carries the next byte, and the tokens

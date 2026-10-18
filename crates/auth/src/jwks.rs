@@ -263,6 +263,18 @@ fn http_client() -> Result<reqwest::Client, JwksError> {
         .map_err(|e| JwksError::HttpClientError(e.to_string()))
 }
 
+/// Refuses a response whose declared length is over [`MAX_JWKS_RESPONSE_SIZE`]
+/// before its body is read. A response without a declared length is not
+/// stopped here; the caller has to bound the body itself.
+fn within_size_limit(response: &reqwest::Response) -> Result<(), JwksError> {
+    match response.content_length() {
+        Some(content_length) if content_length > MAX_JWKS_RESPONSE_SIZE => Err(
+            JwksError::ResponseTooLarge(content_length, MAX_JWKS_RESPONSE_SIZE),
+        ),
+        _ => Ok(()),
+    }
+}
+
 impl JwksProvider {
     /// Create a new JWKS provider with explicit JWKS URI.
     /// The URL is validated for SSRF protection.
@@ -316,15 +328,7 @@ impl JwksProvider {
             )));
         }
 
-        // Check response size before parsing
-        if let Some(content_length) = response.content_length() {
-            if content_length > MAX_JWKS_RESPONSE_SIZE {
-                return Err(JwksError::ResponseTooLarge(
-                    content_length,
-                    MAX_JWKS_RESPONSE_SIZE,
-                ));
-            }
-        }
+        within_size_limit(&response)?;
 
         let discovery: OidcDiscovery = response
             .json()
@@ -375,15 +379,7 @@ impl JwksProvider {
             return Err(JwksError::JwksFetch(format!("HTTP {}", response.status())));
         }
 
-        // Check response size before reading body
-        if let Some(content_length) = response.content_length() {
-            if content_length > MAX_JWKS_RESPONSE_SIZE {
-                return Err(JwksError::ResponseTooLarge(
-                    content_length,
-                    MAX_JWKS_RESPONSE_SIZE,
-                ));
-            }
-        }
+        within_size_limit(&response)?;
 
         // Read body with size limit
         let bytes = response
@@ -405,6 +401,18 @@ impl JwksProvider {
         Ok(jwks)
     }
 
+    /// Fetch the key set and make it the cached one: the step behind an expiry
+    /// refresh and an unknown-`kid` refresh alike.
+    async fn refresh(&self) -> Result<JwkSet, JwksError> {
+        let jwks = self.fetch_jwks().await?;
+        *self.cache.write() = Some(CachedJwks {
+            jwks: jwks.clone(),
+            fetched_at: Instant::now(),
+            ttl: self.ttl,
+        });
+        Ok(jwks)
+    }
+
     /// Get the cached JWKS, refreshing if expired or not present.
     pub async fn get_jwks(&self) -> Result<JwkSet, JwksError> {
         // Check cache first
@@ -417,20 +425,8 @@ impl JwksProvider {
             }
         }
 
-        // Cache miss or expired, fetch new JWKS
-        let jwks = self.fetch_jwks().await?;
-
-        // Update cache
-        {
-            let mut cache = self.cache.write();
-            *cache = Some(CachedJwks {
-                jwks: jwks.clone(),
-                fetched_at: Instant::now(),
-                ttl: self.ttl,
-            });
-        }
-
-        Ok(jwks)
+        // Cache miss or expired.
+        self.refresh().await
     }
 
     /// Get a specific key by kid (key ID).
@@ -452,18 +448,7 @@ impl JwksProvider {
             return Err(JwksError::KeyNotFound(kid.to_string()));
         }
         warn!("Key {} not found in cached JWKS, refreshing...", kid);
-        let jwks = self.fetch_jwks().await?;
-
-        // Update cache
-        {
-            let mut cache = self.cache.write();
-            *cache = Some(CachedJwks {
-                jwks: jwks.clone(),
-                fetched_at: Instant::now(),
-                ttl: self.ttl,
-            });
-        }
-
+        let jwks = self.refresh().await?;
         jwks.find(kid)
             .cloned()
             .ok_or_else(|| JwksError::KeyNotFound(kid.to_string()))
@@ -801,6 +786,42 @@ mod tests {
             Err(JwksError::KeyNotFound(_))
         ));
         assert_eq!(server.hits(), 2);
+    }
+
+    /// The expiry refresh and the unknown-`kid` refresh are one step: each
+    /// fetches once and leaves the fetched set cached, fresh.
+    #[tokio::test]
+    async fn an_expiry_refresh_and_an_unknown_kid_refresh_cache_the_fetched_set_alike() {
+        let server = JwksServer::start(&["k1"]).await;
+        let provider = server.provider();
+        let cached_kids = |provider: &JwksProvider| -> Vec<String> {
+            let cache = provider.cache.read();
+            let cached = cache.as_ref().unwrap();
+            assert!(!cached.is_expired());
+            cached
+                .jwks
+                .keys
+                .iter()
+                .filter_map(|key| key.common.key_id.clone())
+                .collect()
+        };
+        provider.get_key("k1").await.unwrap();
+        assert_eq!(cached_kids(&provider), ["k1"]);
+
+        // The unknown-kid refresh, once the interval has passed.
+        *server.keys.write() = vec!["k2"];
+        *provider.last_fetch_attempt.lock() = Some(Instant::now() - UNKNOWN_KID_REFRESH_INTERVAL);
+        provider.get_key("k2").await.unwrap();
+        assert_eq!(cached_kids(&provider), ["k2"]);
+        assert_eq!(server.hits(), 2);
+
+        // The expiry refresh.
+        *server.keys.write() = vec!["k3"];
+        provider.cache.write().as_mut().unwrap().fetched_at =
+            Instant::now() - TTL - Duration::from_secs(1);
+        assert_eq!(provider.get_jwks().await.unwrap().keys.len(), 1);
+        assert_eq!(cached_kids(&provider), ["k3"]);
+        assert_eq!(server.hits(), 3);
     }
 
     const TTL: Duration = Duration::from_secs(3600);

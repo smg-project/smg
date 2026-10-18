@@ -19,7 +19,6 @@ name = "smg_mcp"
 [dependencies]
 async-trait.workspace = true
 axum.workspace = true
-backoff = { version = "0.4", features = ["tokio", "futures"] }
 futures.workspace = true
 dashmap.workspace = true
 lru.workspace = true

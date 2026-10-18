@@ -142,6 +142,28 @@ pub struct WorkerManagerConfig {
     pub remove_unhealthy: bool,
 }
 
+/// How a profiling call is spelled in its log line and its summary.
+struct ProfileVerb {
+    /// The log line as the call goes out (`Starting profiling on 3 workers`).
+    doing: &'static str,
+    /// The summary when every worker answered (`Successfully started profiling on all 3 workers`).
+    done: &'static str,
+    /// The summary when some did not (`Profile start: 2 succeeded, 1 failed`).
+    call: &'static str,
+}
+
+const PROFILE_START: ProfileVerb = ProfileVerb {
+    doing: "Starting",
+    done: "started",
+    call: "start",
+};
+
+const PROFILE_STOP: ProfileVerb = ProfileVerb {
+    doing: "Stopping",
+    done: "stopped",
+    call: "stop",
+};
+
 impl WorkerManager {
     /// Start the manager only if the background loop has work to do.
     ///
@@ -1150,51 +1172,12 @@ impl WorkerManager {
         options: &ProfileOptions,
         worker_url: Option<&str>,
     ) -> ProfileResult {
-        let workers = Self::admin_target_workers(worker_registry, worker_url);
-        let total_workers = workers.len();
-
-        if workers.is_empty() {
-            return ProfileResult {
-                successful: vec![],
-                failed: vec![],
-                total_workers,
-                message: match worker_url {
-                    Some(url) => format!("No worker matching url '{url}'"),
-                    None => "No workers available for profiling".to_string(),
-                },
-            };
-        }
-
-        info!("Starting profiling on {} workers", total_workers);
-
         let options = options.clone();
-        let (successful, failed) = Self::admin_fan_out(workers, move |w| {
+        Self::admin_profile(worker_registry, worker_url, &PROFILE_START, move |w| {
             let options = options.clone();
             async move { w.start_profile(&options).await }
         })
-        .await;
-
-        let message = if failed.is_empty() {
-            format!(
-                "Successfully started profiling on all {} workers",
-                successful.len()
-            )
-        } else {
-            format!(
-                "Profile start: {} succeeded, {} failed",
-                successful.len(),
-                failed.len()
-            )
-        };
-
-        info!("{}", message);
-
-        ProfileResult {
-            successful,
-            failed,
-            total_workers,
-            message,
-        }
+        .await
     }
 
     /// Stop the in-flight profiling run on all workers, or on the single
@@ -1203,6 +1186,26 @@ impl WorkerManager {
         worker_registry: &WorkerRegistry,
         worker_url: Option<&str>,
     ) -> ProfileResult {
+        Self::admin_profile(worker_registry, worker_url, &PROFILE_STOP, |w| async move {
+            w.stop_profile().await
+        })
+        .await
+    }
+
+    /// One profiling call on all workers, or on the single worker matching
+    /// `worker_url`: an empty fleet is answered with why, the call fans out
+    /// ([`Self::admin_fan_out`]), and the summary says all succeeded or how
+    /// many did not; `verb` spells the call in the log and the summary.
+    async fn admin_profile<F, Fut>(
+        worker_registry: &WorkerRegistry,
+        worker_url: Option<&str>,
+        verb: &ProfileVerb,
+        op: F,
+    ) -> ProfileResult
+    where
+        F: Fn(Arc<dyn Worker>) -> Fut,
+        Fut: Future<Output = WorkerResult<()>>,
+    {
         let workers = Self::admin_target_workers(worker_registry, worker_url);
         let total_workers = workers.len();
 
@@ -1218,19 +1221,20 @@ impl WorkerManager {
             };
         }
 
-        info!("Stopping profiling on {} workers", total_workers);
+        info!("{} profiling on {} workers", verb.doing, total_workers);
 
-        let (successful, failed) =
-            Self::admin_fan_out(workers, |w| async move { w.stop_profile().await }).await;
+        let (successful, failed) = Self::admin_fan_out(workers, op).await;
 
         let message = if failed.is_empty() {
             format!(
-                "Successfully stopped profiling on all {} workers",
+                "Successfully {} profiling on all {} workers",
+                verb.done,
                 successful.len()
             )
         } else {
             format!(
-                "Profile stop: {} succeeded, {} failed",
+                "Profile {}: {} succeeded, {} failed",
+                verb.call,
                 successful.len(),
                 failed.len()
             )
@@ -2429,10 +2433,26 @@ mod tests {
         assert_eq!(result.total_workers, 1);
         assert_eq!(result.successful, vec![url_a.clone()]);
         assert!(result.failed.is_empty());
+        assert_eq!(
+            result.message,
+            "Successfully started profiling on all 1 workers"
+        );
 
         let result = WorkerManager::stop_profile_all(&registry, Some(url_a.as_str())).await;
         assert_eq!(result.total_workers, 1);
         assert_eq!(result.successful, vec![url_a]);
+        assert_eq!(
+            result.message,
+            "Successfully stopped profiling on all 1 workers"
+        );
+
+        // Neither call finds a worker the fleet does not have, and both say so the same way.
+        let none = WorkerManager::stop_profile_all(&registry, Some("http://nowhere:1")).await;
+        assert_eq!(none.total_workers, 0);
+        assert_eq!(none.message, "No worker matching url 'http://nowhere:1'");
+        let empty = WorkerRegistry::new();
+        let none = WorkerManager::start_profile_all(&empty, &options, None).await;
+        assert_eq!(none.message, "No workers available for profiling");
     }
 
     fn load_report(ranks: &[(i32, i32, i32, f64)]) -> WorkerLoadResponse {
@@ -2569,6 +2589,33 @@ mod tests {
         assert_eq!(body.dp_rank_count, 0);
         assert!(body.loads.is_empty());
         assert!(body.aggregate.is_none());
+    }
+
+    /// A fleet where one worker's admin endpoint fails: both calls count the failed worker in
+    /// their summary and name it in the failed list.
+    #[tokio::test]
+    async fn test_profile_all_over_a_mixed_fleet_counts_the_failed() {
+        let url_ok = spawn_admin_stub(StatusCode::OK).await;
+        let url_failing = spawn_admin_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
+
+        let registry = WorkerRegistry::new();
+        registry.register(make_worker(&url_ok, 1, 1)).unwrap();
+        registry.register(make_worker(&url_failing, 1, 1)).unwrap();
+
+        let options = ProfileOptions::default();
+        let result = WorkerManager::start_profile_all(&registry, &options, None).await;
+        assert_eq!(result.total_workers, 2);
+        assert_eq!(result.successful, vec![url_ok.clone()]);
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].0, url_failing);
+        assert_eq!(result.message, "Profile start: 1 succeeded, 1 failed");
+
+        let result = WorkerManager::stop_profile_all(&registry, None).await;
+        assert_eq!(result.total_workers, 2);
+        assert_eq!(result.successful, vec![url_ok]);
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].0, url_failing);
+        assert_eq!(result.message, "Profile stop: 1 succeeded, 1 failed");
     }
 
     #[tokio::test]

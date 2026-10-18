@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use crate::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-    common::ContentPart,
+    common::{invalid, ContentPart},
 };
 
 /// Tool-protocol strictness for conversation history (MPV tests 16_08, 16_09,
@@ -22,7 +22,7 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
             ChatMessage::Assistant { tool_calls, .. } => {
                 for tc in tool_calls.iter().flatten() {
                     if !seen.insert(tc.id.as_str()) {
-                        return Err(error(
+                        return Err(invalid(
                             "tool_call_id_duplicate",
                             format!("duplicate tool_call id '{}'", tc.id),
                         ));
@@ -37,7 +37,7 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
                         )
                         .is_err()
                         {
-                            return Err(error(
+                            return Err(invalid(
                                 "tool_call_arguments_invalid_json",
                                 format!("tool_call '{}' arguments are not a JSON object", tc.id),
                             ));
@@ -48,7 +48,7 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
             ChatMessage::Tool { tool_call_id, .. } => {
                 let answered = pending.remove(tool_call_id.as_str());
                 if !answered {
-                    return Err(error(
+                    return Err(invalid(
                         "tool_call_id_mismatch",
                         format!("no pending tool_call with id '{tool_call_id}'"),
                     ));
@@ -59,7 +59,7 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
     }
 
     if let Some(id) = order.iter().find(|id| pending.contains(*id)) {
-        return Err(error(
+        return Err(invalid(
             "tool_call_unanswered",
             format!("tool_call '{id}' has no matching tool message"),
         ));
@@ -153,10 +153,4 @@ fn into_parts(content: MessageContent) -> Vec<ContentPart> {
         MessageContent::Parts(parts) => parts,
         MessageContent::Text(text) => vec![ContentPart::Text { text }],
     }
-}
-
-fn error(code: &'static str, message: String) -> validator::ValidationError {
-    let mut e = validator::ValidationError::new(code);
-    e.message = Some(message.into());
-    e
 }

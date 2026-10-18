@@ -70,6 +70,8 @@ pub enum DropReason {
     Wrapper,
     /// Whitespace the format treats as structural.
     Whitespace,
+    /// A call after the first, where the request takes one call only ([`first_call_only`]).
+    LaterCall,
 }
 
 /// Why a region could not be parsed. Its text is returned, never lost.
@@ -359,9 +361,121 @@ impl IntoIterator for Events {
     }
 }
 
+/// The engine tokens the reasoning text among `events` cost.
+pub fn reasoning_text_tokens(events: &[Event]) -> u32 {
+    events
+        .iter()
+        .map(|event| match event {
+            Event::Reasoning(text) => text.tokens.unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// One call only (`parallel_tool_calls: false`, `disable_parallel_tool_use`): the events of
+/// every call after the first become its dropped text, so every byte of the output still lands
+/// in one event and the content ranges after the call hold
+/// ([`content_spans`](crate::adapt::chat::content_spans)); the finish counts at most one. A
+/// table's grammar limits a forced call; this limits a free one.
+pub fn first_call_only(events: &mut [Event]) {
+    for event in events {
+        match event {
+            Event::ToolCallStart { index, source, .. }
+            | Event::ToolCallArguments { index, source, .. }
+            | Event::ToolCallEnd { index, source, .. }
+                if *index > 0 =>
+            {
+                *event = Event::Dropped {
+                    text: std::mem::take(source),
+                    why: DropReason::LaterCall,
+                };
+            }
+            Event::Finish { tool_calls, .. } => *tool_calls = (*tool_calls).min(1),
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_text_tokens_sum_the_reasoning_texts_alone() {
+        let events = vec![
+            Event::Content(Text::new("a", 3)),
+            Event::Reasoning(Text::new("b", 2)),
+            Event::Reasoning(Text::uncounted("c")),
+            Event::Reasoning(Text::new("d", 5)),
+        ];
+        assert_eq!(reasoning_text_tokens(&events), 7);
+        assert_eq!(reasoning_text_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn first_call_only_keeps_the_first_call_and_caps_the_finish() {
+        let call = |index: u32| {
+            [
+                Event::ToolCallStart {
+                    index,
+                    id: format!("call_{index}"),
+                    name: "f".to_string(),
+                    source: Text::uncounted("<"),
+                },
+                Event::ToolCallArguments {
+                    index,
+                    json: "{}".to_string(),
+                    source: Text::uncounted("{}"),
+                },
+                Event::ToolCallEnd {
+                    index,
+                    source: Text::uncounted(">"),
+                },
+            ]
+        };
+        let mut events = vec![Event::Content(Text::uncounted("x"))];
+        events.extend(call(0));
+        events.extend(call(1));
+        events.push(Event::Finish {
+            reason: FinishReason::ToolCalls,
+            tool_calls: 2,
+            reasoning_tokens: 0,
+        });
+
+        first_call_only(&mut events);
+
+        let indices: Vec<u32> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallStart { index, .. }
+                | Event::ToolCallArguments { index, .. }
+                | Event::ToolCallEnd { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(indices, [0, 0, 0]);
+        assert!(matches!(events.first(), Some(Event::Content(_))));
+        let dropped: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped {
+                    text,
+                    why: DropReason::LaterCall,
+                } => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dropped,
+            ["<", "{}", ">"],
+            "the second call's bytes stay, in place"
+        );
+        assert_eq!(events.len(), 8);
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 1, .. })
+        ));
+    }
 
     #[test]
     fn adjacent_content_merges_and_counts_tokens() {

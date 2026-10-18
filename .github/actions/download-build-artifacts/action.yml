@@ -1,0 +1,64 @@
+name: 'Download build artifacts'
+description: >-
+  The artifacts the build-wheel job published, into the paths the jobs read them
+  from: the wheel, the WASM test fixtures, the Python client types and the Go FFI
+  library, each when asked. Requires checkout to be done first.
+
+inputs:
+  wheel:
+    description: 'Download the wheel.'
+    required: false
+    default: 'true'
+  wheel-path:
+    description: 'Where the wheel lands.'
+    required: false
+    default: 'wheel/'
+  wasm-fixtures:
+    description: 'Download the WASM test fixtures (a missing artifact is tolerated).'
+    required: false
+    default: 'false'
+  client-types:
+    description: 'Download the generated Python client types.'
+    required: false
+    default: 'false'
+  go-ffi-library:
+    description: 'Download the Go FFI library and check that it is there.'
+    required: false
+    default: 'false'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Download Go FFI library
+      if: inputs.go-ffi-library == 'true'
+      uses: actions/download-artifact@v8
+      with:
+        name: go-ffi-library
+        path: bindings/golang/target/release/
+
+    - name: Verify Go FFI library
+      if: inputs.go-ffi-library == 'true'
+      shell: bash
+      run: ls -la bindings/golang/target/release/libsmg_go.*
+
+    - name: Download wheel artifact
+      if: inputs.wheel == 'true'
+      uses: actions/download-artifact@v8
+      with:
+        name: smg-wheel
+        path: ${{ inputs.wheel-path }}
+
+    - name: Download WASM test fixtures
+      if: inputs.wasm-fixtures == 'true'
+      uses: actions/download-artifact@v8
+      with:
+        name: wasm-test-fixtures
+        path: crates/wasm/tests/fixtures/
+      continue-on-error: true
+
+    - name: Download Python client types
+      if: inputs.client-types == 'true'
+      uses: actions/download-artifact@v8
+      with:
+        name: python-client-types
+        path: clients/python/smg_client/types/

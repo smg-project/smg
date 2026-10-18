@@ -458,6 +458,22 @@ mod tests {
     use super::*;
     use crate::channel::testing::refused_endpoint;
 
+    #[test]
+    fn plain_sampling_seed_is_forwarded_when_it_fits() {
+        let seeded = |seed| GenerateSamplingParams {
+            sampling_seed: seed,
+            ..Default::default()
+        };
+        assert_eq!(
+            MlxEngineClient::build_sampling_params_from_plain(Some(&seeded(Some(7)))).seed,
+            Some(7)
+        );
+        assert_eq!(
+            MlxEngineClient::build_sampling_params_from_plain(Some(&seeded(Some(u64::MAX)))).seed,
+            None
+        );
+    }
+
     #[tokio::test]
     async fn connect_fails_on_a_malformed_or_refused_endpoint() {
         let malformed = MlxEngineClient::connect("not an endpoint").await;

@@ -29,6 +29,7 @@ use crate::{
 mod attributed;
 mod calls;
 mod gemma;
+mod json;
 mod keyed;
 mod output;
 mod pythonic;
@@ -660,12 +661,12 @@ impl Format {
             // the list, as the gateway's older `json` parser forces it. Between markers (Llama
             // Nemotron) the list is one tag's content, and the thought takes the prefix.
             CallSyntax::JsonList | CallSyntax::JsonAlone => match markers {
-                None => (Self::json_list_calls(&named, count), false),
-                Some(markers) => (Self::json_list_tag(markers, &named, count), true),
+                None => (json::list_calls(&named, count), false),
+                Some(markers) => (json::list_tag(markers, &named, count), true),
             },
-            CallSyntax::Json => (Self::json_calls(markers?, &named, count), true),
+            CallSyntax::Json => (json::calls(markers?, &named, count), true),
             CallSyntax::Keyed(tags) if *tags == KeyedTags::PLAIN => {
-                (Self::keyed_calls(markers?, &named, count), true)
+                (keyed::compact_calls(markers?, &named, count), true)
             }
             // XTML's grammar is its own: the block's ways in come from the table.
             CallSyntax::Attributed(tags) if tags.typing == Typing::TypeAttribute => {
@@ -692,12 +693,15 @@ impl Format {
             CallSyntax::Pythonic(dialect) => {
                 (pythonic::calls(markers?, *dialect, &named, count), true)
             }
-            CallSyntax::NamedArguments(marker) => {
-                (self.named_arguments_calls(marker, &named, count)?, true)
-            }
+            CallSyntax::NamedArguments(marker) => (
+                json::named_arguments_calls(self, marker, &named, count)?,
+                true,
+            ),
             CallSyntax::Xml => (xml::calls(markers?, self.separator(), &named, count)?, true),
             CallSyntax::Gemma(spelling) => (gemma::calls(markers?, *spelling, &named, count), true),
-            CallSyntax::NamedJson(marker) => (self.named_json_calls(marker, &named, count)?, false),
+            CallSyntax::NamedJson(marker) => {
+                (json::named_calls(self, marker, &named, count)?, false)
+            }
             // A template's patterns do not say which text a run of whitespace or a skipped
             // attribute stands for, and a tag writes only what the template renders: a shaped
             // call's tag is written from the layout its chat template renders, and a table
@@ -1046,199 +1050,6 @@ impl Format {
             return grammar;
         }
         bound(grammar, tokens)
-    }
-
-    /// The JSON family: each call is the call markers around one JSON object whose `name` is the
-    /// tool's and whose `arguments` the tool's schema accepts, the template's newlines included.
-    fn json_calls(markers: &CallMarkers<'_>, tools: &[&Tool], count: Count<'_>) -> Grammar {
-        let tags = tools
-            .iter()
-            .map(|tool| {
-                let name = Value::String(tool.function.name.clone());
-                Tag::new(
-                    format!("{}\n{{\"name\": {name}, \"arguments\": ", markers.call_open),
-                    Grammar::JsonSchema {
-                        schema: tool.function.parameters.clone(),
-                        style: None,
-                        excludes: Vec::new(),
-                        whitespace: Whitespace::Free,
-                    },
-                    format!("}}\n{}", markers.call_close),
-                )
-            })
-            .collect();
-        count.triggered(vec![markers.call_open.to_string()], tags)
-    }
-
-    /// Inkling's named JSON: the tag the gateway's old Inkling parser hand-writes. The marker that
-    /// says a message is a call triggers it, inside whatever message the model is writing, the
-    /// first one included: the marker, `{"name":"NAME","args":` as the template writes it, the
-    /// arguments the tool's schema accepts, `}` and the message's close (the terminal of the row
-    /// from the turn's own state, where a message starts, to the wrapper state a closed message
-    /// leaves the engine in). The tool's name before the marker stays free text: the assembler
-    /// takes the call's name from the object and drops the header as the template's framing. The
-    /// messages before the call (a thought, the template's empty answer) are free text too, and a
-    /// thought is a message of its own, so the tag is the same whether the prompt left the model
-    /// inside one or not. The tag is wider than the parser at one point, as the gateway's is: a
-    /// marker outside a message's header (after an answer's text, or after a message's close with
-    /// no opener between) is writable here and reads as that message's text, so an output written
-    /// there satisfies `at_least_one` and yields no call; the model does not write it, the
-    /// sequence being off its training. `None` for a table whose messages have no close.
-    fn named_json_calls(&self, marker: &str, tools: &[&Tool], count: Count<'_>) -> Option<Grammar> {
-        let (_, close, _) = self
-            .transitions()
-            .find(|&(source, _, target)| source == 0 && self.emits(target) == Emits::Wrapper)?;
-        let close = self.terminal_text(close);
-        let tags = tools
-            .iter()
-            .map(|tool| {
-                let quoted = Value::String(tool.function.name.clone());
-                Tag::new(
-                    format!("{marker}{{\"name\":{quoted},\"args\":"),
-                    Grammar::JsonSchema {
-                        schema: tool.function.parameters.clone(),
-                        style: None,
-                        excludes: Vec::new(),
-                        whitespace: Whitespace::Free,
-                    },
-                    format!("}}{close}"),
-                )
-            })
-            .collect();
-        Some(count.triggered(vec![marker.to_string()], tags))
-    }
-
-    /// Mistral's named arguments: the call's opener triggers a tag per tool, the opener, the
-    /// tool's name and the marker as its `begin`, the arguments the tool's schema accepts as its
-    /// content, and nothing as its `end`, since the template writes no closing marker: the object
-    /// the schema accepts ends the tag, and the next opener or the end of the turn follows. The
-    /// opener is the terminal of the row from the turn's own state into the arguments state;
-    /// `None` for a table without one.
-    fn named_arguments_calls(
-        &self,
-        marker: &str,
-        tools: &[&Tool],
-        count: Count<'_>,
-    ) -> Option<Grammar> {
-        let (_, open, _) = self
-            .transitions()
-            .find(|&(source, _, target)| source == 0 && self.emits(target) == Emits::Arguments)?;
-        let open = self.terminal_text(open);
-        let tags = tools
-            .iter()
-            .map(|tool| {
-                Tag::new(
-                    format!("{open}{}{marker}", tool.function.name),
-                    Grammar::JsonSchema {
-                        schema: tool.function.parameters.clone(),
-                        style: None,
-                        excludes: Vec::new(),
-                        whitespace: Whitespace::Free,
-                    },
-                    "",
-                )
-            })
-            .collect();
-        Some(count.triggered(vec![open.to_string()], tags))
-    }
-
-    /// xLAM's list: the whole output is `[`, the calls joined by `, `, `]`, each call a JSON object
-    /// whose `name` is the tool's and whose `arguments` the tool's schema accepts, spelled as the
-    /// template spells it (`{"name": "NAME", "arguments": {...}}`, a space after each colon and
-    /// comma); with `at_least_one`, the list alone, and otherwise the list or prose, since the
-    /// model answers in prose instead. The prose is the assembler's rule exactly: its first byte
-    /// that is not whitespace is not `[`, and the rest is free, a `[` later in it included (a
-    /// Markdown link, in 592 of the 13,085 recorded prose answers). The one place the grammar is
-    /// narrower than the assembler: an output that starts with `[` and opens no object is content
-    /// to the assembler and not writable here.
-    /// The list of the tools' calls as xLAM and Llama Nemotron write it: `[`, each call as
-    /// `{"name": NAME, "arguments": ` and the tool's schema, `, ` between calls, `]`; with one
-    /// call, that call alone, and after the `]` what the count writes after the last call.
-    fn json_list(tools: &[&Tool], count: Count<'_>) -> Grammar {
-        let one_call = Grammar::Or(
-            tools
-                .iter()
-                .map(|tool| {
-                    let name = Value::String(tool.function.name.clone());
-                    Grammar::Sequence(vec![
-                        Grammar::ConstString(format!("{{\"name\": {name}, \"arguments\": ")),
-                        Grammar::JsonSchema {
-                            schema: tool.function.parameters.clone(),
-                            style: None,
-                            excludes: Vec::new(),
-                            whitespace: Whitespace::Free,
-                        },
-                        Grammar::ConstString("}".to_string()),
-                    ])
-                })
-                .collect(),
-        );
-        let mut list = vec![Grammar::ConstString("[".to_string()), one_call.clone()];
-        if !count.one {
-            list.push(Grammar::Star(Box::new(Grammar::Sequence(vec![
-                Grammar::ConstString(", ".to_string()),
-                one_call,
-            ]))));
-        }
-        list.push(Grammar::ConstString(count.end("]")));
-        Grammar::Sequence(list)
-    }
-
-    /// xLAM's list alone in the turn: the list, or, when no call is required, prose that does
-    /// not start with a bracket.
-    fn json_list_calls(tools: &[&Tool], count: Count<'_>) -> Grammar {
-        let list = Self::json_list(tools, count);
-        if count.at_least_one {
-            list
-        } else {
-            Grammar::Or(vec![
-                Grammar::Sequence(vec![
-                    Grammar::Regex(r"\s*[^\s\[]".to_string()),
-                    Grammar::AnyText {
-                        excludes: Vec::new(),
-                    },
-                ]),
-                list,
-            ])
-        }
-    }
-
-    /// Llama Nemotron's list between its markers: one tag, the opener, the list, the closer.
-    fn json_list_tag(markers: &CallMarkers<'_>, tools: &[&Tool], count: Count<'_>) -> Grammar {
-        // The tag's end carries the end of the turn, so the list inside it writes none.
-        let inside = Count { last: "", ..count };
-        count.triggered(
-            vec![markers.call_open.to_string()],
-            vec![Tag::new(
-                markers.call_open,
-                Self::json_list(tools, inside),
-                markers.call_close,
-            )],
-        )
-    }
-
-    /// Keyed arguments in the compact spelling (GLM 4.7 and later, IQuest): each call is the call
-    /// opener and the tool's name, the schema written in the engines' `glm_xml` style (`<arg_key>`
-    /// and `<arg_value>` pairs with nothing between them), and the call's close; the shape
-    /// xgrammar's built-in GLM tag has and the gateway writes today. Ling's and Hy4's spellings
-    /// are not this one, and are written from their own tags instead (the `keyed` module).
-    fn keyed_calls(markers: &CallMarkers<'_>, tools: &[&Tool], count: Count<'_>) -> Grammar {
-        let tags = tools
-            .iter()
-            .map(|tool| {
-                Tag::new(
-                    format!("{}{}", markers.call_open, tool.function.name),
-                    Grammar::JsonSchema {
-                        schema: tool.function.parameters.clone(),
-                        style: Some("glm_xml".to_string()),
-                        excludes: Vec::new(),
-                        whitespace: Whitespace::Free,
-                    },
-                    markers.call_close,
-                )
-            })
-            .collect();
-        count.triggered(vec![markers.call_open.to_string()], tags)
     }
 
     /// The text the table drops wherever it stands, which the template writes before every tag
@@ -2755,7 +2566,7 @@ mod tests {
             event::Events,
             input::{EngineFinish, Input},
             parser::Parser as _,
-            tagged::Declared,
+            Declared,
         };
         let mut engine = Engine::new(format.clone(), Declared::of(tools));
         let mut out = Events::new();

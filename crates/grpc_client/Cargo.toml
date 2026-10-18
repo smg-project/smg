@@ -39,7 +39,7 @@ h2 = "0.4.19"
 
 # Archive validation
 sha2 = "0.11"
-zip = "8.6"
+zip = "9.0"
 tempfile = "3.27"
 
 [build-dependencies]

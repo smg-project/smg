@@ -44,20 +44,37 @@
 //! template's reader closes a region at the end of its text: the arguments' object is closed over
 //! the parameters that finished, and the text of one the cut left unfinished is dropped as
 //! wrapping. One JSON value or object is not closed for the client, and what was held after it
-//! comes back as `Malformed` with `UnterminatedRegion`, its whitespace dropped.
+//! comes back as `Malformed` with `UnterminatedRegion`, its whitespace dropped. A value that never
+//! began, the cut or the region's close right after the header, is said to be none the same way a
+//! value cut short is, by a `Malformed` event of no bytes before the call's end
+//! ([`json::Arguments::finish`]), so that a call is never handed over whole with an empty string
+//! for its arguments.
 //!
 //! [`CallSyntax::Shaped`]: crate::CallSyntax::Shaped
 
 use super::params::Params;
 use crate::{
     event::{runs, DropReason, Event, Events, MalformedReason, Text},
+    format::CallId,
     json::{self, arguments::Strings},
     shape::{
-        Arguments, CallShape, Match, Matcher, NameSource, Schema, Slot, Suffix, ValueParser,
-        Values, Verdict,
+        Arguments, Atom, CallShape, Match, Matcher, NameSource, Pattern, Schema, Slot, Suffix,
+        ValueParser, Values, Verdict,
     },
-    tagged::Declared,
+    Declared,
 };
+
+/// The call's id as `header` wrote it: the header's text without the literal that ends
+/// `pattern` (when a literal does) and without the whitespace around it; `None` when nothing is
+/// left.
+fn header_id(header: &str, pattern: &Pattern) -> Option<String> {
+    let written = match pattern.0.last() {
+        Some(Atom::Lit(lit)) => header.strip_suffix(&**lit).unwrap_or(header),
+        _ => header,
+    };
+    let id = written.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
 
 /// What a call's header says, once the bytes fed after the terminal decide it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +93,11 @@ pub enum Header {
 pub struct Assembler {
     index: u32,
     id: String,
+    /// Where the call's id comes from: the one minted for it, or its header as written.
+    call_id: CallId,
+    /// The ids the output's earlier calls were given: a header id that repeats one of them
+    /// falls back to the minted id, so the ids of one response stay distinct.
+    taken: Vec<String>,
     shape: &'static CallShape,
     /// How the call's values read.
     values: Values,
@@ -183,11 +205,25 @@ impl Assembler {
         Self {
             index,
             id: id.into(),
+            call_id: CallId::Minted,
+            taken: Vec::new(),
             shape,
             values,
             before,
             stage: Stage::Header(Box::new(matcher)),
         }
+    }
+
+    /// Where the call's id comes from; the minted one unless the table says otherwise, and the
+    /// minted one again where the header's id repeats one of `taken`, the ids the output's
+    /// earlier calls were given.
+    #[must_use]
+    pub(crate) fn with_call_id(mut self, source: CallId, taken: &[String]) -> Self {
+        self.call_id = source;
+        if source == CallId::Header {
+            self.taken = taken.to_vec();
+        }
+        self
     }
 
     /// Read the next bytes after the terminal into the header, and say what they decide. Once
@@ -280,9 +316,18 @@ impl Assembler {
                 .map(|span| held[span].to_string())
                 .unwrap_or_default(),
         };
+        // The call's id: the one minted for it, or the header's as the model wrote it; a header
+        // that leaves nothing after its literal, or repeats an id this output gave already, falls
+        // back to the minted one, so a response's ids stay distinct.
+        let id = match self.call_id {
+            CallId::Minted => self.id.clone(),
+            CallId::Header => header_id(header, &shape.header)
+                .filter(|id| !self.taken.contains(id))
+                .unwrap_or_else(|| self.id.clone()),
+        };
         out.push(Event::ToolCallStart {
             index: self.index,
-            id: self.id.clone(),
+            id,
             name: name.clone(),
             source: Text::uncounted(header),
         });
@@ -367,9 +412,10 @@ impl Assembler {
 
     /// The stream was cut inside the region: the call ends with what arrived. One JSON value or
     /// object is not closed for the client, and what was held after it comes back as `Malformed`
-    /// with `UnterminatedRegion`, its whitespace dropped. Tagged parameters close as at the end of
-    /// the text: those still undecided are decided there, the bytes no parameter took are dropped
-    /// as wrapping, and the arguments' object is closed.
+    /// with `UnterminatedRegion`, its whitespace dropped; a value that never began is said to be
+    /// none before the end, as one cut short is. Tagged parameters close as at the end of the
+    /// text: those still undecided are decided there, the bytes no parameter took are dropped as
+    /// wrapping, and the arguments' object is closed.
     pub fn finish(mut self, declared: &Declared, out: &mut Events) {
         let Stage::Body(body) = std::mem::replace(&mut self.stage, Stage::Done) else {
             return;
@@ -899,6 +945,10 @@ mod tests {
             [
                 wrapper("<c>"),
                 start("f", "<n=f>"),
+                Event::Malformed {
+                    text: Text::default(),
+                    why: MalformedReason::UnterminatedRegion,
+                },
                 end(""),
                 Event::Finish {
                     reason: crate::event::FinishReason::Length,
@@ -906,7 +956,46 @@ mod tests {
                     reasoning_tokens: 0,
                 },
             ],
-            "a header that matched at the end starts a call the end cut"
+            "a header that matched at the end starts a call the end cut, which says so before its end"
+        );
+    }
+
+    #[test]
+    fn a_call_whose_value_never_began_says_so_before_its_end() {
+        // The region's close right after the header: the call ends with the region's reason, and
+        // its arguments are no empty string handed over as whole.
+        let format = table(named(Pattern::default()));
+        assert_eq!(
+            run(&format, "<c><n=f></c>"),
+            [
+                wrapper("<c>"),
+                start("f", "<n=f>"),
+                Event::Malformed {
+                    text: Text::default(),
+                    why: MalformedReason::BlockWithoutACompleteCall,
+                },
+                end("</c>"),
+                finish(1),
+            ]
+        );
+        // The same with the whitespace the value allows before it, which is the region's wrapping
+        // when no value comes.
+        assert_eq!(
+            run(&format, "<c><n=f>\n</c>"),
+            [
+                wrapper("<c>"),
+                start("f", "<n=f>"),
+                Event::Dropped {
+                    text: Text::uncounted("\n"),
+                    why: DropReason::Whitespace,
+                },
+                Event::Malformed {
+                    text: Text::default(),
+                    why: MalformedReason::BlockWithoutACompleteCall,
+                },
+                end("</c>"),
+                finish(1),
+            ]
         );
     }
 

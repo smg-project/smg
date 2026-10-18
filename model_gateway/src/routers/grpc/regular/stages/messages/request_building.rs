@@ -156,13 +156,15 @@ impl BuildStage for MessageRequestBuildingStage {
             decoding,
             tool_constraints,
             || {
-                symphony::turn_constraint_messages(
+                symphony::turn_constraint(
                     parser,
                     &names,
-                    &messages_request,
+                    symphony::Asks::Messages {
+                        request: &messages_request,
+                        continues: messages_request.continues_final_assistant(),
+                    },
                     &spec.chat_tools,
                     &processed_messages.text,
-                    messages_request.continues_final_assistant(),
                     &ctx.components.templates,
                 )
             },
@@ -184,13 +186,16 @@ impl BuildStage for MessageRequestBuildingStage {
                         }
                     })
                     .unwrap_or_default();
-                symphony::AutoTag::Messages {
+                symphony::AutoTag {
                     parser,
-                    names: names.clone(),
-                    request: Arc::clone(&messages_request),
-                    tools,
+                    labels: names.labels.clone(),
+                    flags: names.flags.clone(),
+                    request: symphony::AutoRequest::Messages {
+                        request: Arc::clone(&messages_request),
+                        tools,
+                        continues: continued_final_message,
+                    },
                     reasoning_open: require_reasoning,
-                    continues: continued_final_message,
                     templates: Arc::clone(&ctx.components.templates),
                 }
             },
@@ -218,10 +223,13 @@ impl BuildStage for MessageRequestBuildingStage {
         // Symphony's assignment, taken while the rendered prompt is still here (see
         // `regular::symphony`): the response spec carries it to the drivers, and the state
         // records which parser reads the message for the response's header.
-        let assignment = symphony::assign_messages(
+        let assignment = symphony::assign(
             parser,
             &names,
-            messages_request.as_ref(),
+            symphony::Asks::Messages {
+                request: messages_request.as_ref(),
+                continues: messages_request.continues_final_assistant(),
+            },
             tool_constraints.as_ref(),
             &processed_messages.text,
             &ctx.components.templates,

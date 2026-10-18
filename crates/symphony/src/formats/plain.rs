@@ -22,55 +22,17 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{Event, Events, Text},
-        input::{EngineFinish, Input},
-        parser::Parser,
-        tagged::Declared,
+        event::{Event, Text},
+        testing::{content, drive},
+        Declared,
     };
 
     fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
-        let mut parser = Engine::new(plain(), Declared::default());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        for piece in pieces {
-            parser
-                .feed(
-                    Input::Delta {
-                        token_ids: &[],
-                        text: piece,
-                        spans: &[],
-                    },
-                    &mut out,
-                )
-                .expect("delta");
-        }
-        parser
-            .feed(
-                Input::End {
-                    finish: EngineFinish::Stop,
-                },
-                &mut out,
-            )
-            .expect("end");
-        out.drain()
-    }
-
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
+        drive(
+            &mut Engine::new(plain(), Declared::default()),
+            prompt,
+            pieces,
+        )
     }
 
     #[test]

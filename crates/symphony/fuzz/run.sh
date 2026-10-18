@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Runs the fuzz targets for a bounded time each, seeded from the crate's recorded output slices
+# Runs the fuzz targets for a bounded time each, seeded from the recorded output slices of
+# bellwether's hand-written sets (BELLWETHER_FIXTURES names the tree `bellwether unpack` writes)
 # and guided by a dictionary of the table's markers, and prints one row per target: executions,
 # executions per second, coverage edges, corpus units and crashes. Exits 1 when any target found
 # a crash, or never ran; a crash's artifact is under artifacts/<target>/ and the log under
@@ -61,7 +62,8 @@ artifacts=artifacts/$label
 mkdir -p "$logs" "$artifacts" corpus prepared
 
 if [ -z "$summary_only" ]; then
-  cargo +nightly run --quiet --release --example prepare -- ../tests/fixtures/slices prepared
+  cargo +nightly run --quiet --release --example prepare -- \
+    "${BELLWETHER_FIXTURES:?set it to the tree bellwether unpack writes}" prepared
   # `cargo fuzz build` takes one target or all of them.
   if [ "${#targets[@]}" -eq "$(cargo +nightly fuzz list | wc -l)" ]; then
     cargo +nightly fuzz build --sanitizer "$sanitizer" "${target_dir[@]}"

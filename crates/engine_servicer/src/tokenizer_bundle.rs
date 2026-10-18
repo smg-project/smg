@@ -291,7 +291,7 @@ mod tests {
             .enumerate()
         {
             let mut entry = archive.by_index(index).unwrap();
-            assert_eq!(entry.name(), name);
+            assert_eq!(entry.name().unwrap(), name);
             assert!(entry.is_file());
             assert_eq!(entry.compression(), CompressionMethod::Deflated);
             let mut content = String::new();

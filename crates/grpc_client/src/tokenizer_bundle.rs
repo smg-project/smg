@@ -192,8 +192,10 @@ pub fn validate_zip_archive<R: Read + Seek>(reader: R) -> Result<ZipArchive<R>, 
         let entry = archive
             .by_index(i)
             .map_err(|e| format!("Failed to read zip entry {i}: {e}"))?;
-        let path = entry.name();
-        let has_traversal = Path::new(path).components().any(|component| {
+        let path = entry
+            .name()
+            .map_err(|e| format!("Failed to read the name of zip entry {i}: {e}"))?;
+        let has_traversal = Path::new(&*path).components().any(|component| {
             matches!(
                 component,
                 Component::ParentDir | Component::RootDir | Component::Prefix(_)

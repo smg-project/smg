@@ -227,6 +227,7 @@ impl Arguments {
     }
 
     /// Whether the bytes stopped being a JSON prefix.
+    #[cfg(test)]
     pub fn refused(&self) -> bool {
         self.invalid_from.is_some()
     }
@@ -257,11 +258,6 @@ impl Arguments {
         let before = self.value.chars().next_back().or(self.led_by);
         self.emitted = self.emitted.min(from);
         Some((tail, before))
-    }
-
-    /// Whether the value's first byte has arrived.
-    pub fn started(&self) -> bool {
-        self.started
     }
 
     /// Whether the value is whole.
@@ -338,10 +334,13 @@ impl Arguments {
     }
 
     /// No more bytes come: a number or a literal the bytes end on is whole now, and a word they
-    /// end on is sent as the prefix it is. A value that began and is no whole one (a string or a
-    /// container left open, a word that is no literal's prefix) is said to be none, by a
-    /// `Malformed` event of no bytes after its fragments: nothing sent is revised and nothing is
-    /// made up for what the model never finished. Returns whether the value is whole.
+    /// end on is sent as the prefix it is. A value that is no whole one, whether it began (a
+    /// string or a container left open, a word that is no literal's prefix) or no byte of it came
+    /// (the end right after the header that opened the call, whitespace alone), is said to be
+    /// none, by a `Malformed` event of no bytes after its fragments: nothing sent is revised,
+    /// nothing is made up for what the model never finished, and a call whose value never began
+    /// is not handed over as a whole one with an empty string for its arguments. Returns whether
+    /// the value is whole.
     pub fn finish(&mut self, out: &mut Events) -> bool {
         if self.whole.is_none()
             && self.started
@@ -355,7 +354,7 @@ impl Arguments {
         // A break the value reported itself has said it; one whose tail it handed back
         // (`ends_where_refused`) has not, and the bytes before the break are no whole value.
         let unsaid = self.invalid_from.is_none() || self.ends_where_refused;
-        if self.started && self.whole.is_none() && unsaid {
+        if self.whole.is_none() && unsaid {
             out.push(Event::Malformed {
                 text: Text::default(),
                 why: if self.ended_where_refused() {
@@ -692,12 +691,27 @@ mod tests {
         assert_eq!(plain.refused_tail(), None);
     }
 
+    /// Whitespace alone, or nothing at all, is no value: the end says so, by the one `Malformed`
+    /// event of no bytes a value cut short gets, so that a call whose arguments never began is
+    /// not handed over as whole with an empty string for them.
     #[test]
     fn whitespace_alone_is_no_value() {
+        let none = Event::Malformed {
+            text: Text::default(),
+            why: MalformedReason::UnterminatedRegion,
+        };
         let (events, taken, whole, finished) = run(&[" \t", "\r\n"]);
         assert_eq!(taken, [2, 2]);
         assert!(!whole && !finished);
         assert!(fragments(&events).is_empty());
         assert_eq!(sources(&events), " \t\r\n");
+        assert_eq!(events.last(), Some(&none), "{events:#?}");
+        let (events, taken, whole, finished) = run(&[]);
+        assert!(taken.is_empty() && !whole && !finished);
+        assert_eq!(
+            events,
+            [none],
+            "no byte came, and the end still says the value is none"
+        );
     }
 }

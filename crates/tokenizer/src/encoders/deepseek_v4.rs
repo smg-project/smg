@@ -152,16 +152,14 @@ impl Default for EncodeParams {
 }
 
 // ---------------------------------------------------------------------------
-// Special-token constants — copied verbatim from the Python source.
+// Special-token constants: the family's shared ones come from `deepseek_common`
+// (re-exported under this renderer's path), this version's own follow. Copied
+// verbatim from the Python source.
 // ---------------------------------------------------------------------------
-pub const BOS_TOKEN: &str = "<｜begin▁of▁sentence｜>";
-pub const EOS_TOKEN: &str = "<｜end▁of▁sentence｜>";
-pub const THINKING_START_TOKEN: &str = "<think>";
-pub const THINKING_END_TOKEN: &str = "</think>";
-pub const DSML_TOKEN: &str = "｜DSML｜";
-const USER_SP_TOKEN: &str = "<｜User｜>";
-const ASSISTANT_SP_TOKEN: &str = "<｜Assistant｜>";
-const LATEST_REMINDER_SP_TOKEN: &str = "<｜latest_reminder｜>";
+use super::deepseek_common::{ASSISTANT_SP_TOKEN, LATEST_REMINDER_SP_TOKEN, USER_SP_TOKEN};
+pub use super::deepseek_common::{
+    BOS_TOKEN, DSML_TOKEN, EOS_TOKEN, THINKING_END_TOKEN, THINKING_START_TOKEN,
+};
 const TOOL_CALLS_BLOCK_NAME: &str = "tool_calls";
 /// V4's DSML tag strings: bare `invoke`/`parameter`, no leading space. The
 /// V4.1 renderer builds its own `DsmlTags` with a leading space on each and

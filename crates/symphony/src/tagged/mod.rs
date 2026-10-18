@@ -7,26 +7,26 @@
 //! passed through: the model writes no JSON object, so the parser writes one, and it has to decide
 //! what type each value's text is.
 //!
-//! [`value`] is that decision; [`assembler`] turns one Qwen call's tags into its events,
+//! `value` is that decision; `assembler` turns one Qwen call's tags into its events,
 //! streaming a declared string as it arrives and writing every other value at its close;
-//! [`keyed`] does the same for one call written as its name and `<arg_key>`/`<arg_value>` pairs
-//! (GLM, Hy4, Ling, IQuest), typed by the request's tools again; [`attributed`] for one invoke
+//! `keyed` does the same for one call written as its name and `<arg_key>`/`<arg_value>` pairs
+//! (GLM, Hy4, Ling, IQuest), typed by the request's tools again; `attributed` for one invoke
 //! whose parameter tags name their key in an attribute (MiniMax M2, dots3, MiniCPM5, typed by the
 //! request's tools; DeepSeek's DSML, typed by the tag's `string` attribute; Kimi K3's XTML, typed
-//! by the tag's `type` attribute); and [`xml`] for one MiniMax M3 invoke, whose arguments are an
+//! by the tag's `type` attribute); and `xml` for one MiniMax M3 invoke, whose arguments are an
 //! XML tree, typed by the request's tools at every depth. `object` is the arguments object the
 //! keyed and attributed assemblers write: the carried bytes, the separators and the close, and the
 //! three ways a member is written.
 
-pub mod assembler;
-pub mod attributed;
-pub mod keyed;
+pub(crate) mod assembler;
+pub(crate) mod attributed;
+pub(crate) mod keyed;
 mod object;
-pub mod value;
-pub mod xml;
+pub(crate) mod value;
+pub(crate) mod xml;
 
-pub use assembler::{Assembler, Placement, Spelling};
-pub use value::{json, Declared, Kind};
+pub(crate) use assembler::Assembler;
+pub use assembler::{Placement, Spelling};
 
 use crate::event::{Event, Events, MalformedReason, Text};
 

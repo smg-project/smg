@@ -32,9 +32,9 @@ use crate::{
         proto_wrapper::ProtoGenerateComplete,
         regular::{
             processor::ResponseProcessor,
-            symphony::{assign, template::Templates, Assignment},
+            symphony::{assign, template::Templates, Asks, Assignment},
         },
-        utils::Names,
+        utils::ModelNames,
     },
 };
 
@@ -188,8 +188,8 @@ async fn a_call_the_conversation_established_is_a_call_without_a_tool_inventory(
     let request = retry_request();
     let assignment = assign(
         ParserChoice::Symphony,
-        &Names::default(),
-        &request,
+        &ModelNames::default(),
+        Asks::Chat(&request),
         None,
         RETRY_PROMPT,
         &Templates::new(Arc::new(TokenizerRegistry::new())),
@@ -756,4 +756,176 @@ async fn a_conversation_that_ends_with_a_system_turn_keeps_the_thought_out_of_th
     );
     assert_eq!(chat_text(&events, 0, "content").trim(), "");
     assert!(!tool_call_deltas(&events).is_empty(), "{events:#?}");
+}
+
+/// A `tool_use` block never carries `{}` for arguments the model wrote as JSON that no input
+/// value holds: the message is refused with the call named, where the stream carries the text as
+/// written for the client's own reader.
+#[tokio::test]
+async fn a_message_whose_tool_use_input_cannot_carry_the_arguments_is_refused() {
+    let output = "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"days\": 9.99e999999}}\n\
+                  </tool_call>";
+    let spec = || assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    // The whole message: refused, the call and the reader's reason in the error.
+    let mut frame = complete(0, "stop");
+    if let Some(proto::generate_response::Response::Complete(complete)) = &mut frame.response {
+        complete.output_ids = output.chars().map(u32::from).collect();
+        complete.completion_tokens = complete.output_ids.len() as u32;
+    }
+    let (stream, server) = scripted_stream(vec![frame], "0").await;
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
+    let result = ResponseProcessor::new(
+        ToolParserFactory::new(),
+        ReasoningParserFactory::new(),
+        utils::ParserResolver::disabled(),
+    )
+    .process_non_streaming_messages_response(
+        context::ExecutionResult::Single { stream },
+        spec(),
+        dispatch(),
+        tokenizer,
+        &mut decoder,
+    )
+    .await;
+    server.abort();
+    let response = match result {
+        Ok((message, _)) => panic!("a message with {:?}", message.content),
+        Err(response) => response,
+    };
+    assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        axum::body::to_bytes(response.into_body(), 65536),
+    )
+    .await
+    .expect("the body in time")
+    .expect("the body");
+    let body = String::from_utf8(body.to_vec()).expect("text");
+    assert!(
+        body.contains("symphony_tool_use_input_refused")
+            && body.contains("call 0 (lookup)")
+            && body.contains("number out of range"),
+        "{body}"
+    );
+    // The stream: the fragments as the model wrote them, and the stop reason the calls give.
+    let (result, events) =
+        message_events(vec![chunk(0, output), complete(0, "stop")], spec(), None).await;
+    assert!(result.is_ok(), "{result:?}");
+    let partial: String = events
+        .iter()
+        .filter_map(|event| event["delta"]["partial_json"].as_str())
+        .collect();
+    assert_eq!(partial, "{\"days\": 9.99e999999}");
+    assert_eq!(message_stop_reason(&events), "tool_use");
+}
+
+/// The scrape of a recorder of this test's own after `read` ran on this thread (the test
+/// runtime is single-threaded, so the local recorder sees every record of the future).
+async fn scraped<F: std::future::Future>(read: F) -> (F::Output, String) {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let guard = metrics::set_default_local_recorder(&recorder);
+    let output = read.await;
+    drop(guard);
+    (output, handle.render())
+}
+
+/// The line of `scrape` for the series `name` with every label in `labels`.
+fn series_line<'a>(scrape: &'a str, name: &str, labels: &[&str]) -> Option<&'a str> {
+    scrape
+        .lines()
+        .find(|line| line.starts_with(name) && labels.iter().all(|label| line.contains(label)))
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_malformed_region_in_a_whole_output_is_counted_and_written_once() {
+    // A call region that never forms a call: the content keeps its bytes, the counters say
+    // which table gave up and why, and one line names the request, the choice and the model.
+    let ((choice, _), scrape) = scraped(fold("Hello <tool_call>\nnot a call\n</tool_call>")).await;
+    let content = choice.message.content.expect("content");
+    assert!(content.contains("not a call"), "{content}");
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"qwen3\"", "outcome=\"malformed\""],
+    )
+    .expect("the outputs counter");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    assert!(
+        series_line(
+            &scrape,
+            "smg_symphony_malformed_total",
+            &["table=\"qwen3\""]
+        )
+        .is_some(),
+        "{scrape}"
+    );
+    assert!(
+        series_line(
+            &scrape,
+            "smg_symphony_malformed_bytes_count",
+            &["table=\"qwen3\""]
+        )
+        .is_some_and(|line| line.ends_with(" 1")),
+        "{scrape}"
+    );
+    assert!(logs_contain(
+        "Symphony did not read the whole output as content, reasoning and calls"
+    ));
+    assert!(logs_contain("request_id=\"test-request\""));
+    assert!(logs_contain("model=\"Qwen/Qwen3-8B\""));
+    assert!(logs_contain("table=\"qwen3\""));
+    assert!(logs_contain("choice=0"));
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_clean_whole_output_is_counted_and_writes_nothing() {
+    let ((choice, _), scrape) = scraped(fold("Hello there")).await;
+    assert_eq!(choice.message.content.as_deref(), Some("Hello there"));
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"qwen3\"", "outcome=\"clean\""],
+    )
+    .expect("the outputs counter");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    assert!(!scrape.contains("smg_symphony_malformed"), "{scrape}");
+    assert!(!logs_contain("Symphony did not read the whole output"));
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_malformed_region_in_a_stream_is_counted_and_written_once() {
+    let spec = assigned(
+        chat_spec(true),
+        qwen3(CallSyntax::Json),
+        "<|im_start|>assistant\n",
+    );
+    let ((result, events), scrape) = scraped(stream_events(
+        vec![
+            chunk(0, "Hi <tool_call>\nnot a call\n"),
+            chunk(0, "</tool_call>"),
+            complete(0, "stop"),
+        ],
+        true,
+        spec,
+    ))
+    .await;
+    result.expect("the stream ends well");
+    assert!(chat_text(&events, 0, "content").contains("not a call"));
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"qwen3\"", "outcome=\"malformed\""],
+    )
+    .expect("the outputs counter");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    assert!(logs_contain(
+        "Symphony did not read the whole output as content, reasoning and calls"
+    ));
+    assert!(logs_contain("table=\"qwen3\""));
+    assert!(logs_contain("choice=0"));
 }

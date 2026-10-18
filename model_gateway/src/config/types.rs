@@ -30,13 +30,15 @@ pub enum ParserChoice {
     /// The tool-call and reasoning parser crates, one parser per model family.
     #[default]
     Legacy,
-    /// Symphony's tables: the one a model's parser names select (its worker labels, else the
-    /// `--tool-call-parser` and `--reasoning-parser` flags) when a table answers to the name, its
-    /// own, a legacy parser's that reads its format (`qwen` for `qwen3`, `qwen_xml` for
-    /// `qwen3_tagged`), or a launcher's for a family whose table has no older parser (`muse` for
-    /// `muse_spark`); the registry's for the models it knows when they name nothing, or only a
-    /// reasoning parser no table answers to, `passthrough` excepted; any other legacy tool-call
-    /// parser's name, `passthrough`, and every other model, keep the legacy parsers.
+    /// Symphony's tables, by one precedence per model (`routers::grpc::regular::symphony::reads`):
+    /// the table its worker labels select, when they select anything; else the registry's table
+    /// for a model it knows; else the one the `--tool-call-parser` and `--reasoning-parser` flags
+    /// select, for a model the registry does not know. Names select a table when it answers to
+    /// them: its own name, a legacy parser's that reads its format (`qwen` for `qwen3`, `qwen_xml`
+    /// for `qwen3_tagged`), or a launcher's for a family whose table has no older parser (`muse`
+    /// for `muse_spark`); `hf` selects the model's response template's table; a reasoning name
+    /// alone that no table answers to selects nothing, `passthrough` excepted; any other legacy
+    /// tool-call parser's name, `passthrough`, and a model no table reads, keep the legacy parsers.
     Symphony,
 }
 

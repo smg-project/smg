@@ -26,11 +26,16 @@ use crate::{
 
 /// Per-request parser-name resolution.
 ///
-/// Precedence: the model's `ModelCard` override (`tool_parser` /
-/// `reasoning_parser`, populated from worker labels or an explicit
-/// `WorkerSpec` card) → the process-wide configured name
-/// (`--tool-call-parser` / `--reasoning-parser`) → `None`, which lets the
-/// factory helpers fall back to their name-based auto-detection, unchanged.
+/// For the legacy parsers, each kind's name is the model's `ModelCard`
+/// override (`tool_parser` / `reasoning_parser`, populated from worker labels
+/// or an explicit `WorkerSpec` card) → the process-wide configured name
+/// (`--tool-call-parser` / `--reasoning-parser`), when a legacy parser of the
+/// kind has it ([`Self::new`] asks the two registries once: under `--parser
+/// symphony` a flag may name a Symphony table or the response template, which
+/// no legacy parser reads) → `None`, which lets the factory helpers fall back
+/// to their name-based auto-detection, unchanged. Symphony takes the two
+/// sources apart ([`Self::names`]), the flags as set, with its registry
+/// between them (`regular::symphony::reads`).
 ///
 /// Lookups borrow straight from worker metadata (no card clones); only the
 /// resolved name is cloned.
@@ -38,20 +43,70 @@ use crate::{
 pub(crate) struct ParserResolver {
     /// `None` disables card lookups (parser-free endpoints, tests).
     worker_registry: Option<Arc<WorkerRegistry>>,
-    configured_tool_parser: Option<String>,
-    configured_reasoning_parser: Option<String>,
+    /// The gateway's `--tool-call-parser` and `--reasoning-parser`.
+    flags: Names,
+    /// The flags as the legacy parsers take them: each kind's when a legacy
+    /// parser of the kind has the name ([`Self::new`]); the flags themselves
+    /// for the tests' [`Self::with_flags`].
+    legacy_flags: Names,
 }
 
 impl ParserResolver {
+    /// The gateway's resolver: `worker_registry` for the cards, the configured
+    /// names, and the two legacy registries, asked once which of the
+    /// configured names they have. Under `--parser symphony` a flag may name a
+    /// Symphony table or the response template, which select for Symphony and
+    /// are nothing to the legacy parsers; handed such a name (by a request
+    /// Symphony leaves to them: a worker labeled `passthrough` alone, or the
+    /// `X-SMG-Parser: legacy` header), the legacy tool side would not parse at
+    /// all, since its availability check asks the registry for the exact name
+    /// and never falls back to the model (the calls come back as content), and
+    /// the reasoning side would warn on every request and detect from the
+    /// model anyway. So such a name is dropped here, once, and the legacy
+    /// parsers' own detection reads the model. Under `--parser legacy` the
+    /// startup check refuses such a flag, so the flags pass whole.
     pub(crate) fn new(
         worker_registry: Arc<WorkerRegistry>,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
+        tools: &ToolParserFactory,
+        reasoning: &ReasoningParserFactory,
     ) -> Self {
+        let flags = Names {
+            tool: configured_tool_parser,
+            reasoning: configured_reasoning_parser,
+        };
+        let legacy_flags = Names {
+            tool: flags.tool.clone().filter(|name| tools.has_parser(name)),
+            reasoning: flags
+                .reasoning
+                .clone()
+                .filter(|name| reasoning.registry().has_parser(name)),
+        };
         Self {
             worker_registry: Some(worker_registry),
-            configured_tool_parser,
-            configured_reasoning_parser,
+            flags,
+            legacy_flags,
+        }
+    }
+
+    /// A resolver whose configured names pass to the legacy parsers whole, the
+    /// registries unasked: for tests, whose names are the legacy parsers' own,
+    /// or which assert Symphony's view of the flags ([`Self::names`]).
+    #[cfg(test)]
+    pub(crate) fn with_flags(
+        worker_registry: Arc<WorkerRegistry>,
+        configured_tool_parser: Option<String>,
+        configured_reasoning_parser: Option<String>,
+    ) -> Self {
+        let flags = Names {
+            tool: configured_tool_parser,
+            reasoning: configured_reasoning_parser,
+        };
+        Self {
+            worker_registry: Some(worker_registry),
+            legacy_flags: flags.clone(),
+            flags,
         }
     }
 
@@ -60,29 +115,53 @@ impl ParserResolver {
     pub(crate) fn disabled() -> Self {
         Self {
             worker_registry: None,
-            configured_tool_parser: None,
-            configured_reasoning_parser: None,
+            flags: Names::default(),
+            legacy_flags: Names::default(),
         }
     }
 
     /// Effective tool-parser name for `model`, if any.
     pub(crate) fn tool_parser(&self, model: &str) -> Option<String> {
         self.card_parser(model, |card| card.tool_parser.as_ref())
-            .or_else(|| self.configured_tool_parser.clone())
+            .or_else(|| self.legacy_flags.tool.clone())
     }
 
     /// Effective reasoning-parser name for `model`, if any.
     pub(crate) fn reasoning_parser(&self, model: &str) -> Option<String> {
         self.card_parser(model, |card| card.reasoning_parser.as_ref())
-            .or_else(|| self.configured_reasoning_parser.clone())
+            .or_else(|| self.legacy_flags.reasoning.clone())
     }
 
-    /// Both names for `model`, as [`Self::tool_parser`] and [`Self::reasoning_parser`] resolve
-    /// them: Symphony reads them as a pair (`regular::symphony::reads`).
-    pub(crate) fn names(&self, model: &str) -> Names {
+    /// The tool-call parser's name as the legacy parsers take it for a request
+    /// whose names are `names`: the labels', else the flags' when a legacy
+    /// parser has it ([`Self::tool_parser`] without another card lookup).
+    pub(crate) fn legacy_tool<'a>(&'a self, names: &'a ModelNames<'_>) -> Option<&'a str> {
+        names
+            .labels
+            .tool
+            .as_deref()
+            .or(self.legacy_flags.tool.as_deref())
+    }
+
+    /// The parser names set for `model`, apart by who set them: its card's
+    /// (its workers' labels), and the gateway's flags as set. Symphony reads
+    /// them in that order with its registry between (`regular::symphony::reads`);
+    /// the legacy parsers take each kind's first, from the flags only a name
+    /// they read ([`Self::tool_parser`], [`Self::reasoning_parser`],
+    /// [`Self::legacy_tool`]).
+    pub(crate) fn names(&self, model: &str) -> ModelNames<'_> {
+        ModelNames {
+            labels: self.card_names(model),
+            flags: &self.flags,
+        }
+    }
+
+    /// The names `model`'s own cards set (worker labels), without the process-wide fallback:
+    /// what the workers say of the model, each `None` when no card names one.
+    fn card_names(&self, model: &str) -> Names {
         Names {
-            tool: self.tool_parser(model),
-            reasoning: self.reasoning_parser(model),
+            tool: self.card_parser(model, |card| card.tool_parser.as_ref()),
+            reasoning: self.card_parser(model, |card| card.reasoning_parser.as_ref()),
         }
     }
 
@@ -126,12 +205,61 @@ impl ParserResolver {
     }
 }
 
-/// The parser names set for one model, resolved by [`ParserResolver`]: the tool-call parser's
-/// and the reasoning parser's, each `None` when nothing names one.
+/// The parser names one source sets for a model: the tool-call parser's and the reasoning
+/// parser's, each `None` when nothing names one. A source is a model's card (its workers' labels,
+/// or the operator's card for it) or the gateway's `--tool-call-parser` and `--reasoning-parser`
+/// flags, which every model shares; [`ModelNames`] holds a model's two.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Names {
     pub tool: Option<String>,
     pub reasoning: Option<String>,
+}
+
+/// No names at all.
+static NO_NAMES: Names = Names {
+    tool: None,
+    reasoning: None,
+};
+
+/// The parser names set for one model, apart by who set them ([`ParserResolver::names`]): the
+/// names of its card, which its workers' labels (or the operator's card) set for the one model,
+/// and the gateway's flags, which every model shares. Symphony reads the two in that order with
+/// its registry between them (`regular::symphony::reads`): the card's names when they select
+/// anything, else the registry's table for a model it knows, else the flags; the legacy parsers
+/// take each kind's first name, from the flags only one a legacy parser of the kind has
+/// ([`ParserResolver::tool_parser`], [`ParserResolver::legacy_tool`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ModelNames<'a> {
+    pub labels: Names,
+    pub flags: &'a Names,
+}
+
+impl Default for ModelNames<'_> {
+    fn default() -> Self {
+        Self {
+            labels: Names::default(),
+            flags: &NO_NAMES,
+        }
+    }
+}
+
+#[cfg(test)]
+impl ModelNames<'_> {
+    /// The names a model's workers label it with, and no flags.
+    pub(crate) fn labeled(labels: Names) -> ModelNames<'static> {
+        ModelNames {
+            labels,
+            flags: &NO_NAMES,
+        }
+    }
+
+    /// The gateway's flags, for a model whose workers label nothing.
+    pub(crate) fn flagged(flags: &Names) -> ModelNames<'_> {
+        ModelNames {
+            labels: Names::default(),
+            flags,
+        }
+    }
 }
 
 /// Determine if thinking is effectively ON based on the template's thinking
@@ -1831,7 +1959,7 @@ mod parser_resolver_tests {
                 .with_tool_parser("json")
                 .with_reasoning_parser("basic"),
         );
-        let resolver = ParserResolver::new(
+        let resolver = ParserResolver::with_flags(
             registry,
             Some("mistral".to_string()),
             Some("deepseek_r1".to_string()),
@@ -1843,7 +1971,7 @@ mod parser_resolver_tests {
     #[test]
     fn falls_back_to_configured_without_card_override() {
         let registry = registry_with_card(ModelCard::new("m"));
-        let resolver = ParserResolver::new(
+        let resolver = ParserResolver::with_flags(
             registry,
             Some("mistral".to_string()),
             Some("deepseek_r1".to_string()),
@@ -1860,7 +1988,7 @@ mod parser_resolver_tests {
     #[test]
     fn no_override_and_no_configured_resolves_none() {
         let registry = registry_with_card(ModelCard::new("m"));
-        let resolver = ParserResolver::new(registry, None, None);
+        let resolver = ParserResolver::with_flags(registry, None, None);
         assert_eq!(resolver.tool_parser("m"), None);
         assert_eq!(resolver.reasoning_parser("m"), None);
     }
@@ -1886,9 +2014,62 @@ mod parser_resolver_tests {
                     .build();
                 registry.register(Arc::new(worker));
             }
-            let resolver = ParserResolver::new(registry, None, None);
+            let resolver = ParserResolver::with_flags(registry, None, None);
             assert_eq!(resolver.tool_parser("m").as_deref(), Some("alpha"));
         }
+    }
+
+    /// The legacy parsers take from the flags only the names they read: under `--parser symphony`
+    /// a flag may name a Symphony table or the response template, which the labels' choice of the
+    /// legacy parsers for one model (`passthrough` alone, a legacy tool-call name) must not hand
+    /// them, else the tool side parses nothing (its availability check asks for the exact name)
+    /// and the reasoning side warns on every request. Symphony's view of the flags
+    /// ([`ParserResolver::names`]) keeps them whole.
+    #[test]
+    fn the_legacy_parsers_take_from_the_flags_only_the_names_they_read() {
+        let tools = ToolParserFactory::new();
+        let reasoning = ReasoningParserFactory::new();
+        assert!(!tools.has_parser("mistral_v13") && !reasoning.registry().has_parser("ling"));
+        let passthrough =
+            registry_with_card(ModelCard::new("m").with_reasoning_parser("passthrough"));
+        let resolver = ParserResolver::new(
+            Arc::clone(&passthrough),
+            Some("mistral_v13".to_string()),
+            Some("ling".to_string()),
+            &tools,
+            &reasoning,
+        );
+        // The flags reach the legacy parsers for no model: their own detection reads it.
+        assert_eq!(resolver.tool_parser("m"), None);
+        assert_eq!(resolver.tool_parser("other"), None);
+        assert_eq!(resolver.reasoning_parser("other"), None);
+        // The labels' names reach them as before.
+        assert_eq!(
+            resolver.reasoning_parser("m").as_deref(),
+            Some("passthrough")
+        );
+        let names = resolver.names("m");
+        assert_eq!(resolver.legacy_tool(&names), None);
+        // Symphony sees the flags as set, beside the labels.
+        assert_eq!(names.flags.tool.as_deref(), Some("mistral_v13"));
+        assert_eq!(names.flags.reasoning.as_deref(), Some("ling"));
+        assert_eq!(names.labels.reasoning.as_deref(), Some("passthrough"));
+        // A flag the legacy parsers read passes whole; a legacy name among the labels first.
+        let resolver = ParserResolver::new(
+            registry_with_card(ModelCard::new("m").with_tool_parser("llama")),
+            Some("qwen".to_string()),
+            Some("qwen3".to_string()),
+            &tools,
+            &reasoning,
+        );
+        assert_eq!(resolver.tool_parser("m").as_deref(), Some("llama"));
+        assert_eq!(resolver.tool_parser("other").as_deref(), Some("qwen"));
+        assert_eq!(resolver.reasoning_parser("other").as_deref(), Some("qwen3"));
+        assert_eq!(resolver.legacy_tool(&resolver.names("m")), Some("llama"));
+        assert_eq!(resolver.legacy_tool(&resolver.names("other")), Some("qwen"));
+        // The tests' constructor passes the flags whole, the registries unasked.
+        let plain = ParserResolver::with_flags(passthrough, Some("mistral_v13".to_string()), None);
+        assert_eq!(plain.tool_parser("other").as_deref(), Some("mistral_v13"));
     }
 }
 

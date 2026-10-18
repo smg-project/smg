@@ -41,7 +41,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::ids::CallIds;
+    use crate::{
+        ids::CallIds,
+        testing::{arguments_of, bytes},
+    };
 
     fn ids() -> CallIds {
         CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
@@ -51,7 +54,7 @@ mod tests {
         event::{DropReason, Event, Events, Text},
         input::{EngineFinish, Input},
         parser::Parser,
-        tagged::Declared,
+        Declared,
     };
 
     /// A recorded output, qwen-style spacing and all: an empty thought, two invokes, a string and
@@ -101,32 +104,6 @@ mod tests {
             )
             .expect("end");
         out.drain()
-    }
-
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
-    }
-
-    fn arguments_of(events: &[Event], call: u32) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallArguments { index, json, .. } if *index == call => {
-                    Some(json.as_str())
-                }
-                _ => None,
-            })
-            .collect()
     }
 
     fn dropped(text: &str) -> Event {

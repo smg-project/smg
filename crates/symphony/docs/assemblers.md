@@ -48,9 +48,10 @@ stand, since a fragment passed on cannot be taken back, nothing is made up for a
 never finished, and a `Malformed` event of no bytes comes before the call's end, so that a client
 that reads the arguments as JSON is told rather than left to find out; the engine names the reason
 for a region a marker closed. The value reader (`json::arguments`) and the Mistral object reader
-(`json::named_arguments`) say the same at their end, and the Gemma assembler for a member cut
-between its colon and its value. Whole arguments that only the object's brace is missing after are
-a call with no word.
+(`json::named_arguments`) say the same at their end; the Gemma assembler, which holds a member's
+key until its value begins, reports the key of a member the end cut after its colon and closes the
+object whole without it. Whole arguments that only the object's brace is missing after are a call
+with no word.
 
 `feed` takes one piece and returns how many of its bytes the object took: all of them before the
 close, and up to the closing brace in the piece that carries it, so the format routes whatever
@@ -59,6 +60,24 @@ follows the object (a closing marker, more text) itself. Bytes fed after the clo
 What the assembler does not decide: the call's index and id (the format mints them and passes them
 to `Assembler::new`), whether the name is a declared tool, and whether a string-valued arguments
 member should be decoded. The format decides those with the events in hand.
+
+## The named reader (`json::named`)
+
+A call written as its tool's name, a marker, then JSON is read by one assembler whose parameter
+(`After`) says what the JSON is: the call's object (Inkling's `<|content_invoke_tool_json|>`, after
+which the object names the function again) or the arguments object alone (Mistral's `[ARGS]`). The
+header is the same either way (`json::header`): the bytes before the marker are held until the
+marker's last byte arrives, the search covering only the new bytes and the marker's length before
+them, so a name that never meets its marker costs each piece its own length. What differs is said
+once, at the marker: with the object after it the header is the template's wrapping, `Dropped`,
+and the JSON assembler reads the object and starts the call at its name; with the arguments after
+it the header names the call, `ToolCallStart` carries the name with the marker as its source, and
+the arguments-object reader (`json::named_arguments`) streams the object's bytes as the fragments,
+accounted for through the JSON assembler's judge. Both end the call at the object's brace and
+leave the bytes after it to the engine. A name the region ends after with no marker is reported by
+the reason the syntax names (`NameWithoutACall`, `NameWithoutArguments`), and as
+`UnterminatedRegion` when the stream is cut; an empty header leaves nothing, which is how a thought
+or an answer message reads under the Inkling table.
 
 ## The Qwen tagged assembler (`tagged::assembler`)
 
@@ -313,3 +332,32 @@ What the syntax says, and what the assembler does with it:
 Ported in spirit from the old crate's pythonic parser, which compiled a regular expression per call
 and read the arguments with a Python-literal evaluator at the end; here the arguments are read as
 the stream arrives, at the value's extent.
+
+## The Gemma assembler (`gemma`)
+
+What the syntax says, and what the assembler does with it:
+
+- **A call is `call:NAME{`, members, `}`** between the table's markers: the header is
+  `ToolCallStart`'s source, the closing marker `ToolCallEnd`'s. The template writes a member as a
+  key, a colon and a value, the keys bare; a value is a string between two string tokens, a
+  number, `true`, `false` or the null word bare, a list or an object; a comma stands between two
+  present members only. The assembler writes the members as JSON as their bytes arrive, a string's
+  text streamed.
+- **A member is written from its value's first byte.** The key and its colon are held until a
+  value is there. A member without a key (a colon where a key should stand) or without a value (a
+  comma or a close where the value should start), which the template never writes, is reported
+  and not written: every byte of it comes back as `Malformed` under the one reason, the comma
+  after it and the containers opened inside it included, and the object closes whole without it,
+  its next member first, as the tagged assemblers leave a parameter without a name; a list item
+  missing before a comma the same. Nothing is made up for such a member: no empty key, no empty
+  string.
+- **Two endings.** `Assembler::close` is the call's closing marker: a key or a bare value cut
+  short, and the key held for a value that never came, come back as `Malformed` with the cut's
+  reason before the end, every open container is closed and the arguments are whole; a string left
+  open stays open, the fragments stand, and a `Malformed` event of no bytes says that the arguments
+  are no whole value. `Assembler::finish` is a stream that was cut: what was held comes back as
+  `Malformed { UnterminatedRegion }`, the containers close unless a string is open, and the call
+  ends with no bytes of its own.
+- **Every byte lands in exactly one event**: the header, each fragment's bytes with the whitespace
+  before them, text after the object closed as `Malformed` run by run and the template's wrapping
+  there as `Dropped { Wrapper }`, the marker as the end's source.

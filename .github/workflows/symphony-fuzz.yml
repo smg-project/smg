@@ -7,7 +7,8 @@ name: symphony fuzz campaign
 # job and its artifact is uploaded for the report crates/symphony/fuzz/README.md describes.
 # Budget: nine targets, three at a time, ten minutes each on a hosted runner. The run looks past
 # the whole-json class (SYMPHONY_FUZZ_ALLOW) until the parser fixes the first campaign found
-# land, so that a night's red is a new class; drop the default then.
+# land, and past made-up-empty-string until the pythonic reader reports a value left out instead
+# of writing an empty string for it, so that a night's red is a new class; drop each name then.
 
 on:
   schedule:
@@ -22,7 +23,7 @@ on:
         default: ""
       allow:
         description: "Breach names the run looks past (comma separated; empty for none)"
-        default: "whole-json"
+        default: "whole-json,made-up-empty-string"
 
 concurrency:
   group: symphony-fuzz
@@ -37,6 +38,27 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
+      # The seeds are the recorded outputs of bellwether's hand-written sets for the tables'
+      # groups (crates/symphony/tests/common/slices.rs), read from the bellwether commit
+      # .github/versions/bellwether.ref pins. bellwether keeps those sets plain in its
+      # fixtures/ tree, so the checkout is the tree the crate reads (`bellwether unpack`
+      # writes the same files for them) and nothing is fetched from Git LFS.
+      - name: Read the pinned bellwether commit
+        id: pin
+        run: |
+          ref="$(tr -d '[:space:]' < .github/versions/bellwether.ref)"
+          if ! [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error file=.github/versions/bellwether.ref::expected one 40-character commit hash"
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+      - name: Check out bellwether
+        uses: actions/checkout@v7
+        with:
+          repository: smg-project/bellwether
+          ref: ${{ steps.pin.outputs.ref }}
+          path: .bellwether
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: clippy, rustfmt
@@ -44,8 +66,11 @@ jobs:
         with:
           key: symphony-fuzz
           workspaces: crates/symphony/fuzz
-      # The crate is a workspace of its own, outside the repository's fmt and clippy jobs.
+      # The crate is a workspace of its own, outside the repository's fmt and clippy jobs. Its
+      # seed tests read the tree; without the variable they would skip.
       - name: Format, lint and test the fuzz crate
+        env:
+          BELLWETHER_FIXTURES: ${{ github.workspace }}/.bellwether/fixtures
         run: |
           cargo fmt --manifest-path crates/symphony/fuzz/Cargo.toml --all -- --check
           cargo clippy --manifest-path crates/symphony/fuzz/Cargo.toml --all-targets -- -D warnings
@@ -54,14 +79,15 @@ jobs:
         run: cargo install cargo-fuzz --locked
       - name: Run the targets
         env:
+          BELLWETHER_FIXTURES: ${{ github.workspace }}/.bellwether/fixtures
           MINUTES: ${{ github.event.inputs.minutes || '10' }}
           TARGETS: ${{ github.event.inputs.targets || '' }}
           EVENT: ${{ github.event_name }}
           ALLOW_INPUT: ${{ github.event.inputs.allow }}
         run: |
           # A dispatch's allowance is its own, an empty one included (an expression's `||` would
-          # put the default back); a scheduled run looks past whole-json until the parser fixes land.
-          if [ "$EVENT" = workflow_dispatch ]; then ALLOW=$ALLOW_INPUT; else ALLOW=whole-json; fi
+          # put the default back); a scheduled run looks past the classes reported and not yet fixed.
+          if [ "$EVENT" = workflow_dispatch ]; then ALLOW=$ALLOW_INPUT; else ALLOW=whole-json,made-up-empty-string; fi
           # shellcheck disable=SC2086
           crates/symphony/fuzz/run.sh --minutes "$MINUTES" --jobs 3 ${ALLOW:+--allow "$ALLOW"} $TARGETS
       - name: Upload crashes and logs

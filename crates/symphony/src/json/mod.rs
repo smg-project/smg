@@ -1,31 +1,32 @@
 //! JSON as models write it: values that are still arriving.
 //!
-//! A tool call arrives as a JSON object that grows with every chunk. [`outline`](fn@outline) finds the call's
+//! A tool call arrives as a JSON object that grows with every chunk. `outline`'s scanner finds the call's
 //! name and the byte span of its arguments in that growing text, so an argument stream can emit the
-//! model's own bytes as they arrive; [`partial`] parses a JSON prefix into the value it determines so
-//! far, for the places that need the value rather than its bytes; [`prefix`] judges, byte by byte
-//! as they arrive, whether the argument bytes are still a prefix of a value. [`assembler`] turns
+//! model's own bytes as they arrive; `partial` parses a JSON prefix into the value it determines so
+//! far, for the places that need the value rather than its bytes; `prefix` judges, byte by byte
+//! as they arrive, whether the argument bytes are still a prefix of a value. `assembler` turns
 //! one call's growing object into the events of that call, on top of the outline and the prefix;
-//! [`named_arguments`] does the same for a call whose name stands before a marker and whose object
-//! is the arguments alone, both accounting for the argument bytes they send, hold or report
-//! through one judge (`fragments`); [`arguments`] for a call's arguments alone, written as one
-//! value, the call named elsewhere; [`forced`] runs it for the call the request forces, whose
-//! arguments are the whole output.
+//! `named` reads a call whose name stands before a marker, with the call's object or the
+//! arguments object alone (`named_arguments`) after it, both object readers accounting for the
+//! argument bytes they send, hold or report through one judge (`fragments`); `list` reads a
+//! list of call objects; `arguments` a call's arguments alone, written as one value, the call
+//! named elsewhere; `forced` runs it for the call the request forces, whose arguments are the
+//! whole output.
 
-pub mod arguments;
-pub mod assembler;
-pub mod forced;
+pub(crate) mod arguments;
+pub(crate) mod assembler;
+pub(crate) mod forced;
 mod fragments;
 mod header;
-pub mod list;
-pub mod named;
-pub mod named_arguments;
-pub mod outline;
-pub mod partial;
-pub mod prefix;
+pub(crate) mod list;
+pub(crate) mod named;
+mod named_arguments;
+pub(crate) mod outline;
+pub(crate) mod partial;
+pub(crate) mod prefix;
 
-pub use arguments::Arguments;
-pub use assembler::Assembler;
-pub use outline::{outline, Outline, Span};
-pub use partial::{is_complete, PartialJson, PartialJsonError};
-pub use prefix::Prefix;
+pub(crate) use arguments::Arguments;
+pub(crate) use assembler::Assembler;
+pub(crate) use partial::is_complete;
+pub use partial::{PartialJson, PartialJsonError};
+pub(crate) use prefix::Prefix;

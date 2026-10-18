@@ -23,9 +23,9 @@
 use std::sync::{Arc, LazyLock, OnceLock};
 
 use super::{
-    deepseek_v4, deepseek_v4_1, dots3, function_gemma, gemma4, glm, glm4, hy4, inkling, iquest,
-    json, k2_horizon, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2, minimax_m3,
-    mistral_v13, muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+    deepseek_v3_2, deepseek_v4, deepseek_v4_1, dots3, function_gemma, gemma4, glm, glm4, hy4,
+    inkling, iquest, json, k2_horizon, kimi_k2, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5,
+    minimax_m2, minimax_m3, mistral_v13, muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
 };
 use crate::{
     format::{CallSyntax, Format},
@@ -121,6 +121,10 @@ tables! {
     MuseSpark => "muse_spark", muse_spark;
     /// [`plain()`].
     Plain => "plain", plain;
+    /// [`deepseek_v3_2()`].
+    DeepSeekV3_2 => "deepseek_v3.2", deepseek_v3_2;
+    /// [`kimi_k2()`].
+    KimiK2 => "kimi_k2", kimi_k2;
 }
 
 /// A table's row in the registry: the table, its name and the function that builds it. The rows
@@ -185,13 +189,15 @@ impl Table {
 
     /// The other names a table answers to ([`Self::answering_to`]): the gateway's older tool and
     /// reasoning parsers that read the table's format, so that a deployment that names one
-    /// (`--tool-call-parser qwen_xml`) reads with the table (`qwen3_tagged`) when the gateway
-    /// reads with Symphony. A parser that reads a format no table reads has no row and keeps its
-    /// own parser; so does `passthrough`, which leaves its channel as written, which no table
-    /// reads for. A row may also be the name a downstream launcher passes for a model family
-    /// whose table has no older parser (`muse` for `muse_spark`), so that the launcher's flags
-    /// read with the table.
-    pub const ALIASES: [(&str, Table); 10] = [
+    /// (`--tool-call-parser qwen_xml`) reads with the table (`qwen3_tagged`) when the gateway reads
+    /// with Symphony. The rule, so that a deployment's existing flags keep a working parser when
+    /// the gateway's default parser changes: every legacy tool-call or reasoning parser's name
+    /// whose format a table reads is an alias of that table; a legacy name no table answers to is
+    /// in [`Self::UNANSWERED`] with the reason (what it selects then is said there), `passthrough`
+    /// among them, which leaves its channel as written, which no table reads for. A row may also be
+    /// the name a downstream launcher passes for a model family whose table has no older parser
+    /// (`muse` for `muse_spark`), so that the launcher's flags read with the table.
+    pub const ALIASES: [(&str, Table); 14] = [
         ("qwen", Table::Qwen3),
         ("qwen_xml", Table::Qwen3Tagged),
         ("qwen_coder", Table::Qwen3Tagged),
@@ -199,9 +205,96 @@ impl Table {
         ("glm47_moe", Table::Glm),
         ("glm45_moe", Table::Glm4),
         ("hy_v4", Table::Hy4),
+        ("deepseek32", Table::DeepSeekV3_2),
         ("deepseek_v41", Table::DeepSeekV4_1),
         ("minimax", Table::MinimaxM2),
         ("muse", Table::MuseSpark),
+        ("kimik2", Table::KimiK2),
+        ("kimi_thinking", Table::KimiK2),
+        ("kimi_k25", Table::KimiK2),
+    ];
+
+    /// The legacy parsers' names no table answers to ([`Self::answering_to`] gives `None`), each
+    /// with the reason, so that every name of the gateway's two parser registries is accounted
+    /// for: a legacy name is here or is one a table answers to, never both and never neither,
+    /// which the gateway's test over its registries holds; so a new legacy name cannot go
+    /// unmapped, and a table that takes a name here removes its row. Under Symphony a tool-call
+    /// name here keeps the legacy parsers, and a reasoning name here alone selects nothing, so
+    /// the next source decides: after a worker's labels the registry's table for a model it
+    /// knows, else the gateway's flags, else the legacy parsers (`passthrough` excepted, which
+    /// keeps the legacy parsers either way).
+    pub const UNANSWERED: [(&str, &str); 17] = [
+        (
+            "passthrough",
+            "leaves its channel as written, which no table reads for: the way back to the \
+             legacy parsers for one model",
+        ),
+        (
+            "base",
+            "a thought between `<think>` and `</think>` and nothing of a family's: the \
+             registry's table reads a known model's thought, and an unknown model's the table \
+             the flags name, else the legacy parser",
+        ),
+        (
+            "glm45",
+            "a thought two tables' families share, glm4 (GLM 4.5 and 4.6) and glm (GLM 4.7 and \
+             later): the tool-call name, glm45_moe or glm47_moe, or the registry decides",
+        ),
+        (
+            "nano_v3",
+            "a thought two tables' families share, qwen3_tagged (Nemotron 3) and llama_nemotron \
+             (Llama Nemotron): the tool-call name, nemotron or json, or the registry decides",
+        ),
+        (
+            "qwen3_thinking",
+            "a thought two tables' families share, qwen3 (the Qwen3-2507 thinking line) and \
+             qwen3_tagged (Qwen 3.5 and later): the tool-call name, qwen or qwen_xml, or the \
+             registry decides",
+        ),
+        (
+            "deepseek",
+            "DeepSeek V3's call spelling, which no table reads yet; the table that does takes \
+             the name",
+        ),
+        (
+            "deepseek31",
+            "DeepSeek V3.1's call spelling, which no table reads yet; the table that does takes \
+             the name",
+        ),
+        (
+            "deepseek_v31",
+            "DeepSeek V3.1's thought, whose table does not exist yet; the table takes the name",
+        ),
+        (
+            "deepseek_r1",
+            "DeepSeek R1's thought; the R1 line reads with DeepSeek V3's table, which does not \
+             exist yet and takes the name",
+        ),
+        (
+            "llama",
+            "Llama 3.2's calls after its python tag, which no table reads yet; the table that \
+             does takes the name",
+        ),
+        (
+            "pythonic",
+            "Llama 4's Python list of calls, which no table reads yet; the table that does takes \
+             the name",
+        ),
+        (
+            "kimi",
+            "a thought between `◁think▷` and `◁/think▷`, which no table reads: the Kimi K2 \
+             line's table reads `<think>`",
+        ),
+        (
+            "mistral",
+            "the list of calls after `[TOOL_CALLS]` of Mistral 7B v0.3 and Small 3, another \
+             spelling than mistral_v13's, which no table reads yet; the table that does takes \
+             the name",
+        ),
+        ("step3", "Step 3's calls and thought: no table"),
+        ("sarashina", "Sarashina's calls: no table"),
+        ("cohere", "Command R and Command A's calls: no table"),
+        ("cohere_cmd", "Command R and Command A's thought: no table"),
     ];
 
     /// The table, built once and shared: the engines that run it, and whoever asks the table
@@ -521,6 +614,26 @@ mod tests {
         // A launcher's name for a family whose table has no older parser answers for the table.
         assert_eq!(Table::answering_to("muse"), Some(Table::MuseSpark));
         assert_eq!(Table::named("muse"), None);
+    }
+
+    #[test]
+    fn every_unanswered_name_answers_to_no_table_and_says_why() {
+        let mut seen = std::collections::HashSet::new();
+        for (name, reason) in Table::UNANSWERED {
+            assert!(seen.insert(name), "{name} is listed twice");
+            assert_eq!(
+                name,
+                name.trim().to_ascii_lowercase(),
+                "{name} is not spelled as the legacy registries spell their names"
+            );
+            assert_eq!(Table::named(name), None, "{name} is a table's own name");
+            assert_eq!(
+                Table::answering_to(name),
+                None,
+                "{name} answers to a table: remove its row"
+            );
+            assert!(!reason.trim().is_empty(), "{name} has no reason");
+        }
     }
 
     #[test]

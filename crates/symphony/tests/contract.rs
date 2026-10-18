@@ -17,7 +17,8 @@
 //!   `Malformed` event came while it was open, so that a client is never handed a cut call as a
 //!   whole one without a word, and a fragment that closes a string the arguments left open
 //!   carries the bytes of the output that closed it, so that no closing quote is made up for a
-//!   value the model never closed;
+//!   value the model never closed, and a fragment that is an empty string carries bytes of the
+//!   output too, so that no value is made up for a member that has none;
 //! - order: calls are numbered from zero as they start, with ids that follow the index;
 //! - the lifecycle: one `Prompt`, deltas, one `End`, and an input out of order is a `Lifecycle`
 //!   error that emits nothing.
@@ -29,12 +30,17 @@
 //! tokenization of each output. A subject joins the contract with one entry in [`FORMATS`], its
 //! constructor and its corpus.
 
+#[expect(
+    dead_code,
+    reason = "the integration tests share these helpers, and this one asks nothing of the fixture tree"
+)]
 mod common;
 
 use common::{bytes_of, chunkings, delta, prompt};
 use openai_protocol::common::{Function, Tool};
 use serde_json::json as value;
 use symphony::{
+    format::CallId,
     formats::{self, Table},
     json::PartialJson,
     shape::{
@@ -310,6 +316,10 @@ fn muse_spark() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::MuseSpark.format(), Declared::default()))
 }
 
+fn kimi_k2() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::KimiK2.format(), Declared::default()))
+}
+
 fn mistral_v13() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::MistralV13.format(), Declared::default()))
 }
@@ -389,6 +399,13 @@ fn qwen3_tagged_direct() -> Box<dyn Parser> {
 
 fn deepseek_v4() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::DeepSeekV4.format(), Declared::default()))
+}
+
+fn deepseek_v3_2() -> Box<dyn Parser> {
+    Box::new(Engine::new(
+        Table::DeepSeekV3_2.format(),
+        Declared::default(),
+    ))
 }
 
 fn json() -> Box<dyn Parser> {
@@ -877,6 +894,12 @@ const FORMATS: &[Subject] = &[
         table: Some(Table::MuseSpark),
     },
     Subject {
+        name: "kimi k2",
+        new: kimi_k2,
+        outputs: KIMI_K2_OUTPUTS,
+        table: Some(Table::KimiK2),
+    },
+    Subject {
         name: "plain",
         new: plain,
         outputs: PLAIN_OUTPUTS,
@@ -893,6 +916,12 @@ const FORMATS: &[Subject] = &[
         new: deepseek_v4,
         outputs: DEEPSEEK_V4_OUTPUTS,
         table: Some(Table::DeepSeekV4),
+    },
+    Subject {
+        name: "deepseek v3.2",
+        new: deepseek_v3_2,
+        outputs: DEEPSEEK_V3_2_OUTPUTS,
+        table: Some(Table::DeepSeekV3_2),
     },
     Subject {
         name: "json",
@@ -1178,6 +1207,44 @@ const MUSE_SPARK_OUTPUTS: &[&str] = &[
     "unframed text",
 ];
 
+/// The Kimi K2 table: a thought and a call; two calls; content and a call with no arguments; a
+/// thought and an answer; an answer alone; the closing marker inside a string argument; a call
+/// cut short; the id without `functions.`; an id without its index, which opens no call;
+/// arguments that are not JSON; text after the object; text in the block between the calls; the
+/// block closed with a call open; a thought the end cuts; and nothing. The contract feeds no
+/// prompt, so each entry with a thought opens it itself, as K2 Thinking's template has the model
+/// do.
+const KIMI_K2_OUTPUTS: &[&str] = &[
+    "<think>Need the weather.</think><|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_calls_section_end|>",
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_call_begin|>functions.get_weather:1<|tool_call_argument_begin|>{\"city\": \"Rome\", \"days\": 3}<|tool_call_end|><|tool_calls_section_end|>",
+    "Let me check.<|tool_calls_section_begin|><|tool_call_begin|>functions.get_stock_price:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>",
+    "<think>Plan.</think>It is sunny.",
+    "Hello!",
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.save_note:0<|tool_call_argument_begin|>{\"body\": \"a <|tool_call_end|> b\"}<|tool_call_end|><|tool_calls_section_end|>",
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Par",
+    // A call the end cuts right after the marker that opens its arguments, and one the model closed
+    // with none: neither is handed over as a whole call with an empty string for its arguments.
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>",
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|><|tool_call_end|><|tool_calls_section_end|>",
+    "<|tool_calls_section_begin|><|tool_call_begin|>get_weather:0<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_calls_section_end|>",
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_calls_section_end|>",
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>not json<|tool_call_end|><|tool_calls_section_end|>",
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>{} trailing<|tool_call_end|><|tool_calls_section_end|>",
+    "<|tool_calls_section_begin|>stray<|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>",
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>{}<|tool_calls_section_end|>",
+    // Two calls the model gave one id: the second takes a minted id, under every cut; the same
+    // id inside the whitespace the header allows repeats it too, and an id one digit longer
+    // does not.
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Rome\"}<|tool_call_end|><|tool_calls_section_end|>",
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_call_begin|> functions.get_weather:0 <|tool_call_argument_begin|>{\"city\": \"Rome\"}<|tool_call_end|><|tool_calls_section_end|>",
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:1<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_call_begin|>functions.get_weather:10<|tool_call_argument_begin|>{\"city\": \"Rome\"}<|tool_call_end|><|tool_calls_section_end|>",
+    // Arguments that nest and hold text outside ASCII, and a brace inside a string value.
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.save_note:0<|tool_call_argument_begin|>{\"title\": \"計画 🌍\", \"body\": \"a \\\"q\\\" \\\\ b\\nc\", \"tags\": [\"a\", \"b\"], \"meta\": {\"nested\": {\"deep\": [1, 2.5, true, null]}}}<|tool_call_end|><|tool_calls_section_end|>",
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.save_note:0<|tool_call_argument_begin|>{\"title\": \"Braces\", \"body\": \"a } b { c\"}<|tool_call_end|><|tool_calls_section_end|>",
+    "<think>unfinished",
+    "",
+];
+
 /// Kimi K3's syntax: the recorded shape, a thought with text, every value type, calls ended every
 /// way the table has, a tag the syntax lacks, a call without its index, and text where tags should
 /// be. The contract feeds no prompt, so each entry opens its thought itself, as the template's
@@ -1345,8 +1412,8 @@ const LLAMA_NEMOTRON_OUTPUTS: &[&str] = &[
 ];
 
 /// FunctionGemma's calls: Gemma's spelling between `<start_function_call>` and
-/// `<end_function_call>`, `<escape>` around a string, `None` for a null; cut streams, a block that
-/// is no call, and text after the arguments.
+/// `<end_function_call>`, `<escape>` around a string, `None` for a null; cut streams, a member
+/// without a key and one without a value, a block that is no call, and text after the arguments.
 const FUNCTION_GEMMA_OUTPUTS: &[&str] = &[
     "<start_function_call>call:get_weather{city:<escape>Paris<escape>,days:[1,2.5,true,None]}\
      <end_function_call>",
@@ -1356,6 +1423,7 @@ const FUNCTION_GEMMA_OUTPUTS: &[&str] = &[
      <end_function_call>",
     "<start_function_call>call:get_weather{city:<escape>Par",
     "<start_function_call>call:f{:1,a:<escape>x<escape>}<end_function_call>",
+    "<start_function_call>call:f{a:,b:<escape>x<escape>}<end_function_call>",
     "<start_function_call>call:get_wea",
     "<start_function_call>not a call<end_function_call>",
     "<start_function_call>call:get_weather{} trailing<end_function_call>",
@@ -1504,7 +1572,7 @@ const ERNIE_OUTPUTS: &[&str] = &[
 /// Gemma 4's turns: transformers' streaming fixture for the template, a thought, calls and an
 /// answer with whitespace at every edge, whitespace inside the text, the content's own close
 /// between two stays, Python's whitespace beyond ASCII, a call written inside a thought, a stay
-/// of whitespace only, a cut call, and nothing.
+/// of whitespace only, a cut call, a member without a value, and nothing.
 const GEMMA4_TEMPLATE_OUTPUTS: &[&str] = &[
     "<|channel>thought\nhi<channel|><|tool_call>call:foo{a:1,b:<|\"|>bar<|\"|>}<tool_call|>",
     "<|channel>thought\n The user wants the weather.\n<channel|>\n<|tool_call>call:get_weather{\
@@ -1515,6 +1583,7 @@ const GEMMA4_TEMPLATE_OUTPUTS: &[&str] = &[
     " \n\t ",
     "Sure.\n<|tool_call>call:get_weather{city:<|\"|>Par",
     "Sure.\n<|tool_call>call:get_weather{city:<|\"|>Par<tool_call|>",
+    "<|tool_call>call:get_weather{city:,unit:<|\"|>celsius<|\"|>}<tool_call|>\nDone.",
     "",
 ];
 
@@ -1660,6 +1729,20 @@ const DEEPSEEK_V4_OUTPUTS: &[&str] = &[
     "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Par</｜DSML｜tool_calls>",
 ];
 
+/// DeepSeek V3.2's DSML as its reference encoder renders it (the thought the prompt opens written
+/// here, since the replay starts from an empty prompt): a call after a thought, a call with a
+/// number and a boolean, two calls after content, an invoke with no parameters, a thought cut
+/// short, content alone, and one cut short.
+const DEEPSEEK_V3_2_OUTPUTS: &[&str] = &[
+    "<think>The user asks.</think>\n\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Beijing</｜DSML｜parameter>\n<｜DSML｜parameter name=\"unit\" string=\"true\">celsius</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
+    "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"add_integers\">\n<｜DSML｜parameter name=\"a\" string=\"false\">17</｜DSML｜parameter>\n<｜DSML｜parameter name=\"b\" string=\"false\">true</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
+    "Sure.\n\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Rome</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
+    "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"noop\">\n\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
+    "<think>still thinking",
+    "Hello!",
+    "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Par",
+];
+
 /// Llama 3.1's bare call object, a list of them, content, and one cut short.
 const JSON_OUTPUTS: &[&str] = &[
     "{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}",
@@ -1732,7 +1815,8 @@ const K2_HORIZON_OUTPUTS: &[&str] = &[
     "<ifm|think>plan</ifm|think><ifm|tool_calls>\n<ifm|tool_call>get_weather\n<ifm|arg_key>city</ifm|arg_key>\n<ifm|arg_value>Par</ifm|tool_call>\n</ifm|tool_calls>",
 ];
 
-/// The outputs bellwether's common set records for Gemma 4, and one cut short.
+/// The outputs bellwether's common set records for Gemma 4, one cut short, and the members the
+/// template never writes: cut, without a key, without a value.
 const GEMMA4_OUTPUTS: &[&str] = &[
     "<|channel>thought\nThe user asks about Paris.\n<channel|><|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>",
     "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,unit:<|\"|>celsius<|\"|>}<tool_call|>Let me check.",
@@ -1754,6 +1838,15 @@ const GEMMA4_OUTPUTS: &[&str] = &[
     "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days:<tool_call|>",
     "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days:",
     "<|tool_call>call:get_weather{tags:[<tool_call|>",
+    // A member without a value, before a comma and before the close, a list item missing before
+    // a comma, and a member without a key around one.
+    "<|tool_call>call:get_weather{city:,days:3}<tool_call|>",
+    "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days: }<tool_call|>",
+    "<|tool_call>call:f{a:{x:},b:[1,,2]}<tool_call|>",
+    "<|tool_call>call:f{:{:1},a:<|\"|><|\"|>}<tool_call|>",
+    // Nesting past the prefix parser's bound, closed and cut.
+    "<|tool_call>call:get_weather{days:[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}<tool_call|>",
+    "<|tool_call>call:get_weather{days:[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[",
 ];
 
 /// The outputs bellwether's common set records for Inkling, and one cut short.
@@ -1943,6 +2036,15 @@ fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event]) {
                         "{}: the fragment {json:?} closes an open string with no byte of the output behind it, a made-up closing quote",
                         place()
                     );
+                    // An empty string a fragment writes has bytes of the output behind it, the
+                    // string the model opened and closed at once or the JSON it wrote: one with
+                    // none, or whitespace alone, is made up for a member that has no value.
+                    assert!(
+                        !(matches!(json.as_str(), "\"\"" | ", \"\"")
+                            && source.text.trim().is_empty()),
+                        "{}: the fragment {json:?} writes an empty string with no byte of the output behind it, a made-up value",
+                        place()
+                    );
                     so_far.push_str(json);
                     assert!(
                         valid_json_prefix(so_far),
@@ -2094,11 +2196,13 @@ fn the_event_stream_is_well_formed_under_every_chunking() {
 #[test]
 fn calls_are_numbered_from_zero_in_order_with_ids_that_count_from_a_nonce_of_the_engines_own() {
     // The whole output is enough: chunking invariance above makes every other cut say the same.
-    fn starts(events: &[Event]) -> Vec<(u32, String)> {
+    fn starts(events: &[Event]) -> Vec<(u32, String, String)> {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::ToolCallStart { index, id, .. } => Some((*index, id.clone())),
+                Event::ToolCallStart {
+                    index, id, source, ..
+                } => Some((*index, id.clone(), source.text.to_string())),
                 _ => None,
             })
             .collect()
@@ -2107,8 +2211,73 @@ fn calls_are_numbered_from_zero_in_order_with_ids_that_count_from_a_nonce_of_the
         let events = replay(subject, text, &[], false)
             .unwrap_or_else(|e| panic!("{}: {text:?}: {e}", subject.name));
         let calls = starts(&events);
-        let first = calls.first().and_then(|(_, id)| common::minted_id(id));
-        for (position, (index, id)) in calls.iter().enumerate() {
+        // A table whose call header writes the id carries the model's own: not minted, found in
+        // the header's bytes, and the same from another engine over the same output.
+        let from_header = subject
+            .table
+            .is_some_and(|table| table.format().call_id_source() == CallId::Header);
+        if from_header {
+            // A call's id is its header's, found in the header's bytes; a header whose id
+            // repeats an earlier call's gets a minted id instead, so the ids stay distinct. The
+            // engine reads the header's id as its text without the ending literal, trimmed; here
+            // the literal is what followed the earlier call's id in its header, so a header
+            // repeats when, past the whitespace the pattern allows, it is that id and that
+            // literal again.
+            for (position, (index, id, source)) in calls.iter().enumerate() {
+                assert_eq!(*index as usize, position, "{}: {text:?}", subject.name);
+                let repeated = calls[..position]
+                    .iter()
+                    .any(|(_, earlier, earlier_source)| {
+                        if common::minted_id(earlier).is_some() {
+                            return false;
+                        }
+                        let Some(at) = earlier_source.find(earlier.as_str()) else {
+                            return false;
+                        };
+                        let literal = earlier_source[at + earlier.len()..].trim_start();
+                        source
+                            .trim_start()
+                            .strip_prefix(earlier.as_str())
+                            .is_some_and(|rest| rest.trim_start() == literal)
+                    });
+                if repeated {
+                    assert!(
+                        common::minted_id(id).is_some(),
+                        "{}: {text:?}: a repeated header ({source:?}) gave {id:?}, not a minted id",
+                        subject.name
+                    );
+                } else {
+                    assert!(
+                        !id.is_empty() && common::minted_id(id).is_none() && source.contains(id),
+                        "{}: {text:?}: id {id:?} is not the header's ({source:?})",
+                        subject.name
+                    );
+                }
+            }
+            let mut distinct: Vec<&String> = calls.iter().map(|(_, id, _)| id).collect();
+            distinct.sort();
+            distinct.dedup();
+            assert_eq!(distinct.len(), calls.len(), "{}: {text:?}", subject.name);
+            // Another engine gives the same ids, the minted fallbacks compared by their shape:
+            // each engine draws its own nonce.
+            let shaped = |calls: &[(u32, String, String)]| -> Vec<(u32, String, String)> {
+                calls
+                    .iter()
+                    .map(|(index, id, source)| (*index, common::id_shape(id), source.clone()))
+                    .collect()
+            };
+            let again = replay(subject, text, &[], false)
+                .unwrap_or_else(|e| panic!("{}: {text:?}: {e}", subject.name));
+            assert_eq!(
+                shaped(&calls),
+                shaped(&starts(&again)),
+                "{}: {text:?}",
+                subject.name
+            );
+            continue;
+        }
+        let first = calls.first().and_then(|(_, id, _)| common::minted_id(id));
+        for (position, (index, id, _)) in calls.iter().enumerate() {
             assert_eq!(*index as usize, position, "{}: {text:?}", subject.name);
             let number = common::minted_id(id).unwrap_or_else(|| {
                 panic!(
@@ -2126,7 +2295,7 @@ fn calls_are_numbered_from_zero_in_order_with_ids_that_count_from_a_nonce_of_the
         // Another engine over the same output is another request: it repeats none of the ids.
         let again = replay(subject, text, &[], false)
             .unwrap_or_else(|e| panic!("{}: {text:?}: {e}", subject.name));
-        for ((_, id), (_, other)) in calls.iter().zip(starts(&again)) {
+        for ((_, id, _), (_, other, _)) in calls.iter().zip(starts(&again)) {
             assert_ne!(id, &other, "{}: {text:?}", subject.name);
         }
     }

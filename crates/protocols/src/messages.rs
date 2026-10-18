@@ -11,7 +11,7 @@ use validator::Validate;
 
 use crate::{
     chat::deserialize_reasoning_effort,
-    common::{self, CachePartition, GenerationRequest},
+    common::{self, invalid, CachePartition, GenerationRequest},
     model_card::ModelCard,
     profile::ProviderProfile,
     validated::Normalizable,
@@ -315,9 +315,10 @@ fn validate_message_request(req: &CreateMessageRequest) -> Result<(), validator:
     crate::messages_validation::validate(req)?;
 
     if req.has_mcp_toolset() && req.mcp_server_configs().is_none() {
-        let mut e = validator::ValidationError::new("mcp_servers_required");
-        e.message = Some("mcp_servers is required when mcp_toolset tools are present".into());
-        return Err(e);
+        return Err(invalid(
+            "mcp_servers_required",
+            "mcp_servers is required when mcp_toolset tools are present",
+        ));
     }
 
     let Some(tool_choice) = &req.tool_choice else {
@@ -328,12 +329,10 @@ fn validate_message_request(req: &CreateMessageRequest) -> Result<(), validator:
     let requires_tools = !matches!(tool_choice, ToolChoice::None);
 
     if requires_tools && !has_tools {
-        let mut e = validator::ValidationError::new("tool_choice_requires_tools");
-        e.message = Some(
-            "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified."
-                .into(),
-        );
-        return Err(e);
+        return Err(invalid(
+            "tool_choice_requires_tools",
+            "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.",
+        ));
     }
 
     if let ToolChoice::Tool { name, .. } = tool_choice {
@@ -343,12 +342,10 @@ fn validate_message_request(req: &CreateMessageRequest) -> Result<(), validator:
             .is_some_and(|tools| tools.iter().any(|tool| tool.matches_tool_choice_name(name)));
 
         if !tool_exists {
-            let mut e = validator::ValidationError::new("tool_choice_tool_not_found");
-            e.message = Some(
-                format!("Invalid value for 'tool_choice': tool '{name}' not found in 'tools'.")
-                    .into(),
-            );
-            return Err(e);
+            return Err(invalid(
+                "tool_choice_tool_not_found",
+                format!("Invalid value for 'tool_choice': tool '{name}' not found in 'tools'."),
+            ));
         }
     }
 

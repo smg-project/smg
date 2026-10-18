@@ -55,7 +55,9 @@ blake3.workspace = true
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 http.workspace = true
-npyz = { version = "0.9", features = ["npz"] }
+# The golden tests read `.npz` fixtures: a zip archive whose members are the arrays as `.npy` files.
+npyz = "0.9"
+zip = "9.0"
 # The dump example for bellwether's multimodal fixtures digests its artifacts with SHA-256, as the fixtures do.
 sha2 = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

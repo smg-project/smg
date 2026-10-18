@@ -1,7 +1,37 @@
 //! Shared by the integration tests: the ways an output is cut into deltas, feeding a parser, and
 //! the output bytes each event accounts for.
 
+use std::path::PathBuf;
+
 use symphony::{EngineFinish, Event, Events, Input, ParseError, Parser};
+
+/// The directory of bellwether's shape patterns in the tree `BELLWETHER_FIXTURES` names: what
+/// Python's `regex` module says about the patterns public response templates write, which
+/// `bellwether patterns` records and `bellwether unpack` writes as `patterns/` beside the models'
+/// sets. None, with the reason printed, when the variable is not set or the pinned commit does not
+/// hold them yet: a test that needs them returns then, and the run says so.
+#[expect(
+    clippy::print_stderr,
+    reason = "the skip notice is test diagnostic output"
+)]
+pub fn patterns() -> Option<PathBuf> {
+    let Some(root) = std::env::var_os("BELLWETHER_FIXTURES").map(PathBuf::from) else {
+        eprintln!(
+            "skipping: BELLWETHER_FIXTURES is not set; point it at the tree `bellwether unpack` writes"
+        );
+        return None;
+    };
+    let dir = root.join("patterns");
+    if !dir.is_dir() {
+        eprintln!(
+            "awaiting fixtures: {} is not in the fixture pin yet (bellwether's shape patterns, \
+             recorded by `bellwether patterns`)",
+            dir.display()
+        );
+        return None;
+    }
+    Some(dir)
+}
 
 /// The number in a call id the engine minted, `call_` and 24 lowercase hex characters; `None` for
 /// an id of any other shape.

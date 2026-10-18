@@ -26,8 +26,9 @@ use crate::{
     tagged::{
         assembler::{push_escaped, push_quoted},
         end_cut_call,
-        value::{json, Declared, Kind, ITEM, NULL_WORDS},
+        value::{json, Kind, ITEM, NULL_WORDS},
     },
+    Declared,
 };
 
 /// The invoke's closing tag: the one terminal a started call's end carries. The next invoke's

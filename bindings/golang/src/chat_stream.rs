@@ -4,7 +4,7 @@
 //! entry points keep what differs around it: which engine takes the request,
 //! and the load a request holds on the worker a policy selected.
 
-use std::{os::raw::c_char, sync::Arc};
+use std::{os::raw::c_char, sync::Arc, time::Duration};
 
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::chat::ChatCompletionRequest;
@@ -21,6 +21,43 @@ use super::{
     tool_constraint::{tool_constraint_for, tools_keep_special_tokens},
     utils::chat_requires_reasoning,
 };
+
+/// How long a client waits for the engine's model information at creation:
+/// a client is built before its first request, so the lookup must not hold
+/// the caller on an engine that does not answer.
+const MODEL_INFO_BOUND: Duration = Duration::from_secs(2);
+
+/// The weight version the engine reports in its model information, the
+/// value the gateway puts in `system_fingerprint`: the gateway's fallback,
+/// `default`, when the engine reports a blank one, answers with an error, or
+/// does not answer within the bound (both logged, so an absent version is
+/// diagnosable).
+pub(crate) async fn weight_version_of(client: &SglangSchedulerClient) -> String {
+    match tokio::time::timeout(MODEL_INFO_BOUND, client.get_model_info()).await {
+        Ok(Ok(info)) => fingerprint_of(Some(&info.weight_version)),
+        Ok(Err(status)) => {
+            tracing::warn!(%status, "model info lookup failed; system_fingerprint is the default");
+            fingerprint_of(None)
+        }
+        Err(_) => {
+            tracing::warn!(
+                ?MODEL_INFO_BOUND,
+                "model info lookup timed out; system_fingerprint is the default"
+            );
+            fingerprint_of(None)
+        }
+    }
+}
+
+/// The `system_fingerprint` for a weight version the engine reported: the
+/// version itself when it is not blank, else the gateway's fallback,
+/// `default` (what the gateway sends for a worker without a version).
+pub(crate) fn fingerprint_of(weight_version: Option<&str>) -> String {
+    match weight_version.map(str::trim) {
+        Some(version) if !version.is_empty() => version.to_string(),
+        _ => "default".to_string(),
+    }
+}
 
 /// A chat request read from the caller's JSON, its prompt rendered by the
 /// tokenizer's chat template and tokenized.
@@ -73,8 +110,10 @@ pub(crate) fn prepare_chat(
 /// token count. `load` is the load the request holds on the worker a policy
 /// selected (the policy client; the single client holds none): the stream
 /// carries it until the caller frees the handle, and a failure here drops
-/// it, which gives it back. A failure leaves the entry point's message in
-/// `error_out` and returns its code.
+/// it, which gives it back. `weight_version` is the engine's, read when the
+/// client was built (the gateway's `default` when it reported none); the
+/// chunks carry it as `system_fingerprint`, as the gateway's do. A failure
+/// leaves the entry point's message in `error_out` and returns its code.
 ///
 /// # Safety
 /// - `error_out` may be null; if non-null, must point to writable memory
@@ -83,6 +122,7 @@ pub(crate) unsafe fn start_chat_stream(
     tokenizer: &Arc<dyn Tokenizer>,
     prepared: PreparedChat,
     load: Option<HeldLoad>,
+    weight_version: &str,
     error_out: *mut *mut c_char,
 ) -> Result<SglangStreamHandle, SglErrorCode> {
     let PreparedChat {
@@ -138,6 +178,7 @@ pub(crate) unsafe fn start_chat_stream(
     let mut converter =
         GrpcResponseConverterHandle::for_chat(Arc::clone(tokenizer), &request, request_id);
     converter.initial_prompt_tokens = Some(prompt_tokens);
+    converter.system_fingerprint = Some(weight_version.to_owned());
     Ok(SglangStreamHandle {
         stream: Arc::new(tokio::sync::Mutex::new(stream)),
         converter: Arc::new(tokio::sync::Mutex::new(converter)),
@@ -158,6 +199,15 @@ mod tests {
     /// per message.
     fn tokenizer() -> Arc<dyn Tokenizer> {
         create_tokenizer_from_file("mock").unwrap()
+    }
+
+    #[test]
+    fn the_fingerprint_is_the_reported_version_or_the_gateways_default() {
+        assert_eq!(fingerprint_of(Some("v7")), "v7");
+        assert_eq!(fingerprint_of(Some(" v7 ")), "v7");
+        assert_eq!(fingerprint_of(Some("")), "default");
+        assert_eq!(fingerprint_of(Some("  ")), "default");
+        assert_eq!(fingerprint_of(None), "default");
     }
 
     #[test]

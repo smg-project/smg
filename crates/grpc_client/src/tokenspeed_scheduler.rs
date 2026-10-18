@@ -10,18 +10,17 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use openai_protocol::{
-    chat::ChatCompletionRequest,
-    common::{ResponseFormat, StringOrArray},
-    completion::CompletionRequest,
-    generate::GenerateRequest,
-    messages::CreateMessageRequest,
-    responses::ResponsesRequest,
+    chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
+    messages::CreateMessageRequest, responses::ResponsesRequest,
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
 use tonic::{transport::Channel, Request};
 use tracing::{debug, warn};
 
-use crate::{AbortOnDropClient, BoxedTraceInjector, NoopTraceInjector};
+use crate::{
+    request_fields::{response_format_schema, stop_strings, PlainSampling},
+    AbortOnDropClient, BoxedTraceInjector, NoopTraceInjector,
+};
 
 #[expect(clippy::allow_attributes)]
 pub mod tokenspeed_proto {
@@ -311,7 +310,7 @@ impl TokenSpeedSchedulerClient {
         request: &ChatCompletionRequest,
         tool_call_constraint: Option<(String, String)>,
     ) -> Result<tokenspeed_proto::SamplingParams, String> {
-        let stop_sequences = Self::extract_stop_strings(request.stop.as_ref());
+        let stop_sequences = stop_strings(request.stop.as_ref());
 
         // Keep skip_special_tokens true; flipping to false on tool calls regresses BFCL.
         Ok(tokenspeed_proto::SamplingParams {
@@ -394,11 +393,7 @@ impl TokenSpeedSchedulerClient {
     fn build_sampling_params_from_completion(
         request: &CompletionRequest,
     ) -> Result<tokenspeed_proto::SamplingParams, String> {
-        let stop_sequences = match &request.stop {
-            Some(StringOrArray::String(s)) => vec![s.clone()],
-            Some(StringOrArray::Array(arr)) => arr.clone(),
-            None => vec![],
-        };
+        let stop_sequences = stop_strings(request.stop.as_ref());
 
         Ok(tokenspeed_proto::SamplingParams {
             temperature: Some(request.temperature.unwrap_or(1.0)),
@@ -426,85 +421,34 @@ impl TokenSpeedSchedulerClient {
     fn build_sampling_params_from_plain(
         params: Option<&GenerateSamplingParams>,
     ) -> Result<tokenspeed_proto::SamplingParams, String> {
-        let mut sampling = tokenspeed_proto::SamplingParams {
-            temperature: Some(1.0),
-            top_p: Some(1.0),
-            top_k: Some(-1),
-            repetition_penalty: Some(1.0),
-            n: 1,
-            skip_special_tokens: true,
+        let plain = PlainSampling::read(params);
+        Ok(tokenspeed_proto::SamplingParams {
+            temperature: Some(plain.temperature),
+            top_p: Some(plain.top_p),
+            top_k: Some(plain.top_k.unwrap_or(-1)),
+            min_p: plain.min_p,
+            frequency_penalty: plain.frequency_penalty,
+            presence_penalty: plain.presence_penalty,
+            repetition_penalty: Some(plain.repetition_penalty),
+            max_new_tokens: plain.max_new_tokens,
+            min_new_tokens: plain.min_new_tokens.unwrap_or(0),
+            stop: plain.stop,
+            stop_token_ids: plain.stop_token_ids,
+            skip_special_tokens: plain.skip_special_tokens,
             spaces_between_special_tokens: true,
+            ignore_eos: plain.ignore_eos,
+            no_stop_trim: plain.no_stop_trim,
+            sampling_seed: plain.sampling_seed,
+            n: plain.n,
+            constraint: match params {
+                Some(p) => Self::build_constraint_from_plain(p)?,
+                None => None,
+            },
             ..Default::default()
-        };
-
-        let Some(p) = params else {
-            return Ok(sampling);
-        };
-
-        if let Some(v) = p.temperature {
-            sampling.temperature = Some(v);
-        }
-        if let Some(v) = p.top_p {
-            sampling.top_p = Some(v);
-        }
-        if let Some(v) = p.top_k {
-            sampling.top_k = Some(v);
-        }
-        if let Some(v) = p.frequency_penalty {
-            sampling.frequency_penalty = Some(v);
-        }
-        if let Some(v) = p.presence_penalty {
-            sampling.presence_penalty = Some(v);
-        }
-        if let Some(v) = p.repetition_penalty {
-            sampling.repetition_penalty = Some(v);
-        }
-        if let Some(v) = p.min_p {
-            sampling.min_p = Some(v);
-        }
-        if let Some(v) = p.ignore_eos {
-            sampling.ignore_eos = v;
-        }
-        if let Some(v) = p.skip_special_tokens {
-            sampling.skip_special_tokens = v;
-        }
-        if let Some(v) = p.no_stop_trim {
-            sampling.no_stop_trim = v;
-        }
-
-        if let Some(stop) = &p.stop {
-            match stop {
-                StringOrArray::String(s) => sampling.stop.push(s.clone()),
-                StringOrArray::Array(arr) => sampling.stop.extend(arr.clone()),
-            }
-        }
-        if let Some(stop_token_ids) = &p.stop_token_ids {
-            sampling.stop_token_ids.clone_from(stop_token_ids);
-        }
-
-        sampling.max_new_tokens = p.max_new_tokens;
-        if let Some(v) = p.min_new_tokens {
-            sampling.min_new_tokens = v;
-        }
-        if let Some(v) = p.n {
-            sampling.n = v;
-        }
-        sampling.sampling_seed = p.sampling_seed;
-
-        sampling.constraint = Self::build_constraint_from_plain(p)?;
-
-        Ok(sampling)
+        })
     }
 
     // ── Constraint helpers ───────────────────────────────────────────
-
-    fn extract_stop_strings(stop: Option<&StringOrArray>) -> Vec<String> {
-        match stop {
-            Some(StringOrArray::String(s)) => vec![s.clone()],
-            Some(StringOrArray::Array(arr)) => arr.clone(),
-            None => vec![],
-        }
-    }
 
     fn build_constraint_for_chat(
         request: &ChatCompletionRequest,
@@ -512,23 +456,10 @@ impl TokenSpeedSchedulerClient {
     ) -> Result<Option<tokenspeed_proto::sampling_params::Constraint>, String> {
         let mut constraints = Vec::new();
 
-        match &request.response_format {
-            Some(ResponseFormat::JsonObject) => {
-                let schema = serde_json::json!({"type": "object"});
-                let schema_str = serde_json::to_string(&schema)
-                    .map_err(|e| format!("Failed to serialize JSON schema: {e}"))?;
-                constraints.push(tokenspeed_proto::sampling_params::Constraint::JsonSchema(
-                    schema_str,
-                ));
-            }
-            Some(ResponseFormat::JsonSchema { json_schema }) => {
-                let schema_str = serde_json::to_string(&json_schema.schema)
-                    .map_err(|e| format!("Failed to serialize JSON schema: {e}"))?;
-                constraints.push(tokenspeed_proto::sampling_params::Constraint::JsonSchema(
-                    schema_str,
-                ));
-            }
-            Some(ResponseFormat::Text) | None => {}
+        if let Some(schema) = response_format_schema(request)? {
+            constraints.push(tokenspeed_proto::sampling_params::Constraint::JsonSchema(
+                schema,
+            ));
         }
 
         if let Some(ebnf) = &request.ebnf {
@@ -855,6 +786,17 @@ mod load_conversion_tests {
 #[cfg(test)]
 mod seed_resolution_tests {
     use super::*;
+
+    #[test]
+    fn plain_sampling_seed_is_forwarded() {
+        let params = GenerateSamplingParams {
+            sampling_seed: Some(7),
+            ..Default::default()
+        };
+        let sampling =
+            TokenSpeedSchedulerClient::build_sampling_params_from_plain(Some(&params)).unwrap();
+        assert_eq!(sampling.sampling_seed, Some(7));
+    }
 
     #[test]
     fn native_sampling_seed_wins_over_legacy_seed() {

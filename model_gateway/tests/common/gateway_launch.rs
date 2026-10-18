@@ -77,7 +77,9 @@ pub fn free_ports<const N: usize>() -> [u16; N] {
 }
 
 /// The common flags: the HTTP listener on `port`, the metrics listener on
-/// `metrics_port`, both on the loopback.
+/// `metrics_port`, both on the loopback, and the log level whose lines the
+/// tests' verdicts read (`RUST_LOG` outranks it in the gateway, so the
+/// launchers remove it from the child's environment).
 pub fn base_args(port: u16, metrics_port: u16) -> Vec<String> {
     let ip = IP.to_string();
     [
@@ -90,6 +92,8 @@ pub fn base_args(port: u16, metrics_port: u16) -> Vec<String> {
         &ip,
         "--prometheus-port",
         &metrics_port.to_string(),
+        "--log-level",
+        "info",
     ]
     .map(str::to_string)
     .to_vec()
@@ -117,6 +121,7 @@ pub fn launch_with(args: &[String], watch: &[u16], until: Until, log_path: &Path
     let log = File::create(log_path).expect("log file");
     let mut child = Command::new(env!("CARGO_BIN_EXE_smg"))
         .args(args)
+        .env_remove("RUST_LOG")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone().expect("log handle")))
         .stderr(Stdio::from(log))
@@ -154,6 +159,25 @@ pub fn launch_with(args: &[String], watch: &[u16], until: Until, log_path: &Path
         bound,
         served,
         log: fs::read_to_string(log_path).unwrap_or_default(),
+    }
+}
+
+/// The log at `log_path` once it holds `line`, or the log as it stands when
+/// `timeout` passes first. A gateway's lines reach its log a moment after
+/// the event they report (its writer thread batches them, and is late on a
+/// busy host), so a verdict on a line waits for it, as the launches wait for
+/// a port, rather than reading the file once.
+pub fn log_with_line(log_path: &Path, line: &str, timeout: Duration) -> Result<String, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let log = fs::read_to_string(log_path).unwrap_or_default();
+        if log.contains(line) {
+            return Ok(log);
+        }
+        if Instant::now() >= deadline {
+            return Err(log);
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 

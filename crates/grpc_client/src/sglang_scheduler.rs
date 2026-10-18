@@ -1,18 +1,17 @@
 use std::{future::Future, pin::Pin};
 
 use openai_protocol::{
-    chat::ChatCompletionRequest,
-    common::{ResponseFormat, StringOrArray},
-    completion::CompletionRequest,
-    generate::GenerateRequest,
-    messages::CreateMessageRequest,
-    responses::ResponsesRequest,
+    chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
+    messages::CreateMessageRequest, responses::ResponsesRequest,
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
 use tonic::{transport::Channel, Request};
 use tracing::{debug, warn};
 
-use crate::{AbortOnDropClient, BoxedTraceInjector};
+use crate::{
+    request_fields::{response_format_schema, stop_strings, PlainSampling},
+    AbortOnDropClient, BoxedTraceInjector,
+};
 
 // Include the generated protobuf code
 #[expect(clippy::allow_attributes)]
@@ -371,7 +370,7 @@ impl SglangSchedulerClient {
         request: &ChatCompletionRequest,
         tool_call_constraint: Option<(String, String)>,
     ) -> Result<proto::SamplingParams, String> {
-        let stop_sequences = Self::extract_stop_strings(request);
+        let stop_sequences = stop_strings(request.stop.as_ref());
 
         let max_new_tokens = request.output_token_cap();
 
@@ -400,15 +399,6 @@ impl SglangSchedulerClient {
         })
     }
 
-    /// Extract stop strings from request
-    fn extract_stop_strings(request: &ChatCompletionRequest) -> Vec<String> {
-        match &request.stop {
-            Some(StringOrArray::String(s)) => vec![s.clone()],
-            Some(StringOrArray::Array(arr)) => arr.clone(),
-            None => vec![],
-        }
-    }
-
     /// Build constraint for structured generation
     fn build_constraint_for_chat(
         request: &ChatCompletionRequest,
@@ -416,23 +406,8 @@ impl SglangSchedulerClient {
     ) -> Result<Option<proto::sampling_params::Constraint>, String> {
         let mut constraints = Vec::new();
 
-        // Handle response_format constraints
-        match &request.response_format {
-            Some(ResponseFormat::JsonObject) => {
-                // json_object mode - constrain to valid JSON object
-                let schema = serde_json::json!({"type": "object"});
-                let schema_str = serde_json::to_string(&schema)
-                    .map_err(|e| format!("Failed to serialize JSON schema: {e}"))?;
-                constraints.push(proto::sampling_params::Constraint::JsonSchema(schema_str));
-            }
-            Some(ResponseFormat::JsonSchema { json_schema }) => {
-                let schema_str = serde_json::to_string(&json_schema.schema)
-                    .map_err(|e| format!("Failed to serialize JSON schema: {e}"))?;
-                constraints.push(proto::sampling_params::Constraint::JsonSchema(schema_str));
-            }
-            Some(ResponseFormat::Text) | None => {
-                // No constraint for text format
-            }
+        if let Some(schema) = response_format_schema(request)? {
+            constraints.push(proto::sampling_params::Constraint::JsonSchema(schema));
         }
 
         if let Some(ebnf) = &request.ebnf {
@@ -667,11 +642,7 @@ impl SglangSchedulerClient {
     fn build_grpc_sampling_params_from_completion(
         request: &CompletionRequest,
     ) -> Result<proto::SamplingParams, String> {
-        let stop_sequences = match &request.stop {
-            Some(StringOrArray::String(s)) => vec![s.clone()],
-            Some(StringOrArray::Array(arr)) => arr.clone(),
-            None => vec![],
-        };
+        let stop_sequences = stop_strings(request.stop.as_ref());
 
         let constraint = Self::build_single_constraint_from_completion(request)?;
 
@@ -750,71 +721,30 @@ impl SglangSchedulerClient {
     fn build_sampling_params_from_plain(
         params: Option<&GenerateSamplingParams>,
     ) -> Result<proto::SamplingParams, String> {
-        let mut sampling = proto::SamplingParams {
-            temperature: 1.0,
-            top_p: 1.0,
-            top_k: -1,
-            repetition_penalty: 1.0,
-            n: 1,
-            skip_special_tokens: true,
+        let plain = PlainSampling::read(params);
+        Ok(proto::SamplingParams {
+            temperature: plain.temperature,
+            top_p: plain.top_p,
+            top_k: plain.top_k.unwrap_or(-1),
+            min_p: plain.min_p.unwrap_or(0.0),
+            frequency_penalty: plain.frequency_penalty.unwrap_or(0.0),
+            presence_penalty: plain.presence_penalty.unwrap_or(0.0),
+            repetition_penalty: plain.repetition_penalty,
+            max_new_tokens: plain.max_new_tokens,
+            stop: plain.stop,
+            stop_token_ids: plain.stop_token_ids,
+            skip_special_tokens: plain.skip_special_tokens,
             spaces_between_special_tokens: true,
+            ignore_eos: plain.ignore_eos,
+            no_stop_trim: plain.no_stop_trim,
+            n: plain.n,
+            min_new_tokens: plain.min_new_tokens.unwrap_or(0),
+            constraint: match params {
+                Some(p) => Self::build_single_constraint_from_plain(p)?,
+                None => None,
+            },
             ..Default::default()
-        };
-
-        let Some(p) = params else {
-            return Ok(sampling);
-        };
-
-        // Simple field mappings using a macro
-        macro_rules! map_field {
-            ($field:ident) => {
-                if let Some(val) = p.$field {
-                    sampling.$field = val;
-                }
-            };
-        }
-
-        map_field!(temperature);
-        map_field!(top_p);
-        map_field!(top_k);
-        map_field!(frequency_penalty);
-        map_field!(presence_penalty);
-        map_field!(repetition_penalty);
-        map_field!(min_p);
-        map_field!(ignore_eos);
-        map_field!(skip_special_tokens);
-        map_field!(no_stop_trim);
-
-        // Handle stop sequences
-        if let Some(stop) = &p.stop {
-            match stop {
-                StringOrArray::String(s) => sampling.stop.push(s.clone()),
-                StringOrArray::Array(arr) => sampling.stop.extend(arr.clone()),
-            }
-        }
-
-        // Handle stop token IDs
-        if let Some(stop_token_ids) = &p.stop_token_ids {
-            sampling.stop_token_ids.clone_from(stop_token_ids);
-        }
-
-        // Handle max_new_tokens
-        sampling.max_new_tokens = p.max_new_tokens;
-
-        // Handle min_new_tokens
-        if let Some(min_new_tokens) = p.min_new_tokens {
-            sampling.min_new_tokens = min_new_tokens;
-        }
-
-        // Handle n
-        if let Some(n) = p.n {
-            sampling.n = n;
-        }
-
-        // Handle constraints (exactly one allowed)
-        sampling.constraint = Self::build_single_constraint_from_plain(p)?;
-
-        Ok(sampling)
+        })
     }
 }
 
@@ -937,12 +867,6 @@ mod tests {
     }
 
     #[test]
-    fn test_proto_types_compilation() {
-        let _health_req = proto::HealthCheckRequest {};
-        // HealthCheckRequest is now empty - no fields to test
-    }
-
-    #[test]
     fn test_scheduler_load_maps_disagg_section() {
         let load = proto::SchedulerLoad {
             dp_rank: 0,
@@ -1017,12 +941,6 @@ mod tests {
         assert_eq!(params.temperature, 0.7);
         assert_eq!(params.max_new_tokens, Some(128));
         assert_eq!(params.stop, vec!["</s>"]);
-    }
-
-    #[test]
-    fn test_health_check_request() {
-        let _health_req = proto::HealthCheckRequest {};
-        // HealthCheckRequest is now empty - server generates its own test internally
     }
 
     #[test]

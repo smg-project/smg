@@ -157,6 +157,120 @@ struct PDRequestContext<'a> {
     headers: Option<HeaderMap>,
 }
 
+/// What the PD dispatch needs to know about a request beyond what every
+/// generation request tells: its route, its batch size, whether logprobs come
+/// back, and the text or tokens the routing policies read when they ask.
+trait PdRoute: GenerationRequest {
+    const ROUTE: &'static str;
+
+    /// The requests the dispatch fans out as a batch (the bootstrap fields
+    /// take their shape from it); None for a single sequence.
+    fn batch_size(&self) -> Option<usize>;
+
+    /// Whether logprobs come back with the response (the prefill leg is then
+    /// merged instead of drained early).
+    fn returns_logprob(&self) -> bool;
+
+    /// The (text, tokens) the policies route on, read only when one asks.
+    fn routing_inputs(&self) -> (Option<String>, Option<Vec<u32>>) {
+        (Some(self.extract_text_for_routing()), None)
+    }
+}
+
+impl PdRoute for GenerateRequest {
+    const ROUTE: &'static str = "/generate";
+
+    fn batch_size(&self) -> Option<usize> {
+        // GenerateRequest doesn't support batch via arrays, only via input_ids
+        match &self.input_ids {
+            Some(InputIds::Batch(batches)) if !batches.is_empty() => Some(batches.len()),
+            _ => None,
+        }
+    }
+
+    fn returns_logprob(&self) -> bool {
+        self.return_logprob.unwrap_or(false)
+    }
+
+    fn routing_inputs(&self) -> (Option<String>, Option<Vec<u32>>) {
+        match self.routing_tokens() {
+            Some(ids) => (None, Some(ids.iter().map(|&id| id as u32).collect())),
+            None => (self.text.as_deref().map(str::to_string), None),
+        }
+    }
+}
+
+impl PdRoute for ChatCompletionRequest {
+    const ROUTE: &'static str = "/v1/chat/completions";
+
+    fn batch_size(&self) -> Option<usize> {
+        self.n.filter(|&n| n > 1).map(|n| n as usize)
+    }
+
+    fn returns_logprob(&self) -> bool {
+        self.logprobs
+    }
+}
+
+impl PdRoute for CreateMessageRequest {
+    const ROUTE: &'static str = "/v1/messages";
+
+    fn batch_size(&self) -> Option<usize> {
+        None
+    }
+
+    fn returns_logprob(&self) -> bool {
+        false
+    }
+}
+
+impl PdRoute for ResponsesRequest {
+    const ROUTE: &'static str = "/v1/responses";
+
+    fn batch_size(&self) -> Option<usize> {
+        None
+    }
+
+    fn returns_logprob(&self) -> bool {
+        false
+    }
+}
+
+impl PdRoute for CompletionRequest {
+    const ROUTE: &'static str = "/v1/completions";
+
+    fn batch_size(&self) -> Option<usize> {
+        match &self.prompt {
+            StringOrArray::Array(arr) if !arr.is_empty() => Some(arr.len()),
+            _ => None,
+        }
+    }
+
+    fn returns_logprob(&self) -> bool {
+        self.logprobs.is_some()
+    }
+
+    fn routing_inputs(&self) -> (Option<String>, Option<Vec<u32>>) {
+        let text = match &self.prompt {
+            StringOrArray::String(s) => Some(s.clone()),
+            StringOrArray::Array(v) => v.first().map(|s| s.to_string()),
+        };
+        (text, None)
+    }
+}
+
+impl PdRoute for RerankRequest {
+    const ROUTE: &'static str = "/v1/rerank";
+
+    fn batch_size(&self) -> Option<usize> {
+        None
+    }
+
+    fn returns_logprob(&self) -> bool {
+        false
+    }
+}
+
 /// The bootstrap rendezvous an SGLang prefill worker hands out for one
 /// request, as the raw JSON values both legs carry.
 struct BootstrapFields {
@@ -339,34 +453,6 @@ impl PDRouter {
         error::internal_error("serialization_failed", "Failed to serialize request")
     }
 
-    fn get_generate_batch_size(req: &GenerateRequest) -> Option<usize> {
-        // GenerateRequest doesn't support batch via arrays, only via input_ids
-        if let Some(InputIds::Batch(batches)) = &req.input_ids {
-            if !batches.is_empty() {
-                return Some(batches.len());
-            }
-        }
-        None
-    }
-
-    fn get_chat_batch_size(req: &ChatCompletionRequest) -> Option<usize> {
-        if let Some(n) = req.n {
-            if n > 1 {
-                return Some(n as usize);
-            }
-        }
-        None
-    }
-
-    fn get_completion_batch_size(req: &CompletionRequest) -> Option<usize> {
-        if let StringOrArray::Array(arr) = &req.prompt {
-            if !arr.is_empty() {
-                return Some(arr.len());
-            }
-        }
-        None
-    }
-
     // Static key strings to avoid per-request allocations
     const BOOTSTRAP_HOST_KEY: &'static str = "bootstrap_host";
     const BOOTSTRAP_PORT_KEY: &'static str = "bootstrap_port";
@@ -430,6 +516,40 @@ impl PDRouter {
             .kv_transfer_params
             .filter(|params| params.get() != "null")
             .map(ToOwned::to_owned)
+    }
+
+    /// Every PD route: the routing derivatives and the request context from
+    /// the request, then the dual dispatch.
+    async fn route_pd<R: PdRoute + Serialize>(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: R,
+        model_id: &str,
+    ) -> Response {
+        let (text, tokens) = if self.policies_need_request_text() {
+            body.routing_inputs()
+        } else {
+            (None, None)
+        };
+        let routing = RoutingDerivatives {
+            tokens,
+            text,
+            rid_key: self
+                .policy_registry
+                .derive_rid_key(body.rid())
+                .map(str::to_string),
+            cache_namespace: CacheNamespace::derive(&body.cache_partition()),
+        };
+        let context = PDRequestContext {
+            route: R::ROUTE,
+            batch_size: body.batch_size(),
+            is_stream: body.is_stream(),
+            return_logprob: body.returns_logprob(),
+            model_id,
+            headers: headers.cloned(),
+        };
+        self.execute_dual_dispatch(headers, body, routing, context)
+            .await
     }
 
     async fn execute_dual_dispatch<T: Serialize>(
@@ -2665,40 +2785,7 @@ impl RouterTrait for PDRouter {
         body: GenerateRequest,
         model_id: &str,
     ) -> Response {
-        let is_stream = body.stream;
-        let return_logprob = body.return_logprob.unwrap_or(false);
-
-        let (request_text, routing_tokens) = if self.policies_need_request_text() {
-            match body.routing_tokens() {
-                Some(ids) => (None, Some(ids.iter().map(|&id| id as u32).collect())),
-                None => (body.text.as_deref().map(|s| s.to_string()), None),
-            }
-        } else {
-            (None, None)
-        };
-
-        let batch_size = Self::get_generate_batch_size(&body);
-
-        let routing = RoutingDerivatives {
-            tokens: routing_tokens,
-            text: request_text,
-            rid_key: self
-                .policy_registry
-                .derive_rid_key(body.rid())
-                .map(str::to_string),
-            cache_namespace: CacheNamespace::derive(&body.cache_partition()),
-        };
-        let context = PDRequestContext {
-            route: "/generate",
-            batch_size,
-            is_stream,
-            return_logprob,
-            model_id,
-            headers: headers.cloned(),
-        };
-
-        self.execute_dual_dispatch(headers, body, routing, context)
-            .await
+        self.route_pd(headers, body, model_id).await
     }
 
     async fn route_chat(
@@ -2708,38 +2795,7 @@ impl RouterTrait for PDRouter {
         body: ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
-        let is_stream = body.stream;
-        let return_logprob = body.logprobs;
-
-        let request_text = if self.policies_need_request_text() {
-            Some(body.extract_text_for_routing())
-        } else {
-            None
-        };
-
-        // Calculate batch size
-        let batch_size = Self::get_chat_batch_size(&body);
-
-        let routing = RoutingDerivatives {
-            tokens: None,
-            text: request_text,
-            rid_key: self
-                .policy_registry
-                .derive_rid_key(body.rid())
-                .map(str::to_string),
-            cache_namespace: CacheNamespace::derive(&body.cache_partition()),
-        };
-        let context = PDRequestContext {
-            route: "/v1/chat/completions",
-            batch_size,
-            is_stream,
-            return_logprob,
-            model_id,
-            headers: headers.cloned(),
-        };
-
-        self.execute_dual_dispatch(headers, body, routing, context)
-            .await
+        self.route_pd(headers, body, model_id).await
     }
 
     async fn route_messages(
@@ -2752,34 +2808,7 @@ impl RouterTrait for PDRouter {
         if let Some(refused) = super::refuse_max_tokens_zero(&body) {
             return refused;
         }
-        let is_stream = body.stream.unwrap_or(false);
-
-        let request_text = if self.policies_need_request_text() {
-            Some(body.extract_text_for_routing())
-        } else {
-            None
-        };
-
-        let routing = RoutingDerivatives {
-            tokens: None,
-            text: request_text,
-            rid_key: self
-                .policy_registry
-                .derive_rid_key(body.rid())
-                .map(str::to_string),
-            cache_namespace: CacheNamespace::derive(&body.cache_partition()),
-        };
-        let context = PDRequestContext {
-            route: "/v1/messages",
-            batch_size: None,
-            is_stream,
-            return_logprob: false,
-            model_id,
-            headers: headers.cloned(),
-        };
-
-        self.execute_dual_dispatch(headers, body, routing, context)
-            .await
+        self.route_pd(headers, body, model_id).await
     }
 
     async fn route_messages_count_tokens(
@@ -2887,34 +2916,7 @@ impl RouterTrait for PDRouter {
         body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
-        let is_stream = body.stream.unwrap_or(false);
-
-        let request_text = if self.policies_need_request_text() {
-            Some(body.extract_text_for_routing())
-        } else {
-            None
-        };
-
-        let routing = RoutingDerivatives {
-            tokens: None,
-            text: request_text,
-            rid_key: self
-                .policy_registry
-                .derive_rid_key(body.rid())
-                .map(str::to_string),
-            cache_namespace: CacheNamespace::derive(&body.cache_partition()),
-        };
-        let context = PDRequestContext {
-            route: "/v1/responses",
-            batch_size: None,
-            is_stream,
-            return_logprob: false,
-            model_id,
-            headers: headers.cloned(),
-        };
-
-        self.execute_dual_dispatch(headers, body, routing, context)
-            .await
+        self.route_pd(headers, body, model_id).await
     }
 
     async fn route_completion(
@@ -2924,41 +2926,7 @@ impl RouterTrait for PDRouter {
         body: CompletionRequest,
         model_id: &str,
     ) -> Response {
-        let is_stream = body.stream;
-        let return_logprob = body.logprobs.is_some();
-
-        let request_text = if self.policies_need_request_text() {
-            match &body.prompt {
-                StringOrArray::String(s) => Some(s.clone()),
-                StringOrArray::Array(v) => v.first().map(|s| s.to_string()),
-            }
-        } else {
-            None
-        };
-
-        // Calculate batch size
-        let batch_size = Self::get_completion_batch_size(&body);
-
-        let routing = RoutingDerivatives {
-            tokens: None,
-            text: request_text,
-            rid_key: self
-                .policy_registry
-                .derive_rid_key(body.rid())
-                .map(str::to_string),
-            cache_namespace: CacheNamespace::derive(&body.cache_partition()),
-        };
-        let context = PDRequestContext {
-            route: "/v1/completions",
-            batch_size,
-            is_stream,
-            return_logprob,
-            model_id,
-            headers: headers.cloned(),
-        };
-
-        self.execute_dual_dispatch(headers, body, routing, context)
-            .await
+        self.route_pd(headers, body, model_id).await
     }
 
     async fn route_rerank(
@@ -2968,33 +2936,7 @@ impl RouterTrait for PDRouter {
         body: RerankRequest,
         model_id: &str,
     ) -> Response {
-        // Extract text for cache-aware routing
-        let req_text = if self.policies_need_request_text() {
-            Some(body.query.clone())
-        } else {
-            None
-        };
-
-        let routing = RoutingDerivatives {
-            tokens: None,
-            text: req_text,
-            rid_key: self
-                .policy_registry
-                .derive_rid_key(body.rid())
-                .map(str::to_string),
-            cache_namespace: CacheNamespace::derive(&body.cache_partition()),
-        };
-        let context = PDRequestContext {
-            route: "/v1/rerank",
-            batch_size: None,
-            is_stream: false,
-            return_logprob: false,
-            model_id,
-            headers: headers.cloned(),
-        };
-
-        self.execute_dual_dispatch(headers, body, routing, context)
-            .await
+        self.route_pd(headers, body, model_id).await
     }
 
     fn router_type(&self) -> &'static str {
@@ -3015,6 +2957,87 @@ mod tests {
         tenant::TenantKey,
         worker::{BasicWorkerBuilder, WorkerType},
     };
+
+    #[test]
+    fn pd_route_facts_per_request_type() {
+        fn req<T: serde::de::DeserializeOwned>(v: Value) -> T {
+            serde_json::from_value(v).unwrap()
+        }
+        let generate: GenerateRequest = req(json!({"text": "hi", "return_logprob": true}));
+        assert_eq!(GenerateRequest::ROUTE, "/generate");
+        assert_eq!(generate.batch_size(), None);
+        assert!(generate.returns_logprob());
+        assert_eq!(generate.routing_inputs(), (Some("hi".to_string()), None));
+        let batched: GenerateRequest = req(json!({"input_ids": [[1, 2], [3]]}));
+        assert_eq!(batched.batch_size(), Some(2));
+        assert!(!batched.returns_logprob());
+        assert_eq!(batched.routing_inputs(), (None, Some(vec![1, 2])));
+
+        let chat: ChatCompletionRequest = req(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hello"}],
+            "n": 2, "logprobs": true, "stream": true
+        }));
+        assert_eq!(ChatCompletionRequest::ROUTE, "/v1/chat/completions");
+        assert_eq!(chat.batch_size(), Some(2));
+        assert!(chat.returns_logprob());
+        assert!(chat.is_stream());
+        assert_eq!(
+            chat.routing_inputs().0,
+            Some(chat.extract_text_for_routing())
+        );
+        let single: ChatCompletionRequest = req(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hello"}], "n": 1
+        }));
+        assert_eq!(single.batch_size(), None);
+
+        let messages: CreateMessageRequest = req(json!({
+            "model": "m", "max_tokens": 5, "messages": [{"role": "user", "content": "hello"}]
+        }));
+        assert_eq!(CreateMessageRequest::ROUTE, "/v1/messages");
+        assert_eq!(
+            (
+                messages.batch_size(),
+                messages.returns_logprob(),
+                messages.is_stream()
+            ),
+            (None, false, false)
+        );
+
+        let responses: ResponsesRequest =
+            req(json!({"model": "m", "input": "hello", "stream": true}));
+        assert_eq!(ResponsesRequest::ROUTE, "/v1/responses");
+        assert_eq!(
+            (
+                responses.batch_size(),
+                responses.returns_logprob(),
+                responses.is_stream()
+            ),
+            (None, false, true)
+        );
+
+        let completion: CompletionRequest =
+            req(json!({"model": "m", "prompt": ["a", "b"], "logprobs": 1}));
+        assert_eq!(CompletionRequest::ROUTE, "/v1/completions");
+        assert_eq!(completion.batch_size(), Some(2));
+        assert!(completion.returns_logprob());
+        assert_eq!(completion.routing_inputs(), (Some("a".to_string()), None));
+        let prompt: CompletionRequest = req(json!({"model": "m", "prompt": "only"}));
+        assert_eq!(prompt.batch_size(), None);
+        assert!(!prompt.returns_logprob());
+        assert_eq!(prompt.routing_inputs(), (Some("only".to_string()), None));
+
+        let rerank: RerankRequest = req(json!({"model": "m", "query": "q", "documents": ["d"]}));
+        assert_eq!(RerankRequest::ROUTE, "/v1/rerank");
+        assert_eq!(
+            (
+                rerank.batch_size(),
+                rerank.returns_logprob(),
+                rerank.is_stream()
+            ),
+            (None, false, false)
+        );
+        assert_eq!(rerank.routing_inputs(), (Some("q".to_string()), None));
+    }
 
     /// Ceiling on a real HTTP round trip in these tests: a guard against a
     /// hang, not a budget, since a loaded machine can take seconds.

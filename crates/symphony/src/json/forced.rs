@@ -15,12 +15,12 @@
 //! `Malformed { Other }`.
 //!
 //! [`formats::forced`]: crate::formats::forced()
-//! [`Declared::forced`]: crate::tagged::Declared::forced
+//! [`Declared::forced`]: crate::Declared::forced
 
 use crate::{
     event::{Event, Events, MalformedReason, Text},
     json::arguments::{json_space, Arguments, AsWritten},
-    tagged::Declared,
+    Declared,
 };
 
 /// The events of the forced call, from the output's first byte.
@@ -135,6 +135,7 @@ impl crate::engine::CallAssembler for Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::names;
 
     const ARGUMENTS: &str = "{\"city\": \"Paris\", \"days\": [1, 2]}";
 
@@ -154,16 +155,6 @@ mod tests {
             .iter()
             .filter_map(|e| match e {
                 Event::ToolCallArguments { json, .. } => Some(json.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn names(events: &[Event]) -> Vec<&str> {
-        events
-            .iter()
-            .filter_map(|e| match e {
-                Event::ToolCallStart { name, .. } => Some(name.as_str()),
                 _ => None,
             })
             .collect()

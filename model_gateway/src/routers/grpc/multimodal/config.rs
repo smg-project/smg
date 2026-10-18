@@ -339,6 +339,13 @@ impl MultimodalComponents {
             source = settings.processing.source.as_str(),
             "multimodal processing mode"
         );
+        // The switch is the way back to the two-pass write: say where it
+        // stands and who set it, so a rollback that did not take is seen.
+        tracing::info!(
+            on = settings.one_pass_wire.value,
+            source = settings.one_pass_wire.source.as_str(),
+            "multimodal one-pass wire write"
+        );
 
         let inflight = max_inflight_bytes
             .map(|bytes| {

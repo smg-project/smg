@@ -154,19 +154,11 @@ jobs:
         if: steps.filter.outputs.skip != 'true'
         run: bash scripts/${{ matrix.variant.setup }}
 
-      - name: Download wheel artifact
+      - name: Download build artifacts
         if: steps.filter.outputs.skip != 'true'
-        uses: actions/download-artifact@v8
+        uses: ./.github/actions/download-build-artifacts
         with:
-          name: smg-wheel
-          path: wheel/
-
-      - name: Download Python client types
-        if: steps.filter.outputs.skip != 'true'
-        uses: actions/download-artifact@v8
-        with:
-          name: python-client-types
-          path: clients/python/smg_client/types/
+          client-types: 'true'
 
       - name: Install wheel and test dependencies
         if: steps.filter.outputs.skip != 'true'
@@ -267,19 +259,11 @@ jobs:
         if: steps.filter.outputs.skip != 'true'
         run: bash scripts/${{ matrix.variant.setup }}
 
-      - name: Download wheel artifact
+      - name: Download build artifacts
         if: steps.filter.outputs.skip != 'true'
-        uses: actions/download-artifact@v8
+        uses: ./.github/actions/download-build-artifacts
         with:
-          name: smg-wheel
-          path: wheel/
-
-      - name: Download Python client types
-        if: steps.filter.outputs.skip != 'true'
-        uses: actions/download-artifact@v8
-        with:
-          name: python-client-types
-          path: clients/python/smg_client/types/
+          client-types: 'true'
 
       - name: Install wheel and test dependencies
         if: steps.filter.outputs.skip != 'true'

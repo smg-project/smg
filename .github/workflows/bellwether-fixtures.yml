@@ -5,10 +5,12 @@ name: Bellwether Fixtures
 # the prompt token ids of a request, and the text of an output token by token.
 # The tests named bellwether_* read those fixtures and skip without them: the
 # gateway's chat request path, Symphony's parsers, and the tokenizer crate's
-# encode and incremental decode. This workflow runs them on every change to
-# the code they judge (the protocol crate, the tokenizer crate, the gRPC
-# router, Symphony) and to the dependencies, so a difference shows on the pull
-# request that makes it.
+# encode and incremental decode; so do the response-template crate's tests of
+# its lowering, which read the shape patterns' oracle bellwether records in
+# the same tree. This workflow runs them on every change to the code they
+# judge (the protocol crate, the tokenizer crate, the gRPC router, Symphony,
+# the response-template crate) and to the dependencies, so a difference shows
+# on the pull request that makes it.
 #
 # The fixtures come from the bellwether commit in
 # .github/versions/bellwether.ref. To move to newer fixtures, change that hash:
@@ -27,6 +29,7 @@ on:
       - crates/protocols/**
       - crates/tokenizer/**
       - crates/symphony/**
+      - crates/response_template/**
       - model_gateway/src/routers/grpc/**
       - model_gateway/tests/bellwether_*.rs
       - model_gateway/Cargo.toml
@@ -43,6 +46,7 @@ on:
       - crates/protocols/**
       - crates/tokenizer/**
       - crates/symphony/**
+      - crates/response_template/**
       - model_gateway/src/routers/grpc/**
       - model_gateway/tests/bellwether_*.rs
       - model_gateway/Cargo.toml
@@ -145,8 +149,9 @@ jobs:
       - name: Unpack the fixtures
         run: uv run --locked --project .bellwether bellwether unpack --fixtures .bellwether/fixtures --out .bellwether/fixtures-plain
 
-      # This job builds three test targets and nothing else, so it keeps its
-      # own cache entry instead of racing the full builds for theirs.
+      # This job builds the bellwether_* test targets and the response-template
+      # crate's two, and nothing else, so it keeps its own cache entry instead
+      # of racing the full builds for theirs.
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
         with:
@@ -172,7 +177,11 @@ jobs:
       # One build for the test targets, so they build with the same features
       # (the tokenizer files are downloaded over the TLS backend the gateway
       # enables), and the pattern takes in every test file named bellwether_*
-      # in these crates. Then each target runs on its own, all at once: each
+      # in these crates; the response-template crate's unit tests and its
+      # `layout` test, which read the shape patterns' oracle (`patterns/` of
+      # the unpacked tree) and cannot be named so, are built with its
+      # `symphony` feature and run beside them. Then each target runs on its
+      # own, all at once: each
       # is one thread comparing its sets, the runner has 8 CPUs, so the step
       # takes as long as the longest target, not their sum. The pinned commit
       # records 78 models: the tokenizer harness takes about an hour on the
@@ -211,6 +220,7 @@ jobs:
           # exercise v1; unsupported configurations retain the existing encoder.
           features=(--features smg/tokenizers-v1)
           cargo test -p llm-tokenizer -p smg -p smg-symphony "${features[@]}" --test 'bellwether_*' --no-run
+          cargo test -p smg-response-template --features symphony --lib --test layout --no-run
           targets=()
           for file in crates/symphony/tests/bellwether_*.rs model_gateway/tests/bellwether_*.rs crates/tokenizer/tests/bellwether_*.rs; do
             targets+=("$(basename "$file" .rs)")
@@ -221,6 +231,13 @@ jobs:
               > "$RUNNER_TEMP/$target.log" 2>&1 &
             pid[$target]=$!
           done
+          cargo test -p smg-response-template --features symphony --lib -- --nocapture \
+            > "$RUNNER_TEMP/response_template_lib.log" 2>&1 &
+          pid[response_template_lib]=$!
+          cargo test -p smg-response-template --features symphony --test layout -- --nocapture \
+            > "$RUNNER_TEMP/response_template_layout.log" 2>&1 &
+          pid[response_template_layout]=$!
+          targets+=(response_template_lib response_template_layout)
           failed=()
           for target in "${targets[@]}"; do
             wait "${pid[$target]}" || failed+=("$target")

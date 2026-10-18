@@ -22,20 +22,19 @@ use std::{
     time::Duration,
 };
 
+use common::grpc_harness::{build_grpc_router, grpc_router_config, grpc_workers, serve_engine};
 use metrics_exporter_prometheus::PrometheusBuilder;
-use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use proto::generate_response::Response as GenResp;
 use smg::{
-    config::{RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
-    routers::{RouterFactory, RouterTrait},
+    routers::RouterTrait,
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType},
+    worker::{RuntimeType, WorkerType},
 };
 use smg_grpc_client::vllm_proto as proto;
-use tokio::{net::TcpListener, sync::mpsc};
-use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
-use tonic::{transport::Server, Request, Response, Status};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status};
 
 const MODEL: &str = "pd-decode-start-cancelled-test-model";
 /// Tokens an engine that completes produces; ids 1..=3 are in the mock
@@ -213,65 +212,17 @@ impl proto::vllm_engine_server::VllmEngine for Engine {
 }
 
 /// Serve a mock engine in-process; returns its port.
-#[expect(
-    clippy::expect_used,
-    clippy::disallowed_methods,
-    reason = "test helper - panicking on failure is intentional; the spawned \
-              mock server task is fire-and-forget for the test process's lifetime"
-)]
 async fn start_mock_engine(engine: Engine) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock engine");
-    let port = listener.local_addr().expect("mock engine address").port();
-    tokio::spawn(
-        Server::builder()
-            .add_service(proto::vllm_engine_server::VllmEngineServer::new(engine))
-            .serve_with_incoming(TcpListenerStream::new(listener)),
-    );
-    port
+    serve_engine(proto::vllm_engine_server::VllmEngineServer::new(engine)).await
 }
 
 /// A PD gRPC router over the given legs (sequential dispatch).
-#[expect(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
 async fn build_pd_router(legs: &[(u16, WorkerType)]) -> Box<dyn RouterTrait> {
-    let mut config = RouterConfig::builder()
-        .mode(RoutingMode::PrefillDecode {
-            prefill_urls: vec![],
-            decode_urls: vec![],
-            prefill_policy: None,
-            decode_policy: None,
-        })
-        .grpc_connection()
+    let config = grpc_router_config()
+        .prefill_decode_mode(vec![], vec![])
         .round_robin_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(1024 * 1024)
         .build_unchecked();
-    config.health_check.disable_health_check = true;
-    let app_context = common::create_test_context_with_mock_tokenizer(config, MODEL).await;
-    for (port, worker_type) in legs {
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
-                .worker_type(*worker_type)
-                .connection_mode(ConnectionMode::Grpc)
-                .runtime_type(RuntimeType::Vllm)
-                .model(ModelCard::new(MODEL))
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
-                .build(),
-        );
-        app_context.worker_registry.register(worker).unwrap();
-    }
-    RouterFactory::create_router(&app_context)
-        .await
-        .expect("PD gRPC router should build")
+    build_grpc_router(config, MODEL, grpc_workers(legs, RuntimeType::Vllm, MODEL)).await
 }
 
 fn tenant() -> TenantRequestMeta {

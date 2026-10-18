@@ -71,6 +71,12 @@ impl RateLimitCell {
         self.outcome.lock().clone()
     }
 
+    /// Place an outcome from outside the reserve stage, for tests only.
+    #[cfg(test)]
+    pub(crate) fn set_for_test(&self, outcome: RateLimitOutcome) {
+        self.set(outcome);
+    }
+
     fn set(&self, outcome: RateLimitOutcome) {
         *self.outcome.lock() = Some(outcome);
     }

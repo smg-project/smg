@@ -20,6 +20,7 @@ pub use smg_external_router::metrics::{
 };
 
 use super::worker_metrics::{self, WorkerSeries, WorkerSeriesRecorder};
+use crate::routers::grpc::regular::symphony::telemetry as symphony_telemetry;
 
 // Interned strings are never freed; only intern low-cardinality, server-controlled
 // labels (model IDs, worker URLs, normalized paths), never user-controlled input.
@@ -374,6 +375,24 @@ pub fn register_jemalloc_as_global_allocator() {
 }
 
 pub(crate) fn init_metrics() {
+    // What the Symphony tables read that was not content, reasoning or a call
+    // (`routers::grpc::regular::symphony::telemetry`).
+    describe_counter!(
+        symphony_telemetry::OUTPUTS,
+        "Outputs a Symphony table read to their end, by table and outcome: clean, malformed (a call region the table gave up on, folded into the content), failed (the table refused the output and the request failed)"
+    );
+    describe_counter!(
+        symphony_telemetry::MALFORMED,
+        "Malformed runs in the outputs a Symphony table read, by table and reason (unterminated_region, invalid_arguments, unknown_tool, other)"
+    );
+    describe_histogram!(
+        symphony_telemetry::MALFORMED_BYTES,
+        "Bytes of the malformed runs of one output a Symphony table read, by table; observed for every output with at least one"
+    );
+    describe_counter!(
+        symphony_telemetry::CALLS_SUPPRESSED,
+        "Tool calls after the first that a Symphony table read and the gateway dropped under parallel_tool_calls: false, by table"
+    );
     describe_counter!("smg_tokenizer_cache_lookups_total", "Tokenizer cache lookups by layer and result; L1 includes inputs without cacheable boundaries and excludes L0 hits");
     describe_counter!(
         "smg_tokenizer_cache_evictions_total",
@@ -1194,6 +1213,10 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
     // (seconds): its own buckets, or the recorder renders it as a summary.
     let retry_backoff_matcher = Matcher::Full(String::from("smg_worker_retry_backoff_seconds"));
 
+    // The malformed bytes of an output run from a marker's worth to a whole
+    // answer: their own buckets, or the recorder renders them as a summary.
+    let malformed_bytes_matcher = Matcher::Full(String::from(symphony_telemetry::MALFORMED_BYTES));
+
     HashMap::from([
         (duration_matcher, duration_bucket.clone()),
         (ttft_matcher, duration_bucket.clone()),
@@ -1210,6 +1233,10 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
         (kv_apply_matcher, KV_INDEX_MICRO_BUCKETS.to_vec()),
         (kv_lag_matcher, KV_EVENT_LAG_BUCKETS.to_vec()),
         (retry_backoff_matcher, WORKER_RETRY_BACKOFF_BUCKETS.to_vec()),
+        (
+            malformed_bytes_matcher,
+            symphony_telemetry::MALFORMED_BYTES_BUCKETS.to_vec(),
+        ),
     ])
 }
 

@@ -40,45 +40,14 @@ pub fn lfm2_5() -> Format {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        engine::Engine,
-        event::{Event, Events},
-        input::{EngineFinish, Input},
-        parser::Parser,
-        tagged::Declared,
-    };
+    use crate::{engine::Engine, event::Event, testing::drive, Declared};
 
     fn run(prompt: &str, output: &str) -> Vec<Event> {
-        let mut parser = Engine::new(lfm2_5(), Declared::default());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        parser
-            .feed(
-                Input::Delta {
-                    token_ids: &[],
-                    text: output,
-                    spans: &[],
-                },
-                &mut out,
-            )
-            .expect("delta");
-        parser
-            .feed(
-                Input::End {
-                    finish: EngineFinish::Stop,
-                },
-                &mut out,
-            )
-            .expect("end");
-        out.drain()
+        drive(
+            &mut Engine::new(lfm2_5(), Declared::default()),
+            prompt,
+            &[output],
+        )
     }
 
     fn text_of(events: &[Event], reasoning: bool) -> String {

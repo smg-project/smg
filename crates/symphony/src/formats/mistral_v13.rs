@@ -43,80 +43,20 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, Events, FinishReason},
-        input::{EngineFinish, Input},
-        parser::Parser,
-        tagged::Declared,
+        event::{DropReason, Event, FinishReason},
+        testing::{calls, content, drive, reasoning},
+        Declared,
     };
 
     /// The generation prompt's tail: the user turn's close, and nothing more.
     const PROMPT: &str = "[/INST]";
 
     fn run(prompt: &str, output: &str) -> Vec<Event> {
-        let mut parser = Engine::new(mistral_v13(), Declared::default());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        parser
-            .feed(
-                Input::Delta {
-                    token_ids: &[],
-                    text: output,
-                    spans: &[],
-                },
-                &mut out,
-            )
-            .expect("delta");
-        parser
-            .feed(
-                Input::End {
-                    finish: EngineFinish::Stop,
-                },
-                &mut out,
-            )
-            .expect("end");
-        out.drain()
-    }
-
-    fn calls(events: &[Event]) -> Vec<(String, String)> {
-        let mut calls: Vec<(String, String)> = Vec::new();
-        for event in events {
-            match event {
-                Event::ToolCallStart { name, .. } => calls.push((name.clone(), String::new())),
-                Event::ToolCallArguments { json, .. } => {
-                    calls.last_mut().expect("a call started").1.push_str(json);
-                }
-                _ => {}
-            }
-        }
-        calls
-    }
-
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn reasoning(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
+        drive(
+            &mut Engine::new(mistral_v13(), Declared::default()),
+            prompt,
+            &[output],
+        )
     }
 
     /// The engine's finish: its reason as the engine gave it (the adapters refine it to

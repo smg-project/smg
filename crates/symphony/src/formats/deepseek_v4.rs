@@ -60,7 +60,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::ids::CallIds;
+    use crate::{
+        ids::CallIds,
+        testing::{arguments_of, bytes, content, drive, reasoning},
+    };
 
     fn ids() -> CallIds {
         CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
@@ -70,7 +73,7 @@ mod tests {
         event::{DropReason, Event, Events, MalformedReason, Text},
         input::{EngineFinish, Input},
         parser::Parser,
-        tagged::Declared,
+        Declared,
     };
 
     /// The turn the reference encoder renders for its first test, after the prompt's `<think>`: a
@@ -98,84 +101,11 @@ mod tests {
     );
 
     fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
-        let mut parser = Engine::with_call_ids(Arc::new(deepseek_v4()), Declared::default(), ids());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        for piece in pieces {
-            parser
-                .feed(
-                    Input::Delta {
-                        token_ids: &[],
-                        text: piece,
-                        spans: &[],
-                    },
-                    &mut out,
-                )
-                .expect("delta");
-        }
-        parser
-            .feed(
-                Input::End {
-                    finish: EngineFinish::Stop,
-                },
-                &mut out,
-            )
-            .expect("end");
-        out.drain()
-    }
-
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
-    }
-
-    fn arguments_of(events: &[Event], call: u32) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallArguments { index, json, .. } if *index == call => {
-                    Some(json.as_str())
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn content_of(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn reasoning_of(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
+        drive(
+            &mut Engine::with_call_ids(Arc::new(deepseek_v4()), Declared::default(), ids()),
+            prompt,
+            pieces,
+        )
     }
 
     fn calls_of(events: &[Event]) -> Vec<(u32, String)> {
@@ -254,7 +184,7 @@ mod tests {
         // values are JSON.
         let events = run("<｜Assistant｜></think>", &[ANSWER]);
         assert_eq!(bytes(&events), ANSWER);
-        assert_eq!(content_of(&events), "Sure, adding them.\n\n");
+        assert_eq!(content(&events), "Sure, adding them.\n\n");
         assert_eq!(calls_of(&events), [(0, "add_integers".to_string())]);
         assert_eq!(arguments_of(&events, 0), r#"{"a": 17, "b": 25}"#);
         assert!(matches!(
@@ -277,7 +207,7 @@ mod tests {
             arguments_of(&events, 0),
             r#"{"text": "hello", "count": 42, "enabled": true}"#
         );
-        assert_eq!(content_of(&events), "");
+        assert_eq!(content(&events), "");
     }
 
     #[test]
@@ -311,7 +241,7 @@ mod tests {
         ] {
             let whole = run(prompt, &[output]);
             let whole_arguments = arguments_of(&whole, 0);
-            let whole_content = content_of(&whole);
+            let whole_content = content(&whole);
             for cut in 1..output.len() {
                 if !output.is_char_boundary(cut) {
                     continue;
@@ -319,7 +249,7 @@ mod tests {
                 let events = run(prompt, &[&output[..cut], &output[cut..]]);
                 assert_eq!(bytes(&events), output, "cut at {cut}");
                 assert_eq!(arguments_of(&events, 0), whole_arguments, "cut at {cut}");
-                assert_eq!(content_of(&events), whole_content, "cut at {cut}");
+                assert_eq!(content(&events), whole_content, "cut at {cut}");
                 assert!(
                     matches!(events.last(), Some(Event::Finish { tool_calls: 1, .. })),
                     "cut at {cut}"
@@ -384,7 +314,7 @@ mod tests {
         // Closed first, as the encoder renders it, the same block is the same call.
         let closed = format!("Let me call.</think>{}", &output["Let me call.".len()..]);
         let events = run("<｜Assistant｜><think>", &[&closed]);
-        assert_eq!(reasoning_of(&events), "Let me call.");
+        assert_eq!(reasoning(&events), "Let me call.");
         assert_eq!(calls_of(&events), [(0, "f".to_string())]);
         assert_eq!(arguments_of(&events, 0), r#"{"a": "x"}"#);
     }
@@ -401,7 +331,7 @@ mod tests {
         assert_eq!(arguments_of(&events, 0), r#"{"a": "x"}"#);
         // The newline between `</think>` and the block is the template's spacing, dropped; the
         // one after the block comes before text, so it is the text's.
-        assert_eq!(content_of(&events), "\nThe weather is sunny.");
+        assert_eq!(content(&events), "\nThe weather is sunny.");
     }
 
     /// The whitespace the engine dropped as the template's spacing, event by event.
@@ -444,7 +374,7 @@ mod tests {
                     &mut out,
                 )
                 .expect("delta");
-            deltas.push(content_of(&out.drain()));
+            deltas.push(content(&out.drain()));
         }
         parser
             .feed(
@@ -454,7 +384,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        deltas.push(content_of(&out.drain()));
+        deltas.push(content(&out.drain()));
         deltas.retain(|delta| !delta.is_empty());
         deltas
     }
@@ -467,7 +397,7 @@ mod tests {
         // what the whole answer has: no content.
         let prompt = "<｜Assistant｜><think>";
         let whole = run(prompt, &[OUTPUT]);
-        assert_eq!(content_of(&whole), "");
+        assert_eq!(content(&whole), "");
         assert_eq!(spacing(&whole), ["\n\n"]);
         let per_char: Vec<&str> = OUTPUT
             .char_indices()
@@ -480,7 +410,7 @@ mod tests {
         for pieces in [per_char, tokens] {
             let events = run(prompt, &pieces);
             assert_eq!(bytes(&events), OUTPUT, "{pieces:?}");
-            assert_eq!(content_of(&events), "", "{pieces:?}");
+            assert_eq!(content(&events), "", "{pieces:?}");
             assert_eq!(spacing(&events), ["\n\n"], "{pieces:?}");
             assert_eq!(
                 arguments_of(&events, 0),
@@ -497,7 +427,7 @@ mod tests {
         let (text, block) = ANSWER.split_once("\n\n").expect("the content's end");
         let pieces = [text, "\n\n", block];
         let events = run("<｜Assistant｜></think>", &pieces);
-        assert_eq!(content_of(&events), "Sure, adding them.\n\n");
+        assert_eq!(content(&events), "Sure, adding them.\n\n");
         assert_eq!(spacing(&events), Vec::<&str>::new());
         assert_eq!(
             content_deltas("<｜Assistant｜></think>", &pieces),
@@ -543,12 +473,12 @@ mod tests {
             &["A thought.</think>Hi"],
         );
         assert_eq!(events[0], Event::ReasoningStart);
-        assert_eq!(reasoning_of(&events), "A thought.");
-        assert_eq!(content_of(&events), "Hi");
+        assert_eq!(reasoning(&events), "A thought.");
+        assert_eq!(content(&events), "Hi");
         // Chat mode writes `</think>` right after the assistant token: the output is content.
         let events = run("<｜User｜>hi<｜Assistant｜></think>", &["Hello"]);
         assert_eq!(events[0], Event::Content(Text::uncounted("Hello")));
-        assert_eq!(reasoning_of(&events), "");
+        assert_eq!(reasoning(&events), "");
     }
 
     #[test]
@@ -616,11 +546,7 @@ mod tests {
 
     /// What the turn said: the reasoning, the content, and the first call's arguments.
     fn said(events: &[Event]) -> (String, String, String) {
-        (
-            reasoning_of(events),
-            content_of(events),
-            arguments_of(events, 0),
-        )
+        (reasoning(events), content(events), arguments_of(events, 0))
     }
 
     #[test]
@@ -637,8 +563,8 @@ mod tests {
                 .any(|event| matches!(event, Event::Content(_))),
             "{events:?}"
         );
-        assert_eq!(reasoning_of(&events), "");
-        assert_eq!(content_of(&events), "");
+        assert_eq!(reasoning(&events), "");
+        assert_eq!(content(&events), "");
         assert_eq!(calls_of(&events), [(0, "get_weather".to_string())]);
         assert_eq!(bytes(&events), format!("</think>{after}"));
         // The thought, then the calls: read as after `<｜Assistant｜><think>`.
@@ -648,16 +574,16 @@ mod tests {
             said(&events),
             said(&run("<｜User｜>q<｜Assistant｜><think>", &[OUTPUT]))
         );
-        assert_eq!(reasoning_of(&events), thought);
-        assert_eq!(content_of(&events), "");
+        assert_eq!(reasoning(&events), thought);
+        assert_eq!(content(&events), "");
         assert_eq!(calls_of(&events), [(0, "get_weather".to_string())]);
         // Content after the thought.
         let events = run(
             TRAILING_SYSTEM_PROMPT,
             &["The notes are context.</think>Running the suite."],
         );
-        assert_eq!(reasoning_of(&events), "The notes are context.");
-        assert_eq!(content_of(&events), "Running the suite.");
+        assert_eq!(reasoning(&events), "The notes are context.");
+        assert_eq!(content(&events), "Running the suite.");
     }
 
     #[test]
@@ -667,8 +593,8 @@ mod tests {
         // result, move nothing: the prompt opens no turn, and nothing of it is replayed.
         let events = run(AGENT_LATER_TURN_PROMPT, &[OUTPUT]);
         assert_eq!(events[0], Event::ReasoningStart);
-        assert_eq!(reasoning_of(&events), thought);
-        assert_eq!(content_of(&events), "");
+        assert_eq!(reasoning(&events), thought);
+        assert_eq!(content(&events), "");
         assert_eq!(calls_of(&events), [(0, "get_weather".to_string())]);
         // An earlier turn the template opened, then a user turn and a system note: the turn's end
         // after the last opener says the prompt opens no turn for the model.
@@ -678,12 +604,12 @@ mod tests {
         );
         let events = run(prompt, &["r2</think>a2"]);
         assert_eq!(events[0], Event::ReasoningStart);
-        assert_eq!(reasoning_of(&events), "r2");
-        assert_eq!(content_of(&events), "a2");
+        assert_eq!(reasoning(&events), "r2");
+        assert_eq!(content(&events), "a2");
         // The model's own turn continued without its end is a prefill the output goes on with.
         let events = run("<｜User｜>u<｜Assistant｜></think>Sure,", &[" here it is."]);
         assert!(!events.contains(&Event::ReasoningStart), "{events:?}");
-        assert_eq!(content_of(&events), " here it is.");
+        assert_eq!(content(&events), " here it is.");
     }
 
     #[test]
@@ -756,7 +682,7 @@ mod tests {
         let events = run("<｜Assistant｜><think>", &[output]);
         assert_eq!(bytes(&events), output);
         assert!(calls_of(&events).is_empty());
-        assert_eq!(content_of(&events), &output["</think>".len()..]);
+        assert_eq!(content(&events), &output["</think>".len()..]);
         assert!(matches!(
             events.last(),
             Some(Event::Finish { tool_calls: 0, .. })
@@ -870,17 +796,17 @@ mod tests {
             let prompt = format!("<｜Assistant｜>{}", turn.tail);
             let events = run(&prompt, &[turn.output]);
             assert_eq!(bytes(&events), turn.output, "{:?}", turn.output);
-            assert_eq!(reasoning_of(&events), turn.reasoning, "{:?}", turn.output);
+            assert_eq!(reasoning(&events), turn.reasoning, "{:?}", turn.output);
             // The two newlines the template writes before a block follow the content here,
             // exactly two of them, where there is content; the encoder's parser skips them
             // (bellwether #17). Where the thought's close is all that comes before them, they
             // are the template's spacing, dropped, as the encoder's parser has it.
-            let content = if turn.calls.is_empty() || turn.content.is_empty() {
+            let expected = if turn.calls.is_empty() || turn.content.is_empty() {
                 turn.content.to_string()
             } else {
                 format!("{}\n\n", turn.content)
             };
-            assert_eq!(content_of(&events), content, "{:?}", turn.output);
+            assert_eq!(content(&events), expected, "{:?}", turn.output);
             let read: Vec<(String, serde_json::Value)> = calls_of(&events)
                 .into_iter()
                 .map(|(index, name)| {
@@ -935,8 +861,8 @@ mod tests {
                 arguments_of(&whole, 0),
                 "cut at {cut}"
             );
-            assert_eq!(content_of(&events), content_of(&whole), "cut at {cut}");
-            assert_eq!(reasoning_of(&events), reasoning_of(&whole), "cut at {cut}");
+            assert_eq!(content(&events), content(&whole), "cut at {cut}");
+            assert_eq!(reasoning(&events), reasoning(&whole), "cut at {cut}");
             assert!(
                 !events
                     .iter()

@@ -17,8 +17,8 @@
 use openai_protocol::common::Tool;
 use serde_json::Value;
 
-use super::{calls, CallMarkers, Count, Grammar, WayIn};
-use crate::tagged::keyed::Tags;
+use super::{calls, CallMarkers, Count, Grammar, Tag, WayIn};
+use crate::{format::Whitespace, tagged::keyed::Tags};
 
 /// The calls for `tools`: in a block, the block's ways in around one or more calls (one, when
 /// `count` asks for one); without one, one tag per tool, triggered by the call's opener.
@@ -56,6 +56,34 @@ pub(super) fn calls(
             before => Grammar::Sequence(vec![all, Grammar::ConstString(before.to_string())]),
         }
     })
+}
+
+/// Keyed arguments in the compact spelling (GLM 4.7 and later, IQuest): each call is the call
+/// opener and the tool's name, the schema written in the engines' `glm_xml` style (`<arg_key>`
+/// and `<arg_value>` pairs with nothing between them), and the call's close; the shape
+/// xgrammar's built-in GLM tag has and the gateway writes today. Ling's and Hy4's spellings
+/// are not this one, and are written from their own tags instead ([`calls()`]).
+pub(super) fn compact_calls(
+    markers: &CallMarkers<'_>,
+    tools: &[&Tool],
+    count: Count<'_>,
+) -> Grammar {
+    let tags = tools
+        .iter()
+        .map(|tool| {
+            Tag::new(
+                format!("{}{}", markers.call_open, tool.function.name),
+                Grammar::JsonSchema {
+                    schema: tool.function.parameters.clone(),
+                    style: Some("glm_xml".to_string()),
+                    excludes: Vec::new(),
+                    whitespace: Whitespace::Free,
+                },
+                markers.call_close,
+            )
+        })
+        .collect();
+    count.triggered(vec![markers.call_open.to_string()], tags)
 }
 
 /// What ends a value: its own closing tag, and the terminals the table has a row for out of the

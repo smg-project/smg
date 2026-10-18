@@ -10,6 +10,7 @@
 //!
 //! [`Format`]: crate::Format
 //! [`Engine`]: crate::Engine
+pub mod deepseek_v3_2;
 pub mod deepseek_v4;
 pub mod deepseek_v4_1;
 pub mod dots3;
@@ -23,6 +24,7 @@ pub mod inkling;
 pub mod iquest;
 pub mod json;
 pub mod k2_horizon;
+pub mod kimi_k2;
 pub mod kimi_k3;
 pub mod lfm2_5;
 pub mod ling;
@@ -40,6 +42,7 @@ pub mod registry;
 pub mod seed_oss;
 pub mod xlam;
 
+pub use deepseek_v3_2::deepseek_v3_2;
 pub use deepseek_v4::deepseek_v4;
 pub use deepseek_v4_1::deepseek_v4_1;
 pub use dots3::dots3;
@@ -53,6 +56,7 @@ pub use inkling::inkling;
 pub use iquest::iquest;
 pub use json::json;
 pub use k2_horizon::k2_horizon;
+pub use kimi_k2::kimi_k2;
 pub use kimi_k3::kimi_k3;
 pub use lfm2_5::lfm2_5;
 pub use ling::ling;

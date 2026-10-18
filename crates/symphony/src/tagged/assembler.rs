@@ -29,8 +29,9 @@ use crate::{
     markers::{Piece, Scanner},
     tagged::{
         end_cut_call,
-        value::{json, Declared, Kind, NULL_WORDS},
+        value::{json, Kind, NULL_WORDS},
     },
+    Declared,
 };
 
 const FUNCTION_OPEN: usize = 0;
@@ -143,6 +144,7 @@ impl Assembler {
 
     /// Whether the call has closed, at `</function>` or as a block that never named a function;
     /// `feed` takes nothing after that, so the format stops here.
+    #[cfg(test)]
     pub fn done(&self) -> bool {
         self.done
     }
@@ -691,6 +693,7 @@ mod tests {
     use serde_json::{json as value, Value};
 
     use super::*;
+    use crate::testing::bytes;
 
     /// A tool `f` with a string `city`, an integer `limit`, a nullable string `note` and nothing
     /// declared for `extra`.
@@ -758,15 +761,6 @@ mod tests {
                 _ => None,
             })
             .collect()
-    }
-
-    /// Every byte the events account for, in order.
-    fn bytes(events: &[Event]) -> String {
-        let mut list = Events::new();
-        for event in events {
-            list.push(event.clone());
-        }
-        list.text()
     }
 
     fn name_of(events: &[Event]) -> Option<&str> {

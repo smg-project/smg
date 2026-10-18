@@ -250,7 +250,7 @@ pub(super) fn processor(with_tools: bool) -> StreamingProcessor {
     StreamingProcessor::new(
         ToolParserFactory::new(),
         ReasoningParserFactory::new(),
-        utils::ParserResolver::new(
+        utils::ParserResolver::with_flags(
             Arc::new(WorkerRegistry::new()),
             with_tools.then(|| "json".to_string()),
             Some("qwen3".to_string()),
@@ -1062,7 +1062,11 @@ async fn byte_fallback_unary_valid_reasoning_counts_original_tokens() {
     let processor = ResponseProcessor::new(
         ToolParserFactory::new(),
         ReasoningParserFactory::new(),
-        utils::ParserResolver::new(Arc::new(WorkerRegistry::new()), None, Some("qwen3".into())),
+        utils::ParserResolver::with_flags(
+            Arc::new(WorkerRegistry::new()),
+            None,
+            Some("qwen3".into()),
+        ),
     );
     for ids in [
         b"<think>ab</think>de"
@@ -1560,7 +1564,7 @@ async fn kimi_k3_cut_inside_the_closing_structure_keeps_the_markers_out_of_conte
     for (cut, finish) in [(6, "length"), (8, "length"), (9, "stop")] {
         let text: String = tokens[..cut].concat();
         let resolver = || {
-            utils::ParserResolver::new(
+            utils::ParserResolver::with_flags(
                 Arc::new(WorkerRegistry::new()),
                 Some("kimi_k3".to_string()),
                 Some("kimi_k3".to_string()),
@@ -1714,7 +1718,7 @@ async fn chat_unary_logprobs_cover_the_content_only() {
     let (response, _) = ResponseProcessor::new(
         ToolParserFactory::new(),
         ReasoningParserFactory::new(),
-        utils::ParserResolver::new(
+        utils::ParserResolver::with_flags(
             Arc::new(WorkerRegistry::new()),
             None,
             Some("qwen3".to_string()),
@@ -2022,7 +2026,7 @@ async fn messages_stream_stop_reason_follows_what_the_engine_matched() {
 /// and the stop reason.
 async fn qwen_xml_messages(text: &str, finish: &str, stream: bool) -> (Vec<String>, String) {
     let resolver = || {
-        utils::ParserResolver::new(
+        utils::ParserResolver::with_flags(
             Arc::new(WorkerRegistry::new()),
             Some("qwen_xml".to_string()),
             None,
@@ -2324,7 +2328,7 @@ fn stub_processor(in_reasoning: bool) -> StreamingProcessor {
     tools
         .registry()
         .register_parser("call-first", || Box::new(CallFirst::default()));
-    let resolver = utils::ParserResolver::new(
+    let resolver = utils::ParserResolver::with_flags(
         Arc::new(WorkerRegistry::new()),
         Some("call-first".to_string()),
         Some("reasoning-but-text".to_string()),
@@ -2478,7 +2482,7 @@ fn named_processor(tool: &str, reasoning: &str) -> StreamingProcessor {
     StreamingProcessor::new(
         ToolParserFactory::new(),
         ReasoningParserFactory::new(),
-        utils::ParserResolver::new(
+        utils::ParserResolver::with_flags(
             Arc::new(WorkerRegistry::new()),
             Some(tool.to_string()),
             Some(reasoning.to_string()),
@@ -2650,7 +2654,7 @@ async fn gemma4_rendered_prompt_state_controls_chat_responses() {
                         "parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}]
                 }))
                 .unwrap();
-                let resolver = utils::ParserResolver::new(
+                let resolver = utils::ParserResolver::with_flags(
                     Arc::new(WorkerRegistry::new()),
                     Some("gemma4".to_string()),
                     configured.map(str::to_string),
@@ -2780,7 +2784,7 @@ async fn gemma4_rendered_prompt_state_controls_messages_responses() {
                     "thinking":{"type":"enabled", "budget_tokens":1024},
                     "tools":[{"name":"lookup", "input_schema":{"type":"object","properties":{"q":{"type":"string"}}}}]
                 })).unwrap();
-                let resolver = utils::ParserResolver::new(
+                let resolver = utils::ParserResolver::with_flags(
                     Arc::new(WorkerRegistry::new()),
                     Some("gemma4".to_string()),
                     configured.map(str::to_string),
@@ -3018,7 +3022,7 @@ plan<|tool_call>call:lookup{q:<|"|>Paris<|"|>}<tool_call|>"#;
         let processor = ResponseProcessor::new(
             ToolParserFactory::new(),
             ReasoningParserFactory::new(),
-            utils::ParserResolver::new(
+            utils::ParserResolver::with_flags(
                 Arc::new(WorkerRegistry::new()),
                 Some("gemma4".to_string()),
                 Some("gemma4".to_string()),
@@ -3551,7 +3555,7 @@ const TWO_JSON_CALLS: [&str; 2] = [
 ];
 
 fn qwen_resolver() -> utils::ParserResolver {
-    utils::ParserResolver::new(
+    utils::ParserResolver::with_flags(
         Arc::new(WorkerRegistry::new()),
         Some("qwen".to_string()),
         None,

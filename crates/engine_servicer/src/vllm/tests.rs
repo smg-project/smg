@@ -1685,7 +1685,7 @@ async fn get_tokenizer_streams_a_bundle_the_router_loader_accepts() {
             let entry = archive.by_index(index).unwrap();
             assert!(entry.is_file());
             assert_eq!(entry.compression(), CompressionMethod::Deflated);
-            entry.name().to_string()
+            entry.name().unwrap().into_owned()
         })
         .collect();
     assert_eq!(

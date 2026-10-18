@@ -139,7 +139,8 @@ Three tiers, two of them at run time:
 
 - **Dropped**: bytes the format consumed on purpose, each with a `DropReason`: a marker that moved
   the engine or a special token (`ControlToken`, `Wrapper`), the template's wrapping between regions
-  (`Wrapper`), whitespace the format treats as structural (`Whitespace`). Dropped bytes are
+  (`Wrapper`), whitespace the format treats as structural (`Whitespace`), a call after the first
+  where the request takes one call only (`LaterCall`). Dropped bytes are
   expected on every well-formed output.
 - **Malformed**: bytes of a region the parser gave up on, returned whole, each with a
   `MalformedReason` from a closed set: the stream ended inside a region (`UnterminatedRegion`),
@@ -194,8 +195,9 @@ outputs at every chunking. `tests/robustness.rs` asks whether any output a model
 from a table's own markers and corrupted, can panic the parser or break the contract.
 `tests/bellwether_parse_fixtures.rs` asks whether the tables read the recorded corpus as the
 chat templates' own round trip does, byte for byte, at every chunking (opt-in, against a checkout
-of the recorded sets). `tests/shape_regex.rs` and `tests/templates.rs` ask whether the shaped
-syntax and the compiled tables agree with the reference implementations they stand in for. The
+of the recorded sets). `tests/bellwether_shape_regex.rs` and `tests/bellwether_templates.rs` ask
+whether the shaped syntax and the compiled tables agree with the reference implementations they
+stand in for, against the shape patterns' oracle bellwether records (opt-in, the same tree). The
 bench asks what it costs. A change to the engine or an assembler carries the first three; a change
 to a table carries its unit tests and the corpus row; a change to the decode path carries the
 bench's rows.

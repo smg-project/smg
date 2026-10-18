@@ -14,22 +14,23 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{future::Future, time::Duration};
 
+use common::grpc_harness::{
+    build_grpc_router, grpc_router_config, grpc_workers, serve_canned_worker, serve_engine, Canned,
+};
 use metrics_exporter_prometheus::PrometheusBuilder;
-use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use proto::generate_response::Response as GenResp;
 use smg::{
-    config::{RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
-    routers::{RouterFactory, RouterTrait},
+    routers::RouterTrait,
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
+    worker::{RuntimeType, WorkerType},
 };
 use smg_grpc_client::vllm_proto as proto;
-use tokio::{net::TcpListener, sync::mpsc};
-use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
-use tonic::{transport::Server, Request, Response, Status};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status};
 
 const MODEL: &str = "pd-ttft-phases-test-model";
 /// Tokens every mock answers with; ids 1..=3 are in the mock tokenizer's vocabulary.
@@ -192,115 +193,38 @@ impl proto::vllm_engine_server::VllmEngine for DelayedEngine {
 }
 
 /// Serve a sequential-dispatch mock engine in-process; returns its port.
-#[expect(
-    clippy::expect_used,
-    clippy::disallowed_methods,
-    reason = "test helper - panicking on failure is intentional; the spawned \
-              mock server task is fire-and-forget for the test process's lifetime"
-)]
 async fn start_mock_engine(engine: DelayedEngine) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock engine");
-    let port = listener.local_addr().expect("mock engine address").port();
-    tokio::spawn(
-        Server::builder()
-            .add_service(proto::vllm_engine_server::VllmEngineServer::new(engine))
-            .serve_with_incoming(TcpListenerStream::new(listener)),
-    );
-    port
+    serve_engine(proto::vllm_engine_server::VllmEngineServer::new(engine)).await
 }
 
 /// Serve the mock-worker crate's canned worker in-process (a parallel-dispatch
 /// runtime once registered as one): one up-front `delay`, then `OUTPUT_TOKENS`
 /// tokens; returns its port.
-#[expect(
-    clippy::expect_used,
-    clippy::disallowed_methods,
-    reason = "test helper - panicking on failure is intentional; the spawned \
-              mock server task is fire-and-forget for the test process's lifetime"
-)]
 async fn start_mock_grpc_worker(delay: Duration) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock gRPC worker");
-    let port = listener
-        .local_addr()
-        .expect("mock gRPC worker address")
-        .port();
-    let cfg = Arc::new(mock_worker::config::Config {
-        admin_port: None,
-        context_length: 32768,
-        host: "127.0.0.1".to_string(),
-        http_base_port: 0,
-        http_count: 0,
-        grpc_base_port: port,
-        grpc_count: 1,
-        zmq_handshake: None,
-        zmq_count: 0,
-        zmq_start_index: 0,
-        model_id: MODEL.to_string(),
-        tokenizer_path: MODEL.to_string(),
+    serve_canned_worker(Canned {
+        model: MODEL,
         gen_delay: delay,
         output_tokens: OUTPUT_TOKENS,
-        realistic: false,
-        engine: mock_worker::engine::EngineParams::default(),
-        ..mock_worker::config::Config::default()
-    });
-    tokio::spawn(mock_worker::grpc::serve_with_listener(cfg, listener));
-    port
+    })
+    .await
 }
 
 /// A PD gRPC router over one prefill and one decode worker registered as
 /// `runtime`, which picks the dispatch shape.
-#[expect(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
 async fn build_pd_router(
     prefill_port: u16,
     decode_port: u16,
     runtime: RuntimeType,
 ) -> Box<dyn RouterTrait> {
-    let mut config = RouterConfig::builder()
-        .mode(RoutingMode::PrefillDecode {
-            prefill_urls: vec![],
-            decode_urls: vec![],
-            prefill_policy: None,
-            decode_policy: None,
-        })
-        .grpc_connection()
+    let config = grpc_router_config()
+        .prefill_decode_mode(vec![], vec![])
         .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(1024 * 1024)
         .build_unchecked();
-    config.health_check.disable_health_check = true;
-
-    let app_context = common::create_test_context_with_mock_tokenizer(config, MODEL).await;
-    for (port, worker_type) in [
+    let legs = [
         (prefill_port, WorkerType::Prefill),
         (decode_port, WorkerType::Decode),
-    ] {
-        let worker = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
-            .worker_type(worker_type)
-            .connection_mode(ConnectionMode::Grpc)
-            .runtime_type(runtime)
-            .model(ModelCard::new(MODEL))
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
-            .build();
-        app_context
-            .worker_registry
-            .register(Arc::new(worker))
-            .unwrap();
-    }
-    RouterFactory::create_router(&app_context)
-        .await
-        .expect("PD gRPC router should build")
+    ];
+    build_grpc_router(config, MODEL, grpc_workers(&legs, runtime, MODEL)).await
 }
 
 fn tenant() -> TenantRequestMeta {

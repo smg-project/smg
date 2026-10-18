@@ -40,7 +40,7 @@ mod tests {
         event::{DropReason, Event, Events, Text},
         input::{EngineFinish, Input},
         parser::Parser,
-        tagged::Declared,
+        Declared,
     };
 
     /// A call as the template writes it: the value between the parameter tags directly.

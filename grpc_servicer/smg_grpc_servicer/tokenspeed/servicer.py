@@ -44,6 +44,7 @@ from tokenspeed.runtime.multimodal.inputs import (
 from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
 from tokenspeed.runtime.pd.kv_events import KVEventBatch
 
+from smg_grpc_servicer import mm_shm
 from smg_grpc_servicer.kv_events import endpoint_for_rank, stream_kv_events
 from smg_grpc_servicer.mm_rdma import RdmaPixelPuller
 from smg_grpc_servicer.tokenizer_bundle import build_tokenizer_zip, tokenizer_chunks
@@ -96,11 +97,6 @@ LOG_MM_TIMING = os.getenv("TOKENSPEED_LOG_MM_TIMING", "").lower() in (
     "1",
     "true",
     "yes",
-)
-UNLINK_MM_SHM_AFTER_READ = os.getenv("TOKENSPEED_UNLINK_MM_SHM_AFTER_READ", "1").lower() not in (
-    "0",
-    "false",
-    "no",
 )
 
 
@@ -1606,7 +1602,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         copied so it never aliases the transient proto bytes.
         """
         shape = list(tensor_data.shape)
-        raw = TokenSpeedSchedulerServicer._tensor_payload_bytes(tensor_data)
+        raw = mm_shm.tensor_payload_bytes(tensor_data)
 
         if tensor_data.dtype == "bfloat16":
             # numpy has no bfloat16 — read the raw bits as uint16, reinterpret.
@@ -1668,53 +1664,8 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 f"shape={list(shape)}: expected {expected}, got {int(shm.nbytes)}"
             )
 
-        name = TokenSpeedSchedulerServicer._validated_shm_name(shm.name)
+        name = mm_shm.validated_shm_name(shm.name)
         return ShmTensorHandle(shm_name=name, shape=shape, dtype=dtype)
-
-    @staticmethod
-    def _tensor_payload_bytes(tensor_data: tokenspeed_scheduler_pb2.TensorData) -> bytes:
-        payload = tensor_data.WhichOneof("payload")
-        if payload == "inline":
-            return bytes(tensor_data.inline)
-        if payload == "shm":
-            return TokenSpeedSchedulerServicer._tensor_payload_bytes_from_shm(tensor_data.shm)
-        if payload == "remote":
-            raise ValueError("TensorData.remote payload is not implemented yet")
-        raise ValueError("TensorData payload is required")
-
-    @staticmethod
-    def _tensor_payload_bytes_from_shm(
-        shm_handle: common_pb2.ShmHandle,
-    ) -> bytes:
-        name = TokenSpeedSchedulerServicer._validated_shm_name(shm_handle.name)
-
-        path = os.path.join("/dev/shm", name)
-        fd = None
-        try:
-            fd = os.open(path, os.O_RDONLY)
-            raw = os.pread(fd, int(shm_handle.nbytes), int(shm_handle.offset))
-        finally:
-            if fd is not None:
-                os.close(fd)
-            if fd is not None and UNLINK_MM_SHM_AFTER_READ:
-                try:
-                    os.unlink(path)
-                except FileNotFoundError:
-                    pass
-
-        if len(raw) != int(shm_handle.nbytes):
-            raise ValueError(
-                f"TensorData.shm byte length mismatch for name={shm_handle.name!r}: "
-                f"expected {int(shm_handle.nbytes)}, got {len(raw)}"
-            )
-        return raw
-
-    @staticmethod
-    def _validated_shm_name(name: str) -> str:
-        name = name.lstrip("/")
-        if not name or "/" in name or name in (".", "..") or "\x00" in name:
-            raise ValueError(f"Invalid TensorData.shm name: {name!r}")
-        return name
 
     @staticmethod
     def _torch_dtype_from_proto(dtype: str) -> torch.dtype:

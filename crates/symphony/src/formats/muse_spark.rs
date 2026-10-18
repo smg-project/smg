@@ -197,11 +197,11 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, Events, Text},
+        event::{DropReason, Event, Text},
         grammar::{GrammarStart, Options},
-        input::{EngineFinish, Input},
-        parser::Parser,
-        tagged::Declared,
+        input::EngineFinish,
+        testing::{bytes, content, drive_to, reasoning},
+        Declared,
     };
 
     fn tool(name: &str, parameters: Value) -> Tool {
@@ -263,49 +263,16 @@ mod tests {
     );
 
     fn run_with(prompt: &str, pieces: &[&str], finish: EngineFinish) -> Vec<Event> {
-        let mut parser = Engine::new(muse_spark(), declared());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        for piece in pieces {
-            parser
-                .feed(
-                    Input::Delta {
-                        token_ids: &[],
-                        text: piece,
-                        spans: &[],
-                    },
-                    &mut out,
-                )
-                .expect("delta");
-        }
-        parser.feed(Input::End { finish }, &mut out).expect("end");
-        out.drain()
+        drive_to(
+            &mut Engine::new(muse_spark(), declared()),
+            prompt,
+            pieces,
+            finish,
+        )
     }
 
     fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
         run_with(prompt, pieces, EngineFinish::Stop)
-    }
-
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
     }
 
     /// The calls as (name, arguments) pairs, the arguments as the JSON value their fragments make.
@@ -329,26 +296,6 @@ mod tests {
                 let value = serde_json::from_str(&arguments)
                     .unwrap_or_else(|e| panic!("{name}: arguments {arguments:?}: {e}"));
                 (name, value)
-            })
-            .collect()
-    }
-
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn reasoning(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
-                _ => None,
             })
             .collect()
     }

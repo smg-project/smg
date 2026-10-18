@@ -68,6 +68,7 @@ impl Scanner {
     }
 
     /// The marker a [`Piece::Marker`] refers to.
+    #[cfg(test)]
     pub fn marker(&self, index: usize) -> &str {
         &self.markers[index]
     }

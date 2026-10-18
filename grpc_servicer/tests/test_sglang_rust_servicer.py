@@ -22,7 +22,7 @@ from types import SimpleNamespace
 
 import pytest
 from smg_grpc_servicer import rust_lifecycle
-from smg_grpc_servicer.sglang import plugin, rust, zmq_plugin
+from smg_grpc_servicer.sglang import plugin, rust
 
 
 def _install(monkeypatch, name: str, **attrs) -> types.ModuleType:
@@ -522,10 +522,6 @@ def _stub_rank_launch(monkeypatch, *, ranks: int = 2) -> dict:
         publish=lambda args, role: recorded["calls"].append(f"publish:{role}"),
     )
     _install(monkeypatch, "sglang.srt.server_args", PortArgs=PortArgs)
-    # The launch writes the plugin's two variables straight into the
-    # environment; registered here so the teardown puts their absence back.
-    monkeypatch.setenv(zmq_plugin.HANDSHAKE_ENV, "")
-    monkeypatch.setenv(zmq_plugin.ENGINE_INDEX_ENV, "")
     # SGLang's own setup sets the spawn method; the launcher's guard reads it
     # and must not switch this test process over.
     recorded["start_method_calls"] = []
@@ -574,8 +570,6 @@ def test_launch_scheduler_ranks_starts_them_from_this_process_as_the_headless_la
     from smg_grpc_servicer.sglang.zmq_plugin import ENGINE_INDEX_ENV, HANDSHAKE_ENV
 
     recorded = _stub_rank_launch(monkeypatch)
-    monkeypatch.delenv(HANDSHAKE_ENV, raising=False)
-    monkeypatch.delenv(ENGINE_INDEX_ENV, raising=False)
     monkeypatch.setattr(
         rust.multiprocessing,
         "get_context",
@@ -681,7 +675,6 @@ def test_serve_rust_starts_the_scheduler_ranks_from_this_process(
         init_servicer_tracing=lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(rust.multiprocessing, "get_context", lambda method: pytest.fail(method))
-    monkeypatch.delenv(HANDSHAKE_ENV, raising=False)
     monkeypatch.setenv(rust.HANDSHAKE_PORT_ENV, "24321")
     monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
     monkeypatch.setattr(rust, "model_facts", lambda args: {"model_path": args.model_path})

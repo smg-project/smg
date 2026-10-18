@@ -1,7 +1,7 @@
 //! The engine: one [`Parser`] that runs any [`Format`]. The scanner splits the model's text into
 //! text and the format's terminals, holding back a half-arrived terminal; the table says which
 //! state the text is in and where a terminal moves the engine; inside an arguments state the call
-//! syntax's assembler ([`json::Assembler`] or [`tagged::Assembler`]) turns the call into its
+//! syntax's assembler (`json::Assembler` or `tagged::Assembler`) turns the call into its
 //! events, streaming the model's own argument bytes.
 //!
 //! Every byte of the output lands in exactly one event: a terminal that moves the engine as
@@ -19,7 +19,7 @@ use std::{collections::VecDeque, sync::Arc};
 
 use crate::{
     event::{runs, DropReason, Event, Events, FinishReason, MalformedReason, Text},
-    format::{CallSyntax, Emits, Format, Replay},
+    format::{CallId, CallSyntax, Emits, Format, Replay},
     gemma,
     ids::CallIds,
     input::{EngineFinish, Input},
@@ -28,8 +28,9 @@ use crate::{
     parser::{ParseError, Parser},
     pythonic,
     shape::{self, Values},
-    tagged::{self, Declared},
+    tagged,
     tokens::Ledger,
+    Declared,
 };
 
 /// Why a call region closed: its closing terminal (or the next opener) arrived, or the stream
@@ -54,6 +55,9 @@ pub struct Engine {
     calls: u32,
     /// Where the output's call ids count from.
     ids: CallIds,
+    /// The ids this output's calls were given, in order: a table that carries the model's id
+    /// falls back to the minted one where a header repeats an id already given.
+    given_ids: Vec<String>,
     tokens: Ledger,
     reasoning_tokens: u32,
     stage: Stage,
@@ -253,19 +257,27 @@ fn assembler(
         Some(CallSyntax::Attributed(tags)) => {
             Box::new(tagged::attributed::Assembler::new(index, id, tags))
         }
-        Some(CallSyntax::NamedJson(marker)) => {
-            Box::new(json::named::Assembler::new(index, id, marker))
-        }
-        Some(CallSyntax::NamedArguments(marker)) => {
-            Box::new(json::named_arguments::Assembler::new(index, id, marker))
-        }
+        // The named call: a tool's name, a marker, then the call's object or its arguments alone.
+        Some(CallSyntax::NamedJson(marker)) => Box::new(json::named::Assembler::new(
+            index,
+            id,
+            marker,
+            json::named::After::Object,
+        )),
+        Some(CallSyntax::NamedArguments(marker)) => Box::new(json::named::Assembler::new(
+            index,
+            id,
+            marker,
+            json::named::After::Arguments,
+        )),
         Some(CallSyntax::ForcedArguments) => Box::new(json::forced::Assembler::new(index, id)),
         Some(CallSyntax::Gemma(spelling)) => Box::new(gemma::Assembler::new(index, id, spelling)),
         // A shaped call opens through its terminal's header, which the engine reads before it
         // enters the call's state with that assembler (`Engine::open_shaped`); a table that
         // validates enters the state no other way.
         Some(CallSyntax::Shaped(shape)) => Box::new(ShapedCall {
-            call: shape::Assembler::new(index, id, shape, values, None),
+            call: shape::Assembler::new(index, id, shape, values, None)
+                .with_call_id(CallId::Minted, &[]),
             declared: declared.clone(),
         }),
     }
@@ -332,6 +344,7 @@ impl Engine {
             call: None,
             calls: 0,
             ids,
+            given_ids: Vec::new(),
             tokens: Ledger::new(),
             reasoning_tokens: 0,
             stage: Stage::Fresh,
@@ -502,7 +515,8 @@ impl Engine {
         let id = self.ids.id(self.calls);
         let values = self.format.value_reader();
         let call =
-            shape::Assembler::new(self.calls, id, shape, values, terminal.chars().next_back());
+            shape::Assembler::new(self.calls, id, shape, values, terminal.chars().next_back())
+                .with_call_id(self.format.call_id_source(), &self.given_ids);
         Some(Pending {
             terminal: index,
             from,
@@ -917,8 +931,9 @@ impl Engine {
     /// region, with the ignored terminals that arrived among them placed where they arrived.
     fn push_call_events(&mut self, mut events: Events, out: &mut Events) {
         for event in events.drain() {
-            if matches!(event, Event::ToolCallStart { .. }) {
+            if let Event::ToolCallStart { id, .. } = &event {
                 self.calls += 1;
+                self.given_ids.push(id.clone());
             }
             for event in self.carried_into(event) {
                 out.push(self.tokens.relabel(event));
@@ -1140,6 +1155,7 @@ mod tests {
         formats::{glm, inkling, qwen3, xlam},
         input::TokenSpan,
         tagged::{Placement, Spelling},
+        testing::bytes,
     };
 
     fn declared() -> Declared {
@@ -1228,14 +1244,6 @@ mod tests {
             }
         }
         calls
-    }
-
-    fn bytes(events: &[Event]) -> String {
-        let mut list = Events::new();
-        for event in events {
-            list.push(event.clone());
-        }
-        list.text()
     }
 
     #[test]

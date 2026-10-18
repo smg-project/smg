@@ -425,6 +425,12 @@ impl AppContextBuilder {
         let router_config = self
             .router_config
             .ok_or(AppContextBuildError::MissingField("router_config"))?;
+        // The configuration's liveness budgets (the stall, wedge and stale
+        // thresholds and the warm-up slice, see `worker::liveness`) take
+        // effect for every context built from it, the server's and a test's
+        // alike, here and nowhere else. They are process-wide and the first
+        // call wins, so the first context built in a process sets them.
+        liveness::configure_from(&router_config);
         let configured_reasoning_parser = router_config.reasoning_parser.clone();
         let configured_tool_parser = router_config.tool_call_parser.clone();
 
@@ -470,7 +476,7 @@ impl AppContextBuilder {
                 symphony_aliases = %symphony_aliases.join(", "),
                 "Unknown parser name"
             );
-            return Err(AppContextBuildError::InvalidConfig(why));
+            return Err(AppContextBuildError::InvalidConfig(why.into()));
         }
         if router_config.parser == ParserChoice::Symphony
             && names.tool.is_some()
@@ -479,10 +485,12 @@ impl AppContextBuilder {
             tracing::warn!(
                 tool_call_parser = ?names.tool,
                 reasoning_parser = ?names.reasoning,
-                "The configured tool-call parser name selects no Symphony table, so every model \
-                 is read by the legacy parsers under --parser symphony; a table's name, a \
-                 legacy name that reads a table's format (qwen, qwen_xml, ...), or a launcher's \
-                 name for a family whose table has no older parser (muse), reads with that table"
+                "The configured tool-call parser name selects no Symphony table, so under \
+                 --parser symphony every model the registry does not know is read by the legacy \
+                 parsers (the registry's table reads the models it knows, a worker's own labels \
+                 aside); a table's name, a legacy name that reads a table's format (qwen, \
+                 qwen_xml, ...), or a launcher's name for a family whose table has no older \
+                 parser (muse), reads those models with that table"
             );
         }
 
@@ -847,19 +855,6 @@ impl AppContextBuilder {
         if let Some(registry) = self.worker_registry.as_ref() {
             registry.set_overload_shed(config.worker_overload_shed);
         }
-        // Progress-based liveness thresholds (see `worker::liveness`).
-        liveness::configure(
-            Duration::from_secs(config.worker_stall_secs),
-            Duration::from_secs(config.worker_wedge_secs),
-            Duration::from_secs(config.worker_stale_secs),
-        );
-        liveness::configure_warmup(liveness::Warmup {
-            secs: Duration::from_secs(config.worker_warmup_secs),
-            share: config.worker_warmup_share,
-            blocks: config.worker_warmup_blocks,
-            thin_ratio: config.worker_warmup_thin_ratio,
-            divert_every: config.worker_warmup_divert_every,
-        });
         // PD dispatch waits here, not in the decode engine's queue, when the
         // pair's running window is full.
         pd_admission::set_pd_admission_wait_secs(config.pd_admission_wait_secs);

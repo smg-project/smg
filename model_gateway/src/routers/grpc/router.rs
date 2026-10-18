@@ -1,4 +1,4 @@
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{borrow::Cow, future::Future, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use axum::{
@@ -129,6 +129,8 @@ impl GrpcRouter {
                 worker_registry.clone(),
                 ctx.configured_tool_parser.clone(),
                 ctx.configured_reasoning_parser.clone(),
+                &tool_parser_factory,
+                &reasoning_parser_factory,
             ),
             multimodal,
             tokenizer_autoload: !ctx.router_config.disable_tokenizer_autoload,
@@ -288,6 +290,29 @@ impl GrpcRouter {
         }
     }
 
+    /// Run a pipeline call for the canonical `model_id` under a tenant
+    /// rate-limit reservation: the cell the pipeline reserves into, the
+    /// model's retry config (keyed by the canonical id, see
+    /// [`Self::resolve_retry_config_for_canonical`]), `run` with those and
+    /// the id, then the close of a reservation a non-2xx answer never
+    /// settled. The routes that reserve nothing call their pipelines
+    /// directly; the reserve stage's doc (`common/stages/rate_limit.rs`)
+    /// names the endpoints that opt in and the ones that do not.
+    async fn execute_reserved<Fut>(
+        &self,
+        model_id: String,
+        run: impl FnOnce(String, Arc<RateLimitCell>, RetryConfig) -> Fut,
+    ) -> Response
+    where
+        Fut: Future<Output = Response>,
+    {
+        let rate_limit_cell = Arc::new(RateLimitCell::new());
+        let retry_config = self.resolve_retry_config_for_canonical(&model_id);
+        let response = run(model_id, rate_limit_cell.clone(), retry_config).await;
+        Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
+        response
+    }
+
     /// Main route_chat implementation
     async fn route_chat_impl(
         &self,
@@ -325,26 +350,27 @@ impl GrpcRouter {
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let mut canonical_body = body;
         canonical_body.model = model_id_cloned.clone();
-        let rate_limit_cell = Arc::new(RateLimitCell::new());
-        let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
 
         // The request Arc moves into the pipeline: no handle survives out
         // here, so the parsed request frees at the build boundary.
-        let response = pipeline
-            .execute_chat(
-                Arc::new(canonical_body),
-                headers.cloned(),
-                model_id_cloned,
-                self.shared_components.clone(),
-                Some(tenant_meta.clone()),
-                Some(rate_limit_cell.clone()),
-                Some(&retry_config),
-                None,
-            )
-            .await;
-
-        Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
-        response
+        self.execute_reserved(
+            model_id_cloned,
+            |model_id, rate_limit_cell, retry_config| async move {
+                pipeline
+                    .execute_chat(
+                        Arc::new(canonical_body),
+                        headers.cloned(),
+                        model_id,
+                        self.shared_components.clone(),
+                        Some(tenant_meta.clone()),
+                        Some(rate_limit_cell),
+                        Some(&retry_config),
+                        None,
+                    )
+                    .await
+            },
+        )
+        .await
     }
 
     /// Main route_generate implementation
@@ -363,24 +389,24 @@ impl GrpcRouter {
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let mut canonical_body = body;
         canonical_body.model = model_id_cloned.clone();
-        let rate_limit_cell = Arc::new(RateLimitCell::new());
-        let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
 
-        let response = self
-            .pipeline
-            .execute_generate(
-                Arc::new(canonical_body),
-                headers.cloned(),
-                model_id_cloned,
-                self.shared_components.clone(),
-                Some(tenant_meta.clone()),
-                Some(rate_limit_cell.clone()),
-                Some(&retry_config),
-            )
-            .await;
-
-        Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
-        response
+        self.execute_reserved(
+            model_id_cloned,
+            |model_id, rate_limit_cell, retry_config| async move {
+                self.pipeline
+                    .execute_generate(
+                        Arc::new(canonical_body),
+                        headers.cloned(),
+                        model_id,
+                        self.shared_components.clone(),
+                        Some(tenant_meta.clone()),
+                        Some(rate_limit_cell),
+                        Some(&retry_config),
+                    )
+                    .await
+            },
+        )
+        .await
     }
 
     /// Main route_responses implementation
@@ -692,24 +718,24 @@ impl GrpcRouter {
             }
             return response;
         }
-        let rate_limit_cell = Arc::new(RateLimitCell::new());
-        let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
 
-        let response = self
-            .messages_pipeline
-            .execute_messages(
-                canonical_body,
-                headers.cloned(),
-                model_id_cloned,
-                self.shared_components.clone(),
-                Some(tenant_meta.clone()),
-                Some(rate_limit_cell.clone()),
-                Some(&retry_config),
-            )
-            .await;
-
-        Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
-        response
+        self.execute_reserved(
+            model_id_cloned,
+            |model_id, rate_limit_cell, retry_config| async move {
+                self.messages_pipeline
+                    .execute_messages(
+                        canonical_body,
+                        headers.cloned(),
+                        model_id,
+                        self.shared_components.clone(),
+                        Some(tenant_meta.clone()),
+                        Some(rate_limit_cell),
+                        Some(&retry_config),
+                    )
+                    .await
+            },
+        )
+        .await
     }
 
     /// `/v1/messages/count_tokens`, answered from the gateway's own
@@ -923,24 +949,24 @@ impl GrpcRouter {
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let mut canonical_body = body;
         canonical_body.model = model_id_cloned.clone();
-        let rate_limit_cell = Arc::new(RateLimitCell::new());
-        let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
 
-        let response = self
-            .completion_pipeline
-            .execute_completion(
-                Arc::new(canonical_body),
-                headers.cloned(),
-                model_id_cloned,
-                self.shared_components.clone(),
-                Some(tenant_meta.clone()),
-                Some(rate_limit_cell.clone()),
-                Some(&retry_config),
-            )
-            .await;
-
-        Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
-        response
+        self.execute_reserved(
+            model_id_cloned,
+            |model_id, rate_limit_cell, retry_config| async move {
+                self.completion_pipeline
+                    .execute_completion(
+                        Arc::new(canonical_body),
+                        headers.cloned(),
+                        model_id,
+                        self.shared_components.clone(),
+                        Some(tenant_meta.clone()),
+                        Some(rate_limit_cell),
+                        Some(&retry_config),
+                    )
+                    .await
+            },
+        )
+        .await
     }
 
     /// Score Decisions through the regular SGLang pipeline.
@@ -975,21 +1001,23 @@ impl GrpcRouter {
             );
         }
         body.model = canonical.clone();
-        let rate_limit_cell = Arc::new(RateLimitCell::new());
-        let retry_config = self.resolve_retry_config_for_canonical(&canonical);
-        let response = pipeline
-            .execute_decisions(
-                Arc::new(body),
-                headers.cloned(),
-                canonical,
-                self.shared_components.clone(),
-                Some(tenant_meta.clone()),
-                Some(rate_limit_cell.clone()),
-                Some(&retry_config),
-            )
-            .await;
-        Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
-        response
+        self.execute_reserved(
+            canonical,
+            |model_id, rate_limit_cell, retry_config| async move {
+                pipeline
+                    .execute_decisions(
+                        Arc::new(body),
+                        headers.cloned(),
+                        model_id,
+                        self.shared_components.clone(),
+                        Some(tenant_meta.clone()),
+                        Some(rate_limit_cell),
+                        Some(&retry_config),
+                    )
+                    .await
+            },
+        )
+        .await
     }
 
     /// Main route_classify implementation
@@ -1233,28 +1261,39 @@ fn canonicalize_responses_request<'a>(
 mod pd_tests {
     use std::{
         fs,
-        sync::{Arc, OnceLock},
+        sync::{
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+            Arc, OnceLock,
+        },
         time::{Duration, Instant},
     };
 
     use http::header::RETRY_AFTER;
     use llm_tokenizer::{factory, registry::TokenizerRegistry};
     use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+    use portpicker::pick_unused_port;
     use reasoning_parser::ParserFactory as ReasoningParserFactory;
     use serde_json::json;
     use smg_data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
     };
+    use smg_grpc_client::{common_proto as common, tokenspeed_proto as ts};
     use smg_mcp::{McpConfig, McpOrchestrator};
+    use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
     use tool_parser::ParserFactory as ToolParserFactory;
+    use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer};
     use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
 
     use super::*;
     use crate::{
-        config::{PolicyConfig, RouterConfig, RoutingMode},
+        config::{ParserChoice, PolicyConfig, RouterConfig, RoutingMode},
         policies::PolicyRegistry,
+        rate_limit::{
+            RateLimitBackend, ReserveOutcome, ReserveRequest, SharedReservationHandle,
+            UsageSettlement,
+        },
         tenant::TenantKey,
-        worker::{BasicWorker, BasicWorkerBuilder, ConnectionMode, WorkerRegistry},
+        worker::{BasicWorker, BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerRegistry},
         workflow::{
             create_worker_workflow_data, steps::local::SubmitTokenizerJobStep, JobQueue,
             JobQueueConfig, TokenizerLoadFailure, WorkerKind, WorkerRegistrationMode, WorkerSpec,
@@ -1353,8 +1392,20 @@ mod pd_tests {
     /// Minimal `AppContext` for constructing a disaggregated gRPC router. PD
     /// serves /v1/responses, so the MCP orchestrator must be initialized.
     async fn grpc_ctx(mode: RoutingMode) -> Arc<AppContext> {
-        let config = RouterConfig::builder()
+        grpc_ctx_with_parsers(mode, ParserChoice::default(), None).await
+    }
+
+    /// [`grpc_ctx`] with the gateway's `--parser` choice and its
+    /// `--tool-call-parser` name, which under Symphony pins the table that
+    /// answers to it for every model the registry does not know.
+    async fn grpc_ctx_with_parsers(
+        mode: RoutingMode,
+        parser: ParserChoice,
+        tool_parser: Option<&str>,
+    ) -> Arc<AppContext> {
+        let mut builder = RouterConfig::builder()
             .mode(mode)
+            .parser(parser)
             .grpc_connection()
             .policy(PolicyConfig::Random)
             .host("127.0.0.1")
@@ -1364,8 +1415,11 @@ mod pd_tests {
             .worker_startup_timeout_secs(10)
             .worker_startup_check_interval_secs(1)
             .max_concurrent_requests(64)
-            .queue_timeout_secs(60)
-            .build_unchecked();
+            .queue_timeout_secs(60);
+        if let Some(name) = tool_parser {
+            builder = builder.tool_call_parser(name);
+        }
+        let config = builder.build_unchecked();
 
         let mcp_orchestrator = Arc::new(OnceLock::new());
         mcp_orchestrator
@@ -2027,6 +2081,68 @@ mod pd_tests {
         }
     }
 
+    /// A rate-limit backend that counts the reservations closed unsettled.
+    #[derive(Default)]
+    struct ClosingBackend {
+        closed: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RateLimitBackend for ClosingBackend {
+        async fn reserve(&self, _request: ReserveRequest) -> ReserveOutcome {
+            ReserveOutcome::Admitted
+        }
+        async fn settle_success(&self, _request_charge_id: Uuid, _usage: UsageSettlement) {}
+        async fn close_reserved_only(&self, _request_charge_id: Uuid) {
+            self.closed.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+        async fn abandon(&self, _request_charge_id: Uuid) {}
+    }
+
+    /// The reserved execution hands the run the canonical id, a fresh cell
+    /// and the model's retry config; the reservation the run made is closed
+    /// when the answer is not a 2xx and left to its own settlement when it is.
+    #[tokio::test]
+    async fn execute_reserved_closes_the_reservation_of_a_failed_answer() {
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("router");
+        let override_retries = router.retry_config.max_retries + 3;
+        ctx.worker_registry.set_model_retry_config(
+            "canonical-model",
+            RetryConfig {
+                max_retries: override_retries,
+                ..RetryConfig::default()
+            },
+            true,
+        );
+
+        for (status, closed) in [(StatusCode::INTERNAL_SERVER_ERROR, 1), (StatusCode::OK, 0)] {
+            let backend = Arc::new(ClosingBackend::default());
+            let handle = Arc::new(SharedReservationHandle::new(
+                backend.clone() as Arc<dyn RateLimitBackend>,
+                Uuid::now_v7(),
+            ));
+            let response = router
+                .execute_reserved(
+                    "canonical-model".to_string(),
+                    |model_id, cell, retry_config| async move {
+                        assert_eq!(model_id, "canonical-model");
+                        assert_eq!(retry_config.max_retries, override_retries);
+                        assert!(cell.peek().is_none(), "the cell starts empty");
+                        cell.set_for_test(RateLimitOutcome::Admitted(handle));
+                        status.into_response()
+                    },
+                )
+                .await;
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                backend.closed.load(AtomicOrdering::SeqCst),
+                closed,
+                "reservation closed after a {status} answer"
+            );
+        }
+    }
+
     /// PD-mode completion must honor a per-model retry override, not the router
     /// default.
     #[tokio::test]
@@ -2240,5 +2356,360 @@ mod pd_tests {
             retry_config_for("unrelated-model").max_retries,
             default_retries
         );
+    }
+
+    /// A gRPC engine on loopback that answers every generate call with
+    /// `output_ids`: one chunk carrying them, then the complete frame.
+    #[derive(Clone)]
+    struct ScriptedEngine {
+        output_ids: Vec<u32>,
+    }
+
+    type ScriptedStream<T> =
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<T, Status>> + Send>>;
+
+    #[tonic::async_trait]
+    impl TokenSpeedScheduler for ScriptedEngine {
+        type GenerateStream = ScriptedStream<ts::GenerateResponse>;
+        type SubscribeKvEventsStream = ScriptedStream<common::KvEventBatch>;
+        type GetTokenizerStream = ScriptedStream<common::GetTokenizerChunk>;
+
+        async fn generate(
+            &self,
+            request: TonicRequest<ts::GenerateRequest>,
+        ) -> Result<TonicResponse<Self::GenerateStream>, Status> {
+            use ts::generate_response::Response as GenResp;
+            let request_id = request.into_inner().request_id;
+            let completion_tokens = self.output_ids.len() as u32;
+            let frames = vec![
+                Ok(ts::GenerateResponse {
+                    request_id: request_id.clone(),
+                    response: Some(GenResp::Chunk(ts::GenerateStreamChunk {
+                        token_ids: self.output_ids.clone(),
+                        prompt_tokens: 3,
+                        completion_tokens,
+                        index: 0,
+                        ..Default::default()
+                    })),
+                }),
+                Ok(ts::GenerateResponse {
+                    request_id,
+                    response: Some(GenResp::Complete(ts::GenerateComplete {
+                        output_ids: self.output_ids.clone(),
+                        finish_reason: "stop".to_string(),
+                        prompt_tokens: 3,
+                        completion_tokens,
+                        index: 0,
+                        ..Default::default()
+                    })),
+                }),
+            ];
+            Ok(TonicResponse::new(Box::pin(futures::stream::iter(frames))))
+        }
+
+        async fn health_check(
+            &self,
+            _request: TonicRequest<ts::HealthCheckRequest>,
+        ) -> Result<TonicResponse<ts::HealthCheckResponse>, Status> {
+            Ok(TonicResponse::new(ts::HealthCheckResponse {
+                healthy: true,
+                message: "ok".to_string(),
+            }))
+        }
+
+        async fn abort(
+            &self,
+            _request: TonicRequest<ts::AbortRequest>,
+        ) -> Result<TonicResponse<ts::AbortResponse>, Status> {
+            Ok(TonicResponse::new(ts::AbortResponse {
+                success: true,
+                message: String::new(),
+            }))
+        }
+
+        async fn get_model_info(
+            &self,
+            _request: TonicRequest<ts::GetModelInfoRequest>,
+        ) -> Result<TonicResponse<ts::GetModelInfoResponse>, Status> {
+            Err(Status::unimplemented("scripted engine"))
+        }
+
+        async fn get_server_info(
+            &self,
+            _request: TonicRequest<ts::GetServerInfoRequest>,
+        ) -> Result<TonicResponse<ts::GetServerInfoResponse>, Status> {
+            Err(Status::unimplemented("scripted engine"))
+        }
+
+        async fn get_loads(
+            &self,
+            _request: TonicRequest<ts::GetLoadsRequest>,
+        ) -> Result<TonicResponse<ts::GetLoadsResponse>, Status> {
+            Err(Status::unimplemented("scripted engine"))
+        }
+
+        async fn subscribe_kv_events(
+            &self,
+            _request: TonicRequest<common::SubscribeKvEventsRequest>,
+        ) -> Result<TonicResponse<Self::SubscribeKvEventsStream>, Status> {
+            Err(Status::unimplemented("scripted engine"))
+        }
+
+        async fn flush_cache(
+            &self,
+            _request: TonicRequest<common::FlushCacheRequest>,
+        ) -> Result<TonicResponse<common::FlushCacheResponse>, Status> {
+            Err(Status::unimplemented("scripted engine"))
+        }
+
+        async fn start_profile(
+            &self,
+            _request: TonicRequest<common::StartProfileRequest>,
+        ) -> Result<TonicResponse<common::ProfileResponse>, Status> {
+            Err(Status::unimplemented("scripted engine"))
+        }
+
+        async fn stop_profile(
+            &self,
+            _request: TonicRequest<common::StopProfileRequest>,
+        ) -> Result<TonicResponse<common::ProfileResponse>, Status> {
+            Err(Status::unimplemented("scripted engine"))
+        }
+
+        async fn get_tokenizer(
+            &self,
+            _request: TonicRequest<common::GetTokenizerRequest>,
+        ) -> Result<TonicResponse<Self::GetTokenizerStream>, Status> {
+            Err(Status::unimplemented("scripted engine"))
+        }
+    }
+
+    /// Serves a [`ScriptedEngine`] on a free loopback port and returns the port
+    /// once it accepts connections.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test helper; the engine's server lives for the test process"
+    )]
+    async fn spawn_engine(output_ids: Vec<u32>) -> u16 {
+        let port = pick_unused_port().expect("a free port for the scripted engine");
+        let addr = format!("127.0.0.1:{port}").parse().expect("engine address");
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(TokenSpeedSchedulerServer::new(ScriptedEngine {
+                    output_ids,
+                }))
+                .serve(addr)
+                .await
+                .expect("scripted engine server");
+        });
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                return port;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the scripted engine on port {port} never came up");
+    }
+
+    /// A gRPC worker of `worker_type` serving `card`'s model at `url`.
+    fn register_worker(ctx: &AppContext, url: &str, worker_type: WorkerType, card: ModelCard) {
+        let worker = BasicWorkerBuilder::new(url)
+            .worker_type(worker_type)
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(RuntimeType::TokenSpeed)
+            .model(card)
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        ctx.worker_registry
+            .register(Arc::new(worker))
+            .expect("register worker");
+    }
+
+    /// The worker types of a mode's legs.
+    fn legs(mode: Mode) -> &'static [WorkerType] {
+        match mode {
+            Mode::Regular => &[WorkerType::Regular],
+            Mode::PrefillDecode => &[WorkerType::Prefill, WorkerType::Decode],
+            Mode::EncodePrefillDecode => {
+                &[WorkerType::Encode, WorkerType::Prefill, WorkerType::Decode]
+            }
+        }
+    }
+
+    fn routing_mode(mode: Mode) -> RoutingMode {
+        match mode {
+            Mode::Regular => regular_routing_mode(),
+            Mode::PrefillDecode => pd_routing_mode(),
+            Mode::EncodePrefillDecode => epd_routing_mode(),
+        }
+    }
+
+    /// The output the `qwen3` table reads: a thought, content and
+    /// one call of the declared `lookup` tool, which the engine answers as the
+    /// one token the tokenizer decodes into it.
+    const TABLE_OUTPUT: &str = "<think>plan</think>Hello <tool_call>\n\
+                                {\"name\": \"lookup\", \"arguments\": {\"q\": 1}}\n</tool_call>";
+    const TABLE_OUTPUT_ID: u32 = 100;
+    /// A chat template whose generation prompt ends at the turn opener the
+    /// `qwen3` table replays from.
+    const CHAT_TEMPLATE: &str = "{% for message in messages %}<|im_start|>{{ message.role }}\n\
+                                 {{ message.content }}<|im_end|>\n{% endfor %}\
+                                 {% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+
+    /// A tokenizer for `model`: renders `chat_template`, encodes the prompt as
+    /// three ids, and decodes the one id of `output` into its text.
+    async fn register_tokenizer_for(
+        ctx: &AppContext,
+        model: &str,
+        chat_template: &str,
+        output: (&str, u32),
+    ) {
+        let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
+            llm_tokenizer::mock::MockTokenizer::new()
+                .with_chat_template(chat_template)
+                .expect("chat template")
+                .with_deferred_chat_ids(vec![11, 12, 13])
+                .with_tokens(&[output]),
+        );
+        ctx.tokenizer_registry
+            .load(model, model, "mock", || async move { Ok(tokenizer) })
+            .await
+            .expect("register the tokenizer");
+    }
+
+    /// One chat completion for `model` through `router` under `headers`, with
+    /// the thought asked apart and one `lookup` tool declared: the status, the
+    /// `x-smg-parser` response header, and the body.
+    async fn chat(
+        router: &GrpcRouter,
+        model: &str,
+        headers: &HeaderMap,
+    ) -> (StatusCode, Option<String>, serde_json::Value) {
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let body: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": model, "separate_reasoning": true,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {"q": {"type": "integer"}}}
+            }}]
+        }))
+        .expect("chat request");
+        let response = router
+            .route_chat(Some(headers), &tenant_meta, body, model)
+            .await;
+        let status = response.status();
+        let parser = response
+            .headers()
+            .get("x-smg-parser")
+            .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&bytes)}));
+        (status, parser, body)
+    }
+
+    /// The served models of the mixed-fleet test: one the registry knows, whose
+    /// workers label no parser, and one it does not know, of the family whose
+    /// table the gateway's tool-call parser name selects.
+    const KNOWN_MODEL: &str = "Qwen/Qwen3-8B";
+    const UNKNOWN_MODEL: &str = "acme/ministral-3-14b-instruct-w4a16";
+    /// The unknown model's output in its family's syntax: the thought, content
+    /// and call of [`TABLE_OUTPUT`], as the `mistral_v13` table writes them.
+    const V13_OUTPUT: &str = "[THINK]plan[/THINK]Hello [TOOL_CALLS]lookup[ARGS]{\"q\": 1}";
+    const V13_OUTPUT_ID: u32 = 101;
+    /// A chat template whose generation prompt ends at the `mistral_v13`
+    /// table's turn opener.
+    const V13_CHAT_TEMPLATE: &str =
+        "{% for message in messages %}[INST]{{ message.content }}[/INST]{% endfor %}";
+
+    /// One gateway serving two families under `--parser symphony
+    /// --tool-call-parser mistral_v13`, in both modes: the model the registry
+    /// knows, whose workers label no parser, is read by the registry's table
+    /// (its own syntax read apart, not the fleet-wide name's), and the model
+    /// the registry does not know is read by the fleet-wide name's table; both
+    /// answers name Symphony.
+    #[tokio::test]
+    async fn an_unlabeled_model_the_registry_knows_is_read_by_its_table_beside_the_fleet_wide_names(
+    ) {
+        assert_eq!(
+            ::symphony::formats::table_for(KNOWN_MODEL).map(|table| table.name()),
+            Some("qwen3")
+        );
+        assert_eq!(::symphony::formats::table_for(UNKNOWN_MODEL), None);
+        for mode in [Mode::Regular, Mode::PrefillDecode] {
+            let ctx = grpc_ctx_with_parsers(
+                routing_mode(mode),
+                ParserChoice::Symphony,
+                Some("mistral_v13"),
+            )
+            .await;
+            register_tokenizer_for(
+                &ctx,
+                KNOWN_MODEL,
+                CHAT_TEMPLATE,
+                (TABLE_OUTPUT, TABLE_OUTPUT_ID),
+            )
+            .await;
+            register_tokenizer_for(
+                &ctx,
+                UNKNOWN_MODEL,
+                V13_CHAT_TEMPLATE,
+                (V13_OUTPUT, V13_OUTPUT_ID),
+            )
+            .await;
+            for worker_type in legs(mode) {
+                for (model, output_id) in [
+                    (KNOWN_MODEL, TABLE_OUTPUT_ID),
+                    (UNKNOWN_MODEL, V13_OUTPUT_ID),
+                ] {
+                    let port = spawn_engine(vec![output_id]).await;
+                    register_worker(
+                        &ctx,
+                        &format!("grpc://127.0.0.1:{port}"),
+                        *worker_type,
+                        ModelCard::new(model),
+                    );
+                }
+            }
+            let router = GrpcRouter::new(&ctx, mode).expect("router");
+            for model in [KNOWN_MODEL, UNKNOWN_MODEL] {
+                let (status, parser, answer) = chat(&router, model, &HeaderMap::new()).await;
+                assert_eq!(status, StatusCode::OK, "{mode:?} {model}: {answer}");
+                assert_eq!(
+                    parser.as_deref(),
+                    Some("symphony"),
+                    "{mode:?} {model}: {answer}"
+                );
+                let message = &answer["choices"][0]["message"];
+                assert_eq!(
+                    message["reasoning_content"], "plan",
+                    "{mode:?} {model}: {answer}"
+                );
+                assert_eq!(
+                    message["content"].as_str().map(str::trim),
+                    Some("Hello"),
+                    "{mode:?} {model}: {answer}"
+                );
+                let call = &message["tool_calls"][0]["function"];
+                assert_eq!(call["name"], "lookup", "{mode:?} {model}: {answer}");
+                let arguments: serde_json::Value =
+                    serde_json::from_str(call["arguments"].as_str().unwrap_or_default())
+                        .unwrap_or_else(|_| json!({}));
+                assert_eq!(arguments["q"], 1, "{mode:?} {model}: {answer}");
+                assert_eq!(
+                    answer["choices"][0]["finish_reason"], "tool_calls",
+                    "{mode:?} {model}: {answer}"
+                );
+            }
+        }
     }
 }

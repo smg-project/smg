@@ -226,6 +226,23 @@ fn peer_connected(gateway: &Gateway, peer: &str) -> bool {
     })
 }
 
+/// The `router_mesh_peer_connections` lines of `gateway`'s metrics whose
+/// `peer` label is empty: a series for the time before a stream's dialer was
+/// named, which no gateway may carry. `None` when the metrics endpoint did
+/// not answer: a failure of its own, not an empty list.
+fn nameless_peer_series(gateway: &Gateway) -> Option<Vec<String>> {
+    let metrics = http_get(gateway.metrics_port, "/metrics")?;
+    Some(
+        metrics
+            .lines()
+            .filter(|line| {
+                line.starts_with("router_mesh_peer_connections") && line.contains("peer=\"\"")
+            })
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
 /// What the mesh listener made of a handshake.
 #[derive(Debug)]
 enum Handshake {
@@ -387,6 +404,26 @@ fn mesh_with_mtls_forms_between_two_gateway_processes() {
             "{}'s mesh server failed\n{}",
             gateway.name,
             gateway.log()
+        );
+    }
+
+    // The accepting end names its peer from the first frame of the stream;
+    // no series is left behind for the time before that. Both endpoints have
+    // to answer: the formation check above proved only one of them did.
+    for gateway in [&a, &b] {
+        let nameless = nameless_peer_series(gateway);
+        assert!(
+            nameless.is_some(),
+            "{}'s /metrics did not answer\n{}",
+            gateway.name,
+            logs(&[&a, &b])
+        );
+        let nameless = nameless.expect("the endpoint answered");
+        assert!(
+            nameless.is_empty(),
+            "{} carries a peer series without a name: {nameless:?}\n{}",
+            gateway.name,
+            logs(&[&a, &b])
         );
     }
 }

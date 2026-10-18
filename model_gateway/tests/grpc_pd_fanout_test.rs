@@ -13,22 +13,22 @@ mod common;
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
+use common::grpc_harness::{
+    grpc_router, grpc_router_config, grpc_test_context_with_tokenizer, grpc_workers,
+    serve_canned_worker, Canned,
+};
 use llm_tokenizer::{
     chat_template::ChatTemplateParams,
     traits::{ChatTemplateOutput, Tokenizer},
-    Decoder, Encoder, Encoding, MockTokenizer, SpecialTokens, TokenizerRegistry,
+    Decoder, Encoder, Encoding, MockTokenizer, SpecialTokens,
 };
-use openai_protocol::{
-    completion::CompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
-};
+use openai_protocol::completion::CompletionRequest;
 use smg::{
-    config::{RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
-    routers::{RouterFactory, RouterTrait},
+    routers::RouterTrait,
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
+    worker::{RuntimeType, WorkerType},
 };
-use tokio::net::TcpListener;
 
 const MODEL: &str = "pd-fanout-test-model";
 /// Tokens the canned mock emits per request; every sample reports exactly this.
@@ -100,101 +100,33 @@ impl Tokenizer for CannedTokenizer {
 
 /// Spawn a canned mock gRPC worker in-process: one index-0 completion of
 /// `OUTPUT_TOKENS` tokens per request, `n` ignored.
-#[expect(
-    clippy::expect_used,
-    clippy::disallowed_methods,
-    reason = "test helper - panicking on failure is intentional; the spawned \
-              mock server task is fire-and-forget for the test process's lifetime"
-)]
 async fn start_mock_grpc_worker() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock gRPC worker");
-    let port = listener
-        .local_addr()
-        .expect("mock gRPC worker address")
-        .port();
-    let cfg = Arc::new(mock_worker::config::Config {
-        admin_port: None,
-        context_length: 32768,
-        host: "127.0.0.1".to_string(),
-        http_base_port: 0,
-        http_count: 0,
-        grpc_base_port: port,
-        grpc_count: 1,
-        zmq_handshake: None,
-        zmq_count: 0,
-        zmq_start_index: 0,
-        model_id: MODEL.to_string(),
-        tokenizer_path: MODEL.to_string(),
+    serve_canned_worker(Canned {
+        model: MODEL,
         gen_delay: Duration::ZERO,
         output_tokens: OUTPUT_TOKENS,
-        realistic: false,
-        engine: mock_worker::engine::EngineParams::default(),
-        ..mock_worker::config::Config::default()
-    });
-    tokio::spawn(mock_worker::grpc::serve_with_listener(cfg, listener));
-    port
+    })
+    .await
 }
 
 /// A PD gRPC router over one mock prefill and one mock decode worker, both
 /// registered as TokenSpeed so the dispatch takes the rendezvous-room path.
-#[expect(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
 async fn build_pd_router(prefill_port: u16, decode_port: u16) -> Box<dyn RouterTrait> {
-    let mut config = RouterConfig::builder()
-        .mode(RoutingMode::PrefillDecode {
-            prefill_urls: vec![],
-            decode_urls: vec![],
-            prefill_policy: None,
-            decode_policy: None,
-        })
-        .grpc_connection()
+    let config = grpc_router_config()
+        .prefill_decode_mode(vec![], vec![])
         .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(1024 * 1024)
         .build_unchecked();
-    config.health_check.disable_health_check = true;
-
-    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-    let tokenizer = Arc::new(CannedTokenizer(MockTokenizer::new())) as Arc<dyn Tokenizer>;
-    tokenizer_registry
-        .load(
-            "tokenizer-id",
-            MODEL,
-            "test",
-            || async move { Ok(tokenizer) },
-        )
-        .await
-        .unwrap();
-    let app_context =
-        common::create_test_context_with_tokenizer_registry(config, tokenizer_registry).await;
-    for (port, worker_type) in [
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CannedTokenizer(MockTokenizer::new()));
+    let app_context = grpc_test_context_with_tokenizer(config, MODEL, tokenizer).await;
+    let legs = [
         (prefill_port, WorkerType::Prefill),
         (decode_port, WorkerType::Decode),
-    ] {
-        let worker = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
-            .worker_type(worker_type)
-            .connection_mode(ConnectionMode::Grpc)
-            .runtime_type(RuntimeType::TokenSpeed)
-            .model(ModelCard::new(MODEL))
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
-            .build();
-        app_context
-            .worker_registry
-            .register(Arc::new(worker))
-            .unwrap();
-    }
-    RouterFactory::create_router(&app_context)
-        .await
-        .expect("PD gRPC router should build")
+    ];
+    grpc_router(
+        &app_context,
+        grpc_workers(&legs, RuntimeType::TokenSpeed, MODEL),
+    )
+    .await
 }
 
 #[expect(
