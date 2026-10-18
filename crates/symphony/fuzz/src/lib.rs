@@ -559,13 +559,12 @@ fn closes_an_open_string(so_far: &str, fragment: &str) -> bool {
 /// value once the key's own text is taken out: whitespace and the separators `=`, `:` and `,`
 /// alone (`city=`). The model's own empty value leaves its quotes or its tags in the source
 /// (`city=""`, `<parameter=city></parameter>`), and the JSON syntaxes' source is the member itself.
+/// A trailing `}`, `,` or `]` (`{"city": ""}`, `"city": "",`, `"tags": [""]`) is set aside before
+/// the string is judged.
 fn made_up_empty_string(json: &str, source: &str) -> bool {
-    // A whole member may close its object or carry the next separator (`{"key": ""}`,
-    // `"key": "",`): the empty string is judged without that trailing byte.
-    let json = json
-        .strip_suffix('}')
-        .or_else(|| json.strip_suffix(','))
-        .unwrap_or(json);
+    // A whole member may close its object or list or carry the next separator (`{"key": ""}`,
+    // `"key": "",`, `"tags": [""]`): the empty string is judged without that trailing byte.
+    let json = json.strip_suffix(['}', ',', ']']).unwrap_or(json);
     if !json.ends_with("\"\"") {
         return false;
     }
@@ -1359,6 +1358,14 @@ mod tests {
         assert!(made_up_empty_string("{\"city\": \"\"", "city="));
         assert!(!made_up_empty_string("{\"city\": \"\"", "city=\"\""));
         assert!(!made_up_empty_string("{\"city\": \"x\"", ""));
+        // A whole member through its closing byte: the object's or the list's close, or the
+        // next member's separator.
+        assert!(made_up_empty_string("{\"city\": \"\"}", "city="));
+        assert!(made_up_empty_string(", \"city\": \"\",", "city="));
+        assert!(made_up_empty_string("\"tags\": [\"\"]", "tags="));
+        assert!(made_up_empty_string("[\"\"]", " "));
+        assert!(!made_up_empty_string("{\"city\": \"\"}", "city=\"\""));
+        assert!(!made_up_empty_string("\"tags\": [\"\"]", "tags=[\"\"]"));
     }
 
     #[test]

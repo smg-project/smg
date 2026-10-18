@@ -2028,9 +2028,9 @@ fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event]) {
                 assert!(!ended.contains(index), "{}: after the call's end", place());
                 if let Some((_, so_far)) = arguments.iter_mut().find(|(i, _)| i == index) {
                     // A fragment that closes a string the arguments so far left open carries the
-                    // bytes that closed it, the model's closing tag or token: a closing quote with
-                    // no source is one no byte of the output accounts for, made up for a value the
-                    // model never closed.
+                    // bytes that closed it, the model's quote, closing tag or token: a closing
+                    // quote with no byte of the output behind it (none, or whitespace alone) is
+                    // one the reader made up for a value the model never closed.
                     assert!(
                         !closes_an_open_string(so_far, json) || !source.text.trim().is_empty(),
                         "{}: the fragment {json:?} closes an open string with no byte of the output behind it, a made-up closing quote",
