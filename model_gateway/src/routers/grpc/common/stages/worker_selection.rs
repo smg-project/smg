@@ -1991,7 +1991,7 @@ impl WorkerSelectionStage {
             return Err(EpdSelectionFailure::PrefillAtCapacity);
         }
         info.role = WorkerRole::Decode;
-        // The decode follows the traffic group the prefill leg was split
+        // The decode follows the traffic group the prefill side was split
         // into, or the named group an unsplit prefill was picked from, so a
         // pair never spans two groups; an unsplit prefill from the default
         // group leaves it to decide for itself (see

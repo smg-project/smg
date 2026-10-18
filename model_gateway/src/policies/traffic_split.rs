@@ -20,11 +20,11 @@
 //! capacity): the selection then misses, and the caller reports that,
 //! rather than serve from the drained build.
 //!
-//! The split confines the regular selection and the prefill and decode legs
-//! of a disaggregated pair, whose decode follows the group the prefill leg
+//! The split confines the regular selection and the prefill and decode sides
+//! of a disaggregated pair, whose decode follows the group the prefill side
 //! was split into (see `PolicyRegistry::select_worker_for_model_split`; a
-//! prefill pool of one group leaves the decode leg to its own split, so a
-//! canary only the decode pool carries keeps its share). The encode leg of
+//! prefill pool of one group leaves the decode side to its own split, so a
+//! canary only the decode pool carries keeps its share). The encode side of
 //! an encode-prefill-decode deployment keys every media item by its content
 //! hash over all encode workers and is not confined: a weight of 0 does not
 //! drain an encode worker.
@@ -244,7 +244,7 @@ impl<'a> Split<'a> {
     }
 
     /// The arm named `name` while it is in the draw (an available member
-    /// and a positive weight): the one a later leg of a request follows.
+    /// and a positive weight): the one a later side of a request follows.
     pub fn arm_named(&self, name: &str) -> Option<&Arm<'a>> {
         self.arms
             .iter()
