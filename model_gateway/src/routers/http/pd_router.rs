@@ -31,15 +31,11 @@ use serde_json::{
     value::{to_raw_value, RawValue},
     Value,
 };
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, warn, Instrument};
+use tracing::{debug, error, warn};
 
 use super::{
     request_body::RawBody,
-    stream_failure::{
-        head_success_recorded, mark_head_success_recorded, note_sent, RelaySource, UpstreamCut,
-    },
+    stream_failure::{head_success_recorded, RelaySource},
 };
 use crate::{
     config::types::RetryConfig,
@@ -66,7 +62,8 @@ use crate::{
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{is_retryable_response, RetryExecutor},
             serialize_json_sized,
-            sse::{SseEncoder, SSE_CHANNEL_BUFFER},
+            sse::SseEncoder,
+            stream_relay::{relay_streaming_body, ChunkStep, Relay},
             trim_serialization_slack,
         },
         error,
@@ -76,7 +73,7 @@ use crate::{
         PD_PREFILL_QUEUE_TIMEOUT,
     },
     worker::{
-        acquire_prefill, GuardedStream, PdPairIndex, PdWire, PrefillAcquireError, PrefillAdmission,
+        acquire_prefill, PdPairIndex, PdWire, PrefillAcquireError, PrefillAdmission,
         PrefillAdmissionRejection, PrefillLoadGuard, PrefillSelectionContext, RoutingPool,
         RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
@@ -2240,8 +2237,6 @@ impl PDRouter {
         headers: Option<HeaderMap>,
         decode_guard: WorkerLoadGuard,
     ) -> Response {
-        let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
-
         // The same rule as the regular relay: a successful stream with no
         // content type is relayed as SSE. Read from the decode leg's own
         // headers, before the response's content type is set below.
@@ -2253,111 +2248,43 @@ impl PDRouter {
             Some(content_type) => content_type.starts_with("text/event-stream"),
             None => status.is_success(),
         };
-        // The head's success is the decode worker's before the relay can
-        // sample the body's failure: on a multi-threaded runtime the task may
-        // run first with a body error already buffered behind the head, and
-        // the head's success recorded by the attempt afterwards would reset
-        // the breaker's failure streak and erase the cut's sample. A failed
-        // head stays the attempt's to record; the relay never accounts its
-        // body.
-        let head_success_recorded = status.is_success();
-        if head_success_recorded {
-            source.worker().record_outcome(status.as_u16());
-        }
-
-        // The relay runs under the request's span, so a failure after the
-        // head went out is logged with the request's id.
-        let span = tracing::Span::current();
-
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "fire-and-forget stream relay; gateway shutdown need not wait for decode stream forwarding"
-        )]
-        tokio::spawn(
-            async move {
-                futures_util::pin_mut!(stream);
-                // Reusable SSE encoder for the logprob-merge re-encode path.
-                let mut encoder = SseEncoder::new();
-                // Whether the next chunk begins at an SSE line boundary (i.e. the
-                // previous chunk ended with an EOL); used to anchor the [DONE]
-                // sentinel detection when the match sits at the start of a chunk.
-                let mut at_line_start = true;
-                // What the client has been sent, for the record of a cut, and
-                // its last bytes, so the event that ends a cut SSE body is
-                // written on a frame boundary.
-                let mut relayed: u64 = 0;
-                let mut sent_tail: Vec<u8> = Vec::with_capacity(4);
-                while let Some(chunk_result) = stream.next().await {
-                    match chunk_result {
-                        Ok(chunk) => {
-                            let is_done = Self::chunk_contains_done_event(&chunk, at_line_start);
-                            if let Some(&last) = chunk.last() {
-                                at_line_start = last == b'\n' || last == b'\r';
-                            }
-
-                            let result = if return_logprob && prefill_logprobs.is_some() {
-                                Self::merge_streaming_logprobs(
-                                    prefill_logprobs.as_ref(),
-                                    &chunk,
-                                    &mut encoder,
-                                )
-                                .unwrap_or(chunk)
-                            } else {
-                                chunk
-                            };
-
-                            relayed += result.len() as u64;
-                            note_sent(&mut sent_tail, &result);
-                            if tx.send(Ok(result)).await.is_err() {
-                                break;
-                            }
-
-                            if is_done {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            // A head that was a success was answered as one; the
-                            // decode body ending in an error after it is the decode
-                            // worker's failure, counted here, and an SSE response is
-                            // ended with the typed event and the stream's own end. A
-                            // failed head was counted when it arrived; its body is
-                            // cut as before.
-                            if status.is_success() {
-                                let cut = UpstreamCut::of(&e);
-                                source.account(&cut, relayed);
-                                if upstream_sse {
-                                    // On its own frame: a cut inside a frame leaves
-                                    // a partial line the event must not merge into.
-                                    let event =
-                                        source.error_event_on_its_own_frame(&cut, &sent_tail);
-                                    let _ = tx.send(Ok(event)).await;
-                                    break;
-                                }
-                            }
-                            let _ = tx.send(Err(format!("Stream error: {e}"))).await;
-                            break;
-                        }
-                    }
-                }
-            }
-            .instrument(span),
-        );
-
-        // The decode guard rides in the body's own stream: released when
-        // the body is dropped, at its end or when the client leaves.
-        let body = Body::from_stream(GuardedStream::new(ReceiverStream::new(rx), decode_guard));
-
-        let mut response = Response::new(body);
-        *response.status_mut() = status;
-
         let mut response_headers = headers.unwrap_or_default();
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-        *response.headers_mut() = response_headers;
-        if head_success_recorded {
-            mark_head_success_recorded(&mut response);
-        }
-        response
+
+        // Each decode chunk is read for the `[DONE]` sentinel, which ends the
+        // relay, and re-encoded with the prefill log-probabilities when the
+        // request asked for them; the sentinel is anchored at a line start
+        // when the previous chunk ended with an end of line.
+        let mut encoder = SseEncoder::new();
+        let mut at_line_start = true;
+        let per_chunk: Box<dyn FnMut(Bytes) -> ChunkStep + Send> = Box::new(move |chunk: Bytes| {
+            let is_done = Self::chunk_contains_done_event(&chunk, at_line_start);
+            if let Some(&last) = chunk.last() {
+                at_line_start = last == b'\n' || last == b'\r';
+            }
+            let bytes = if return_logprob && prefill_logprobs.is_some() {
+                Self::merge_streaming_logprobs(prefill_logprobs.as_ref(), &chunk, &mut encoder)
+                    .unwrap_or(chunk)
+            } else {
+                chunk
+            };
+            ChunkStep {
+                bytes,
+                last: is_done,
+            }
+        });
+        relay_streaming_body(
+            stream,
+            Relay {
+                status,
+                upstream_sse,
+                source,
+                guard: decode_guard,
+                headers: response_headers,
+                rechunker: None,
+                per_chunk: Some(per_chunk),
+            },
+        )
     }
 
     /// Build a non-streaming PD response with `Content-Type: application/json`.
@@ -2948,12 +2875,14 @@ impl RouterTrait for PDRouter {
 mod tests {
     use axum::http::header::RETRY_AFTER;
     use openai_protocol::model_card::ModelCard;
-    use tokio::sync::oneshot;
+    use tokio::sync::{mpsc, oneshot};
+    use tokio_stream::wrappers::ReceiverStream;
 
     use super::*;
     use crate::{
         config::{types::PdPairingMode, PolicyConfig},
         middleware::ReportedRefusal,
+        routers::common::sse::SSE_CHANNEL_BUFFER,
         tenant::TenantKey,
         worker::{BasicWorkerBuilder, WorkerType},
     };

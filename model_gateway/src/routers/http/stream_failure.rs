@@ -161,10 +161,10 @@ impl RelaySource {
     ///
     /// The breaker sample sits outside the request's attempt ledger on
     /// purpose: the relay task outlives the attempt that produced the head.
-    /// The regular router (`forward_worker_response`) and the PD router's
-    /// decode leg (`create_streaming_response`) record a successful head
-    /// before they spawn the relay, so the cut is sampled after the head's
-    /// success and never erased by it. A request retried onto the same worker
+    /// The shared relay (`routers::common::stream_relay`) records a
+    /// successful head before it spawns its task, for the regular router and
+    /// the PD router's decode leg alike, so the cut is sampled after the
+    /// head's success and never erased by it. A request retried onto the same worker
     /// after a failed head is charged for that head and for the cut.
     pub(crate) fn account(&self, cut: &UpstreamCut, bytes_relayed: u64) {
         let error_type = error_type_from_status(cut.status);

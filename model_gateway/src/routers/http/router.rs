@@ -40,7 +40,7 @@ use openai_protocol::{
 use reqwest::multipart::{Form, Part};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, warn, Instrument};
+use tracing::{error, warn};
 
 use crate::{
     app_context::AppContext,
@@ -70,8 +70,8 @@ use crate::{
             },
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{is_retryable_response, is_retryable_status, RetryExecutor},
-            sse::SSE_CHANNEL_BUFFER,
-            sse_rechunk::{NoopObserver, SseRechunker, IDLE_FLUSH},
+            sse_rechunk::{NoopObserver, SseRechunker},
+            stream_relay::{relay_streaming_body, Relay},
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
         error::{self, extract_error_code_from_response},
@@ -83,10 +83,7 @@ use crate::{
                 serialize_request_body, serialize_request_body_preserving_fields, RequestBodyError,
             },
             request_stream::{CappedBodyStream, StreamProgress},
-            stream_failure::{
-                head_success_recorded, mark_head_success_recorded, note_sent, RelaySource,
-                UpstreamCut,
-            },
+            stream_failure::{head_success_recorded, RelaySource},
         },
         BodyPolicy, RouterTrait,
     },
@@ -1416,157 +1413,25 @@ impl Router {
                 Some(ct) => ct.starts_with("text/event-stream"),
                 None => status.is_success(),
             };
-            let mut rechunker =
+            let rechunker =
                 (rechunk && upstream_sse).then(|| SseRechunker::with_observer(NoopObserver));
             if rechunker.is_some() {
                 // Re-chunking changes the body length.
                 response_headers.remove(CONTENT_LENGTH);
             }
-            let stream = res.bytes_stream();
-            // Bounded channel applies backpressure: a slow client makes the
-            // relay await on `send` instead of buffering the whole response.
-            let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
-
-            // The head's success is the worker's before the relay can sample
-            // the body's failure: on a multi-threaded runtime the task may
-            // run first with a body error already buffered behind the head,
-            // and the head's success recorded by the caller afterwards would
-            // reset the breaker's failure streak and erase the cut's sample.
-            // A failed head is the caller's to record (through its ledger on
-            // the typed route); the relay never accounts its body.
-            let head_success_recorded = status.is_success();
-            if head_success_recorded {
-                source.worker().record_outcome(status.as_u16());
-            }
-
-            // The relay runs under the request's span, so a failure after
-            // the head went out is logged with the request's id.
-            let span = tracing::Span::current();
-            // Spawn task to forward stream
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "fire-and-forget stream relay; gateway shutdown need not wait for individual stream forwarding"
-            )]
-            tokio::spawn(
-                async move {
-                    let mut stream = stream;
-                    // What the client has been sent, for the record of a cut, and
-                    // its last bytes, so the event that ends a cut SSE body is
-                    // written on a frame boundary.
-                    let mut relayed: u64 = 0;
-                    let mut sent_tail: Vec<u8> = Vec::with_capacity(4);
-                    // One timer, reset per chunk, instead of a fresh sleep per token.
-                    let idle = tokio::time::sleep(IDLE_FLUSH);
-                    tokio::pin!(idle);
-                    loop {
-                        tokio::select! {
-                            chunk = stream.next() => {
-                                if rechunker.is_some() {
-                                    idle.as_mut().reset(tokio::time::Instant::now() + IDLE_FLUSH);
-                                }
-                                match chunk {
-                                    // Same as the regular relay: an empty upstream chunk must
-                                    // not become an empty h2 DATA frame toward the client.
-                                    Some(Ok(bytes)) if bytes.is_empty() => {}
-                                    Some(Ok(bytes)) => {
-                                        let bytes = match rechunker.as_mut() {
-                                            Some(r) => r.feed(bytes),
-                                            None => bytes,
-                                        };
-                                        if !bytes.is_empty() {
-                                            relayed += bytes.len() as u64;
-                                            note_sent(&mut sent_tail, &bytes);
-                                            if tx.send(Ok(bytes)).await.is_err() {
-                                                break;
-                                            }
-                                        }
-                                        // The observer ended the stream: its error
-                                        // event was the last frame, and letting go of
-                                        // the upstream cancels the engine's work.
-                                        if rechunker.as_ref().is_some_and(|r| r.stopped().is_some()) {
-                                            break;
-                                        }
-                                    }
-                                    Some(Err(e)) => {
-                                        if let Some(tail) = rechunker.as_mut().map(SseRechunker::finish) {
-                                            if !tail.is_empty() {
-                                                note_sent(&mut sent_tail, &tail);
-                                                let _ = tx.send(Ok(tail)).await;
-                                            }
-                                        }
-                                        // The observer ended the stream on its tail: its
-                                        // error event was the last frame. The cut stays the
-                                        // worker's to account.
-                                        if rechunker.as_ref().is_some_and(|r| r.stopped().is_some()) {
-                                            if status.is_success() {
-                                                source.account(&UpstreamCut::of(&e), relayed);
-                                            }
-                                            break;
-                                        }
-                                        // A head that was a success was answered as one; the
-                                        // body ending in an error after it is the worker's
-                                        // failure, counted here, and an SSE response is ended
-                                        // with the typed event and the stream's own end. A
-                                        // failed head was counted when it arrived; its body
-                                        // is cut as before.
-                                        if status.is_success() {
-                                            let cut = UpstreamCut::of(&e);
-                                            source.account(&cut, relayed);
-                                            if upstream_sse {
-                                                // On its own frame: a cut inside a frame leaves
-                                                // a partial line the event must not merge into.
-                                                let event =
-                                                    source.error_event_on_its_own_frame(&cut, &sent_tail);
-                                                let _ = tx.send(Ok(event)).await;
-                                                break;
-                                            }
-                                        }
-                                        let _ = tx.send(Err(format!("Stream error: {e}"))).await;
-                                        break;
-                                    }
-                                    None => {
-                                        if let Some(tail) = rechunker.as_mut().map(SseRechunker::finish) {
-                                            if !tail.is_empty() {
-                                                let _ = tx.send(Ok(tail)).await;
-                                            }
-                                        }
-                                        break;
-                                    }
-                                }
-                            },
-                            () = &mut idle, if rechunker.as_ref().is_some_and(SseRechunker::has_pending) => {
-                                idle.as_mut().reset(tokio::time::Instant::now() + IDLE_FLUSH);
-                                if let Some(tail) = rechunker.as_mut().map(SseRechunker::flush_pending) {
-                                    if !tail.is_empty() && tx.send(Ok(tail)).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                if rechunker.as_ref().is_some_and(|r| r.stopped().is_some()) {
-                                    break;
-                                }
-                            }
-                            // Client gone with no chunk in flight (long prefill,
-                            // stalled upstream): break so the reqwest stream drops,
-                            // closing the upstream connection and letting the
-                            // engine abort generation.
-                            () = tx.closed() => break,
-                        }
-                    }
-                }
-                .instrument(span),
+            let mut response = relay_streaming_body(
+                res.bytes_stream(),
+                Relay {
+                    status,
+                    upstream_sse,
+                    source,
+                    guard: load_guard,
+                    headers: response_headers,
+                    rechunker,
+                    per_chunk: None,
+                },
             );
-
-            // The load guard rides in the body's own stream: released when
-            // the body is dropped, at its end or when the client leaves.
-            let body = Body::from_stream(GuardedStream::new(ReceiverStream::new(rx), load_guard));
-
-            let mut response = Response::new(body);
-            *response.status_mut() = status;
-            *response.headers_mut() = response_headers;
             mark_upstream_answer(&mut response);
-            if head_success_recorded {
-                mark_head_success_recorded(&mut response);
-            }
             response
         } else {
             // For non-streaming requests, preserve headers
