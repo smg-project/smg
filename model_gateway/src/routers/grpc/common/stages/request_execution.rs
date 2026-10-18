@@ -939,10 +939,10 @@ async fn execute_single_embed(
     Ok(ExecutionResult::Embedding { response: complete })
 }
 
-/// What addresses both legs of a disaggregated dispatch: the pair and the
-/// request's ledger, each leg's transport label, the request id both legs
-/// carry, and the prompt's size, which bounds each leg's silence.
-struct PdLegs<'a> {
+/// What addresses both sides of a disaggregated dispatch: the pair and the
+/// request's ledger, each side's transport label, the request id both sides
+/// carry, and the prompt's size, which bounds each side's silence.
+struct PdSides<'a> {
     workers: &'a WorkerSelection,
     ledger: &'a AttemptLedger,
     prefill_label: &'static str,
@@ -951,7 +951,7 @@ struct PdLegs<'a> {
     prompt_tokens: u64,
 }
 
-impl<'a> PdLegs<'a> {
+impl<'a> PdSides<'a> {
     fn of(
         workers: &'a WorkerSelection,
         ledger: &'a AttemptLedger,
@@ -971,7 +971,7 @@ impl<'a> PdLegs<'a> {
     }
 }
 
-/// Execute a parallel PD dispatch: both legs are sent together and rendezvous
+/// Execute a parallel PD dispatch: both sides are sent together and rendezvous
 /// on the bootstrap info the request carries; the first failure answers, and
 /// the pair that answered is handed to the response with the decode's abort
 /// deferred until its first item proves the handoff finished.
@@ -995,14 +995,14 @@ async fn execute_parallel_pd(
     // it on this path), so prefill duration cannot be measured — only TTFT,
     // recorded at the first decode token in streaming. prefill_start anchors it.
     let prefill_start = Instant::now();
-    let legs = PdLegs::of(workers, ledger, &prefill_request);
+    let sides = PdSides::of(workers, ledger, &prefill_request);
     // The prefill leg's silence is bounded from its dispatch: a call that
     // returns no stream, or a stream with nothing on it, within the bound
     // fails the attempt instead of holding the request (and the decode room
     // the admission gate claimed for it) until its own timeout.
     let prefill_worker = workers.prefill_worker();
     let bound = prefill_worker
-        .and_then(|worker| PrefillLegBound::at(worker, legs.prompt_tokens, prefill_start));
+        .and_then(|worker| PrefillLegBound::at(worker, sides.prompt_tokens, prefill_start));
     // Each leg owns its client handle (a cheap channel clone, the same one
     // batched dispatch takes per sub-request) so the leg still in flight when
     // its partner fails can be moved off the request path.
@@ -1020,23 +1020,23 @@ async fn execute_parallel_pd(
     // would time nothing (see `PrefillTicket::book`). The bound above was
     // read before the booking, so the leg's own prompt is not counted twice.
     let prefill_ticket =
-        prefill_worker.and_then(|worker| PrefillTicket::book(worker, legs.prompt_tokens));
+        prefill_worker.and_then(|worker| PrefillTicket::book(worker, sides.prompt_tokens));
     let prefill_dispatch: PdLegDispatch = Box::pin(dispatch_prefill_within(
         bound,
         Box::pin(async move { prefill_client.generate(prefill_request).await }),
         prefill_worker.cloned(),
         workers.decode_worker().cloned(),
-        legs.prefill_label,
-        legs.request_id.clone(),
-        legs.prompt_tokens,
+        sides.prefill_label,
+        sides.request_id.clone(),
+        sides.prompt_tokens,
     ));
     let decode_dispatch: PdLegDispatch =
         Box::pin(async move { decode_client.generate(decode_request).await });
 
     match dispatch_pd_legs(prefill_dispatch, decode_dispatch).await {
         PdDispatchOutcome::Both(prefill_result, decode_result) => {
-            parallel_legs_answered(
-                &legs,
+            parallel_sides_answered(
+                &sides,
                 prefill_result,
                 decode_result,
                 bound,
@@ -1056,12 +1056,12 @@ async fn execute_parallel_pd(
             leg,
             error,
             partner,
-        } => Err(parallel_leg_failed_first(&legs, leg, &error, partner)),
+        } => Err(parallel_side_failed_first(&sides, leg, &error, partner)),
     }
 }
 
-/// The parallel dispatch's two requests from the client's: the prefill leg is
-/// the request itself, the decode leg its pixel-free clone, each pinned to its
+/// The parallel dispatch's two requests from the client's: the prefill side is
+/// the request itself, the decode side its pixel-free clone, each pinned to its
 /// worker's DP rank where the engine reads placement from the request.
 fn parallel_pd_requests(
     proto_request: ProtoGenerateRequest,
@@ -1091,12 +1091,12 @@ fn parallel_pd_requests(
     (prefill_request, decode_request)
 }
 
-/// Both legs answered their dispatch: each verdict is translated before either
-/// is propagated, the prefill leg's first response is waited for within what is
+/// Both sides answered their dispatch: each verdict is translated before either
+/// is propagated, the prefill side's first response is waited for within what is
 /// left of its bound, and the pair goes to the response with the decode's abort
 /// deferred until its first item.
-async fn parallel_legs_answered(
-    legs: &PdLegs<'_>,
+async fn parallel_sides_answered(
+    sides: &PdSides<'_>,
     prefill_result: StreamResult,
     decode_result: StreamResult,
     bound: Option<PrefillLegBound>,
@@ -1104,8 +1104,8 @@ async fn parallel_legs_answered(
     prefill_guard: PrefillLoadGuard,
     pd_timing: PdTiming,
 ) -> Result<ExecutionResult, Response> {
-    let workers = legs.workers;
-    record_pd_dispatch_outcomes(workers, legs.ledger, &prefill_result, &decode_result);
+    let workers = sides.workers;
+    record_pd_dispatch_outcomes(workers, sides.ledger, &prefill_result, &decode_result);
 
     // Both legs are translated before either is propagated: a
     // decode-side failure is logged and counted even when the prefill
@@ -1114,9 +1114,9 @@ async fn parallel_legs_answered(
         .as_ref()
         .is_err_and(|e| is_prefill_silence(e) || is_decode_silence(e));
     let prefill =
-        prefill_result.map_err(|e| pd_leg_error(PdLeg::Prefill, legs.prefill_label, &e, workers));
+        prefill_result.map_err(|e| pd_leg_error(PdLeg::Prefill, sides.prefill_label, &e, workers));
     let decode =
-        decode_result.map_err(|e| pd_leg_error(PdLeg::Decode, legs.decode_label, &e, workers));
+        decode_result.map_err(|e| pd_leg_error(PdLeg::Decode, sides.decode_label, &e, workers));
     let (prefill_stream, decode_stream) = match (prefill, decode) {
         (Ok(prefill), Ok(decode)) => (prefill, decode),
         // A prefill given up on for a silence verdict (its own, or
@@ -1152,9 +1152,9 @@ async fn parallel_legs_answered(
         bound,
         prefill_worker,
         workers.decode_worker(),
-        legs.prefill_label,
-        &legs.request_id,
-        legs.prompt_tokens,
+        sides.prefill_label,
+        &sides.request_id,
+        sides.prompt_tokens,
     )
     .await
     {
@@ -1165,10 +1165,10 @@ async fn parallel_legs_answered(
             // not be torn down mid-write.
             drop(prefill_stream);
             drop(decode_stream.defer_abort_until_first_item());
-            record_silence_outcome(workers, legs.ledger, &e);
+            record_silence_outcome(workers, sides.ledger, &e);
             return Err(pd_leg_error(
                 PdLeg::Prefill,
-                legs.prefill_label,
+                sides.prefill_label,
                 &e,
                 workers,
             ));
@@ -1178,7 +1178,7 @@ async fn parallel_legs_answered(
         // where its reader meets it (the streaming layer's
         // accounting); a stream that ended with nothing on it is no
         // success of the leg either.
-        Ok(FirstItem::Response) => workers.record_outcome_prefill(legs.ledger, 200),
+        Ok(FirstItem::Response) => workers.record_outcome_prefill(sides.ledger, 200),
         Ok(FirstItem::Failure | FirstItem::End) => {}
     }
 
@@ -1202,36 +1202,36 @@ async fn parallel_legs_answered(
     })
 }
 
-/// One leg failed while its partner was still dispatching: the verdict is
-/// recorded against the leg that answered and becomes the response, and the
+/// One side failed while its partner was still dispatching: the verdict is
+/// recorded against the side that answered and becomes the response, and the
 /// partner is retired off the request path.
-fn parallel_leg_failed_first(
-    legs: &PdLegs<'_>,
-    leg: PdLeg,
+fn parallel_side_failed_first(
+    sides: &PdSides<'_>,
+    side: PdLeg,
     error: &tonic::Status,
     partner: PdLegDispatch,
 ) -> Response {
-    let workers = legs.workers;
+    let workers = sides.workers;
     let status = error.breaker_status();
-    // Only the leg that answered is recorded: the abandoned one has
+    // Only the side that answered is recorded: the abandoned one has
     // said nothing about its worker yet, and `retire_pd_leg` records
     // it when it finally does.
-    let (label, partner_label, partner_worker) = match leg {
+    let (label, partner_label, partner_worker) = match side {
         PdLeg::Prefill => {
-            record_silence_outcome(workers, legs.ledger, error);
+            record_silence_outcome(workers, sides.ledger, error);
             (
-                legs.prefill_label,
-                legs.decode_label,
+                sides.prefill_label,
+                sides.decode_label,
                 workers.decode_worker(),
             )
         }
         PdLeg::Decode => {
             if let Some(status) = status {
-                workers.record_outcome_decode(legs.ledger, status);
+                workers.record_outcome_decode(sides.ledger, status);
             }
             (
-                legs.decode_label,
-                legs.prefill_label,
+                sides.decode_label,
+                sides.prefill_label,
                 workers.prefill_worker(),
             )
         }
@@ -1249,14 +1249,14 @@ fn parallel_leg_failed_first(
             Retirement::PartnerFailed
         };
         retire_pd_leg(
-            leg.partner(),
+            side.partner(),
             partner_label,
             Arc::clone(worker),
             partner,
             retirement,
         );
     }
-    pd_leg_error(leg, label, error, workers)
+    pd_leg_error(side, label, error, workers)
 }
 
 /// Dispatch both legs together and answer with the first failure.
@@ -2120,9 +2120,9 @@ fn sequential_pd_decode_form(
     Ok(SequentialPdDecodeForm::TextPlusHashes)
 }
 
-/// What the sequential dispatch decides before either leg is sent: the pair's
+/// What the sequential dispatch decides before either side is sent: the pair's
 /// KV connector mode, whether the KV handoff is relayed through the router,
-/// the transfer id the router mints for Mooncake, and the decode leg's form.
+/// the transfer id the router mints for Mooncake, and the decode side's form.
 struct SequentialPlan {
     mode: KvConnectorMode,
     /// The KV handoff is single-consumer: with n>1 each fan-out child on decode
@@ -2133,11 +2133,11 @@ struct SequentialPlan {
     /// the transfer correlation id and synthesizes decode params from metadata
     mooncake_transfer_id: Option<String>,
     decode_form: SequentialPdDecodeForm,
-    /// A stripped multimodal leg has no local-recompute fallback: the image
+    /// A stripped multimodal side has no local-recompute fallback: the image
     /// KV exists only on the prefill worker. Text requests strip to a no-op
     /// and keep the fallback, so only mm requests need the handoff checked.
     stripped_mm_decode: bool,
-    /// The request streams: its decode leg owes a first token within a bound.
+    /// The request streams: its decode side owes a first token within a bound.
     streaming: bool,
 }
 
@@ -2145,7 +2145,7 @@ impl SequentialPlan {
     /// Decide the plan from the pair and the request; a pairing this pipeline
     /// cannot serve (a MoRI-IO decode, a language-model-only decode the
     /// request's multimodal payload needs more of) is refused here, before
-    /// either leg is sent.
+    /// either side is sent.
     fn decide(
         proto_request: &ProtoGenerateRequest,
         workers: &WorkerSelection,
@@ -2241,8 +2241,8 @@ impl SequentialPlan {
             || (self.mode == KvConnectorMode::Nixl && self.relay_kv_params)
     }
 
-    /// The two legs' requests from the client's: the decode leg in the form
-    /// the plan decided, the prefill leg sanitized to one token, one sample
+    /// The two sides' requests from the client's: the decode side in the form
+    /// the plan decided, the prefill side sanitized to one token, one sample
     /// and no stream, pinned to its worker's DP rank and tagged for the
     /// connector's handoff.
     fn requests(
@@ -2293,9 +2293,9 @@ impl SequentialPlan {
     }
 }
 
-/// What the drained prefill leg hands on: its completed stream, the connector
+/// What the drained prefill side hands on: its completed stream, the connector
 /// params and the processed media identity its Complete frame carried, the
-/// input logprobs and the prefix-cache hit, and the leg's start and end.
+/// input logprobs and the prefix-cache hit, and the side's start and end.
 struct PrefillHarvest {
     stream: ProtoStream,
     kv_params: Option<String>,
@@ -2332,7 +2332,7 @@ async fn execute_sequential_pd(
     // requests don't pollute success metrics; captured here before use of mode.
     let kv_connector_label = plan.mode.metrics_label();
     let (prefill_request, mut decode_request) = plan.requests(proto_request, workers);
-    let legs = PdLegs::of(workers, ledger, &prefill_request);
+    let sides = PdSides::of(workers, ledger, &prefill_request);
 
     let PrefillHarvest {
         stream: prefill_stream,
@@ -2342,8 +2342,8 @@ async fn execute_sequential_pd(
         cached_tokens: prefill_cached_tokens,
         started: prefill_start,
         done: prefill_done,
-    } = sequential_prefill_leg(
-        &legs,
+    } = sequential_prefill_side(
+        &sides,
         prefill_request,
         prefill_client.clone(),
         prefill_guard,
@@ -2359,8 +2359,8 @@ async fn execute_sequential_pd(
         kv_params,
         media_identity.as_ref(),
     )?;
-    let (decode_stream, decode_sent) = sequential_decode_leg(
-        &legs,
+    let (decode_stream, decode_sent) = sequential_decode_side(
+        &sides,
         &plan,
         decode_request,
         decode_client.clone(),
@@ -2407,18 +2407,18 @@ async fn execute_sequential_pd(
     })
 }
 
-/// The prefill leg of the sequential dispatch: sent and answered within its
-/// bound, booked on its worker, then drained for what the decode leg needs;
+/// The prefill side of the sequential dispatch: sent and answered within its
+/// bound, booked on its worker, then drained for what the decode side needs;
 /// its admission slot is released once it is drained. A failure anywhere is
 /// the attempt's, where the retry layer can still take the request to another
 /// prefill worker.
-async fn sequential_prefill_leg(
-    legs: &PdLegs<'_>,
+async fn sequential_prefill_side(
+    sides: &PdSides<'_>,
     prefill_request: ProtoGenerateRequest,
     mut prefill_client: BackendClient,
     prefill_guard: PrefillLoadGuard,
 ) -> Result<PrefillHarvest, Response> {
-    let workers = legs.workers;
+    let workers = sides.workers;
     debug!(
         request_id = %prefill_request.request_id(),
         "vLLM PD: sending prefill request (max_tokens=1)"
@@ -2433,7 +2433,7 @@ async fn sequential_prefill_leg(
     let prefill_worker = workers.prefill_worker();
     let prefill_start = Instant::now();
     let bound = prefill_worker
-        .and_then(|worker| PrefillLegBound::at(worker, legs.prompt_tokens, prefill_start));
+        .and_then(|worker| PrefillLegBound::at(worker, sides.prompt_tokens, prefill_start));
     if let Some(prefill) = prefill_worker {
         Metrics::record_worker_request(prefill.url(), prefill.model_id());
     }
@@ -2441,18 +2441,18 @@ async fn sequential_prefill_leg(
     // headers with the first message (see `PrefillTicket::book`); the bound
     // above was read before the booking.
     let prefill_ticket =
-        prefill_worker.and_then(|worker| PrefillTicket::book(worker, legs.prompt_tokens));
+        prefill_worker.and_then(|worker| PrefillTicket::book(worker, sides.prompt_tokens));
     let prefill_stream = dispatch_prefill_within(
         bound,
         Box::pin(async move { prefill_client.generate(prefill_request).await }),
         prefill_worker.cloned(),
         None,
-        legs.prefill_label,
-        legs.request_id.clone(),
-        legs.prompt_tokens,
+        sides.prefill_label,
+        sides.request_id.clone(),
+        sides.prompt_tokens,
     )
     .await
-    .map_err(|e| sequential_prefill_failure(&e, workers, legs.ledger, legs.prefill_label))?;
+    .map_err(|e| sequential_prefill_failure(&e, workers, sides.ledger, sides.prefill_label))?;
     // The prompt has been pending prefill on its worker since the dispatch,
     // until the first response, which teaches the worker's rate; the stream
     // takes the booking over.
@@ -2467,9 +2467,9 @@ async fn sequential_prefill_leg(
         bound,
         prefill_worker,
         None,
-        legs.prefill_label,
-        &legs.request_id,
-        legs.prompt_tokens,
+        sides.prefill_label,
+        &sides.request_id,
+        sides.prompt_tokens,
     )
     .await
     {
@@ -2478,8 +2478,8 @@ async fn sequential_prefill_leg(
         return Err(sequential_prefill_failure(
             &e,
             workers,
-            legs.ledger,
-            legs.prefill_label,
+            sides.ledger,
+            sides.prefill_label,
         ));
     }
 
@@ -2508,11 +2508,11 @@ async fn sequential_prefill_leg(
             }
             Err(e) => {
                 if let Some(status) = e.breaker_status() {
-                    workers.record_outcome_prefill(legs.ledger, status);
+                    workers.record_outcome_prefill(sides.ledger, status);
                 }
                 UpstreamClass::account_dispatch_failure(
                     metrics_labels::WORKER_PREFILL,
-                    legs.prefill_label,
+                    sides.prefill_label,
                     &e,
                 );
                 account_pd_leg_failure(metrics_labels::WORKER_PREFILL, &e);
@@ -2527,7 +2527,7 @@ async fn sequential_prefill_leg(
     prefill_stream.mark_completed();
     // Prefill is drained: its admission slot is free while decode runs.
     drop(prefill_guard);
-    workers.record_outcome_prefill(legs.ledger, 200);
+    workers.record_outcome_prefill(sides.ledger, 200);
     // The prefill phase ends at the drain; recorded by the executor only once
     // decode is established.
     let done = Instant::now();
@@ -2542,11 +2542,11 @@ async fn sequential_prefill_leg(
     })
 }
 
-/// Complete the decode leg's request from the prefill leg's harvest: its
+/// Complete the decode side's request from the prefill side's harvest: its
 /// worker's DP rank, the KV handoff in the connector's form (minted for
 /// Mooncake, relayed for the others) and the media identity the prefill
 /// resolved. Returns whether a handoff is on the request. A stripped
-/// multimodal leg without one is refused rather than sent.
+/// multimodal side without one is refused rather than sent.
 fn relay_to_decode(
     plan: &SequentialPlan,
     workers: &WorkerSelection,
@@ -2648,19 +2648,19 @@ fn relay_to_decode(
     Ok(handed_off)
 }
 
-/// The decode leg of the sequential dispatch: sent once the handoff is on its
+/// The decode side of the sequential dispatch: sent once the handoff is on its
 /// request, bounded to its first token when the request streams, its abort
 /// deferred until that first item proves the handoff finished, tracked on its
 /// worker. Returns the established stream and the instant of the dispatch,
-/// where the relay phase ends and the decode leg's time to first token begins.
-async fn sequential_decode_leg(
-    legs: &PdLegs<'_>,
+/// where the relay phase ends and the decode side's time to first token begins.
+async fn sequential_decode_side(
+    sides: &PdSides<'_>,
     plan: &SequentialPlan,
     decode_request: ProtoGenerateRequest,
     mut decode_client: BackendClient,
     handed_off: bool,
 ) -> Result<(ProtoStream, Instant), Response> {
-    let workers = legs.workers;
+    let workers = sides.workers;
     // Send request to decode
     if let Some(decode) = workers.decode_worker() {
         Metrics::record_worker_request(decode.url(), decode.model_id());
@@ -2685,7 +2685,7 @@ async fn sequential_decode_leg(
     // first token (see `worker_prefilling_before_decode`).
     let decode_bound = if plan.streaming {
         worker_prefilling_before_decode(workers, handed_off, plan.relay_kv_params)
-            .and_then(|worker| DecodeLegBound::at(worker, legs.prompt_tokens, decode_sent))
+            .and_then(|worker| DecodeLegBound::at(worker, sides.prompt_tokens, decode_sent))
     } else {
         None
     };
@@ -2694,12 +2694,12 @@ async fn sequential_decode_leg(
         decode_bound,
         Box::pin(async move { decode_client.generate(decode_request).await }),
         decode_worker.clone(),
-        legs.decode_label,
-        legs.request_id.clone(),
-        legs.prompt_tokens,
+        sides.decode_label,
+        sides.request_id.clone(),
+        sides.prompt_tokens,
     )
     .await
-    .map_err(|e| sequential_decode_failure(&e, workers, legs.ledger, legs.decode_label))?;
+    .map_err(|e| sequential_decode_failure(&e, workers, sides.ledger, sides.decode_label))?;
 
     // Prefill has completed and its KV blocks are held pending decode's
     // transfer; aborting decode mid-transfer on a client disconnect can
@@ -2724,17 +2724,17 @@ async fn sequential_decode_leg(
         &mut decode_stream,
         decode_bound,
         decode_worker.as_ref(),
-        legs.decode_label,
-        &legs.request_id,
-        legs.prompt_tokens,
+        sides.decode_label,
+        &sides.request_id,
+        sides.prompt_tokens,
     )
     .await
     {
         return Err(sequential_decode_failure(
             &e,
             workers,
-            legs.ledger,
-            legs.decode_label,
+            sides.ledger,
+            sides.decode_label,
         ));
     }
     Ok((decode_stream, decode_sent))
