@@ -1,12 +1,18 @@
-//! Events from one tagged call as it arrives.
+//! Events from the tagged calls of one block as they arrive.
 //!
-//! [`Assembler`] takes a call written as tags, `<function=NAME>` and then `<parameter=KEY>` around
-//! each value's text, in pieces as the format cuts it out of the model's output, and turns it into
-//! the events of one call: `ToolCallStart` once the function tag is whole, `ToolCallArguments` as
-//! the arguments object is built, `ToolCallEnd` at `</function>`. The model writes no JSON object,
-//! so the assembler writes one, member by member, in the spelling the references use: `{"city":
-//! "Paris", "limit": 5}`. What each value's text means as JSON is [`json`]'s decision, from the
-//! type the tool declares for the parameter ([`Declared`]).
+//! [`Assembler`] takes the calls written as tags, `<function=NAME>` and then `<parameter=KEY>`
+//! around each value's text, in pieces as the format cuts them out of the model's output, and
+//! turns each into the events of one call: `ToolCallStart` once the function tag is whole,
+//! `ToolCallArguments` as the arguments object is built, `ToolCallEnd` at `</function>`. The
+//! templates write one function block per call region; a model answering with several calls at
+//! once also writes them one after another inside one region
+//! (`<function=A>…</function><function=B>…</function>` between one pair of call markers), and the
+//! engines' own parsers read every block in the region as a call. So does the assembler: after
+//! `</function>` it stays in the block, and the next `<function=` starts the next call, at the
+//! next index, with the id that index mints ([`CallIds`]). The model writes no JSON object, so
+//! the assembler writes one per call, member by member, in the spelling the references use:
+//! `{"city": "Paris", "limit": 5}`. What each value's text means as JSON is [`json`]'s decision,
+//! from the type the tool declares for the parameter ([`Declared`]).
 //!
 //! A value declared a string is streamed: its opening fragment `{"key": "` (or `, "key": "`) is
 //! pushed at the parameter tag, each piece of its text as it arrives, and `"` at `</parameter>`.
@@ -26,6 +32,7 @@
 
 use crate::{
     event::{runs, DropReason, Event, Events, MalformedReason, Text},
+    ids::CallIds,
     markers::{Piece, Scanner},
     tagged::{
         end_cut_call,
@@ -71,20 +78,25 @@ pub enum Placement {
     Direct,
 }
 
-/// The events of one tool call, from the bytes of its tags.
+/// The events of one block's tool calls, from the bytes of their tags.
 #[derive(Clone, Debug)]
 pub struct Assembler {
+    /// The index of the call that is open, or of the next one to start; its id is what `ids`
+    /// mints for that index.
     index: u32,
-    id: String,
+    /// Where the output's call ids count from.
+    ids: CallIds,
     scanner: Scanner,
     /// Bytes no event has accounted for yet, in order; the next event takes them as its source.
     carried: String,
     stage: Stage,
-    /// The function's name once its tag is whole, which is when `ToolCallStart` was pushed.
+    /// The open call's function name once its tag is whole, which is when `ToolCallStart` was
+    /// pushed; nothing before the block's first call and between its calls.
     function: Option<String>,
-    /// Members written to the arguments object so far.
+    /// Members written to the open call's arguments object so far.
     written: u32,
-    done: bool,
+    /// Whether a call of the block has ended, so that the bytes between tags are between calls.
+    ended: bool,
     /// Where the template puts a value: whether a newline on either side of it is the template's.
     placement: Placement,
 }
@@ -101,6 +113,8 @@ enum Stage {
     ParameterName { start: usize },
     /// Inside a value.
     Value(ValueState),
+    /// After a call's `</function>`: the block may hold another call, which `<function=` opens.
+    AfterCall,
 }
 
 #[derive(Clone, Debug)]
@@ -126,27 +140,20 @@ enum Mode {
 }
 
 impl Assembler {
-    /// An assembler for the call at `index` with the id the format minted for it, reading the
-    /// values where the family's template puts them.
-    pub fn new(index: u32, id: impl Into<String>, placement: Placement) -> Self {
+    /// An assembler for the block's calls, the first at `index` and their ids counting from
+    /// `ids`, reading the values where the family's template puts them.
+    pub fn new(index: u32, ids: CallIds, placement: Placement) -> Self {
         Self {
             index,
-            id: id.into(),
+            ids,
             scanner: Scanner::new(TAGS),
             carried: String::new(),
             stage: Stage::Opening,
             function: None,
             written: 0,
-            done: false,
+            ended: false,
             placement,
         }
-    }
-
-    /// Whether the call has closed, at `</function>` or as a block that never named a function;
-    /// `feed` takes nothing after that, so the format stops here.
-    #[cfg(test)]
-    pub fn done(&self) -> bool {
-        self.done
     }
 
     /// Whether a call has started, that is, whether `ToolCallStart` has been pushed.
@@ -154,24 +161,12 @@ impl Assembler {
         self.function.is_some()
     }
 
-    /// Append the next bytes of the call, push the events they complete, and return how many of
-    /// the bytes the call took: all of them before `</function>`, up to that tag in the piece that
-    /// carries it, none after it.
+    /// Append the next bytes of the block, push the events they complete, and return how many of
+    /// the bytes were taken: all of them, since the block's calls follow one another and its
+    /// closing marker is the format's to read.
     pub fn feed(&mut self, bytes: &str, declared: &Declared, out: &mut Events) -> usize {
-        if self.done {
-            return 0;
-        }
-        let held_before = self.scanner.held().len();
-        let mut seen = 0;
         for piece in self.scanner.feed(bytes) {
-            seen += match &piece {
-                Piece::Text(text) => text.len(),
-                Piece::Marker(tag) => TAGS[*tag].len(),
-            };
             self.take(piece, declared, out);
-            if self.done {
-                return seen - held_before;
-            }
         }
         bytes.len()
     }
@@ -183,12 +178,15 @@ impl Assembler {
     /// stand, and one `Malformed` event with what was held, or no bytes, says that the arguments
     /// are no whole value before the call's end ([`end_cut_call`]). A block that never named a
     /// function has had its text reported as it came; what is left of it comes back as
-    /// `Malformed` here.
+    /// `Malformed` here. A block whose calls all closed at their own `</function>` has no call to
+    /// end: the whitespace after the last one is the template's, and a tag cut short is reported.
     pub fn close(mut self, out: &mut Events) {
-        if self.done {
+        let held = self.held_tag();
+        if matches!(self.stage, Stage::AfterCall) {
+            self.carried.push_str(&held);
+            self.report_tag(MalformedReason::TagCutShort, out);
             return;
         }
-        let held = self.held_tag();
         if !self.started() {
             self.carried.push_str(&held);
             if matches!(self.stage, Stage::Opening) {
@@ -218,8 +216,8 @@ impl Assembler {
                 Stage::Value(_) => MalformedReason::ValueCutShort,
                 Stage::FunctionName { .. } => MalformedReason::ClosedBeforeTheName,
                 // Not reached once the call started (`Between` took the branch above, `Opening`
-                // is never re-entered); the match stays exhaustive.
-                Stage::Opening | Stage::Between => MalformedReason::TagCutShort,
+                // and `AfterCall` have no call open); the match stays exhaustive.
+                Stage::Opening | Stage::Between | Stage::AfterCall => MalformedReason::TagCutShort,
             };
             self.carried.push_str(&held);
             self.report_tag(why, out);
@@ -238,15 +236,28 @@ impl Assembler {
     /// that never named a function has had its text reported as it came; what is left of it comes
     /// back as `Malformed` here.
     pub fn finish(mut self, out: &mut Events) {
-        if self.done {
-            return;
-        }
         let held = self.held_tag();
         self.carried.push_str(&held);
         if self.started() {
             end_cut_call(self.index, std::mem::take(&mut self.carried), "", out);
+        } else if matches!(self.stage, Stage::AfterCall) {
+            // The block's calls ended at their own `</function>`: the whitespace after the last
+            // is the template's, and a tag cut short is what the region never finished.
+            self.report_tag(MalformedReason::UnterminatedRegion, out);
         } else {
             self.leftover(MalformedReason::UnterminatedRegion, out);
+        }
+    }
+
+    /// The whitespace the block ends with after its last call, which the engine drops as the
+    /// region's wrapping: taken from the block, so that neither ending says it again. Nothing while
+    /// a call is open or before the block's first; what the scanner holds as the start of a tag
+    /// stays for the ending to report.
+    pub fn trailing_whitespace(&mut self) -> String {
+        if matches!(self.stage, Stage::AfterCall) {
+            std::mem::take(&mut self.carried)
+        } else {
+            String::new()
         }
     }
 
@@ -254,6 +265,25 @@ impl Assembler {
     /// a whole tag is never held, so they are text no event has used.
     fn held_tag(&mut self) -> String {
         self.scanner.held().to_string()
+    }
+
+    /// The stage between tags when no call is open: before the block's first call, or after one.
+    fn idle(&self) -> Stage {
+        if self.ended {
+            Stage::AfterCall
+        } else {
+            Stage::Opening
+        }
+    }
+
+    /// `</function>` closed the call: the next `<function=` in the block starts the next call, at
+    /// the next index, with nothing of this call's left in it.
+    fn ended(&mut self) {
+        self.index += 1;
+        self.function = None;
+        self.written = 0;
+        self.ended = true;
+        self.stage = Stage::AfterCall;
     }
 
     fn open_string(&self) -> bool {
@@ -321,7 +351,7 @@ impl Assembler {
     fn tag(&mut self, tag: usize, declared: &Declared, out: &mut Events) {
         let bytes = TAGS[tag];
         match self.stage {
-            Stage::Opening | Stage::Between => self.tag_between(tag, out),
+            Stage::Opening | Stage::Between | Stage::AfterCall => self.tag_between(tag, out),
             // A tag cuts the name short: the tag's bytes so far are reported, and the tag is read
             // where the name began.
             Stage::FunctionName { .. } => {
@@ -329,7 +359,7 @@ impl Assembler {
                 self.stage = if self.started() {
                     Stage::Between
                 } else {
-                    Stage::Opening
+                    self.idle()
                 };
                 self.tag_between(tag, out);
             }
@@ -344,7 +374,8 @@ impl Assembler {
         }
     }
 
-    /// A tag where the syntax expects one: before the function tag, or between parameters.
+    /// A tag where the syntax expects one: before the function tag, between parameters, or after a
+    /// call, where the next function tag starts the next call.
     fn tag_between(&mut self, tag: usize, out: &mut Events) {
         let bytes = TAGS[tag];
         let between = matches!(self.stage, Stage::Between);
@@ -368,12 +399,13 @@ impl Assembler {
                     index: self.index,
                     source: Text::uncounted(bytes),
                 });
-                self.done = true;
+                self.ended();
             }
-            FUNCTION_CLOSE => {
+            // A close before the block's first function tag: the call it would end never named a
+            // function. After a call, a second close is a tag out of its place, below.
+            FUNCTION_CLOSE if matches!(self.stage, Stage::Opening) => {
                 self.carried.push_str(bytes);
                 self.leftover(MalformedReason::CallWithoutFunctionTag, out);
-                self.done = true;
             }
             _ => {
                 self.drop_carried(out);
@@ -387,7 +419,10 @@ impl Assembler {
 
     fn text(&mut self, text: &str, declared: &Declared, out: &mut Events) {
         match self.stage {
-            Stage::Opening | Stage::Between => self.text_between(text, out),
+            Stage::Opening | Stage::Between => {
+                self.text_between(text, MalformedReason::TextBetweenTags, out);
+            }
+            Stage::AfterCall => self.text_between(text, MalformedReason::TextBetweenCalls, out),
             Stage::FunctionName { start } => match text.split_once('>') {
                 Some((head, rest)) => {
                     self.carried.push_str(head);
@@ -412,8 +447,9 @@ impl Assembler {
         }
     }
 
-    /// Text where the syntax has tags: whitespace is the template's, anything else is reported.
-    fn text_between(&mut self, text: &str, out: &mut Events) {
+    /// Text where the syntax has tags, or the block's next call: whitespace is the template's,
+    /// anything else is reported with `why`.
+    fn text_between(&mut self, text: &str, why: MalformedReason, out: &mut Events) {
         for (run, space) in runs(text) {
             if space {
                 self.carried.push_str(run);
@@ -421,7 +457,7 @@ impl Assembler {
                 self.drop_carried(out);
                 out.push(Event::Malformed {
                     text: Text::uncounted(run),
-                    why: MalformedReason::TextBetweenTags,
+                    why,
                 });
             }
         }
@@ -435,7 +471,7 @@ impl Assembler {
             self.stage = if self.started() {
                 Stage::Between
             } else {
-                Stage::Opening
+                self.idle()
             };
         } else if self.started() {
             self.report_tag(MalformedReason::SecondFunctionTag, out);
@@ -443,7 +479,7 @@ impl Assembler {
         } else {
             out.push(Event::ToolCallStart {
                 index: self.index,
-                id: self.id.clone(),
+                id: self.ids.id(self.index),
                 name: name.clone(),
                 source: Text::uncounted(std::mem::take(&mut self.carried)),
             });
@@ -675,6 +711,10 @@ impl crate::engine::CallAssembler for Assembler {
         self.feed(text, declared, out)
     }
 
+    fn trailing_whitespace(&mut self) -> String {
+        self.trailing_whitespace()
+    }
+
     /// The region's marker closes the call for the client; it belongs to the region, not to the
     /// call.
     fn close(self: Box<Self>, _terminal: &str, out: &mut Events) -> bool {
@@ -694,6 +734,10 @@ mod tests {
 
     use super::*;
     use crate::testing::bytes;
+
+    fn ids() -> CallIds {
+        CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
+    }
 
     /// A tool `f` with a string `city`, an integer `limit`, a nullable string `note` and nothing
     /// declared for `extra`.
@@ -728,7 +772,7 @@ mod tests {
         ending: fn(Assembler, &mut Events),
     ) -> (Vec<Event>, Vec<usize>) {
         let declared = declared();
-        let mut assembler = Assembler::new(0, "call_0", placement);
+        let mut assembler = Assembler::new(0, ids(), placement);
         let mut out = Events::new();
         let mut taken = Vec::new();
         for piece in pieces {
@@ -833,7 +877,7 @@ mod tests {
             vec![
                 Event::ToolCallStart {
                     index: 0,
-                    id: "call_0".to_string(),
+                    id: ids().id(0),
                     name: "f".to_string(),
                     source: Text::uncounted("\n<function=f>"),
                 },
@@ -939,7 +983,7 @@ mod tests {
             },
         }]);
         let call = "<function=f>\n<parameter=metrics>\n[]\n</parameter>\n</function>";
-        let mut assembler = Assembler::new(0, "call_0", Placement::OwnLine);
+        let mut assembler = Assembler::new(0, ids(), Placement::OwnLine);
         let mut out = Events::new();
         assembler.feed(call, &declared, &mut out);
         assembler.finish(&mut out);
@@ -1065,29 +1109,166 @@ mod tests {
     }
 
     #[test]
-    fn bytes_after_the_function_close_are_not_taken() {
+    fn a_second_function_block_in_the_block_is_the_next_call() {
+        // A parallel answer writes its calls one after another between one pair of call markers,
+        // and the engines' own parsers read every block as a call. The second starts at its
+        // `<function=` with the next index and the id that index mints; the whitespace between
+        // the blocks is its source, and the whitespace after the last block is the template's.
+        let block = "<function=f>\n</function>\n<function=f>\n<parameter=limit>\n5\n</parameter>\n\
+                     </function>\n";
+        let start = |index: u32, source: &str| Event::ToolCallStart {
+            index,
+            id: ids().id(index),
+            name: "f".to_string(),
+            source: Text::uncounted(source),
+        };
+        let fragment_of = |index: u32, json: &str, source: &str| Event::ToolCallArguments {
+            index,
+            json: json.to_string(),
+            source: Text::uncounted(source),
+        };
+        let end_of = |index: u32| Event::ToolCallEnd {
+            index,
+            source: Text::uncounted("</function>"),
+        };
+        let expected = vec![
+            start(3, "<function=f>"),
+            fragment_of(3, "{}", "\n"),
+            end_of(3),
+            start(4, "\n<function=f>"),
+            fragment_of(4, "{\"limit\": 5", "\n<parameter=limit>\n5\n</parameter>"),
+            fragment_of(4, "}", "\n"),
+            end_of(4),
+            Event::Dropped {
+                text: Text::uncounted("\n"),
+                why: DropReason::Wrapper,
+            },
+        ];
         let declared = declared();
-        let mut assembler = Assembler::new(3, "call_3", Placement::OwnLine);
-        let mut out = Events::new();
-        let piece = "<function=f>\n</function>\n</tool_call>more";
-        let taken = assembler.feed(piece, &declared, &mut out);
-        assert_eq!(&piece[..taken], "<function=f>\n</function>");
-        assert!(assembler.done());
-        assert_eq!(assembler.feed("x", &declared, &mut out), 0);
-        let events = out.drain();
-        assert_eq!(bytes(&events), "<function=f>\n</function>");
-        assert_eq!(
-            events.last(),
-            Some(&Event::ToolCallEnd {
-                index: 3,
-                source: Text::uncounted("</function>"),
-            })
+        let mut cuts: Vec<Vec<&str>> = vec![vec![block]];
+        cuts.extend((1..block.len()).map(|cut| vec![&block[..cut], &block[cut..]]));
+        cuts.push(
+            block
+                .char_indices()
+                .map(|(at, c)| &block[at..at + c.len_utf8()])
+                .collect(),
         );
-        // Neither ending adds anything to a call that closed.
-        let mut after = Events::new();
-        assembler.clone().close(&mut after);
-        assembler.finish(&mut after);
-        assert!(after.is_empty());
+        for pieces in cuts {
+            let mut assembler = Assembler::new(3, ids(), Placement::OwnLine);
+            let mut out = Events::new();
+            for piece in &pieces {
+                assert_eq!(assembler.feed(piece, &declared, &mut out), piece.len());
+            }
+            assembler.close(&mut out);
+            let events = out.drain();
+            assert_eq!(arguments(&events), "{}{\"limit\": 5}", "{pieces:?}");
+            assert_eq!(bytes(&events), block, "{pieces:?}");
+            assert_eq!(ends(&events), 2, "{pieces:?}");
+            assert!(malformed(&events).is_empty(), "{pieces:?}");
+            nothing_empty(&events);
+            if pieces.len() == 1 {
+                assert_eq!(events, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn after_a_call_text_is_between_calls_and_a_stray_or_cut_tag_is_reported() {
+        // Prose after a complete call, and a tag the block's close cut short.
+        let block = "<function=f>\n</function>\nstray words\n<fun";
+        let events = closed(&[block]);
+        assert_eq!(ends(&events), 1);
+        assert_eq!(
+            malformed(&events),
+            vec![
+                ("stray".to_string(), MalformedReason::TextBetweenCalls),
+                ("words".to_string(), MalformedReason::TextBetweenCalls),
+                ("<fun".to_string(), MalformedReason::TagCutShort),
+            ]
+        );
+        assert_eq!(dropped(&events), vec!["\n", " ", "\n"]);
+        assert_eq!(bytes(&events), block);
+        nothing_empty(&events);
+        // The stream cut after the last call: the newline is the template's, a cut tag is what
+        // the region never finished.
+        let events = finished(&["<function=f>\n</function>\n<fun"]);
+        assert_eq!(
+            malformed(&events),
+            vec![("<fun".to_string(), MalformedReason::UnterminatedRegion)]
+        );
+        assert_eq!(dropped(&events), vec!["\n"]);
+        // Whitespace alone after the last call is the template's at either ending, and nothing
+        // after `</function>` adds nothing.
+        for ending in [finished, closed] {
+            let events = ending(&["<function=f>\n</function>\n"]);
+            assert!(malformed(&events).is_empty());
+            assert_eq!(dropped(&events), vec!["\n"]);
+            assert_eq!(ends(&events), 1);
+            let events = ending(&["<function=f>\n</function>"]);
+            assert_eq!(events.last(), Some(&end("</function>")));
+        }
+        // A second close and a parameter tag with no call open are out of their place.
+        let events =
+            closed(&["<function=f>\n</function>\n</function>\n<parameter=x>y</parameter>"]);
+        assert_eq!(
+            malformed(&events),
+            vec![
+                ("</function>".to_string(), MalformedReason::TagOutOfPlace),
+                ("<parameter=".to_string(), MalformedReason::TagOutOfPlace),
+                ("x>y".to_string(), MalformedReason::TextBetweenCalls),
+                ("</parameter>".to_string(), MalformedReason::TagOutOfPlace),
+            ]
+        );
+        assert_eq!(dropped(&events), vec!["\n", "\n"]);
+        assert_eq!(ends(&events), 1);
+    }
+
+    #[test]
+    fn the_whitespace_after_the_last_call_is_handed_back_and_the_endings_add_nothing_for_it() {
+        let declared = declared();
+        for ending in [Assembler::close, Assembler::finish] {
+            let mut assembler = Assembler::new(0, ids(), Placement::OwnLine);
+            let mut out = Events::new();
+            assembler.feed("<function=f>\n</function>\n \n", &declared, &mut out);
+            assert_eq!(assembler.trailing_whitespace(), "\n \n");
+            assert_eq!(assembler.trailing_whitespace(), "");
+            let before = out.len();
+            ending(assembler, &mut out);
+            assert_eq!(out.len(), before, "{:?}", out.as_slice());
+        }
+        // A tag the end cut short stays for the ending; before the first call, and while a call is
+        // open, nothing is handed back.
+        let mut assembler = Assembler::new(0, ids(), Placement::OwnLine);
+        let mut out = Events::new();
+        assembler.feed("<function=f>\n</function>\n<fun", &declared, &mut out);
+        assert_eq!(assembler.trailing_whitespace(), "\n");
+        assembler.close(&mut out);
+        assert_eq!(
+            malformed(&out.drain()),
+            vec![("<fun".to_string(), MalformedReason::TagCutShort)]
+        );
+        let mut assembler = Assembler::new(0, ids(), Placement::OwnLine);
+        assembler.feed("\n", &declared, &mut out);
+        assert_eq!(assembler.trailing_whitespace(), "");
+        assembler.feed("<function=f>\n", &declared, &mut out);
+        assert_eq!(assembler.trailing_whitespace(), "");
+    }
+
+    #[test]
+    fn a_close_before_the_first_function_tag_leaves_the_block_open_for_its_call() {
+        let block = "</function>\n<function=f>\n</function>";
+        let events = finished(&[block]);
+        assert_eq!(
+            malformed(&events),
+            vec![(
+                "</function>".to_string(),
+                MalformedReason::CallWithoutFunctionTag
+            )]
+        );
+        assert_eq!(name_of(&events), Some("f"));
+        assert_eq!(arguments(&events), "{}");
+        assert_eq!(ends(&events), 1);
+        assert_eq!(bytes(&events), block);
     }
 
     #[test]
@@ -1130,7 +1311,7 @@ mod tests {
                 .find(|e| matches!(e, Event::ToolCallStart { .. })),
             Some(&Event::ToolCallStart {
                 index: 0,
-                id: "call_0".to_string(),
+                id: ids().id(0),
                 name: "f".to_string(),
                 source: Text::uncounted(" <function=f>"),
             })
@@ -1143,12 +1324,10 @@ mod tests {
 
     #[test]
     fn a_tag_inside_a_name_cuts_the_name_short() {
-        // `</function>` inside the function's name ends the block, which named no function.
-        let (events, taken) = run(
-            &["<function=f</function>rest"],
-            Placement::OwnLine,
-            Assembler::finish,
-        );
+        // `</function>` inside the function's name closes a call that named no function; the
+        // block goes on, and what follows is text between its tags.
+        let piece = "<function=f</function>rest";
+        let (events, taken) = run(&[piece], Placement::OwnLine, Assembler::finish);
         assert_eq!(name_of(&events), None);
         assert_eq!(
             malformed(&events),
@@ -1158,9 +1337,10 @@ mod tests {
                     "</function>".to_string(),
                     MalformedReason::CallWithoutFunctionTag
                 ),
+                ("rest".to_string(), MalformedReason::TextBetweenTags),
             ]
         );
-        assert_eq!(taken, vec!["<function=f</function>".len()]);
+        assert_eq!(taken, vec![piece.len()]);
         assert_eq!(ends(&events), 0);
         // Inside a parameter's key, the call goes on and `</function>` ends it.
         let call = "<function=f>\n<parameter=a</function>";
@@ -1486,12 +1666,10 @@ mod tests {
             )]
         );
         assert_eq!(ends(&events), 0);
-        // `</function>` with no function open ends the block as one that named none.
-        let (events, taken) = run(
-            &["\nx</function>rest"],
-            Placement::OwnLine,
-            Assembler::finish,
-        );
+        // `</function>` with no function open closes a call that named none; the block goes on,
+        // and what follows is text between its tags.
+        let piece = "\nx</function>rest";
+        let (events, taken) = run(&[piece], Placement::OwnLine, Assembler::finish);
         assert_eq!(
             malformed(&events),
             vec![
@@ -1500,10 +1678,11 @@ mod tests {
                     "</function>".to_string(),
                     MalformedReason::CallWithoutFunctionTag
                 ),
+                ("rest".to_string(), MalformedReason::TextBetweenTags),
             ]
         );
         assert_eq!(dropped(&events), vec!["\n"]);
-        assert_eq!(taken, vec!["\nx</function>".len()]);
+        assert_eq!(taken, vec![piece.len()]);
     }
 
     #[test]

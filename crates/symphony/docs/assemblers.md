@@ -144,9 +144,15 @@ tag, the template's newline) or no bytes when the cut fell between events. The f
 since a fragment passed on cannot be taken back, and nothing is made up for a value the model never
 finished; the four assemblers of `tagged` share that end (`tagged::end_cut_call`).
 
-`feed` takes one piece and returns how many of its bytes the call took: all of them before
-`</function>`, and up to that tag in the piece that carries it, so the format routes whatever
-follows (the block's closing marker, more text) itself.
+`feed` takes one piece and takes every byte of it: the block's calls follow one another, and the
+block's closing marker is the format's to read. The templates write one function block per call
+region, and a model answering with several calls at once writes them one after another inside one
+region, which the engines' own parsers read as the calls they are; so after `</function>` the
+assembler stays in the block. Whitespace there is the template's and goes into the next event's
+source, the next `<function=` starts the next call at the next index with the id that index mints,
+and anything else is `Malformed { TextBetweenCalls }`. A region that ends after its last call
+closed ends nothing: the whitespace after the call is dropped, and a tag the end cut short is
+reported.
 
 ## The keyed assembler (`tagged::keyed`)
 

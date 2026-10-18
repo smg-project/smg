@@ -1500,6 +1500,14 @@ const SEED_OUTPUTS: &[&str] = &[
     "<think>not a thought</think><tool_call>not a call</tool_call><seed:think>a thought",
     "<seed:tool_call>\n<function=get_weather>\n<parameter=city>\n計画 🌍 \"q\" \\ \n</parameter>\n\
      </function>\n</seed:tool_call>",
+    // A parallel answer's calls one after another in one region: the tags on one line, and one
+    // per line with text between the blocks and a block the region's close cuts.
+    "<seed:tool_call><function=get_weather><parameter=city>Paris</parameter><parameter=days>3\
+     </parameter></function><function=other><parameter=note>None</parameter></function>\
+     </seed:tool_call>",
+    "<seed:tool_call>\n<function=get_weather>\n<parameter=city>Paris</parameter>\n</function>\n\
+     then\n<function=other>\n</function>\n<function=get_weather>\n<parameter=city>Par\
+     </seed:tool_call>",
     "",
 ];
 
@@ -1706,6 +1714,9 @@ const QWEN3_TAGGED_OUTPUTS: &[&str] = &[
     "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>",
     "<think>plan</think><tool_call>\n<function=get_weather>\n<parameter=city>\n計画 🌍 \"q\" \\ \n\
      </parameter>\n</function>\n</tool_call>",
+    // Two function blocks in one `<tool_call>` block, as a parallel answer may write them.
+    "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n\
+     <function=other>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>",
 ];
 
 const QWEN3_OUTPUTS: &[&str] = &[
@@ -1772,6 +1783,7 @@ const QWEN3_TAGGED_DIRECT_OUTPUTS: &[&str] = &[
     "Hello!",
     "<tool_call>\n<function=get_weather>\n<parameter=city>Par",
     "<tool_call>\n<function=get_weather>\n<parameter=city>Par</tool_call>",
+    "<tool_call>\n<function=get_weather>\n<parameter=city>Paris</parameter>\n</function>\n<function=get_stock_price>\n<parameter=ticker>AAPL</parameter>\n</function>\n</tool_call>",
 ];
 
 /// DeepSeek V4's DSML as its reference encoder renders it (the thought the prompt opens written

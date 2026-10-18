@@ -2,7 +2,9 @@
 //! `</tool_call>`, everything else content. Inside the call markers the family writes one of two
 //! syntaxes ([`CallSyntax`]): Qwen3 a JSON object, `{"name": …, "arguments": {…}}`; Qwen 3.5
 //! and later and Qwen3-Coder the tags `<function=NAME>` and `<parameter=KEY>` around each value's
-//! text, which the request's tools type, an object or a list written as JSON. Qwen 3.5 puts the
+//! text, which the request's tools type, an object or a list written as JSON, one function block
+//! per pair of markers as the template writes it and several in one as a model may write a
+//! parallel answer. Qwen 3.5 puts the
 //! value on a line of its own and MiMo writes it between the tags directly, which the syntax's
 //! [`Placement`](crate::tagged::Placement) says.
 //!
@@ -1120,6 +1122,84 @@ mod tests {
             events.last(),
             Some(Event::Finish { tool_calls: 2, .. })
         ));
+    }
+
+    #[test]
+    fn two_function_blocks_in_one_block_are_two_calls_under_either_placement() {
+        // The template writes one `<tool_call>` block per call; a parallel answer may put its
+        // function blocks in one, which the engines' own parsers read as the calls they are.
+        let shapes = [
+            (
+                Placement::OwnLine,
+                concat!(
+                    "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n",
+                    "</function>\n<function=lookup>\n<parameter=id>\n42\n</parameter>\n</function>\n",
+                    "</tool_call>"
+                ),
+            ),
+            (
+                Placement::Direct,
+                concat!(
+                    "<tool_call>\n<function=get_weather>\n<parameter=city>Paris</parameter>\n",
+                    "</function>\n<function=lookup>\n<parameter=id>42</parameter>\n</function>\n",
+                    "</tool_call>"
+                ),
+            ),
+        ];
+        for (placement, output) in shapes {
+            let per_char: Vec<String> = output.chars().map(String::from).collect();
+            let per_char: Vec<&str> = per_char.iter().map(String::as_str).collect();
+            for pieces in [vec![output], per_char] {
+                let mut parser = engine(
+                    qwen3(CallSyntax::Tagged(Spelling::Json, placement)),
+                    declared(),
+                );
+                let mut out = Events::new();
+                for piece in &pieces {
+                    parser.feed(delta(piece), &mut out).expect("delta");
+                }
+                parser
+                    .feed(
+                        Input::End {
+                            finish: EngineFinish::Stop,
+                        },
+                        &mut out,
+                    )
+                    .expect("end");
+                let events = out.drain();
+                let starts: Vec<(u32, String, String)> = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        Event::ToolCallStart {
+                            index, id, name, ..
+                        } => Some((*index, id.clone(), name.clone())),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    starts,
+                    vec![
+                        (0, ids().id(0), "get_weather".to_string()),
+                        (1, ids().id(1), "lookup".to_string()),
+                    ],
+                    "{placement:?} in {} pieces",
+                    pieces.len()
+                );
+                assert_eq!(arguments_of(&events, 0), r#"{"city": "Paris"}"#);
+                assert_eq!(arguments_of(&events, 1), r#"{"id": 42}"#);
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, Event::Malformed { .. })),
+                    "{placement:?}: {events:?}"
+                );
+                assert_eq!(bytes(&events), output);
+                assert!(matches!(
+                    events.last(),
+                    Some(Event::Finish { tool_calls: 2, .. })
+                ));
+            }
+        }
     }
 
     #[test]
