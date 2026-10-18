@@ -72,6 +72,32 @@ use crate::{
     tenant::TenantContext,
 };
 
+/// A server's tools as inventory entries under `category`: the listing and
+/// the entries; `None`, after one warning, when the server cannot be listed.
+async fn tools_of<S: rmcp::service::Service<RoleClient>>(
+    client: &RunningService<RoleClient, S>,
+    server_key: &str,
+    category: ToolCategory,
+) -> Option<Vec<ToolEntry>> {
+    match client.peer().list_all_tools().await {
+        Ok(tools) => {
+            info!("Discovered {} tools from '{}'", tools.len(), server_key);
+            Some(
+                tools
+                    .into_iter()
+                    .map(|tool| {
+                        ToolEntry::from_server_tool(server_key, tool).with_category(category)
+                    })
+                    .collect(),
+            )
+        }
+        Err(e) => {
+            warn!("Failed to list tools from '{}': {}", server_key, e);
+            None
+        }
+    }
+}
+
 /// Build request headers from token and custom headers.
 fn build_request_headers(
     token: Option<&str>,
@@ -603,16 +629,11 @@ impl McpOrchestrator {
     /// Load tools, prompts, and resources from a server into the inventory.
     async fn load_server_inventory(&self, server_key: &str, client: &Arc<McpClientWithHandler>) {
         // Load tools
-        match client.peer().list_all_tools().await {
-            Ok(tools) => {
-                info!("Discovered {} tools from '{}'", tools.len(), server_key);
-                for tool in tools {
-                    let entry = ToolEntry::from_server_tool(server_key, tool)
-                        .with_category(ToolCategory::Static);
-                    self.tool_inventory.insert_entry(entry);
-                }
-            }
-            Err(e) => warn!("Failed to list tools from '{}': {}", server_key, e),
+        for entry in tools_of(client.as_ref(), server_key, ToolCategory::Static)
+            .await
+            .unwrap_or_default()
+        {
+            self.tool_inventory.insert_entry(entry);
         }
 
         // Load prompts
@@ -677,25 +698,21 @@ impl McpOrchestrator {
                             tool_inventory.clear_server_tools(&request.server_key);
 
                             // Reload tools
-                            match entry.client.peer().list_all_tools().await {
-                                Ok(tools) => {
-                                    for tool in tools {
-                                        let entry = ToolEntry::from_server_tool(&request.server_key, tool)
-                                            .with_category(ToolCategory::Static);
-                                        tool_inventory.insert_entry(entry);
-                                    }
-                                    info!(
-                                        "Refreshed inventory for '{}': {} tools",
-                                        request.server_key,
-                                        tool_inventory.counts().0
-                                    );
+                            if let Some(entries) = tools_of(
+                                entry.client.as_ref(),
+                                &request.server_key,
+                                ToolCategory::Static,
+                            )
+                            .await
+                            {
+                                for entry in entries {
+                                    tool_inventory.insert_entry(entry);
                                 }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to refresh tools for '{}': {}",
-                                        request.server_key, e
-                                    );
-                                }
+                                info!(
+                                    "Refreshed inventory for '{}': {} tools",
+                                    request.server_key,
+                                    tool_inventory.counts().0
+                                );
                             }
                         }
                     }
@@ -1524,20 +1541,11 @@ impl McpOrchestrator {
             .await?;
 
         // Pooled connections are keyed by URL.
-        match client.peer().list_all_tools().await {
-            Ok(tools) => {
-                info!(
-                    "Discovered {} tools from dynamic server '{}'",
-                    tools.len(),
-                    server_key
-                );
-                for tool in tools {
-                    let entry = ToolEntry::from_server_tool(&server_key, tool)
-                        .with_category(ToolCategory::Dynamic);
-                    inventory_clone.insert_entry(entry);
-                }
-            }
-            Err(e) => warn!("Failed to list tools from '{}': {}", server_key, e),
+        for entry in tools_of(client.as_ref(), &server_key, ToolCategory::Dynamic)
+            .await
+            .unwrap_or_default()
+        {
+            inventory_clone.insert_entry(entry);
         }
 
         self.metrics.record_connection_opened();
@@ -1765,16 +1773,12 @@ impl<'a> McpRequestContext<'a> {
         let client = Arc::new(client);
 
         // Load tools
-        match client.peer().list_all_tools().await {
-            Ok(tools) => {
-                for tool in tools {
-                    let entry = ToolEntry::from_server_tool(&config.name, tool)
-                        .with_category(ToolCategory::Dynamic);
-                    self.dynamic_tools
-                        .insert(entry.qualified_name.clone(), entry);
-                }
-            }
-            Err(e) => warn!("Failed to list tools from '{}': {}", config.name, e),
+        for entry in tools_of(client.as_ref(), &config.name, ToolCategory::Dynamic)
+            .await
+            .unwrap_or_default()
+        {
+            self.dynamic_tools
+                .insert(entry.qualified_name.clone(), entry);
         }
 
         self.dynamic_clients.insert(config.name.clone(), client);
