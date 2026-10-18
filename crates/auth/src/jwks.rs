@@ -264,8 +264,8 @@ fn http_client() -> Result<reqwest::Client, JwksError> {
 }
 
 /// Refuses a response whose declared length is over [`MAX_JWKS_RESPONSE_SIZE`]
-/// before its body is read; a body without a declared length is bounded as it
-/// is read.
+/// before its body is read. A response without a declared length is not
+/// stopped here; the caller has to bound the body itself.
 fn within_size_limit(response: &reqwest::Response) -> Result<(), JwksError> {
     match response.content_length() {
         Some(content_length) if content_length > MAX_JWKS_RESPONSE_SIZE => Err(
