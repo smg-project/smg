@@ -130,64 +130,83 @@ fn compile_anchor(
         ));
     }
     if let Some(raw) = spec.get(literal_key) {
-        let mut literals: Vec<String> = Vec::new();
-        match raw {
-            Value::String(s) => literals.push(s.clone()),
-            Value::Array(items) if items.is_empty() => {
-                return Err(invalid(
-                    scope,
-                    format!("'{literal_key}' list must contain at least one literal"),
-                ));
-            }
-            Value::Array(items) => {
-                let mut seen = HashSet::new();
-                for item in items {
-                    let Value::String(s) = item else {
-                        return Err(invalid(
-                            scope,
-                            format!("'{literal_key}' list must contain only strings"),
-                        ));
-                    };
-                    if seen.insert(s.as_str()) {
-                        literals.push(s.clone());
-                    }
-                }
-            }
-            other => {
-                return Err(invalid(
-                    scope,
-                    format!(
-                        "'{literal_key}' must be a string or list of strings, got {}",
-                        py::type_name(other)
-                    ),
-                ))
-            }
-        }
-        if literals.iter().any(String::is_empty) {
-            return Err(invalid(
-                scope,
-                format!("'{literal_key}' literals cannot be empty strings"),
-            ));
-        }
-        // One literal is a strict prefix of another exactly when, in sorted
-        // order, one is a prefix of the next.
-        let mut sorted: Vec<&str> = literals.iter().map(String::as_str).collect();
-        sorted.sort_unstable();
-        let can_extend = sorted.windows(2).any(|pair| pair[1].starts_with(pair[0]));
-        // Longest first (in characters, stable), as transformers sorts them.
-        literals.sort_by_key(|s| Reverse(s.chars().count()));
-        return Ok(Some(Delimiter {
-            regex: None,
-            pattern: Some(Pattern::literals(&literals)),
-            literals: true,
-            #[cfg(feature = "symphony")]
-            texts: literals,
-            can_extend,
-        }));
+        return literal_delimiter(scope, literal_key, raw).map(Some);
     }
     let Some(raw) = spec.get(pattern_key) else {
         return Ok(None);
     };
+    pattern_delimiter(scope, pattern_key, raw, role, refusal).map(Some)
+}
+
+/// A delimiter given as literals under `literal_key`: one string or a list
+/// of distinct non-empty strings, kept longest first.
+fn literal_delimiter(scope: &str, literal_key: &str, raw: &Value) -> Result<Delimiter, LoadError> {
+    let mut literals: Vec<String> = Vec::new();
+    match raw {
+        Value::String(s) => literals.push(s.clone()),
+        Value::Array(items) if items.is_empty() => {
+            return Err(invalid(
+                scope,
+                format!("'{literal_key}' list must contain at least one literal"),
+            ));
+        }
+        Value::Array(items) => {
+            let mut seen = HashSet::new();
+            for item in items {
+                let Value::String(s) = item else {
+                    return Err(invalid(
+                        scope,
+                        format!("'{literal_key}' list must contain only strings"),
+                    ));
+                };
+                if seen.insert(s.as_str()) {
+                    literals.push(s.clone());
+                }
+            }
+        }
+        other => {
+            return Err(invalid(
+                scope,
+                format!(
+                    "'{literal_key}' must be a string or list of strings, got {}",
+                    py::type_name(other)
+                ),
+            ))
+        }
+    }
+    if literals.iter().any(String::is_empty) {
+        return Err(invalid(
+            scope,
+            format!("'{literal_key}' literals cannot be empty strings"),
+        ));
+    }
+    // One literal is a strict prefix of another exactly when, in sorted
+    // order, one is a prefix of the next.
+    let mut sorted: Vec<&str> = literals.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let can_extend = sorted.windows(2).any(|pair| pair[1].starts_with(pair[0]));
+    // Longest first (in characters, stable), as transformers sorts them.
+    literals.sort_by_key(|s| Reverse(s.chars().count()));
+    Ok(Delimiter {
+        regex: None,
+        pattern: Some(Pattern::literals(&literals)),
+        literals: true,
+        #[cfg(feature = "symphony")]
+        texts: literals,
+        can_extend,
+    })
+}
+
+/// A delimiter given as a pattern under `pattern_key`: parsed by the
+/// reader (refused when it does not read it), compiled for the matcher
+/// (noted in `refusal` when it does not run it).
+fn pattern_delimiter(
+    scope: &str,
+    pattern_key: &str,
+    raw: &Value,
+    role: Role,
+    refusal: &mut Option<LoadError>,
+) -> Result<Delimiter, LoadError> {
     let Value::String(source) = raw else {
         return Err(invalid(
             scope,
@@ -199,14 +218,14 @@ fn compile_anchor(
     let pattern = Pattern::compile(&regex, role)
         .map_err(|feature| refuse(refusal, scope, feature))
         .ok();
-    Ok(Some(Delimiter {
+    Ok(Delimiter {
         regex: Some(regex),
         pattern,
         literals: false,
         #[cfg(feature = "symphony")]
         texts: Vec::new(),
         can_extend: false,
-    }))
+    })
 }
 
 /// transformers: `_validate_template_shape`.
@@ -280,12 +299,7 @@ fn build_field(
     {
         return Err(invalid(&scope, format!("unknown keys [{key:?}]")));
     }
-    let parser = match field.get("content") {
-        None => ContentParser::Text,
-        Some(Value::String(s)) => ContentParser::from_name(s)
-            .ok_or_else(|| invalid(&scope, format!("unknown content parser '{s}'")))?,
-        Some(other) => return Err(invalid(&scope, format!("unknown content parser {other}"))),
-    };
+    let parser = field_content_parser(&scope, field)?;
     let open = compile_anchor(
         &scope,
         field,
@@ -302,53 +316,9 @@ fn build_field(
         Role::Delimiter,
         refusal,
     )?;
-    let join = match field.get("join") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(s)) => Some(s.clone()),
-        Some(other) => {
-            return Err(invalid(
-                &scope,
-                format!("'join' must be a string, got {}", py::type_name(other)),
-            ))
-        }
-    };
     let repeats = field.get("repeats").is_some_and(py::truthy);
-    if join.is_some() && !repeats {
-        return Err(invalid(&scope, "'join' requires 'repeats': true"));
-    }
-    let transform = field.get("transform").filter(|t| !t.is_null()).cloned();
-    let transform_each = match field.get("transform_each") {
-        None => false,
-        Some(Value::Bool(b)) => *b,
-        Some(other) => {
-            return Err(invalid(
-                &scope,
-                format!(
-                    "transform_each must be a bool, got {}",
-                    py::type_name(other)
-                ),
-            ))
-        }
-    };
-    if transform_each && transform.is_none() {
-        return Err(invalid(
-            &scope,
-            "transform_each is set but no transform was provided",
-        ));
-    }
-    match &transform {
-        Some(transform) => content_parsers::validate_transform_strings(&scope, transform)?,
-        None => {
-            // Named captures only reach the output through a transform.
-            let delimiters = open.iter().chain(close.iter());
-            if delimiters.flat_map(Delimiter::group_names).next().is_some() {
-                return Err(invalid(
-                    &scope,
-                    "open_pattern/close_pattern declares named group(s), but the field has no 'transform'",
-                ));
-            }
-        }
-    }
+    let join = field_join(&scope, field, repeats)?;
+    let (transform, transform_each) = field_transform(&scope, field, [&open, &close])?;
     // transformers reads `content_args` only while parsing.
     let content = Content::new(parser, field.get("content_args")).unwrap_or_else(|feature| {
         refuse(refusal, &scope, feature);
@@ -379,6 +349,84 @@ fn build_field(
         transform,
         transform_each,
     })
+}
+
+/// The field's `content` parser, by name; text when none is given.
+fn field_content_parser(
+    scope: &str,
+    field: &Map<String, Value>,
+) -> Result<ContentParser, LoadError> {
+    match field.get("content") {
+        None => Ok(ContentParser::Text),
+        Some(Value::String(s)) => ContentParser::from_name(s)
+            .ok_or_else(|| invalid(scope, format!("unknown content parser '{s}'"))),
+        Some(other) => Err(invalid(scope, format!("unknown content parser {other}"))),
+    }
+}
+
+/// The field's `join`, a string that needs `repeats`.
+fn field_join(
+    scope: &str,
+    field: &Map<String, Value>,
+    repeats: bool,
+) -> Result<Option<String>, LoadError> {
+    let join = match field.get("join") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(other) => {
+            return Err(invalid(
+                scope,
+                format!("'join' must be a string, got {}", py::type_name(other)),
+            ))
+        }
+    };
+    if join.is_some() && !repeats {
+        return Err(invalid(scope, "'join' requires 'repeats': true"));
+    }
+    Ok(join)
+}
+
+/// The field's `transform` and `transform_each`: the transform's strings
+/// validated, and without a transform no named group in the delimiters
+/// (named captures only reach the output through a transform).
+fn field_transform(
+    scope: &str,
+    field: &Map<String, Value>,
+    delimiters: [&Option<Delimiter>; 2],
+) -> Result<(Option<Value>, bool), LoadError> {
+    let transform = field.get("transform").filter(|t| !t.is_null()).cloned();
+    let transform_each = match field.get("transform_each") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        Some(other) => {
+            return Err(invalid(
+                scope,
+                format!(
+                    "transform_each must be a bool, got {}",
+                    py::type_name(other)
+                ),
+            ))
+        }
+    };
+    if transform_each && transform.is_none() {
+        return Err(invalid(
+            scope,
+            "transform_each is set but no transform was provided",
+        ));
+    }
+    match &transform {
+        Some(transform) => content_parsers::validate_transform_strings(scope, transform)?,
+        None => {
+            let mut delimiters = delimiters.into_iter().flatten();
+            if delimiters.any(|d| d.group_names().next().is_some()) {
+                return Err(invalid(
+                    scope,
+                    "open_pattern/close_pattern declares named group(s), but the field has no 'transform'",
+                ));
+            }
+        }
+    }
+    Ok((transform, transform_each))
 }
 
 /// transformers: `load_response_template`. Rejects what transformers rejects
