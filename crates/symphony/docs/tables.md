@@ -292,23 +292,41 @@ list syntax, which no recorded group writes.
 
 What the table says beyond the others:
 
-- **One state, no markers, an object or a list.** As `xlam`, the output starts in the arguments
+- **One state, an object, several, or a list.** As `xlam`, the output starts in the arguments
   state and the assembler decides at the first byte that is not whitespace; unlike `xlam`, a `{`
   there is one call alone (`json::list::Assembler::object_or_list`), whose object reads as a
-  list's object does, `arguments`, `parameters` or `args` naming the arguments. What follows the
-  object reads as what follows a list's `]`: whitespace that ends the output is the template's
-  wrapping, dropped; text is malformed, with the whitespace before and between its words, since
-  a model that explains its JSON in a sentence wrote that sentence and the reference keeps it.
+  list's object does, `arguments`, `parameters` or `args` naming the arguments. After the object
+  a `;` and another object is another call, the `;` and the whitespace around it the template's
+  wrapping: Llama 3.1 writes its parallel calls so, `{…}; {…}`, and the engines' own readers of
+  the family split on the `;`. Anything else after the object reads as what follows a list's
+  `]`: whitespace that ends the output is the template's wrapping, dropped; text is malformed,
+  with the whitespace before and between its words, since a model that explains its JSON in a
+  sentence wrote that sentence and the reference keeps it; so is a `;` that no object follows.
+- **The family's call token opens the output, or does not.** Llama 3.1's template renders a call
+  as the bare object, but its models write the call behind `<|python_tag|>`, the token the
+  template reserves for a tool call (`CallSyntax::JsonAlone` names it): at the output's start,
+  after whitespace or not, the token is dropped as the template's wrapping and the first byte
+  after it decides as the output's first did, so an output with the token and one without read
+  the same. A delta that ends inside the token is held until the next byte decides. The token is
+  read at the start only, as the family's own readers read it: after prose it is text, whole with
+  the prose, and after the object it is text after the arguments. The gateway's older `llama`
+  parser, whose name the table answers to, took the token anywhere in the text and the prose
+  before it as content; that shape reads as content whole here, by the rule that no table scans
+  for a marker, and a served Llama 3.1 Instruct checkpoint wrote the token first on every output
+  that had it (248 of 248 in the recorded set). A request without tools reads with the table
+  without its calls, and then the output is the text it was, token included.
 - **Prose before the JSON is content, whole.** The gateway's older `json` parser searches the
   output for the first `{` or `[`; this table does not, as no other table scans for a marker.
 - **A forced call is the list.** `Format::grammar` writes the `xlam` list, as the older parser's
-  forced calls were written.
+  forced calls were written; the call token is not in the grammar, since the template never
+  renders it.
 
-What the table leaves open: the format is Llama 3.1's own template's, which six recorded groups
-write (Nemotron Ultra 253B CPT, the UltraLong 1M, 2M and 4M, Safety Guard 8B v3, the 70B Reward
-Principle): one call alone, `parameters` naming the arguments, and never a list, content beside a
-call or a thought, since the template refuses them; the list and the wrapping after an object rest
-on the unit tests until a group writes them.
+What the table leaves open: six recorded groups write the format (Nemotron Ultra 253B CPT, the
+UltraLong 1M, 2M and 4M, Safety Guard 8B v3, the 70B Reward Principle), as the template renders
+it: one call alone, `parameters` naming the arguments, and never a list, content beside a call or a
+thought, since the template refuses them; the call token and the `;` between calls are what a
+served Llama 3.1 Instruct checkpoint writes, held verbatim in the table's unit tests, and the list
+and the wrapping after an object rest on the unit tests until a group writes them.
 
 ## The forced call (`forced`)
 

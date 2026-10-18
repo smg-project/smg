@@ -1812,6 +1812,17 @@ const JSON_OUTPUTS: &[&str] = &[
     "{\"name\": \"f\", \"arguments\": {}} and then some",
     "{\"name\": \"get_weather\"}",
     "{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\", }}",
+    // Llama 3.1's models write the call behind the template's call token, and parallel calls
+    // with `; ` between the objects (verbatim from a served checkpoint); the token before prose,
+    // a `;` nothing follows, and the token cut short.
+    "<|python_tag|>{\"name\": \"get_stock_info\", \"parameters\": {\"company_name\": \"Apple Inc.\", \"detail_level\": \"detailed\", \"market\": \"NASDAQ\"}}",
+    "<|python_tag|>{\"name\": \"scientist_info_get_birthdate\", \"parameters\": {\"name\": \"Nikola Tesla\"}}; {\"name\": \"scientist_info_get_famous_discovery\", \"parameters\": {\"name\": \"Nikola Tesla\", \"discovery_order\": \"1\"}}",
+    "{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}};{\"name\": \"get_stock_price\", \"parameters\": {\"ticker\": \"AAPL\"}} ;\n {\"name\": \"f\"}",
+    "<|python_tag|>I cannot help with that.",
+    "\n<|python_tag|>\n{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}; ",
+    "<|python_tag|>{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Par",
+    "<|python_ta",
+    "Sure: <|python_tag|>{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}",
 ];
 
 /// The outputs bellwether's common set records for MiniMax M2 (the thought the prompt opens

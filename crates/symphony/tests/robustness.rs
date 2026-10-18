@@ -40,8 +40,8 @@ use common::bytes_of;
 use openai_protocol::common::{Function, Tool};
 use serde_json::json as value;
 use symphony::{
-    adapt, formats::Table, Declared, DropReason, Engine, EngineFinish, Event, Events, FinishReason,
-    Format, Input, MalformedReason, ParseError, Parser, TokenSpan,
+    adapt, formats::Table, CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events,
+    FinishReason, Format, Input, MalformedReason, ParseError, Parser, TokenSpan,
 };
 
 const CASES_ENV: &str = "SYMPHONY_SCRAMBLE_CASES";
@@ -237,6 +237,11 @@ fn vocabulary(format: &Format) -> Vec<String> {
     let mut markers: Vec<String> = format.terminal_texts().map(str::to_string).collect();
     if let Some(syntax) = format.call_syntax() {
         markers.extend(syntax.tag_texts().into_iter().map(str::to_string));
+        // The call marker a family may open its output with (Llama 3.1's) is the `json`
+        // table's own too.
+        if let CallSyntax::JsonAlone(Some(opener)) = syntax {
+            markers.push((*opener).to_string());
+        }
     }
     let mut pieces = markers.clone();
     for marker in &markers {

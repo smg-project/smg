@@ -252,7 +252,9 @@ fn assembler(
         // bare list the output starts in (xLAM) takes it for prose.
         Some(CallSyntax::JsonList) if framed => Box::new(json::list::Assembler::framed(index, ids)),
         Some(CallSyntax::JsonList) => Box::new(json::list::Assembler::new(index, ids)),
-        Some(CallSyntax::JsonAlone) => Box::new(json::list::Assembler::object_or_list(index, ids)),
+        Some(CallSyntax::JsonAlone(opener)) => {
+            Box::new(json::list::Assembler::object_or_list(index, ids, opener))
+        }
         Some(CallSyntax::Xml) => Box::new(tagged::xml::Assembler::new(index, id)),
         Some(CallSyntax::Attributed(tags)) => {
             Box::new(tagged::attributed::Assembler::new(index, id, tags))

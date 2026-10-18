@@ -31,7 +31,7 @@ pub fn answering_to(name: &str) -> Option<Table> {
 /// among them, which leaves its channel as written, which no table reads for. A row may also be
 /// the name a downstream launcher passes for a model family whose table has no older parser
 /// (`muse` for `muse_spark`), so that the launcher's flags read with the table.
-pub const ALIASES: [(&str, Table); 14] = [
+pub const ALIASES: [(&str, Table); 15] = [
     ("qwen", Table::Qwen3),
     ("qwen_xml", Table::Qwen3Tagged),
     ("qwen_coder", Table::Qwen3Tagged),
@@ -46,6 +46,12 @@ pub const ALIASES: [(&str, Table); 14] = [
     ("kimik2", Table::KimiK2),
     ("kimi_thinking", Table::KimiK2),
     ("kimi_k25", Table::KimiK2),
+    // Llama 3.2's calls behind the python tag, `;` between them: the format Llama 3.1's models
+    // write, which the json table reads. One shape differs: the legacy parser took the tag
+    // anywhere in the text, prose before it as content; the table reads it at the output's
+    // start only, as the engine's own reader of the family does, and an output with prose
+    // before the tag is content whole (`docs/tables.md`, the JSON table).
+    ("llama", Table::Json),
 ];
 
 /// The legacy parsers' names no table answers to ([`answering_to`] gives `None`), each
@@ -57,7 +63,7 @@ pub const ALIASES: [(&str, Table); 14] = [
 /// the next source decides: after a worker's labels the registry's table for a model it
 /// knows, else the gateway's flags, else the legacy parsers (`passthrough` excepted, which
 /// keeps the legacy parsers either way).
-pub const UNANSWERED: [(&str, &str); 17] = [
+pub const UNANSWERED: [(&str, &str); 16] = [
     (
         "passthrough",
         "leaves its channel as written, which no table reads for: the way back to the \
@@ -105,11 +111,6 @@ pub const UNANSWERED: [(&str, &str); 17] = [
          exist yet and takes the name",
     ),
     (
-        "llama",
-        "Llama 3.2's calls after its python tag, which no table reads yet; the table that \
-         does takes the name",
-    ),
-    (
         "pythonic",
         "Llama 4's Python list of calls, which no table reads yet; the table that does takes \
          the name",
@@ -155,7 +156,8 @@ mod tests {
                 "{alias}"
             );
         }
-        assert_eq!(answering_to("llama"), None);
+        assert_eq!(answering_to("llama"), Some(Table::Json));
+        assert_eq!(answering_to("pythonic"), None);
         assert_eq!(answering_to("passthrough"), None);
         // A launcher's name for a family whose table has no older parser answers for the table.
         assert_eq!(answering_to("muse"), Some(Table::MuseSpark));

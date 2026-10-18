@@ -147,11 +147,16 @@ pub enum CallSyntax {
     /// an arguments state entered at the output's start, and the assembler decides at the first
     /// byte that is not whitespace.
     JsonList,
-    /// One JSON call object, or a list of them, alone in the turn with no markers around it, or
-    /// content: the format the gateway's older `json` parser reads. The table's one state is an
+    /// One JSON call object, or several with `;` between them, or a list of them, alone in the
+    /// turn, after the family's call marker where the model writes one, or content: Llama 3.1's
+    /// format, which the gateway's older `json` parser reads. The table's one state is an
     /// arguments state entered at the output's start, and the assembler decides at the first byte
-    /// that is not whitespace: `{` is one call, `[` a list, anything else content.
-    JsonAlone,
+    /// that is not whitespace: `{` is one call, and another after each `;`, `[` a list, anything
+    /// else content. The marker is the one the family's model writes before its first call,
+    /// when the table names one (`<|python_tag|>`, the token Llama 3.1's template reserves for a
+    /// call): read at the output's start only and dropped as the template's wrapping, so that an
+    /// output with it and one without read the same.
+    JsonAlone(Option<&'static str>),
     /// An XML tree of arguments: `<invoke name="…">`, then one element per argument, `<key>` to
     /// `</key>`, nested for an object and with `<item>` elements for a list, typed by the request's
     /// tools at every depth: MiniMax M3. The terminal that enters the state is the invoke tag's
@@ -228,7 +233,7 @@ impl CallSyntax {
             Self::Json
             | Self::Pythonic(_)
             | Self::JsonList
-            | Self::JsonAlone
+            | Self::JsonAlone(_)
             | Self::ForcedArguments
             | Self::Xml => Vec::new(),
         }

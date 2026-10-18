@@ -22,8 +22,16 @@
 //! alone: the object goes to a [`json::Assembler`](super::Assembler) as a list's object does, and
 //! what follows it reads as what follows a list's `]`: whitespace that ends the output is the
 //! template's wrapping, dropped; text, with the whitespace before and between its words, is
-//! `Malformed`. A list reads as before. [`Assembler::new`] (the `xlam` table) keeps a `{` as
-//! prose.
+//! `Malformed`; but a `;` and then another object is another call (Llama 3.1 writes its parallel
+//! calls so, `{…}; {…}`), the `;` and the whitespace around it the template's wrapping, and a `;`
+//! that no object follows is text after the arguments. Where the table names the family's call
+//! marker (Llama 3.1's `<|python_tag|>`), the output may open with it, after whitespace or not:
+//! the marker is dropped as wrapping, with the whitespace before it, and what follows decides as
+//! the first byte did, so that an output with the marker and one without read the same; a delta
+//! that ends inside the marker is held until the next decides, and bytes that turn out not to be
+//! it are prose with everything held. The marker is read at the output's start only: later, or
+//! after prose, it is text. A list reads as before. [`Assembler::new`] (the `xlam` table) keeps a
+//! `{` as prose.
 //!
 //! A region with no markers never closes by one, so [`Assembler::close`] is for a table that puts
 //! the list between markers after all; [`Assembler::finish`] is the end of the stream: an object
@@ -66,12 +74,21 @@ pub struct Assembler {
     /// whitespace included, is the model's prose after its calls. Before it, whitespace is held,
     /// the template's wrapping if nothing follows.
     prose_after: bool,
+    /// The family's call marker the output may open with ([`Self::object_or_list`]), until the
+    /// first byte that is not whitespace has decided whether it does.
+    opener: Option<&'static str>,
+    /// Whether a `;` followed the lone object, so that the next object is another call: the `;`
+    /// is held with the whitespace around it until the next byte decides.
+    separated: bool,
 }
 
 #[derive(Debug)]
 enum Stage {
     /// Before the first byte that is not whitespace.
     Deciding,
+    /// Inside the family's call marker at the output's start: `matched` bytes of it have come,
+    /// held, and the next byte says whether the rest follows.
+    Opening { matched: usize },
     /// The output is prose.
     Content,
     /// Text where the list should be, between markers: every byte malformed.
@@ -100,13 +117,18 @@ impl Assembler {
             listed: false,
             framed: false,
             prose_after: false,
+            opener: None,
+            separated: false,
         }
     }
 
-    /// [`Self::new`], also reading a `{` at the first byte as one call alone.
-    pub fn object_or_list(first: u32, ids: CallIds) -> Self {
+    /// [`Self::new`], also reading a `{` at the first byte as one call alone, and another call
+    /// after each `;` that follows it; `opener` is the family's call marker the output may open
+    /// with, dropped as the template's wrapping where it does.
+    pub fn object_or_list(first: u32, ids: CallIds, opener: Option<&'static str>) -> Self {
         Self {
             lone_object: true,
+            opener,
             ..Self::new(first, ids)
         }
     }
@@ -141,7 +163,8 @@ impl Assembler {
                 self.drop_carried(out);
                 object.finish(out);
             }
-            Stage::Deciding | Stage::Content => {
+            // The bytes of a marker the output ends inside are text, as a cut marker is anywhere.
+            Stage::Deciding | Stage::Opening { .. } | Stage::Content => {
                 if !self.carried.is_empty() {
                     out.push(Event::Content(Text::uncounted(std::mem::take(
                         &mut self.carried,
@@ -149,7 +172,13 @@ impl Assembler {
                 }
             }
             // Whitespace held after the object or the list, with nothing after it: the template's
-            // wrapping.
+            // wrapping. A `;` held there separates nothing: text after the arguments.
+            Stage::After if self.separated => {
+                out.push(Event::Malformed {
+                    text: Text::uncounted(std::mem::take(&mut self.carried)),
+                    why: MalformedReason::TextAfterTheArguments,
+                });
+            }
             Stage::After => self.drop_carried(out),
             // Every byte was reported as it arrived.
             Stage::Malformed => {}
@@ -174,6 +203,9 @@ impl Assembler {
                     return "";
                 };
                 self.carried.push_str(&text[..at]);
+                // The marker is read once, at the output's start: whatever the first byte is,
+                // a later one is text.
+                let opener = self.opener.take();
                 if first == '[' {
                     // Held until the first object or the `]` says this is a list: prose after a
                     // `[` takes it back as content.
@@ -182,14 +214,45 @@ impl Assembler {
                     self.stage = Stage::Between;
                     &text[at + 1..]
                 } else if first == '{' && self.lone_object {
-                    self.drop_carried(out);
-                    let index = self.next_index;
-                    self.objects += 1;
-                    self.stage =
-                        Stage::Object(Box::new(json::Assembler::new(index, self.ids.id(index))));
+                    self.open_object(out);
+                    &text[at..]
+                } else if opener.is_some_and(|opener| opener.starts_with(first)) {
+                    self.opener = opener;
+                    self.stage = Stage::Opening { matched: 0 };
                     &text[at..]
                 } else {
                     self.not_a_list(&text[at..], out);
+                    ""
+                }
+            }
+            Stage::Opening { matched } => {
+                let matched = *matched;
+                let opener = self.opener.unwrap_or_default();
+                let pending = &opener[matched..];
+                let common = text
+                    .bytes()
+                    .zip(pending.bytes())
+                    .take_while(|(byte, expected)| byte == expected)
+                    .count();
+                if common == pending.len() {
+                    // The marker is whole: it and the whitespace before it are the template's
+                    // wrapping, and the first byte after it decides as the output's first did.
+                    self.carried.push_str(&text[..common]);
+                    self.drop_carried(out);
+                    self.opener = None;
+                    self.stage = Stage::Deciding;
+                    &text[common..]
+                } else if common == text.len() {
+                    // The delta ends inside the marker: held until the next byte decides.
+                    self.carried.push_str(text);
+                    self.stage = Stage::Opening {
+                        matched: matched + common,
+                    };
+                    ""
+                } else {
+                    // Not the marker after all: the bytes held and the rest are prose.
+                    self.opener = None;
+                    self.not_a_list(text, out);
                     ""
                 }
             }
@@ -215,13 +278,7 @@ impl Assembler {
                 self.carried.push_str(&text[..at]);
                 match first {
                     '{' => {
-                        self.drop_carried(out);
-                        let index = self.next_index;
-                        self.objects += 1;
-                        self.stage = Stage::Object(Box::new(json::Assembler::new(
-                            index,
-                            self.ids.id(index),
-                        )));
+                        self.open_object(out);
                         &text[at..]
                     }
                     ']' => {
@@ -268,14 +325,32 @@ impl Assembler {
             }
             Stage::After => {
                 // Whitespace after the object or the list is held: the template's wrapping if
-                // nothing follows it, the model's prose if text does. Once text follows, every
-                // byte is prose after the calls, reported malformed with its whitespace, since
-                // the template's reference keeps it as written.
+                // nothing follows it, the model's prose if text does. After a lone object a `;`
+                // is held too, and another object after it is another call, the `;` and the
+                // whitespace around it the template's wrapping. Once text follows, every byte
+                // is prose after the calls, reported malformed with its whitespace, since the
+                // template's reference keeps it as written.
                 if !self.prose_after {
-                    if text.chars().all(char::is_whitespace) {
+                    let Some((at, first)) = text.char_indices().find(|(_, c)| !c.is_whitespace())
+                    else {
                         self.carried.push_str(text);
                         return "";
+                    };
+                    if self.lone_object && !self.listed {
+                        if first == ';' && !self.separated {
+                            self.separated = true;
+                            self.carried.push_str(&text[..=at]);
+                            return &text[at + 1..];
+                        }
+                        if first == '{' && self.separated {
+                            self.separated = false;
+                            self.carried.push_str(&text[..at]);
+                            self.open_object(out);
+                            return &text[at..];
+                        }
                     }
+                    // A `;` held here is part of the prose's run from now on.
+                    self.separated = false;
                     self.prose_after = true;
                 }
                 self.carried.push_str(text);
@@ -290,6 +365,15 @@ impl Assembler {
                 ""
             }
         }
+    }
+
+    /// An object opens at the next byte: the bytes held before it are the template's wrapping,
+    /// and the object goes to an assembler of its own with the next free index.
+    fn open_object(&mut self, out: &mut Events) {
+        self.drop_carried(out);
+        let index = self.next_index;
+        self.objects += 1;
+        self.stage = Stage::Object(Box::new(json::Assembler::new(index, self.ids.id(index))));
     }
 
     /// The bytes held and `text` are not a list of calls: content under the bare list, malformed
@@ -504,7 +588,7 @@ mod tests {
     }
 
     fn run_alone(pieces: &[&str]) -> Vec<Event> {
-        let mut assembler = Assembler::object_or_list(0, ids());
+        let mut assembler = Assembler::object_or_list(0, ids(), None);
         let mut out = Events::new();
         for piece in pieces {
             assembler.feed(piece, &mut out);
@@ -636,6 +720,192 @@ mod tests {
             assert_eq!(dropped(&events), [" \n"]);
             assert!(malformed(&events, MalformedReason::TextAfterTheArguments).is_empty());
         }
+    }
+
+    /// [`run_alone`] with Llama 3.1's call marker named.
+    fn run_opened(pieces: &[&str]) -> Vec<Event> {
+        let mut assembler = Assembler::object_or_list(0, ids(), Some("<|python_tag|>"));
+        let mut out = Events::new();
+        for piece in pieces {
+            assembler.feed(piece, &mut out);
+        }
+        assembler.finish(&mut out);
+        out.drain()
+    }
+
+    /// `output` through `run`, whole and one character at a time: the same bytes, calls,
+    /// dropped text and malformed text either way; the events of the whole.
+    fn whole_and_per_char(run: fn(&[&str]) -> Vec<Event>, output: &str) -> Vec<Event> {
+        let whole = run(&[output]);
+        assert_eq!(bytes(&whole), output);
+        let pieces: Vec<String> = output.chars().map(String::from).collect();
+        let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
+        let cut = run(&refs);
+        assert_eq!(bytes(&cut), output);
+        assert_eq!(calls(&cut), calls(&whole), "{output:?}");
+        assert_eq!(
+            dropped(&cut).concat(),
+            dropped(&whole).concat(),
+            "{output:?}"
+        );
+        for why in [
+            MalformedReason::TextAfterTheArguments,
+            MalformedReason::TextAfterTheList,
+            MalformedReason::TextBetweenCalls,
+        ] {
+            assert_eq!(malformed(&cut, why), malformed(&whole, why), "{output:?}");
+        }
+        whole
+    }
+
+    #[test]
+    fn a_semicolon_after_a_lone_object_separates_the_next_call() {
+        let (a, b, c) = (
+            "{\"name\": \"a\", \"parameters\": {\"n\": 1}}",
+            "{\"name\": \"b\", \"parameters\": {\"n\": 2}}",
+            "{\"name\": \"c\"}",
+        );
+        let expected = [
+            (0, "a".to_string(), r#"{"n": 1}"#.to_string()),
+            (1, "b".to_string(), r#"{"n": 2}"#.to_string()),
+            (2, "c".to_string(), "{}".to_string()),
+        ];
+        for separator in ["; ", ";", " ;\n "] {
+            let output = format!("{a}{separator}{b}{separator}{c}");
+            let events = whole_and_per_char(run_alone, &output);
+            assert_eq!(calls(&events), expected, "{separator:?}");
+            assert_eq!(dropped(&events), [separator, separator], "{separator:?}");
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::Malformed { .. })),
+                "{separator:?}: {events:?}"
+            );
+        }
+        // Whitespace after the last object stays wrapping; the list-only assembler reads none
+        // of this, a `{` being prose to it.
+        let events = whole_and_per_char(run_alone, &format!("{a}; {b}\n"));
+        assert_eq!(calls(&events).len(), 2);
+        assert_eq!(dropped(&events), ["; ", "\n"]);
+        assert!(calls(&run(&[&format!("{a}; {b}")])).is_empty());
+    }
+
+    #[test]
+    fn a_semicolon_that_no_object_follows_is_text_after_the_arguments() {
+        let a = "{\"name\": \"a\", \"parameters\": {\"n\": 1}}";
+        for tail in [
+            ";",
+            "; ",
+            ";\n\n",
+            "; and then some",
+            "; [{\"name\": \"b\"}]",
+            ";;",
+        ] {
+            let output = format!("{a}{tail}");
+            let events = whole_and_per_char(run_alone, &output);
+            assert_eq!(calls(&events).len(), 1, "{tail:?}");
+            assert_eq!(
+                malformed(&events, MalformedReason::TextAfterTheArguments),
+                tail,
+                "{tail:?}"
+            );
+            assert!(dropped(&events).is_empty(), "{tail:?}: {events:?}");
+            // One event per run of text, and never one of no bytes: the held `;` joins the
+            // prose's run, so telemetry counts the run once, as it does without the `;`.
+            let malformed_events = events
+                .iter()
+                .filter(|event| matches!(event, Event::Malformed { .. }))
+                .count();
+            assert_eq!(malformed_events, 1, "{tail:?}: {events:?}");
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    Event::Malformed { text, .. } | Event::Content(text) if text.text.is_empty()
+                )),
+                "{tail:?}: {events:?}"
+            );
+        }
+        // After a list, a `;` is text after the list, as any text is.
+        let events = whole_and_per_char(run_alone, &format!("[{a}]; {a}"));
+        assert_eq!(calls(&events).len(), 1);
+        assert_eq!(
+            malformed(&events, MalformedReason::TextAfterTheList),
+            format!("; {a}")
+        );
+    }
+
+    #[test]
+    fn the_call_marker_at_the_start_is_wrapping_and_elsewhere_or_cut_short_it_is_text() {
+        let a = "{\"name\": \"a\", \"parameters\": {\"n\": 1}}";
+        let one = [(0, "a".to_string(), r#"{"n": 1}"#.to_string())];
+        // The marker, with or without whitespace around it, before an object, a list, or a
+        // `;`-separated pair.
+        for (output, wrapping) in [
+            (format!("<|python_tag|>{a}"), vec!["<|python_tag|>"]),
+            (
+                format!("  <|python_tag|>\n{a}"),
+                vec!["  <|python_tag|>", "\n"],
+            ),
+            (
+                format!("<|python_tag|>[{a}]"),
+                vec!["<|python_tag|>", "[", "]"],
+            ),
+        ] {
+            let events = whole_and_per_char(run_opened, &output);
+            assert_eq!(calls(&events), one, "{output:?}");
+            assert_eq!(dropped(&events), wrapping, "{output:?}");
+        }
+        let events = whole_and_per_char(run_opened, &format!("<|python_tag|>{a}; {a}"));
+        assert_eq!(calls(&events).len(), 2);
+        assert_eq!(dropped(&events), ["<|python_tag|>", "; "]);
+        // Without the marker the opened assembler reads as the plain one.
+        assert_eq!(calls(&whole_and_per_char(run_opened, a)), one);
+        // Prose after the marker is content, the marker dropped; the marker inside prose, a
+        // marker cut short, and text that begins like it are content whole.
+        let events = whole_and_per_char(run_opened, "<|python_tag|>no call");
+        assert!(calls(&events).is_empty());
+        assert_eq!(dropped(&events), ["<|python_tag|>"]);
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Content(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>(),
+            "no call"
+        );
+        for output in [
+            format!("Sure: <|python_tag|>{a}"),
+            "<|python_".to_string(),
+            "<|python_tag|".to_string(),
+            "<|pyxx".to_string(),
+            "<".to_string(),
+            " <x>".to_string(),
+        ] {
+            let events = whole_and_per_char(run_opened, &output);
+            assert!(calls(&events).is_empty(), "{output:?}");
+            assert!(dropped(&events).is_empty(), "{output:?}");
+            assert!(
+                events
+                    .iter()
+                    .all(|event| matches!(event, Event::Content(_))),
+                "{output:?}: {events:?}"
+            );
+        }
+        // After the object the marker is text after the arguments; the plain assembler keeps
+        // the marker as prose.
+        let events = whole_and_per_char(run_opened, &format!("{a}<|python_tag|>{a}"));
+        assert_eq!(calls(&events), one);
+        assert_eq!(
+            malformed(&events, MalformedReason::TextAfterTheArguments),
+            format!("<|python_tag|>{a}")
+        );
+        let events = whole_and_per_char(run_alone, &format!("<|python_tag|>{a}"));
+        assert!(calls(&events).is_empty());
+        assert!(events
+            .iter()
+            .all(|event| matches!(event, Event::Content(_))));
     }
 
     #[test]

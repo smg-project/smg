@@ -1880,8 +1880,10 @@ mod tests {
             named_table(&pair(Some("kimi_k3"), Some("qwen3"))),
             Some(Table::KimiK3)
         );
-        assert_eq!(named_table(&pair(Some("llama"), None)), None);
-        assert_eq!(named_table(&pair(Some("llama"), Some("qwen3"))), None);
+        assert_eq!(named_table(&pair(Some("pythonic"), None)), None);
+        assert_eq!(named_table(&pair(Some("pythonic"), Some("qwen3"))), None);
+        // The older `llama` parser's format is the json table's.
+        assert_eq!(named_table(&pair(Some("llama"), None)), Some(Table::Json));
         // `passthrough` leaves a channel as written, which no table reads for: the legacy
         // parsers keep it, alone or beside another name.
         assert_eq!(
@@ -1950,6 +1952,7 @@ mod tests {
         let symphony = ParserChoice::Symphony;
         let mapped = [
             ("json", "json"),
+            ("llama", "json"),
             ("gemma4", "gemma4"),
             ("qwen", "qwen3"),
             ("qwen3", "qwen3"),
@@ -2097,7 +2100,7 @@ mod tests {
             PROMPT,
         );
         assert_eq!(assigned.expect("assigned").format.name(), "qwen3");
-        let legacy = names(Some("llama"), Some("deepseek_r1"));
+        let legacy = names(Some("pythonic"), Some("deepseek_r1"));
         assert!(assign(
             ParserChoice::Symphony,
             &legacy,
@@ -4222,7 +4225,7 @@ mod tests {
             table("mistral_v13")
         );
         assert_eq!(
-            read(&labeled(pair(Some("llama"), None), &v13), known),
+            read(&labeled(pair(Some("pythonic"), None), &v13), known),
             Ok(None)
         );
         assert_eq!(

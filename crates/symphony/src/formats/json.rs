@@ -1,16 +1,27 @@
-//! JSON calls alone in the turn: the whole output is one call object, `{"name": …, "arguments":
-//! {…}}`, or a list of them, or content. The format the gateway's older `json` parser reads for a
-//! model that names it. No recorded group writes it as its own format, so the table stands on its
-//! unit tests until one does.
+//! JSON calls alone in the turn: the whole output is one call object, `{"name": …, "parameters":
+//! {…}}` (`arguments` reads the same), or several with `;` between them, or a list of them, or
+//! content; Llama 3.1's format, whose template renders a call as the bare object and whose
+//! models write the call behind the template's call token, `<|python_tag|>{"name": …,
+//! "parameters": {…}}`, and their parallel calls as `<|python_tag|>{…}; {…}`. The marker is read
+//! at the output's start and dropped, so an output with it and one without read the same. The
+//! format the gateway's older `json` parser reads for a model that names it, and its older
+//! `llama` parser's (Llama 3.2 writes the same). The recorded groups that write it (Nemotron
+//! Ultra CPT, UltraLong, Safety Guard, the 70B Reward Principle) record the template's bare
+//! object; the marker and the `;` form stand on the unit tests, which hold a model's output
+//! verbatim.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 use crate::format::{CallSyntax, Emits, Format};
+
+/// The token Llama 3.1's template reserves for a tool call, which its models write before the
+/// call's object; the `json` table drops it where the output opens with it.
+pub const PYTHON_TAG: &str = "<|python_tag|>";
 
 /// The JSON table.
 pub fn json() -> Format {
     Format::new("json")
         .state("calls", Emits::Arguments)
-        .calls(CallSyntax::JsonAlone)
+        .calls(CallSyntax::JsonAlone(Some(PYTHON_TAG)))
 }
 
 #[cfg(test)]
@@ -18,15 +29,19 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, Events, MalformedReason},
+        event::{DropReason, Event, Events, FinishReason, MalformedReason},
         input::{EngineFinish, Input},
         parser::Parser,
-        testing::calls,
+        testing::{bytes, calls, content},
         Declared,
     };
 
     fn run(pieces: &[&str]) -> Vec<Event> {
-        let mut parser = Engine::new(json(), Declared::default());
+        run_with(json(), pieces)
+    }
+
+    fn run_with(format: Format, pieces: &[&str]) -> Vec<Event> {
+        let mut parser = Engine::new(format, Declared::default());
         let mut out = Events::new();
         parser
             .feed(
@@ -103,6 +118,265 @@ mod tests {
             let events = run(&[&output[..cut], &output[cut..]]);
             assert_eq!(calls(&events), calls(&whole), "cut at {cut}");
         }
+    }
+
+    /// Whole, and one byte at a time: the same calls, the same bytes accounted for, the same
+    /// dropped and malformed text by reason, and the same finish.
+    fn whole_and_per_byte(output: &str) -> Vec<Event> {
+        let whole = run(&[output]);
+        assert_eq!(bytes(&whole), output);
+        let pieces: Vec<&str> = output
+            .char_indices()
+            .map(|(at, c)| &output[at..at + c.len_utf8()])
+            .collect();
+        let per_byte = run(&pieces);
+        assert_eq!(bytes(&per_byte), output);
+        assert_eq!(calls(&per_byte), calls(&whole), "{output:?}");
+        assert_eq!(content(&per_byte), content(&whole), "{output:?}");
+        assert_eq!(dropped(&per_byte), dropped(&whole), "{output:?}");
+        assert_eq!(malformed(&per_byte), malformed(&whole), "{output:?}");
+        assert_eq!(per_byte.last(), whole.last(), "{output:?}");
+        whole
+    }
+
+    /// The dropped text by reason, each reason's text joined.
+    fn dropped(events: &[Event]) -> Vec<(DropReason, String)> {
+        let mut joined: Vec<(DropReason, String)> = Vec::new();
+        for event in events {
+            if let Event::Dropped { text, why } = event {
+                match joined.iter_mut().find(|(reason, _)| reason == why) {
+                    Some((_, so_far)) => so_far.push_str(&text.text),
+                    None => joined.push((*why, text.text.clone())),
+                }
+            }
+        }
+        joined
+    }
+
+    /// The malformed text by reason, each reason's text joined.
+    fn malformed(events: &[Event]) -> Vec<(MalformedReason, String)> {
+        let mut joined: Vec<(MalformedReason, String)> = Vec::new();
+        for event in events {
+            if let Event::Malformed { text, why } = event {
+                match joined.iter_mut().find(|(reason, _)| reason == why) {
+                    Some((_, so_far)) => so_far.push_str(&text.text),
+                    None => joined.push((*why, text.text.clone())),
+                }
+            }
+        }
+        joined
+    }
+
+    /// One Llama 3.1 call as the model writes it, verbatim from a served checkpoint's output.
+    const ONE_CALL: &str = concat!(
+        "<|python_tag|>{\"name\": \"get_stock_info\", \"parameters\": {\"company_name\": ",
+        "\"Apple Inc.\", \"detail_level\": \"detailed\", \"market\": \"NASDAQ\"}}"
+    );
+
+    /// Four parallel calls as the model writes them, verbatim: one marker, `; ` between the
+    /// objects.
+    const PARALLEL_CALLS: &str = concat!(
+        "<|python_tag|>{\"name\": \"calculate_average\", \"parameters\": {\"numbers\": \"[23, 45, 67, 89]\"}}; ",
+        "{\"name\": \"calculate_average\", \"parameters\": {\"numbers\": \"[12, 34, 56, 78]\"}}; ",
+        "{\"name\": \"calculate_average\", \"parameters\": {\"numbers\": \"[98, 76, 54, 32]\"}}; ",
+        "{\"name\": \"calculate_average\", \"parameters\": {\"numbers\": \"[87, 65, 43, 21]\"}}"
+    );
+
+    /// Two calls of different tools, verbatim.
+    const TWO_TOOLS: &str = concat!(
+        "<|python_tag|>{\"name\": \"scientist_info_get_birthdate\", \"parameters\": {\"name\": \"Nikola Tesla\"}}; ",
+        "{\"name\": \"scientist_info_get_famous_discovery\", \"parameters\": {\"name\": \"Nikola Tesla\", ",
+        "\"discovery_order\": \"1\"}}"
+    );
+
+    #[test]
+    fn the_call_token_and_the_semicolons_between_calls_are_the_templates_wrapping() {
+        // The one call: the marker dropped, the arguments as written, nothing in content.
+        let events = whole_and_per_byte(ONE_CALL);
+        assert_eq!(
+            calls(&events),
+            [(
+                "get_stock_info".to_string(),
+                r#"{"company_name": "Apple Inc.", "detail_level": "detailed", "market": "NASDAQ"}"#
+                    .to_string()
+            )]
+        );
+        assert_eq!(content(&events), "");
+        assert_eq!(
+            dropped(&events),
+            [(DropReason::Wrapper, PYTHON_TAG.to_string())]
+        );
+        assert!(malformed(&events).is_empty());
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish {
+                reason: FinishReason::Stop,
+                tool_calls: 1,
+                ..
+            })
+        ));
+        // The parallel calls: one call per object, numbered in order, each with its own
+        // arguments; the `; ` between them dropped with the marker.
+        let events = whole_and_per_byte(PARALLEL_CALLS);
+        let numbers = [
+            "[23, 45, 67, 89]",
+            "[12, 34, 56, 78]",
+            "[98, 76, 54, 32]",
+            "[87, 65, 43, 21]",
+        ];
+        assert_eq!(
+            calls(&events),
+            numbers.map(|numbers| (
+                "calculate_average".to_string(),
+                format!(r#"{{"numbers": "{numbers}"}}"#)
+            ))
+        );
+        let indices: Vec<u32> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallStart { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(indices, [0, 1, 2, 3]);
+        assert_eq!(content(&events), "");
+        assert_eq!(
+            dropped(&events),
+            [(DropReason::Wrapper, format!("{PYTHON_TAG}; ; ; "))]
+        );
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish {
+                reason: FinishReason::Stop,
+                tool_calls: 4,
+                ..
+            })
+        ));
+        // Two tools, and the same two with the marker left out, or the `;` spaced otherwise.
+        let expected = [
+            (
+                "scientist_info_get_birthdate".to_string(),
+                r#"{"name": "Nikola Tesla"}"#.to_string(),
+            ),
+            (
+                "scientist_info_get_famous_discovery".to_string(),
+                r#"{"name": "Nikola Tesla", "discovery_order": "1"}"#.to_string(),
+            ),
+        ];
+        assert_eq!(calls(&whole_and_per_byte(TWO_TOOLS)), expected);
+        let bare = &TWO_TOOLS[PYTHON_TAG.len()..];
+        assert_eq!(calls(&whole_and_per_byte(bare)), expected);
+        let spaced = bare.replacen("; ", "\n;\n", 1);
+        let events = whole_and_per_byte(&spaced);
+        assert_eq!(calls(&events), expected);
+        assert_eq!(
+            dropped(&events),
+            [(DropReason::Wrapper, "\n;\n".to_string())]
+        );
+        let tight = bare.replacen("; ", ";", 1);
+        assert_eq!(calls(&whole_and_per_byte(&tight)), expected);
+        // Whitespace around the marker is wrapping too, and a list after it is the list.
+        let events = whole_and_per_byte(&format!("\n{PYTHON_TAG}\n{bare}"));
+        assert_eq!(calls(&events), expected);
+        assert_eq!(
+            dropped(&events),
+            [(DropReason::Wrapper, format!("\n{PYTHON_TAG}\n; "))]
+        );
+        let events = whole_and_per_byte(&format!(
+            "{PYTHON_TAG}[{{\"name\": \"a\", \"arguments\": {{}}}}, {{\"name\": \"b\", \"arguments\": {{}}}}]"
+        ));
+        assert_eq!(calls(&events).len(), 2);
+    }
+
+    #[test]
+    fn a_semicolon_nothing_follows_and_text_after_it_are_text_after_the_arguments() {
+        let call = r#"{"name": "f", "parameters": {"a": 1}}"#;
+        for (tail, text) in [
+            (";", ";"),
+            ("; ", "; "),
+            ("; and then some", "; and then some"),
+            (";\n[]", ";\n[]"),
+            (
+                "<|python_tag|>{\"name\": \"g\"}",
+                "<|python_tag|>{\"name\": \"g\"}",
+            ),
+        ] {
+            let events = whole_and_per_byte(&format!("{call}{tail}"));
+            assert_eq!(calls(&events).len(), 1, "{tail:?}");
+            assert_eq!(
+                malformed(&events),
+                [(MalformedReason::TextAfterTheArguments, text.to_string())],
+                "{tail:?}"
+            );
+            assert!(dropped(&events).is_empty(), "{tail:?}");
+            // Whole, the text after the arguments is one run and one event, with no event of no
+            // bytes after it.
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, Event::Malformed { .. }))
+                    .count(),
+                1,
+                "{tail:?}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_call_token_before_prose_is_dropped_and_inside_prose_or_cut_short_it_is_text() {
+        // The model declines after writing its call token: the token is the template's, the
+        // sentence is the answer.
+        let events = whole_and_per_byte("<|python_tag|>I cannot help with that.");
+        assert!(calls(&events).is_empty());
+        assert_eq!(content(&events), "I cannot help with that.");
+        assert_eq!(
+            dropped(&events),
+            [(DropReason::Wrapper, PYTHON_TAG.to_string())]
+        );
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish {
+                reason: FinishReason::Stop,
+                tool_calls: 0,
+                ..
+            })
+        ));
+        // The token after prose, or an object after it then, is the model's text, whole: the
+        // marker is read at the output's start only, as the engine's own reader reads it.
+        let output = format!("Sure, here it is: {ONE_CALL}");
+        let events = whole_and_per_byte(&output);
+        assert!(calls(&events).is_empty());
+        assert_eq!(content(&events), output);
+        assert!(dropped(&events).is_empty());
+        // Cut inside the token, or not the token after all: text.
+        for output in ["<|pyth", "<|pyxx", "<|python_tag|", "<", "<b>bold</b>"] {
+            let events = whole_and_per_byte(output);
+            assert!(calls(&events).is_empty(), "{output:?}");
+            assert_eq!(content(&events), output, "{output:?}");
+            assert!(dropped(&events).is_empty(), "{output:?}");
+        }
+        // A second token after the first is text too.
+        let events = whole_and_per_byte("<|python_tag|><|python_tag|>{\"name\": \"f\"}");
+        assert!(calls(&events).is_empty());
+        assert_eq!(content(&events), "<|python_tag|>{\"name\": \"f\"}");
+        assert_eq!(
+            dropped(&events),
+            [(DropReason::Wrapper, PYTHON_TAG.to_string())]
+        );
+    }
+
+    #[test]
+    fn without_its_calls_the_table_shows_the_output_as_written() {
+        // A request without tools reads with the table without its calls: the output is the
+        // text it was, the call token included, as the legacy parsers leave it when they run no
+        // tool parser.
+        let events = run_with(json().without_calls(), &[PARALLEL_CALLS]);
+        assert!(calls(&events).is_empty());
+        assert_eq!(content(&events), PARALLEL_CALLS);
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 0, .. })
+        ));
     }
 
     #[test]

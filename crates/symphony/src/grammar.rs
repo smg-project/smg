@@ -660,7 +660,7 @@ impl Format {
             // has no thought: the list is the same either way; a call alone (`json`) is forced as
             // the list, as the gateway's older `json` parser forces it. Between markers (Llama
             // Nemotron) the list is one tag's content, and the thought takes the prefix.
-            CallSyntax::JsonList | CallSyntax::JsonAlone => match markers {
+            CallSyntax::JsonList | CallSyntax::JsonAlone(_) => match markers {
                 None => (json::list_calls(&named, count), false),
                 Some(markers) => (json::list_tag(markers, &named, count), true),
             },

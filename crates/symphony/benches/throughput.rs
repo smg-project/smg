@@ -159,6 +159,18 @@ const SUBJECTS: &[Subject] = &[
         ),
         content_prompt: "<|im_start|>assistant\n",
     },
+    // Llama 3.1's calls alone in the turn: no thought and no answer, the call token, two calls
+    // with `; ` between them, as the model writes them.
+    Subject {
+        table: Table::Json,
+        prompt: "",
+        output: concat!(
+            "<|python_tag|>{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\", \"days\": 3}}; ",
+            "{\"name\": \"change_drink\", \"parameters\": {\"drink_id\": \"latte\", ",
+            "\"new_preferences\": {\"size\": \"large\", \"temperature\": \"hot\"}}}"
+        ),
+        content_prompt: "",
+    },
 ];
 
 /// Prose of about four kilobytes with no marker of any table in it: what most deltas carry.
