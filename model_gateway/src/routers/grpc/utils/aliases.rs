@@ -31,7 +31,8 @@ pub fn answering_to(name: &str) -> Option<Table> {
 /// among them, which leaves its channel as written, which no table reads for. A row may also be
 /// the name a downstream launcher passes for a model family whose table has no older parser
 /// (`muse` for `muse_spark`), so that the launcher's flags read with the table, or an engine's
-/// exact name for a table (`llama4_pythonic` for `llama4`), beside the generic legacy name.
+/// exact name for a table (`llama4_pythonic` for `llama4`, whose generic legacy name `pythonic`
+/// is in [`UNANSWERED`] while another family carries it).
 pub const ALIASES: [(&str, Table); 19] = [
     ("qwen", Table::Qwen3),
     ("qwen_xml", Table::Qwen3Tagged),

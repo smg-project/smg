@@ -765,367 +765,7 @@ mod tests {
     }
 
     fn run(pieces: &[&str]) -> Vec<Event> {
-        let mut assembler = Assembler::new(0, ids());
-        let mut out = Events::new();
-        for piece in pieces {
-            assembler.feed(piece, &mut out);
-        }
-        assembler.close(&mut out);
-        out.drain()
-    }
-
-    fn calls(events: &[Event]) -> Vec<(u32, String, String)> {
-        let mut calls: Vec<(u32, String, String)> = Vec::new();
-        for event in events {
-            match event {
-                Event::ToolCallStart { index, name, .. } => {
-                    calls.push((*index, name.clone(), String::new()));
-                }
-                Event::ToolCallArguments { json, .. } => {
-                    if let Some(last) = calls.last_mut() {
-                        last.2.push_str(json);
-                    }
-                }
-                _ => {}
-            }
-        }
-        calls
-    }
-
-    const OLMO: &str = concat!(
-        "get_weather(city=\"Paris\", days=3, ",
-        "prefs={\"size\": \"large\", \"deep\": [1, 2.5, true, null]})\n",
-        "get_stock_price()"
-    );
-    const OLMO_ARGUMENTS: &str = concat!(
-        r#"{"city": "Paris", "days": 3, "#,
-        r#""prefs": {"size": "large", "deep": [1, 2.5, true, null]}}"#
-    );
-    const LFM: &str = "[get_weather(city='Paris', days=3, note='it\\'s fine'), get_stock_price()]";
-
-    #[test]
-    fn olmos_bare_calls_give_two_calls_with_their_values_and_every_byte() {
-        let events = run(&[OLMO]);
-        assert_eq!(bytes(&events), OLMO);
-        assert_eq!(
-            calls(&events),
-            [
-                (0, "get_weather".to_string(), OLMO_ARGUMENTS.to_string()),
-                (1, "get_stock_price".to_string(), "{}".to_string()),
-            ]
-        );
-        assert_eq!(
-            events[0],
-            Event::ToolCallStart {
-                index: 0,
-                id: ids().id(0),
-                name: "get_weather".into(),
-                source: Text::uncounted("get_weather("),
-            }
-        );
-    }
-
-    #[test]
-    fn lfms_list_gives_the_same_calls_with_the_brackets_and_commas_dropped() {
-        let events = run(&[LFM]);
-        assert_eq!(bytes(&events), LFM);
-        assert_eq!(
-            calls(&events),
-            [
-                (
-                    0,
-                    "get_weather".to_string(),
-                    r#"{"city": "Paris", "days": 3, "note": "it's fine"}"#.to_string()
-                ),
-                (1, "get_stock_price".to_string(), "{}".to_string()),
-            ]
-        );
-        let dropped: Vec<&str> = events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Dropped { text, .. } => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(dropped, ["[", ", ", "]"]);
-    }
-
-    #[test]
-    fn every_chunking_says_the_same_and_accounts_for_every_byte() {
-        for text in [OLMO, LFM] {
-            let whole = calls(&run(&[text]));
-            for cut in 1..text.len() {
-                if !text.is_char_boundary(cut) {
-                    continue;
-                }
-                let events = run(&[&text[..cut], &text[cut..]]);
-                assert_eq!(bytes(&events), text, "cut at {cut}");
-                assert_eq!(calls(&events), whole, "cut at {cut}");
-            }
-        }
-    }
-
-    #[test]
-    fn a_call_cut_by_the_regions_end_is_closed_and_a_cut_stream_closes_nothing() {
-        let events = run(&["get_weather(city=\"Par"]);
-        assert!(events.iter().any(|event| matches!(
-            event,
-            Event::Malformed {
-                why: MalformedReason::ArgumentCutShort,
-                ..
-            }
-        )));
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, Event::ToolCallEnd { .. })));
-        assert_eq!(bytes(&events), "get_weather(city=\"Par");
-
-        let mut assembler = Assembler::new(3, ids());
-        let mut out = Events::new();
-        assembler.feed("get_weather(city=\"Par", &mut out);
-        assembler.finish(&mut out);
-        let events = out.drain();
-        // The call ends with no bytes of its own; its arguments stay cut.
-        assert!(events.iter().any(|event| matches!(
-            event,
-            Event::ToolCallEnd { index: 3, source } if source.text.is_empty()
-        )));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            Event::Malformed {
-                why: MalformedReason::UnterminatedRegion,
-                ..
-            }
-        )));
-        assert!(matches!(&events[0], Event::ToolCallStart { index: 3, .. }));
-    }
-
-    #[test]
-    fn prose_where_a_call_should_begin_is_malformed_and_the_calls_around_it_still_come() {
-        let text = "I will call:\nget_weather(city=\"Paris\")";
-        let events = run(&[text]);
-        assert_eq!(bytes(&events), text);
-        assert_eq!(calls(&events).len(), 1);
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, Event::Malformed { .. })));
-    }
-
-    #[test]
-    fn pythons_whitespace_around_the_parenthesis_and_the_equals_sign_is_allowed() {
-        let output = "get_weather (city = \"Paris\", days= 3 )";
-        let events = run(&[output]);
-        assert_eq!(bytes(&events), output);
-        assert_eq!(
-            calls(&events),
-            [(
-                0,
-                "get_weather".to_string(),
-                r#"{"city": "Paris", "days": 3}"#.to_string()
-            )]
-        );
-    }
-
-    #[test]
-    fn a_positional_argument_is_reported_as_text_where_an_argument_should_begin() {
-        let events = run(&["get_weather(\"Paris\", days=3)"]);
-        assert_eq!(
-            calls(&events),
-            [(0, "get_weather".to_string(), r#"{"days": 3}"#.to_string())]
-        );
-        assert!(events.iter().any(|event| matches!(
-            event,
-            Event::Malformed {
-                why: MalformedReason::TextWhereAnArgumentShouldBegin,
-                ..
-            }
-        )));
-    }
-
-    /// The stream's end after `pieces`: nothing is closed, as the engine ends a cut stream.
-    fn cut(pieces: &[&str]) -> Vec<Event> {
-        let mut assembler = Assembler::new(0, ids());
-        let mut out = Events::new();
-        for piece in pieces {
-            assembler.feed(piece, &mut out);
-        }
-        assembler.finish(&mut out);
-        out.drain()
-    }
-
-    fn by_the_character(text: &str) -> Vec<String> {
-        text.chars().map(String::from).collect()
-    }
-
-    /// The words the end said: the text of every `Malformed { UnterminatedRegion }` event.
-    fn said(events: &[Event]) -> Vec<&str> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Malformed {
-                    text,
-                    why: MalformedReason::UnterminatedRegion,
-                } => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn a_call_the_streams_end_cuts_right_after_its_parenthesis_says_so_before_its_end() {
-        let start = |index: u32, name: &str| Event::ToolCallStart {
-            index,
-            id: ids().id(index),
-            name: name.to_string(),
-            source: Text::uncounted(format!("{name}(")),
-        };
-        let word = Event::Malformed {
-            text: Text::uncounted(""),
-            why: MalformedReason::UnterminatedRegion,
-        };
-        let end = |index: u32| Event::ToolCallEnd {
-            index,
-            source: Text::uncounted(""),
-        };
-        assert_eq!(
-            cut(&["[get_weather("]),
-            [
-                Event::Dropped {
-                    text: Text::uncounted("["),
-                    why: DropReason::Wrapper,
-                },
-                start(0, "get_weather"),
-                word.clone(),
-                end(0),
-            ]
-        );
-        // The same by the character, for a second call the end cuts there: the first stands whole.
-        let text = "[get_weather(city='Paris'), get_stock_price(";
-        let pieces = by_the_character(text);
-        let events = cut(&pieces.iter().map(String::as_str).collect::<Vec<_>>());
-        assert_eq!(bytes(&events), text);
-        assert_eq!(
-            calls(&events),
-            [
-                (
-                    0,
-                    "get_weather".to_string(),
-                    r#"{"city": "Paris"}"#.to_string()
-                ),
-                (1, "get_stock_price".to_string(), String::new()),
-            ]
-        );
-        assert_eq!(
-            events[events.len() - 3..],
-            [start(1, "get_stock_price"), word, end(1)]
-        );
-    }
-
-    #[test]
-    fn the_streams_end_says_so_wherever_it_cuts_a_call_and_carries_what_was_held() {
-        // Where the end cuts, what the one word carries, and whether a call was open at the cut.
-        let cuts: &[(&str, &str, bool)] = &[
-            ("[get_weather", "get_weather", false),
-            ("[get_weather(", "", true),
-            ("[get_weather( ", " ", true),
-            ("[get_weather(ci", "ci", true),
-            ("[get_weather(city ", "city ", true),
-            ("[get_weather(city=", "city=", true),
-            ("[get_weather(city='Par", "city='Par", true),
-            ("[get_weather(city='Paris'", "city='Paris'", true),
-            ("[get_weather(city='Paris',", ",", true),
-            ("[get_weather(city='Paris', ", ", ", true),
-            ("[get_weather(city='Paris', da", ", da", true),
-            ("[get_weather(prefs={'a': [1, ", "prefs={'a': [1, ", true),
-            ("[get_weather(city='Paris')", "", false),
-            ("[get_weather(city='Paris'), ", ", ", false),
-            ("[get_weather(city='Paris'), get_stock_price(", "", true),
-        ];
-        for (text, held, open) in cuts {
-            let pieces = by_the_character(text);
-            let whole = cut(&[text]);
-            let by_the_character = cut(&pieces.iter().map(String::as_str).collect::<Vec<_>>());
-            for events in [whole, by_the_character] {
-                assert_eq!(bytes(&events), *text);
-                let starts = events
-                    .iter()
-                    .filter(|event| matches!(event, Event::ToolCallStart { .. }))
-                    .count();
-                let ends = events
-                    .iter()
-                    .filter(|event| matches!(event, Event::ToolCallEnd { .. }))
-                    .count();
-                assert_eq!(starts, ends, "{text:?}: every call that started ends");
-                if *open {
-                    assert_eq!(
-                        said(&events),
-                        [*held],
-                        "{text:?}: one word, with what was held"
-                    );
-                    assert!(
-                        matches!(
-                            &events[events.len() - 2..],
-                            [Event::Malformed { .. }, Event::ToolCallEnd { .. }]
-                        ),
-                        "{text:?}: the word comes right before the end"
-                    );
-                    // Nothing is made up: a cut call's fragments never close its object, so
-                    // they are no whole JSON value (a member's own `}` may end them).
-                    assert!(
-                        calls(&events).last().is_some_and(|(_, _, arguments)| {
-                            serde_json::from_str::<serde_json::Value>(arguments).is_err()
-                        }),
-                        "{text:?}: the cut call's arguments stay open"
-                    );
-                } else if held.is_empty() {
-                    assert!(said(&events).is_empty(), "{text:?}: whole calls, no word");
-                } else {
-                    assert_eq!(
-                        said(&events),
-                        [*held],
-                        "{text:?}: what was held, no call open"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn a_call_the_streams_end_cuts_anywhere_keeps_the_fragments_it_sent_and_nothing_more() {
-        let whole = calls(&run(&[LFM]));
-        for at in 1..LFM.len() {
-            if !LFM.is_char_boundary(at) {
-                continue;
-            }
-            let text = &LFM[..at];
-            let events = cut(&[text]);
-            assert_eq!(bytes(&events), text, "cut at {at}");
-            for (index, name, arguments) in calls(&events) {
-                let (_, whole_name, whole_arguments) = &whole[index as usize];
-                assert_eq!(&name, whole_name, "cut at {at}");
-                // A call's fragments are a prefix of what the whole call gives, and the one word
-                // stands between a cut call's start and its end, never inside a whole one.
-                assert!(
-                    whole_arguments.starts_with(&arguments),
-                    "cut at {at}: {arguments:?} is no prefix of {whole_arguments:?}"
-                );
-                let start = events
-                    .iter()
-                    .position(|event| matches!(event, Event::ToolCallStart { index: i, .. } if *i == index))
-                    .unwrap_or_else(|| panic!("cut at {at}: call {index} has no start"));
-                let end = events
-                    .iter()
-                    .position(
-                        |event| matches!(event, Event::ToolCallEnd { index: i, .. } if *i == index),
-                    )
-                    .unwrap_or_else(|| panic!("cut at {at}: call {index} has no end"));
-                assert_eq!(
-                    said(&events[start..end]).len(),
-                    usize::from(&arguments != whole_arguments),
-                    "cut at {at}: a cut call says so once, a whole one not at all"
-                );
-            }
-        }
+        run_with(Dialect::OLMO3, &Declared::default(), pieces)
     }
 
     fn run_with(dialect: Dialect, declared: &Declared, pieces: &[&str]) -> Vec<Event> {
@@ -1197,6 +837,24 @@ mod tests {
         out.drain()
     }
 
+    fn calls(events: &[Event]) -> Vec<(u32, String, String)> {
+        let mut calls: Vec<(u32, String, String)> = Vec::new();
+        for event in events {
+            match event {
+                Event::ToolCallStart { index, name, .. } => {
+                    calls.push((*index, name.clone(), String::new()));
+                }
+                Event::ToolCallArguments { json, .. } => {
+                    if let Some(last) = calls.last_mut() {
+                        last.2.push_str(json);
+                    }
+                }
+                _ => {}
+            }
+        }
+        calls
+    }
+
     fn content(events: &[Event]) -> String {
         events
             .iter()
@@ -1260,12 +918,163 @@ mod tests {
         ])
     }
 
+    const OLMO: &str = concat!(
+        "get_weather(city=\"Paris\", days=3, ",
+        "prefs={\"size\": \"large\", \"deep\": [1, 2.5, true, null]})\n",
+        "get_stock_price()"
+    );
+    const OLMO_ARGUMENTS: &str = concat!(
+        r#"{"city": "Paris", "days": 3, "#,
+        r#""prefs": {"size": "large", "deep": [1, 2.5, true, null]}}"#
+    );
+    const LFM: &str = "[get_weather(city='Paris', days=3, note='it\\'s fine'), get_stock_price()]";
+
+    #[test]
+    fn olmos_bare_calls_give_two_calls_with_their_values_and_every_byte() {
+        let events = run(&[OLMO]);
+        assert_eq!(bytes(&events), OLMO);
+        assert_eq!(
+            calls(&events),
+            [
+                (0, "get_weather".to_string(), OLMO_ARGUMENTS.to_string()),
+                (1, "get_stock_price".to_string(), "{}".to_string()),
+            ]
+        );
+        assert_eq!(
+            events[0],
+            Event::ToolCallStart {
+                index: 0,
+                id: ids().id(0),
+                name: "get_weather".into(),
+                source: Text::uncounted("get_weather("),
+            }
+        );
+    }
+
+    #[test]
+    fn lfms_list_gives_the_same_calls_with_the_brackets_and_commas_dropped() {
+        let events = run_with(Dialect::LFM2_5, &Declared::default(), &[LFM]);
+        assert_eq!(bytes(&events), LFM);
+        assert_eq!(
+            calls(&events),
+            [
+                (
+                    0,
+                    "get_weather".to_string(),
+                    r#"{"city": "Paris", "days": 3, "note": "it's fine"}"#.to_string()
+                ),
+                (1, "get_stock_price".to_string(), "{}".to_string()),
+            ]
+        );
+        let dropped: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped { text, .. } => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dropped, ["[", ", ", "]"]);
+    }
+
+    #[test]
+    fn every_chunking_says_the_same_and_accounts_for_every_byte() {
+        for text in [OLMO, LFM] {
+            let whole = calls(&run(&[text]));
+            for cut in 1..text.len() {
+                if !text.is_char_boundary(cut) {
+                    continue;
+                }
+                let events = run(&[&text[..cut], &text[cut..]]);
+                assert_eq!(bytes(&events), text, "cut at {cut}");
+                assert_eq!(calls(&events), whole, "cut at {cut}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_call_cut_by_the_regions_end_is_closed_and_a_cut_stream_closes_nothing() {
+        let events = run(&["get_weather(city=\"Par"]);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Malformed {
+                why: MalformedReason::ArgumentCutShort,
+                ..
+            }
+        )));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, Event::ToolCallEnd { .. })));
+        assert_eq!(bytes(&events), "get_weather(city=\"Par");
+
+        let mut assembler = Assembler::new(3, ids(), Dialect::OLMO3);
+        let mut out = Events::new();
+        assembler.feed("get_weather(city=\"Par", &Declared::default(), &mut out);
+        assembler.finish(&mut out);
+        let events = out.drain();
+        // The call ends with no bytes of its own; its arguments stay cut.
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::ToolCallEnd { index: 3, source } if source.text.is_empty()
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Malformed {
+                why: MalformedReason::UnterminatedRegion,
+                ..
+            }
+        )));
+        assert!(matches!(&events[0], Event::ToolCallStart { index: 3, .. }));
+    }
+
+    #[test]
+    fn prose_where_a_call_should_begin_is_malformed_and_the_calls_around_it_still_come() {
+        let text = "I will call:\nget_weather(city=\"Paris\")";
+        let events = run(&[text]);
+        assert_eq!(bytes(&events), text);
+        assert_eq!(calls(&events).len(), 1);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, Event::Malformed { .. })));
+    }
+
+    #[test]
+    fn pythons_whitespace_around_the_parenthesis_and_the_equals_sign_is_allowed() {
+        let output = "get_weather (city = \"Paris\", days= 3 )";
+        let events = run(&[output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(
+            calls(&events),
+            [(
+                0,
+                "get_weather".to_string(),
+                r#"{"city": "Paris", "days": 3}"#.to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_positional_argument_is_reported_as_text_where_an_argument_should_begin() {
+        let events = run(&["get_weather(\"Paris\", days=3)"]);
+        assert_eq!(
+            calls(&events),
+            [(0, "get_weather".to_string(), r#"{"days": 3}"#.to_string())]
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Malformed {
+                why: MalformedReason::TextWhereAnArgumentShouldBegin,
+                ..
+            }
+        )));
+    }
+
+    // The quoted dialect: every value between double quotes, typed by the request's tools.
+
     const QUOTED: &str = concat!(
         "[get_weather(city=\"Paris\", zip=\"75001\", days=\"3\", ratio=\"2.5\", ",
         "detailed=\"True\", tags=\"['a', 'b']\", ",
         "prefs=\"{'size': 'large', 'deep': [1, 2.5, True, None]}\", note=\"None\")]"
     );
-
     const QUOTED_ARGUMENTS: &str = concat!(
         r#"{"city": "Paris", "zip": "75001", "days": 3, "ratio": 2.5, "detailed": true, "#,
         r#""tags": ["a", "b"], "prefs": {"size": "large", "deep": [1, 2.5, true, null]}, "#,
@@ -1452,6 +1261,192 @@ mod tests {
             assert_eq!(bytes(&events), text, "character by character");
             assert_eq!(calls(&events), calls(&whole), "character by character");
             assert_eq!(content(&events), content(&whole), "character by character");
+        }
+    }
+
+    /// The stream's end after `pieces`: nothing is closed, as the engine ends a cut stream.
+    fn cut(pieces: &[&str]) -> Vec<Event> {
+        let mut assembler = Assembler::new(0, ids(), Dialect::OLMO3);
+        let mut out = Events::new();
+        for piece in pieces {
+            assembler.feed(piece, &Declared::default(), &mut out);
+        }
+        assembler.finish(&mut out);
+        out.drain()
+    }
+
+    fn by_the_character(text: &str) -> Vec<String> {
+        text.chars().map(String::from).collect()
+    }
+
+    /// The words the end said: the text of every `Malformed { UnterminatedRegion }` event.
+    fn said(events: &[Event]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Malformed {
+                    text,
+                    why: MalformedReason::UnterminatedRegion,
+                } => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_call_the_streams_end_cuts_right_after_its_parenthesis_says_so_before_its_end() {
+        let start = |index: u32, name: &str| Event::ToolCallStart {
+            index,
+            id: ids().id(index),
+            name: name.to_string(),
+            source: Text::uncounted(format!("{name}(")),
+        };
+        let word = Event::Malformed {
+            text: Text::uncounted(""),
+            why: MalformedReason::UnterminatedRegion,
+        };
+        let end = |index: u32| Event::ToolCallEnd {
+            index,
+            source: Text::uncounted(""),
+        };
+        assert_eq!(
+            cut(&["[get_weather("]),
+            [
+                Event::Dropped {
+                    text: Text::uncounted("["),
+                    why: DropReason::Wrapper,
+                },
+                start(0, "get_weather"),
+                word.clone(),
+                end(0),
+            ]
+        );
+        // The same by the character, for a second call the end cuts there: the first stands whole.
+        let text = "[get_weather(city='Paris'), get_stock_price(";
+        let pieces = by_the_character(text);
+        let events = cut(&pieces.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(bytes(&events), text);
+        assert_eq!(
+            calls(&events),
+            [
+                (
+                    0,
+                    "get_weather".to_string(),
+                    r#"{"city": "Paris"}"#.to_string()
+                ),
+                (1, "get_stock_price".to_string(), String::new()),
+            ]
+        );
+        assert_eq!(
+            events[events.len() - 3..],
+            [start(1, "get_stock_price"), word, end(1)]
+        );
+    }
+
+    #[test]
+    fn the_streams_end_says_so_wherever_it_cuts_a_call_and_carries_what_was_held() {
+        // Where the end cuts, what the one word carries, and whether a call was open at the cut.
+        let cuts: &[(&str, &str, bool)] = &[
+            ("[get_weather", "get_weather", false),
+            ("[get_weather(", "", true),
+            ("[get_weather( ", " ", true),
+            ("[get_weather(ci", "ci", true),
+            ("[get_weather(city ", "city ", true),
+            ("[get_weather(city=", "city=", true),
+            ("[get_weather(city='Par", "city='Par", true),
+            ("[get_weather(city='Paris'", "city='Paris'", true),
+            ("[get_weather(city='Paris',", ",", true),
+            ("[get_weather(city='Paris', ", ", ", true),
+            ("[get_weather(city='Paris', da", ", da", true),
+            ("[get_weather(prefs={'a': [1, ", "prefs={'a': [1, ", true),
+            ("[get_weather(city='Paris')", "", false),
+            ("[get_weather(city='Paris'), ", ", ", false),
+            ("[get_weather(city='Paris'), get_stock_price(", "", true),
+        ];
+        for (text, held, open) in cuts {
+            let pieces = by_the_character(text);
+            let whole = cut(&[text]);
+            let by_the_character = cut(&pieces.iter().map(String::as_str).collect::<Vec<_>>());
+            for events in [whole, by_the_character] {
+                assert_eq!(bytes(&events), *text);
+                let starts = events
+                    .iter()
+                    .filter(|event| matches!(event, Event::ToolCallStart { .. }))
+                    .count();
+                let ends = events
+                    .iter()
+                    .filter(|event| matches!(event, Event::ToolCallEnd { .. }))
+                    .count();
+                assert_eq!(starts, ends, "{text:?}: every call that started ends");
+                if *open {
+                    assert_eq!(
+                        said(&events),
+                        [*held],
+                        "{text:?}: one word, with what was held"
+                    );
+                    assert!(
+                        matches!(
+                            &events[events.len() - 2..],
+                            [Event::Malformed { .. }, Event::ToolCallEnd { .. }]
+                        ),
+                        "{text:?}: the word comes right before the end"
+                    );
+                    // Nothing is made up: a cut call's fragments never close its object, so
+                    // they are no whole JSON value (a member's own `}` may end them).
+                    assert!(
+                        calls(&events).last().is_some_and(|(_, _, arguments)| {
+                            serde_json::from_str::<serde_json::Value>(arguments).is_err()
+                        }),
+                        "{text:?}: the cut call's arguments stay open"
+                    );
+                } else if held.is_empty() {
+                    assert!(said(&events).is_empty(), "{text:?}: whole calls, no word");
+                } else {
+                    assert_eq!(
+                        said(&events),
+                        [*held],
+                        "{text:?}: what was held, no call open"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_call_the_streams_end_cuts_anywhere_keeps_the_fragments_it_sent_and_nothing_more() {
+        let whole = calls(&run(&[LFM]));
+        for at in 1..LFM.len() {
+            if !LFM.is_char_boundary(at) {
+                continue;
+            }
+            let text = &LFM[..at];
+            let events = cut(&[text]);
+            assert_eq!(bytes(&events), text, "cut at {at}");
+            for (index, name, arguments) in calls(&events) {
+                let (_, whole_name, whole_arguments) = &whole[index as usize];
+                assert_eq!(&name, whole_name, "cut at {at}");
+                // A call's fragments are a prefix of what the whole call gives, and the one word
+                // stands between a cut call's start and its end, never inside a whole one.
+                assert!(
+                    whole_arguments.starts_with(&arguments),
+                    "cut at {at}: {arguments:?} is no prefix of {whole_arguments:?}"
+                );
+                let start = events
+                    .iter()
+                    .position(|event| matches!(event, Event::ToolCallStart { index: i, .. } if *i == index))
+                    .unwrap_or_else(|| panic!("cut at {at}: call {index} has no start"));
+                let end = events
+                    .iter()
+                    .position(
+                        |event| matches!(event, Event::ToolCallEnd { index: i, .. } if *i == index),
+                    )
+                    .unwrap_or_else(|| panic!("cut at {at}: call {index} has no end"));
+                assert_eq!(
+                    said(&events[start..end]).len(),
+                    usize::from(&arguments != whole_arguments),
+                    "cut at {at}: a cut call says so once, a whole one not at all"
+                );
+            }
         }
     }
 }
