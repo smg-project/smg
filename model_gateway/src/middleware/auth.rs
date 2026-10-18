@@ -147,6 +147,10 @@ pub async fn auth_middleware(
                 request.extensions_mut().insert(DataPlaneCaller::new(
                     TenantIdentity::Authenticated(identity).into_key(),
                 ));
+                // The certificate is the credential; a gateway key the
+                // caller's SDK still sends ends here as it does under
+                // bearer auth.
+                spend_gateway_keys(&auth_config, &mut request);
                 return next.run(request).await;
             }
             Some(ClientCertificate::Unidentified) if required => {
@@ -188,27 +192,41 @@ pub async fn auth_middleware(
         request
             .extensions_mut()
             .insert(DataPlaneCaller::new(tenant_key.clone()));
-        // The gateway's key is spent: it identifies the caller and nothing
-        // else, and it must not travel on as an upstream's credential; a
-        // gateway key presented a second time under a provider's own header
-        // name goes with it (every value of a repeated header is read, since
-        // the removal takes the whole name), where a caller's own provider
-        // key there stays.
-        request.headers_mut().remove(header::AUTHORIZATION);
-        for name in PROVIDER_KEY_HEADERS {
-            let is_a_gateway_key = request
-                .headers()
-                .get_all(name)
-                .iter()
-                .filter_map(|value| value.to_str().ok())
-                .any(|value| auth_config.contains_token(value.trim()));
-            if is_a_gateway_key {
-                request.headers_mut().remove(name);
-            }
-        }
+        spend_gateway_keys(&auth_config, &mut request);
     }
 
     next.run(request).await
+}
+
+/// The gateway's key is spent: it identifies the caller and nothing else,
+/// and it must not travel on as an upstream's credential. A bearer that is a
+/// gateway key goes (on the bearer path it is the matched key; on a
+/// certificate-identified connection it is the key an SDK still sends beside
+/// the certificate), where any other bearer stays the caller's own; a gateway
+/// key presented under a provider's own header name goes with it (every value
+/// of a repeated header is read, since the removal takes the whole name),
+/// where a caller's own provider key there stays.
+fn spend_gateway_keys(auth_config: &AuthConfig, request: &mut Request<Body>) {
+    let bearer_is_a_gateway_key = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(bearer_token)
+        .is_some_and(|token| auth_config.contains_token(token));
+    if bearer_is_a_gateway_key {
+        request.headers_mut().remove(header::AUTHORIZATION);
+    }
+    for name in PROVIDER_KEY_HEADERS {
+        let is_a_gateway_key = request
+            .headers()
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .any(|value| auth_config.contains_token(value.trim()));
+        if is_a_gateway_key {
+            request.headers_mut().remove(name);
+        }
+    }
 }
 
 /// A verified client certificate that names no identity in the configured
@@ -893,6 +911,80 @@ mod tests {
         );
         let response = app(keyed).oneshot(with_key).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK, "the key still works");
+    }
+
+    /// On a certificate-identified connection the certificate is the
+    /// credential, and a gateway key the caller's SDK still sends as the
+    /// bearer ends at the middleware as it does under bearer auth, so nothing
+    /// downstream forwards it to an upstream; a bearer that is not a gateway
+    /// key stays the caller's own (bring your own key).
+    #[tokio::test]
+    async fn a_gateway_key_on_an_identified_connection_ends_at_the_middleware_too() {
+        let auth_config = AuthConfig::new(Some("shared-secret".to_string()))
+            .with_client_certificates(TlsClientAuth::Optional);
+        let spiffe = "spiffe://cluster.local/ns/default/sa/team-red";
+
+        let mut gateway_key = with_certificate(Some(identified(spiffe)));
+        gateway_key.headers_mut().insert(
+            header::AUTHORIZATION,
+            "Bearer shared-secret".parse().unwrap(),
+        );
+        let response = header_reporting_app(auth_config.clone())
+            .oneshot(gateway_key)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_text(response).await, "absent");
+
+        let mut own_key = with_certificate(Some(identified(spiffe)));
+        own_key.headers_mut().insert(
+            header::AUTHORIZATION,
+            "Bearer providers-own-key".parse().unwrap(),
+        );
+        let response = header_reporting_app(auth_config)
+            .oneshot(own_key)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_text(response).await, "present");
+    }
+
+    /// The same on a provider's own header name: a gateway key there ends at
+    /// the middleware on an identified connection too, a caller's own
+    /// provider key stays.
+    #[tokio::test]
+    async fn a_gateway_key_under_a_providers_header_name_ends_at_the_middleware_on_an_identified_connection_too(
+    ) {
+        let auth_config = AuthConfig::new(Some("shared-secret".to_string()))
+            .with_client_certificates(TlsClientAuth::Required);
+        let app = || {
+            Router::new()
+                .route("/", get(provider_keys_seen))
+                .route_layer(from_fn_with_state(auth_config.clone(), auth_middleware))
+        };
+        let spiffe = "spiffe://cluster.local/ns/default/sa/team-red";
+
+        let mut twice = with_certificate(Some(identified(spiffe)));
+        twice.headers_mut().insert(
+            header::AUTHORIZATION,
+            "Bearer shared-secret".parse().unwrap(),
+        );
+        twice
+            .headers_mut()
+            .insert("x-api-key", "shared-secret".parse().unwrap());
+        twice
+            .headers_mut()
+            .insert("x-goog-api-key", "shared-secret".parse().unwrap());
+        let response = app().oneshot(twice).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_text(response).await, "");
+
+        let mut own = with_certificate(Some(identified(spiffe)));
+        own.headers_mut()
+            .insert("x-api-key", "providers-own-key".parse().unwrap());
+        let response = app().oneshot(own).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_text(response).await, "x-api-key=providers-own-key");
     }
 
     /// A configuration that does not take client certificates (the admin
