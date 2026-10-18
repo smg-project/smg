@@ -406,8 +406,9 @@ What the syntax says, and what the assembler does with it:
   module's `json`, or by its text where none is declared; a bare value, a single-quoted Python
   string included, reads as under the other dialects.
 - **A parameter without a value is reported and skipped.** `key=` followed by the comma or the
-  call's `)` is a member Python refuses and the templates never write: its bytes, the key, the
-  `=` and the whitespace around them, come back as `Malformed { KeyWithoutAValue }`, nothing is
+  call's `)` is a member Python refuses and the templates never write: its bytes, the separator
+  before it, the key, the `=` and the whitespace around them, come back as
+  `Malformed { KeyWithoutAValue }`, nothing is
   written for it, and the object closes whole without it, as the Gemma reader leaves a member
   without a value; no empty string stands for a value the model did not write.
 

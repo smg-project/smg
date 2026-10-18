@@ -1090,8 +1090,9 @@ mod tests {
     }
 
     /// A parameter whose value is missing before the comma or the close is a member Python
-    /// refuses and the templates never write: its bytes, the key and the `=` with the whitespace
-    /// around them, come back under the one reason, nothing is written for it, and the object
+    /// refuses and the templates never write: its bytes, the separator before it, the key and
+    /// the `=` with the whitespace around them, come back under the one reason, nothing is
+    /// written for it, and the object
     /// closes whole without it, whole and by the character alike; no empty string stands for the
     /// value the model did not write.
     #[test]
