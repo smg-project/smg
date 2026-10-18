@@ -549,7 +549,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_pd_rendezvous_failures_total",
-        "PD rendezvous failures by leg (the worker type of the leg that failed) and phase: a bootstrap port that refused the registration probe (probe), and the failures the engines report on the gRPC path when the legs never met (bootstrap) or the KV handoff after they met failed (transfer)"
+        "PD rendezvous failures by leg (the worker type of the leg whose rendezvous failed) and phase: a bootstrap port that refused the registration probe (probe) or the same probe run when a decode leg's engine failed a request without a reason (request, on the prefill leg whose port it is), and the failures the engines report on the gRPC path when the legs never met (bootstrap) or the KV handoff after they met failed (transfer)"
     );
     describe_counter!(
         "smg_pd_kv_transfer_failures_total",
@@ -1953,8 +1953,10 @@ impl Metrics {
     }
 
     /// Record a PD rendezvous failure by `side` (the worker type of the side
-    /// that failed) and `phase` (`probe` at registration; `bootstrap` or
-    /// `transfer` as the engine reported it). Its own family: the injection
+    /// whose rendezvous failed) and `phase` (`probe` at registration and
+    /// `request` on the request path, the prefill side's port probed by the
+    /// gateway; `bootstrap` or `transfer` as the engine reported it). Its
+    /// own family: the injection
     /// failures above keep their unlabelled series, so a bare selector on
     /// it still reads them alone.
     pub fn record_pd_rendezvous_failure(side: &'static str, phase: &'static str) {

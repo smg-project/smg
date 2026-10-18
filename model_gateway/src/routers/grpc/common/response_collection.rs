@@ -2,6 +2,8 @@
 //! the answers that are not streamed to the client. The regular and the
 //! Harmony processors both collect here.
 
+use std::sync::Arc;
+
 use axum::response::Response;
 use tracing::error as trace_error;
 
@@ -16,11 +18,12 @@ use crate::{
                 ProtoStream,
             },
             utils::{
-                account_pd_side_failure, stream_failure::UpstreamClass, tonic_ext::TonicStatusExt,
+                account_pd_side_failure, dead_rendezvous_of, stream_failure::UpstreamClass,
+                tonic_ext::TonicStatusExt, DeadRendezvous,
             },
         },
     },
-    worker::PrefillLoadGuard,
+    worker::{PrefillLoadGuard, Worker},
 };
 
 /// Drain each Prefill sample through its terminal response, releasing only that
@@ -87,7 +90,7 @@ pub(crate) async fn collect_responses(
 ) -> Result<Vec<ProtoGenerateComplete>, Response> {
     let all_responses = match execution_result {
         ExecutionResult::Single { mut stream } => {
-            let responses = collect_stream_responses(&mut stream, "Single", None).await?;
+            let responses = collect_stream_responses(&mut stream, "Single", None, None).await?;
             stream.mark_completed();
             responses
         }
@@ -150,7 +153,7 @@ async fn collect_prefill_decode(
             }
             UpstreamClass::account_collected_failure(worker.as_ref(), &status);
         }
-        stream_failed("Prefill", &status)
+        stream_failed("Prefill", &status, None)
     })?;
 
     // The client's prompt-side usage is the prefill side's.
@@ -159,6 +162,7 @@ async fn collect_prefill_decode(
         &mut decode_stream,
         "Decode",
         Some(metrics_labels::WORKER_DECODE),
+        prefill_worker.as_ref(),
     )
     .await?;
 
@@ -191,40 +195,87 @@ fn merge_prefill_logprobs(
 }
 
 /// The client's answer when `side`'s stream ended with `status` before its
-/// `Complete`: the status's own HTTP class with the wording clients know.
-fn stream_failed(side: &str, status: &tonic::Status) -> Response {
-    status.to_http_error(
-        "worker_stream_failed",
-        format!("{side} stream failed: {}", status.message()),
-    )
+/// `Complete`: the status's own HTTP class with the wording clients know,
+/// under the code and with the words that name the dead rendezvous port when
+/// the gateway found one behind the failure.
+fn stream_failed(
+    side: &str,
+    status: &tonic::Status,
+    rendezvous: Option<&DeadRendezvous>,
+) -> Response {
+    match rendezvous {
+        Some(rendezvous) => status.to_http_error(
+            "pd_rendezvous_failed",
+            format!("{side} stream failed: {}; {rendezvous}", status.message()),
+        ),
+        None => status.to_http_error(
+            "worker_stream_failed",
+            format!("{side} stream failed: {}", status.message()),
+        ),
+    }
 }
 
 /// Collect all `Complete` frames of a gRPC stream; chunks carry nothing a
 /// collected answer needs. `side` names the disaggregated side the stream
 /// belongs to, whose rendezvous failures are counted before they become the
-/// client's answer; a single worker's stream has none. A failed stream is not
-/// marked completed, so its drop sends the abort.
+/// client's answer: the engine's words by phase, and, for a decode leg the
+/// engine failed without a reason, the `prefill` leg's bootstrap port probed
+/// now (see [`dead_rendezvous_of`]); a single worker's stream has none. A
+/// failed stream is not marked completed, so its drop sends the abort.
 async fn collect_stream_responses<S: FanoutChild>(
     stream: &mut S,
     worker_name: &str,
     side: Option<&'static str>,
+    prefill: Option<&Arc<dyn Worker>>,
 ) -> Result<Vec<ProtoGenerateComplete>, Response> {
     let mut all_responses = Vec::new();
 
     while let Some(response) = stream.next_item().await {
-        let gen_response = response.map_err(|status| {
-            if let Some(side) = side {
-                account_pd_side_failure(side, &status);
+        let gen_response = match response {
+            Ok(response) => response,
+            Err(status) => {
+                let rendezvous = match side {
+                    Some(side) => {
+                        account_pd_side_failure(side, &status);
+                        if side == metrics_labels::WORKER_DECODE {
+                            dead_rendezvous_of(prefill, &status).await
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                };
+                match &rendezvous {
+                    Some(DeadRendezvous(port)) => trace_error!(
+                        function = "collect_stream_responses",
+                        worker = %worker_name,
+                        grpc_code = ?status.code(),
+                        error = ?status,
+                        prefill = prefill.map_or("none", |prefill| prefill.url()),
+                        bootstrap_host = port.host.as_str(),
+                        bootstrap_port = port.port,
+                        bootstrap_port_source = port.source.label(),
+                        probe_error = %port.error,
+                        "Worker stream error, and the prefill side's bootstrap port did not accept \
+                         a connection: the sides could not rendezvous"
+                    ),
+                    None => trace_error!(
+                        function = "collect_stream_responses",
+                        worker = %worker_name,
+                        grpc_code = ?status.code(),
+                        error = ?status,
+                        "Worker stream error"
+                    ),
+                }
+                // The worker's failure counts against it as a streamed
+                // answer's does; the client's status and the router-error
+                // family are the pipeline's.
+                if let Some(worker) = stream.worker() {
+                    UpstreamClass::account_collected_failure(worker.as_ref(), &status);
+                }
+                return Err(stream_failed(worker_name, &status, rendezvous.as_ref()));
             }
-            trace_error!(function = "collect_stream_responses", worker = %worker_name, grpc_code = ?status.code(), error = ?status, "Worker stream error");
-            // The worker's failure counts against it as a streamed answer's
-            // does; the client's status and the router-error family are the
-            // pipeline's.
-            if let Some(worker) = stream.worker() {
-                UpstreamClass::account_collected_failure(worker.as_ref(), &status);
-            }
-            stream_failed(worker_name, &status)
-        })?;
+        };
         if let ProtoResponseVariant::Complete(complete) = gen_response.into_response() {
             all_responses.push(complete);
         }
@@ -235,15 +286,17 @@ async fn collect_stream_responses<S: FanoutChild>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+    use std::{
+        net::TcpListener,
+        sync::atomic::{AtomicUsize, Ordering},
     };
+
+    use axum::http::StatusCode;
 
     use super::*;
     use crate::{
         routers::grpc::proto_wrapper::{ProtoGenerateResponse, ENGINE_ERROR_MESSAGE},
-        worker::{BasicWorkerBuilder, ConnectionMode, Worker, WorkerType},
+        worker::{BasicWorkerBuilder, ConnectionMode, WorkerType},
     };
 
     /// A stream that is already at EOF, as sequential PD hands to the
@@ -333,9 +386,11 @@ mod tests {
                     &mut FailingStream(Some(status.clone())),
                     "Decode",
                     Some(metrics_labels::WORKER_DECODE),
+                    None,
                 )
                 .await,
-                collect_stream_responses(&mut FailingStream(Some(status)), "Single", None).await,
+                collect_stream_responses(&mut FailingStream(Some(status)), "Single", None, None)
+                    .await,
             )
         };
         assert!(decode.is_err(), "the failure becomes the answer");
@@ -349,6 +404,101 @@ mod tests {
         assert!(
             counted[0].contains(r#"leg="decode""#)
                 && counted[0].contains(r#"phase="bootstrap""#)
+                && counted[0].ends_with(" 1"),
+            "{rendered}"
+        );
+    }
+
+    /// A decode side the engine failed without a reason, behind a prefill side
+    /// whose bootstrap port nothing listens on: the non-streamed answer
+    /// names the rendezvous in its code and its message (the status's own
+    /// HTTP class kept), and the rendezvous family counts it under the
+    /// request phase on the prefill side. Behind a port that accepts, the
+    /// answer is the one clients know.
+    #[tokio::test]
+    async fn a_decode_leg_the_engine_failed_without_a_reason_names_the_dead_rendezvous_port() {
+        let prefill_on = |port: u16| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new("grpc://127.0.0.1:30000")
+                    .worker_type(WorkerType::Prefill)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .bootstrap_port(Some(port))
+                    .build(),
+            )
+        };
+        let report = || tonic::Status::internal(ENGINE_ERROR_MESSAGE);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let live = listener.local_addr().expect("address").port();
+        let dead = {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("address").port();
+            drop(listener);
+            port
+        };
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let (known, answer) = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            (
+                collect_stream_responses(
+                    &mut FailingStream(Some(report())),
+                    "Decode",
+                    Some(metrics_labels::WORKER_DECODE),
+                    Some(&prefill_on(live)),
+                )
+                .await
+                .err()
+                .expect("the failure becomes the answer"),
+                collect_stream_responses(
+                    &mut FailingStream(Some(report())),
+                    "Decode",
+                    Some(metrics_labels::WORKER_DECODE),
+                    Some(&prefill_on(dead)),
+                )
+                .await
+                .err()
+                .expect("the failure becomes the answer"),
+            )
+        };
+        assert_eq!(
+            known
+                .headers()
+                .get("X-SMG-Error-Code")
+                .and_then(|code| code.to_str().ok()),
+            Some("worker_stream_failed"),
+            "behind a port that accepts, the answer clients know"
+        );
+        assert_eq!(answer.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            answer
+                .headers()
+                .get("X-SMG-Error-Code")
+                .and_then(|code| code.to_str().ok()),
+            Some("pd_rendezvous_failed")
+        );
+        let body = axum::body::to_bytes(answer.into_body(), 1 << 20)
+            .await
+            .expect("a body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("an error envelope");
+        assert_eq!(body["error"]["code"], "pd_rendezvous_failed", "{body}");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with(&format!(
+                "Decode stream failed: {ENGINE_ERROR_MESSAGE}; the prefill side's bootstrap port \
+                 did not accept a connection ("
+            )) && message.ends_with("), so the sides could not rendezvous"),
+            "{message}"
+        );
+        let rendered = handle.render();
+        let counted: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_pd_rendezvous_failures_total{"))
+            .collect();
+        assert_eq!(counted.len(), 1, "{rendered}");
+        assert!(
+            counted[0].contains(r#"leg="prefill""#)
+                && counted[0].contains(r#"phase="request""#)
                 && counted[0].ends_with(" 1"),
             "{rendered}"
         );
