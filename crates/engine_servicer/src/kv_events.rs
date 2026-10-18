@@ -9,13 +9,16 @@
 //! every batch stamped with its socket's rank (the socket's rank wins over
 //! what the payload names, as in the Python relay). Each rank's own sequence
 //! numbers are kept, which is what the gateway's per-rank admission cursors
-//! expect. A subscription's `start_sequence_number` is rank 0's cursor (the
-//! request carries one): rank 0 resumes after it from its window, the other
-//! ranks resume live (nothing below a cursor the relay was not given may be
-//! resent on a fresh stream: the gateway reads that as a publisher restart),
-//! and a gap on them from the outage is settled by the gateway's own replay
-//! round. A subscription from zero gets every rank's window, or a state
-//! snapshot whose chunks are stamped at each rank's own cursor.
+//! expect. A subscription's `start_sequence_number` names one rank's
+//! sequence (the request carries one cursor): a relay over one rank resumes
+//! after it from its window; a relay over several ranks refuses it with
+//! `OUT_OF_RANGE`, since the other ranks' cursors are unknown to it and
+//! nothing below a cursor the gateway holds may be resent on a fresh stream
+//! (the gateway reads that as a publisher restart), so the gateway clears
+//! the worker and resubscribes from zero, which is served from every rank's
+//! window or from a state snapshot whose chunks are stamped at each rank's
+//! own cursor: a resync per reconnect, lossless, until the request carries
+//! a cursor per rank.
 //!
 //! The relay subscribes to the publishers once, for the servicer's lifetime,
 //! when the servicer starts serving (so it sees the engine from its first
@@ -143,7 +146,7 @@ use zeromq::{
 use crate::{
     kv_history::{History, Window},
     kv_state::{LiveState, RankCut, Snapshot, SnapshotChunks},
-    kv_wire::{low64_big_endian, Normalizer, WireBatch, WireEvent},
+    kv_wire::{low64_big_endian, Counts as WireCounts, Normalizer, WireBatch, WireEvent},
     BoxStream,
 };
 
@@ -399,10 +402,12 @@ struct Shared {
     /// Counts the publishers' restarts; a rank's sequences compare within one.
     generation: u64,
     counts: RelayCounts,
-    /// Normalizes every rank's events (its state is kept per rank); its
-    /// counters are what the summary and closing lines print.
-    normalizer: Normalizer,
-    /// Event ids advance once per event over every rank.
+    /// Per source, its normalizer's counters as of its last relayed batch:
+    /// what was forwarded, dropped by reason, and the engine-hash check's
+    /// tally; summed for the summary and closing lines.
+    wire: Vec<WireCounts>,
+    /// Event ids advance once per event over every rank: a publisher task
+    /// reserves its batch's run here and numbers the events off the lock.
     event_id: u64,
     /// Why a publisher task gave up, when one did.
     failed: Option<String>,
@@ -490,9 +495,18 @@ impl Shared {
         record.started_at = None;
         record.unknown_before = 0;
         self.state.clear_rank(dp_rank);
-        self.normalizer.forget_rank(dp_rank);
         self.counts.publisher_restarts += 1;
         self.generation
+    }
+
+    /// Every source's normalizer counters summed.
+    fn wire_counts(&self) -> WireCounts {
+        self.wire
+            .iter()
+            .fold(WireCounts::default(), |mut total, counts| {
+                total.add(counts);
+                total
+            })
     }
 
     fn relayed_anything(&self) -> bool {
@@ -577,7 +591,7 @@ impl Drop for KvEventRelay {
             endpoint = %self.config.label(),
             ranks = self.config.sources.len(),
             ?counts,
-            wire = ?shared.normalizer.counts(),
+            wire = ?shared.wire_counts(),
             window = shared.window(),
             holes = shared.holes(),
             bytes = shared.bytes(),
@@ -590,9 +604,13 @@ impl Drop for KvEventRelay {
 }
 
 impl KvEventRelay {
-    /// A relay over `config.sources` (at least one: a config without any
-    /// relays rank 0 of nothing and fails at its first subscription).
+    /// A relay over `config.sources`, at least one ([`rank_sources`] gives
+    /// one for any width); a config without any is a caller bug.
     pub fn new(config: RelayConfig) -> Arc<Self> {
+        assert!(
+            !config.sources.is_empty(),
+            "a KV event relay needs at least one rank source"
+        );
         let (live, _) = broadcast::channel(LIVE_CHANNEL);
         let ranks = config
             .sources
@@ -610,7 +628,7 @@ impl KvEventRelay {
                 state: LiveState::new(),
                 generation: 0,
                 counts: RelayCounts::default(),
-                normalizer: Normalizer::from_env(),
+                wire: vec![WireCounts::default(); config.sources.len()],
                 event_id: 0,
                 failed: None,
             })),
@@ -655,8 +673,8 @@ impl KvEventRelay {
     /// dropped by reason, the engine-hash check's tally); what the summary
     /// and closing log lines print.
     #[cfg(test)]
-    pub(crate) fn wire_counts(&self) -> crate::kv_wire::Counts {
-        lock(&self.shared).normalizer.counts().clone()
+    pub(crate) fn wire_counts(&self) -> WireCounts {
+        lock(&self.shared).wire_counts()
     }
 
     /// Ranks holding live blocks in the relay's record.
@@ -806,9 +824,21 @@ impl KvEventRelay {
                     }
                     Serve::Live
                 }
+            } else if self.config.sources.len() > 1 {
+                // One cursor names one rank's sequence; the other ranks'
+                // are the gateway's alone, and nothing below them may be
+                // resent on a fresh stream. The gateway clears and comes
+                // back from zero for every window or a snapshot.
+                shared.counts.out_of_range += 1;
+                let message = format!(
+                    "SubscribeKvEvents: the relay for {label} follows {} ranks and a cursor \
+                     names one rank's sequence; resubscribe from zero for every rank's window \
+                     or a state snapshot",
+                    self.config.sources.len()
+                );
+                info!(counts = ?shared.counts, "{message}");
+                return Err(Status::out_of_range(message));
             } else {
-                // The cursor is rank 0's (the request carries one): its
-                // window resumes after it, the other ranks resume live.
                 let Some((source, record)) = self.config.sources.first().zip(shared.ranks.first())
                 else {
                     return Err(Status::internal(
@@ -1171,8 +1201,10 @@ impl Subscriber {
                     ))));
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    // Each rank's window after what this stream sent of it;
-                    // a rank it sent nothing of yet is owed its whole window,
+                    // Each rank's window after what this stream sent of it.
+                    // A rank it sent nothing of yet (one that began publishing
+                    // after a subscription from zero: a resumed stream has one
+                    // rank, seeded with its cursor) is owed its whole window,
                     // which only a window from the publisher's start can be.
                     let refill = {
                         let mut shared = lock(&self.shared);
@@ -1264,9 +1296,10 @@ async fn run(
         index,
         shared: &shared,
         live: &live,
+        normalizer: Normalizer::from_env(),
     };
     if index == 0 {
-        if let Some(check) = lock(&shared).normalizer.hash_check() {
+        if let Some(check) = relay.normalizer.hash_check() {
             info!(
                 endpoint = %source.endpoint,
                 check = check.as_str(),
@@ -1357,6 +1390,7 @@ async fn run(
                     "KV event publisher restarted; live subscribers end with DATA_LOSS"
                 );
                 let _ = live.send(Live::Restart { generation });
+                relay.normalizer = Normalizer::from_env();
                 // The SUB re-joins a restarted publisher a moment late too.
                 if joined_late(sequence, startup_clear) {
                     relay.recover_start(sequence).await;
@@ -1396,6 +1430,8 @@ struct Relaying<'a> {
     index: usize,
     shared: &'a Mutex<Shared>,
     live: &'a broadcast::Sender<Live>,
+    /// This rank's normalizer (its state is the rank's own).
+    normalizer: Normalizer,
 }
 
 impl Relaying<'_> {
@@ -1403,28 +1439,35 @@ impl Relaying<'_> {
     /// with this source's rank (the socket's rank wins over the payload's,
     /// as in the Python relay: it is what the gateway keys its cursors by).
     fn relay(&mut self, sequence: u64, decoded: Decoded) {
-        let batch = {
+        let (batch, undecodable) = match decoded {
+            Decoded::Batch(mut batch) => {
+                batch.dp_rank = Some(self.source.rank);
+                // The batch's run of event ids, reserved under the lock;
+                // the normalization runs off it.
+                let mut event_id = {
+                    let mut shared = lock(self.shared);
+                    let first = shared.event_id;
+                    shared.event_id += batch.events.len() as u64;
+                    first
+                };
+                (
+                    self.normalizer
+                        .normalize_batch(batch, sequence, &mut event_id),
+                    false,
+                )
+            }
+            Decoded::Undecodable => (
+                common::KvEventBatch {
+                    sequence_number: sequence,
+                    dp_rank: Some(self.source.rank),
+                    ..common::KvEventBatch::default()
+                },
+                true,
+            ),
+        };
+        let batch = Arc::new(batch);
+        {
             let mut shared = lock(self.shared);
-            let (batch, undecodable) = match decoded {
-                Decoded::Batch(mut batch) => {
-                    batch.dp_rank = Some(self.source.rank);
-                    let Shared {
-                        normalizer,
-                        event_id,
-                        ..
-                    } = &mut *shared;
-                    (normalizer.normalize_batch(batch, sequence, event_id), false)
-                }
-                Decoded::Undecodable => (
-                    common::KvEventBatch {
-                        sequence_number: sequence,
-                        dp_rank: Some(self.source.rank),
-                        ..common::KvEventBatch::default()
-                    },
-                    true,
-                ),
-            };
-            let batch = Arc::new(batch);
             let record = &mut shared.ranks[self.index];
             record.history.push(sequence, Arc::clone(&batch));
             if record.started_at.is_none() {
@@ -1436,18 +1479,18 @@ impl Relaying<'_> {
             if undecodable {
                 shared.counts.undecodable_batches += 1;
             }
+            shared.wire[self.index] = self.normalizer.counts().clone();
             if shared.counts.relayed.is_multiple_of(SUMMARY_EVERY_BATCHES) {
                 info!(
                     endpoint = %self.config.label(),
                     counts = ?shared.counts,
-                    wire = ?shared.normalizer.counts(),
+                    wire = ?shared.wire_counts(),
                     live_blocks = shared.state.blocks(),
                     live_entries = shared.state.entries(),
                     "KV event relay summary"
                 );
             }
-            batch
-        };
+        }
         let _ = self.live.send(Live::Batch(batch));
     }
 
@@ -1800,7 +1843,7 @@ mod tests {
     use zeromq::{PubSocket, RouterSocket, SocketEvent};
 
     use super::{golden, *};
-    use crate::kv_wire::{Counts as WireCounts, WireBatch};
+    use crate::kv_wire::WireBatch;
 
     fn decode(hex: &str) -> WireBatch {
         rmp_serde::from_slice::<TrailingTolerant<WireBatch>>(&golden::bytes(hex))
@@ -3353,12 +3396,12 @@ mod tests {
         assert_eq!(lab.relay.counts().served_from_history, 1);
     }
 
-    /// The cursor a subscriber resumes with is rank 0's: its window is
-    /// served after it; the other ranks, whose cursors the request does not
-    /// carry, resume live (a fresh stream may send nothing below a cursor
-    /// the gateway holds, which it would read as a publisher restart).
+    /// The request carries one cursor and a relay over several ranks cannot
+    /// tell what the gateway holds of the others (nothing below it may be
+    /// resent on a fresh stream): the cursor is refused, and the
+    /// resubscription from zero the gateway answers with gets every window.
     #[tokio::test]
-    async fn a_resume_cursor_serves_rank_zero_from_its_window_and_the_other_ranks_live() {
+    async fn a_cursor_on_a_relay_over_several_ranks_is_refused_for_a_resubscription_from_zero() {
         let mut lab = start_rank_lab(2, 100).await;
         lab.prime().await;
         lab.publish(0, 1, &store_payload(1.0, &[2], Some(1))).await;
@@ -3366,13 +3409,26 @@ mod tests {
         lab.publish(1, 1, &store_payload(1.0, &[12], Some(1))).await;
         lab.wait_relayed(5).await;
 
-        let mut stream = lab.subscribe(1).expect("inside rank 0's window");
-        assert_eq!(tagged(&mut stream, 1).await, vec![(Some(0), 2)]);
-        lab.publish(1, 2, &store_payload(2.0, &[13], Some(12)))
-            .await;
-        assert_eq!(tagged(&mut stream, 1).await, vec![(Some(1), 2)]);
-        lab.publish(0, 3, &store_payload(3.0, &[4], Some(3))).await;
-        assert_eq!(tagged(&mut stream, 1).await, vec![(Some(0), 3)]);
+        let status = refused(lab.subscribe(1));
+        assert_eq!(status.code(), tonic::Code::OutOfRange);
+        assert!(
+            status.message().contains("follows 2 ranks")
+                && status.message().contains("resubscribe from zero"),
+            "{}",
+            status.message()
+        );
+        assert_eq!(lab.relay.counts().out_of_range, 1);
+        let mut stream = lab.subscribe(0).expect("every window");
+        assert_eq!(
+            tagged(&mut stream, 5).await,
+            vec![
+                (Some(0), 0),
+                (Some(0), 1),
+                (Some(0), 2),
+                (Some(1), 0),
+                (Some(1), 1)
+            ]
+        );
     }
 
     /// Once a window rolled, a subscriber from zero gets the state snapshot:

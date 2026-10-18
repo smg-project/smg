@@ -462,8 +462,8 @@ pub struct SnapshotChunks {
     /// The units of each chunk, `(rank index, start, end)`, in order; empty
     /// for an empty state, whose one chunk is the clear.
     cuts: Vec<(usize, usize, usize)>,
-    /// Each chunk's sequence stamp and `unknown_before`, in chunk order.
-    stamps: Vec<(u64, u64)>,
+    /// Each chunk's rank, sequence stamp and `unknown_before`, in chunk order.
+    stamps: Vec<(Option<i32>, u64, u64)>,
     count: u32,
     next: u32,
     timestamp: f64,
@@ -475,7 +475,8 @@ impl SnapshotChunks {
     /// stamped `through - chunks + 1 ..= through` of that rank's cut in
     /// `cuts` (a rank without one is cut at 0); `timestamp` is what the
     /// chunks carry (the gateway reads it as the publish time). An empty
-    /// state is one chunk, the clear, stamped with the first cut.
+    /// state is one chunk, the clear, stamped with the first cut and carrying
+    /// its rank (the stamp moves that rank's cursor at the gateway).
     pub fn new(snapshot: Snapshot, cuts: &BTreeMap<Option<i32>, RankCut>, timestamp: f64) -> Self {
         let blocks = snapshot.blocks;
         let ranks: Vec<(Option<i32>, Vec<Arc<LiveBlock>>)> = snapshot
@@ -515,21 +516,25 @@ impl SnapshotChunks {
         }
         let per_rank = chunks_per_rank(ranks.len(), &chunks);
         let mut seen = vec![0u64; ranks.len()];
-        let mut stamps: Vec<(u64, u64)> = chunks
+        let mut stamps: Vec<(Option<i32>, u64, u64)> = chunks
             .iter()
             .map(|&(rank_index, _, _)| {
-                let cut = cut_of(&ranks[rank_index].0);
+                let rank = ranks[rank_index].0;
+                let cut = cut_of(&rank);
                 let stamp = cut
                     .through
                     .saturating_sub(per_rank[rank_index] as u64 - 1)
                     .saturating_add(seen[rank_index]);
                 seen[rank_index] += 1;
-                (stamp, cut.unknown_before)
+                (rank, stamp, cut.unknown_before)
             })
             .collect();
         if stamps.is_empty() {
-            let first = cuts.values().next().copied().unwrap_or_default();
-            stamps.push((first.through, first.unknown_before));
+            let (rank, first) = match cuts.iter().next() {
+                Some((rank, cut)) => (*rank, *cut),
+                None => (None, RankCut::default()),
+            };
+            stamps.push((rank, first.through, first.unknown_before));
         }
         let count = u32::try_from(stamps.len()).unwrap_or(u32::MAX);
         Self {
@@ -576,7 +581,7 @@ impl SnapshotChunks {
         }
         let index = self.next;
         self.next += 1;
-        let (sequence_number, unknown_before) = self.stamps[index as usize];
+        let (dp_rank, sequence_number, unknown_before) = self.stamps[index as usize];
         let mut events = Vec::new();
         if index == 0 {
             events.push(common::KvCacheEvent {
@@ -586,11 +591,8 @@ impl SnapshotChunks {
                 )),
             });
         }
-        let mut dp_rank = None;
         if let Some(&(rank_index, start, end)) = self.cuts.get(index as usize) {
-            let (rank, units) = &self.ranks[rank_index];
-            dp_rank = *rank;
-            stored_events(&units[start..end], &mut events);
+            stored_events(&self.ranks[rank_index].1[start..end], &mut events);
         }
         Some(common::KvEventBatch {
             sequence_number,
@@ -1249,6 +1251,32 @@ mod tests {
         assert_eq!(
             late[0].snapshot.as_ref().map(|chunk| chunk.unknown_before),
             Some(7)
+        );
+    }
+
+    /// A relay whose rank 1 relayed (and freed) everything while rank 0 has
+    /// not spoken yet cuts an empty state at rank 1's cursor: the clear chunk
+    /// names rank 1, so the stamp moves rank 1's cursor at the gateway and
+    /// rank 0's first live batch is taken as its first.
+    #[test]
+    fn an_empty_states_clear_chunk_names_the_first_cuts_rank() {
+        let cuts = BTreeMap::from([(
+            Some(1),
+            RankCut {
+                through: 7,
+                unknown_before: 2,
+            },
+        )]);
+        let chunks: Vec<common::KvEventBatch> =
+            SnapshotChunks::new(LiveState::new().snapshot(), &cuts, 2.0).collect();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!((chunks[0].dp_rank, chunks[0].sequence_number), (Some(1), 7));
+        assert_eq!(
+            chunks[0]
+                .snapshot
+                .as_ref()
+                .map(|chunk| chunk.unknown_before),
+            Some(2)
         );
     }
 
