@@ -24,7 +24,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gateway_launch::{base_args, free_ports, serial, EXIT_TIMEOUT, IP};
+use gateway_launch::{base_args, free_ports, log_with_line, serial, EXIT_TIMEOUT, IP};
 
 /// A running gateway, killed when dropped.
 struct Gateway {
@@ -39,6 +39,7 @@ impl Gateway {
         let file = File::create(log).expect("log file");
         let child = Command::new(env!("CARGO_BIN_EXE_smg"))
             .args(args)
+            .env_remove("RUST_LOG")
             .stdin(Stdio::null())
             .stdout(Stdio::from(file.try_clone().expect("log handle")))
             .stderr(Stdio::from(file))
@@ -230,10 +231,8 @@ fn a_connection_beyond_the_bound_is_closed_without_a_response_and_counted() {
     assert!(ok(request(&mut fourth, "/health")));
     assert!(ok(request(&mut second, "/health")));
 
-    let log = gateway.log();
-    assert!(
-        log.contains("\"max_connections\":2"),
-        "the start does not report the bound\n{log}"
-    );
+    if let Err(log) = log_with_line(&gateway.log, "\"max_connections\":2", EXIT_TIMEOUT) {
+        panic!("the start does not report the bound\n{log}");
+    }
     drop(gateway);
 }

@@ -24,7 +24,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gateway_launch::{base_args, free_ports, launch, serial, Until, EXIT_TIMEOUT, IP};
+use gateway_launch::{
+    base_args, free_ports, launch, log_with_line, serial, Until, EXIT_TIMEOUT, IP,
+};
 
 /// A running gateway, killed when dropped.
 struct Gateway {
@@ -39,6 +41,7 @@ impl Gateway {
         let file = File::create(log).expect("log file");
         let child = Command::new(env!("CARGO_BIN_EXE_smg"))
             .args(args)
+            .env_remove("RUST_LOG")
             .stdin(Stdio::null())
             .stdout(Stdio::from(file.try_clone().expect("log handle")))
             .stderr(Stdio::from(file))
@@ -153,13 +156,10 @@ fn the_admin_listener_carries_the_control_plane_and_the_data_listener_answers_40
         );
     }
 
-    let log = gateway.log();
-    assert!(
-        log.contains(&format!(
-            "Admin listener serving the control plane on {admin} (--admin-port)"
-        )),
-        "the start does not report the admin listener\n{log}"
-    );
+    let line = format!("Admin listener serving the control plane on {admin} (--admin-port)");
+    if let Err(log) = log_with_line(&gateway.log, &line, EXIT_TIMEOUT) {
+        panic!("the start does not report the admin listener\n{log}");
+    }
     drop(gateway);
 }
 
