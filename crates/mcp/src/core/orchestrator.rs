@@ -332,8 +332,10 @@ impl ToolExecutionResult {
 ///
 /// Thread-safe and designed for sharing across async tasks.
 pub struct McpOrchestrator {
-    /// Static servers (from config, never evicted).
-    static_servers: DashMap<String, ServerEntry>,
+    /// Static servers (from config, never evicted). Shared with the refresh
+    /// handler, which must see a server's current client after a recovery
+    /// re-inserts it.
+    static_servers: Arc<DashMap<String, ServerEntry>>,
     /// Tool inventory with qualified names.
     tool_inventory: Arc<ToolInventory>,
     /// Approval manager for interactive and policy-only modes.
@@ -392,7 +394,7 @@ impl McpOrchestrator {
         let (refresh_tx, refresh_rx) = mpsc::channel(100);
 
         let orchestrator = Self {
-            static_servers: DashMap::new(),
+            static_servers: Arc::new(DashMap::new()),
             tool_inventory,
             approval_manager,
             connection_pool,
@@ -445,7 +447,7 @@ impl McpOrchestrator {
         let approval_manager = Arc::new(ApprovalManager::new(policy_engine, audit_log));
 
         Self {
-            static_servers: DashMap::new(),
+            static_servers: Arc::new(DashMap::new()),
             tool_inventory: Arc::new(ToolInventory::new()),
             approval_manager,
             connection_pool: Arc::new(McpConnectionPool::new()),
@@ -675,7 +677,7 @@ impl McpOrchestrator {
     fn spawn_refresh_handler(&self, mut rx: mpsc::Receiver<RefreshRequest>) {
         let token = self.shutdown_token.clone();
         let tool_inventory = Arc::clone(&self.tool_inventory);
-        let static_servers = self.static_servers.clone();
+        let static_servers = Arc::clone(&self.static_servers);
 
         #[expect(
             clippy::disallowed_methods,
@@ -693,23 +695,26 @@ impl McpOrchestrator {
                     Some(request) = rx.recv() => {
                         debug!("Processing refresh request for '{}'", request.server_key);
 
-                        if let Some(entry) = static_servers.get(&request.server_key) {
-                            // Clear existing tools for this server
-                            tool_inventory.clear_server_tools(&request.server_key);
-
-                            // Reload tools
-                            if let Some(entries) = tools_of(
-                                entry.client.as_ref(),
-                                &request.server_key,
-                                ToolCategory::Static,
-                            )
-                            .await
+                        // The client out of the map's guard before the
+                        // listing's round-trip: a removal or an insert on the
+                        // same shard must not wait behind it.
+                        let client = static_servers
+                            .get(&request.server_key)
+                            .map(|entry| Arc::clone(&entry.client));
+                        if let Some(client) = client {
+                            // The listing first: a failed one keeps the
+                            // server's previous entries instead of leaving it
+                            // with none until its next notification.
+                            if let Some(entries) =
+                                tools_of(client.as_ref(), &request.server_key, ToolCategory::Static)
+                                    .await
                             {
+                                tool_inventory.clear_server_tools(&request.server_key);
                                 for entry in entries {
                                     tool_inventory.insert_entry(entry);
                                 }
                                 info!(
-                                    "Refreshed inventory for '{}': {} tools",
+                                    "Refreshed '{}'; the inventory now holds {} tools",
                                     request.server_key,
                                     tool_inventory.counts().0
                                 );
@@ -747,7 +752,7 @@ impl McpOrchestrator {
 
         // First, search connected static servers (dynamically registered via connect_static_server).
         // This handles servers registered after orchestrator initialization.
-        for entry in &self.static_servers {
+        for entry in self.static_servers.iter() {
             if let Some(result) = extract_builtin(&entry.config) {
                 return Some(result);
             }
@@ -769,7 +774,7 @@ impl McpOrchestrator {
         let mut names = HashSet::new();
 
         // Check connected static servers first
-        for entry in &self.static_servers {
+        for entry in self.static_servers.iter() {
             if entry.config.builtin_type.is_some() {
                 names.insert(entry.config.name.clone());
             }
@@ -789,7 +794,7 @@ impl McpOrchestrator {
     pub fn internal_server_names(&self) -> HashSet<String> {
         let mut names = HashSet::new();
 
-        for entry in &self.static_servers {
+        for entry in self.static_servers.iter() {
             if entry.config.internal {
                 names.insert(entry.config.name.clone());
             }
@@ -1438,14 +1443,14 @@ impl McpOrchestrator {
 
     /// Set request context on all static server handlers.
     pub fn set_handler_contexts(&self, ctx: &HandlerRequestContext) {
-        for entry in &self.static_servers {
+        for entry in self.static_servers.iter() {
             entry.handler.set_request_context(ctx.clone());
         }
     }
 
     /// Clear request context from all static server handlers.
     pub fn clear_handler_contexts(&self) {
-        for entry in &self.static_servers {
+        for entry in self.static_servers.iter() {
             entry.handler.clear_request_context();
         }
     }
@@ -1702,7 +1707,7 @@ impl McpOrchestrator {
         // Cancel pending approvals
         self.approval_manager.cancel_all_pending();
 
-        for _ in &self.static_servers {
+        for _ in self.static_servers.iter() {
             self.metrics.record_connection_closed();
         }
         self.static_servers.clear();
@@ -2377,7 +2382,7 @@ mod tests {
         let approval_manager = Arc::new(ApprovalManager::new(policy_engine, audit_log));
 
         let orchestrator = McpOrchestrator {
-            static_servers: DashMap::new(),
+            static_servers: Arc::new(DashMap::new()),
             tool_inventory: Arc::new(ToolInventory::new()),
             approval_manager,
             connection_pool: Arc::new(McpConnectionPool::new()),
@@ -2446,7 +2451,7 @@ mod tests {
         let approval_manager = Arc::new(ApprovalManager::new(policy_engine, audit_log));
 
         let orchestrator = McpOrchestrator {
-            static_servers: DashMap::new(),
+            static_servers: Arc::new(DashMap::new()),
             tool_inventory: Arc::new(ToolInventory::new()),
             approval_manager,
             connection_pool: Arc::new(McpConnectionPool::new()),
