@@ -119,19 +119,26 @@ def _max_running_requests(engine) -> int:
     return running_window(getattr(engine, "vllm_config", None))
 
 
-def _first_rank(engine) -> int:
-    """The lowest data-parallel rank this servicer serves: the first of the
-    engine client's managed ranks (a slice of all the ranks under external or
+def _managed_ranks(engine) -> list[int]:
+    """The data-parallel ranks this servicer serves, in order: the engine
+    client's managed ranks (a slice of all the ranks under external or
     hybrid load balancing, from ``data_parallel_rank`` on), else that start
-    rank from the config, else 0. ``GetLoads`` reports this rank, and its
-    pushed record is the one that carries the servicer's estimate, as the
-    first entry of the Rust servicer's ``GetLoads`` does."""
+    rank from the config alone, else rank 0. ``GetLoads`` reports each of
+    them, as the Rust servicer's does."""
     managed = getattr(getattr(engine, "engine_core", None), "engine_ranks_managed", None)
     if isinstance(managed, (list, tuple, range)):
-        ranks = [rank for rank in managed if isinstance(rank, int)]
+        ranks = sorted({rank for rank in managed if isinstance(rank, int)})
         if ranks:
-            return min(ranks)
-    return EngineConfigView(getattr(engine, "vllm_config", None)).parallel.data_parallel_rank
+            return ranks
+    return [EngineConfigView(getattr(engine, "vllm_config", None)).parallel.data_parallel_rank]
+
+
+def _first_rank(engine) -> int:
+    """The lowest data-parallel rank this servicer serves (the first of
+    :func:`_managed_ranks`): the rank a request that names none is counted
+    on, and the one whose load entry is zero-filled before its first
+    snapshot rather than left out."""
+    return _managed_ranks(engine)[0]
 
 
 def _rank_in_flight(engine, request_id: str, choice: int = 0) -> int | None:
@@ -867,23 +874,26 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         """
         Handle load-metric requests.
 
-        Reads the latest SchedulerStats snapshot cached on the engine's stat
-        loggers and maps it onto a single-DP-rank SchedulerLoad: ``token_usage``
-        carries KV-cache utilization ([0,1)) and ``num_running_reqs`` /
+        One SchedulerLoad per data-parallel rank this servicer serves (see
+        ``_managed_ranks``), from the latest SchedulerStats snapshot cached
+        on the engine's stat loggers for that rank: ``token_usage`` carries
+        KV-cache utilization ([0,1)) and ``num_running_reqs`` /
         ``num_waiting_reqs`` report queue depth. ``num_waiting_uncached_tokens``,
         ``gen_throughput`` and ``cache_hit_rate`` come from this servicer's own
         bookkeeping of the requests it forwards, per rank
         (``smg_grpc_servicer.vllm.loads``), since vLLM's stats do not carry them.
+        The entries are the figures the ranks' pushed load records carry, so
+        a poll refreshes every rank, those whose event stream is quiet too.
 
-        Always returns exactly one SchedulerLoad entry (zero-filled when no
-        snapshot is available yet, e.g. with --disable-log-stats or before the
-        first engine step) so callers treat the worker as responsive rather than
-        dropping the poll.
+        The first rank's entry is always present (zero-filled when no snapshot
+        is available yet, e.g. with --disable-log-stats or before the first
+        engine step) so callers treat the worker as responsive rather than
+        dropping the poll; another rank without a readable snapshot gets no
+        entry rather than another rank's figures (see ``_rank_counts``).
 
-        Note: ``request.dp_rank`` and ``request.include`` are accepted but not yet
-        applied — vLLM reports a single DP rank (the servicer's first, see
-        ``_first_rank``; ``dp_rank_count=1``) with only core metrics, so there is
-        nothing to filter. They are reserved for future multi-DP /
+        Note: ``request.dp_rank`` and ``request.include`` are accepted but not
+        yet applied — every served rank is reported with only core metrics, so
+        there is nothing to filter. They are reserved for future
         sectioned-metrics support.
 
         Args:
@@ -893,25 +903,12 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         Returns:
             GetLoadsResponse protobuf
         """
-        first_rank = _first_rank(self.engine)
-        num_running, num_waiting, kv_usage = self._scheduler_counts(first_rank) or (0, 0, 0.0)
-        load = vllm_engine_pb2.SchedulerLoad(
-            **scheduler_load_fields(
-                num_running,
-                num_waiting,
-                kv_usage,
-                self._loads.estimate(num_waiting, rank=first_rank),
-                dp_rank=first_rank,
-                max_total_num_tokens=_kv_capacity_tokens(self.engine),
-                max_running_requests=_max_running_requests(self.engine),
-            )
-        )
-
+        loads = self._scheduler_loads()
         return vllm_engine_pb2.GetLoadsResponse(
             timestamp=datetime.now(timezone.utc).isoformat(),
             version=VLLM_VERSION,
-            dp_rank_count=1,
-            loads=[load],
+            dp_rank_count=len(loads),
+            loads=loads,
         )
 
     def _scheduler_counts(self, engine_idx: int = 0) -> tuple[int, int, float] | None:
@@ -929,6 +926,47 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             float(getattr(stats, "kv_cache_usage", 0.0) or 0.0),
         )
 
+    def _rank_counts(self, rank: int) -> tuple[int, int, float] | None:
+        """``rank``'s running, waiting and KV usage for a load report
+        (``GetLoads`` and the pushed record alike): its own snapshot's;
+        zeros for the servicer's first rank before its first snapshot, so a
+        poll always has an entry to read; ``None`` for another rank whose
+        snapshot the servicer cannot read, which gets no entry rather than
+        another rank's figures or zeros that read as idle."""
+        counts = self._scheduler_counts(rank)
+        if counts is None and rank == _first_rank(self.engine):
+            return (0, 0, 0.0)
+        return counts
+
+    def _scheduler_loads(self) -> list[vllm_engine_pb2.SchedulerLoad]:
+        """The ``GetLoads`` entries: one per rank this servicer serves (see
+        ``_managed_ranks``) with counts to report (see ``_rank_counts``),
+        each with that rank's own counts and this servicer's own estimate
+        for it, the figures the rank's pushed record carries
+        (``_load_record``)."""
+        max_total_num_tokens = _kv_capacity_tokens(self.engine)
+        max_running_requests = _max_running_requests(self.engine)
+        loads = []
+        for rank in _managed_ranks(self.engine):
+            counts = self._rank_counts(rank)
+            if counts is None:
+                continue
+            num_running, num_waiting, kv_usage = counts
+            loads.append(
+                vllm_engine_pb2.SchedulerLoad(
+                    **scheduler_load_fields(
+                        num_running,
+                        num_waiting,
+                        kv_usage,
+                        self._loads.estimate(num_waiting, rank=rank),
+                        dp_rank=rank,
+                        max_total_num_tokens=max_total_num_tokens,
+                        max_running_requests=max_running_requests,
+                    )
+                )
+            )
+        return loads
+
     def _load_record(self, dp_rank: int | None) -> common_pb2.EngineLoad | None:
         """The load record the KV-event stream carries for the batch's rank
         (the servicer's first rank when it names none, see ``_first_rank``):
@@ -936,15 +974,12 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         throughput and hit-rate figures for that rank, as the Rust servicer
         stamps its batches. A rank whose snapshot the servicer cannot read
         gets no record rather than another rank's figures; the first rank
-        reports zeros before its first snapshot, as ``GetLoads`` does. A read
-        that raises is the recorder's to report."""
-        first_rank = _first_rank(self.engine)
-        rank = first_rank if dp_rank is None else dp_rank
-        counts = self._scheduler_counts(rank)
+        reports zeros before its first snapshot, as ``GetLoads`` does (see
+        ``_rank_counts``). A read that raises is the recorder's to report."""
+        rank = _first_rank(self.engine) if dp_rank is None else dp_rank
+        counts = self._rank_counts(rank)
         if counts is None:
-            if rank != first_rank:
-                return None
-            counts = (0, 0, 0.0)
+            return None
         num_running, num_waiting, kv_usage = counts
         return load_record(
             num_running,

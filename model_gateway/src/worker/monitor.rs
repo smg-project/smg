@@ -343,8 +343,12 @@ pub struct WorkerMonitor {
     event_task: Mutex<Option<JoinHandle<()>>>,
     eviction_flush_task: Mutex<Option<JoinHandle<()>>>,
     liveness_sweep_task: Mutex<Option<JoinHandle<()>>>,
-    /// Load records pushed on the KV-event streams, per worker and rank,
-    /// merged into one report per worker the way a poll reports every rank.
+    /// Each worker's report by rank, as its stream and the poll last left
+    /// it: a record pushed on the KV-event stream replaces its rank's entry
+    /// ([`Self::apply_pushed_load`]), a poll's entry replaces a rank's that
+    /// pushed nothing since the poll began ([`Self::apply_polled_load`]);
+    /// every push rebuilds the worker's report from it, the way a poll
+    /// reports every rank.
     pushed_ranks: Mutex<HashMap<String, BTreeMap<i32, SchedulerLoadSnapshot>>>,
     /// When each rank of a worker last pushed a load record, by receipt:
     /// the tick's poll decision reads it (see [`PollMode`]).
@@ -618,6 +622,62 @@ impl WorkerMonitor {
                 }
             }
             _ => PollMode::Poll,
+        }
+    }
+
+    /// A poll's report of `url` (`load`, asked at `polled_at`) is the newer
+    /// figure for every rank that pushed no record since the poll began.
+    /// Under data parallelism the ranks' streams are not equally busy: a
+    /// rank whose working set is cached, or that has nothing in flight,
+    /// stores no blocks, and the heartbeats that keep the worker's stream
+    /// alive name the last active rank, so a quiet rank's own record stops
+    /// arriving while the worker's report is rebuilt on every push from
+    /// the record it last sent. The tick's decision ([`Self::poll_mode`])
+    /// falls back to the poll for such a worker; the poll's entry for the
+    /// quiet rank replaces the one on file, so the next push rebuilds the
+    /// report from it and the rank's figures are at most a tick interval
+    /// old, the poll decision's own bound. A rank whose record arrived
+    /// since the poll began keeps it: the stream's is the newer. The
+    /// receipts (`pushed_at`) are not touched: a poll is not the stream
+    /// working, and the worker stays polled until the rank's records
+    /// resume. Only a rank on file is replaced: a rank the stream never
+    /// named has no receipt for the poll decision to age, so a poll's
+    /// figure for it would sit in the report unrefreshed once the pushing
+    /// ranks are fresh again; it stays out of the pushed report, and the
+    /// poll's report stands for it while the worker is polled. A worker
+    /// with no pushed record on file has no report to merge into; the
+    /// poll's report stands on its own, as always.
+    pub(crate) fn apply_polled_load(
+        &self,
+        url: &str,
+        load: &WorkerLoadResponse,
+        polled_at: Instant,
+    ) {
+        // A rollup from a gateway registered as a worker is keyed by
+        // downstream worker, not by rank: its entries all say rank 0 and
+        // would collapse into one slot (the DP cache applies the same
+        // guard).
+        if !load.ranks_are_dp_ranks() {
+            return;
+        }
+        // Both tables held together so a record landing between the two
+        // reads is not undone; nothing else takes both at once.
+        let mut pushed = self.pushed_ranks.lock();
+        let Some(ranks) = pushed.get_mut(url) else {
+            return;
+        };
+        let pushed_at = self.pushed_at.lock();
+        let receipts = pushed_at.get(url);
+        for entry in &load.loads {
+            let pushed_since = receipts
+                .and_then(|ranks| ranks.get(&entry.dp_rank))
+                .is_some_and(|&at| at >= polled_at);
+            if pushed_since {
+                continue;
+            }
+            if let Some(slot) = ranks.get_mut(&entry.dp_rank) {
+                *slot = entry.clone();
+            }
         }
     }
 
@@ -1479,6 +1539,10 @@ async fn poll_group_once(
         monitor.apply_overload_verdict(&worker, response.as_ref(), "poll");
         if let Some(mut load) = response {
             load.sampled_at = Some(Instant::now());
+            // A worker polled because a rank's records went quiet
+            // (`fallback`) takes the poll's figures for the ranks that
+            // pushed nothing since the tick began.
+            monitor.apply_polled_load(&url, &load, now);
             // The wedged rule reads the queue depth off every report.
             let waiting: i64 = load
                 .loads
@@ -2252,6 +2316,180 @@ mod worker_monitor_tests {
         // A worker that leaves takes its records with it.
         monitor.evict_worker_loads(&worker);
         assert_eq!(monitor.poll_mode(url, late, interval), PollMode::Poll);
+    }
+
+    /// Under data parallelism a quiet rank's record stops arriving while
+    /// the other rank's heartbeats keep the stream alive, and the tick
+    /// falls back to the poll for the worker. The poll's figure for the
+    /// quiet rank replaces its entry in the pushed report: a heartbeat
+    /// naming the busy rank no longer rebuilds the report from the quiet
+    /// rank's last pushed record, the rank follows the poll from then on,
+    /// a rank whose own record arrived since the poll began keeps it, and
+    /// the poll decision is unchanged (the worker stays polled until the
+    /// rank's records resume).
+    #[tokio::test]
+    async fn a_quiet_ranks_figures_follow_the_poll_rather_than_its_last_pushed_record() {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("grpc://w1:9000", "llama-3");
+        registry.register(Arc::clone(&worker)).unwrap();
+        let url = "grpc://w1:9000";
+        let interval = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let record = |running: u32, hit_rate: f64| EngineLoad {
+            cache_hit_rate: Some(hit_rate),
+            ..pushed(running)
+        };
+        let poll = |rank1_hit_rate: f64| WorkerLoadResponse {
+            dp_rank_count: 2,
+            loads: vec![
+                SchedulerLoadSnapshot {
+                    dp_rank: 0,
+                    num_running_reqs: 2,
+                    cache_hit_rate: 0.9,
+                    ..Default::default()
+                },
+                SchedulerLoadSnapshot {
+                    dp_rank: 1,
+                    num_running_reqs: 8,
+                    cache_hit_rate: rank1_hit_rate,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let ranks_of = |report: &WorkerLoadResponse| -> Vec<(i32, i32, f64)> {
+            report
+                .loads
+                .iter()
+                .map(|rank| (rank.dp_rank, rank.num_running_reqs, rank.cache_hit_rate))
+                .collect()
+        };
+
+        // Both ranks push during the first passes; then rank 1's working
+        // set is cached and its records stop, while rank 0 keeps pushing.
+        monitor.apply_pushed_load(&worker, 0, &record(3, 0.5), t0);
+        monitor.apply_pushed_load(&worker, 1, &record(8, 0.65), t0);
+        let polled_at = t0 + interval;
+        assert_eq!(
+            monitor.poll_mode(url, polled_at, interval),
+            PollMode::Fallback
+        );
+        // Rank 0 pushed while the poll was in flight: its own record is the
+        // newer; rank 1 pushed nothing since the poll began.
+        monitor.apply_pushed_load(
+            &worker,
+            0,
+            &record(4, 0.5),
+            polled_at + Duration::from_millis(1),
+        );
+        monitor.apply_polled_load(url, &poll(0.91), polled_at);
+        // The next heartbeat names rank 0 only: the report it rebuilds and
+        // the gauges carry rank 1 at the poll's figure, rank 0 at its own.
+        let rendered = render_with_recorder(|| {
+            monitor.apply_pushed_load(
+                &worker,
+                0,
+                &record(5, 0.5),
+                polled_at + Duration::from_millis(2),
+            );
+        });
+        monitor.flush_pushed();
+        let snapshot = monitor.load_state.snapshot();
+        let report = snapshot.get(url).expect("published");
+        assert_eq!(report.version, "pushed");
+        assert_eq!(ranks_of(report), vec![(0, 5, 0.5), (1, 8, 0.91)]);
+        let rank1_hit_rate = rendered
+            .lines()
+            .find(|l| {
+                l.starts_with("smg_engine_cache_hit_rate{")
+                    && l.contains("worker=\"grpc://w1:9000\"")
+                    && l.contains("dp_rank=\"1\"")
+            })
+            .map(|l| l.rsplit(' ').next().unwrap_or("").to_string())
+            .unwrap_or_else(|| panic!("rank 1's hit rate gauge missing:\n{rendered}"));
+        assert_eq!(rank1_hit_rate, "0.91");
+
+        // The receipts are the stream's: rank 1 is still quiet, the worker
+        // stays polled, and each poll's figure replaces the last. A rank
+        // the stream never named (here a rank 2 the poll reports) stays
+        // out of the pushed report: nothing would refresh it once the
+        // pushing ranks are fresh again.
+        let next = polled_at + interval;
+        assert_eq!(monitor.poll_mode(url, next, interval), PollMode::Fallback);
+        let mut with_a_third_rank = poll(0.93);
+        with_a_third_rank.loads.push(SchedulerLoadSnapshot {
+            dp_rank: 2,
+            num_running_reqs: 1,
+            cache_hit_rate: 0.2,
+            ..Default::default()
+        });
+        with_a_third_rank.dp_rank_count = 3;
+        monitor.apply_polled_load(url, &with_a_third_rank, next);
+        monitor.apply_pushed_load(&worker, 0, &record(6, 0.5), next + Duration::from_millis(1));
+        monitor.flush_pushed();
+        let snapshot = monitor.load_state.snapshot();
+        assert_eq!(
+            ranks_of(snapshot.get(url).expect("published")),
+            vec![(0, 6, 0.5), (1, 8, 0.93)]
+        );
+        // A rollup keyed by downstream worker rather than by rank is
+        // ignored: its entries both say rank 0, and rank 0's slot keeps
+        // the record the stream pushed before the rollup was asked.
+        let rollup = WorkerLoadResponse {
+            dp_rank_count: 2,
+            loads: vec![
+                SchedulerLoadSnapshot {
+                    dp_rank: 0,
+                    num_running_reqs: 40,
+                    worker: Some("http://downstream-a:8000".to_string()),
+                    ..Default::default()
+                },
+                SchedulerLoadSnapshot {
+                    dp_rank: 0,
+                    num_running_reqs: 41,
+                    worker: Some("http://downstream-b:8000".to_string()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        monitor.apply_polled_load(url, &rollup, next + Duration::from_millis(2));
+        let rank0 = monitor
+            .pushed_ranks
+            .lock()
+            .get(url)
+            .and_then(|ranks| ranks.get(&0).cloned())
+            .expect("rank 0 on file");
+        assert_eq!(
+            (rank0.num_running_reqs, rank0.cache_hit_rate, rank0.worker),
+            (6, 0.5, None)
+        );
+        // Rank 1's own record, once it pushes again, is the newer figure
+        // and suppresses the poll again; the report it rebuilds carries
+        // rank 0 as the stream left it.
+        monitor.apply_pushed_load(&worker, 1, &record(7, 0.7), next + Duration::from_millis(3));
+        monitor.flush_pushed();
+        let snapshot = monitor.load_state.snapshot();
+        assert_eq!(
+            ranks_of(snapshot.get(url).expect("published")),
+            vec![(0, 6, 0.5), (1, 7, 0.7)]
+        );
+        assert_eq!(
+            monitor.poll_mode(url, next + Duration::from_millis(4), interval),
+            PollMode::Suppressed
+        );
+
+        // A worker with no pushed record on file has no report to merge
+        // into: the poll's report stands on its own and the worker is
+        // polled as always.
+        let other = ready_worker("grpc://w2:9000", "llama-3");
+        registry.register(Arc::clone(&other)).unwrap();
+        monitor.apply_polled_load("grpc://w2:9000", &poll(0.1), t0);
+        assert!(monitor.pushed_ranks.lock().get("grpc://w2:9000").is_none());
+        assert_eq!(
+            monitor.poll_mode("grpc://w2:9000", t0, interval),
+            PollMode::Poll
+        );
     }
 
     /// A tick does not poll a worker whose stream pushed within the
@@ -3186,5 +3424,59 @@ mod native_loads_tests {
             stub.gateway_query.lock().clone(),
             Some("model=meta-llama%2FLlama-3.1-8B".to_string())
         );
+    }
+
+    /// The tick's fallback poll of a worker whose stream went quiet on one
+    /// rank refreshes that rank's entry in the pushed report: the next
+    /// record the stream pushes rebuilds the report from the poll's figure
+    /// for it, not from the rank's last pushed record.
+    #[tokio::test]
+    async fn a_fallback_polls_figures_reach_the_pushed_report_of_a_quiet_rank() {
+        const TWO_RANKS: &str = r#"{"loads":[
+            {"dp_rank":0,"num_running_reqs":3,"num_waiting_reqs":0,"token_usage":0.25,"cache_hit_rate":0.9},
+            {"dp_rank":1,"num_running_reqs":8,"num_waiting_reqs":0,"token_usage":0.5,"cache_hit_rate":0.91}]}"#;
+        let stub = spawn_engine(StatusCode::OK, TWO_RANKS).await;
+        let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
+        let worker = vllm_worker(&stub.url);
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&worker)).unwrap();
+        let key = WorkerGroupKey {
+            model_id: "a".to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Http,
+        };
+        let interval = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let record = |running: u32, hit_rate: f64, sample: u64| EngineLoad {
+            running_requests: running,
+            cache_hit_rate: Some(hit_rate),
+            sample,
+            ..Default::default()
+        };
+        monitor.apply_pushed_load(&worker, 0, &record(2, 0.5, 1), t0);
+        monitor.apply_pushed_load(&worker, 1, &record(8, 0.65, 2), t0);
+
+        // One interval later rank 1's record is older than the interval:
+        // the tick polls the worker.
+        poll_group_once(&monitor, &key, interval, t0 + interval).await;
+        assert_eq!(stub.probes.load(Ordering::SeqCst), 1, "one fallback poll");
+
+        // The stream's next record names rank 0 only.
+        monitor.apply_pushed_load(
+            &worker,
+            0,
+            &record(4, 0.5, 3),
+            t0 + interval + Duration::from_millis(1),
+        );
+        monitor.flush_pushed();
+        let snapshot = monitor.load_state.snapshot();
+        let report = snapshot.get(stub.url.as_str()).expect("published");
+        assert_eq!(report.version, "pushed");
+        let ranks: Vec<(i32, i32, f64)> = report
+            .loads
+            .iter()
+            .map(|rank| (rank.dp_rank, rank.num_running_reqs, rank.cache_hit_rate))
+            .collect();
+        assert_eq!(ranks, vec![(0, 4, 0.5), (1, 8, 0.91)]);
     }
 }
