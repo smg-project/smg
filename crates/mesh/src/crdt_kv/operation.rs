@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 
 use super::replica::ReplicaId;
@@ -180,12 +178,6 @@ impl OperationLog {
         self.operations.is_empty()
     }
 
-    /// Drop operations with timestamp <= watermark.
-    pub fn compact_up_to(&mut self, watermark: u64) {
-        self.operations
-            .retain(|operation| operation.timestamp() > watermark);
-    }
-
     /// Group operations by key, fold each group via `fold`, and replace the
     /// log with the resulting per-key winners sorted by `(timestamp,
     /// replica_id)`. Strategy-agnostic - the caller's `fold` decides what
@@ -217,45 +209,10 @@ impl OperationLog {
         folded.sort_by_key(|op| (op.timestamp(), op.replica_id()));
         self.operations = folded;
     }
-
-    /// Decode the latest known counter value for a key from log payloads.
-    pub fn latest_counter_value(&self, key: &str) -> Option<i64> {
-        let latest = self
-            .operations
-            .iter()
-            .filter(|operation| operation.key() == key)
-            .max_by_key(|operation| (operation.timestamp(), operation.replica_id()))?;
-
-        match latest {
-            Operation::Insert { value, .. } => decode_counter_payload(value),
-            Operation::Remove { .. } => None,
-        }
-    }
-
-    /// Decode the latest known counter value, regardless of key.
-    pub fn latest_counter_value_any(&self) -> Option<i64> {
-        let latest = self
-            .operations
-            .iter()
-            .max_by_key(|operation| (operation.timestamp(), operation.replica_id()))?;
-
-        match latest {
-            Operation::Insert { value, .. } => decode_counter_payload(value),
-            Operation::Remove { .. } => None,
-        }
-    }
 }
 
 impl Default for OperationLog {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn decode_counter_payload(value: &[u8]) -> Option<i64> {
-    bincode::deserialize::<i64>(value).ok().or_else(|| {
-        bincode::deserialize::<HashMap<String, i64>>(value)
-            .ok()
-            .and_then(|map| map.get("value").copied())
-    })
 }

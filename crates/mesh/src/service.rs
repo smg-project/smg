@@ -825,7 +825,6 @@ mod tests {
             server_cert_path: certs.node_cert_path.clone(),
             server_key_path: certs.node_key_path.clone(),
             require_client_cert: false,
-            rotation_check_interval: Duration::from_secs(300),
         });
         try_ping(
             &NodeState {
@@ -881,7 +880,6 @@ mod tests {
             server_cert_path: certs.node_cert_path.clone(),
             server_key_path: certs.node_key_path.clone(),
             require_client_cert: true,
-            rotation_check_interval: Duration::from_secs(300),
         }
     }
 
