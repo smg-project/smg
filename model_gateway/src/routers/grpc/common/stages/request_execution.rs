@@ -2137,6 +2137,8 @@ struct SequentialPlan {
     /// KV exists only on the prefill worker. Text requests strip to a no-op
     /// and keep the fallback, so only mm requests need the handoff checked.
     stripped_mm_decode: bool,
+    /// The request streams: its decode leg owes a first token within a bound.
+    streaming: bool,
 }
 
 impl SequentialPlan {
@@ -2228,6 +2230,7 @@ impl SequentialPlan {
             mooncake_transfer_id,
             decode_form,
             stripped_mm_decode,
+            streaming: proto_request.stream(),
         })
     }
 
@@ -2317,7 +2320,6 @@ async fn execute_sequential_pd(
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
-    let streaming = proto_request.stream();
     let runtime = workers
         .disaggregated_runtime_type()
         .map(|r| r.as_str())
@@ -2359,11 +2361,10 @@ async fn execute_sequential_pd(
     )?;
     let (decode_stream, decode_sent) = sequential_decode_leg(
         &legs,
+        &plan,
         decode_request,
         decode_client.clone(),
-        streaming,
         handed_off,
-        plan.relay_kv_params,
     )
     .await?;
     // Decode established: record the success-only PD metrics here.
@@ -2654,11 +2655,10 @@ fn relay_to_decode(
 /// where the relay phase ends and the decode leg's time to first token begins.
 async fn sequential_decode_leg(
     legs: &PdLegs<'_>,
+    plan: &SequentialPlan,
     decode_request: ProtoGenerateRequest,
     mut decode_client: BackendClient,
-    streaming: bool,
     handed_off: bool,
-    relay_kv_params: bool,
 ) -> Result<(ProtoStream, Instant), Response> {
     let workers = legs.workers;
     // Send request to decode
@@ -2683,8 +2683,8 @@ async fn sequential_decode_leg(
     // non-streaming request before it finishes), no first-token signal. Its
     // size follows the worker whose prefill of the prompt stands before the
     // first token (see `worker_prefilling_before_decode`).
-    let decode_bound = if streaming {
-        worker_prefilling_before_decode(workers, handed_off, relay_kv_params)
+    let decode_bound = if plan.streaming {
+        worker_prefilling_before_decode(workers, handed_off, plan.relay_kv_params)
             .and_then(|worker| DecodeLegBound::at(worker, legs.prompt_tokens, decode_sent))
     } else {
         None
