@@ -1,0 +1,10 @@
+HTTP 200 text/event-stream
+
+data: {"id":"three","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hello, world"},"finish_reason":null}]}
+
+data: {"id":"three","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+data: {"id":"after","object":"chat.completion.chunk","choices":[]}
+
