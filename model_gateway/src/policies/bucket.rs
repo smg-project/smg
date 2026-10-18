@@ -1715,7 +1715,7 @@ mod tests {
     /// the first split), the first three stopping short of their share for
     /// the workers after them. No bound is a load sum.
     #[test]
-    fn an_adjusted_partitions_bounds_are_sizes_once_the_classes_run_out() {
+    fn an_adjusted_partitions_bounds_are_sizes_and_each_worker_owns_one_class() {
         let url = |n: usize| format!("http://w{n}:8000");
         let mut bucket = Bucket::new(3_600_000);
         bucket.init_prefill_worker_urls((1..=4).map(url).collect());
@@ -1733,6 +1733,34 @@ mod tests {
                 (url(2), [102, 2001]),
                 (url(3), [2002, 3001]),
                 (url(4), [3002, usize::MAX]),
+            ]
+        );
+    }
+
+    /// Fewer classes than workers: the workers that find the classes used
+    /// up own no range until the next adjustment, the partition stays
+    /// contiguous around them (the last worker's open end follows the last
+    /// class), and the size-domain check accepts it. Four workers over the
+    /// sizes 101 and 2001: the first two own one class each, the third
+    /// nothing, the fourth the open end.
+    #[test]
+    fn a_worker_that_finds_the_classes_used_up_owns_no_range_and_the_partition_stays_contiguous() {
+        let url = |n: usize| format!("http://w{n}:8000");
+        let mut bucket = Bucket::new(3_600_000);
+        bucket.init_prefill_worker_urls((1..=4).map(url).collect());
+        for _ in 0..10 {
+            for size in [101, 2001] {
+                let owner = bucket.find_boundary(size).expect("every size has an owner");
+                bucket.post_process_request(size, owner);
+            }
+        }
+        bucket.adjust_boundary();
+        assert_eq!(
+            bucket_ranges(&bucket),
+            [
+                (url(1), [0, 101]),
+                (url(2), [102, 2001]),
+                (url(4), [2002, usize::MAX]),
             ]
         );
     }
