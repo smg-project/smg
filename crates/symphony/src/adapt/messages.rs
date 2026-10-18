@@ -5,7 +5,17 @@
 //! [`responses::output`](super::responses::output): call ids ride on the events, the stop reason is
 //! decided from the `Finish` event alone, and nothing is remembered between calls. The driver wraps
 //! the blocks in the message envelope (id, model, usage) and, when its stop decoder matched a stop
-//! sequence, sets `stop_sequence` and that reason, since the events carry neither.
+//! sequence, sets `stop_sequence` and that reason, since the events carry neither. A `tool_use`
+//! block's `input` is the call's argument fragments parsed as one JSON value, and `{}` where they
+//! are none: a call the model closed without arguments, or fragments that are no whole JSON text
+//! (the output cut, or the model wrote something else), which the parser said in a `Malformed`
+//! event. Fragments that are one whole JSON text no `input` value holds get `{}` too, and nothing
+//! in the events says so: [`Output::refused`] names each such call with the reader's reason, so
+//! that the driver decides what the client gets rather than hand over `{}` for arguments the model
+//! wrote. Whole by its syntax is what a reader that keeps no value takes; what no value holds is
+//! a number outside the range a reader keeps, a surrogate escape without its other half, or
+//! nesting past the value reader's limit. The crate's own readers refuse the last two as they
+//! arrive and say so, so from them the set is the numbers.
 //!
 //! [`Stream`] is the streaming half, the content-block machine: one block is open at a time, and
 //! each parser event becomes the `content_block_start`, `content_block_delta` and
@@ -34,12 +44,14 @@ use std::mem;
 use openai_protocol::messages::{
     ContentBlock, ContentBlockDelta, MessageStreamEvent, StopReason, ToolUseCaller,
 };
+use serde::de::IgnoredAny;
 use serde_json::{Map, Value};
 
 use super::fold::fold;
 use crate::event::{Event, FinishReason};
 
-/// A whole output as the Messages API reports it: the content blocks and the stop reason.
+/// A whole output as the Messages API reports it: the content blocks and the stop reason, and the
+/// calls whose `tool_use` block could not carry their arguments.
 #[derive(Clone, Debug)]
 pub struct Output {
     /// The content blocks in the Messages API's order: thinking, text, then the calls as they
@@ -47,6 +59,27 @@ pub struct Output {
     pub content: Vec<ContentBlock>,
     /// The stop reason decided from the `Finish` event; none when the sequence has not finished.
     pub stop_reason: Option<StopReason>,
+    /// The calls whose argument fragments are one whole JSON text that no `input` value holds (a
+    /// number outside the range a reader keeps; a surrogate escape without its other half or
+    /// nesting past the value reader's limit, which the crate's readers refuse before they get
+    /// here), in the order the calls started: their block carries `{}`, and no `Malformed` event
+    /// says so, since the text is JSON by its syntax. Empty when every block carries its call's
+    /// arguments, or the parser said they are none.
+    pub refused: Vec<RefusedInput>,
+}
+
+/// A call whose `tool_use` block carries `{}` in place of arguments that are JSON by their syntax
+/// ([`Output::refused`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefusedInput {
+    /// The call's index among the output's calls.
+    pub index: u32,
+    /// The function's name.
+    pub name: String,
+    /// The arguments as the model wrote them, the fragments joined.
+    pub arguments: String,
+    /// Why no `input` value holds them, in the reader's words.
+    pub why: String,
 }
 
 /// The message's content and stop reason, folded from a whole event sequence.
@@ -65,11 +98,23 @@ pub fn output<'a>(events: impl IntoIterator<Item = &'a Event>) -> Output {
             citations: None,
         });
     }
-    blocks.extend(folded.calls.into_iter().map(|call| ContentBlock::ToolUse {
-        id: tool_use_id(&call.id),
-        name: call.name,
-        input: input(&call.arguments),
-        caller: ToolUseCaller::Direct,
+    let mut refused = Vec::new();
+    blocks.extend(folded.calls.into_iter().map(|call| {
+        let input = input(&call.arguments).unwrap_or_else(|why| {
+            refused.push(RefusedInput {
+                index: call.index,
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+                why,
+            });
+            Value::Object(Map::new())
+        });
+        ContentBlock::ToolUse {
+            id: tool_use_id(&call.id),
+            name: call.name,
+            input,
+            caller: ToolUseCaller::Direct,
+        }
     }));
 
     Output {
@@ -77,6 +122,7 @@ pub fn output<'a>(events: impl IntoIterator<Item = &'a Event>) -> Output {
         stop_reason: folded
             .finish
             .map(|finish| stop(&finish.reason, finish.tool_calls)),
+        refused,
     }
 }
 
@@ -282,10 +328,23 @@ fn tool_use_id(id: &str) -> String {
     }
 }
 
-/// The `input` for a call's joined argument fragments: the JSON value they form, or `{}` when they
-/// do not form one.
-fn input(arguments: &str) -> Value {
-    serde_json::from_str(arguments).unwrap_or_else(|_| Value::Object(Map::new()))
+/// The `input` for a call's joined argument fragments: the JSON value they form; `{}` when they
+/// form none and the parser said so (a call closed without arguments, fragments that are no whole
+/// JSON text); and the reader's refusal, in its words, when they are one whole JSON text that no
+/// value holds (a number outside the range a reader keeps, a surrogate escape without its other
+/// half, nesting past the value reader's limit), which nothing else says.
+fn input(arguments: &str) -> Result<Value, String> {
+    match serde_json::from_str(arguments) {
+        Ok(value) => Ok(value),
+        Err(why) if whole_json(arguments) => Err(why.to_string()),
+        Err(_) => Ok(Value::Object(Map::new())),
+    }
+}
+
+/// Whether `text` is one whole JSON text by its syntax, whatever its values: what a reader that
+/// keeps no value takes, as the Responses adapter judges a call's arguments.
+fn whole_json(text: &str) -> bool {
+    !text.is_empty() && serde_json::from_str::<IgnoredAny>(text).is_ok()
 }
 
 #[cfg(test)]
@@ -456,14 +515,24 @@ mod tests {
         assert_eq!(output(&[]).stop_reason, None);
     }
 
+    /// The output of one call of `f` with `fragments` for its arguments, ended by `length`.
+    fn one_call(fragments: &[&str]) -> Output {
+        let mut events = vec![call(0, "f")];
+        events.extend(fragments.iter().map(|json| arguments(0, json)));
+        events.push(end(0));
+        events.push(finish(FinishReason::Length, 1));
+        output(&events)
+    }
+
     #[test]
     fn arguments_that_are_not_a_whole_json_value_give_an_empty_input() {
         let inputs = |fragments: &[&str]| {
-            let mut events = vec![call(0, "f")];
-            events.extend(fragments.iter().map(|json| arguments(0, json)));
-            events.push(end(0));
-            events.push(finish(FinishReason::Length, 1));
-            wire(&output(&events).content)[0]["input"].clone()
+            let output = one_call(fragments);
+            assert!(
+                output.refused.is_empty(),
+                "{fragments:?}: the parser's word stands"
+            );
+            wire(&output.content)[0]["input"].clone()
         };
         assert_eq!(inputs(&[r#"{"city":"#]), json!({}), "cut short");
         assert_eq!(inputs(&["not json"]), json!({}), "not JSON at all");
@@ -478,6 +547,82 @@ mod tests {
             json!([1, 2]),
             "a whole value of another kind"
         );
+    }
+
+    /// Arguments that are JSON by their syntax and that no `input` value holds: the block carries
+    /// `{}`, as for arguments that are none, and the output names the call with the reader's
+    /// reason, since no event says so; the stream carries the text as the model wrote it. Three
+    /// kinds of text are such: a number outside the range a reader keeps, a surrogate escape
+    /// without its other half, and nesting past the value reader's limit (the crate's readers
+    /// refuse the last two as they arrive, so from them only the numbers get here).
+    #[test]
+    fn arguments_no_input_value_holds_are_named_as_refused_with_the_readers_reason() {
+        let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+        for (text, reason) in [
+            (r#"{"days": 9.99e999999}"#, "number out of range"),
+            (r#"{"n": 1e400, "city": "Paris"}"#, "number out of range"),
+            ("[-1e400]", "number out of range"),
+            (r#"{"q": "\ud800"}"#, "hex escape"),
+            (deep.as_str(), "recursion limit exceeded"),
+        ] {
+            let folded = one_call(&[text]);
+            assert_eq!(wire(&folded.content)[0]["input"], json!({}), "{text}");
+            assert_eq!(folded.refused.len(), 1, "{text}: {:?}", folded.refused);
+            let refused = &folded.refused[0];
+            assert_eq!((refused.index, refused.name.as_str()), (0, "f"), "{text}");
+            assert_eq!(refused.arguments, text);
+            assert!(refused.why.contains(reason), "{text}: {}", refused.why);
+            assert_eq!(
+                folded.stop_reason,
+                Some(StopReason::MaxTokens),
+                "{text}: the stop reason is the finish's, as for every output"
+            );
+            // The same arguments in two fragments and in two calls: each call is named once, in
+            // the order the calls started, with its own arguments.
+            let (head, tail) = text.split_at(4);
+            let mut events = vec![
+                call(0, "f"),
+                arguments(0, head),
+                arguments(0, tail),
+                end(0),
+                call(1, "g"),
+                arguments(1, r#"{"ok": true}"#),
+                end(1),
+                call(2, "h"),
+                arguments(2, text),
+                end(2),
+                finish(FinishReason::Stop, 3),
+            ];
+            let folded = output(&events);
+            assert_eq!(
+                folded
+                    .refused
+                    .iter()
+                    .map(|refused| (refused.index, refused.name.as_str()))
+                    .collect::<Vec<_>>(),
+                [(0, "f"), (2, "h")],
+                "{text}"
+            );
+            assert_eq!(
+                wire(&folded.content)[1]["input"],
+                json!({"ok": true}),
+                "{text}"
+            );
+            // The stream hands the fragments on as written, for the client's own reader.
+            events.truncate(4);
+            let mut stream = Stream::new();
+            let mut out = Vec::new();
+            for event in &events {
+                stream.feed(event, &mut out);
+            }
+            let partial: String = stream_wire(&out)
+                .as_array()
+                .expect("events")
+                .iter()
+                .filter_map(|event| event["delta"]["partial_json"].as_str().map(String::from))
+                .collect();
+            assert_eq!(partial, text);
+        }
     }
 
     #[test]

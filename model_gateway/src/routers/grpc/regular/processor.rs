@@ -30,6 +30,7 @@ use crate::routers::{
         proto_wrapper::ProtoGenerateComplete,
         regular::symphony::{
             content_spans, engine_finish, finished, telemetry::Who, Assignment, Reader,
+            SymphonyError,
         },
         spec::{ChatResponseSpec, CompletionResponseSpec, MessagesResponseSpec},
         utils,
@@ -416,21 +417,22 @@ impl ResponseProcessor {
     /// finish, and the content blocks the events fold into (`adapt::messages::output`). A stop
     /// sequence the decoder or the engine matched is the stop reason, as on the older path; the
     /// thinking tokens are the engine's, or the reasoning text's, when the request asked for
-    /// thinking.
+    /// thinking. A call whose arguments no `tool_use` input holds refuses the message
+    /// (`SymphonyError::InputRefused`, the call named), rather than leave as `{}` without a word.
     fn read_messages_with_symphony(
         dispatch: &DispatchMetadata,
         assignment: &Assignment,
         complete: &ProtoGenerateComplete,
         request: &MessagesResponseSpec,
         stop_decoder: &mut StopSequenceDecoder,
-    ) -> Result<Message, String> {
+    ) -> Result<Message, SymphonyError> {
         let mut reader = Reader::new(assignment, Arc::clone(&request.chat_tools))?
             .first_call_only(request.first_tool_call_only);
         stop_decoder.reset();
         let (mut events, stopped) = reader.read(stop_decoder, complete.output_ids())?;
         let tail = stop_decoder
             .finish()
-            .map_err(|e| format!("Failed to finish token decoding: {e}"))?;
+            .map_err(|e| SymphonyError::Read(format!("Failed to finish token decoding: {e}")))?;
         utils::warn_detokenize_recoveries(&dispatch.request_id, 0, stop_decoder);
         if let SequenceDecoderOutput::Text(text) | SequenceDecoderOutput::StoppedWithText(text) =
             tail
@@ -449,6 +451,15 @@ impl ResponseProcessor {
         };
         events.extend(reader.end(engine_finish(reason), who)?);
         let mut output = adapt::messages::output(&events);
+        // A `tool_use` block carries `{}` only where the parser said the arguments are none;
+        // arguments that are JSON no `input` value holds would leave as `{}` with no word, so the
+        // message is refused, naming the call (the stream carries such arguments as written).
+        if let Some(refused) = output.refused.first() {
+            return Err(SymphonyError::InputRefused(format!(
+                "the tool_use input of call {} ({}) cannot carry the arguments the model wrote: {}",
+                refused.index, refused.name, refused.why
+            )));
+        }
         if !request.thinking_text_returned {
             utils::message_utils::omit_thinking_text(&mut output.content);
         }
@@ -848,9 +859,16 @@ impl ResponseProcessor {
                 stop_decoder,
             )
             .map(|message| (message, counts))
-            .map_err(|e| {
-                error!(function = "process_non_streaming_messages_response", error = %e, "Symphony failed to read the message");
-                error::internal_error("symphony_read_failed", e)
+            .map_err(|e| match e {
+                // The output's own doing: the model wrote arguments no tool_use input holds.
+                SymphonyError::InputRefused(why) => {
+                    warn!(function = "process_non_streaming_messages_response", error = %why, "the message's tool_use input cannot carry the model's arguments");
+                    error::internal_error("symphony_tool_use_input_refused", why)
+                }
+                e => {
+                    error!(function = "process_non_streaming_messages_response", error = %e, "Symphony failed to read the message");
+                    error::internal_error("symphony_read_failed", e.to_string())
+                }
             });
         }
 

@@ -93,9 +93,11 @@ use crate::{
 /// gateway's `--parser` flag.
 pub(crate) const HEADER: &str = "x-smg-parser";
 
-/// Why the seam refused a request or failed to read an output, as five classes a caller can match
-/// on. Every caller today takes the text, which is the one the gateway answered or logged before
-/// the classes were named; a count or a status by class is a change of its own.
+/// Why the seam refused a request or failed to read an output, as six classes a caller can match
+/// on. Every caller but one takes the text, which is the one the gateway answered or logged before
+/// the classes were named: the non-streaming Messages path answers [`Self::InputRefused`] under
+/// its own code at warn level, since that one is the output's doing. A count or a status by class
+/// is a change of its own.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum SymphonyError {
     /// The request's parser header names neither parser (a 400).
@@ -114,6 +116,11 @@ pub(crate) enum SymphonyError {
     /// The output could not be read: the stop decoder or the engine refused it.
     #[error("{0}")]
     Read(String),
+    /// The output was read, and a `tool_use` block's `input` cannot carry the arguments the model
+    /// wrote (JSON that no input value holds; the Messages fold names the call): the output's own
+    /// doing, not the gateway's, so it is logged as a warning under its own code.
+    #[error("{0}")]
+    InputRefused(String),
 }
 
 impl From<SymphonyError> for String {
@@ -4212,6 +4219,20 @@ mod tests {
         assert!(matches!(
             StreamFailure::from(read),
             StreamFailure::Internal(text) if text == "the stop decoder refused token 7"
+        ));
+        // The refused input converts to its bare text like the others; the non-streaming Messages
+        // path alone matches on the class.
+        let refused = SymphonyError::InputRefused(
+            "the tool_use input of call 0 (f) cannot carry the arguments the model wrote: number out of range"
+                .to_string(),
+        );
+        assert_eq!(
+            String::from(refused.clone()),
+            "the tool_use input of call 0 (f) cannot carry the arguments the model wrote: number out of range"
+        );
+        assert!(matches!(
+            StreamFailure::from(refused),
+            StreamFailure::Internal(text) if text.starts_with("the tool_use input of call 0 (f)")
         ));
         let tools = tool_parser::ParserFactory::new();
         assert!(matches!(

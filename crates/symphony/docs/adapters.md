@@ -131,8 +131,19 @@ Policy this adapter sets, where the events say more than the Messages API can:
 - A call whose argument fragments are not a whole JSON value, because the output was cut or the
   model wrote something else, has `{}` as its `input`: `input` must be a JSON value, and the
   fragments are not one. Chat carries the fragments as a string and Responses marks the call
-  `incomplete`; here `max_tokens` is all a client learns. A call the model closed without
-  arguments has `{}` too.
+  `incomplete`; here `max_tokens` is all a client learns, with the parser's `Malformed` word. A
+  call the model closed without arguments has `{}` too.
+- A call whose argument fragments are one whole JSON text that no `input` value holds has `{}` as
+  its `input` as well, and the parser said no word, since the text is JSON by its syntax:
+  `Output::refused` names the call with the reader's reason, so that the driver decides what the
+  client gets instead of a `{}` nothing reports (the gateway refuses the message under its own
+  error code, naming the call). Whole by its syntax is what a reader that keeps no value takes, the
+  judgement the Responses adapter makes; what no value holds is a number outside the range a reader
+  keeps (`9.99e999999`), a surrogate escape without its other half (`"\ud800"`) or nesting past the
+  value reader's limit. The crate's own readers refuse the last two as the bytes arrive and say so
+  in a `Malformed` event, so from them the set is the numbers. Chat carries the text as written and
+  Responses judges it whole, as the stream here does, whose `input_json_delta`s carry the fragments
+  as the model wrote them for the client's own reader.
 - Argument fragments for a call that never started cannot occur under the `Event` contract;
   should one arrive, its text joins the content so that no byte is lost. In the stream the same
   goes for a fragment whose call has no open `tool_use` block because other text, or another

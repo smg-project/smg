@@ -758,6 +758,68 @@ async fn a_conversation_that_ends_with_a_system_turn_keeps_the_thought_out_of_th
     assert!(!tool_call_deltas(&events).is_empty(), "{events:#?}");
 }
 
+/// A `tool_use` block never carries `{}` for arguments the model wrote as JSON that no input
+/// value holds: the message is refused with the call named, where the stream carries the text as
+/// written for the client's own reader.
+#[tokio::test]
+async fn a_message_whose_tool_use_input_cannot_carry_the_arguments_is_refused() {
+    let output = "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"days\": 9.99e999999}}\n\
+                  </tool_call>";
+    let spec = || assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    // The whole message: refused, the call and the reader's reason in the error.
+    let mut frame = complete(0, "stop");
+    if let Some(proto::generate_response::Response::Complete(complete)) = &mut frame.response {
+        complete.output_ids = output.chars().map(u32::from).collect();
+        complete.completion_tokens = complete.output_ids.len() as u32;
+    }
+    let (stream, server) = scripted_stream(vec![frame], "0").await;
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
+    let result = ResponseProcessor::new(
+        ToolParserFactory::new(),
+        ReasoningParserFactory::new(),
+        utils::ParserResolver::disabled(),
+    )
+    .process_non_streaming_messages_response(
+        context::ExecutionResult::Single { stream },
+        spec(),
+        dispatch(),
+        tokenizer,
+        &mut decoder,
+    )
+    .await;
+    server.abort();
+    let response = match result {
+        Ok((message, _)) => panic!("a message with {:?}", message.content),
+        Err(response) => response,
+    };
+    assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        axum::body::to_bytes(response.into_body(), 65536),
+    )
+    .await
+    .expect("the body in time")
+    .expect("the body");
+    let body = String::from_utf8(body.to_vec()).expect("text");
+    assert!(
+        body.contains("symphony_tool_use_input_refused")
+            && body.contains("call 0 (lookup)")
+            && body.contains("number out of range"),
+        "{body}"
+    );
+    // The stream: the fragments as the model wrote them, and the stop reason the calls give.
+    let (result, events) =
+        message_events(vec![chunk(0, output), complete(0, "stop")], spec(), None).await;
+    assert!(result.is_ok(), "{result:?}");
+    let partial: String = events
+        .iter()
+        .filter_map(|event| event["delta"]["partial_json"].as_str())
+        .collect();
+    assert_eq!(partial, "{\"days\": 9.99e999999}");
+    assert_eq!(message_stop_reason(&events), "tool_use");
+}
+
 /// The scrape of a recorder of this test's own after `read` ran on this thread (the test
 /// runtime is single-threaded, so the local recorder sees every record of the future).
 async fn scraped<F: std::future::Future>(read: F) -> (F::Output, String) {
