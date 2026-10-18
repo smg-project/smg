@@ -247,11 +247,21 @@ pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
             .unwrap_or(1)
             .max(1);
         loads = (0..ranks)
-            .map(|rank| vllm::SchedulerLoad {
-                dp_rank: i32::try_from(rank).unwrap_or(i32::MAX),
-                max_running_requests,
-                max_total_num_tokens,
-                ..Default::default()
+            .map(|rank| {
+                let dp_rank = i32::try_from(rank).unwrap_or(i32::MAX);
+                // The servicer's own figures do not wait for the engine's
+                // first snapshot: what this rank cached and streamed so far,
+                // and the token-work queued to it.
+                let estimate = state.loads.estimate(dp_rank, 0);
+                vllm::SchedulerLoad {
+                    dp_rank,
+                    max_running_requests,
+                    max_total_num_tokens,
+                    num_waiting_uncached_tokens: estimate.queued_token_work,
+                    gen_throughput: estimate.gen_throughput,
+                    cache_hit_rate: estimate.cache_hit_rate,
+                    ..Default::default()
+                }
             })
             .collect();
         dp_rank_count = loads.len().try_into().unwrap_or_default();
