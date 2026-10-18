@@ -215,6 +215,7 @@ impl VllmEngineClient {
             skip_special_tokens,
             spaces_between_special_tokens: true, // Default from Python SamplingParams
             ignore_eos: request.ignore_eos,
+            include_stop_str_in_output: request.no_stop_trim,
             n: request.n.unwrap_or(1),
             logprobs,
             // Proto seed is i32 (line 48 of generated vllm.grpc.engine.rs);

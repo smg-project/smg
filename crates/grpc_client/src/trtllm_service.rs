@@ -125,7 +125,7 @@ impl TrtllmServiceClient {
             ignore_eos: body.ignore_eos,
             guided_decoding,
             multimodal_input,
-            include_stop_token_in_output: false,
+            include_stop_token_in_output: body.no_stop_trim,
             ..Default::default()
         };
 
@@ -600,8 +600,12 @@ impl TrtllmServiceClient {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use tonic::transport::Endpoint;
+
     use super::*;
-    use crate::channel::testing::refused_endpoint;
+    use crate::{channel::testing::refused_endpoint, NoopTraceInjector};
 
     #[test]
     fn plain_sampling_seed_and_stop_token_ids_reach_the_request() {
@@ -847,5 +851,35 @@ mod tests {
             );
         }
         assert_eq!(TrtllmServiceClient::guide_of(None), None);
+    }
+
+    /// A chat request's `no_stop_trim` reaches the engine's field, through a
+    /// client that is built but never dialled.
+    #[tokio::test]
+    async fn chat_no_stop_trim_reaches_include_stop_token_in_output() {
+        let client = TrtllmServiceClient {
+            client: proto::trtllm_service_client::TrtllmServiceClient::new(
+                Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            ),
+            trace_injector: Arc::new(NoopTraceInjector),
+        };
+        for asked in [true, false] {
+            let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "stop": ["\n"], "no_stop_trim": asked
+            }))
+            .unwrap();
+            let request = client
+                .build_generate_request_from_chat(
+                    "r".into(),
+                    &chat,
+                    "hi".into(),
+                    vec![1],
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(request.include_stop_token_in_output, asked, "asked {asked}");
+        }
     }
 }
