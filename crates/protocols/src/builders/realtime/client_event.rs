@@ -43,6 +43,10 @@ impl ClientEvent {
     }
 
     /// Build a `conversation.item.delete` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn conversation_item_delete(event_id: Option<String>, item_id: impl Into<String>) -> Self {
         Self::ConversationItemDelete {
             event_id,
@@ -51,6 +55,10 @@ impl ClientEvent {
     }
 
     /// Build a `conversation.item.retrieve` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn conversation_item_retrieve(
         event_id: Option<String>,
         item_id: impl Into<String>,
@@ -62,6 +70,10 @@ impl ClientEvent {
     }
 
     /// Build a `conversation.item.truncate` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn conversation_item_truncate(
         event_id: Option<String>,
         item_id: impl Into<String>,
@@ -79,6 +91,10 @@ impl ClientEvent {
     // ---- Input audio buffer ----
 
     /// Build an `input_audio_buffer.append` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn input_audio_buffer_append(event_id: Option<String>, audio: impl Into<String>) -> Self {
         Self::InputAudioBufferAppend {
             event_id,
@@ -87,11 +103,19 @@ impl ClientEvent {
     }
 
     /// Build an `input_audio_buffer.clear` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn input_audio_buffer_clear(event_id: Option<String>) -> Self {
         Self::InputAudioBufferClear { event_id }
     }
 
     /// Build an `input_audio_buffer.commit` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn input_audio_buffer_commit(event_id: Option<String>) -> Self {
         Self::InputAudioBufferCommit { event_id }
     }
@@ -99,6 +123,10 @@ impl ClientEvent {
     // ---- Output audio buffer (WebRTC/SIP only) ----
 
     /// Build an `output_audio_buffer.clear` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn output_audio_buffer_clear(event_id: Option<String>) -> Self {
         Self::OutputAudioBufferClear { event_id }
     }
@@ -106,6 +134,10 @@ impl ClientEvent {
     // ---- Response ----
 
     /// Build a `response.cancel` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn response_cancel(event_id: Option<String>, response_id: Option<String>) -> Self {
         Self::ResponseCancel {
             event_id,

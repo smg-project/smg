@@ -162,6 +162,10 @@ impl ChatCompletionStreamResponseBuilder {
 
     /// Add a choice delta that appends a tool-call *arguments delta*
     /// Uses `Cow` so you can pass `&str` or `String` without extra clones
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn add_choice_tool_args(
         mut self,
         index: u32,
@@ -191,6 +195,10 @@ impl ChatCompletionStreamResponseBuilder {
     }
 
     /// Add a choice delta that sets reasoning content (for models that stream reasoning)
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn add_choice_reasoning(mut self, index: u32, reasoning: impl Into<String>) -> Self {
         self.choices.push(ChatStreamChoice {
             index,

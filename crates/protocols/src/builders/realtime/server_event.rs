@@ -56,6 +56,10 @@ impl ServerEvent {
     }
 
     /// Build a `session.updated` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn session_updated(event_id: impl Into<String>, session: SessionConfig) -> Self {
         Self::SessionUpdated {
             event_id: event_id.into(),
@@ -66,6 +70,10 @@ impl ServerEvent {
     // ---- Conversation events ----
 
     /// Build a `conversation.created` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn conversation_created(event_id: impl Into<String>, conversation: Conversation) -> Self {
         Self::ConversationCreated {
             event_id: event_id.into(),
@@ -74,6 +82,10 @@ impl ServerEvent {
     }
 
     /// Build a `conversation.item.created` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn conversation_item_created(
         event_id: impl Into<String>,
         previous_item_id: Option<String>,
@@ -87,6 +99,10 @@ impl ServerEvent {
     }
 
     /// Build a `conversation.item.added` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn conversation_item_added(
         event_id: impl Into<String>,
         previous_item_id: Option<String>,
@@ -100,6 +116,10 @@ impl ServerEvent {
     }
 
     /// Build a `conversation.item.done` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn conversation_item_done(
         event_id: impl Into<String>,
         previous_item_id: Option<String>,
@@ -113,6 +133,10 @@ impl ServerEvent {
     }
 
     /// Build a `conversation.item.deleted` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn conversation_item_deleted(
         event_id: impl Into<String>,
         item_id: impl Into<String>,
@@ -124,6 +148,10 @@ impl ServerEvent {
     }
 
     /// Build a `conversation.item.retrieved` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn conversation_item_retrieved(
         event_id: impl Into<String>,
         item: RealtimeConversationItem,
@@ -135,6 +163,10 @@ impl ServerEvent {
     }
 
     /// Build a `conversation.item.truncated` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn conversation_item_truncated(
         event_id: impl Into<String>,
         item_id: impl Into<String>,
@@ -152,6 +184,10 @@ impl ServerEvent {
     // ---- Input audio transcription events ----
 
     /// Build a `conversation.item.input_audio_transcription.completed` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn input_audio_transcription_completed(
         event_id: impl Into<String>,
         item_id: impl Into<String>,
@@ -170,6 +206,10 @@ impl ServerEvent {
     }
 
     /// Build a `conversation.item.input_audio_transcription.completed` event with logprobs.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn input_audio_transcription_completed_with_logprobs(
         event_id: impl Into<String>,
         item_id: impl Into<String>,
@@ -189,6 +229,10 @@ impl ServerEvent {
     }
 
     /// Build a `conversation.item.input_audio_transcription.delta` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn input_audio_transcription_delta(
         event_id: impl Into<String>,
         item_id: impl Into<String>,
@@ -206,6 +250,10 @@ impl ServerEvent {
     }
 
     /// Build a `conversation.item.input_audio_transcription.failed` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn input_audio_transcription_failed(
         event_id: impl Into<String>,
         item_id: impl Into<String>,
@@ -222,6 +270,10 @@ impl ServerEvent {
 
     /// Build a `conversation.item.input_audio_transcription.segment` event.
     #[expect(clippy::too_many_arguments)]
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn input_audio_transcription_segment(
         event_id: impl Into<String>,
         item_id: impl Into<String>,
@@ -247,6 +299,10 @@ impl ServerEvent {
     // ---- Input audio buffer events ----
 
     /// Build an `input_audio_buffer.cleared` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn input_audio_buffer_cleared(event_id: impl Into<String>) -> Self {
         Self::InputAudioBufferCleared {
             event_id: event_id.into(),
@@ -254,6 +310,10 @@ impl ServerEvent {
     }
 
     /// Build an `input_audio_buffer.committed` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn input_audio_buffer_committed(
         event_id: impl Into<String>,
         item_id: impl Into<String>,
@@ -267,6 +327,10 @@ impl ServerEvent {
     }
 
     /// Build an `input_audio_buffer.speech_started` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn input_audio_buffer_speech_started(
         event_id: impl Into<String>,
         audio_start_ms: u32,
@@ -280,6 +344,10 @@ impl ServerEvent {
     }
 
     /// Build an `input_audio_buffer.speech_stopped` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn input_audio_buffer_speech_stopped(
         event_id: impl Into<String>,
         audio_end_ms: u32,
@@ -293,6 +361,10 @@ impl ServerEvent {
     }
 
     /// Build an `input_audio_buffer.timeout_triggered` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn input_audio_buffer_timeout_triggered(
         event_id: impl Into<String>,
         audio_start_ms: u32,
@@ -310,6 +382,10 @@ impl ServerEvent {
     /// Build an `input_audio_buffer.dtmf_event_received` event.
     ///
     /// DTMF events have no `event_id` per the OpenAI spec.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn dtmf_event_received(event: impl Into<String>, received_at: i64) -> Self {
         Self::InputAudioBufferDtmfEventReceived {
             event: event.into(),
@@ -320,6 +396,10 @@ impl ServerEvent {
     // ---- MCP list tools events ----
 
     /// Build an `mcp_list_tools.in_progress` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn mcp_list_tools_in_progress(
         event_id: impl Into<String>,
         item_id: impl Into<String>,
@@ -331,6 +411,10 @@ impl ServerEvent {
     }
 
     /// Build an `mcp_list_tools.completed` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn mcp_list_tools_completed(
         event_id: impl Into<String>,
         item_id: impl Into<String>,
@@ -342,6 +426,10 @@ impl ServerEvent {
     }
 
     /// Build an `mcp_list_tools.failed` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn mcp_list_tools_failed(event_id: impl Into<String>, item_id: impl Into<String>) -> Self {
         Self::McpListToolsFailed {
             event_id: event_id.into(),
@@ -352,6 +440,10 @@ impl ServerEvent {
     // ---- MCP call lifecycle events ----
 
     /// Build a `response.mcp_call.in_progress` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn mcp_call_in_progress(
         event_id: impl Into<String>,
         item_id: impl Into<String>,
@@ -365,6 +457,10 @@ impl ServerEvent {
     }
 
     /// Build a `response.mcp_call.completed` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn mcp_call_completed(
         event_id: impl Into<String>,
         item_id: impl Into<String>,
@@ -378,6 +474,10 @@ impl ServerEvent {
     }
 
     /// Build a `response.mcp_call.failed` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn mcp_call_failed(
         event_id: impl Into<String>,
         item_id: impl Into<String>,
@@ -393,6 +493,10 @@ impl ServerEvent {
     // ---- Rate limits ----
 
     /// Build a `rate_limits.updated` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn rate_limits_updated(
         event_id: impl Into<String>,
         rate_limits: Vec<RealtimeRateLimit>,
@@ -406,6 +510,10 @@ impl ServerEvent {
     // ---- Response lifecycle events ----
 
     /// Build a `response.created` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn response_created(event_id: impl Into<String>, response: RealtimeResponse) -> Self {
         Self::ResponseCreated {
             event_id: event_id.into(),
@@ -414,6 +522,10 @@ impl ServerEvent {
     }
 
     /// Build a `response.done` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn response_done(event_id: impl Into<String>, response: RealtimeResponse) -> Self {
         Self::ResponseDone {
             event_id: event_id.into(),
@@ -476,6 +588,10 @@ impl ResponseEventBuilder {
     }
 
     /// Build an `output_audio_buffer.stopped` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn output_audio_buffer_stopped(&self, event_id: impl Into<String>) -> ServerEvent {
         ServerEvent::OutputAudioBufferStopped {
             event_id: event_id.into(),
@@ -484,6 +600,10 @@ impl ResponseEventBuilder {
     }
 
     /// Build an `output_audio_buffer.cleared` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn output_audio_buffer_cleared(&self, event_id: impl Into<String>) -> ServerEvent {
         ServerEvent::OutputAudioBufferCleared {
             event_id: event_id.into(),
@@ -536,6 +656,10 @@ impl ItemEventBuilder {
     // ---- Response output item events ----
 
     /// Build a `response.output_item.added` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn output_item_added(
         &self,
         event_id: impl Into<String>,
@@ -566,6 +690,10 @@ impl ItemEventBuilder {
     // ---- Response function call events ----
 
     /// Build a `response.function_call_arguments.delta` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn function_call_arguments_delta(
         &self,
         event_id: impl Into<String>,
@@ -583,6 +711,10 @@ impl ItemEventBuilder {
     }
 
     /// Build a `response.function_call_arguments.done` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn function_call_arguments_done(
         &self,
         event_id: impl Into<String>,
@@ -604,6 +736,10 @@ impl ItemEventBuilder {
     // ---- Response MCP call events ----
 
     /// Build a `response.mcp_call_arguments.delta` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn mcp_call_arguments_delta(
         &self,
         event_id: impl Into<String>,
@@ -621,6 +757,10 @@ impl ItemEventBuilder {
     }
 
     /// Build a `response.mcp_call_arguments.done` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn mcp_call_arguments_done(
         &self,
         event_id: impl Into<String>,
@@ -672,6 +812,10 @@ impl ContentEventBuilder {
     // ---- Response content part events ----
 
     /// Build a `response.content_part.added` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn content_part_added(
         &self,
         event_id: impl Into<String>,
@@ -688,6 +832,10 @@ impl ContentEventBuilder {
     }
 
     /// Build a `response.content_part.done` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn content_part_done(
         &self,
         event_id: impl Into<String>,
@@ -722,6 +870,10 @@ impl ContentEventBuilder {
     }
 
     /// Build a `response.output_text.done` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn output_text_done(
         &self,
         event_id: impl Into<String>,
@@ -740,6 +892,10 @@ impl ContentEventBuilder {
     // ---- Response audio events ----
 
     /// Build a `response.output_audio.delta` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn output_audio_delta(
         &self,
         event_id: impl Into<String>,
@@ -756,6 +912,10 @@ impl ContentEventBuilder {
     }
 
     /// Build a `response.output_audio.done` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn output_audio_done(&self, event_id: impl Into<String>) -> ServerEvent {
         ServerEvent::ResponseOutputAudioDone {
             event_id: event_id.into(),
@@ -769,6 +929,10 @@ impl ContentEventBuilder {
     // ---- Response audio transcript events ----
 
     /// Build a `response.output_audio_transcript.delta` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn output_audio_transcript_delta(
         &self,
         event_id: impl Into<String>,
@@ -785,6 +949,10 @@ impl ContentEventBuilder {
     }
 
     /// Build a `response.output_audio_transcript.done` event.
+    #[deprecated(
+        since = "1.17.0",
+        note = "unused by the gateway; removed in the next major"
+    )]
     pub fn output_audio_transcript_done(
         &self,
         event_id: impl Into<String>,
