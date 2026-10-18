@@ -84,8 +84,8 @@ mod tests {
         event::{DropReason, Event, FinishReason, MalformedReason, Text},
         formats::{deepseek_v4, deepseek_v4_1},
         input::EngineFinish,
-        tagged::Declared,
         testing::{self, bytes, content, drive_to, reasoning},
+        Declared,
     };
 
     /// The generation prompt's tail in thinking mode: the turn's opener and the thought opened.
