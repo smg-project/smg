@@ -155,7 +155,7 @@ MODEL_SPECS: dict[str, dict] = {
         "features": ["chat", "streaming", "multimodal"],
     },
     # Standard-RoPE vision model for the PD multimodal KV-isolation test:
-    # M-RoPE models (Qwen-VL) cannot decode on the tensor-stripped PD leg.
+    # M-RoPE models (Qwen-VL) cannot decode on the tensor-stripped PD side.
     "microsoft/Phi-3.5-vision-instruct": {
         "model": _resolve_model_path("microsoft/Phi-3.5-vision-instruct"),
         "tp": 1,

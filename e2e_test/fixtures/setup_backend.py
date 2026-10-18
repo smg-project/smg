@@ -65,10 +65,10 @@ _WORKER_DEFAULTS = {
     "count": 1,
     "prefill": None,
     "decode": None,
-    # PD only: per-leg tensor parallelism (None = the model spec's tp).
+    # PD only: per-pool tensor parallelism (None = the model spec's tp).
     "prefill_tp": None,
     "decode_tp": None,
-    # PD only: KV transfer backend per worker of each leg ("nixl" /
+    # PD only: KV transfer backend per worker of each pool ("nixl" /
     # "mooncake" / "moriio"), a list one entry per worker; None = the lane's default.
     "prefill_kv": None,
     "decode_kv": None,
@@ -208,7 +208,7 @@ def _wait_for_serving(
         except openai.APIStatusError as exc:
             code = _error_code_of(exc)
             if code in _SETTLED_VERDICTS:
-                # A fleet still registering shows one worker per leg and can
+                # A fleet still registering shows one worker per pool and can
                 # refuse a pair it accepts moments later; only a verdict the
                 # gateway has held for a few seconds is the fleet's.
                 if code != settled_code:
@@ -257,13 +257,13 @@ def setup_backend(request: pytest.FixtureRequest):
         GPU count and extra engine CLI args (local workers only)
       - ``@pytest.mark.workers(prefill=1, decode=1)``: PD worker counts
       - ``("pd_grpc", (n_prefill, n_decode[, prefill_tp, decode_tp]))`` as
-        the param: PD counts, optionally with asymmetric per-leg tp; a
+        the param: PD counts, optionally with asymmetric per-pool tp; a
         trailing dict may add ``prefill_kv`` / ``decode_kv`` lists naming
         each worker's KV transfer backend, so one fleet can mix transports,
         and ``prefill_env`` / ``decode_env`` dicts of engine environment
-        for one leg (a deployment-injected ``SMG_PAIRING_PROTOCOL``) or
+        for one role (a deployment-injected ``SMG_PAIRING_PROTOCOL``) or
         ``prefill_args`` / ``decode_args`` lists of engine CLI flags for one
-        leg (a ``--language-model-only`` decode pool)
+        pool (a ``--language-model-only`` decode pool)
       - ``@pytest.mark.gateway(policy=..., timeout=..., extra_args=...)``: Gateway config
 
     Returns:
@@ -271,9 +271,9 @@ def setup_backend(request: pytest.FixtureRequest):
     """
     raw_param = request.param
     if isinstance(raw_param, tuple):
-        backend_name, leg_counts = raw_param
+        backend_name, pool_counts = raw_param
     else:
-        backend_name, leg_counts = raw_param, None
+        backend_name, pool_counts = raw_param, None
 
     if os.environ.get(ENV_SKIP_BACKEND_SETUP, "").lower() in ("1", "true", "yes"):
         pytest.skip(f"{ENV_SKIP_BACKEND_SETUP} is set")
@@ -303,37 +303,39 @@ def setup_backend(request: pytest.FixtureRequest):
     _validate_connection_mode(connection_mode, engine)
     model_path = get_model_spec(model_id)["model"]
     workers_config = get_marker_kwargs(request, "workers", defaults=_WORKER_DEFAULTS)
-    if is_pd and leg_counts is not None:
+    if is_pd and pool_counts is not None:
         # ``("pd_grpc", (n_prefill, n_decode))`` lets one class sweep PD
         # topologies; setup_backend is class-scoped, so counts ride in the param.
-        leg_options: dict = {}
-        if leg_counts and isinstance(leg_counts[-1], dict):
-            leg_options = dict(leg_counts[-1])
-            leg_counts = tuple(leg_counts[:-1])
-        if len(leg_counts) not in (2, 4):
+        pool_options: dict = {}
+        if pool_counts and isinstance(pool_counts[-1], dict):
+            pool_options = dict(pool_counts[-1])
+            pool_counts = tuple(pool_counts[:-1])
+        if len(pool_counts) not in (2, 4):
             raise ValueError(
                 "pd_* backend params take (n_prefill, n_decode) or "
                 "(n_prefill, n_decode, prefill_tp, decode_tp), optionally followed by "
                 "a dict of per-worker options"
             )
-        if any(not isinstance(n, int) or isinstance(n, bool) or n < 1 for n in leg_counts):
-            raise ValueError(f"pd_* leg counts and tp must be positive integers, got {leg_counts}")
-        workers_config = {**workers_config, "prefill": leg_counts[0], "decode": leg_counts[1]}
-        if len(leg_counts) == 4:
+        if any(not isinstance(n, int) or isinstance(n, bool) or n < 1 for n in pool_counts):
+            raise ValueError(
+                f"pd_* pool counts and tp must be positive integers, got {pool_counts}"
+            )
+        workers_config = {**workers_config, "prefill": pool_counts[0], "decode": pool_counts[1]}
+        if len(pool_counts) == 4:
             workers_config = {
                 **workers_config,
-                "prefill_tp": leg_counts[2],
-                "decode_tp": leg_counts[3],
+                "prefill_tp": pool_counts[2],
+                "decode_tp": pool_counts[3],
             }
         for key in ("prefill_kv", "decode_kv"):
-            if key in leg_options:
-                workers_config = {**workers_config, key: list(leg_options[key])}
+            if key in pool_options:
+                workers_config = {**workers_config, key: list(pool_options[key])}
         for key in ("prefill_env", "decode_env"):
-            if key in leg_options:
-                workers_config = {**workers_config, key: dict(leg_options[key])}
+            if key in pool_options:
+                workers_config = {**workers_config, key: dict(pool_options[key])}
         for key in ("prefill_args", "decode_args"):
-            if key in leg_options:
-                workers_config = {**workers_config, key: list(leg_options[key])}
+            if key in pool_options:
+                workers_config = {**workers_config, key: list(pool_options[key])}
     log_dir = os.environ.get("E2E_LOG_DIR") or gateway_config.get("log_dir")
 
     fail_count = _worker_start_failures.get(engine, 0)
@@ -369,7 +371,7 @@ def setup_backend(request: pytest.FixtureRequest):
                 model_path,
                 engine,
                 connection_mode,
-                leg_counts,
+                pool_counts,
                 gateway_config,
                 gateway,
                 log_dir,
@@ -519,24 +521,24 @@ def _setup_local(
 # ---------------------------------------------------------------------------
 
 
-def _per_worker_kv(raw, count: int, leg: str) -> list[str] | None:
-    """Normalise a per-worker KV backend list for one PD leg (None = lane default)."""
+def _per_worker_kv(raw, count: int, role: str) -> list[str] | None:
+    """Normalise a per-worker KV backend list for one PD role (None = lane default)."""
     if raw is None:
         return None
     backends = [str(b).lower() for b in raw]
     if len(backends) != count:
-        raise ValueError(f"{leg}_kv names {len(backends)} backends for {count} {leg} workers")
+        raise ValueError(f"{role}_kv names {len(backends)} backends for {count} {role} workers")
     return backends
 
 
-def _merge_engine_args(shared: list[str] | None, leg_only: list[str] | None) -> list[str] | None:
-    """Combine the class-wide engine flags with one PD leg's own flags."""
-    if not leg_only:
+def _merge_engine_args(shared: list[str] | None, pool_only: list[str] | None) -> list[str] | None:
+    """Combine the class-wide engine flags with one PD pool's own flags."""
+    if not pool_only:
         return shared
-    return [*(shared or []), *leg_only]
+    return [*(shared or []), *pool_only]
 
 
-def _start_pd_leg(
+def _start_pd_pool(
     *,
     model_id: str,
     engine: str,
@@ -551,7 +553,7 @@ def _start_pd_leg(
     extra_engine_args: list[str] | None = None,
     extra_env: dict[str, str] | None = None,
 ) -> list:
-    """Start one PD leg; a per-worker KV backend list starts the workers one by one."""
+    """Start one PD pool; a per-worker KV backend list starts the workers one by one."""
     if kv_backends is None and not wait_ready:
         return _start_workers_tracked(
             model_id=model_id,
@@ -664,15 +666,15 @@ def _setup_pd(
 
     parallel_start = bool(workers_config.get("parallel_start"))
     # The class marker's engine flags (a decode window, a context length)
-    # reach every leg, as they do for regular workers. The ``prefill_args`` /
-    # ``decode_args`` leg options add flags to one leg only (a
+    # reach every pool, as they do for regular workers. The ``prefill_args`` /
+    # ``decode_args`` pool options add flags to one pool only (a
     # ``--language-model-only`` decode pool, say).
     extra_engine_args = workers_config.get("extra_engine_args")
     prefill_engine_args = _merge_engine_args(extra_engine_args, workers_config.get("prefill_args"))
     decode_engine_args = _merge_engine_args(extra_engine_args, workers_config.get("decode_args"))
     all_workers: list = []
     try:
-        prefill_workers = _start_pd_leg(
+        prefill_workers = _start_pd_pool(
             model_id=model_id,
             engine=engine,
             mode=connection_mode,
@@ -690,7 +692,7 @@ def _setup_pd(
 
         # Decode workers start on GPUs after prefill workers
         decode_gpu_offset = num_prefill * (prefill_tp or spec.get("tp", 1))
-        decode_workers = _start_pd_leg(
+        decode_workers = _start_pd_pool(
             model_id=model_id,
             engine=engine,
             mode=connection_mode,
@@ -708,7 +710,7 @@ def _setup_pd(
         if parallel_start:
             # Each worker loads on its own GPUs, so spawning them all first
             # makes a topology cost one model load instead of one per worker.
-            # It also brings the legs up in no particular order, which is what
+            # It also brings the pools up in no particular order, which is what
             # a user launching a fleet does.
             # One deadline for the fleet, and a failed load still counts toward
             # the session's fail-fast budget as it does on the sequential path.

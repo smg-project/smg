@@ -88,6 +88,16 @@ Signed-off-by: Your Name <your.email@example.com>
 
 ---
 
+## Words for disaggregated serving
+
+The gateway's prefill-decode code uses one word per thing, so a reader never has to guess which of three meanings is meant:
+
+- the two halves of one disaggregated dispatch are its **sides** (the prefill side, the decode side; `PdSide`, `PrefillBound`, `DecodeBound`);
+- a worker's prefill-decode function is its **role** (`WorkerRole::{Single, Prefill, Decode}`), and the set of workers of one role is a **pool**;
+- a single worker, a stream or a call is called what it is (`worker`, `UpstreamStream`).
+
+"Leg" is not used for any of these: it meant all three at once, and it does not come back in code, comments, test names or log lines. Metric names and labels keep their published spelling.
+
 ## Pull requests
 
 - **Fill in the [PR template](./.github/PULL_REQUEST_TEMPLATE.md)** — especially

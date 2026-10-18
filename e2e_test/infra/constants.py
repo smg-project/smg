@@ -320,7 +320,7 @@ def get_gpu_offset() -> int:
 
     Workers take GPUs sequentially from 0; on a multi-GPU host, set
     ``E2E_GPU_OFFSET`` to run several lanes side by side, each on its own
-    GPUs. Every worker of the lane (regular and PD legs) shifts by it.
+    GPUs. Every worker of the lane (regular and PD pools) shifts by it.
     Unset/blank means 0.
     """
     value = os.environ.get(ENV_GPU_OFFSET, "").strip()

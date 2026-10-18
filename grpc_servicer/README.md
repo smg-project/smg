@@ -338,7 +338,7 @@ servicer; the `smg` pipeline takes image and video references and refuses an
 audio one before any work, naming the modes that take it.
 
 The in-flight cap, the saturation refusal, the advertised `mm_processor` /
-`mm_media_ref_schemes` / `mm_processor_source` and the PD prefill leg's
+`mm_media_ref_schemes` / `mm_processor_source` and the PD prefill side's
 `media_identity` behave as on the Python servicer whichever processor runs;
 the engine-side contract does not change.
 

@@ -257,8 +257,8 @@ class RustMediaBridge:
 
     @staticmethod
     def _identity(request_id: str, engine_input: Any) -> bytes | None:
-        """The PD prefill leg's media identity, serialized; an optimisation
-        with a fallback (the decode leg reprocesses), so a shape it cannot
+        """The PD prefill side's media identity, serialized; an optimisation
+        with a fallback (the decode side reprocesses), so a shape it cannot
         read must not fail a served request."""
         # Imported here: the identity module needs torch, and this module
         # must import on the launcher's engine-free path.
@@ -270,7 +270,7 @@ class RustMediaBridge:
         if not media_identity_supported():
             logger.warning(
                 "Request %s: the installed smg-grpc-proto has no media_identity; "
-                "the decode leg will reprocess the media",
+                "the decode side will reprocess the media",
                 request_id,
             )
             return None
@@ -278,7 +278,7 @@ class RustMediaBridge:
             identity = build_media_identity(engine_input)
         except Exception as e:  # noqa: BLE001 - any failure falls back
             logger.warning(
-                "Request %s: media identity not built (%s); the decode leg will reprocess "
+                "Request %s: media identity not built (%s); the decode side will reprocess "
                 "the media",
                 request_id,
                 e,

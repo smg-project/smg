@@ -375,7 +375,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         input_type = request.WhichOneof("input")
         # One batch per modality: `mm_inputs`, then `extra_mm_inputs` for a
         # request that mixes image and video. A pixel-less mm payload with
-        # grid tensors is the PD decode leg's form: enough to rebuild mm
+        # grid tensors is the PD decode side's form: enough to rebuild mm
         # features (positions + block hashing).
         preprocessed_batches = [
             batch for batch in mm_batches(request) if has_preprocessed_mm_payload(batch)
@@ -394,7 +394,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         )
 
         kv_transfer_params: dict | None = None
-        # What a PD prefill leg learned about its media, for the decode leg.
+        # What a PD prefill side learned about its media, for the decode side.
         media_identity = None
         engine_started = False
         try:
@@ -428,7 +428,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     )
                 finally:
                     self._mm_inflight.release()
-                # A PD prefill leg answers with the identity so decode is
+                # A PD prefill side answers with the identity so decode is
                 # served without pixels or references. The identity is an
                 # optimisation with a fallback (decode reprocesses), so a
                 # shape it cannot read must not fail a served request.
@@ -438,7 +438,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                             media_identity = build_media_identity(prompt)
                         except Exception as e:  # noqa: BLE001 - any failure falls back
                             logger.warning(
-                                "Request %s: media identity not built (%s); the decode leg "
+                                "Request %s: media identity not built (%s); the decode side "
                                 "will reprocess the media",
                                 request_id,
                                 e,
@@ -447,11 +447,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     else:
                         logger.warning(
                             "Request %s: the installed smg-grpc-proto has no media_identity; "
-                            "the decode leg will reprocess the media",
+                            "the decode side will reprocess the media",
                             request_id,
                         )
             elif has_preprocessed_mm and input_type == "tokenized":
-                # A pixel-less payload (PD decode leg) is only decodable with
+                # A pixel-less payload (PD decode side) is only decodable with
                 # remote KV: a local recompute would schedule the vision
                 # encoder with no pixels and crash the engine.
                 # Every batch needs its own, not just one of them: a batch left
@@ -481,9 +481,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 prompt: TokensPrompt = {"prompt_token_ids": list(request.tokenized.input_ids)}
                 if request.tokenized.original_text:
                     prompt["prompt"] = request.tokenized.original_text
-                # Tensor-less mm payload (grid-less PD decode leg): fold the
+                # Tensor-less mm payload (grid-less PD decode side): fold the
                 # kept mm hashes into cache_salt so different images cannot
-                # alias. Grid-carrying legs took the preprocessed path above.
+                # alias. Grid-carrying sides took the preprocessed path above.
                 batches = mm_batches(request)
                 if batches:
                     cache_salt = mm_identity_cache_salt(mm_identity_hashes(batches))
@@ -1016,7 +1016,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         """Build vLLM MultiModalInput from preprocessed proto data.
 
         Bypasses HF processor entirely — the tensors were already computed by
-        the Rust router. Pixel values are optional: the PD decode leg carries
+        the Rust router. Pixel values are optional: the PD decode side carries
         only the grid tensors (positions + block hashing need no pixels).
         Field layouts (batched / flat / shared) are also determined by the
         router via ``batched_keys`` and ``flat_keys`` proto fields.
@@ -1051,7 +1051,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
             num_items = len(mm_proto.mm_placeholders)
 
-            # Deserialize all tensors from proto. The PD decode leg carries no
+            # Deserialize all tensors from proto. The PD decode side carries no
             # pixel_values (KV arrives via the P/D transfer), only grid tensors.
             # The primary tensor is registered under the model's forward kwarg
             # (``encoder_input_key``; DeepSeek-V4.1 takes ``patches``), the same
@@ -1390,7 +1390,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                        If None, uses output.outputs[0] for backwards compatibility.
             num_logprobs: Number of top logprobs for output tokens
             num_prompt_logprobs: Number of top logprobs for prompt tokens
-            media_identity: A PD prefill leg's processed media, for the decode leg
+            media_identity: A PD prefill side's processed media, for the decode side
 
         Returns:
             GenerateResponse with complete field set
@@ -1426,7 +1426,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             num_prompt_logprobs,
         )
 
-        # Connector KV-transfer params returned by the engine (PD prefill leg)
+        # Connector KV-transfer params returned by the engine (PD prefill side)
         kv_transfer_params, kv_transfer_params_json = params_to_response_fields(
             output.kv_transfer_params
         )

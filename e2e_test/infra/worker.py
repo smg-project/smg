@@ -80,7 +80,7 @@ class Worker:
     dist_init_port: int | None = None
     log_dir: str | None = None
     extra_engine_args: list[str] | None = None
-    # Overrides the model spec's tp, so a PD pair can run asymmetric legs.
+    # Overrides the model spec's tp, so a PD pair can run asymmetric pools.
     tp: int | None = None
     # KV transfer backend for this PD worker ("nixl", "mooncake" or "moriio");
     # None takes the lane's default, so one fleet can mix transports.

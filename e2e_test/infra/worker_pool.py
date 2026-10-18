@@ -134,7 +134,7 @@ class WorkerPool:
 
             if tp is not None or kv_backend is not None or extra_env is not None:
                 raise ValueError(
-                    "a per-leg tp, kv_backend or extra_env is only meaningful for "
+                    "a tp, kv_backend or extra_env of their own is only meaningful for "
                     "PD prefill/decode workers"
                 )
 
