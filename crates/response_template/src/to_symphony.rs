@@ -79,7 +79,7 @@ use symphony::{
 use self::{
     lower::{
         anchor_literals, describe, literals, lower, lower_tag, pattern, split_close, split_open,
-        word, Branches, Captures, Item,
+        word, Branches, Captures, Item, Tag,
     },
     refusal::Refused,
 };
@@ -90,7 +90,7 @@ pub use self::{
 use crate::{
     content_parsers::{placeholder, Content, ContentParser},
     py,
-    pyre::Node,
+    pyre::{Node, Regex},
     response_templates::{Delimiter, ResponseTemplate, ResponseTemplateField, Template},
 };
 
@@ -549,47 +549,8 @@ impl Compiler<'_> {
                 ),
             );
         }
-        let named = if field.transform_each {
-            self.refuse(
-                &scope,
-                Refused::new(Construct::TransformEach, "tool calls given as a list"),
-            );
-            None
-        } else {
-            match call_transform(field.transform.as_ref()) {
-                Ok(named) => Some(named),
-                Err(refused) => {
-                    self.refuse(&scope, refused);
-                    None
-                }
-            }
-        };
-        let content = &field.content;
-        let arguments = match (&named, content.parser) {
-            (Some(Named::Group(_) | Named::Literal(_)), ContentParser::XmlInline) => {
-                self.params(&scope, content)
-            }
-            (Some(named), parser) => {
-                self.refuse(&scope, unlowered(parser, named));
-                None
-            }
-            (None, _) => None,
-        };
-        if content.parser == ContentParser::Json && content.json_dialect() {
-            self.refuse(
-                &scope,
-                Refused::new(
-                    Construct::JsonDialect,
-                    "JSON with unquoted keys or its own string delimiters",
-                ),
-            );
-        }
-        if content.parser == ContentParser::XmlInline && content.merges_duplicates() {
-            self.refuse(
-                &scope,
-                Refused::new(Construct::MergeDuplicates, "merge_duplicates"),
-            );
-        }
+        let named = self.call_name(&scope, field);
+        let arguments = self.call_arguments(&scope, &field.content, named.as_ref());
         let state = self.table.states.len();
         self.table.states.push(State {
             name: format!("{state}:{}", field.name),
@@ -636,6 +597,61 @@ impl Compiler<'_> {
         });
     }
 
+    /// Where a call's name comes from, read off the field's transform: a literal, a group of
+    /// the open, or the envelope; none when the transform is one no table reads.
+    fn call_name(&mut self, scope: &str, field: &ResponseTemplateField) -> Option<Named> {
+        if field.transform_each {
+            self.refuse(
+                scope,
+                Refused::new(Construct::TransformEach, "tool calls given as a list"),
+            );
+            return None;
+        }
+        match call_transform(field.transform.as_ref()) {
+            Ok(named) => Some(named),
+            Err(refused) => {
+                self.refuse(scope, refused);
+                None
+            }
+        }
+    }
+
+    /// The call's arguments: tagged parameters are lowered; every other form is refused by name,
+    /// with what else the field's content uses that no table reads.
+    fn call_arguments(
+        &mut self,
+        scope: &str,
+        content: &Content,
+        named: Option<&Named>,
+    ) -> Option<(Arguments, String, bool)> {
+        let arguments = match (named, content.parser) {
+            (Some(Named::Group(_) | Named::Literal(_)), ContentParser::XmlInline) => {
+                self.params(scope, content)
+            }
+            (Some(named), parser) => {
+                self.refuse(scope, unlowered(parser, named));
+                None
+            }
+            (None, _) => None,
+        };
+        if content.parser == ContentParser::Json && content.json_dialect() {
+            self.refuse(
+                scope,
+                Refused::new(
+                    Construct::JsonDialect,
+                    "JSON with unquoted keys or its own string delimiters",
+                ),
+            );
+        }
+        if content.parser == ContentParser::XmlInline && content.merges_duplicates() {
+            self.refuse(
+                scope,
+                Refused::new(Construct::MergeDuplicates, "merge_duplicates"),
+            );
+        }
+        arguments
+    }
+
     /// Tagged parameters (`xml-inline`): the tag pattern lowered into the tag, from its first
     /// literal through its value, and the ways the value ends, each split at its lookahead; the
     /// values read by the template's `value_parser`. With them, a short description for the
@@ -649,33 +665,7 @@ impl Compiler<'_> {
                 None
             }
         };
-        let Some(regex) = content.tag_regex() else {
-            self.refuse(
-                scope,
-                Refused::new(
-                    Construct::TagPattern,
-                    "no tag pattern that this crate's reader runs",
-                ),
-            );
-            return None;
-        };
-        let group = |name: &str| {
-            regex
-                .names
-                .iter()
-                .find(|(named, _)| named == name)
-                .map(|(_, number)| *number)
-        };
-        let (Some(key), Some(value)) = (group("key"), group("value")) else {
-            self.refuse(
-                scope,
-                Refused::new(
-                    Construct::TagPattern,
-                    "a tag pattern without a key group or a value group",
-                ),
-            );
-            return None;
-        };
+        let (regex, key, value) = self.tag_groups(scope, content)?;
         let captures = Captures(vec![(key, Slot::Key), (value, Slot::Value)]);
         let (tag, refused) = lower_tag(regex, &captures, value);
         let mut clean = refused.is_empty() && values.is_some();
@@ -705,28 +695,50 @@ impl Compiler<'_> {
             }
         }
         let (values, parser) = values.unwrap_or((ValueParser::Raw, String::new()));
-        let described_ends: Vec<String> = tag
-            .ends
-            .iter()
-            .map(|end| {
-                let mut way = describe(&end.consume);
-                if !end.ahead.is_empty() {
-                    let _ = write!(way, " (?={})", describe(&end.ahead));
-                }
-                format!("[{}]", way.trim_start())
-            })
-            .collect();
-        let described = format!(
-            "params [{}] ends [{}] values {parser}",
-            describe(&tag.tag),
-            described_ends.join(" ")
-        );
+        let described = describe_params(&tag, &parser);
         let arguments = Arguments::Params {
             tag: pattern(&tag.tag),
             ends: ends.into(),
             values,
         };
         Some((arguments, described, clean))
+    }
+
+    /// The tag pattern of `content` with its key and value groups, refused when the reader does
+    /// not run it or a group is missing.
+    fn tag_groups<'c>(
+        &mut self,
+        scope: &str,
+        content: &'c Content,
+    ) -> Option<(&'c Regex, usize, usize)> {
+        let Some(regex) = content.tag_regex() else {
+            self.refuse(
+                scope,
+                Refused::new(
+                    Construct::TagPattern,
+                    "no tag pattern that this crate's reader runs",
+                ),
+            );
+            return None;
+        };
+        let group = |name: &str| {
+            regex
+                .names
+                .iter()
+                .find(|(named, _)| named == name)
+                .map(|(_, number)| *number)
+        };
+        let (Some(key), Some(value)) = (group("key"), group("value")) else {
+            self.refuse(
+                scope,
+                Refused::new(
+                    Construct::TagPattern,
+                    "a tag pattern without a key group or a value group",
+                ),
+            );
+            return None;
+        };
+        Some((regex, key, value))
     }
 
     /// The markers of a call's open into `state`, with what follows them, the header, which every
@@ -740,40 +752,7 @@ impl Compiler<'_> {
     ) -> Option<Vec<Item>> {
         let scope = scope(field);
         let open = field.open.as_ref()?;
-        let captures = match (named, open.regex.as_ref()) {
-            (Some(Named::Group(group)), Some(regex)) => {
-                let numbers: Vec<usize> = regex
-                    .names
-                    .iter()
-                    .filter(|(name, _)| name == group)
-                    .map(|(_, number)| *number)
-                    .collect();
-                match numbers.as_slice() {
-                    [number] => Captures(vec![(*number, Slot::Name)]),
-                    _ => {
-                        self.refuse(
-                            &scope,
-                            Refused::new(
-                                Construct::HeaderName,
-                                format!("the name {group:?} is no group the open captures once"),
-                            ),
-                        );
-                        Captures::default()
-                    }
-                }
-            }
-            (Some(Named::Group(group)), None) => {
-                self.refuse(
-                    &scope,
-                    Refused::new(
-                        Construct::HeaderName,
-                        format!("the name {group:?} is no group of a literal open"),
-                    ),
-                );
-                Captures::default()
-            }
-            _ => Captures::default(),
-        };
+        let captures = self.name_capture(&scope, named, open);
         let branches = match branches(open, &captures) {
             Ok(branches) => branches,
             Err(refused) => {
@@ -821,12 +800,59 @@ impl Compiler<'_> {
             markers.push(open.marker);
         }
         self.alternative_order(&scope, &markers);
-        for marker in &markers {
+        self.shared_open_markers(&scope, &markers, state);
+        header
+    }
+
+    /// The capture of a call's name in its open: the one group of the open's pattern the
+    /// transform names; none (refused) when the open is a literal or captures the group
+    /// more or less than once.
+    fn name_capture(&mut self, scope: &str, named: Option<&Named>, open: &Delimiter) -> Captures {
+        match (named, open.regex.as_ref()) {
+            (Some(Named::Group(group)), Some(regex)) => {
+                let numbers: Vec<usize> = regex
+                    .names
+                    .iter()
+                    .filter(|(name, _)| name == group)
+                    .map(|(_, number)| *number)
+                    .collect();
+                match numbers.as_slice() {
+                    [number] => Captures(vec![(*number, Slot::Name)]),
+                    _ => {
+                        self.refuse(
+                            scope,
+                            Refused::new(
+                                Construct::HeaderName,
+                                format!("the name {group:?} is no group the open captures once"),
+                            ),
+                        );
+                        Captures::default()
+                    }
+                }
+            }
+            (Some(Named::Group(group)), None) => {
+                self.refuse(
+                    scope,
+                    Refused::new(
+                        Construct::HeaderName,
+                        format!("the name {group:?} is no group of a literal open"),
+                    ),
+                );
+                Captures::default()
+            }
+            _ => Captures::default(),
+        }
+    }
+
+    /// An open marker that already opens another call's state is refused: the table's row for
+    /// it out of the outside would be two.
+    fn shared_open_markers(&mut self, scope: &str, markers: &[String], state: usize) {
+        for marker in markers {
             let on = self.table.terminal(marker);
             if let Some(to) = self.table.row(0, on, state) {
                 let other = self.table.states[to].field.clone().unwrap_or_default();
                 self.refuse(
-                    &scope,
+                    scope,
                     Refused::new(
                         Construct::SharedOpenMarker,
                         format!("the open {marker:?} also opens {other:?}"),
@@ -834,7 +860,6 @@ impl Compiler<'_> {
                 );
             }
         }
-        header
     }
 
     /// The markers of a call's close out of `state` into the outside, and what comes before them,
@@ -1011,6 +1036,27 @@ fn unlowered(parser: ContentParser, named: &Named) -> Refused {
             "tool calls whose content is a text or a number: a call needs a name and arguments",
         ),
     }
+}
+
+/// The summary's description of tagged parameters: the tag, the ways a value ends, the
+/// values' parser.
+fn describe_params(tag: &Tag, parser: &str) -> String {
+    let described_ends: Vec<String> = tag
+        .ends
+        .iter()
+        .map(|end| {
+            let mut way = describe(&end.consume);
+            if !end.ahead.is_empty() {
+                let _ = write!(way, " (?={})", describe(&end.ahead));
+            }
+            format!("[{}]", way.trim_start())
+        })
+        .collect();
+    format!(
+        "params [{}] ends [{}] values {parser}",
+        describe(&tag.tag),
+        described_ends.join(" ")
+    )
 }
 
 /// The parser a tagged value's text reads with, as a call shape holds it, and a short
