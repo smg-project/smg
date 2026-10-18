@@ -793,16 +793,7 @@ async fn execute_single(
     workers: &WorkerSelection,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
-    let client = clients.single_mut().ok_or_else(|| {
-        error!(
-            function = "execute_single",
-            "Expected single client but got disaggregated"
-        );
-        error::internal_error(
-            "expected_single_client_got_disaggregated",
-            "Expected single client but got disaggregated",
-        )
-    })?;
+    let client = clients.single_or_mismatch("execute_single")?;
 
     if let Some(rank) = workers.single().and_then(|w| w.dp_rank()) {
         proto_request.set_data_parallel_rank(rank as i32);
@@ -918,16 +909,7 @@ async fn execute_single_embed(
     workers: &WorkerSelection,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
-    let client = clients.single_mut().ok_or_else(|| {
-        error!(
-            function = "execute_single_embed",
-            "Expected single client but got disaggregated"
-        );
-        error::internal_error(
-            "expected_single_client_got_disaggregated",
-            "Expected single client but got disaggregated",
-        )
-    })?;
+    let client = clients.single_or_mismatch("execute_single_embed")?;
 
     if let Some(worker) = workers.single() {
         Metrics::record_worker_request(worker.url(), worker.model_id());
@@ -968,16 +950,8 @@ async fn execute_parallel_pd(
         .disaggregated_runtime_type()
         .map(|r| r.as_str())
         .unwrap_or("");
-    let (prefill_client, decode_client) = clients.disaggregated_mut().ok_or_else(|| {
-        error!(
-            function = "execute_parallel_pd",
-            "Expected disaggregated clients but got single"
-        );
-        error::internal_error(
-            "expected_disaggregated_clients_got_single",
-            "Expected disaggregated clients but got single",
-        )
-    })?;
+    let (prefill_client, decode_client) =
+        clients.disaggregated_or_mismatch("execute_parallel_pd")?;
 
     // Decode consumes the KV handoff from prefill, but TokenSpeed still
     // needs multimodal metadata to pad placeholders and compute MRoPE in
@@ -2068,16 +2042,8 @@ async fn execute_sequential_pd(
         .disaggregated_runtime_type()
         .map(|r| r.as_str())
         .unwrap_or("");
-    let (prefill_client, decode_client) = clients.disaggregated_mut().ok_or_else(|| {
-        error!(
-            function = "execute_sequential_pd",
-            "Expected disaggregated clients but got single"
-        );
-        error::internal_error(
-            "expected_disaggregated_clients_got_single",
-            "Expected disaggregated clients but got single",
-        )
-    })?;
+    let (prefill_client, decode_client) =
+        clients.disaggregated_or_mismatch("execute_sequential_pd")?;
 
     let mode = match workers.decode_worker() {
         // A MoRI-IO decode engine never recomputes the prompt, whatever the

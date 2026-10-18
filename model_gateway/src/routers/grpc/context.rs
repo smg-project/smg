@@ -1483,6 +1483,40 @@ impl ClientSelection {
         }
     }
 
+    /// The single engine's client for an executor of single dispatches, or
+    /// the client-shape mismatch answer, logged under `function`. Client
+    /// acquisition shapes the selection after the worker selection the plan
+    /// kind comes from, so no executor meets the mismatch; the answer says
+    /// so if one ever does.
+    pub fn single_or_mismatch(
+        &mut self,
+        function: &'static str,
+    ) -> Result<&mut BackendClient, axum::response::Response> {
+        self.single_mut().ok_or_else(|| {
+            error!(function, "Expected single client but got disaggregated");
+            internal_error(
+                "expected_single_client_got_disaggregated",
+                "Expected single client but got disaggregated",
+            )
+        })
+    }
+
+    /// The prefill and decode clients for an executor of disaggregated
+    /// dispatches, or the client-shape mismatch answer, logged under
+    /// `function` (see [`Self::single_or_mismatch`]).
+    pub fn disaggregated_or_mismatch(
+        &mut self,
+        function: &'static str,
+    ) -> Result<(&mut BackendClient, &mut BackendClient), axum::response::Response> {
+        self.disaggregated_mut().ok_or_else(|| {
+            error!(function, "Expected disaggregated clients but got single");
+            internal_error(
+                "expected_disaggregated_clients_got_single",
+                "Expected disaggregated clients but got single",
+            )
+        })
+    }
+
     pub fn prefill_client(&self) -> Option<&BackendClient> {
         match self {
             Self::Disaggregated { prefill, .. } => Some(prefill),
@@ -1606,7 +1640,10 @@ pub(crate) enum FinalResponse {
 
 #[cfg(test)]
 mod tests {
+    use smg_grpc_client::VllmEngineClient;
+
     use super::*;
+    use crate::routers::grpc::{client::GrpcClient, test_engine::mock_engine};
 
     /// The status of a failure a stage reports and the code of its JSON
     /// error object.
@@ -2004,5 +2041,43 @@ mod tests {
             3,
         ));
         assert_eq!(spy.0.lock().unwrap().len(), before + 3);
+    }
+
+    /// The client-shape mismatch answers an executor takes from the
+    /// selection: one status and code per shape, whichever executor asks;
+    /// a selection of the asked shape hands its clients out.
+    #[tokio::test]
+    async fn a_selection_of_the_other_shape_answers_the_mismatch() {
+        let (url, server) = mock_engine("test-model").await;
+        let client = VllmEngineClient::connect(&url)
+            .await
+            .expect("connect mock engine");
+        let client = BackendClient::Grpc(GrpcClient::Vllm(client));
+        let mut single = ClientSelection::Single {
+            client: client.clone(),
+        };
+        assert!(single.single_or_mismatch("an_executor").is_ok());
+        assert_eq!(
+            failure_shape(failure_of(single.disaggregated_or_mismatch("an_executor"))).await,
+            (
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                "expected_disaggregated_clients_got_single".to_owned()
+            )
+        );
+        let mut disaggregated = ClientSelection::Disaggregated {
+            prefill: client.clone(),
+            decode: client,
+        };
+        assert!(disaggregated
+            .disaggregated_or_mismatch("an_executor")
+            .is_ok());
+        assert_eq!(
+            failure_shape(failure_of(disaggregated.single_or_mismatch("an_executor"))).await,
+            (
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                "expected_single_client_got_disaggregated".to_owned()
+            )
+        );
+        server.abort();
     }
 }
