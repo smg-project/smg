@@ -373,32 +373,11 @@ impl Reader {
                 '[' => self.set(),
                 '^' => Ok(Node::Look(Look::Start)),
                 '$' => Ok(Node::Look(Look::Dollar)),
-                '?' | '*' | '+' | '{' => {
-                    match self.quantifier(c) {
-                        Ok(Some((min, max))) => match self.apply_quantifier(&mut items, min, max) {
-                            Ok(()) => {
-                                items.push(None);
-                                continue;
-                            }
-                            Err(e) => Err(e),
-                        },
-                        Ok(None) => match self.fuzzy(c) {
-                            // A setting that allows no error is dropped.
-                            Ok(Some(false)) => continue,
-                            Ok(Some(true)) => match items.pop() {
-                                Some(Some(node)) => {
-                                    items.push(Some(Node::Other(Other::Fuzzy, vec![node])));
-                                    items.push(None);
-                                    continue;
-                                }
-                                _ => syntax("nothing for fuzzy constraint"),
-                            },
-                            Ok(None) => Ok(Node::One(Set::Char(c))),
-                            Err(e) => Err(e),
-                        },
-                        Err(e) => Err(e),
-                    }
-                }
+                '?' | '*' | '+' | '{' => match self.quantified(c, &mut items) {
+                    Ok(Some(node)) => Ok(node),
+                    Ok(None) => continue,
+                    Err(e) => Err(e),
+                },
                 c => Ok(Node::One(Set::Char(c))),
             };
             match item {
@@ -412,6 +391,32 @@ impl Reader {
         } else {
             Node::Cat(items)
         }))
+    }
+
+    /// A `?`, `*`, `+` or `{` in a sequence: a quantifier of the item before
+    /// it (applied, and a `None` item pushed after it), a fuzzy constraint
+    /// (dropped when it allows no error, else wrapped around the item
+    /// before it), or, for a `{` that starts neither, the character itself.
+    /// `None` when the sequence gets no new item.
+    fn quantified(&mut self, c: char, items: &mut Vec<Option<Node>>) -> Read<Option<Node>> {
+        if let Some((min, max)) = self.quantifier(c)? {
+            self.apply_quantifier(items, min, max)?;
+            items.push(None);
+            return Ok(None);
+        }
+        match self.fuzzy(c)? {
+            // A setting that allows no error is dropped.
+            Some(false) => Ok(None),
+            Some(true) => match items.pop() {
+                Some(Some(node)) => {
+                    items.push(Some(Node::Other(Other::Fuzzy, vec![node])));
+                    items.push(None);
+                    Ok(None)
+                }
+                _ => syntax("nothing for fuzzy constraint"),
+            },
+            None => Ok(Some(Node::One(Set::Char(c)))),
+        }
     }
 
     /// `apply_quantifier`, once the counts are read.
