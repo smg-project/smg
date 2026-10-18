@@ -2431,14 +2431,14 @@ const VIDEO_DECODED_BYTES_KNOB: &str = "SMG_VIDEO_MAX_DECODED_BYTES";
 /// What `ensure_decode_work_limit` names in the error of a decode refused for its work.
 const VIDEO_MAX_DECODE_PIXELS_KNOB: &str = "SMG_VIDEO_MAX_DECODE_PIXELS";
 
-/// `true` for the error of a decode refused for its size or its work, or
-/// ended for its time: a budget no other runner over the same stream, and no
-/// resampling of it, can answer, so it ends the decode instead of starting
-/// the next runner.
+/// `true` for the error of a decode refused for its size (the typed
+/// refusal) or its work (named in the decoder's message), or ended for its
+/// time: a budget no other runner over the same stream, and no resampling of
+/// it, can answer, so it ends the decode instead of starting the next runner.
 fn is_video_budget_error(error: &MediaConnectorError) -> bool {
     is_video_command_timeout(error)
         || matches!(error, MediaConnectorError::DecodedTooLarge { .. })
-        || matches!(error, MediaConnectorError::VideoDecode(message) if message.contains(VIDEO_DECODED_BYTES_KNOB) || message.contains(VIDEO_MAX_DECODE_PIXELS_KNOB))
+        || matches!(error, MediaConnectorError::VideoDecode(message) if message.contains(VIDEO_MAX_DECODE_PIXELS_KNOB))
 }
 
 /// Runs a decoder command to completion under the video process timeout. A
