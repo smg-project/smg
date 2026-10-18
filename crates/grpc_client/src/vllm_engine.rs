@@ -49,6 +49,36 @@ impl AbortOnDropClient for VllmEngineClient {
 impl VllmEngineClient {
     crate::impl_engine_client_basics!(proto::vllm_engine_client::VllmEngineClient<Channel>, "vLLM");
 
+    /// The request every builder of this client sends: the tokenized input, the
+    /// sampling, the stream flag and the multimodal inputs. The fields no
+    /// builder sets are named here, once.
+    fn tokenized_request(
+        request_id: String,
+        original_text: String,
+        token_ids: Vec<u32>,
+        sampling_params: proto::SamplingParams,
+        stream: bool,
+        mm_inputs: Option<proto::MultimodalInputs>,
+    ) -> proto::GenerateRequest {
+        proto::GenerateRequest {
+            request_id,
+            input: Some(proto::generate_request::Input::Tokenized(
+                proto::TokenizedInput {
+                    original_text,
+                    input_ids: token_ids,
+                },
+            )),
+            sampling_params: Some(sampling_params),
+            stream,
+            kv_transfer_params: None,
+            kv_transfer_params_json: None,
+            data_parallel_rank: None,
+            mm_inputs,
+            media_refs: None,
+            extra_mm_inputs: Vec::new(),
+        }
+    }
+
     /// Submit a generation request (returns auto-aborting streaming response)
     ///
     /// The returned stream automatically sends an abort request when dropped,
@@ -128,27 +158,14 @@ impl VllmEngineClient {
         let sampling_params =
             Self::build_grpc_sampling_params_from_chat(body, tool_call_constraint)?;
 
-        let mm_inputs = multimodal_inputs;
-
-        let grpc_request = proto::GenerateRequest {
+        Ok(Self::tokenized_request(
             request_id,
-            input: Some(proto::generate_request::Input::Tokenized(
-                proto::TokenizedInput {
-                    original_text: processed_text,
-                    input_ids: token_ids,
-                },
-            )),
-            sampling_params: Some(sampling_params),
-            stream: body.stream,
-            kv_transfer_params: None,
-            kv_transfer_params_json: None,
-            data_parallel_rank: None,
-            mm_inputs,
-            media_refs: None,
-            extra_mm_inputs: Vec::new(),
-        };
-
-        Ok(grpc_request)
+            processed_text,
+            token_ids,
+            sampling_params,
+            body.stream,
+            multimodal_inputs,
+        ))
     }
 
     /// Build a basic GenerateRequest from the vLLM spec GenerateRequest
@@ -161,25 +178,14 @@ impl VllmEngineClient {
         let sampling_params =
             Self::build_sampling_params_from_plain(body.sampling_params.as_ref())?;
 
-        let grpc_request = proto::GenerateRequest {
+        Ok(Self::tokenized_request(
             request_id,
-            input: Some(proto::generate_request::Input::Tokenized(
-                proto::TokenizedInput {
-                    original_text: original_text.unwrap_or_default(),
-                    input_ids: token_ids,
-                },
-            )),
-            sampling_params: Some(sampling_params),
-            stream: body.stream,
-            kv_transfer_params: None,
-            kv_transfer_params_json: None,
-            data_parallel_rank: None,
-            mm_inputs: None,
-            media_refs: None,
-            extra_mm_inputs: Vec::new(),
-        };
-
-        Ok(grpc_request)
+            original_text.unwrap_or_default(),
+            token_ids,
+            sampling_params,
+            body.stream,
+            None,
+        ))
     }
 
     /// Build a GenerateRequest from ResponsesRequest (OpenAI Responses API)
@@ -196,25 +202,14 @@ impl VllmEngineClient {
         // Build sampling params from ResponsesRequest
         let sampling_params = Self::build_grpc_sampling_params_from_responses(body, constraint)?;
 
-        let grpc_request = proto::GenerateRequest {
+        Ok(Self::tokenized_request(
             request_id,
-            input: Some(proto::generate_request::Input::Tokenized(
-                proto::TokenizedInput {
-                    original_text: processed_text,
-                    input_ids: token_ids,
-                },
-            )),
-            sampling_params: Some(sampling_params),
-            stream: body.stream.unwrap_or(false),
-            kv_transfer_params: None,
-            kv_transfer_params_json: None,
-            data_parallel_rank: None,
-            mm_inputs: None,
-            media_refs: None,
-            extra_mm_inputs: Vec::new(),
-        };
-
-        Ok(grpc_request)
+            processed_text,
+            token_ids,
+            sampling_params,
+            body.stream.unwrap_or(false),
+            None,
+        ))
     }
 
     /// Build gRPC SamplingParams from ChatCompletionRequest
@@ -386,25 +381,14 @@ impl VllmEngineClient {
         let sampling_params =
             Self::build_grpc_sampling_params_from_messages(body, tool_call_constraint)?;
 
-        let grpc_request = proto::GenerateRequest {
+        Ok(Self::tokenized_request(
             request_id,
-            input: Some(proto::generate_request::Input::Tokenized(
-                proto::TokenizedInput {
-                    original_text: processed_text,
-                    input_ids: token_ids,
-                },
-            )),
-            sampling_params: Some(sampling_params),
-            stream: body.stream.unwrap_or(false),
-            kv_transfer_params: None,
-            kv_transfer_params_json: None,
-            data_parallel_rank: None,
-            mm_inputs: multimodal_inputs,
-            media_refs: None,
-            extra_mm_inputs: Vec::new(),
-        };
-
-        Ok(grpc_request)
+            processed_text,
+            token_ids,
+            sampling_params,
+            body.stream.unwrap_or(false),
+            multimodal_inputs,
+        ))
     }
 
     /// Build gRPC SamplingParams from CreateMessageRequest
@@ -447,25 +431,14 @@ impl VllmEngineClient {
     ) -> Result<proto::GenerateRequest, String> {
         let sampling_params = Self::build_grpc_sampling_params_from_completion(body)?;
 
-        let grpc_request = proto::GenerateRequest {
+        Ok(Self::tokenized_request(
             request_id,
-            input: Some(proto::generate_request::Input::Tokenized(
-                proto::TokenizedInput {
-                    original_text,
-                    input_ids: token_ids,
-                },
-            )),
-            sampling_params: Some(sampling_params),
-            stream: body.stream,
-            kv_transfer_params: None,
-            kv_transfer_params_json: None,
-            data_parallel_rank: None,
-            mm_inputs: None,
-            media_refs: None,
-            extra_mm_inputs: Vec::new(),
-        };
-
-        Ok(grpc_request)
+            original_text,
+            token_ids,
+            sampling_params,
+            body.stream,
+            None,
+        ))
     }
 
     /// Build an EmbedRequest for embedding/classify endpoints

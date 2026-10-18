@@ -57,6 +57,37 @@ impl TrtllmServiceClient {
         "TensorRT-LLM"
     );
 
+    /// A request with every field unset, the base each builder fills with
+    /// `..Self::unset()`: the one place that names every field of the proto,
+    /// so a new field is placed here once and the builders keep writing only
+    /// what they set.
+    fn unset() -> proto::GenerateRequest {
+        proto::GenerateRequest {
+            request_id: String::new(),
+            tokenized: None,
+            sampling_config: None,
+            output_config: None,
+            max_tokens: 0,
+            streaming: false,
+            stop: vec![],
+            stop_token_ids: vec![],
+            ignore_eos: false,
+            bad: vec![],
+            bad_token_ids: vec![],
+            guided_decoding: None,
+            embedding_bias: vec![],
+            lora_config: None,
+            prompt_tuning_config: None,
+            multimodal_input: None,
+            kv_cache_retention: None,
+            disaggregated_params: None,
+            lookahead_config: None,
+            cache_salt_id: None,
+            arrival_time: None,
+            include_stop_token_in_output: false,
+        }
+    }
+
     /// Submit a generation request (returns auto-aborting streaming response)
     ///
     /// The returned stream automatically sends an abort request when dropped,
@@ -150,19 +181,10 @@ impl TrtllmServiceClient {
             stop,
             stop_token_ids: vec![],
             ignore_eos: body.ignore_eos,
-            bad: vec![],
-            bad_token_ids: vec![],
             guided_decoding,
-            embedding_bias: vec![],
-            lora_config: None,
-            prompt_tuning_config: None,
             multimodal_input,
-            kv_cache_retention: None,
-            disaggregated_params: None,
-            lookahead_config: None,
-            cache_salt_id: None,
-            arrival_time: None,
             include_stop_token_in_output: false,
+            ..Self::unset()
         };
 
         Ok(grpc_request)
@@ -227,19 +249,10 @@ impl TrtllmServiceClient {
             stop: plain.stop,
             stop_token_ids: plain.stop_token_ids,
             ignore_eos: plain.ignore_eos,
-            bad: vec![],
-            bad_token_ids: vec![],
             guided_decoding,
-            embedding_bias: vec![],
-            lora_config: None,
-            prompt_tuning_config: None,
             multimodal_input: None,
-            kv_cache_retention: None,
-            disaggregated_params: None,
-            lookahead_config: None,
-            cache_salt_id: None,
-            arrival_time: None,
             include_stop_token_in_output: false,
+            ..Self::unset()
         };
 
         Ok(grpc_request)
@@ -287,19 +300,10 @@ impl TrtllmServiceClient {
             stop: vec![], // Does not pass through body.stop yet (follow-up fix)
             stop_token_ids: vec![],
             ignore_eos: false,
-            bad: vec![],
-            bad_token_ids: vec![],
             guided_decoding,
-            embedding_bias: vec![],
-            lora_config: None,
-            prompt_tuning_config: None,
             multimodal_input: None,
-            kv_cache_retention: None,
-            disaggregated_params: None,
-            lookahead_config: None,
-            cache_salt_id: None,
-            arrival_time: None,
             include_stop_token_in_output: false,
+            ..Self::unset()
         };
 
         Ok(grpc_request)
@@ -497,19 +501,10 @@ impl TrtllmServiceClient {
             stop,
             stop_token_ids: vec![],
             ignore_eos: false,
-            bad: vec![],
-            bad_token_ids: vec![],
             guided_decoding,
-            embedding_bias: vec![],
-            lora_config: None,
-            prompt_tuning_config: None,
             multimodal_input,
-            kv_cache_retention: None,
-            disaggregated_params: None,
-            lookahead_config: None,
-            cache_salt_id: None,
-            arrival_time: None,
             include_stop_token_in_output: false,
+            ..Self::unset()
         };
 
         Ok(grpc_request)
@@ -584,19 +579,10 @@ impl TrtllmServiceClient {
             stop,
             stop_token_ids: body.stop_token_ids.clone().unwrap_or_default(),
             ignore_eos: body.ignore_eos,
-            bad: vec![],
-            bad_token_ids: vec![],
             guided_decoding,
-            embedding_bias: vec![],
-            lora_config: None,
-            prompt_tuning_config: None,
             multimodal_input: None,
-            kv_cache_retention: None,
-            disaggregated_params: None,
-            lookahead_config: None,
-            cache_salt_id: None,
-            arrival_time: None,
             include_stop_token_in_output: body.no_stop_trim,
+            ..Self::unset()
         };
 
         Ok(grpc_request)
