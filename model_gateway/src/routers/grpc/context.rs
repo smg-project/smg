@@ -1591,7 +1591,7 @@ impl ExecutionResult {
     /// The answer stream(s) under the no-progress budget of a
     /// grammar-constrained generation (see
     /// [`ProtoStream::with_no_progress_budget`]): the one worker's stream, a
-    /// disaggregated pair's decode leg (the prefill leg answers once, with
+    /// disaggregated pair's decode side (the prefill side answers once, with
     /// no tokens to pace), each result of a batch. An embedding has no stream.
     #[must_use]
     pub(crate) fn with_no_progress_budget(

@@ -3130,6 +3130,10 @@ pub(crate) fn is_no_progress_cut(status: &tonic::Status) -> bool {
 pub struct BudgetedStream {
     /// `None` once the budget fired: the stream was dropped there.
     inner: Option<ProtoStream>,
+    /// The stream's worker, kept past the cut: the cut is a failure the
+    /// collection's error path charges to the worker, as any other of the
+    /// stream's.
+    worker: Option<Arc<dyn Worker>>,
     budget: Duration,
     constraint: &'static str,
     request_id: String,
@@ -3962,7 +3966,7 @@ impl ProtoStream {
             Self::Tracked(tracked) => Some(&tracked.worker),
             Self::DecodeSide(side) => side.inner.worker(),
             Self::Ahead(ahead) => ahead.inner.worker(),
-            Self::Budgeted(budgeted) => budgeted.inner.as_ref().and_then(ProtoStream::worker),
+            Self::Budgeted(budgeted) => budgeted.worker.as_ref(),
             _ => None,
         }
     }
@@ -3978,8 +3982,10 @@ impl ProtoStream {
         constraint: &'static str,
         request_id: String,
     ) -> Self {
+        let worker = self.worker().cloned();
         Self::Budgeted(Box::new(BudgetedStream {
             inner: Some(self),
+            worker,
             budget,
             constraint,
             request_id,
@@ -4203,6 +4209,7 @@ impl ProtoStream {
             Self::Budgeted(budgeted) => {
                 let BudgetedStream {
                     inner,
+                    worker,
                     budget,
                     constraint,
                     request_id,
@@ -4210,6 +4217,7 @@ impl ProtoStream {
                 } = *budgeted;
                 Self::Budgeted(Box::new(BudgetedStream {
                     inner: inner.map(ProtoStream::defer_abort_until_first_item),
+                    worker,
                     budget,
                     constraint,
                     request_id,
@@ -5198,7 +5206,10 @@ mod tests {
 
 #[cfg(test)]
 mod no_progress_tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     use metrics_exporter_prometheus::PrometheusBuilder;
     use smg_grpc_client::{
@@ -5211,7 +5222,10 @@ mod no_progress_tests {
         constraint_kind, is_no_progress_cut, ProtoGenerateRequest, ProtoStream,
         NO_PROGRESS_ERROR_CODE,
     };
-    use crate::routers::grpc::regular::streaming::eof_tests::{chunk, complete, gated_stream};
+    use crate::{
+        routers::grpc::regular::streaming::eof_tests::{chunk, complete, gated_stream},
+        worker::{BasicWorkerBuilder, Worker},
+    };
 
     /// A stream whose `first` frames come at once and whose `rest` wait for
     /// the returned gate, under a no-progress budget of `millis`.
@@ -5269,6 +5283,37 @@ mod no_progress_tests {
         assert!(
             rendered.contains("smg_constrained_no_progress_total{constraint=\"json_schema\"} 1"),
             "{rendered}"
+        );
+    }
+
+    /// The cut keeps the stream's worker: the collection's error path charges
+    /// the cut to it, as it does any other failure of the stream.
+    #[tokio::test]
+    async fn a_cut_stream_still_names_its_worker() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w1:8000").build());
+        let (_gate, gate_rx) = oneshot::channel::<()>();
+        let (stream, _server) =
+            gated_stream(vec![chunk(0, "a")], gate_rx, vec![complete(0, "stop")], "0").await;
+        let mut stream = stream
+            .tracked(Arc::clone(&worker), 0, true)
+            .with_no_progress_budget(
+                Duration::from_millis(150),
+                constraint_kind::JSON_SCHEMA,
+                "req-budget".to_string(),
+            );
+        assert_eq!(stream.worker().map(|w| w.url()), Some("http://w1:8000"));
+        assert!(
+            matches!(stream.next().await, Some(Ok(_))),
+            "the first response is read at once"
+        );
+        assert!(
+            matches!(stream.next().await, Some(Err(status)) if is_no_progress_cut(&status)),
+            "the gap after it is the cut"
+        );
+        assert_eq!(
+            stream.worker().map(|w| w.url()),
+            Some("http://w1:8000"),
+            "the cut stream still names its worker"
         );
     }
 
