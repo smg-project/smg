@@ -77,6 +77,7 @@ from smg_grpc_servicer.vllm.model_info import (
     engine_reasoning_parser,
     eos_token_ids_with_generation_config,
     mm_device_do_normalize,
+    mm_encoder_budget,
     mm_item_limits,
     model_facts,
     server_facts,
@@ -100,7 +101,9 @@ HOOK_SYMBOL = "resolve_servicer_impl"
 LAUNCHER_PATHS = tuple(os.path.join(*name.split(".")[1:]) + ".py" for name in LAUNCHER_MODULES)
 
 
-def model_info_from_config(vllm_config: Any, *, log_stats: bool | None = None) -> dict[str, Any]:
+def model_info_from_config(
+    vllm_config: Any, *, log_stats: bool | None = None, encoder_budget: int | None = None
+) -> dict[str, Any]:
     """`VllmGrpcServer` keyword arguments from vLLM's own config: the facts
     both servicers advertise (`model_facts`, `server_facts`), plus the inputs
     only the Rust servicer needs up front because no Python runs on its
@@ -108,7 +111,10 @@ def model_info_from_config(vllm_config: Any, *, log_stats: bool | None = None) -
     their scheduler statistics on (``--disable-log-stats`` not given): such
     an engine's wire reports every scheduler step, which the servicer's
     pushed load records say from the first record; ``None`` leaves the
-    servicer to classify the wire by what it shows."""
+    servicer to classify the wire by what it shows. ``encoder_budget`` is the
+    engine's encoder budget when the caller derived it already
+    (:func:`~smg_grpc_servicer.vllm.model_info.mm_encoder_budget`); ``None``
+    derives it here."""
     view = EngineConfigView(vllm_config)
     model_config = vllm_config.model_config
     facts = {**model_facts(model_config), **server_facts(vllm_config)}
@@ -141,6 +147,9 @@ def model_info_from_config(vllm_config: Any, *, log_stats: bool | None = None) -
         "pooler_dimensions": view.pooler.dimensions,
         "mm_device_do_normalize": mm_device_do_normalize(vllm_config),
         "mm_item_limits": mm_item_limits(vllm_config),
+        "mm_encoder_budget": (
+            mm_encoder_budget(vllm_config) if encoder_budget is None else encoder_budget
+        ),
         "engine_reasoning_parser": engine_reasoning_parser(vllm_config),
         "constrained_decoding_start": constrained_decoding_start(vllm_config),
         "log_stats": log_stats,
@@ -182,7 +191,9 @@ def _zmq_publisher_config(endpoint: str) -> Any:
         return {"enable_kv_cache_events": True, "publisher": "zmq", "endpoint": endpoint}
 
 
-def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[str, Any] | None:
+def smg_media_options(
+    vllm_config, settings, tokenizer_dir: str | None, encoder_budget: int | None = None
+) -> dict[str, Any] | None:
     """What the binding builds smg's own media pipeline from (``--mm-processor
     smg``): the model's config directory and id, the pixel format the engine
     takes, its dtype, and the ``--mm-*`` caps. ``None`` when the served model
@@ -209,7 +220,10 @@ def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[
     than the engine's server would, as the cap intends); a sampling rule of
     the loader the pipeline cannot follow goes along by name
     (``video_loader_rule``), and the pipeline refuses it for those families
-    only.
+    only. The engine's encoder budget goes along as well (``encoder_budget``
+    when the caller derived it, else derived here): the pipeline refuses an
+    item above it before the engine, which would admit the item and never
+    schedule it.
     """
     model_config = vllm_config.model_config
     if not getattr(model_config, "is_multimodal_model", False):
@@ -238,6 +252,10 @@ def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[
         "max_inflight": settings.max_inflight,
         "max_items": settings.max_items,
         "engine_item_limits": engine_item_limits(model_config),
+        "engine_encoder_budget": (
+            mm_encoder_budget(vllm_config) if encoder_budget is None else encoder_budget
+        )
+        or None,
         "max_item_bytes": settings.max_item_bytes,
         "video_frame_budget": video_frame_budget(model_config),
         "video_loader_rule": video_loader_rule(model_config),
@@ -496,6 +514,7 @@ class VllmLauncher(RustLauncher):
     def __init__(self) -> None:
         self.vllm_config: Any = None
         self.media: Any = None
+        self.encoder_budget: int = 0
 
     def prepare(self, args: argparse.Namespace) -> None:
         configure_logging()
@@ -514,9 +533,20 @@ class VllmLauncher(RustLauncher):
         # The engine cores are started with `log_stats=not disable_log_stats`
         # (`launch_engine_cores`); the servicer is told the same.
         disable_log_stats = getattr(engine_args, "disable_log_stats", None)
+        # The engine's encoder budget, derived once here (vLLM's helper builds
+        # the largest item the model's processor can produce): the servicer
+        # advertises it and the worker-side pipeline holds each item to it.
+        self.encoder_budget = mm_encoder_budget(self.vllm_config)
+        logger.info(
+            "Engine encoder budget: %s",
+            f"{self.encoder_budget} feature tokens per media item"
+            if self.encoder_budget
+            else "none (item sizes are left to the engine)",
+        )
         return model_info_from_config(
             self.vllm_config,
             log_stats=None if disable_log_stats is None else not disable_log_stats,
+            encoder_budget=self.encoder_budget,
         )
 
     def tokenizer_dir(self, args: argparse.Namespace) -> str | None:
@@ -534,7 +564,9 @@ class VllmLauncher(RustLauncher):
         settings = MmSettings.from_args(args).resolve()
         smg_media = None
         if settings.processor == MODE_SMG:
-            smg_media = smg_media_options(self.vllm_config, settings, tokenizer_dir)
+            smg_media = smg_media_options(
+                self.vllm_config, settings, tokenizer_dir, encoder_budget=self.encoder_budget
+            )
         else:
             self.media = RustMediaBridge.build(
                 self.vllm_config, settings, asyncio.get_running_loop()

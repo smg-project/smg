@@ -203,6 +203,10 @@ impl MessagePreparationStage {
                     model_id,
                     self.wire_pools,
                 );
+                // The engine's per-item bound, the smallest its workers
+                // advertise: an item above it would never be scheduled.
+                let encoder_budget =
+                    multimodal::engine_encoder_budget(&ctx.components.worker_registry, model_id);
                 match multimodal::process_multimodal_plan(
                     media_plan,
                     model_id,
@@ -213,6 +217,7 @@ impl MessagePreparationStage {
                     &tokenizer_source,
                     image_wire_dtype,
                     transparency,
+                    encoder_budget,
                 )
                 .await
                 {

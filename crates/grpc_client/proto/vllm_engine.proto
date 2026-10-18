@@ -486,6 +486,16 @@ message GetServerInfoResponse {
   // parser's gate (the call is forced right there, as the engine's own server
   // does), the thought and then the calls from the first token.
   string constrained_decoding_start = 24;
+
+  // The engine's encoder budget in feature tokens: the most one media item
+  // may carry and still be scheduled (vLLM: the lesser of its encoder compute
+  // budget and its encoder cache size, the "budget of N tokens" of its
+  // encoder-cache start-up line; its own front end refuses an item above it).
+  // 0 when unknown, or not a multimodal model. Flattened into the
+  // `mm_encoder_budget` worker label, which the router's own media pipeline
+  // holds each item to; the worker-side pipeline takes the same number from
+  // its launcher.
+  int32 mm_encoder_budget = 25;
 }
 
 // =====================

@@ -2852,6 +2852,34 @@ async fn server_info_advertises_the_engines_item_limits() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// The engine's encoder budget is a fact of its config, advertised whatever
+/// processes media so the Router's own pipeline refuses an item the engine
+/// could never place; an engine without one (a text model) advertises none.
+#[tokio::test]
+async fn server_info_advertises_the_engines_encoder_budget() {
+    let mut model = model_info();
+    model.mm_encoder_budget = 192_000;
+    let mut h = harness_with(model, None, None).await;
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.mm_encoder_budget, 192_000);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    let mut h = harness_with(model_info(), None, None).await;
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.mm_encoder_budget, 0);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// Where the engine starts a request's grammar on a thinking prompt is a fact
 /// of its config the launcher read: advertised with the reasoning parser's
 /// name so the Router shapes a forced tool call's grammar as the engine's own

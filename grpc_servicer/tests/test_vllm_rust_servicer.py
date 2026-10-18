@@ -448,11 +448,26 @@ def test_smg_media_options_follow_the_engine_config(tmp_path, monkeypatch):
         "max_inflight": 3,
         "max_items": 2,
         "engine_item_limits": None,
+        "engine_encoder_budget": None,
         "max_item_bytes": 10,
         "video_frame_budget": None,
         "video_loader_rule": None,
         "source": "flag",
     }
+    # The engine's encoder budget rides along as the launcher derived it (0,
+    # an engine that could not tell, leaves the pipeline without one).
+    assert (
+        rust.smg_media_options(config, settings, str(tmp_path), encoder_budget=192000)[
+            "engine_encoder_budget"
+        ]
+        == 192000
+    )
+    assert (
+        rust.smg_media_options(config, settings, str(tmp_path), encoder_budget=0)[
+            "engine_encoder_budget"
+        ]
+        is None
+    )
     # The engine's own per-prompt limits ride along for the pipeline to enforce.
     config.model_config.multimodal_config = SimpleNamespace(
         mm_device_do_normalize=True,
@@ -598,6 +613,7 @@ def test_smg_media_options_carry_the_processor_kwargs_from_where_the_engine_keep
         "max_inflight": 3,
         "max_items": 2,
         "engine_item_limits": None,
+        "engine_encoder_budget": None,
         "max_item_bytes": 10,
         "video_frame_budget": None,
         "video_loader_rule": None,
@@ -655,6 +671,13 @@ def test_model_info_advertises_the_engines_item_limits():
         ),
     )
     assert rust.model_info_from_config(config)["mm_item_limits"] == "image=8,video=2"
+
+
+def test_model_info_advertises_the_engines_encoder_budget():
+    # A text model has none; a budget the launcher derived is advertised as given.
+    assert rust.model_info_from_config(_config())["mm_encoder_budget"] == 0
+    config = _config(is_multimodal_model=True)
+    assert rust.model_info_from_config(config, encoder_budget=192000)["mm_encoder_budget"] == 192000
 
 
 def test_model_info_carries_where_the_engine_starts_a_grammar():

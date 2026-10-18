@@ -52,6 +52,7 @@ mod assemble;
 mod capability;
 mod config;
 mod detect;
+mod encoder_budget;
 mod inflight;
 mod item_limits;
 mod pixel_cache;
@@ -77,6 +78,7 @@ pub(crate) use config::{
     MultimodalConfigRegistry, MultimodalModelConfig,
 };
 pub(crate) use detect::{media_plan_chat, media_plan_messages};
+pub(crate) use encoder_budget::engine_encoder_budget;
 pub(crate) use inflight::{
     reserve_multimodal_inflight, InflightPermit, UNIT_BYTES as INFLIGHT_UNIT_BYTES,
 };
@@ -142,9 +144,15 @@ pub(crate) fn media_verdict(error: &anyhow::Error) -> Option<&MediaConnectorErro
 /// cannot run, a decode task that died) a 500; a failure with no verdict in
 /// its chain (a part the pipeline does not take, a model it has no spec for)
 /// stays a 400 `multimodal_processing_failed`.
+/// An item the engine could never place ([`encoder_budget::ItemOverEncoderBudget`])
+/// is a 400 under a code of its own, so a client can tell the item's size from a
+/// fetch or a decode that failed.
 pub(crate) fn processing_failed_response(error: &anyhow::Error) -> Response {
     const PIPELINE_CODE: &str = "multimodal_processing_failed";
     let message = processing_failed_message(error);
+    if encoder_budget::ItemOverEncoderBudget::is(error) {
+        return error::bad_request(encoder_budget::ITEM_OVER_ENCODER_BUDGET_CODE, message);
+    }
     if let Some(media) = media_verdict(error) {
         return match media.fault() {
             MediaFault::Client | MediaFault::Transient => {
@@ -352,9 +360,51 @@ mod tests {
 
     use axum::body::to_bytes;
     use http::StatusCode;
-    use llm_multimodal::{MediaConnectorError, MultiModalError};
+    use llm_multimodal::{MediaConnectorError, Modality, MultiModalError};
 
-    use super::{processing_failed_message, processing_failed_response, Response};
+    use super::{
+        encoder_budget::ItemOverEncoderBudget, processing_failed_message,
+        processing_failed_response, Response,
+    };
+
+    async fn status_and_error(response: Response) -> (u16, serde_json::Value) {
+        let status = response.status().as_u16();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// An item the engine could never place answers under a code of its own,
+    /// a 400 like every other processing failure, with the item's size and
+    /// the budget in the message; a failure of another kind keeps its code.
+    #[tokio::test]
+    async fn an_item_over_the_engines_budget_answers_under_its_own_code() {
+        let over = anyhow::Error::new(ItemOverEncoderBudget {
+            modality: Modality::Video,
+            position: 1,
+            count: 1,
+            feature_tokens: 192_001,
+            sampled_frames: Some(900),
+            budget: 192_000,
+        })
+        .context("Failed to process the plan");
+        let (status, json) = status_and_error(processing_failed_response(&over)).await;
+        assert_eq!(status, 400);
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(json["error"]["code"], "multimodal_item_too_large");
+        let message = json["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("192001 feature tokens (900 sampled frames)")
+                && message.contains("192000-token encoder budget"),
+            "{message}"
+        );
+
+        let (status, json) = status_and_error(processing_failed_response(&anyhow::anyhow!(
+            "decode failed"
+        )))
+        .await;
+        assert_eq!(status, 400);
+        assert_eq!(json["error"]["code"], "multimodal_processing_failed");
+    }
 
     /// A fetch that ran out of its budget is reported with its URL and the
     /// budget, not as the bare "failed to finalize" context around it.

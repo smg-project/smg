@@ -72,6 +72,7 @@ from smg_grpc_servicer.vllm.model_info import (
     constrained_decoding_start,
     engine_reasoning_parser,
     mm_device_do_normalize,
+    mm_encoder_budget,
     mm_item_limits,
     model_facts,
     running_window,
@@ -219,6 +220,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         self._loads = LoadTracker()
         # Flag > env > default, resolved once so each value names its source.
         self._mm_settings = (mm_settings or launcher_settings() or MmSettings()).resolve()
+        # The engine's encoder budget, derived once (vLLM's helper builds the
+        # largest item the model's processor can produce) and advertised so
+        # the Router's media pipeline refuses a larger item before the engine.
+        self._mm_encoder_budget = mm_encoder_budget(getattr(async_llm, "vllm_config", None))
         # Worker-side media processing (media_refs); None keeps refs rejected.
         self._mm_processor = build_mm_processor(async_llm, settings=self._mm_settings)
         # One cap over all the multimodal work this servicer runs off the event
@@ -759,6 +764,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # pipeline to hold requests to; likewise absent from an older package.
         if "mm_item_limits" in info.DESCRIPTOR.fields_by_name:
             info.mm_item_limits = mm_item_limits(self.engine.vllm_config)
+        # The engine's encoder budget, for the Router's media pipeline to
+        # refuse an item the engine could never place; likewise absent from
+        # an older package.
+        if self._mm_encoder_budget and "mm_encoder_budget" in info.DESCRIPTOR.fields_by_name:
+            info.mm_encoder_budget = self._mm_encoder_budget
         # The engine's reasoning parser and where it starts a grammar on a
         # thinking prompt, for the Router to shape a forced tool call's
         # grammar by; likewise absent from an older package.

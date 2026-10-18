@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from smg_grpc_servicer import mm_shm
@@ -143,6 +144,46 @@ def mm_item_limits(vllm_config: Any) -> str:
         if limit > 0:
             pairs.append(f"{modality}={limit}")
     return ",".join(pairs)
+
+
+def mm_encoder_budget(vllm_config: Any, budget_factory: Callable[[Any], Any] | None = None) -> int:
+    """The engine's encoder budget as the ``mm_encoder_budget`` fact both
+    servicers advertise: the most feature (embedding) tokens one media item may
+    carry and still be scheduled, in the units of the engine's "Encoder cache
+    will be initialized with a budget of N tokens" start-up line. Derived as
+    vLLM derives it, with the ``MultiModalBudget`` helper its own front end and
+    model runner share (the lesser of the encoder compute budget and the
+    encoder cache size: the front end refuses an item above the latter, the
+    scheduler never places one above either). ``0`` on a text model, and when
+    the installed vLLM cannot tell, which leaves an item's size to the engine
+    as before. ``budget_factory`` builds the helper from the config (the
+    default imports vLLM's; tests pass their own)."""
+    model_config = getattr(vllm_config, "model_config", None)
+    if not getattr(model_config, "is_multimodal_model", False):
+        return 0
+    try:
+        factory = budget_factory or _vllm_multimodal_budget
+        budget = int(factory(vllm_config).get_encoder_budget())
+    except Exception:  # an unexpected helper or config shape must not take the servicer down
+        logger.warning(
+            "Could not derive the engine's encoder budget; a media item larger than the engine "
+            "can place is not refused before it reaches the engine",
+            exc_info=True,
+        )
+        return 0
+    return max(budget, 0)
+
+
+def _vllm_multimodal_budget(vllm_config: Any) -> Any:
+    """vLLM's own budget helper over the engine's config, without a processor
+    cache (the number is all a servicer keeps of it)."""
+    from vllm.multimodal import MULTIMODAL_REGISTRY
+    from vllm.multimodal.encoder_budget import MultiModalBudget
+
+    try:
+        return MultiModalBudget(vllm_config, MULTIMODAL_REGISTRY, enable_cache=False)
+    except TypeError:  # a release before the helper took the cache switch
+        return MultiModalBudget(vllm_config, MULTIMODAL_REGISTRY)
 
 
 def running_window(vllm_config: Any) -> int:

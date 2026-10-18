@@ -111,6 +111,37 @@ def test_mm_item_limits_follow_the_engines_per_prompt_limits():
     assert parsed.mm_item_limits == "image=8,video=2"
 
 
+def test_mm_encoder_budget_is_the_engines_own(caplog):
+    # A text model has none.
+    assert model_info.mm_encoder_budget(SimpleNamespace(model_config=_model_config())) == 0
+    assert model_info.mm_encoder_budget(None) == 0
+    # A multimodal engine's budget comes from vLLM's own helper over its config,
+    # as the number the scheduler places one item under.
+    config = SimpleNamespace(model_config=_model_config(is_multimodal_model=True))
+    seen = []
+
+    def factory(vllm_config):
+        seen.append(vllm_config)
+        return SimpleNamespace(get_encoder_budget=lambda: 192000)
+
+    assert model_info.mm_encoder_budget(config, budget_factory=factory) == 192000
+    assert seen == [config]
+
+    # A helper that cannot tell (or a vLLM without one) leaves the item's size
+    # to the engine, as before, and says so.
+    def failing(vllm_config):
+        raise RuntimeError("no dummy data for this processor")
+
+    with caplog.at_level(logging.WARNING):
+        assert model_info.mm_encoder_budget(config, budget_factory=failing) == 0
+        assert model_info.mm_encoder_budget(config) == 0  # no vLLM in this environment
+    assert sum("encoder budget" in r.getMessage() for r in caplog.records) == 2
+    # The proto carries it as it is.
+    info = vllm_engine_pb2.GetServerInfoResponse(mm_encoder_budget=192000)
+    parsed = vllm_engine_pb2.GetServerInfoResponse.FromString(info.SerializeToString())
+    assert parsed.mm_encoder_budget == 192000
+
+
 def test_model_facts_build_the_proto_as_they_are(caplog):
     with caplog.at_level(logging.WARNING, logger=model_info.__name__):
         facts = model_info.model_facts(_model_config())

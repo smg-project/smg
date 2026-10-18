@@ -535,6 +535,10 @@ fn native_media_options(
     // `video_loader_rule` names a loader rule the pipeline cannot follow; the
     // pipeline refuses it for a spec that samples the way the loader does.
     let video_frame_budget = count("video_frame_budget")?;
+    // The engine's encoder budget, the most feature tokens one item may
+    // carry; absent when the launcher could not tell, which leaves an item's
+    // size to the engine, as before.
+    let encoder_budget = count("engine_encoder_budget")?.filter(|&budget| budget > 0);
     let fetch_timeout_ms: u64 = item("fetch_timeout_ms")?
         .map(|v| v.extract())
         .transpose()?
@@ -582,6 +586,7 @@ fn native_media_options(
             video_fetch_timeout: Duration::from_millis(video_fetch_timeout_ms),
             video_frame_budget,
             video_loader_rule: string("video_loader_rule")?,
+            encoder_budget,
         },
         source: string("source")?.unwrap_or_else(|| "default".to_string()),
         max_inflight: count("max_inflight")?.unwrap_or(4).max(1),
@@ -636,6 +641,7 @@ impl PyVllmGrpcServer {
         pooler_dimensions = None,
         mm_device_do_normalize = false,
         mm_item_limits = String::new(),
+        mm_encoder_budget = 0,
         max_num_seqs = 0,
         engine_reasoning_parser = String::new(),
         constrained_decoding_start = String::new(),
@@ -684,6 +690,7 @@ impl PyVllmGrpcServer {
         pooler_dimensions: Option<u32>,
         mm_device_do_normalize: bool,
         mm_item_limits: String,
+        mm_encoder_budget: i32,
         max_num_seqs: i32,
         engine_reasoning_parser: String,
         constrained_decoding_start: String,
@@ -739,6 +746,7 @@ impl PyVllmGrpcServer {
             pooler_dimensions,
             mm_device_do_normalize,
             mm_item_limits,
+            mm_encoder_budget,
             max_num_seqs,
             engine_reasoning_parser,
             constrained_decoding_start,
@@ -794,6 +802,7 @@ impl PyVllmGrpcServer {
                 max_inflight = native.max_inflight,
                 item_limits = %pipeline.item_limits_summary(),
                 video_frame_budget = ?pipeline.video_frame_budget(),
+                encoder_budget = ?pipeline.encoder_budget(),
                 "smg media processor ready"
             );
             config.media_processor = Some(Arc::new(SmgMediaProcessor {

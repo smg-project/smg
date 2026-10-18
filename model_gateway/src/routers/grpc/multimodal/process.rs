@@ -20,6 +20,7 @@ use tracing::{debug, info, warn};
 
 use super::{
     config::{MultimodalComponents, MultimodalModelConfig},
+    encoder_budget::check_item_feature_budget,
     log_mm_timing_enabled,
     pixel_cache::{config_fingerprint, CachedPreprocessedItem, PixelCache, PixelCacheKey},
     plan::MediaPlan,
@@ -53,6 +54,9 @@ struct PlanContext<'a> {
     model_config: &'a MultimodalModelConfig,
     image_wire_dtype: Option<EncoderDtype>,
     transparency: TransparencyPolicy,
+    /// The engine's per-item bound in feature tokens, when known (see
+    /// [`super::encoder_budget`]).
+    encoder_budget: Option<usize>,
 }
 
 /// The milliseconds each step of a plan's processing took, filled by the
@@ -156,6 +160,10 @@ impl Fetched {
 }
 
 /// Process a protocol-independent, ordered media plan.
+///
+/// `encoder_budget` is the engine's per-item bound in feature tokens, when
+/// known (see [`super::encoder_budget`]): an item above it is refused once
+/// its features are counted, before anything reaches the engine.
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn process_multimodal_plan(
     plan: MediaPlan,
@@ -167,6 +175,7 @@ pub(crate) async fn process_multimodal_plan(
     tokenizer_source: &str,
     image_wire_dtype: Option<EncoderDtype>,
     transparency: TransparencyPolicy,
+    encoder_budget: Option<usize>,
 ) -> Result<MultimodalOutput> {
     let log_timing = log_mm_timing_enabled();
     let total_started = Instant::now();
@@ -210,6 +219,7 @@ pub(crate) async fn process_multimodal_plan(
         model_config: &model_config,
         image_wire_dtype,
         transparency,
+        encoder_budget,
     };
 
     let media_started = Instant::now();
@@ -361,6 +371,14 @@ fn prepared_part(
     );
 
     let media_info = media_item_infos(&media);
+    // The engine never places an item above its encoder budget: refuse one
+    // here, on the count the expansion below uses.
+    check_item_feature_budget(
+        modality,
+        &preprocessed.feature_token_counts,
+        &media_info,
+        ctx.encoder_budget,
+    )?;
     let prompt_replacements = spec
         .prompt_replacements_with_media(
             metadata,

@@ -129,6 +129,11 @@ pub struct VllmModelInfo {
     /// as the `mm_item_limits` label the Router's media pipeline holds
     /// requests to (`image=8,video=2`); empty when the engine has none.
     pub mm_item_limits: String,
+    /// The engine's encoder budget in feature tokens, as its own front end
+    /// derives it: the most one media item may carry and still be scheduled,
+    /// advertised as `mm_encoder_budget` so the Router's media pipeline
+    /// refuses a larger item before the engine; 0 when unknown.
+    pub mm_encoder_budget: i32,
     /// The scheduler's running window (`--max-num-seqs`) as the launcher read
     /// it: how many requests the engine runs at once, which `GetServerInfo`
     /// advertises as the bound the Router's PD admission gate claims decode

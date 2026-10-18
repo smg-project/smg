@@ -75,7 +75,13 @@ through `GetServerInfo`; a router with media-reference support forwards
 labels and keeps sending preprocessed tensors. Whatever the processor mode, a
 multimodal engine also advertises its resolved `--limit-mm-per-prompt` as
 `mm_item_limits` (`image=8,video=2`), so a router that preprocesses media
-itself holds requests to the engine's limits. vLLM's `--allowed-media-domains`,
+itself holds requests to the engine's limits, and its encoder budget as
+`mm_encoder_budget` (the `budget of N tokens` of the engine's encoder-cache
+start-up line, derived at launch with vLLM's own helper): the most feature
+tokens one media item may carry and still be scheduled, so the router refuses
+a larger item (a long video sampled at a high rate) with a 400 that names the
+item's size and the budget, instead of sending the engine an item it admits
+and never schedules. vLLM's `--allowed-media-domains`,
 `--allowed-local-media-path`, `--media-io-kwargs`, `--limit-mm-per-prompt` and
 `VLLM_*_FETCH_TIMEOUT` govern fetching on the worker; without
 `--allowed-media-domains` the worker fetches from any public host the router
@@ -309,7 +315,10 @@ Worker-side media processing uses the same `--mm-processor` /
   the pipeline has no field for is refused at launch), refuses a request
   above the engine's own `--limit-mm-per-prompt` as the engine's server does
   (`--mm-max-items` and `SMG_*_MAX_COUNT` tighten those limits, never loosen
-  them), and samples a
+  them), refuses a media item whose features exceed the engine's encoder
+  budget (`mm_encoder_budget` above) before it reaches the engine, as the
+  engine's own front end does, with the item's feature tokens and the budget
+  in the same message, and samples a
   video to the engine's own frame budget (`--media-io-kwargs`
   `video.num_frames`, else its loader's default) where the family's processor
   takes the loader's frames, so a clip costs the same tokens as on the engine's

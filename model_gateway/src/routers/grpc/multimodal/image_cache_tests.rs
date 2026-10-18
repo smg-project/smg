@@ -177,6 +177,7 @@ async fn run_for(
             model_config: config,
             image_wire_dtype,
             transparency: TransparencyPolicy::KeepAlpha,
+            encoder_budget: None,
         },
     )
     .await
@@ -466,6 +467,7 @@ async fn run_probe(
             model_config: config,
             image_wire_dtype: None,
             transparency: policy,
+            encoder_budget: None,
         },
     )
     .await
