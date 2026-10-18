@@ -223,7 +223,7 @@ group names it, else it keeps the older parsers). The flags stay, as aliases: un
 reasoning parser's name whose format a table reads is a name of that table (`Table::ALIASES`:
 `qwen` for `qwen3`; `qwen_xml`, `qwen_coder` and `nemotron` for
 `qwen3_tagged`; `glm45_moe` for `glm4`; `glm47_moe` for `glm`; `hy_v4` for `hy4`; `kimik2`,
-`kimi_thinking` and `kimi_k25` for `kimi_k2`; `deepseek_v41`
+`kimi_thinking` and `kimi_k25` for `kimi_k2`; `deepseek32` for `deepseek_v3.2`; `deepseek_v41`
 for `deepseek_v4.1`; `minimax` for `minimax_m2`; `muse`, a launcher's name for a family whose table
 has no older parser, for `muse_spark`; a table's own name where the legacy parser
 carries it, `json`, `gemma4`, `qwen3`, `deepseek_v4`, `kimi_k3`, `inkling`, `minimax_m2`,
@@ -235,7 +235,7 @@ the reason: `passthrough` (the way back for one model), `base` (a thought of no 
 `nano_v3` and `qwen3_thinking` (a thought two tables' families share: the tool-call name
 decides), `kimi` (thought
 markers no table reads), `step3`, `sarashina`, `cohere` and `cohere_cmd` (no table), and the names
-of the families whose table is not on main yet (`deepseek`, `deepseek31`, `deepseek32`,
+of the families whose table is not on main yet (`deepseek`, `deepseek31`,
 `deepseek_r1`, `deepseek_v31`, `llama`, `pythonic`, `mistral`), which the table takes when it lands. The gateway's test over its two parser
 registries holds every legacy name to one of the two lists. The Harmony family (gpt-oss) has no
 table and no alias: it stays on the Harmony pipeline, by the maintainers' decision of 2026-10-17.
