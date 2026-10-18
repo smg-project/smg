@@ -48,13 +48,13 @@ shape and the three APIs' response shapes.
 content, reasoning, a call's name (`ToolCallStart.source`), a fragment of its arguments, bytes the
 format consumed (`Dropped`, with a reason), or bytes of a region the parser gave up on (`Malformed`,
 whole, with a reason). `Finish` comes last and once. Calls are numbered from zero as they start, one
-start per index, arguments and an end only for a started call, and the fragments of one call always
-form a valid JSON prefix that equals the final arguments when the call ends. What the engine says
-does not depend on how the output was cut into deltas, nor on empty deltas between them (the one
-stated exception is a broken surrogate escape inside a top-level string value, held by the
-assemblers' own tests). With token spans, every token is counted once, in the event that carries
-its first byte. Events a caller took are final: later text starts a new event and never merges into
-one already drained. These are checked for every registry table by `tests/contract.rs`.
+start per index, arguments and an end only for a started call, and the fragments of one call form
+a valid JSON prefix until a `Malformed { InvalidArguments }` event of no bytes says where they
+stopped being one, from which they are the model's bytes as written, and equal the final arguments
+when the call ends. What the engine says does not depend on how the output was cut into deltas,
+nor on empty deltas between them. With token spans, every token is counted once, in the event that
+carries its first byte. Events a caller took are final: later text starts a new event and never
+merges into one already drained. These are checked for every registry table by `tests/contract.rs`.
 
 **The table.** `Format::validate` holds every table to the rows the engine can run, and a table is
 checked when it is built (the registry's tables in the crate's tests, a compiled response template
@@ -151,10 +151,9 @@ Three tiers, two of them at run time:
   after the list, a block that closed without a complete call, and the rest the enum lists with a
   sentence each (`event.rs`). A malformed region on a well-formed output is a defect of the model's
   or of the table's, and the reason says which shape to look at.
-- **Forgiven**: a difference a harness accepts on purpose, never an event: the scramble harness
-  forgives the one stated exception above, and the corpus harness carries per-syntax known
-  differences and opt-in allowances for the classes the recorded references get wrong. Each run
-  counts them on its diagnostic line.
+- **Forgiven**: a difference a harness accepts on purpose, never an event: the corpus harness
+  carries per-syntax known differences and opt-in allowances for the classes the recorded
+  references get wrong. Each run counts them on its diagnostic line.
 
 The adapters show malformed text as content and drop nothing, so a client never loses the bytes;
 the reason is for the operator. The set is closed and `Copy` so that a reader can count malformed

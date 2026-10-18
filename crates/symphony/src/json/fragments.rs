@@ -1,11 +1,18 @@
-//! The fragments of an arguments value: which of its bytes are sent, which are held, and which
-//! are malformed.
+//! The fragments of an arguments value: which of its bytes are sent, which are held, and where
+//! the value stopped being JSON.
 //!
 //! A value's bytes arrive in pieces cut wherever the model's chunks fell. [`Fragments`] judges
 //! them as they come ([`Prefix`]) and accounts for every byte once: a fragment for each run that
-//! keeps the value a valid JSON prefix, malformed text from the first byte that breaks it, and,
-//! while the value is still open, the bytes the judge may yet go back to held until the next
-//! bytes settle them, the value closes, or the stream ends. The object readers of this module
+//! keeps the value a valid JSON prefix; while the value is still open, the bytes the judge may yet
+//! go back to held until the next bytes settle them, the value closes, or the stream ends; and
+//! from the first byte a strict reader refuses, one `Malformed { InvalidArguments }` event of no
+//! bytes that says where the value stopped being JSON, then the rest of the value as fragments
+//! again, the bytes as the model wrote them. A call so carries every byte of its arguments, what
+//! the model wrote and nothing else, and says once that they are no JSON, whole and in pieces
+//! alike: a client that reads them as JSON is told rather than left to find out, and one that
+//! shows them sees what the model wrote. Cutting the fragments at the break and handing the rest
+//! back as malformed text, as the readers once did, gave a client a call cut at the first bad
+//! token and the rest of its arguments as the answer's content. The object readers of this module
 //! ([`Assembler`](super::Assembler), [`named_arguments`](super::named_arguments)) keep their
 //! accounting here, so that the two say the same of the same bytes.
 
@@ -17,7 +24,7 @@ use crate::{
 /// The argument bytes of one value, accounted for as they arrive.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Fragments {
-    /// Bytes accounted for so far, as fragments or as malformed text.
+    /// Bytes sent as fragments so far.
     emitted: usize,
     /// Bytes the prefix has judged so far.
     judged: usize,
@@ -46,11 +53,14 @@ impl Fragments {
     /// passed on cannot be taken back, so the pieces would say `n` where the whole says nothing.
     /// They go once the next bytes settle them, with the value's end, or when no more bytes can
     /// come ([`Self::send_held`]), as the prefix they are then. A string where the value should
-    /// be streams as written, the one shape where the pieces may say more than the whole
-    /// (`Prefix::held_from`). A fragment carries the bytes as the model wrote them, but for a raw
-    /// control character inside a string, which JSON forbids and the fragment writes as its escape
-    /// ([`Prefix::escaped`]); the fragment's `source` keeps the byte. Where the sent bytes end, the
-    /// held ones excluded; `None` when every byte of `value` was accounted for already.
+    /// be streams as written (`Prefix::held_from`). A fragment carries the bytes as the model
+    /// wrote them, but for a raw control character inside a string, which JSON forbids and the
+    /// fragment writes as its escape ([`Prefix::escaped`]); the fragment's `source` keeps the
+    /// byte. Where the bytes stop being a JSON prefix, the break is said once, by a
+    /// `Malformed { InvalidArguments }` event of no bytes after the prefix's last fragment, and
+    /// the bytes from there on are the caller's: to send as the model wrote them
+    /// ([`Self::send_rest`]), or to hand back. Where the sent bytes end, the held ones excluded;
+    /// `None` when every byte of `value` was accounted for already.
     pub(super) fn send(
         &mut self,
         value: &str,
@@ -64,6 +74,7 @@ impl Fragments {
         // Only the bytes that arrived are judged; the prefix keeps its place between pieces.
         let verdict = self.prefix.feed(&value[self.judged..]);
         self.judged = value.len();
+        let breaks_here = self.invalid_from.is_none() && verdict.is_some();
         let valid_end = match self.invalid_from {
             Some(from) => from,
             None => match verdict {
@@ -86,16 +97,24 @@ impl Fragments {
             });
             self.emitted = valid_end;
         }
+        if breaks_here {
+            out.push(Event::Malformed {
+                text: Text::default(),
+                why: MalformedReason::InvalidArguments,
+            });
+        }
         Some(valid_end)
     }
 
-    /// Past the break, the bytes of `value` not yet accounted for are malformed; before any break
-    /// nothing is said, since what is not sent is held.
-    pub(super) fn send_malformed(&mut self, value: &str, out: &mut Events) {
+    /// Past the break, the bytes of `value` not yet sent go as a fragment of the call at `index`,
+    /// as the model wrote them; before any break nothing is said, since what is not sent is held.
+    pub(super) fn send_rest(&mut self, value: &str, index: u32, out: &mut Events) {
         if self.invalid_from.is_some() && self.emitted < value.len() {
-            out.push(Event::Malformed {
-                text: Text::uncounted(&value[self.emitted..]),
-                why: MalformedReason::InvalidArguments,
+            let rest = &value[self.emitted..];
+            out.push(Event::ToolCallArguments {
+                index,
+                json: rest.to_string(),
+                source: Text::uncounted(rest),
             });
             self.emitted = value.len();
         }
@@ -148,22 +167,28 @@ mod tests {
     }
 
     #[test]
-    fn the_bytes_from_the_break_on_are_malformed_once_and_the_valid_prefix_is_a_fragment() {
+    fn the_break_is_said_once_with_no_bytes_and_the_rest_goes_on_as_fragments() {
         let mut fragments = Fragments::default();
         let mut out = Events::new();
         let value = r#"{"a": 1} tail"#;
         assert_eq!(fragments.send(value, true, 0, &mut out), Some(8));
         assert!(fragments.refused());
-        fragments.send_malformed(value, &mut out);
+        fragments.send_rest(value, 0, &mut out);
         assert_eq!(
             said(&out.drain()),
-            ["fragment {\"a\": 1}", "malformed  tail (InvalidArguments)"]
+            [
+                "fragment {\"a\": 1}",
+                "malformed  (InvalidArguments)",
+                "fragment  tail"
+            ]
         );
-        // More bytes after the break: malformed too, and nothing is sent twice.
+        // More bytes after the break: fragments as written, the break not said again, nothing
+        // sent twice, and a broken value is never whole.
         let value = r#"{"a": 1} tail more"#;
         assert_eq!(fragments.send(value, true, 0, &mut out), Some(8));
-        fragments.send_malformed(value, &mut out);
-        assert_eq!(said(&out.drain()), ["malformed  more (InvalidArguments)"]);
+        fragments.send_rest(value, 0, &mut out);
+        assert_eq!(said(&out.drain()), ["fragment  more"]);
+        assert!(!fragments.whole());
         fragments.send_held(value, 0, &mut out);
         assert!(out.drain().is_empty(), "a broken value holds nothing");
     }

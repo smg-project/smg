@@ -22,7 +22,11 @@
 //! `content_block_stop` events a client expects, the block index advancing by one per block. A
 //! `thinking` block opens at the first reasoning text and closes when the region ends; a `text`
 //! block opens at the first content; a `tool_use` block opens at `ToolCallStart` with an empty
-//! `input` and closes at `ToolCallEnd`; a block closes when text of another kind arrives.
+//! `input` and closes at `ToolCallEnd`, and its `input_json_delta`s stop at a `Malformed {
+//! InvalidArguments }` event of no bytes (the fragments after it are the model's bytes as written
+//! and go nowhere), so the joined `partial_json` is the prefix a strict reader accepted, which a
+//! client's partial JSON reader closes into an object where the fold gives the call `{}`; a block
+//! closes when text of another kind arrives.
 //! Whitespace-only text that arrives with no text block open is held: it leads the text block when
 //! text with substance follows, and is let go when a block of another kind starts or the stream
 //! ends, so the template's separators between blocks open no block of their own. `Finish` closes
@@ -48,7 +52,7 @@ use serde::de::IgnoredAny;
 use serde_json::{Map, Value};
 
 use super::fold::fold;
-use crate::event::{Event, FinishReason};
+use crate::event::{Event, FinishReason, MalformedReason};
 
 /// A whole output as the Messages API reports it: the content blocks and the stop reason, and the
 /// calls whose `tool_use` block could not carry their arguments.
@@ -139,6 +143,11 @@ pub struct Stream {
     index: u32,
     /// Whitespace-only text that arrived with no text block open, waiting for text with substance.
     held: String,
+    /// Whether the open `tool_use` block's arguments stopped being JSON (a `Malformed {
+    /// InvalidArguments }` event of no bytes while it was open): its later fragments are not
+    /// sent, so the joined `partial_json` stays the prefix the readers accepted, which a client's
+    /// partial JSON reader closes into an object; the fold gives the call `{}`.
+    refused: bool,
 }
 
 /// The kind of block that is open.
@@ -162,6 +171,12 @@ impl Stream {
     /// `event` is `Finish`, after closing the open block.
     pub fn feed(&mut self, event: &Event, out: &mut Vec<MessageStreamEvent>) -> Option<StopReason> {
         match event {
+            Event::Malformed {
+                text,
+                why: MalformedReason::InvalidArguments,
+            } if text.text.is_empty() && matches!(self.open, Some(Block::ToolUse { .. })) => {
+                self.refused = true;
+            }
             Event::Content(text) | Event::Malformed { text, .. } => self.text(&text.text, out),
             Event::Reasoning(text) => self.reasoning(&text.text, out),
             Event::ReasoningEnd => {
@@ -210,6 +225,7 @@ impl Stream {
         if self.open.take().is_some() {
             out.push(MessageStreamEvent::ContentBlockStop { index: self.index });
             self.index += 1;
+            self.refused = false;
         }
     }
 
@@ -236,13 +252,18 @@ impl Stream {
     }
 
     /// A fragment of call `call`'s arguments into its open `tool_use` block; text when the call has
-    /// no open block, so that no byte is lost.
+    /// no open block, so that no byte is lost; nothing once the block's arguments stopped being
+    /// JSON (a client's partial JSON reader takes a prefix cut short, not a token that is no JSON;
+    /// it closes the prefix into an object, where the fold gives the call `{}`).
     fn arguments(&mut self, call: u32, json: &str, out: &mut Vec<MessageStreamEvent>) {
         if json.is_empty() {
             return;
         }
         if self.open != Some(Block::ToolUse { call }) {
             self.text(json, out);
+            return;
+        }
+        if self.refused {
             return;
         }
         out.push(MessageStreamEvent::ContentBlockDelta {
@@ -623,6 +644,62 @@ mod tests {
                 .collect();
             assert_eq!(partial, text);
         }
+    }
+
+    /// The stream of a call whose arguments stop being JSON: the fragments before the break are
+    /// `input_json_delta`s, the break (a `Malformed { InvalidArguments }` event of no bytes) ends
+    /// them, and the fragments after it go nowhere, since a client's partial JSON reader takes a
+    /// prefix cut short but not a token that is no JSON (it closes the prefix into an object; the
+    /// fold gives the call `{}`). The next call's block streams whole again.
+    #[test]
+    fn arguments_that_stop_being_json_stream_the_prefix_and_nothing_after_the_break() {
+        let events = [
+            call(0, "plot_sine_wave"),
+            arguments(0, r#"{"start_range": 0, "end_range": 2.0 "#),
+            Event::Malformed {
+                text: Text::default(),
+                why: MalformedReason::InvalidArguments,
+            },
+            arguments(0, r#"* Math.PI, "frequency": 5}"#),
+            end(0),
+            call(1, "g"),
+            arguments(1, r#"{"ok": true}"#),
+            end(1),
+            finish(FinishReason::ToolCalls, 2),
+        ];
+        let mut stream = Stream::new();
+        let mut out = Vec::new();
+        for event in &events {
+            stream.feed(event, &mut out);
+        }
+        let events_wire = stream_wire(&out);
+        let events_wire = events_wire.as_array().expect("events");
+        let partial = |index: u64| -> String {
+            events_wire
+                .iter()
+                .filter(|event| event["index"] == index)
+                .filter_map(|event| event["delta"]["partial_json"].as_str().map(String::from))
+                .collect()
+        };
+        assert_eq!(partial(0), r#"{"start_range": 0, "end_range": 2.0 "#);
+        assert_eq!(partial(1), r#"{"ok": true}"#);
+        assert!(
+            events_wire
+                .iter()
+                .all(|event| event["delta"]["type"] != "text_delta"),
+            "nothing of the tail is text: {events_wire:?}"
+        );
+        assert_eq!(
+            events_wire
+                .iter()
+                .filter(|event| event["type"] == "content_block_start")
+                .count(),
+            2,
+            "two tool_use blocks and nothing else: {events_wire:?}"
+        );
+        let folded = output(&events);
+        assert_eq!(wire(&folded.content)[0]["input"], json!({}));
+        assert_eq!(wire(&folded.content)[1]["input"], json!({"ok": true}));
     }
 
     #[test]

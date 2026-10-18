@@ -16,15 +16,23 @@ with nothing in it, on every path that reads the fragments (a client of the stre
 server call made from the arguments). A member whose key came and whose value never began is not
 one: the call ends with what arrived, and nothing is made up for a value the model botched.
 
-The assembler keeps the promise `ToolCallArguments` makes, that the fragments so far are always a
-prefix of JSON a strict reader accepts: each new run of argument bytes is judged by `Prefix` before
-it is emitted, and from the first byte a strict reader refuses, the argument bytes come back as
-`Malformed` with `InvalidArguments` instead, nothing already emitted being revised. The oracle is
-the template reference and the JSON grammar: the template writes a JSON object that the engine's
-own server hands to a strict reader (`json.loads`, `serde_json`, a client's library), so a call its
-terminal closed is whole only if such a reader takes its arguments. The judge therefore refuses what
-the partial parser (`PartialJson`, the old crate's reader) tolerated and JSON lacks, each at its
-first byte, whole and in pieces alike:
+The assembler keeps the promise `ToolCallArguments` makes, that the fragments so far are a prefix
+of JSON a strict reader accepts until the parser says otherwise: each new run of argument bytes is
+judged by `Prefix` before it is emitted, and at the first byte a strict reader refuses, one
+`Malformed { InvalidArguments }` event of no bytes says that the arguments stopped being JSON
+there; the bytes from the break to the value's end are fragments still, the model's own as written,
+nothing already emitted being revised (`json::fragments`). The call so carries exactly what the
+model wrote, and says once that it is no JSON, whole and in pieces alike: a client that reads the
+arguments as JSON is told, at the byte where its own reader would refuse them, and one that shows
+them sees what the model wrote (`"end_range": 2.0 * Math.PI` where a number was due). Cutting the
+fragments at the break and handing the rest back as malformed text, which the readers did before,
+gave a client a call cut at the first bad token and the rest of its arguments as the answer's
+content, and nothing honest can be done with either. The oracle for the break is the template
+reference and the JSON grammar: the template writes a JSON object that the engine's own server
+hands to a strict reader (`json.loads`, `serde_json`, a client's library), so a call its terminal
+closed is whole only if such a reader takes its arguments. The judge therefore refuses what the
+partial parser (`PartialJson`, the old crate's reader) tolerated and JSON lacks, each at its first
+byte, whole and in pieces alike:
 
 - a value left out before a comma or a close (`{"days": ,}`, `[,,]`) and a trailing comma before a
   close (`{"days": 3, }`): refused at the comma or the close that stands where a value or a key
@@ -47,8 +55,9 @@ object's brace stops, `"arguments": 12.}`) is said to be none by a `Malformed` e
 before the call's end, as at the stream's end. The value reader (`json::arguments`) and the Mistral
 object reader (`json::named_arguments`) judge and say the same. The contract tests
 (`tests/contract.rs`) check both halves of the promise under every chunking: a fragment never takes
-a call's arguments past a prefix a strict reader accepts, and a call that closed without a
-`Malformed` event has arguments a strict reader parses whole.
+a call's arguments past a prefix a strict reader accepts until the break is said, every fragment
+after it is the model's bytes as written, and a call that closed without a `Malformed` event has
+arguments a strict reader parses whole.
 
 A raw control character inside a string (U+0000..U+001F: a newline in a multi-line value, a tab
 in code), which JSON forbids there and no strict reader accepts, is written in the fragment as its

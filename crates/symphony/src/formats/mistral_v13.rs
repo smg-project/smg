@@ -43,7 +43,7 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, FinishReason},
+        event::{DropReason, Event, FinishReason, MalformedReason, Text},
         testing::{calls, content, drive, reasoning},
         Declared,
     };
@@ -71,6 +71,47 @@ mod tests {
                 _ => None,
             })
             .expect("a finish")
+    }
+
+    /// A call whose arguments are not JSON carries them as the model wrote them and says once,
+    /// with no bytes, that they are no JSON; nothing leaks into content, whole and in pieces.
+    #[test]
+    fn arguments_that_are_not_json_stay_the_calls_own_and_are_said_to_be_no_json() {
+        let output = "[TOOL_CALLS]plot_sine_wave[ARGS]{\"start_range\": 0, \"end_range\": 2.0 * Math.PI, \"frequency\": 5}";
+        let per_char: Vec<&str> = output
+            .char_indices()
+            .map(|(i, c)| &output[i..i + c.len_utf8()])
+            .collect();
+        let whole = run(PROMPT, output);
+        let streamed = drive(
+            &mut Engine::new(mistral_v13(), Declared::default()),
+            PROMPT,
+            &per_char,
+        );
+        for (how, events) in [("whole", &whole), ("per character", &streamed)] {
+            assert_eq!(
+                calls(events),
+                [(
+                    "plot_sine_wave".to_string(),
+                    "{\"start_range\": 0, \"end_range\": 2.0 * Math.PI, \"frequency\": 5}"
+                        .to_string()
+                )],
+                "{how}"
+            );
+            assert_eq!(content(events), "", "{how}");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, Event::Malformed { .. }))
+                    .collect::<Vec<_>>(),
+                [&Event::Malformed {
+                    text: Text::default(),
+                    why: MalformedReason::InvalidArguments,
+                }],
+                "{how}: the break is said once, with no bytes"
+            );
+            assert_eq!(finish(events), (FinishReason::Stop, 1), "{how}");
+        }
     }
 
     #[test]

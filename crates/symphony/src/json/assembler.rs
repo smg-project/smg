@@ -7,7 +7,9 @@
 //! own bytes: what a client receives, concatenated, is exactly what the model wrote as the
 //! arguments value, spacing included, but for a raw control character inside a string, which JSON
 //! forbids and the fragment writes as its escape (`Prefix::escaped`), and no fragment ever has to
-//! be revised; an object that ends
+//! be revised; arguments that stop being JSON are said to, once, by a `Malformed` event of no
+//! bytes where they stop, and the call still carries every byte of them (`json::fragments`); an
+//! object that ends
 //! without an arguments member is a call with none, `{}`, one fragment of no bytes, as every
 //! other syntax writes a call with nothing in it. The old crate had no
 //! equivalent; it parsed the partial object on every chunk, re-serialized the arguments and emitted
@@ -181,10 +183,11 @@ impl Assembler {
             // (`refused_tail`).
             self.send_held(arguments.as_ref(), out);
             self.no_arguments(arguments.as_ref(), out);
-            // An object that ended where its arguments broke handed the bytes from the break
-            // back, so nothing of its own says that the arguments are no whole value: a
-            // `Malformed` event of no bytes does, before the end.
-            if !self.arguments_whole(arguments.as_ref()) {
+            // An object that ended where its arguments broke said so at the break
+            // (`Fragments::send`) and handed the bytes from there back; one whose outline
+            // stopped with arguments that are no whole value says so here, by a `Malformed`
+            // event of no bytes before the end.
+            if !self.fragments.refused() && !self.arguments_whole(arguments.as_ref()) {
                 out.push(Event::Malformed {
                     text: Text::default(),
                     why: MalformedReason::InvalidArguments,
@@ -205,11 +208,11 @@ impl Assembler {
             self.send_held(arguments.as_ref(), out);
             self.no_arguments(arguments.as_ref(), out);
             // The object closed, and the arguments value with it. A value the judge refused said
-            // so with the bytes from the first one a strict reader refuses; one the outline ended
-            // whole for the partial parser and cut short for a strict reader (a number or a word
-            // the object's brace stops, `12.`, `nu`) is said to be none by a `Malformed` event of
-            // no bytes, as at the stream's end, so that a client is told rather than handed
-            // arguments its own reader refuses.
+            // so at the break, where the first byte a strict reader refuses stands; one the
+            // outline ended whole for the partial parser and cut short for a strict reader (a
+            // number or a word the object's brace stops, `12.`, `nu`) is said to be none by a
+            // `Malformed` event of no bytes, as at the stream's end, so that a client is told
+            // rather than handed arguments its own reader refuses.
             if !self.fragments.refused() && !self.arguments_whole(arguments.as_ref()) {
                 out.push(Event::Malformed {
                     text: Text::default(),
@@ -256,8 +259,8 @@ impl Assembler {
         }
         let found = self.scanner.found().clone();
         if self.started {
-            // `feed` has emitted every argument byte that arrived, as fragments or as malformed
-            // text, but for a word it still held; that goes first, as the prefix it is. The object
+            // `feed` has emitted every argument byte that arrived as fragments, but for a word it
+            // still held; that goes first, as the prefix it is. The object
             // never closed, so what follows the arguments value is the tail of an unterminated
             // region: a comma cut short, a complete member, or bytes that are no member at all. A
             // closed object's tail is the source of its `ToolCallEnd` instead.
@@ -321,9 +324,9 @@ impl Assembler {
     }
 
     /// The argument bytes that arrived since the last call: a fragment for the part that keeps the
-    /// arguments a valid JSON prefix, malformed text for the rest, once the prefix has broken,
-    /// and the bytes the judge may still go back to held while the value is open
-    /// ([`Fragments::send`]).
+    /// arguments a valid JSON prefix, the break said once where they stop being one, the rest as
+    /// the model wrote it, and the bytes the judge may still go back to held while the value is
+    /// open ([`Fragments::send`], [`Fragments::send_rest`]).
     fn emit_new_argument_bytes(&mut self, arguments: Option<&Span>, out: &mut Events) {
         let Some(span) = arguments else {
             return;
@@ -336,12 +339,12 @@ impl Assembler {
             return;
         };
         if self.ends_where_refused && self.fragments.refused() {
-            // The object ends at the break; what follows is handed back, not reported as its
-            // malformed rest.
+            // The object ends at the break; what follows is handed back, not sent as the rest of
+            // its arguments.
             self.ended_at = Some(span.start + sent_to);
             return;
         }
-        self.fragments.send_malformed(bytes, out);
+        self.fragments.send_rest(bytes, self.index, out);
     }
 }
 
@@ -424,54 +427,67 @@ mod tests {
             .collect()
     }
 
+    /// The fragments sent before the first `Malformed` event, joined; `None` when none came.
+    fn said_before(events: &[Event]) -> Option<String> {
+        let at = events
+            .iter()
+            .position(|event| matches!(event, Event::Malformed { .. }))?;
+        Some(arguments(&events[..at]))
+    }
+
     #[test]
-    fn a_top_level_string_a_surrogate_breaks_is_the_one_shape_the_pieces_say_more_of() {
+    fn a_top_level_string_a_surrogate_breaks_says_the_same_whole_and_in_pieces() {
         // A string-valued arguments streams as written (a stringified call object is one), and
-        // the parser refuses the whole value when a surrogate escape breaks inside it: the pieces
-        // have said the string's bytes before the escape (which is held from its backslash until
-        // it is decided) where the whole says nothing. Every byte is accounted for either way,
-        // and nothing a piece said is taken back.
+        // the judge refuses the whole value when a surrogate escape breaks inside it: the pieces
+        // have sent the string's bytes before the escape (held from its backslash until it is
+        // decided) by the time it is decided, where the whole sends none before the break. Both
+        // say the break once, with no bytes, and both carry every byte of the value as the
+        // call's own, so what the call says is the same; only where the break stands among the
+        // fragments differs. Nothing a piece said is taken back.
         let object = r#"{"name": "f", "arguments": "ab\udc00"}"#;
-        let whole = run(&[object]);
-        assert_eq!(arguments(&whole), "");
-        assert_eq!(malformed(&whole), r#""ab\udc00""#);
         let per_char: Vec<&str> = object
             .char_indices()
             .map(|(i, c)| &object[i..i + c.len_utf8()])
             .collect();
-        let streamed = run(&per_char);
-        assert_eq!(arguments(&streamed), r#""ab"#);
-        assert_eq!(malformed(&streamed), r#"\udc00""#);
-        for events in [&whole, &streamed] {
-            assert_eq!(sources(events), object);
+        for (how, events, before) in [
+            ("whole", run(&[object]), ""),
+            ("per character", run(&per_char), r#""ab"#),
+        ] {
+            assert_eq!(arguments(&events), r#""ab\udc00""#, "{how}");
+            assert_eq!(said_before(&events), Some(before.to_string()), "{how}");
+            assert_eq!(malformed(&events), "", "{how}: the break carries no bytes");
+            assert_eq!(sources(&events), object, "{how}");
         }
     }
 
     #[test]
     fn a_word_under_way_is_held_so_the_pieces_say_of_it_what_the_whole_says() {
-        // A word that is no literal is refused from its first letter, and nothing of it is
-        // passed on as arguments however the bytes were cut; a literal, whole or cut short at
-        // the end, is sent once it is spelled or once nothing more can come; a number is sent as
-        // far as it is one. A surrogate escape that breaks behind its backslash takes the
-        // backslash with it. Open values end with the stream, closed ones at their object's brace.
+        // A word that is no literal is refused from its first letter, so the break stands before
+        // it however the bytes were cut; a literal, whole or cut short at the end, is sent once
+        // it is spelled or once nothing more can come; a number is sent as far as it is one. A
+        // surrogate escape that breaks behind its backslash breaks from the backslash. Every byte
+        // of the value is the call's own either way, and a value that broke or was cut short says
+        // so once, with no bytes: `said_before` is what the call had sent by then, `None` where it
+        // had nothing to say. Open values end with the stream, closed ones at their object's
+        // brace.
         let cases = [
-            ("nosuch", "", "nosuch"),
-            ("trash", "", "trash"),
-            ("nul", "nul", ""),
-            ("null", "null", ""),
-            ("true", "true", ""),
-            ("1x", "1", "x"),
-            (r#"{"a": nosuch}"#, r#"{"a": "#, "nosuch}"),
-            (r#"{"a": null}"#, r#"{"a": null}"#, ""),
-            ("[true, trash]", "[true, ", "trash]"),
-            (r#"{"e": "\ud83c\x"}"#, r#"{"e": "\ud83c"#, r#"\x"}"#),
-            (r#"{"e": "\ud83c\ude00"}"#, r#"{"e": "\ud83c\ude00"}"#, ""),
-            (r#""ab\ud83c\ude00 c""#, r#""ab\ud83c\ude00 c""#, ""),
+            ("nosuch", Some("")),
+            ("trash", Some("")),
+            ("nul", Some("nul")),
+            ("null", None),
+            ("true", None),
+            ("1x", Some("1")),
+            (r#"{"a": nosuch}"#, Some(r#"{"a": "#)),
+            (r#"{"a": null}"#, None),
+            ("[true, trash]", Some("[true, ")),
+            (r#"{"e": "\ud83c\x"}"#, Some(r#"{"e": "\ud83c"#)),
+            (r#"{"e": "\ud83c\ude00"}"#, None),
+            (r#""ab\ud83c\ude00 c""#, None),
             // The outline keeps the whitespace before the value out of the arguments' span.
-            ("\tnosuch", "", "nosuch"),
-            (" null", "null", ""),
+            ("\tnosuch", Some("")),
+            (" null", None),
         ];
-        for (value, expected_arguments, expected_malformed) in cases {
+        for (value, expected_before) in cases {
             for closed in [false, true] {
                 let brace = if closed { "}" } else { "" };
                 let object = format!(r#"{{"name": "f", "arguments": {value}{brace}"#);
@@ -484,13 +500,22 @@ mod tests {
                 for (how, events) in [("whole", &whole), ("per character", &streamed)] {
                     assert_eq!(
                         arguments(events),
-                        expected_arguments,
+                        value.trim_start(),
                         "{object:?} {how}: arguments"
                     );
                     assert_eq!(
-                        malformed(events),
-                        expected_malformed,
-                        "{object:?} {how}: malformed"
+                        said_before(events),
+                        expected_before.map(str::to_string),
+                        "{object:?} {how}: said before"
+                    );
+                    assert_eq!(malformed(events), "", "{object:?} {how}: no bytes reported");
+                    assert!(
+                        events
+                            .iter()
+                            .filter(|event| matches!(event, Event::Malformed { .. }))
+                            .count()
+                            <= 1,
+                        "{object:?} {how}: said once"
                     );
                     assert_eq!(sources(events), object, "{object:?} {how}: every byte");
                 }
@@ -788,10 +813,11 @@ mod tests {
         assert!(!whole
             .iter()
             .any(|event| matches!(event, Event::Malformed { .. })));
-        // Arguments that broke have said so already, from the byte that broke them.
+        // Arguments that broke have said so already, at the byte that broke them, and carry it.
         let broken = run(&[r#"{"name": "f", "arguments": {"a": 12abc"#]);
-        assert_eq!(arguments(&broken), r#"{"a": 12"#);
-        assert_eq!(malformed(&broken), "abc");
+        assert_eq!(arguments(&broken), r#"{"a": 12abc"#);
+        assert_eq!(said_before(&broken), Some(r#"{"a": 12"#.to_string()));
+        assert_eq!(malformed(&broken), "");
         assert_eq!(
             broken
                 .iter()
@@ -847,16 +873,17 @@ mod tests {
     /// comma after a value and after a member, list items left out, an escape JSON lacks, a `\u`
     /// escape short of four hex digits, a bracket of the wrong kind, whitespace JSON lacks, a
     /// number and a word cut short before a close) closed a call as whole with arguments no JSON
-    /// reader takes. The fragments stop at the first byte a strict reader refuses, the rest of the
-    /// value is malformed with `InvalidArguments`, the object's brace ends the call, and the cut
-    /// changes nothing of it.
+    /// reader takes. The break is said at the first byte a strict reader refuses, by one
+    /// `Malformed { InvalidArguments }` event of no bytes, the fragments before it a prefix such a
+    /// reader takes, the rest of the value fragments as written; the object's brace ends the
+    /// call, and the cut changes nothing of it.
     #[test]
-    fn arguments_a_strict_reader_refuses_are_malformed_from_the_first_such_byte() {
+    fn arguments_a_strict_reader_refuses_are_said_to_at_the_first_such_byte_and_kept_whole() {
         let strict_prefix = |text: &str| match serde_json::from_str::<serde_json::Value>(text) {
             Ok(_) => true,
             Err(error) => error.is_eof(),
         };
-        for (text, expected_arguments, expected_malformed) in [
+        for (text, prefix, rest) in [
             (
                 r#"{"name": "get_weather", "arguments": {"city": "Paris", "days": ,}}"#,
                 r#"{"city": "Paris", "days": "#,
@@ -919,12 +946,33 @@ mod tests {
                 .collect();
             let by_char = run(&pieces);
             for (events, how) in [(&whole, "whole"), (&by_char, "by the character")] {
-                assert_eq!(arguments(events), expected_arguments, "{text:?} {how}");
-                assert!(
-                    strict_prefix(expected_arguments),
-                    "{text:?}: the arguments are a prefix a strict reader takes"
+                assert_eq!(
+                    arguments(events),
+                    format!("{prefix}{rest}"),
+                    "{text:?} {how}"
                 );
-                assert_eq!(malformed(events), expected_malformed, "{text:?} {how}");
+                assert_eq!(
+                    said_before(events),
+                    Some(prefix.to_string()),
+                    "{text:?} {how}"
+                );
+                assert!(
+                    strict_prefix(prefix),
+                    "{text:?}: the arguments before the break are a prefix a strict reader takes"
+                );
+                assert_eq!(
+                    malformed(events),
+                    "",
+                    "{text:?} {how}: the break carries no bytes"
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, Event::Malformed { .. }))
+                        .count(),
+                    1,
+                    "{text:?} {how}: said once"
+                );
                 assert!(
                     events.iter().all(|event| !matches!(
                         event,
@@ -1010,7 +1058,7 @@ mod tests {
     }
 
     #[test]
-    fn arguments_that_stop_being_a_json_prefix_come_back_malformed_from_that_byte() {
+    fn arguments_that_stop_being_a_json_prefix_say_so_there_and_go_on_as_written() {
         let events = run(&[r#"{"name": "f", "arguments": 12abc}"#]);
         assert_eq!(
             events,
@@ -1027,8 +1075,13 @@ mod tests {
                     source: Text::uncounted("12"),
                 },
                 Event::Malformed {
-                    text: Text::uncounted("abc"),
+                    text: Text::default(),
                     why: MalformedReason::InvalidArguments,
+                },
+                Event::ToolCallArguments {
+                    index: 0,
+                    json: "abc".into(),
+                    source: Text::uncounted("abc"),
                 },
                 Event::ToolCallEnd {
                     index: 0,

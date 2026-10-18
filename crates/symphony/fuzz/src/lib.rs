@@ -14,7 +14,9 @@
 //!   their ids and arguments and the finish (both replays count their call ids from one nonce,
 //!   as one request's engine does);
 //! - well-formedness: one start and one end per call, arguments only between them and a valid
-//!   JSON prefix after every fragment, reasoning text only inside a region, one `Finish` that
+//!   JSON prefix after every fragment until a `Malformed { InvalidArguments }` event of no bytes
+//!   says where the arguments stopped being one (from there every fragment is the model's bytes
+//!   as written), reasoning text only inside a region, one `Finish` that
 //!   counts the calls; a fragment of the arguments that closes a string, writes a member under an
 //!   empty key or writes an empty string carries the output bytes that wrote it (a reader makes
 //!   no byte up); and a call that ended, at its own terminal or at the stream's end, has
@@ -649,6 +651,9 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
     let mut ended: Vec<u32> = Vec::new();
     let mut arguments: Vec<(u32, String)> = Vec::new();
     let mut malformed_inside: Vec<u32> = Vec::new();
+    // The calls whose arguments stopped being JSON, said by a `Malformed { InvalidArguments }`
+    // event of no bytes while the call was open: from there the fragments are the model's bytes.
+    let mut broke: Vec<u32> = Vec::new();
     let mut reasoning_open = false;
     let mut finished = false;
     for (at, event) in replayed.events.iter().enumerate() {
@@ -722,12 +727,21 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                         },
                     );
                     so_far.push_str(json);
-                    breach("json-prefix", valid_json_prefix(so_far), || {
-                        format!(
-                            "{}: the arguments so far, {so_far:?}, are no valid JSON prefix",
-                            place()
-                        )
-                    });
+                    if broke.contains(index) {
+                        breach("verbatim-after-break", json == &source.text, || {
+                            format!(
+                                "{}: the fragment {json:?} after the break is not the model's bytes as written",
+                                place()
+                            )
+                        });
+                    } else {
+                        breach("json-prefix", valid_json_prefix(so_far), || {
+                            format!(
+                                "{}: the arguments so far, {so_far:?}, are no valid JSON prefix",
+                                place()
+                            )
+                        });
+                    }
                 }
             }
             Event::ToolCallEnd { index, .. } => {
@@ -778,10 +792,17 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                     }
                 }
             }
-            Event::Malformed { .. } => {
+            Event::Malformed { text, why } => {
                 for index in &started {
                     if !ended.contains(index) && !malformed_inside.contains(index) {
                         malformed_inside.push(*index);
+                    }
+                    if !ended.contains(index)
+                        && *why == MalformedReason::InvalidArguments
+                        && text.text.is_empty()
+                        && !broke.contains(index)
+                    {
+                        broke.push(*index);
                     }
                 }
             }

@@ -143,7 +143,12 @@ Policy this adapter sets, where the events say more than the Messages API can:
   value reader's limit. The crate's own readers refuse the last two as the bytes arrive and say so
   in a `Malformed` event, so from them the set is the numbers. Chat carries the text as written and
   Responses judges it whole, as the stream here does, whose `input_json_delta`s carry the fragments
-  as the model wrote them for the client's own reader.
+  as the model wrote them for the client's own reader, up to a break the parser says (a
+  `Malformed { InvalidArguments }` event of no bytes): from there the call's fragments go nowhere,
+  since a client's partial JSON reader takes a prefix cut short, not a token that is no JSON. The
+  streamed `input` is therefore the prefix the readers accepted, which such a reader closes into
+  an object, where the fold gives the call `{}`: the two differ for this call, as they do for the
+  blocks' order and the whitespace between them.
 - Argument fragments for a call that never started cannot occur under the `Event` contract;
   should one arrive, its text joins the content so that no byte is lost. In the stream the same
   goes for a fragment whose call has no open `tool_use` block because other text, or another

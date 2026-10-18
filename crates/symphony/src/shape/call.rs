@@ -298,7 +298,8 @@ impl Assembler {
             // With a trailer, an object ends where its bytes stop being a call's object (its
             // arguments refused as JSON, or its outline stopped short of the close) and the trailer
             // reads what follows; without one, the region's terminal closes the call wherever the
-            // object stands, and the object keeps its malformed rest as before.
+            // object stands, and the object's bytes after a break stay the call's fragments, the
+            // break said once.
             let assembler = json::Assembler::new(self.index, self.id.clone());
             let reader = JsonReader::Envelope(if shape.trailer.0.is_empty() {
                 assembler
@@ -1997,7 +1998,7 @@ mod tests {
             EngineFinish::Stop,
         );
         assert_eq!(
-            broken[2..4],
+            broken[2..5],
             [
                 Event::ToolCallArguments {
                     index: 0,
@@ -2005,11 +2006,17 @@ mod tests {
                     source: Text::uncounted("{\"n\": \"5\", "),
                 },
                 Event::Malformed {
-                    text: Text::uncounted("x}"),
+                    text: Text::default(),
                     why: MalformedReason::InvalidArguments,
                 },
+                Event::ToolCallArguments {
+                    index: 0,
+                    json: "x}".to_string(),
+                    source: Text::uncounted("x}"),
+                },
             ],
-            "a held string that closed before the bytes broke is typed at every cut"
+            "a held string that closed before the bytes broke is typed at every cut, and the \
+             bytes from the break on are the model's as written"
         );
         let mut engine = Engine::new(format, tools());
         let mut out = Events::new();

@@ -880,6 +880,94 @@ async fn a_malformed_region_in_a_whole_output_is_counted_and_written_once() {
     assert!(logs_contain("choice=0"));
 }
 
+/// A call whose arguments are not JSON (an expression where a number was due): the client gets
+/// the call with the arguments exactly as the model wrote them, nothing of the block as content,
+/// and the output is counted as malformed under `invalid_arguments`, the line naming the byte
+/// where the arguments stopped being JSON (`at`) and a run of no bytes.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn arguments_that_are_not_json_reach_the_client_whole_and_are_counted() {
+    let output =
+        "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": 2.0 * Math.PI}}\n</tool_call>";
+    let ((choice, _), scrape) = scraped(fold(output)).await;
+    let calls = choice.message.tool_calls.as_ref().expect("tool calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].function.name, "lookup");
+    assert_eq!(
+        calls[0].function.arguments.as_deref(),
+        Some("{\"q\": 2.0 * Math.PI}"),
+        "the arguments as the model wrote them"
+    );
+    assert!(
+        choice
+            .message
+            .content
+            .as_deref()
+            .is_none_or(|content| content.trim().is_empty()),
+        "{:?}",
+        choice.message.content
+    );
+    assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"qwen3\"", "outcome=\"malformed\""],
+    )
+    .expect("the outputs counter");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    let malformed = series_line(
+        &scrape,
+        "smg_symphony_malformed_total",
+        &["table=\"qwen3\"", "reason=\"invalid_arguments\""],
+    )
+    .expect("the malformed counter");
+    assert!(malformed.ends_with(" 1"), "{malformed}");
+    assert!(logs_contain("reason=\"invalid_arguments\""));
+    // The break stands at the `*`: the output's bytes up to it, and the run has no bytes.
+    let at = output.find('*').expect("the expression");
+    assert!(logs_contain(&format!("at={at} bytes=0")));
+
+    // The same in a stream cut inside the expression: the argument deltas, joined, are the
+    // arguments as written, and no content delta carries any of them.
+    let spec = assigned(
+        chat_spec(true),
+        qwen3(CallSyntax::Json),
+        "<|im_start|>assistant\n",
+    );
+    let ((result, events), scrape) = scraped(stream_events(
+        vec![
+            chunk(
+                0,
+                "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": 2.0 * Ma",
+            ),
+            chunk(0, "th.PI}}\n</tool_call>"),
+            complete(0, "stop"),
+        ],
+        true,
+        spec,
+    ))
+    .await;
+    result.expect("the stream ends well");
+    let arguments: String = tool_call_deltas(&events)
+        .iter()
+        .filter_map(|delta| delta["function"]["arguments"].as_str())
+        .collect();
+    assert_eq!(arguments, "{\"q\": 2.0 * Math.PI}");
+    assert_eq!(chat_text(&events, 0, "content").trim(), "");
+    let finish = events
+        .iter()
+        .find_map(|event| event["choices"][0]["finish_reason"].as_str())
+        .expect("a finish chunk");
+    assert_eq!(finish, "tool_calls");
+    let malformed = series_line(
+        &scrape,
+        "smg_symphony_malformed_total",
+        &["table=\"qwen3\"", "reason=\"invalid_arguments\""],
+    )
+    .expect("the malformed counter");
+    assert!(malformed.ends_with(" 1"), "{malformed}");
+}
+
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn a_clean_whole_output_is_counted_and_writes_nothing() {

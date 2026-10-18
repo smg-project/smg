@@ -41,8 +41,8 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, FinishReason},
-        testing::{calls, content, drive, reasoning},
+        event::{DropReason, Event, FinishReason, MalformedReason, Text},
+        testing::{arguments_of, bytes, calls, content, drive, reasoning},
         Declared,
     };
 
@@ -236,6 +236,99 @@ mod tests {
         // after the `]` is the model's.
         assert_eq!(malformed(&events), [" tail"]);
         assert_eq!(dropped(&events), ["<TOOLCALL>", "[", "]", "</TOOLCALL>"]);
+    }
+
+    /// A call whose arguments are not JSON (an expression where a number was due) is not cut at
+    /// the bad token with the rest of the block leaking into content: the call carries the
+    /// arguments exactly as the model wrote them, one `Malformed { InvalidArguments }` event of
+    /// no bytes says where they stopped being JSON, the content stays empty, and the stream of
+    /// small pieces says the same as the whole. A block the model closes with one bracket too
+    /// many keeps its whole call; the residue is reported as a block without a complete call.
+    #[test]
+    fn arguments_that_are_not_json_stay_the_calls_own_and_are_said_to_be_no_json() {
+        let block = "<TOOLCALL>[{\"name\": \"plot_sine_wave\", \"arguments\": {\"start_range\": 0, \"end_range\": 2.0 * Math.PI, \"frequency\": 5}}]</TOOLCALL>";
+        let arguments = "{\"start_range\": 0, \"end_range\": 2.0 * Math.PI, \"frequency\": 5}";
+        let per_char: Vec<&str> = block
+            .char_indices()
+            .map(|(i, c)| &block[i..i + c.len_utf8()])
+            .collect();
+        let whole = run(PROMPT, block);
+        let streamed = drive(
+            &mut Engine::new(llama_nemotron(), Declared::default()),
+            PROMPT,
+            &per_char,
+        );
+        for (how, events) in [("whole", &whole), ("per character", &streamed)] {
+            assert_eq!(
+                calls(events),
+                [("plot_sine_wave".to_string(), arguments.to_string())],
+                "{how}: the call carries the arguments as written"
+            );
+            assert_eq!(
+                content(events),
+                "",
+                "{how}: nothing of the block leaks into content"
+            );
+            let said: Vec<&Event> = events
+                .iter()
+                .filter(|event| matches!(event, Event::Malformed { .. }))
+                .collect();
+            assert_eq!(
+                said,
+                [&Event::Malformed {
+                    text: Text::default(),
+                    why: MalformedReason::InvalidArguments,
+                }],
+                "{how}: the break is said once, with no bytes"
+            );
+            let (break_at, end_at) = (
+                events
+                    .iter()
+                    .position(|event| matches!(event, Event::Malformed { .. }))
+                    .expect("the break"),
+                events
+                    .iter()
+                    .position(|event| matches!(event, Event::ToolCallEnd { .. }))
+                    .expect("the end"),
+            );
+            assert!(
+                break_at < end_at,
+                "{how}: the break comes before the call's end"
+            );
+            assert_eq!(
+                arguments_of(&events[..break_at], 0),
+                "{\"start_range\": 0, \"end_range\": 2.0 ",
+                "{how}: the fragments before the break are the JSON prefix a strict reader takes"
+            );
+            assert_eq!(finish(events), (FinishReason::Stop, 1), "{how}");
+            assert_eq!(
+                dropped(events),
+                ["<TOOLCALL>", "[", "]", "</TOOLCALL>"],
+                "{how}"
+            );
+            assert_eq!(bytes(events), block, "{how}: every byte in one event");
+        }
+        // One bracket too many after a whole call: the call stands, the residue is reported.
+        let events = run(
+            PROMPT,
+            "<TOOLCALL>[{\"name\": \"get_strategy\", \"arguments\": {\"game\": \"chess\"}]}]</TOOLCALL>",
+        );
+        assert_eq!(
+            calls(&events),
+            [(
+                "get_strategy".to_string(),
+                "{\"game\": \"chess\"}".to_string()
+            )]
+        );
+        assert_eq!(malformed(&events), ["]}]"]);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Malformed {
+                why: MalformedReason::BlockWithoutACompleteCall,
+                ..
+            }
+        )));
+        assert_eq!(content(&events), "");
     }
 
     #[test]

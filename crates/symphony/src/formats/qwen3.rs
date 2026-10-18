@@ -117,6 +117,49 @@ mod tests {
         }
     }
 
+    /// A call whose arguments are not JSON carries them as the model wrote them and says once,
+    /// with no bytes, that they are no JSON; nothing leaks into content, and the pieces say what
+    /// the whole says.
+    #[test]
+    fn arguments_that_are_not_json_stay_the_calls_own_and_are_said_to_be_no_json() {
+        let output = "<tool_call>\n{\"name\": \"plot_sine_wave\", \"arguments\": {\"start_range\": 0, \"end_range\": 2.0 * Math.PI, \"frequency\": 5}}\n</tool_call>";
+        let per_char: Vec<&str> = output
+            .char_indices()
+            .map(|(i, c)| &output[i..i + c.len_utf8()])
+            .collect();
+        let whole = run(&[output], EngineFinish::Stop);
+        let streamed = run(&per_char, EngineFinish::Stop);
+        for (how, events) in [("whole", &whole), ("per character", &streamed)] {
+            assert_eq!(
+                arguments_of(events, 0),
+                "{\"start_range\": 0, \"end_range\": 2.0 * Math.PI, \"frequency\": 5}",
+                "{how}"
+            );
+            assert_eq!(content(events), "", "{how}");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, Event::Malformed { .. }))
+                    .collect::<Vec<_>>(),
+                [&Event::Malformed {
+                    text: Text::default(),
+                    why: MalformedReason::InvalidArguments,
+                }],
+                "{how}: the break is said once, with no bytes"
+            );
+            assert_eq!(bytes(events), output, "{how}");
+            assert!(
+                matches!(events.last(), Some(Event::Finish { tool_calls: 1, .. })),
+                "{how}"
+            );
+        }
+        assert_eq!(
+            joined(whole),
+            joined(streamed),
+            "the pieces say what the whole says"
+        );
+    }
+
     #[test]
     fn thinking_then_content_in_the_fixtures_shape() {
         let output = "<think>\n\n</think>\n\nHello!";

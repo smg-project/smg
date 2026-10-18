@@ -85,7 +85,9 @@ pub enum DropReason {
 pub enum MalformedReason {
     /// The stream ended inside a region that never closed.
     UnterminatedRegion,
-    /// Tool-call arguments did not parse under the format's argument syntax.
+    /// Tool-call arguments did not parse under the format's argument syntax. From a JSON syntax
+    /// the event carries no bytes and stands where the arguments stopped being JSON; the call's
+    /// fragments carry every byte the model wrote.
     InvalidArguments,
     /// A tool call named a function the request did not declare.
     UnknownTool,
@@ -227,11 +229,12 @@ pub enum Event {
         /// The output bytes this event accounts for: the opening marker and the name as written.
         source: Text,
     },
-    /// A fragment of the call's arguments. Concatenated fragments for one index are always a
-    /// prefix of JSON a strict reader accepts (a number out of the reader's range excepted: the
-    /// prefix judge reads a number's grammar, not its size), and equal the final arguments when
-    /// the call ends; a call whose arguments are no whole JSON then says so by a `Malformed`
-    /// event before its end.
+    /// A fragment of the call's arguments. Concatenated fragments for one index are a prefix of
+    /// JSON a strict reader accepts (a number out of the reader's range excepted: the prefix judge
+    /// reads a number's grammar, not its size) until a `Malformed { InvalidArguments }` event of
+    /// no bytes says where they stopped being one, from which the fragments are the model's bytes
+    /// as written (`json` equal to `source`), and equal the final arguments when the call ends: a
+    /// call whose arguments are no whole JSON says so by a `Malformed` event before its end.
     ToolCallArguments {
         /// Which call the fragment belongs to.
         index: u32,

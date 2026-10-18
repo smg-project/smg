@@ -31,8 +31,8 @@
 //! crate did (it refuses the depth, the bytes after the value, the word that is no literal and
 //! the surrogate), which is right for a prefix that is still arriving and wrong at a call's close,
 //! where the fragments are handed over as the model's whole arguments and no strict reader takes
-//! them; where the judge refuses, the readers report the bytes from there as
-//! `Malformed { InvalidArguments }` and nothing twice.
+//! them; where the judge refuses, the readers say so once, by a `Malformed { InvalidArguments }`
+//! event of no bytes, and send the bytes from there as the model wrote them, nothing twice.
 
 use std::borrow::Cow;
 
@@ -288,9 +288,8 @@ impl Prefix {
     ///
     /// A top-level string is not held, though the parser refuses it whole when a surrogate
     /// escape breaks inside it: a string-valued arguments (a stringified call object) streams
-    /// as written, and a surrogate that breaks inside one is the one shape where the pieces have
-    /// said the string's bytes before the break and the whole says nothing. The assemblers say
-    /// so where they choose it.
+    /// as written, and a surrogate that breaks inside one is said once at the break, after the
+    /// string's bytes before it, whole and in pieces alike.
     pub fn held_from(&self) -> Option<usize> {
         let before_the_value = self.open.is_empty()
             && self.expect == Expect::Value

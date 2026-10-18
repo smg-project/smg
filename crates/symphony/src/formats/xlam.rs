@@ -17,7 +17,7 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{Event, Events, Text},
+        event::{Event, Events, MalformedReason, Text},
         input::{EngineFinish, Input},
         parser::Parser,
         Declared,
@@ -54,6 +54,42 @@ mod tests {
             )
             .expect("end");
         out.drain()
+    }
+
+    /// A call whose arguments are not JSON carries them as the model wrote them and says once,
+    /// with no bytes, that they are no JSON; nothing of the list leaks into content.
+    #[test]
+    fn arguments_that_are_not_json_stay_the_calls_own_and_are_said_to_be_no_json() {
+        let list = "[{\"name\": \"plot_sine_wave\", \"arguments\": {\"start_range\": 0, \"end_range\": 2.0 * Math.PI, \"frequency\": 5}}]";
+        let events = run(list);
+        let arguments: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            arguments,
+            "{\"start_range\": 0, \"end_range\": 2.0 * Math.PI, \"frequency\": 5}"
+        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, Event::Content(_))));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::Malformed { .. }))
+                .collect::<Vec<_>>(),
+            [&Event::Malformed {
+                text: Text::default(),
+                why: MalformedReason::InvalidArguments,
+            }]
+        );
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 1, .. })
+        ));
     }
 
     #[test]

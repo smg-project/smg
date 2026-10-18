@@ -12,7 +12,10 @@
 //! - well-formedness: arguments and an end only for a call that has started and not ended, one
 //!   start per index, reasoning text only inside an open region, exactly one `Finish`, counting the
 //!   calls that started, after every fragment each call's arguments so far a prefix of JSON a
-//!   strict reader accepts, which is what prefix stability promises a client, and a call that ended, by its own
+//!   strict reader accepts, which is what prefix stability promises a client, until a
+//!   `Malformed { InvalidArguments }` event of no bytes says where they stopped being one, from
+//!   which every fragment is the model's bytes as written (`json` equal to `source`), so that
+//!   the call carries exactly what the model wrote, and a call that ended, by its own
 //!   terminal, the region's or the end of the stream, has arguments that are whole JSON unless a
 //!   `Malformed` event came while it was open, so that a client is never handed a cut call as a
 //!   whole one without a word, and a fragment that closes a string the arguments left open
@@ -1341,6 +1344,9 @@ const PLAIN_OUTPUTS: &[&str] = &[
 
 /// A bare JSON list of calls, or prose.
 const XLAM_OUTPUTS: &[&str] = &[
+    // Arguments that are not JSON (an expression where a number should be): the call carries
+    // them as written, and says once that they are no JSON.
+    "[{\"name\": \"plot_sine_wave\", \"arguments\": {\"start_range\": 0, \"end_range\": 2.0 * Math.PI, \"frequency\": 5}}]",
     "[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}, \
      {\"name\": \"get_stock_price\", \"arguments\": {}}]",
     "[{\"name\": \"get_weather\", \"argu",
@@ -1377,6 +1383,7 @@ const LFM_OUTPUTS: &[&str] = &[
 /// Mistral's calls: the tool's name, `[ARGS]`, the arguments object alone, one call per opener,
 /// the thought between `[THINK]` and `[/THINK]`.
 const MISTRAL_OUTPUTS: &[&str] = &[
+    "[TOOL_CALLS]plot_sine_wave[ARGS]{\"start_range\": 0, \"end_range\": 2.0 * Math.PI, \"frequency\": 5}",
     "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\", \"days\": [1, 2.5, true, null]}",
     "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\"}[TOOL_CALLS]get_stock_price[ARGS]{}",
     "Let me check.[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\"}",
@@ -1397,6 +1404,7 @@ const MISTRAL_OUTPUTS: &[&str] = &[
 /// Llama Nemotron's calls: one JSON list between `<TOOLCALL>` and `</TOOLCALL>`, content before
 /// it, the thought between `<think>` and `</think>`; the list cut, empty, or not a list.
 const LLAMA_NEMOTRON_OUTPUTS: &[&str] = &[
+    "<TOOLCALL>[{\"name\": \"plot_sine_wave\", \"arguments\": {\"start_range\": 0, \"end_range\": 2.0 * Math.PI, \"frequency\": 5}}]</TOOLCALL>",
     "<TOOLCALL>[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"days\": \
      [1, 2.5, true, null]}}]</TOOLCALL>",
     "<TOOLCALL>[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}, \
@@ -1438,6 +1446,7 @@ const FUNCTION_GEMMA_OUTPUTS: &[&str] = &[
 /// The forced call's arguments alone, as the engine writes them under the gateway's schema for a
 /// named function: whole, wrapped in whitespace, cut short, broken, followed by text, blank.
 const FORCED_OUTPUTS: &[&str] = &[
+    "{\"start_range\": 0, \"end_range\": 2.0 * Math.PI, \"frequency\": 5}",
     "{\"city\": \"Paris\", \"days\": [1, 2.5, true, null]}",
     "  {\"city\": \"Paris\"}\n",
     "{\"city\": \"Par",
@@ -1680,6 +1689,7 @@ const QWEN3_TAGGED_OUTPUTS: &[&str] = &[
 ];
 
 const QWEN3_OUTPUTS: &[&str] = &[
+    "<tool_call>\n{\"name\": \"plot_sine_wave\", \"arguments\": {\"start_range\": 0, \"end_range\": 2.0 * Math.PI, \"frequency\": 5}}\n</tool_call>",
     "",
     "Hello!",
     "<think>\n\n</think>\n\nHello!",
@@ -1772,6 +1782,7 @@ const DEEPSEEK_V3_2_OUTPUTS: &[&str] = &[
 
 /// Llama 3.1's bare call object, a list of them, content, and one cut short.
 const JSON_OUTPUTS: &[&str] = &[
+    "{\"name\": \"plot_sine_wave\", \"arguments\": {\"start_range\": 0, \"end_range\": 2.0 * Math.PI, \"frequency\": 5}}",
     "{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}",
     "[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}, {\"name\": \"get_stock_price\", \"arguments\": {\"ticker\": \"AAPL\"}}]",
     "{\"name\": \"save_note\", \"parameters\": {\"title\": \"計画 🌍\", \"body\": \"a \\\"q\\\" \\\\ b\\nc\"}}",
@@ -2038,6 +2049,9 @@ fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event]) {
     let mut ended: Vec<u32> = Vec::new();
     let mut arguments: Vec<(u32, String)> = Vec::new();
     let mut malformed_inside: Vec<u32> = Vec::new();
+    // The calls whose arguments stopped being JSON, said by a `Malformed { InvalidArguments }`
+    // event of no bytes while the call was open: from there the fragments are the model's bytes.
+    let mut broke: Vec<u32> = Vec::new();
     let mut reasoning_open = false;
     let mut finished = false;
     for (at, event) in events.iter().enumerate() {
@@ -2080,11 +2094,20 @@ fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event]) {
                         place()
                     );
                     so_far.push_str(json);
-                    assert!(
-                        strict_json_prefix(so_far),
-                        "{}: the arguments so far, {so_far:?}, are no prefix of JSON a strict reader accepts",
-                        place()
-                    );
+                    if broke.contains(index) {
+                        assert_eq!(
+                            json,
+                            &source.text,
+                            "{}: a fragment after the break is not the model's bytes as written",
+                            place()
+                        );
+                    } else {
+                        assert!(
+                            strict_json_prefix(so_far),
+                            "{}: the arguments so far, {so_far:?}, are no prefix of JSON a strict reader accepts",
+                            place()
+                        );
+                    }
                 }
             }
             Event::ToolCallEnd { index, .. } => {
@@ -2110,10 +2133,17 @@ fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event]) {
                     );
                 }
             }
-            Event::Malformed { .. } => {
+            Event::Malformed { text, why } => {
                 for index in &started {
                     if !ended.contains(index) && !malformed_inside.contains(index) {
                         malformed_inside.push(*index);
+                    }
+                    if !ended.contains(index)
+                        && *why == MalformedReason::InvalidArguments
+                        && text.text.is_empty()
+                        && !broke.contains(index)
+                    {
+                        broke.push(*index);
                     }
                 }
             }

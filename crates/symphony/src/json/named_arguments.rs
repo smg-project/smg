@@ -63,9 +63,9 @@ impl Object {
         };
         self.emit_new_bytes(close.is_none(), out);
         if close.is_some() {
-            // The object closed. A value the judge refused said so with the bytes; one the
-            // outline ended whole for the partial parser and cut short for a strict reader is
-            // said to be none by a `Malformed` event of no bytes, as the JSON assembler says it.
+            // The object closed. A value the judge refused said so at the break; one the outline
+            // ended whole for the partial parser and cut short for a strict reader is said to be
+            // none by a `Malformed` event of no bytes, as the JSON assembler says it.
             if !self.fragments.refused() && !self.fragments.whole() {
                 out.push(Event::Malformed {
                     text: Text::default(),
@@ -82,8 +82,8 @@ impl Object {
     }
 
     /// No more bytes will come: a closed object has said everything; one that never closed ends
-    /// with what arrived, every byte of it already a fragment or malformed text but for a word it
-    /// still held, which goes first, as the prefix it is, and a `Malformed` event of no bytes
+    /// with what arrived, every byte of it already a fragment but for a word it still held, which
+    /// goes first, as the prefix it is, and a `Malformed` event of no bytes
     /// before the end says that the arguments are no whole value, unless the bytes happen to be
     /// one (a value that is no object, which the template never writes).
     pub(super) fn finish(mut self, out: &mut Events) {
@@ -104,17 +104,17 @@ impl Object {
     }
 
     /// The bytes that arrived since the last call: a fragment for the part that keeps the
-    /// arguments a valid JSON prefix, malformed text for the rest, once the prefix has broken,
-    /// and the bytes the judge may still go back to held while the object is `open`
-    /// ([`Fragments::send`]); they go with the object's close, or when no more bytes can come
-    /// ([`Self::finish`]).
+    /// arguments a valid JSON prefix, the break said once where they stop being one, the rest as
+    /// the model wrote it ([`Fragments::send`], [`Fragments::send_rest`]), and the bytes the judge
+    /// may still go back to held while the object is `open`; they go with the object's close, or
+    /// when no more bytes can come ([`Self::finish`]).
     fn emit_new_bytes(&mut self, open: bool, out: &mut Events) {
         if self
             .fragments
             .send(&self.text, open, self.index, out)
             .is_some()
         {
-            self.fragments.send_malformed(&self.text, out);
+            self.fragments.send_rest(&self.text, self.index, out);
         }
     }
 }
@@ -177,39 +177,46 @@ mod tests {
             .collect()
     }
 
+    /// The fragments sent before the first `Malformed` event, joined; `None` when none came.
+    fn said_before(events: &[Event]) -> Option<String> {
+        let at = events
+            .iter()
+            .position(|event| matches!(event, Event::Malformed { .. }))?;
+        Some(arguments(&events[..at]))
+    }
+
     #[test]
     fn a_word_under_way_is_held_so_the_pieces_say_of_it_what_the_whole_says() {
-        // A word that is no literal is refused from its first letter and nothing of it is sent
-        // as arguments however the bytes were cut; a literal, whole or cut short at the end, is
-        // sent once it is spelled or once nothing more can come; a number streams as far as it
-        // is one. A value that is no object ends with the region.
+        // A word that is no literal is refused from its first letter, so the break stands before
+        // it however the bytes were cut; a literal, whole or cut short at the end, is sent once
+        // it is spelled or once nothing more can come; a number streams as far as it is one.
+        // Every byte of the value is the call's own either way, and a value that broke or was
+        // cut short says so once, with no bytes: `said_before` is what the call had sent by then,
+        // `None` where it had nothing to say. A value that is no object ends with the region.
         let cases = [
-            ("nosuch", "", "nosuch"),
-            ("trash", "", "trash"),
-            ("nul", "nul", ""),
-            ("null", "null", ""),
-            ("1x", "1", "x"),
-            ("{\"a\": nosuch}", "{\"a\": ", "nosuch}"),
-            ("{\"a\": null}", "{\"a\": null}", ""),
-            ("{\"e\": \"\\ud83c\\x\"}", "{\"e\": \"\\ud83c", "\\x\"}"),
-            ("\"ab\\ud83c\\ude00 c\"", "\"ab\\ud83c\\ude00 c\"", ""),
-            ("\tnosuch", "", "\tnosuch"),
-            (" null", " null", ""),
+            ("nosuch", Some("")),
+            ("trash", Some("")),
+            ("nul", Some("nul")),
+            ("null", None),
+            ("1x", Some("1")),
+            ("{\"a\": nosuch}", Some("{\"a\": ")),
+            ("{\"a\": null}", None),
+            ("{\"e\": \"\\ud83c\\x\"}", Some("{\"e\": \"\\ud83c")),
+            ("\"ab\\ud83c\\ude00 c\"", None),
+            ("\tnosuch", Some("")),
+            (" null", None),
         ];
-        for (value, expected_arguments, expected_malformed) in cases {
+        for (value, expected_before) in cases {
             let (whole, _) = run(&[value]);
             let (streamed, _) = run(&per_char(value));
             for (how, events) in [("whole", &whole), ("per character", &streamed)] {
+                assert_eq!(arguments(events), value, "{value:?} {how}: arguments");
                 assert_eq!(
-                    arguments(events),
-                    expected_arguments,
-                    "{value:?} {how}: arguments"
+                    said_before(events),
+                    expected_before.map(str::to_string),
+                    "{value:?} {how}: said before"
                 );
-                assert_eq!(
-                    malformed(events),
-                    expected_malformed,
-                    "{value:?} {how}: malformed"
-                );
+                assert_eq!(malformed(events), "", "{value:?} {how}: no bytes reported");
                 assert_eq!(bytes(events), value, "{value:?} {how}: every byte");
                 assert!(
                     matches!(events.last(), Some(Event::ToolCallEnd { .. })),
@@ -247,12 +254,12 @@ mod tests {
     }
 
     /// What the partial parser tolerates and a strict reader refuses (a value left out, a trailing
-    /// comma) closed the call as whole with arguments no JSON reader takes: the fragments stop at
-    /// the first byte a strict reader refuses, the rest is malformed with `InvalidArguments`, and
-    /// the object's brace ends the call, whole and in pieces alike.
+    /// comma) closed the call as whole with arguments no JSON reader takes: the break is said at
+    /// the first byte a strict reader refuses, with no bytes, the rest of the value stays the
+    /// call's own, and the object's brace ends the call, whole and in pieces alike.
     #[test]
-    fn arguments_a_strict_reader_refuses_are_malformed_from_the_first_such_byte() {
-        for (text, expected_arguments, expected_malformed) in [
+    fn arguments_a_strict_reader_refuses_are_said_to_at_the_first_such_byte_and_kept_whole() {
+        for (text, prefix, rest) in [
             (
                 "{\"city\": \"Paris\", \"days\": ,}",
                 "{\"city\": \"Paris\", \"days\": ",
@@ -264,8 +271,21 @@ mod tests {
             let (by_char, _) = run(&per_char(text));
             for (events, how) in [(&whole, "whole"), (&by_char, "by the character")] {
                 assert_eq!(bytes(events), text, "{text:?} {how}");
-                assert_eq!(arguments(events), expected_arguments, "{text:?} {how}");
-                assert_eq!(malformed(events), expected_malformed, "{text:?} {how}");
+                assert_eq!(
+                    arguments(events),
+                    format!("{prefix}{rest}"),
+                    "{text:?} {how}"
+                );
+                assert_eq!(
+                    said_before(events),
+                    Some(prefix.to_string()),
+                    "{text:?} {how}"
+                );
+                assert_eq!(
+                    malformed(events),
+                    "",
+                    "{text:?} {how}: the break carries no bytes"
+                );
                 assert!(
                     events.iter().all(|event| !matches!(
                         event,
@@ -282,20 +302,22 @@ mod tests {
     }
 
     #[test]
-    fn bytes_that_break_the_json_prefix_are_malformed_from_there_whatever_the_cut() {
+    fn bytes_that_break_the_json_prefix_are_said_to_from_there_whatever_the_cut() {
         // `@` is no JSON value's first byte, so the boundary does not depend on the cut (a word
         // that begins like a literal is held until it is decided, so neither does its boundary).
         let text = "{\"city\": @}";
         let (whole, _) = run(&[text]);
         assert_eq!(bytes(&whole), text);
-        assert_eq!(arguments(&whole), "{\"city\": ");
+        assert_eq!(arguments(&whole), text);
+        assert_eq!(said_before(&whole), Some("{\"city\": ".to_string()));
         assert!(whole.iter().any(|e| matches!(
             e,
-            Event::Malformed { why: MalformedReason::InvalidArguments, text } if text.text == "@}"
+            Event::Malformed { why: MalformedReason::InvalidArguments, text } if text.text.is_empty()
         )));
         for cut in 1..text.len() {
             let (pieces, _) = run(&[&text[..cut], &text[cut..]]);
             assert_eq!(arguments(&pieces), arguments(&whole), "cut at {cut}");
+            assert_eq!(said_before(&pieces), said_before(&whole), "cut at {cut}");
             assert_eq!(bytes(&pieces), text, "cut at {cut}");
         }
     }

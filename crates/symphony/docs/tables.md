@@ -306,9 +306,10 @@ names a function and whose constraint is the JSON schema the older path builds f
 function's `parameters`), so the whole output is that function's arguments, with no marker and no
 name in it. The name comes from the request (`Declared::forcing`), and `ToolCallStart` carries it
 with no source byte of its own. The value streams through `json::Arguments` (`json::forced` drives
-it): the whitespace before it is dropped, a fragment for every byte that keeps it a JSON prefix,
-malformed from the first that does not, and the call's end where the value is whole or where the
-stream ends; the engine reports text after a whole value as text after the object. A required call
+it): the whitespace before it is dropped, a fragment for every byte, a JSON prefix until a
+`Malformed { InvalidArguments }` event of no bytes says where it stopped being one, and the call's
+end where the value is whole or where the stream ends; the engine reports text after a whole value
+as text after the object. A required call
 under the same path is a list of `{"name": …, "parameters": …}` objects, which the `json` table
 reads.
 

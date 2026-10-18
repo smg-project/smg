@@ -59,8 +59,10 @@ The whole-JSON promise breaks under three names, so that an allowance is exact: 
 (a call ended with no arguments fragment at all), `tolerated-json` (arguments whose shape closed,
 or one scalar token, but which JSON refuses: a value left out, a trailing comma, an escape JSON
 lacks, a short `\u`, whitespace outside JSON's, a number or a word cut short) and `whole-json` (the
-committed prefix of a value that never closed). A name is a shape, from any reader on every
-target, not a reader's own. The nightly workflow allows the shapes of the classes reported and
+committed prefix of a value that never closed). `json-prefix` holds until a call's
+`Malformed { InvalidArguments }` event of no bytes says where its arguments stopped being JSON;
+from there `verbatim-after-break` asks that every fragment be the model's bytes as written. A name
+is a shape, from any reader on every target, not a reader's own. The nightly workflow allows the shapes of the classes reported and
 not yet fixed, named in `symphony-fuzz.yml`; a name leaves the list with its fix, and a new
 reader's breach of an allowed shape surfaces then.
 

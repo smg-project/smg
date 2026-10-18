@@ -6,8 +6,9 @@
 //! output, and the stream's end closes the call.
 //!
 //! The value reads through [`Arguments`]: the whitespace before it is dropped, its bytes are
-//! fragments while they keep it a JSON prefix, and the rest is `Malformed { InvalidArguments }`.
-//! The value's first byte starts the call, named by the function the request forces
+//! fragments, a JSON prefix until a `Malformed { InvalidArguments }` event of no bytes says where
+//! they stopped being one, and the model's own from there to the end of the stream. The value's
+//! first byte starts the call, named by the function the request forces
 //! ([`Declared::forced`]) and with no source byte of its own, since no output byte names it; the
 //! call ends where the value is whole, or with the stream. Bytes after a whole value are not
 //! taken: the engine reports them as text after the object. Without a forced function the output
