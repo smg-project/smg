@@ -20,13 +20,11 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::Instrument;
 
-use super::{
-    sse::SSE_CHANNEL_BUFFER,
-    sse_rechunk::{NoopObserver, SseRechunker, IDLE_FLUSH},
-};
+use super::stream_failure::{mark_head_success_recorded, note_sent, RelaySource, UpstreamCut};
 use crate::{
-    routers::http::stream_failure::{
-        mark_head_success_recorded, note_sent, RelaySource, UpstreamCut,
+    routers::common::{
+        sse::SSE_CHANNEL_BUFFER,
+        sse_rechunk::{NoopObserver, SseRechunker, IDLE_FLUSH},
     },
     worker::{GuardedStream, WorkerLoadGuard},
 };
@@ -36,6 +34,38 @@ use crate::{
 pub(crate) struct ChunkStep {
     pub(crate) bytes: Bytes,
     pub(crate) last: bool,
+}
+
+/// How the relay reads each upstream chunk: as it is; through the SSE
+/// re-chunker the regular router's provider profile asks for; or through
+/// the decode leg's hook (the prefill log-probability merge and the
+/// `[DONE]` cut). One of the three, so a re-chunker's held text can never be
+/// cut short by a hook that ends the relay.
+pub(crate) enum ChunkMode {
+    Plain,
+    Rechunk(Box<SseRechunker<NoopObserver>>),
+    Hook(Box<dyn FnMut(Bytes) -> ChunkStep + Send>),
+}
+
+impl ChunkMode {
+    /// Whether the re-chunker's observer ended the stream (its error event
+    /// was the last frame).
+    fn stopped(&self) -> bool {
+        matches!(self, Self::Rechunk(rechunker) if rechunker.stopped().is_some())
+    }
+
+    /// Whether the re-chunker holds text an idle flush should release.
+    fn has_pending(&self) -> bool {
+        matches!(self, Self::Rechunk(rechunker) if rechunker.has_pending())
+    }
+
+    /// The re-chunker's tail at the stream's end, or nothing.
+    fn finish(&mut self) -> Bytes {
+        match self {
+            Self::Rechunk(rechunker) => rechunker.finish(),
+            Self::Plain | Self::Hook(_) => Bytes::new(),
+        }
+    }
 }
 
 /// The relay of one streaming answer.
@@ -52,10 +82,8 @@ pub(crate) struct Relay {
     pub(crate) guard: WorkerLoadGuard,
     /// The response headers, prepared by the caller.
     pub(crate) headers: HeaderMap,
-    /// The regular relay's SSE re-chunker, when its provider asks for one.
-    pub(crate) rechunker: Option<SseRechunker<NoopObserver>>,
-    /// The decode relay's per-chunk read, before anything is sent.
-    pub(crate) per_chunk: Option<Box<dyn FnMut(Bytes) -> ChunkStep + Send>>,
+    /// How each chunk is read before it is sent.
+    pub(crate) mode: ChunkMode,
 }
 
 /// Relay `stream` to the client as the response's body. The head's success
@@ -71,8 +99,7 @@ where
         source,
         guard,
         headers,
-        mut rechunker,
-        mut per_chunk,
+        mut mode,
     } = relay;
     // Bounded channel applies backpressure: a slow client makes the
     // relay await on `send` instead of buffering the whole response.
@@ -111,7 +138,7 @@ where
             loop {
                 tokio::select! {
                     chunk = stream.next() => {
-                        if rechunker.is_some() {
+                        if let ChunkMode::Rechunk(_) = mode {
                             idle.as_mut().reset(tokio::time::Instant::now() + IDLE_FLUSH);
                         }
                         match chunk {
@@ -119,16 +146,13 @@ where
                             // h2 DATA frame toward the client.
                             Some(Ok(bytes)) if bytes.is_empty() => {}
                             Some(Ok(bytes)) => {
-                                let (bytes, last) = match per_chunk.as_mut() {
-                                    Some(read) => {
+                                let (bytes, last) = match &mut mode {
+                                    ChunkMode::Plain => (bytes, false),
+                                    ChunkMode::Rechunk(rechunker) => (rechunker.feed(bytes), false),
+                                    ChunkMode::Hook(read) => {
                                         let step = read(bytes);
                                         (step.bytes, step.last)
                                     }
-                                    None => (bytes, false),
-                                };
-                                let bytes = match rechunker.as_mut() {
-                                    Some(r) => r.feed(bytes),
-                                    None => bytes,
                                 };
                                 if !bytes.is_empty() {
                                     relayed += bytes.len() as u64;
@@ -141,21 +165,20 @@ where
                                 // sentinel), or the observer did: its error
                                 // event was the last frame, and letting go of
                                 // the upstream cancels the engine's work.
-                                if last || rechunker.as_ref().is_some_and(|r| r.stopped().is_some()) {
+                                if last || mode.stopped() {
                                     break;
                                 }
                             }
                             Some(Err(e)) => {
-                                if let Some(tail) = rechunker.as_mut().map(SseRechunker::finish) {
-                                    if !tail.is_empty() {
-                                        note_sent(&mut sent_tail, &tail);
-                                        let _ = tx.send(Ok(tail)).await;
-                                    }
+                                let tail = mode.finish();
+                                if !tail.is_empty() {
+                                    note_sent(&mut sent_tail, &tail);
+                                    let _ = tx.send(Ok(tail)).await;
                                 }
                                 // The observer ended the stream on its tail: its
                                 // error event was the last frame. The cut stays the
                                 // worker's to account.
-                                if rechunker.as_ref().is_some_and(|r| r.stopped().is_some()) {
+                                if mode.stopped() {
                                     if status.is_success() {
                                         source.account(&UpstreamCut::of(&e), relayed);
                                     }
@@ -183,23 +206,23 @@ where
                                 break;
                             }
                             None => {
-                                if let Some(tail) = rechunker.as_mut().map(SseRechunker::finish) {
-                                    if !tail.is_empty() {
-                                        let _ = tx.send(Ok(tail)).await;
-                                    }
+                                let tail = mode.finish();
+                                if !tail.is_empty() {
+                                    let _ = tx.send(Ok(tail)).await;
                                 }
                                 break;
                             }
                         }
                     },
-                    () = &mut idle, if rechunker.as_ref().is_some_and(SseRechunker::has_pending) => {
+                    () = &mut idle, if mode.has_pending() => {
                         idle.as_mut().reset(tokio::time::Instant::now() + IDLE_FLUSH);
-                        if let Some(tail) = rechunker.as_mut().map(SseRechunker::flush_pending) {
+                        if let ChunkMode::Rechunk(rechunker) = &mut mode {
+                            let tail = rechunker.flush_pending();
                             if !tail.is_empty() && tx.send(Ok(tail)).await.is_err() {
                                 break;
                             }
                         }
-                        if rechunker.as_ref().is_some_and(|r| r.stopped().is_some()) {
+                        if mode.stopped() {
                             break;
                         }
                     }

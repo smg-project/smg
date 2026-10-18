@@ -6,6 +6,7 @@ pub(crate) mod request_body;
 pub(crate) mod request_stream;
 pub mod router;
 pub(crate) mod stream_failure;
+pub(crate) mod stream_relay;
 
 use axum::response::Response;
 use openai_protocol::messages::CreateMessageRequest;

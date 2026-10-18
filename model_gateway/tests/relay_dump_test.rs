@@ -184,6 +184,43 @@ async fn the_regular_router_relays_the_scripted_streams_byte_for_byte() {
     ctx.shutdown().await;
 }
 
+/// The frames the client receives for `body` on `path`, in order.
+async fn frames(ctx: &AppTestContext, path: &str, body: Value) -> Vec<Vec<u8>> {
+    let app = ctx.create_app();
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let mut body = response.into_body();
+    let mut frames = Vec::new();
+    while let Some(frame) = body.frame().await {
+        if let Ok(data) = frame.unwrap().into_data() {
+            frames.push(data.to_vec());
+        }
+    }
+    frames
+}
+
+/// The script's empty chunk reaches the client as no frame at all from the
+/// decode leg, as from the regular relay: an empty upstream chunk must not
+/// become an empty frame toward the client.
+#[tokio::test]
+async fn the_decode_leg_sends_no_empty_frame_for_an_empty_upstream_chunk() {
+    let ctx = pd_app(18904, 18905).await;
+    let frames = frames(&ctx, "/v1/chat/completions", chat("mock-model")).await;
+    assert!(!frames.is_empty(), "no frames at all");
+    assert!(
+        frames.iter().all(|frame| !frame.is_empty()),
+        "an empty frame reached the client: {:?}",
+        frames.iter().map(Vec::len).collect::<Vec<_>>()
+    );
+    ctx.shutdown().await;
+}
+
 #[tokio::test]
 async fn the_disaggregated_router_relays_the_decode_streams_byte_for_byte() {
     let ctx = pd_app(18902, 18903).await;

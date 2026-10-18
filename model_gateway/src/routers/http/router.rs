@@ -71,7 +71,6 @@ use crate::{
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{is_retryable_response, is_retryable_status, RetryExecutor},
             sse_rechunk::{NoopObserver, SseRechunker},
-            stream_relay::{relay_streaming_body, Relay},
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
         error::{self, extract_error_code_from_response},
@@ -84,6 +83,7 @@ use crate::{
             },
             request_stream::{CappedBodyStream, StreamProgress},
             stream_failure::{head_success_recorded, RelaySource},
+            stream_relay::{relay_streaming_body, ChunkMode, Relay},
         },
         BodyPolicy, RouterTrait,
     },
@@ -1427,8 +1427,9 @@ impl Router {
                     source,
                     guard: load_guard,
                     headers: response_headers,
-                    rechunker,
-                    per_chunk: None,
+                    mode: rechunker.map_or(ChunkMode::Plain, |rechunker| {
+                        ChunkMode::Rechunk(Box::new(rechunker))
+                    }),
                 },
             );
             mark_upstream_answer(&mut response);

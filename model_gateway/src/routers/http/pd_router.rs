@@ -36,6 +36,7 @@ use tracing::{debug, error, warn};
 use super::{
     request_body::RawBody,
     stream_failure::{head_success_recorded, RelaySource},
+    stream_relay::{relay_streaming_body, ChunkMode, ChunkStep, Relay},
 };
 use crate::{
     config::types::RetryConfig,
@@ -63,7 +64,6 @@ use crate::{
             retry::{is_retryable_response, RetryExecutor},
             serialize_json_sized,
             sse::SseEncoder,
-            stream_relay::{relay_streaming_body, ChunkStep, Relay},
             trim_serialization_slack,
         },
         error,
@@ -2281,8 +2281,7 @@ impl PDRouter {
                 source,
                 guard: decode_guard,
                 headers: response_headers,
-                rechunker: None,
-                per_chunk: Some(per_chunk),
+                mode: ChunkMode::Hook(per_chunk),
             },
         )
     }
