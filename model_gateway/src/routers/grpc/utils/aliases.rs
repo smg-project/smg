@@ -45,7 +45,6 @@ pub const ALIASES: [(&str, Table); 19] = [
     ("deepseek", Table::DeepSeekV3),
     ("deepseek32", Table::DeepSeekV3_2),
     ("deepseek_v41", Table::DeepSeekV4_1),
-    ("pythonic", Table::Llama4),
     ("llama4_pythonic", Table::Llama4),
     ("minimax", Table::MinimaxM2),
     ("muse", Table::MuseSpark),
@@ -101,6 +100,13 @@ pub const UNANSWERED: [(&str, &str); 13] = [
         "deepseek_r1",
         "DeepSeek R1's thought, which the R1 distills share; the tool-call name decides: \
          deepseek reads the R1 line with DeepSeek V3's table",
+    ),
+    (
+        "pythonic",
+        "Llama 4's Python list of calls, which the llama4 table reads, and the name the \
+         DeepSeek R1 line carries while its own table is pending: the alias arrives once \
+         every family that names pythonic has a table; llama4_pythonic names the Llama 4 \
+         table exactly",
     ),
     (
         "kimi",

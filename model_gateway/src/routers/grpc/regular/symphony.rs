@@ -1880,12 +1880,15 @@ mod tests {
             named_table(&pair(Some("kimi_k3"), Some("qwen3"))),
             Some(Table::KimiK3)
         );
-        // The older `pythonic` parser's family reads with the Llama 4 table.
+        // The older `pythonic` parser's name serves more than one family, so it keeps the
+        // legacy parsers until every one of them has a table; the Llama 4 table answers to
+        // its exact alias.
+        assert_eq!(named_table(&pair(Some("pythonic"), None)), None);
+        assert_eq!(named_table(&pair(Some("pythonic"), Some("qwen3"))), None);
         assert_eq!(
-            named_table(&pair(Some("pythonic"), None)),
+            named_table(&pair(Some("llama4_pythonic"), None)),
             Some(Table::Llama4)
         );
-        assert_eq!(named_table(&pair(Some("pythonic"), Some("qwen3"))), None);
         // The older `llama` parser's format is the json table's.
         assert_eq!(named_table(&pair(Some("llama"), None)), Some(Table::Json));
         // The older DeepSeek pairings read with the tables, the thought included: the R1 line
@@ -1996,7 +1999,6 @@ mod tests {
             ("deepseek", "deepseek_v3"),
             ("deepseek31", "deepseek_v3.1"),
             ("deepseek_v31", "deepseek_v3.1"),
-            ("pythonic", "llama4"),
         ];
         let mut legacy: Vec<(String, &str)> = tools
             .list_parsers()
