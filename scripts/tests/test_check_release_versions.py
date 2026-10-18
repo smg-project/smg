@@ -257,16 +257,18 @@ def test_the_repo_reads_its_root_whatever_git_variables_the_caller_carries(mod, 
     assert r.show("HEAD", "Cargo.toml") is not None
 
 
-def test_a_shallow_file_the_caller_carries_does_not_cut_the_history(
-    mod, repo, monkeypatch, tmp_path
+@pytest.mark.parametrize("variable", ["GIT_SHALLOW_FILE", "GIT_GRAFT_FILE"])
+def test_a_shallow_or_graft_file_the_caller_carries_does_not_cut_the_history(
+    mod, repo, monkeypatch, tmp_path, variable
 ):
-    """`GIT_SHALLOW_FILE` makes git treat the listed commits as roots, so an inherited one
-    naming HEAD would cut the commits between the tag and HEAD from the history and with
-    them the bump they ask for; the tool drops it."""
+    """`GIT_SHALLOW_FILE` and `GIT_GRAFT_FILE` make git treat the listed commits as roots
+    (a graft line naming HEAD alone gives it no parents), so an inherited one would cut
+    the commits between the tag and HEAD from the history and with them the bump they
+    ask for; the tool drops both."""
     head = git(repo, "rev-parse", "HEAD").strip()
-    shallow = tmp_path / "shallow"
-    shallow.write_text(head + "\n")
-    monkeypatch.setenv("GIT_SHALLOW_FILE", str(shallow))
+    roots = tmp_path / "roots"
+    roots.write_text(head + "\n")
+    monkeypatch.setenv(variable, str(roots))
     subjects = [subject for subject, _ in mod.Repo(repo).commits_since("v1.0.0", ["crates/alpha/"])]
     assert any(subject.startswith("feat(alpha)") for subject in subjects), subjects
 
