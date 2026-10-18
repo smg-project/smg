@@ -914,6 +914,10 @@ jobs:
           # regression; the completions, embeddings, realtime and Go suites drive
           # paths of their own, named below where a change reaches them.
           CORE = "chat-completions chat-symphony agentic vendor"
+          # The core, and the Go suite: the Go library links the gateway crate whole
+          # and calls these paths itself (the policies and the KV index behind the
+          # cache-aware one, the crypto provider, the allocator setting).
+          CORE_GO = CORE + " go-bindings"
           # One engine's own files reach the lanes with a row for that engine.
           SGLANG = "chat-completions chat-symphony completions embeddings agentic go-bindings"
           VLLM = "chat-completions chat-symphony completions embeddings realtime"
@@ -1040,14 +1044,14 @@ jobs:
               ("model_gateway/src/endpoints/conversations/**",   "agentic vendor"),
               ("model_gateway/src/endpoints/**",                 CORE),
               ("model_gateway/src/middleware/**",                CORE),
-              ("model_gateway/src/observability/**",             CORE),
+              ("model_gateway/src/observability/**",             CORE_GO),
               ("model_gateway/src/rate_limit/**",                CORE),
-              ("model_gateway/src/policies/**",                  CORE),
+              ("model_gateway/src/policies/**",                  CORE_GO),
               ("model_gateway/src/mesh/**",                      CORE),
               ("model_gateway/src/mesh_discovery/**",            CORE),
               ("model_gateway/src/service_discovery/**",         CORE),
               ("model_gateway/src/wasm/**",                      CORE),
-              ("model_gateway/src/tls.rs",                       CORE),
+              ("model_gateway/src/tls.rs",                       CORE_GO),
               ("model_gateway/src/version.rs",                   CORE),
               ("model_gateway/src/posture.rs",                   CORE),
               ("model_gateway/src/tenant.rs",                    CORE),
@@ -1070,7 +1074,7 @@ jobs:
               ("crates/grpc_client/go/**",                       NONE),
               ("crates/mock_worker/**",                          NONE),
               ("crates/radix_tree/**",                           NONE),
-              ("crates/tokenizer/**",                            NONE),
+              ("crates/tokenizer/**",                            "go-bindings"),
               # Symphony and the response templates it compiles: read behind
               # --parser symphony, the Symphony lane's flag
               ("crates/symphony/**",                             "chat-symphony"),
@@ -1079,15 +1083,22 @@ jobs:
               ("crates/engine_servicer/**",                      "chat-completions"),
               ("crates/engine_zmq_client/**",                    "chat-completions"),
               ("crates/engine_zmq_adapter/**",                   "chat-completions"),
-              # the Responses tools and the provider routers
+              # the Responses tools, and the provider routers' own subtrees; the rest
+              # of that crate (retry, SSE, headers, realtime, the OpenAI bridge) is
+              # re-exported and called by the gateway's own routers, on every lane
               ("crates/mcp/**",                                  "agentic vendor"),
-              ("crates/external_router/**",                      "agentic vendor"),
-              # crates the gateway alone links, on every suite's path: the core (the
-              # Go library links the tool parser too)
-              ("crates/tool_parser/**",                          CORE + " go-bindings"),
+              ("crates/external_router/src/openai/**",           "agentic vendor"),
+              ("crates/external_router/src/anthropic/**",        "agentic vendor"),
+              ("crates/external_router/src/gemini/**",           "agentic vendor"),
+              ("crates/external_router/**",                      FULL),
+              # crates the gateway links on every suite's path: the core; the Go
+              # library links the tool parser directly too (and the tokenizer, the
+              # protocols and the gRPC client: the tokenizer's row names the Go lane,
+              # the other two reach every lane)
+              ("crates/tool_parser/**",                          CORE_GO),
               ("crates/reasoning_parser/**",                     CORE),
               ("crates/multimodal/**",                           CORE),
-              ("crates/kv_index/**",                             CORE),
+              ("crates/kv_index/**",                             CORE_GO),
               ("crates/data_connector/**",                       CORE),
               ("crates/auth/**",                                 CORE),
               ("crates/mesh/**",                                 CORE),
