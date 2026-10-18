@@ -4,6 +4,15 @@
 //! "close" to a valid token produces an unrelated hash, so there's no
 //! byte-at-a-time timing signal to recover from a plain hash-keyed lookup,
 //! unlike comparing raw secrets.
+//!
+//! A bearer that is one of the gateway's own keys ends here: once the caller
+//! is identified ([`DataPlaneCaller`]) the `Authorization` header is removed
+//! from the request, so no route downstream reads the gateway's key as the
+//! caller's credential for an upstream (a self-hosted worker, a third-party
+//! provider): those get their own configured key, as they do for a request
+//! that carried no header. A bearer that is not a gateway key is refused
+//! before that, so a request that reaches a route with its `Authorization`
+//! still on it was not authenticated by this middleware (auth disabled).
 
 use std::collections::HashMap;
 
@@ -82,7 +91,9 @@ fn hash_key(key: &str) -> [u8; 32] {
 }
 
 /// Middleware to validate Bearer token against configured API key(s).
-/// Only active when the router has at least one key configured.
+/// Only active when the router has at least one key configured. A matched
+/// key leaves the request with the caller's identity in its place (see the
+/// module doc).
 pub async fn auth_middleware(
     State(auth_config): State<AuthConfig>,
     mut request: Request<Body>,
@@ -116,6 +127,9 @@ pub async fn auth_middleware(
         request
             .extensions_mut()
             .insert(DataPlaneCaller::new(tenant_key.clone()));
+        // The gateway's key is spent: it identifies the caller and nothing
+        // else, and it must not travel on as an upstream's credential.
+        request.headers_mut().remove(header::AUTHORIZATION);
     }
 
     next.run(request).await
@@ -177,6 +191,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::routers::common::header_utils::extract_auth_header;
 
     async fn handler(request: Request<Body>) -> impl IntoResponse {
         request
@@ -190,6 +205,131 @@ mod tests {
         Router::new()
             .route("/", get(handler))
             .route_layer(from_fn_with_state(auth_config, auth_middleware))
+    }
+
+    /// Whether the request still carries an `Authorization` header when it
+    /// reaches the route.
+    async fn authorization_seen(request: Request<Body>) -> impl IntoResponse {
+        if request.headers().contains_key(header::AUTHORIZATION) {
+            "present"
+        } else {
+            "absent"
+        }
+    }
+
+    fn header_reporting_app(auth_config: AuthConfig) -> Router {
+        Router::new()
+            .route("/", get(authorization_seen))
+            .route_layer(from_fn_with_state(auth_config, auth_middleware))
+    }
+
+    async fn authorization_after(auth_config: AuthConfig, bearer: Option<&str>) -> String {
+        let mut request = Request::builder().uri("/");
+        if let Some(bearer) = bearer {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+        }
+        let response = header_reporting_app(auth_config)
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        body_text(response).await
+    }
+
+    /// A matched gateway key ends at the middleware: the route sees the
+    /// caller's identity and no `Authorization` header, so nothing downstream
+    /// forwards the gateway's key to an upstream as the caller's credential.
+    #[tokio::test]
+    async fn a_matched_gateway_key_does_not_travel_past_the_middleware() {
+        let shared = AuthConfig::new(Some("shared-secret".to_string()));
+        assert_eq!(
+            authorization_after(shared, Some("shared-secret")).await,
+            "absent"
+        );
+
+        let tenant = AuthConfig::with_tenant_keys(
+            None,
+            &[TenantApiKeyEntry {
+                tenant_id: "team-red".to_string(),
+                key: "team-red-secret".to_string(),
+            }],
+        );
+        assert_eq!(
+            authorization_after(tenant, Some("team-red-secret")).await,
+            "absent"
+        );
+    }
+
+    /// The credential a route sends upstream, as the HTTP router and the
+    /// external router compute it (`header_utils::extract_auth_header`:
+    /// the caller's header, else the upstream's configured key).
+    async fn upstream_credential(request: Request<Body>) -> impl IntoResponse {
+        let configured = "provider-key".to_string();
+        extract_auth_header(Some(request.headers()), Some(&configured))
+            .and_then(|value| value.to_str().ok().map(str::to_string))
+            .unwrap_or_else(|| "none".to_string())
+    }
+
+    async fn upstream_credential_after(auth_config: AuthConfig, bearer: Option<&str>) -> String {
+        let mut request = Request::builder().uri("/");
+        if let Some(bearer) = bearer {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+        }
+        let response = Router::new()
+            .route("/", get(upstream_credential))
+            .route_layer(from_fn_with_state(auth_config, auth_middleware))
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        body_text(response).await
+    }
+
+    /// What leaves for the upstream: under gateway auth the configured
+    /// provider key, never the gateway key the caller presented; without
+    /// gateway auth the caller's own key, as before, and the configured key
+    /// when the caller sent none.
+    #[tokio::test]
+    async fn the_upstream_gets_its_configured_key_under_gateway_auth_and_the_callers_without() {
+        let gateway = AuthConfig::with_tenant_keys(
+            Some("shared-secret".to_string()),
+            &[TenantApiKeyEntry {
+                tenant_id: "team-red".to_string(),
+                key: "team-red-secret".to_string(),
+            }],
+        );
+        assert_eq!(
+            upstream_credential_after(gateway.clone(), Some("shared-secret")).await,
+            "Bearer provider-key"
+        );
+        assert_eq!(
+            upstream_credential_after(gateway, Some("team-red-secret")).await,
+            "Bearer provider-key"
+        );
+        assert_eq!(
+            upstream_credential_after(AuthConfig::new(None), Some("callers-own-provider-key"))
+                .await,
+            "Bearer callers-own-provider-key"
+        );
+        assert_eq!(
+            upstream_credential_after(AuthConfig::new(None), None).await,
+            "Bearer provider-key"
+        );
+    }
+
+    /// With no key configured the middleware authenticates nothing and leaves
+    /// the header where it is: a caller's own upstream key still passes
+    /// through.
+    #[tokio::test]
+    async fn without_a_configured_key_the_header_stays_on_the_request() {
+        assert_eq!(
+            authorization_after(AuthConfig::new(None), Some("a-providers-own-key")).await,
+            "present"
+        );
+        assert_eq!(
+            authorization_after(AuthConfig::new(None), None).await,
+            "absent"
+        );
     }
 
     async fn body_text(response: Response) -> String {
