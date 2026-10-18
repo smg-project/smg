@@ -266,6 +266,7 @@ pub(super) fn dispatch() -> context::DispatchMetadata {
         created: 1,
         weight_version: None,
         tenant_key: None,
+        dispatched_at: Instant::now(),
     }
 }
 

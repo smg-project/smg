@@ -506,6 +506,7 @@ mod tests {
             created: 1,
             weight_version: None,
             tenant_key: None,
+            dispatched_at: std::time::Instant::now(),
         }
     }
 

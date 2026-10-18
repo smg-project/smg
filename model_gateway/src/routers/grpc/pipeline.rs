@@ -79,7 +79,7 @@ use crate::{
     observability::{
         cache_trace,
         metrics::{bool_to_static_str, metrics_labels, Metrics},
-        tenant_usage::{self, RequestUsage},
+        tenant_usage,
     },
     policies::PolicyRegistry,
     rate_limit::{RateLimitManager, UsageSettlement},
@@ -940,25 +940,18 @@ impl RequestPipeline {
     /// Book a buffered response to its tenant's usage row, when accounting
     /// is on: the token counts the caller passes (the engine's, see
     /// `engine_counts_booked`, where the response's usage differs), the time
-    /// since the successful attempt's start. A stream books itself at its
-    /// last token. A request is one engine round trip: a Responses call whose
-    /// tool loop runs several iterations books each of them, buffered or
-    /// streamed.
-    fn record_usage(
-        dctx: &DispatchContext,
-        prompt_tokens: u32,
-        completion_tokens: u32,
-        start: Instant,
-    ) {
+    /// since the successful attempt's dispatch (`DispatchMetadata::usage`),
+    /// not since the attempt's start: admission and worker selection are the
+    /// router's time, which `record_duration` keeps. A stream books itself
+    /// at its last token. A request is one engine round trip: a Responses
+    /// call whose tool loop runs several iterations books each of them,
+    /// buffered or streamed.
+    fn record_usage(dctx: &DispatchContext, prompt_tokens: u32, completion_tokens: u32) {
         if let Some(dispatch) = dctx.dispatch.as_ref() {
             tenant_usage::record(
                 dispatch.usage_tenant(),
                 &dispatch.model,
-                RequestUsage {
-                    prompt_tokens: u64::from(prompt_tokens),
-                    completion_tokens: u64::from(completion_tokens),
-                    elapsed: start.elapsed(),
-                },
+                dispatch.usage(prompt_tokens, completion_tokens),
             );
         }
     }
@@ -1160,7 +1153,7 @@ impl RequestPipeline {
                     .await;
                     let (prompt_tokens, completion_tokens) =
                         Self::engine_counts_booked(&dctx.response);
-                    Self::record_usage(&dctx, prompt_tokens, completion_tokens, start);
+                    Self::record_usage(&dctx, prompt_tokens, completion_tokens);
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
@@ -1225,7 +1218,7 @@ impl RequestPipeline {
                         response.first().map_or(0, |r| r.meta_info.prompt_tokens);
                     let completion_tokens =
                         response.iter().map(|r| r.meta_info.completion_tokens).sum();
-                    Self::record_usage(&dctx, actual_input_tokens, completion_tokens, start);
+                    Self::record_usage(&dctx, actual_input_tokens, completion_tokens);
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     let body = generate_response_body(single_prompt, n, response);
                     Self::routed_response(&dctx, axum::Json(body).into_response())
@@ -1276,7 +1269,6 @@ impl RequestPipeline {
                         &dctx,
                         usage.map_or(0, |u| u.prompt_tokens),
                         usage.map_or(0, |u| u.completion_tokens),
-                        start,
                     );
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(&dctx, axum::Json(response).into_response())
@@ -1327,7 +1319,7 @@ impl RequestPipeline {
                     .await;
                     let (prompt_tokens, completion_tokens) =
                         Self::engine_counts_booked(&dctx.response);
-                    Self::record_usage(&dctx, prompt_tokens, completion_tokens, start);
+                    Self::record_usage(&dctx, prompt_tokens, completion_tokens);
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
@@ -1377,7 +1369,7 @@ impl RequestPipeline {
                     .await;
                     let input_tokens =
                         u32::try_from(response.usage.input_tokens).unwrap_or(u32::MAX);
-                    Self::record_usage(&dctx, input_tokens, 0, start);
+                    Self::record_usage(&dctx, input_tokens, 0);
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
@@ -1413,7 +1405,7 @@ impl RequestPipeline {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Embedding(response)) => {
-                    Self::record_usage(&dctx, response.usage.prompt_tokens, 0, start);
+                    Self::record_usage(&dctx, response.usage.prompt_tokens, 0);
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
@@ -1453,7 +1445,7 @@ impl RequestPipeline {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Transcription { text, format }) => {
-                    Self::record_usage(&dctx, 0, 0, start);
+                    Self::record_usage(&dctx, 0, 0);
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(
                         &dctx,
@@ -1494,7 +1486,7 @@ impl RequestPipeline {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Classify(response)) => {
-                    Self::record_usage(&dctx, response.usage.prompt_tokens, 0, start);
+                    Self::record_usage(&dctx, response.usage.prompt_tokens, 0);
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
@@ -1545,11 +1537,11 @@ impl RequestPipeline {
                     "Streaming is not supported in this context".to_string(),
                 ))
             }
-            Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
+            Ok(RunOutcome::Final(mut dctx, _)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Chat(response)) => {
                     let (prompt_tokens, completion_tokens) =
                         Self::engine_counts_booked(&dctx.response);
-                    Self::record_usage(&dctx, prompt_tokens, completion_tokens, start);
+                    Self::record_usage(&dctx, prompt_tokens, completion_tokens);
                     Ok(response)
                 }
                 Some(_) => {
@@ -1598,7 +1590,7 @@ impl RequestPipeline {
             ctx.input.tenant_request_meta = tenant_request_meta;
             self.run(ctx, None, None)
         };
-        let (mut dctx, start) = match run.await {
+        let mut dctx = match run.await {
             Ok(RunOutcome::Early(response)) => {
                 error!(
                     function = "execute_harmony_responses",
@@ -1606,7 +1598,7 @@ impl RequestPipeline {
                 );
                 return Err(response);
             }
-            Ok(RunOutcome::Final(dctx, start)) => (dctx, start),
+            Ok(RunOutcome::Final(dctx, _)) => dctx,
             Err(response) => return Err(response),
         };
 
@@ -1625,7 +1617,7 @@ impl RequestPipeline {
                 )
             })?;
         let usage = result.usage();
-        Self::record_usage(&dctx, usage.prompt_tokens, usage.completion_tokens, start);
+        Self::record_usage(&dctx, usage.prompt_tokens, usage.completion_tokens);
         Ok(result)
     }
 
@@ -1653,7 +1645,7 @@ impl RequestPipeline {
             ctx.input.tenant_request_meta = tenant_request_meta;
             self.run_signalling(ctx, None, None, stream_start)
         };
-        let (mut dctx, start) = match run.await {
+        let mut dctx = match run.await {
             Ok(RunOutcome::Early(response)) => {
                 error!(
                     function = "execute_harmony_responses_streaming",
@@ -1661,7 +1653,7 @@ impl RequestPipeline {
                 );
                 return Err(response);
             }
-            Ok(RunOutcome::Final(dctx, start)) => (dctx, start),
+            Ok(RunOutcome::Final(dctx, _)) => dctx,
             Err(response) => return Err(response),
         };
 
@@ -1677,7 +1669,7 @@ impl RequestPipeline {
         })?;
 
         let load_guards = dctx.load_guards.take();
-        let usage_booking = StreamUsageBooking::new(&dctx, start);
+        let usage_booking = StreamUsageBooking::new(&dctx);
 
         Ok((execution_result, load_guards, usage_booking))
     }
@@ -1688,38 +1680,31 @@ impl RequestPipeline {
 /// books the iteration's usage once it knows it, as the other streams book
 /// themselves at their last token.
 pub(crate) struct StreamUsageBooking {
-    /// The tenant the usage is booked to; `None` while accounting is off,
-    /// so the request path clones nothing then.
-    tenant: Option<String>,
-    model: String,
-    start: Instant,
+    /// The attempt's dispatch metadata (the tenant, the model, the instant
+    /// of the dispatch); `None` while accounting is off, so the request
+    /// path clones nothing then.
+    dispatch: Option<DispatchMetadata>,
 }
 
 impl StreamUsageBooking {
-    fn new(dctx: &DispatchContext, start: Instant) -> Self {
-        let dispatch = dctx
-            .dispatch
-            .as_ref()
-            .filter(|_| tenant_usage::installed().is_some());
+    fn new(dctx: &DispatchContext) -> Self {
         Self {
-            tenant: dispatch.map(|d| d.usage_tenant().to_owned()),
-            model: dispatch.map(|d| d.model.clone()).unwrap_or_default(),
-            start,
+            dispatch: dctx
+                .dispatch
+                .as_ref()
+                .filter(|_| tenant_usage::installed().is_some())
+                .cloned(),
         }
     }
 
     /// Book the iteration the stream carried, with the time since the
-    /// successful attempt's start.
+    /// attempt's dispatch.
     pub(crate) fn book(&self, usage: &Usage) {
-        if let Some(tenant) = &self.tenant {
+        if let Some(dispatch) = &self.dispatch {
             tenant_usage::record(
-                tenant,
-                &self.model,
-                RequestUsage {
-                    prompt_tokens: u64::from(usage.prompt_tokens),
-                    completion_tokens: u64::from(usage.completion_tokens),
-                    elapsed: self.start.elapsed(),
-                },
+                dispatch.usage_tenant(),
+                &dispatch.model,
+                dispatch.usage(usage.prompt_tokens, usage.completion_tokens),
             );
         }
     }
@@ -5362,6 +5347,32 @@ mod usage_booking_tests {
         assert_eq!(
             RequestPipeline::engine_counts_booked(&ResponseState::default()),
             (0, 0)
+        );
+    }
+
+    /// A usage entry's time runs from the attempt's dispatch, not from the
+    /// attempt's start: the admission and the worker selection before the
+    /// dispatch stay the router's time.
+    #[test]
+    fn a_usage_entry_times_from_the_dispatch() {
+        let attempt_start = Instant::now();
+        std::thread::sleep(Duration::from_millis(20));
+        let dispatch = DispatchMetadata {
+            request_id: "req-1".to_string(),
+            model: "m".to_string(),
+            created: 1,
+            weight_version: None,
+            tenant_key: None,
+            dispatched_at: Instant::now(),
+        };
+        let usage = dispatch.usage(120, 30);
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (120, 30));
+        let since_attempt_start = attempt_start.elapsed();
+        assert!(
+            since_attempt_start >= usage.elapsed + Duration::from_millis(20),
+            "the time before the dispatch is the router's, not the row's: \
+             {since_attempt_start:?} since the attempt's start, {:?} booked",
+            usage.elapsed
         );
     }
 }

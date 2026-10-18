@@ -46,7 +46,11 @@ use super::{
 use crate::{
     config::ParserChoice,
     middleware::{TenantKey, TenantRequestMeta},
-    observability::{cache_trace, metrics::Metrics, tenant_usage::UNRESOLVED_TENANT},
+    observability::{
+        cache_trace,
+        metrics::Metrics,
+        tenant_usage::{RequestUsage, UNRESOLVED_TENANT},
+    },
     policies::CacheNamespace,
     routers::{
         common::{attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard},
@@ -825,12 +829,28 @@ pub(crate) struct DispatchMetadata {
     /// The caller's tenant key, carried to the end of the response (the last
     /// token of a stream) for the usage row the request is booked to.
     pub tenant_key: Option<TenantKey>,
+    /// The instant the attempt was dispatched: taken as this metadata is
+    /// prepared, right before the dispatch (a retry's metadata takes its
+    /// own). The usage row's time runs from here to the last token; what
+    /// came before, admission and worker selection, is the router's time,
+    /// which the router's duration metric keeps.
+    pub dispatched_at: Instant,
 }
 
 impl DispatchMetadata {
     /// The tenant the request's usage is booked to.
     pub fn usage_tenant(&self) -> &str {
         usage_tenant(self.tenant_key.as_ref())
+    }
+
+    /// The attempt's entry in its tenant's usage row: the counts given and
+    /// the time since the dispatch (`dispatched_at`).
+    pub fn usage(&self, prompt_tokens: u32, completion_tokens: u32) -> RequestUsage {
+        RequestUsage {
+            prompt_tokens: u64::from(prompt_tokens),
+            completion_tokens: u64::from(completion_tokens),
+            elapsed: self.dispatched_at.elapsed(),
+        }
     }
 }
 

@@ -84,6 +84,7 @@ async fn content_deltas_around_the_park(model: &str) -> (Vec<String>, Vec<String
         created: 1_700_000_000,
         weight_version: None,
         tenant_key: None,
+        dispatched_at: Instant::now(),
     };
     let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_CHAT);
     let response = Arc::new(processor(false))

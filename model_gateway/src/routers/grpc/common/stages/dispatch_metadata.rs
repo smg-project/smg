@@ -1,7 +1,7 @@
 //! Dispatch metadata: per-attempt response metadata derived from the stamped
 //! plan and the attempt's worker selection.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{
     middleware::TenantKey,
@@ -11,7 +11,9 @@ use crate::{
 /// Metadata for one dispatch attempt. `dispatch_model` was captured from the
 /// request at the build boundary (already canonical); the weight version
 /// comes from the attempt's selected worker; `tenant_key` is the caller's,
-/// for the usage row the response is booked to.
+/// for the usage row the response is booked to; `dispatched_at` is taken
+/// last, as the caller dispatches right after this metadata is prepared:
+/// the usage row's time runs from it.
 pub(crate) fn prepare_dispatch_metadata(
     plan: &ExecutionPlan,
     dispatch_model: &str,
@@ -37,5 +39,6 @@ pub(crate) fn prepare_dispatch_metadata(
         created,
         weight_version: Some(weight_version),
         tenant_key,
+        dispatched_at: Instant::now(),
     }
 }

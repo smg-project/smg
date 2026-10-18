@@ -194,6 +194,7 @@ async fn stream_bytes(scenario: &Scenario) -> Vec<u8> {
         created: 1_700_000_000,
         weight_version: scenario.weight_version.map(str::to_string),
         tenant_key: None,
+        dispatched_at: Instant::now(),
     };
     let stop = scenario
         .stop
@@ -314,6 +315,7 @@ async fn completion_stream_bytes(scenario: &CompletionScenario) -> Vec<u8> {
         created: 1_700_000_000,
         weight_version: scenario.weight_version.map(str::to_string),
         tenant_key: None,
+        dispatched_at: Instant::now(),
     };
     let stop = scenario
         .stop
@@ -383,6 +385,7 @@ async fn each_engine_message_leaves_as_its_own_frame() {
         created: 1_700_000_000,
         weight_version: None,
         tenant_key: None,
+        dispatched_at: Instant::now(),
     };
     let result = processor(false)
         .process_streaming_chunks(
