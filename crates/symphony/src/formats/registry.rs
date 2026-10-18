@@ -567,6 +567,9 @@ mod tests {
                 "{}: a thought state remains",
                 table.name()
             );
+            // The frame of a message header's table (Inkling's ended message) stays a wrapper in
+            // the variant: the space between two messages is not a call's.
+            let frame = format.message_frame();
             let unread = format.without_calls();
             unread
                 .validate()
@@ -578,7 +581,8 @@ mod tests {
                 table.name()
             );
             assert!(
-                (1..unread.states()).all(|state| unread.emits(state) != Emits::Wrapper),
+                (1..unread.states())
+                    .all(|state| unread.emits(state) != Emits::Wrapper || frame[state]),
                 "{}: a calls wrapper remains",
                 table.name()
             );

@@ -315,6 +315,11 @@ struct Terminal {
     /// Read as content text where it moves the engine, in place of being dropped: a table's
     /// variant shows the markers of the channel a request does not separate.
     shown: bool,
+    /// Frames the turn's messages where the table starts in a message header
+    /// ([`Format::message_framing`]): the template's protocol in every variant, never shown.
+    /// Set by [`Format::without_calls`], which reads the header before it becomes content, so
+    /// that a variant made after it keeps the framing dropped.
+    frames_messages: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -412,6 +417,7 @@ impl Format {
             text: text.to_string(),
             ignored: false,
             shown: false,
+            frames_messages: false,
         });
         self
     }
@@ -425,6 +431,7 @@ impl Format {
             text: text.to_string(),
             ignored: true,
             shown: false,
+            frames_messages: false,
         });
         self
     }
@@ -732,16 +739,17 @@ impl Format {
     /// after the thought reads as before, from wherever a start row, an anchor or the prompt's
     /// replay puts the turn. A call's markers are the terminals on the rows into or out of an
     /// arguments state or a calls wrapper; a table whose thought is framed by them alone
-    /// (Inkling's) shows none. A state's own text rows stay with it: a trimmed stay is still
-    /// trimmed, a framing state's text still dropped; and a tag the end cut short is still
-    /// dropped, as the legacy parsers drop it on both their paths. A table without a thought
-    /// changes only in what it shows; the thought-first mark and the layout, which serve the tags
-    /// alone, go.
+    /// (Inkling's) shows none, and neither does the variant [`Self::without_calls`] made of it,
+    /// whose message framing stays dropped ([`Self::message_framing`]). A state's own text rows
+    /// stay with it: a trimmed stay is still trimmed, a framing state's text still dropped; and a
+    /// tag the end cut short is still dropped, as the legacy parsers drop it on both their paths.
+    /// A table without a thought changes only in what it shows; the thought-first mark and the
+    /// layout, which serve the tags alone, go.
     #[must_use]
     pub fn without_reasoning(mut self) -> Self {
         let calls = self.terminals_of_calls();
         for (index, terminal) in self.terminals.iter_mut().enumerate() {
-            if !terminal.ignored && !calls.contains(&index) {
+            if !terminal.ignored && !calls.contains(&index) && !terminal.frames_messages {
                 terminal.shown = true;
             }
         }
@@ -759,15 +767,30 @@ impl Format {
     /// legacy path runs no tool parser then: the arguments states and the calls wrappers are
     /// content, with no call syntax to read them, and a call's markers are shown, read as content
     /// text where they move the engine, so a call's bytes stay in the content as the model wrote
-    /// them; a marker that also opens the thought is not shown, so the thought reads as before,
-    /// its markers dropped. The turn's own wrapper, where a table starts in one (Kimi K3's
-    /// message), is the turn's frame, not a calls region: it and its markers stay. A table whose
-    /// output starts in its calls (`json`, `xlam`, `forced`) becomes content from its first byte.
-    /// A state's own text rows stay with it, as in [`Self::without_reasoning`]. A stop that closed
-    /// a call closes nothing; the layout goes.
+    /// them. The markers that frame the thought and the answer are not shown: a marker that also
+    /// opens the thought, and, where the turn starts in a message header
+    /// ([`Self::message_framing`]: Inkling's arguments state, which the message opener returns
+    /// to and the thought and the answer open from), every marker of the message frame, which
+    /// stays dropped in a variant made of this one too; so the thought and the answer read as
+    /// before, their markers dropped, and a call the model writes anyway is content between
+    /// dropped framing, as the legacy reasoning parser leaves it. The turn's own wrapper, where
+    /// a table starts in one (Kimi K3's message), is the turn's frame, not a calls region: it
+    /// and its markers stay; so does the space between two messages of a message header's table
+    /// (Inkling's ended message), whose whitespace is the template's with or without tools. A
+    /// table whose output starts in its calls (`json`, `xlam`, `forced`) becomes content from
+    /// its first byte. A state's own text rows stay with it, as in [`Self::without_reasoning`].
+    /// A stop that closed a call closes nothing; the layout goes.
     #[must_use]
     pub fn without_calls(mut self) -> Self {
-        let demoted = self.calls_regions();
+        let frame = self.message_frame();
+        let framing = self.message_framing();
+        let demoted: Vec<bool> = self
+            .calls_regions()
+            .iter()
+            .zip(&self.states)
+            .zip(&frame)
+            .map(|((&region, state), &frame)| region && !(frame && state.emits == Emits::Wrapper))
+            .collect();
         let calls = self.terminals_of_calls();
         let opens_thought: Vec<usize> = self
             .transitions
@@ -776,7 +799,13 @@ impl Format {
             .map(|row| row.on)
             .collect();
         for (index, terminal) in self.terminals.iter_mut().enumerate() {
-            if calls.contains(&index) && !opens_thought.contains(&index) {
+            if framing.contains(&index) {
+                terminal.frames_messages = true;
+            }
+            if calls.contains(&index)
+                && !opens_thought.contains(&index)
+                && !terminal.frames_messages
+            {
                 terminal.shown = true;
             }
         }
@@ -789,6 +818,50 @@ impl Format {
         self.calls = None;
         self.layout = None;
         self
+    }
+
+    /// The states of the turn's frame where the table starts in a message header: an arguments
+    /// state a row returns to (Inkling's, where the call's name follows the message's opener, so
+    /// the state reads the call, and the thought and the answer open from it too), and the
+    /// wrappers whose every row leads back into the frame (the space between two messages, where
+    /// the thought, the answer and a call all close). All false for a table that starts anywhere
+    /// else, or in its calls, which no row enters (`json`, `xlam`, `forced`).
+    pub(crate) fn message_frame(&self) -> Vec<bool> {
+        let mut frame = vec![false; self.states.len()];
+        let header = self
+            .states
+            .first()
+            .is_some_and(|state| state.emits == Emits::Arguments)
+            && self.transitions.iter().any(|row| row.to == 0);
+        if !header {
+            return frame;
+        }
+        frame[0] = true;
+        loop {
+            let joined = (1..self.states.len()).find(|&index| {
+                let mut rows = self.transitions.iter().filter(|row| row.from == index);
+                !frame[index]
+                    && self.states[index].emits == Emits::Wrapper
+                    && rows.clone().next().is_some()
+                    && rows.all(|row| frame[row.to])
+            });
+            match joined {
+                Some(index) => frame[index] = true,
+                None => return frame,
+            }
+        }
+    }
+
+    /// The terminals that frame the turn's messages ([`Self::message_frame`]): those with a row
+    /// into or out of a state of the frame, which frame the thought and the answer as much as a
+    /// call, and no variant shows. Empty for a table without the frame.
+    fn message_framing(&self) -> Vec<usize> {
+        let frame = self.message_frame();
+        self.transitions
+            .iter()
+            .filter(|row| frame[row.from] || frame[row.to])
+            .map(|row| row.on)
+            .collect()
     }
 
     /// Which states are a call's region: the arguments states, and the wrapper states other than
@@ -1741,27 +1814,100 @@ mod tests {
     );
 
     #[test]
-    fn without_calls_keeps_inklings_thought_and_shows_its_call_message_as_text() {
-        // The message header is Inkling's arguments state, so its framing is shown here where the
-        // legacy reasoning parser removes it; the thought still reads, the ignored terminal is
-        // still dropped, and the call's message is text.
+    fn without_calls_keeps_inklings_framing_dropped_and_reads_its_call_message_as_text() {
+        // The message header is Inkling's arguments state, which every message opens from: its
+        // markers frame the thought and the answer as much as a call, so none is shown, as the
+        // legacy reasoning parser removes them; the thought reads, the answer is bare, the call's
+        // message is text between dropped framing, and the ignored terminal is still dropped.
         let format = crate::formats::inkling().without_calls();
         assert!(format.validate().is_ok());
+        assert!(
+            (0..4).all(|terminal| !format.shown(terminal)),
+            "no marker of the message framing is shown"
+        );
+        assert_eq!(format.emits(0), Emits::Content, "the header is content");
+        assert_eq!(
+            format.emits(3),
+            Emits::Wrapper,
+            "the ended message is the frame between two messages, not a call's wrapper"
+        );
         let out = events(format, "<|message_model|>", INKLING_TURN);
         let (content, reasoning, calls) = said(&out);
         assert_eq!(reasoning, "check sources");
         assert_eq!(calls, 0);
-        assert!(
-            content.contains("Here is the answer.")
-                && content.contains(
-                    "search<|content_invoke_tool_json|>{\"name\": \"search\", \"args\": \
-                     {\"q\": \"rust\"}}"
-                ),
-            "{content}"
+        assert_eq!(
+            content,
+            "Here is the answer.search<|content_invoke_tool_json|>{\"name\": \"search\", \
+             \"args\": {\"q\": \"rust\"}}"
         );
         assert!(
-            !content.contains("<|content_model_end_sampling|>"),
-            "{content}"
+            !out.iter()
+                .any(|e| matches!(e, crate::event::Event::Malformed { .. })),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn without_calls_inklings_space_between_messages_is_the_templates_with_or_without_tools() {
+        // Whitespace after a message's close and before the next opener, or after the last close,
+        // is dropped by the full table; the variant keeps the ended message a wrapper, so it
+        // drops it too, and the content reads the same.
+        let output = "<|content_text|>Hi<|end_message|>\n<|message_model|><|content_text|>there\
+                      <|end_message|>\n";
+        for format in [
+            crate::formats::inkling(),
+            crate::formats::inkling().without_calls(),
+        ] {
+            let out = events(format, "<|message_model|>", output);
+            let (content, reasoning, calls) = said(&out);
+            assert_eq!(
+                (content.as_str(), reasoning.as_str(), calls),
+                ("Hithere", "", 0)
+            );
+            assert!(
+                !out.iter()
+                    .any(|e| matches!(e, crate::event::Event::Malformed { .. })),
+                "{out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inklings_message_framing_stays_dropped_in_the_variants_composed_in_either_order() {
+        // A request that declares no tools and keeps the reasoning in the content reads with
+        // both variants; the framing is the template's in that reading too, as it is for the
+        // same request with tools, whichever variant is made first.
+        for format in [
+            crate::formats::inkling()
+                .without_calls()
+                .without_reasoning(),
+            crate::formats::inkling()
+                .without_reasoning()
+                .without_calls(),
+        ] {
+            assert!(format.validate().is_ok());
+            assert!(
+                (0..4).all(|terminal| !format.shown(terminal)),
+                "no marker of the message framing is shown"
+            );
+            let (content, reasoning, calls) =
+                said(&events(format, "<|message_model|>", INKLING_TURN));
+            assert_eq!(
+                content,
+                "check sourcesHere is the answer.search<|content_invoke_tool_json|>{\"name\": \
+                 \"search\", \"args\": {\"q\": \"rust\"}}"
+            );
+            assert_eq!((reasoning.as_str(), calls), ("", 0));
+        }
+        // With tools and the reasoning kept, the same bytes read the same way, the call apart.
+        let (content, reasoning, calls) = said(&events(
+            crate::formats::inkling().without_reasoning(),
+            "<|message_model|>",
+            INKLING_TURN,
+        ));
+        assert_eq!(
+            (content.as_str(), reasoning.as_str(), calls),
+            ("check sourcesHere is the answer.", "", 1)
         );
     }
 

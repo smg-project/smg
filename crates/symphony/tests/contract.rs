@@ -442,6 +442,14 @@ fn inkling() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::Inkling.format(), Declared::default()))
 }
 
+/// Inkling as a request without tools reads it: the message header content, its markers dropped.
+fn inkling_without_calls() -> Box<dyn Parser> {
+    Box::new(Engine::new(
+        Table::Inkling.format().without_calls(),
+        Declared::default(),
+    ))
+}
+
 /// `\w` as these outputs need it: the ASCII letters, digits and `_` their names are written in.
 fn word() -> Class {
     Class::new([('0', '9'), ('A', 'Z'), ('_', '_'), ('a', 'z')], false)
@@ -972,6 +980,12 @@ const FORMATS: &[Subject] = &[
         new: inkling,
         outputs: INKLING_OUTPUTS,
         table: Some(Table::Inkling),
+    },
+    Subject {
+        name: "inkling, no tools",
+        new: inkling_without_calls,
+        outputs: INKLING_NO_TOOLS_OUTPUTS,
+        table: None,
     },
     Subject {
         name: "mistral v13",
@@ -1904,6 +1918,17 @@ const INKLING_OUTPUTS: &[&str] = &[
     "<|content_thinking|>97 is not divisible by 2, 3, 5 or 7.<|end_message|><|message_model|><|content_text|>Yes, 97 is prime.<|end_message|>",
     "<|content_text|><|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"ci",
     "<|content_text|><|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\"}<|end_message|>",
+];
+
+/// Outputs recorded from requests that declared no tools: a thought and a short answer, a thought
+/// and a longer one, a JSON answer whose grammar wrote the text marker again after the model's
+/// own, the common set's call written without tools, and one cut inside the answer.
+const INKLING_NO_TOOLS_OUTPUTS: &[&str] = &[
+    "<|content_thinking|>We need solve math problem. Shop sells pens at 3 for 2 dollars. So price per pen = 2/3 dollars. 18 pens cost 18 * 2/3 = 12 dollars. Alternatively 18/3=6 groups, each 2 dollars => 12. Answer: 12.<|end_message|><|message_model|><|content_text|>12<|end_message|>",
+    "<|content_thinking|>The user wants to rewrite \"The meeting was postponed by the manager\" in the active voice.\n\nOriginal: The meeting was postponed by the manager.\n- Subject: The meeting\n- Verb: was postponed (passive)\n- Agent: by the manager\n\nActive voice: The manager postponed the meeting.\n\nThis is straightforward. I should provide the rewritten sentence clearly.<|end_message|><|message_model|><|content_text|>The manager postponed the meeting.<|end_message|>",
+    "<|content_thinking|>The user asks: \"Give the facts about Tokyo.\" The system instruction says: \"Answer with a JSON object with the keys city, country and population.\"\n\nSo I need to provide facts about Tokyo, but specifically format the answer as a JSON object with keys: city, country, population.\n\nI should include the relevant values:\n- city: Tokyo\n- country: Japan\n- population: Approximately 13.9 million (for Tokyo proper) or 37 million (for Greater Tokyo Area). Usually \"Tokyo\" as a city refers to the prefecture/capital, but the city proper is about 14 million. I should provide a clear figure. Let's use ~13.96 million (as of recent estimates) or just \"13.9 million\". To be safe and accurate, I can specify the metropolitan area, but the key is just population. Let's provide \"13.9 million\" for the city proper, or mention both? The instruction is strict: JSON object with those keys. So just those three.\n\nLet's construct:\n{\n  \"city\": \"Tokyo\",\n  \"country\": \"Japan\",\n  \"population\": \"13.9 million\"\n}\n\nThis satisfies. I will not add extra text outside JSON? The instruction says \"Answer with a JSON object...\". Usually that means the response should be just the JSON. I will provide just the JSON.<|end_message|><|message_model|><|content_text|><|content_text|>{\"city\": \"Tokyo\", \"country\": \"Japan\", \"population\": \"13.9 million\"}<|end_message|>",
+    "<|content_thinking|>The user asks about Paris.<|end_message|><|message_model|><|content_text|><|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|>",
+    "<|content_thinking|>Short.<|end_message|><|message_model|><|content_text|>The answer is cut he",
 ];
 
 /// Every subject with each of its outputs.

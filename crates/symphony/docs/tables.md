@@ -241,6 +241,17 @@ What the table says beyond the others:
 - **The group is one template.** Inkling, Inkling-Small and Inkling-NVFP4 ship the same chat
   template byte for byte (one sha256 at the three checkpoints' recorded or current revisions), so
   the three read with the one table and the recorded `inkling` set stands for the group.
+- **A request without tools reads the same framing.** The variant the gateway reads such a
+  request with (`Format::without_calls`) turns the message header into content, as no syntax
+  reads a call there, keeps the ended message a wrapper (the space between two messages, whose
+  whitespace is the template's), and keeps every marker dropped: the header is the state the turn
+  starts in and returns to, so its four markers frame the thought and the answer as much as a
+  call, and are not a call's own; the variant without the thought made of it, for a request that
+  keeps the reasoning in the content, drops them too, as that variant does with tools. The
+  thought and the answer read as with tools; a call the model writes anyway comes back as content
+  between the dropped framing (`search<|content_invoke_tool_json|>{...}`), as the legacy path
+  leaves it. Before this, the variant showed `<|end_message|><|message_model|><|content_text|>`
+  and the answer's `<|end_message|>` as content on every request without tools.
 
 What the table leaves out, for want of fixtures: image and audio messages, which the template writes
 for the user and never for the model; and the text-mode invocation, `<|content_invoke_tool_text|>`,

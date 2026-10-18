@@ -190,6 +190,148 @@ mod tests {
         assert_eq!(malformed_count(&events), 0);
     }
 
+    /// An output recorded from a request that declared no tools, as the gateway reads it then
+    /// (`Format::without_calls`): the thought in its message, the answer in the next.
+    const RECORDED_THOUGHT_AND_ANSWER: &str = concat!(
+        "<|content_thinking|>We need solve math problem. Shop sells pens at 3 for 2 dollars. ",
+        "So price per pen = 2/3 dollars. 18 pens cost 18 * 2/3 = 12 dollars. Alternatively ",
+        "18/3=6 groups, each 2 dollars => 12. Answer: 12.<|end_message|>",
+        "<|message_model|><|content_text|>12<|end_message|>"
+    );
+
+    /// The thought of [`RECORDED_THOUGHT_AND_ANSWER`].
+    const RECORDED_THOUGHT: &str = concat!(
+        "We need solve math problem. Shop sells pens at 3 for 2 dollars. So price per pen = 2/3 ",
+        "dollars. 18 pens cost 18 * 2/3 = 12 dollars. Alternatively 18/3=6 groups, each 2 ",
+        "dollars => 12. Answer: 12."
+    );
+
+    /// Another recorded output of a request without tools, with a longer answer.
+    const RECORDED_REWRITE: &str = concat!(
+        "<|content_thinking|>The user wants to rewrite \"The meeting was postponed by the ",
+        "manager\" in the active voice.\n\nOriginal: The meeting was postponed by the manager.\n",
+        "- Subject: The meeting\n- Verb: was postponed (passive)\n- Agent: by the manager\n\n",
+        "Active voice: The manager postponed the meeting.\n\nThis is straightforward. I should ",
+        "provide the rewritten sentence clearly.<|end_message|><|message_model|>",
+        "<|content_text|>The manager postponed the meeting.<|end_message|>"
+    );
+
+    /// A recorded output of a request without tools whose answer a JSON object was asked for:
+    /// the engine's grammar wrote the text marker again after the model's own.
+    const RECORDED_JSON_ANSWER: &str = concat!(
+        "<|content_thinking|>The user asks: \"Give the facts about Tokyo.\" The system ",
+        "instruction says: \"Answer with a JSON object with the keys city, country and ",
+        "population.\"\n\nSo I need to provide facts about Tokyo, but specifically format the ",
+        "answer as a JSON object with keys: city, country, population.\n\nI should include the ",
+        "relevant values:\n- city: Tokyo\n- country: Japan\n- population: Approximately 13.9 ",
+        "million (for Tokyo proper) or 37 million (for Greater Tokyo Area). Usually \"Tokyo\" ",
+        "as a city refers to the prefecture/capital, but the city proper is about 14 million. ",
+        "I should provide a clear figure. Let's use ~13.96 million (as of recent estimates) or ",
+        "just \"13.9 million\". To be safe and accurate, I can specify the metropolitan area, ",
+        "but the key is just population. Let's provide \"13.9 million\" for the city proper, ",
+        "or mention both? The instruction is strict: JSON object with those keys. So just ",
+        "those three.\n\nLet's construct:\n{\n  \"city\": \"Tokyo\",\n  \"country\": ",
+        "\"Japan\",\n  \"population\": \"13.9 million\"\n}\n\nThis satisfies. I will not add ",
+        "extra text outside JSON? The instruction says \"Answer with a JSON object...\". ",
+        "Usually that means the response should be just the JSON. I will provide just the ",
+        "JSON.<|end_message|><|message_model|><|content_text|><|content_text|>{\"city\": ",
+        "\"Tokyo\", \"country\": \"Japan\", \"population\": \"13.9 million\"}<|end_message|>",
+    );
+
+    /// One turn through the table as a request without tools reads it.
+    fn run_without_tools(pieces: &[&str]) -> Vec<Event> {
+        drive(
+            &mut Engine::new(inkling().without_calls(), Declared::default()),
+            PROMPT,
+            pieces,
+        )
+    }
+
+    /// `text` one character at a time.
+    fn characters(text: &str) -> Vec<String> {
+        text.chars().map(String::from).collect()
+    }
+
+    #[test]
+    fn without_tools_a_recorded_thought_and_answer_keep_their_framing_out_of_the_content() {
+        let events = run_without_tools(&[RECORDED_THOUGHT_AND_ANSWER]);
+        assert_eq!(bytes(&events), RECORDED_THOUGHT_AND_ANSWER);
+        assert_eq!(reasoning(&events), RECORDED_THOUGHT);
+        assert_eq!(content(&events), "12");
+        assert_eq!(names(&events), [""; 0]);
+        assert_eq!(malformed_count(&events), 0);
+        assert!(
+            events.contains(&dropped("<|message_model|>"))
+                && events.contains(&dropped("<|content_text|>")),
+            "{events:?}"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn without_tools_the_recorded_outputs_read_the_same_one_character_at_a_time() {
+        for (output, thought_tail, answer) in [
+            (RECORDED_THOUGHT_AND_ANSWER, "Answer: 12.", "12"),
+            (
+                RECORDED_REWRITE,
+                "provide the rewritten sentence clearly.",
+                "The manager postponed the meeting.",
+            ),
+        ] {
+            let pieces = characters(output);
+            let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
+            let events = run_without_tools(&pieces);
+            assert_eq!(bytes(&events), output);
+            assert!(reasoning(&events).ends_with(thought_tail), "{events:?}");
+            assert_eq!(content(&events), answer);
+            assert_eq!(malformed_count(&events), 0);
+        }
+    }
+
+    #[test]
+    fn without_tools_a_recorded_json_answer_carries_no_message_framing() {
+        // The second text marker stands inside the answer, where the table has no row for it,
+        // and is the answer's text as any marker out of place is; the message's framing is not.
+        for pieces in [
+            vec![RECORDED_JSON_ANSWER.to_string()],
+            characters(RECORDED_JSON_ANSWER),
+        ] {
+            let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
+            let events = run_without_tools(&pieces);
+            assert_eq!(bytes(&events), RECORDED_JSON_ANSWER);
+            assert!(reasoning(&events).ends_with("I will provide just the JSON."));
+            let content = content(&events);
+            assert!(
+                !content.contains("<|end_message|>") && !content.contains("<|message_model|>"),
+                "{content}"
+            );
+            assert!(
+                content.ends_with("\"population\": \"13.9 million\"}"),
+                "{content}"
+            );
+            assert_eq!(malformed_count(&events), 0);
+        }
+    }
+
+    #[test]
+    fn without_tools_a_call_the_model_writes_anyway_is_content_between_dropped_framing() {
+        let events = run_without_tools(&[OUTPUT]);
+        assert_eq!(bytes(&events), OUTPUT);
+        assert_eq!(reasoning(&events), "The user asks about Paris.");
+        assert_eq!(
+            content(&events),
+            "get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}"
+        );
+        assert_eq!(names(&events), [""; 0]);
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 0, .. })
+        ));
+    }
+
     #[test]
     fn the_table_validates() {
         inkling().validate().expect("a sound table");
