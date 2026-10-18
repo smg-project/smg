@@ -1,7 +1,7 @@
-//! What a disaggregated leg's failure says about the rendezvous.
+//! What a disaggregated side's failure says about the rendezvous.
 //!
-//! The legs of a disaggregated request meet on the prefill's bootstrap port;
-//! a leg that cannot (the port is closed, the partner never arrived, the
+//! The sides of a disaggregated request meet on the prefill's bootstrap port;
+//! a side that cannot (the port is closed, the partner never arrived, the
 //! handoff broke) is retired by its engine with a message that names the
 //! phase it died in. Those failures count under
 //! `smg_pd_rendezvous_failures_total{leg, phase}`, next to the registration
@@ -11,21 +11,21 @@
 use super::stream_failure::UpstreamClass;
 use crate::observability::metrics::Metrics;
 
-/// Words an engine puts on a leg that never met its partner: the bootstrap
+/// Words an engine puts on a side that never met its partner: the bootstrap
 /// (its server, its room, the wait in the bootstrapping state) and the
 /// handshake the decode side runs against it.
 const BOOTSTRAP_WORDS: &[&str] = &["bootstrap", "handshake"];
 
-/// Words an engine puts on a leg whose KV handoff failed after the legs met.
+/// Words an engine puts on a side whose KV handoff failed after the sides met.
 const TRANSFER_WORDS: &[&str] = &["transfer failed", "kv transfer", "kvcache from prefill"];
 
-/// The phase of the rendezvous a leg's failure names.
+/// The phase of the rendezvous a side's failure names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RendezvousPhase {
-    /// The legs never met: a bootstrap or handshake that was refused or
+    /// The sides never met: a bootstrap or handshake that was refused or
     /// timed out.
     Bootstrap,
-    /// The legs met and the KV handoff between them failed.
+    /// The sides met and the KV handoff between them failed.
     Transfer,
 }
 
@@ -62,12 +62,12 @@ impl RendezvousPhase {
     }
 }
 
-/// Count `status`, the failure of the `leg` of a disaggregated request, under
+/// Count `status`, the failure of the `side` of a disaggregated request, under
 /// the rendezvous family when it names a phase of it. Any other
-/// failure of the leg is left to its own accounting.
-pub(crate) fn account_pd_leg_failure(leg: &'static str, status: &tonic::Status) {
+/// failure of the side is left to its own accounting.
+pub(crate) fn account_pd_side_failure(side: &'static str, status: &tonic::Status) {
     if let Some(phase) = RendezvousPhase::of(status) {
-        Metrics::record_pd_rendezvous_failure(leg, phase.label());
+        Metrics::record_pd_rendezvous_failure(side, phase.label());
     }
 }
 
@@ -79,7 +79,7 @@ mod tests {
     use crate::observability::metrics::metrics_labels;
 
     /// The texts a disaggregated engine's scheduler and transfer layer write
-    /// for a leg they retire, as their sources spell them, and the phase
+    /// for a side they retire, as their sources spell them, and the phase
     /// each names.
     #[test]
     fn an_engine_reported_rendezvous_failure_is_classed_by_phase() {
@@ -103,7 +103,7 @@ mod tests {
                  to receive the KV indices from the decode instance of this request.",
                 RendezvousPhase::Bootstrap,
             ),
-            // The legs met; the handoff itself failed.
+            // The sides met; the handoff itself failed.
             (
                 "Decode transfer failed for request rank=0 req.rid='r3' req.bootstrap_room=43 \
                  with exception KVTransferError(bootstrap_room=43): KV transfer failed",
@@ -159,23 +159,23 @@ mod tests {
     }
 
     #[test]
-    fn a_leg_failure_that_names_the_rendezvous_is_counted_under_the_rendezvous_family() {
+    fn a_side_failure_that_names_the_rendezvous_is_counted_under_the_rendezvous_family() {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
-            account_pd_leg_failure(
+            account_pd_side_failure(
                 metrics_labels::WORKER_PREFILL,
                 &tonic::Status::internal(
                     "Prefill bootstrap failed for request rank=0 req.rid='r1' req.bootstrap_room=41",
                 ),
             );
-            account_pd_leg_failure(
+            account_pd_side_failure(
                 metrics_labels::WORKER_DECODE,
                 &tonic::Status::internal(
                     "Decode transfer failed for request rank=0 req.rid='r3' req.bootstrap_room=43",
                 ),
             );
-            account_pd_leg_failure(
+            account_pd_side_failure(
                 metrics_labels::WORKER_DECODE,
                 &tonic::Status::unavailable("connection reset"),
             );

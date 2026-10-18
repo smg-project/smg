@@ -46,7 +46,7 @@ use crate::{
                 ProtoResponseVariant, ProtoStream,
             },
             utils::{
-                account_pd_leg_failure,
+                account_pd_side_failure,
                 stream_failure::UpstreamClass,
                 tonic_ext::{TonicResultExt, TonicStatusExt},
             },
@@ -57,21 +57,21 @@ use crate::{
 
 type StreamResult = Result<ProtoStream, tonic::Status>;
 
-/// One leg's owned dispatch. Owned (rather than borrowed from the client
-/// selection) so the leg still in flight when its partner fails can be moved
-/// off the request path — see [`retire_pd_leg`].
-type PdLegDispatch = Pin<Box<dyn Future<Output = StreamResult> + Send>>;
+/// One side's owned dispatch. Owned (rather than borrowed from the client
+/// selection) so the side still in flight when its partner fails can be moved
+/// off the request path — see [`retire_pd_side`].
+type SideDispatch = Pin<Box<dyn Future<Output = StreamResult> + Send>>;
 
-/// Which leg of a disaggregated dispatch a result belongs to. The error code
-/// and message are part of the client contract, so they live per leg here
+/// Which side of a disaggregated dispatch a result belongs to. The error code
+/// and message are part of the client contract, so they live per side here
 /// rather than being reconstructed at each call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PdLeg {
+enum PdSide {
     Prefill,
     Decode,
 }
 
-impl PdLeg {
+impl PdSide {
     fn name(self) -> &'static str {
         match self {
             Self::Prefill => metrics_labels::WORKER_PREFILL,
@@ -101,20 +101,20 @@ impl PdLeg {
     }
 }
 
-/// How the two parallel legs resolved.
+/// How the two parallel sides resolved.
 #[expect(
     clippy::large_enum_variant,
     reason = "consumed by its caller on the next line; boxing would add an allocation to the success path to save one stack move"
 )]
 enum PdDispatchOutcome {
-    /// Both legs answered; either or both may carry an error.
+    /// Both sides answered; either or both may carry an error.
     Both(StreamResult, StreamResult),
-    /// One leg failed while its partner was still dispatching. The partner is
+    /// One side failed while its partner was still dispatching. The partner is
     /// handed back so the caller can retire it instead of waiting it out.
     FailedFirst {
-        leg: PdLeg,
+        side: PdSide,
         error: tonic::Status,
-        partner: PdLegDispatch,
+        partner: SideDispatch,
     },
 }
 
@@ -212,15 +212,15 @@ fn trace_engine_ids(
     (ids, complete)
 }
 
-/// Give the decode leg the media identity the prefill leg produced, so it
-/// is served without pixels or references. Only on a leg that will pull its
+/// Give the decode side the media identity the prefill side produced, so it
+/// is served without pixels or references. Only on a side that will pull its
 /// prompt KV from prefill: it must hold a KV handoff (`handed_off`) and be
 /// a single-sample request (`relay_kv_params`); with n>1 decode recomputes
 /// the prompt and needs the references itself, even where legacy Mooncake
-/// still injects its host and port, and a pixel-less leg without KV is
+/// still injects its host and port, and a pixel-less side without KV is
 /// refused by the servicer. A prefill that was asked for an identity
 /// (`solicited`: its request carried KV params) but returned none is an
-/// older servicer; the leg is left as it is, and decode reprocesses the
+/// older servicer; the side is left as it is, and decode reprocesses the
 /// media.
 fn apply_prefill_media_identity(
     decode_request: &mut ProtoGenerateRequest,
@@ -237,7 +237,7 @@ fn apply_prefill_media_identity(
         None if solicited => {
             warn!(
                 request_id = %decode_request.request_id(),
-                "prefill worker returned no media identity; decode leg will reprocess media"
+                "prefill worker returned no media identity; decode side will reprocess media"
             );
             return;
         }
@@ -246,7 +246,7 @@ fn apply_prefill_media_identity(
     if !applied {
         warn!(
             request_id = %decode_request.request_id(),
-            "prefill worker's media identity is unusable; decode leg will reprocess media"
+            "prefill worker's media identity is unusable; decode side will reprocess media"
         );
     }
 }
@@ -272,8 +272,8 @@ fn fan_out_pd_request(
         .collect()
 }
 
-/// Metric connection labels for the PD legs (a leg can be gRPC or ZMQ).
-fn pd_leg_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
+/// Metric connection labels for the PD sides (a side can be gRPC or ZMQ).
+fn pd_side_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
     match workers {
         WorkerSelection::Disaggregated {
             prefill, decode, ..
@@ -307,7 +307,7 @@ pub(crate) async fn execute_plan(
     let sub_requests = plan_sub_requests(&execution_plan, ctx.workers.as_ref());
 
     // Admission runs before this attempt claims anything else. The decode
-    // leg's engine window is what clears the prefill's bootstrap deadline, so
+    // side's engine window is what clears the prefill's bootstrap deadline, so
     // a request the decode cannot admit yet waits here rather than in the
     // engine's queue — where it would burn the prefill's deadline and strand
     // both rooms. Waiting ahead of the encode take below also keeps the
@@ -399,7 +399,7 @@ pub(crate) async fn execute_plan(
             ExecutionPlan::EncodePrefillDecode { request } => {
                 // Bootstrap info was injected into the prefill request during
                 // request building; dispatch the encode jobs with the
-                // prefill+decode leg.
+                // prefill+decode side.
                 let prefill_guard = require_prefill_guard(prefill_guard)?;
                 execute_epd_dispatch(
                     request,
@@ -495,8 +495,8 @@ async fn execute_pd_dispatch(
         ));
     };
     // Dispatch shape comes from the per-runtime PD protocol table (see
-    // `PdProtocol::for_runtime`): sequential legs relay the KV handoff
-    // through the router, parallel legs rendezvous on bootstrap info
+    // `PdProtocol::for_runtime`): sequential sides relay the KV handoff
+    // through the router, parallel sides rendezvous on bootstrap info
     // carried in the request.
     let result = match protocol.dispatch {
         PdDispatch::Sequential => {
@@ -536,22 +536,22 @@ async fn execute_pd_dispatch(
             }
         },
     }?;
-    Ok(attribute_pd_legs(result, workers))
+    Ok(attribute_pd_sides(result, workers))
 }
 
-/// Pair each leg's stream of a disaggregated dispatch with the worker it was
+/// Pair each side's stream of a disaggregated dispatch with the worker it was
 /// sent to, so a failure of the stream can be charged to that worker wherever
-/// the stream is read: the streamed answer knows its legs from the request's
+/// the stream is read: the streamed answer knows its sides from the request's
 /// selection, the buffered one reads the streams alone and had no worker to
 /// charge. Each response then counts as that worker's token progress for the
-/// liveness monitor, as a regular dispatch's does. The legs join no tracked
+/// liveness monitor, as a regular dispatch's does. The sides join no tracked
 /// pile and add no prefill backlog: those are the regular dispatch's rules,
 /// and a disaggregated request is admitted through its prefill guard. The
-/// decode leg's dispatch success is sampled on its worker's breaker at the
-/// leg's first response (see [`ProtoStream::tracked_decode_leg`]). The
+/// decode side's dispatch success is sampled on its worker's breaker at the
+/// side's first response (see [`ProtoStream::tracked_decode_side`]). The
 /// sequential dispatch's prefill stream is drained already; the wrapper is a
 /// no-op on it.
-fn attribute_pd_legs(result: ExecutionResult, workers: &WorkerSelection) -> ExecutionResult {
+fn attribute_pd_sides(result: ExecutionResult, workers: &WorkerSelection) -> ExecutionResult {
     let ExecutionResult::PrefillDecode {
         prefill,
         decode,
@@ -566,13 +566,13 @@ fn attribute_pd_legs(result: ExecutionResult, workers: &WorkerSelection) -> Exec
         Some(worker) => stream.tracked(Arc::clone(worker), 0, false),
         None => stream,
     };
-    // The sequential path tracks its decode leg itself, at the dispatch,
-    // so it can wait for the leg's first token under the leg's bound: a leg
+    // The sequential path tracks its decode side itself, at the dispatch,
+    // so it can wait for the side's first token under the side's bound: a side
     // already on a worker is left as it is (a second layer would sample its
     // success twice).
     let decode = match workers.decode_worker() {
         Some(worker) if decode.worker().is_none() => {
-            (*decode).tracked_decode_leg(Arc::clone(worker))
+            (*decode).tracked_decode_side(Arc::clone(worker))
         }
         _ => *decode,
     };
@@ -586,7 +586,7 @@ fn attribute_pd_legs(result: ExecutionResult, workers: &WorkerSelection) -> Exec
 }
 
 /// Dispatch an n>1 request as `n` concurrent single-sample PD pairs, each
-/// with its own rendezvous room, and merge their legs into one PD result
+/// with its own rendezvous room, and merge their sides into one PD result
 /// whose responses carry the sample index. Fail-fast: the first pair that
 /// fails to start fails the request, and dropping the others aborts them.
 async fn execute_fanout_pd(
@@ -692,7 +692,7 @@ async fn execute_epd_dispatch(
 
 #[expect(
     clippy::disallowed_methods,
-    reason = "EPD encode dispatch is intentionally supervised in the background while the prefill leg blocks on embedding receive."
+    reason = "EPD encode dispatch is intentionally supervised in the background while the prefill side blocks on embedding receive."
 )]
 fn spawn_encode_dispatch(encode_dispatch: EncodeDispatchPlan) {
     if encode_dispatch.is_empty() {
@@ -806,7 +806,7 @@ async fn execute_single(
     if let Some(worker) = worker {
         Metrics::record_worker_request(worker.url(), worker.model_id());
     }
-    // The call's future is boxed, as the disaggregated legs' are: it is the
+    // The call's future is boxed, as the disaggregated sides' are: it is the
     // large part of the dispatch, and inlined in the pipeline's future it
     // put that future over the size bound.
     let result = dispatch_single_booked(
@@ -958,7 +958,7 @@ impl<'a> PdSides<'a> {
         ledger: &'a AttemptLedger,
         prefill_request: &ProtoGenerateRequest,
     ) -> Self {
-        let (prefill_label, decode_label) = pd_leg_labels(workers);
+        let (prefill_label, decode_label) = pd_side_labels(workers);
         let prompt_tokens = u64::try_from(prefill_request.prompt_len()).unwrap_or(u64::MAX);
         let request_id = prefill_request.request_id().to_string();
         Self {
@@ -997,15 +997,15 @@ async fn execute_parallel_pd(
     // recorded at the first decode token in streaming. prefill_start anchors it.
     let prefill_start = Instant::now();
     let sides = PdSides::of(workers, ledger, &prefill_request);
-    // The prefill leg's silence is bounded from its dispatch: a call that
+    // The prefill side's silence is bounded from its dispatch: a call that
     // returns no stream, or a stream with nothing on it, within the bound
     // fails the attempt instead of holding the request (and the decode room
     // the admission gate claimed for it) until its own timeout.
     let prefill_worker = workers.prefill_worker();
     let bound = prefill_worker
-        .and_then(|worker| PrefillLegBound::at(worker, sides.prompt_tokens, prefill_start));
-    // Each leg owns its client handle (a cheap channel clone, the same one
-    // batched dispatch takes per sub-request) so the leg still in flight when
+        .and_then(|worker| PrefillBound::at(worker, sides.prompt_tokens, prefill_start));
+    // Each side owns its client handle (a cheap channel clone, the same one
+    // batched dispatch takes per sub-request) so the side still in flight when
     // its partner fails can be moved off the request path.
     let mut prefill_client = prefill_client.clone();
     let mut decode_client = decode_client.clone();
@@ -1015,14 +1015,14 @@ async fn execute_parallel_pd(
     {
         Metrics::record_worker_request(worker.url(), worker.model_id());
     }
-    // The leg is booked on its worker here, before its call is polled: a
+    // The side is booked on its worker here, before its call is polled: a
     // servicer that sends its headers with the first message answers the
     // call only once the prefill is done, so a booking at the call's return
     // would time nothing (see `PrefillTicket::book`). The bound above was
-    // read before the booking, so the leg's own prompt is not counted twice.
+    // read before the booking, so the side's own prompt is not counted twice.
     let prefill_ticket =
         prefill_worker.and_then(|worker| PrefillTicket::book(worker, sides.prompt_tokens));
-    let prefill_dispatch: PdLegDispatch = Box::pin(dispatch_prefill_within(
+    let prefill_dispatch: SideDispatch = Box::pin(dispatch_prefill_within(
         bound,
         Box::pin(async move { prefill_client.generate(prefill_request).await }),
         prefill_worker.cloned(),
@@ -1031,10 +1031,10 @@ async fn execute_parallel_pd(
         sides.request_id.clone(),
         sides.prompt_tokens,
     ));
-    let decode_dispatch: PdLegDispatch =
+    let decode_dispatch: SideDispatch =
         Box::pin(async move { decode_client.generate(decode_request).await });
 
-    match dispatch_pd_legs(prefill_dispatch, decode_dispatch).await {
+    match dispatch_pd_sides(prefill_dispatch, decode_dispatch).await {
         PdDispatchOutcome::Both(prefill_result, decode_result) => {
             parallel_sides_answered(
                 &sides,
@@ -1043,7 +1043,7 @@ async fn execute_parallel_pd(
                 bound,
                 prefill_ticket,
                 prefill_guard,
-                // Both legs were dispatched together, so the decode leg's
+                // Both sides were dispatched together, so the decode side's
                 // time to first token is the end-to-end one.
                 PdTiming {
                     prefill_start,
@@ -1054,10 +1054,10 @@ async fn execute_parallel_pd(
             .await
         }
         PdDispatchOutcome::FailedFirst {
-            leg,
+            side,
             error,
             partner,
-        } => Err(parallel_side_failed_first(&sides, leg, &error, partner)),
+        } => Err(parallel_side_failed_first(&sides, side, &error, partner)),
     }
 }
 
@@ -1072,15 +1072,15 @@ fn parallel_pd_requests(
     // Decode consumes the KV handoff from prefill, but TokenSpeed still
     // needs multimodal metadata to pad placeholders and compute MRoPE in
     // the same way as prefill. Drop raw pixels and prefill-only encode
-    // rooms, but keep the per-item metadata. The pixel-free leg is the
+    // rooms, but keep the per-item metadata. The pixel-free side is the
     // clone, so pixel tensors are never duplicated.
     let mut prefill_request = proto_request;
     let mut decode_request = prefill_request.clone_without_mm_pixels();
     decode_request.clear_encode_bootstrap_info();
-    // Pin each leg's DP rank only when the engine reads placement from
+    // Pin each side's DP rank only when the engine reads placement from
     // the request field; `RoomResidue` engines take it from the bootstrap
     // room minted in maybe_inject_pd_rendezvous, ignore the pin, and spam
-    // conflict warnings on a mismatched decode-leg pin.
+    // conflict warnings on a mismatched decode-side pin.
     if protocol.dp_placement == DpPlacement::PinField {
         if let Some(rank) = workers.prefill_worker().and_then(|w| w.dp_rank()) {
             prefill_request.set_data_parallel_rank(rank as i32);
@@ -1100,7 +1100,7 @@ async fn parallel_sides_answered(
     sides: &PdSides<'_>,
     prefill_result: StreamResult,
     decode_result: StreamResult,
-    bound: Option<PrefillLegBound>,
+    bound: Option<PrefillBound>,
     prefill_ticket: Option<PrefillTicket>,
     prefill_guard: PrefillLoadGuard,
     pd_timing: PdTiming,
@@ -1108,16 +1108,16 @@ async fn parallel_sides_answered(
     let workers = sides.workers;
     record_pd_dispatch_outcomes(workers, sides.ledger, &prefill_result, &decode_result);
 
-    // Both legs are translated before either is propagated: a
+    // Both sides are translated before either is propagated: a
     // decode-side failure is logged and counted even when the prefill
     // error is the one the client sees.
     let prefill_silence = prefill_result
         .as_ref()
         .is_err_and(|e| is_prefill_silence(e) || is_decode_silence(e));
-    let prefill =
-        prefill_result.map_err(|e| pd_leg_error(PdLeg::Prefill, sides.prefill_label, &e, workers));
+    let prefill = prefill_result
+        .map_err(|e| pd_side_error(PdSide::Prefill, sides.prefill_label, &e, workers));
     let decode =
-        decode_result.map_err(|e| pd_leg_error(PdLeg::Decode, sides.decode_label, &e, workers));
+        decode_result.map_err(|e| pd_side_error(PdSide::Decode, sides.decode_label, &e, workers));
     let (prefill_stream, decode_stream) = match (prefill, decode) {
         (Ok(prefill), Ok(decode)) => (prefill, decode),
         // A prefill given up on for a silence verdict (its own, or
@@ -1129,22 +1129,22 @@ async fn parallel_sides_answered(
             drop(decode.defer_abort_until_first_item());
             return Err(response);
         }
-        // Any other failure: the surviving leg's stream drops here,
+        // Any other failure: the surviving side's stream drops here,
         // which aborts its room on the worker.
         (Err(response), _) | (Ok(_), Err(response)) => return Err(response),
     };
 
-    // The prefill leg's prompt has been pending prefill on its worker
+    // The prefill side's prompt has been pending prefill on its worker
     // since its dispatch, until its first response (which teaches the
     // worker's rate); the stream takes the booking over. What is left
-    // of the leg's bound is spent waiting for that response here,
+    // of the side's bound is spent waiting for that response here,
     // before the response to the client begins, so a silent prefill
     // fails the attempt where the retry layer can still take the
     // request to another prefill worker.
     let prefill_worker = workers.prefill_worker();
     let mut prefill_stream = match prefill_worker {
         Some(worker) => {
-            prefill_stream.tracked_prefill_leg_booked(Arc::clone(worker), prefill_ticket)
+            prefill_stream.tracked_prefill_side_booked(Arc::clone(worker), prefill_ticket)
         }
         None => prefill_stream,
     };
@@ -1167,28 +1167,28 @@ async fn parallel_sides_answered(
             drop(prefill_stream);
             drop(decode_stream.defer_abort_until_first_item());
             record_silence_outcome(workers, sides.ledger, &e);
-            return Err(pd_leg_error(
-                PdLeg::Prefill,
+            return Err(pd_side_error(
+                PdSide::Prefill,
                 sides.prefill_label,
                 &e,
                 workers,
             ));
         }
-        // The leg answered: the success its dispatch's sample waited
-        // for. A leg whose first item is a failure is charged once,
+        // The side answered: the success its dispatch's sample waited
+        // for. A side whose first item is a failure is charged once,
         // where its reader meets it (the streaming layer's
         // accounting); a stream that ended with nothing on it is no
-        // success of the leg either.
+        // success of the side either.
         Ok(FirstItem::Response) => workers.record_outcome_prefill(sides.ledger, 200),
         Ok(FirstItem::Failure | FirstItem::End) => {}
     }
 
-    // A client disconnect drops both leg streams, which normally fires an
-    // immediate abort to each worker. The decode leg must not be aborted
+    // A client disconnect drops both side streams, which normally fires an
+    // immediate abort to each worker. The decode side must not be aborted
     // while it is still receiving the KV handoff from prefill — tearing
     // the request down mid-transfer can crash or leak on the engine — so
     // its abort is deferred until the first decode response (the proof
-    // the handoff completed). The prefill leg keeps the immediate abort:
+    // the handoff completed). The prefill side keeps the immediate abort:
     // if prefill is still running there is nothing to hand off yet, and
     // stopping it promptly frees capacity.
     let decode_stream = decode_stream.defer_abort_until_first_item();
@@ -1208,17 +1208,17 @@ async fn parallel_sides_answered(
 /// partner is retired off the request path.
 fn parallel_side_failed_first(
     sides: &PdSides<'_>,
-    side: PdLeg,
+    side: PdSide,
     error: &tonic::Status,
-    partner: PdLegDispatch,
+    partner: SideDispatch,
 ) -> Response {
     let workers = sides.workers;
     let status = error.breaker_status();
     // Only the side that answered is recorded: the abandoned one has
-    // said nothing about its worker yet, and `retire_pd_leg` records
+    // said nothing about its worker yet, and `retire_pd_side` records
     // it when it finally does.
     let (label, partner_label, partner_worker) = match side {
-        PdLeg::Prefill => {
+        PdSide::Prefill => {
             record_silence_outcome(workers, sides.ledger, error);
             (
                 sides.prefill_label,
@@ -1226,7 +1226,7 @@ fn parallel_side_failed_first(
                 workers.decode_worker(),
             )
         }
-        PdLeg::Decode => {
+        PdSide::Decode => {
             if let Some(status) = status {
                 workers.record_outcome_decode(sides.ledger, status);
             }
@@ -1249,7 +1249,7 @@ fn parallel_side_failed_first(
         } else {
             Retirement::PartnerFailed
         };
-        retire_pd_leg(
+        retire_pd_side(
             side.partner(),
             partner_label,
             Arc::clone(worker),
@@ -1257,32 +1257,32 @@ fn parallel_side_failed_first(
             retirement,
         );
     }
-    pd_leg_error(side, label, error, workers)
+    pd_side_error(side, label, error, workers)
 }
 
-/// Dispatch both legs together and answer with the first failure.
+/// Dispatch both sides together and answer with the first failure.
 ///
-/// The legs rendezvous on one bootstrap room, so a leg that cannot start
+/// The sides rendezvous on one bootstrap room, so a side that cannot start
 /// leaves its partner's room unreachable — and the engine holding that room
 /// for the whole of its own deadline. Waiting for the second verdict before
 /// reporting the first failure is what turned a 120 s prefill bootstrap
 /// timeout into a 300 s decode transfer timeout for the client, with the
-/// pair's slot held throughout. A leg that has already answered is never
+/// pair's slot held throughout. A side that has already answered is never
 /// discarded, so the success path is byte-for-byte what a join produced.
-async fn dispatch_pd_legs(
-    mut prefill: PdLegDispatch,
-    mut decode: PdLegDispatch,
+async fn dispatch_pd_sides(
+    mut prefill: SideDispatch,
+    mut decode: SideDispatch,
 ) -> PdDispatchOutcome {
     /// One turn of the dispatch loop. The `select!` handlers may only
-    /// classify — moving a still-pending leg out happens after the macro's
+    /// classify — moving a still-pending side out happens after the macro's
     /// borrows end.
-    enum LegStep {
-        /// The prefill leg answered; a failure here was beaten to the finish
+    enum DispatchStep {
+        /// The prefill side answered; a failure here was beaten to the finish
         /// by its partner, so both verdicts are in.
         Prefill(StreamResult),
         Decode(StreamResult),
-        /// This leg failed while its partner was still dispatching.
-        Alone(PdLeg, tonic::Status),
+        /// This side failed while its partner was still dispatching.
+        Alone(PdSide, tonic::Status),
     }
 
     // At most one of these is `Some` at the top of the loop: the second
@@ -1294,32 +1294,32 @@ async fn dispatch_pd_legs(
     loop {
         let step = tokio::select! {
             result = &mut prefill, if prefill_result.is_none() => match result {
-                Err(error) if decode_result.is_none() => LegStep::Alone(PdLeg::Prefill, error),
-                result => LegStep::Prefill(result),
+                Err(error) if decode_result.is_none() => DispatchStep::Alone(PdSide::Prefill, error),
+                result => DispatchStep::Prefill(result),
             },
             result = &mut decode, if decode_result.is_none() => match result {
-                Err(error) if prefill_result.is_none() => LegStep::Alone(PdLeg::Decode, error),
-                result => LegStep::Decode(result),
+                Err(error) if prefill_result.is_none() => DispatchStep::Alone(PdSide::Decode, error),
+                result => DispatchStep::Decode(result),
             },
         };
 
         match step {
-            LegStep::Alone(leg, error) => {
-                let partner = match leg {
-                    PdLeg::Prefill => decode,
-                    PdLeg::Decode => prefill,
+            DispatchStep::Alone(side, error) => {
+                let partner = match side {
+                    PdSide::Prefill => decode,
+                    PdSide::Decode => prefill,
                 };
                 return PdDispatchOutcome::FailedFirst {
-                    leg,
+                    side,
                     error,
                     partner,
                 };
             }
-            LegStep::Prefill(result) => match decode_result.take() {
+            DispatchStep::Prefill(result) => match decode_result.take() {
                 Some(decode) => return PdDispatchOutcome::Both(result, decode),
                 None => prefill_result = Some(result),
             },
-            LegStep::Decode(result) => match prefill_result.take() {
+            DispatchStep::Decode(result) => match prefill_result.take() {
                 Some(prefill) => return PdDispatchOutcome::Both(prefill, result),
                 None => decode_result = Some(result),
             },
@@ -1327,61 +1327,61 @@ async fn dispatch_pd_legs(
     }
 }
 
-/// Log, count and translate one leg's dispatch failure into the client answer.
+/// Log, count and translate one side's dispatch failure into the client answer.
 /// A failure that names the rendezvous counts under the rendezvous family too.
-/// A prefill leg's silence verdict was logged and counted where its bound
+/// A prefill side's silence verdict was logged and counted where its bound
 /// passed, and answers under its own code (see [`prefill_silence_response`]).
-fn pd_leg_error(
-    leg: PdLeg,
+fn pd_side_error(
+    side: PdSide,
     connection: &'static str,
     error: &tonic::Status,
     workers: &WorkerSelection,
 ) -> Response {
-    if leg == PdLeg::Prefill && is_prefill_silence(error) {
+    if side == PdSide::Prefill && is_prefill_silence(error) {
         if let Some(prefill) = workers.prefill_worker() {
             return prefill_silence_response(error, prefill);
         }
     }
-    if leg == PdLeg::Prefill && is_decode_silence(error) {
+    if side == PdSide::Prefill && is_decode_silence(error) {
         if let Some(decode) = workers.decode_worker() {
             return decode_silence_response(error, decode);
         }
     }
-    UpstreamClass::account_dispatch_failure(leg.name(), connection, error);
-    account_pd_leg_failure(leg.name(), error);
+    UpstreamClass::account_dispatch_failure(side.name(), connection, error);
+    account_pd_side_failure(side.name(), error);
     start_failure_response(
         error,
         "execute_parallel_pd",
-        leg.error_message(),
-        leg.error_code(),
+        side.error_message(),
+        side.error_code(),
     )
 }
 
-/// Why a PD leg still dispatching is retired off the request path (see
-/// [`retire_pd_leg`]), and what its late result is worth to its worker's
+/// Why a PD side still dispatching is retired off the request path (see
+/// [`retire_pd_side`]), and what its late result is worth to its worker's
 /// record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Retirement {
-    /// Its partner failed to start, and the request with it. The leg's own
+    /// Its partner failed to start, and the request with it. The side's own
     /// late failure is still this request's one word on its worker: sampled
     /// on the breaker and counted as a dispatch's is. A late stream is
-    /// aborted and earns no success: the leg never produced anything.
+    /// aborted and earns no success: the side never produced anything.
     PartnerFailed,
     /// Its partner, the prefill, fell silent: the request charged that
-    /// prefill where its bound passed, and this leg's late result is not its
+    /// prefill where its bound passed, and this side's late result is not its
     /// worker's fault (the handoff it waited for never came), so it is
     /// neither sampled nor counted. Its abort is deferred: the prefill may
     /// yet start the handoff, which must not be torn down mid-write.
     PartnerSilent,
     /// Its own silence bound passed. The request charged a worker once,
     /// where the bound passed (the breaker sample through the ledger, the
-    /// `timeout` worker error): this leg's, or its decode partner's when
+    /// `timeout` worker error): this side's, or its decode partner's when
     /// the partner had stalled mid-stream (see [`decode_partner_silent`]).
     /// Its late result is neither sampled nor counted, whatever it is. A
     /// late stream is aborted, a late error noted.
     Silent,
     /// Its own first-token bound passed while a KV handoff may still be
-    /// written into it (the decode leg of the sequential dispatch): charged
+    /// written into it (the decode side of the sequential dispatch): charged
     /// as [`Self::Silent`] is, and its abort deferred as
     /// [`Self::PartnerSilent`]'s, since the handoff must not be torn down
     /// mid-write.
@@ -1408,31 +1408,31 @@ impl Retirement {
     }
 }
 
-/// Finish off a leg that was still dispatching when its request gave up on
+/// Finish off a side that was still dispatching when its request gave up on
 /// it: its partner failed, or its own silence bound passed
 /// ([`Retirement`]).
 ///
 /// The request is already answered; what is left is the engine-side room,
-/// which the abandoned leg will allocate the moment its dispatch lands and
-/// then hold for its own deadline. Dropping the leg's stream as soon as it
+/// which the abandoned side will allocate the moment its dispatch lands and
+/// then hold for its own deadline. Dropping the side's stream as soon as it
 /// arrives is the abort path the router already uses on a client disconnect,
 /// and it is the only thing that releases that room early. The abort is
-/// deferred only when a KV handoff may still be written into the leg: the
+/// deferred only when a KV handoff may still be written into the side: the
 /// decode partner of a prefill that fell silent rather than failed; a peer
 /// that failed to start writes nothing. A late failure is sampled and
-/// counted only when it is the request's one word on the worker; a leg
+/// counted only when it is the request's one word on the worker; a side
 /// given up on for its silence charged its worker when the bound passed.
-/// A late stream earns no success either way: the leg is aborted before it
+/// A late stream earns no success either way: the side is aborted before it
 /// produced anything.
 #[expect(
     clippy::disallowed_methods,
-    reason = "the abandoned PD leg is retired off the request path; its dispatch is bounded by the engine's own deadline"
+    reason = "the abandoned PD side is retired off the request path; its dispatch is bounded by the engine's own deadline"
 )]
-fn retire_pd_leg(
-    leg: PdLeg,
+fn retire_pd_side(
+    side: PdSide,
     connection: &'static str,
     worker: Arc<dyn Worker>,
-    dispatch: PdLegDispatch,
+    dispatch: SideDispatch,
     retirement: Retirement,
 ) {
     tokio::spawn(async move {
@@ -1447,10 +1447,10 @@ fn retire_pd_leg(
         match result {
             Ok(stream) => {
                 debug!(
-                    leg = leg.name(),
+                    leg = side.name(),
                     worker = worker.url(),
                     cause,
-                    "Aborting the room of an abandoned PD leg"
+                    "Aborting the room of an abandoned PD side"
                 );
                 if retirement.defer_abort() {
                     drop(stream.defer_abort_until_first_item());
@@ -1459,60 +1459,60 @@ fn retire_pd_leg(
                 }
             }
             Err(error) if retirement.charges() => {
-                UpstreamClass::account_dispatch_failure(leg.name(), connection, &error);
+                UpstreamClass::account_dispatch_failure(side.name(), connection, &error);
                 error!(
-                    function = "retire_pd_leg",
-                    leg = leg.name(),
+                    function = "retire_pd_side",
+                    leg = side.name(),
                     worker = worker.url(),
                     cause,
                     error = %error,
-                    "Abandoned PD leg failed after its request had given up on it"
+                    "Abandoned PD side failed after its request had given up on it"
                 );
             }
             Err(error) => {
                 debug!(
-                    leg = leg.name(),
+                    leg = side.name(),
                     worker = worker.url(),
                     cause,
                     error = %error,
-                    "Abandoned PD leg failed late; its request had charged what it gave up on"
+                    "Abandoned PD side failed late; its request had charged what it gave up on"
                 );
             }
         }
     });
 }
 
-/// The message a prefill leg's silence verdict starts with (see
-/// [`prefill_leg_silent`]); it tells the verdict from an engine's own
+/// The message a prefill side's silence verdict starts with (see
+/// [`prefill_side_silent`]); it tells the verdict from an engine's own
 /// `DEADLINE_EXCEEDED`.
 const PREFILL_SILENCE_MESSAGE: &str = "prefill leg produced nothing within";
 
-/// The message of the verdict that puts a prefill leg's silence on its
+/// The message of the verdict that puts a prefill side's silence on its
 /// stalled decode partner (see [`decode_partner_silent`]).
 const DECODE_SILENCE_MESSAGE: &str = "decode worker produced nothing within";
 
-/// The message a sequential decode leg's silence verdict starts with (see
-/// [`decode_leg_silent`]); it tells the verdict from an engine's own
+/// The message a sequential decode side's silence verdict starts with (see
+/// [`decode_side_silent`]); it tells the verdict from an engine's own
 /// `DEADLINE_EXCEEDED`.
-const DECODE_LEG_SILENCE_MESSAGE: &str = "decode leg produced nothing within";
+const DECODE_SIDE_SILENCE_MESSAGE: &str = "decode leg produced nothing within";
 
-/// The bound on one prefill leg's silence, counted from its dispatch (see
+/// The bound on one prefill side's silence, counted from its dispatch (see
 /// [`liveness::prefill_leg_bound`]); the dispatch instant stays with it,
 /// as a reprieve past the deadline may count from there (see
 /// [`liveness::prefill_leg_reprieve`]).
 #[derive(Clone, Copy, Debug)]
-struct PrefillLegBound {
+struct PrefillBound {
     dispatched: Instant,
     deadline: Instant,
     bound: Duration,
 }
 
-impl PrefillLegBound {
-    /// The bound for a leg of `prompt_tokens` dispatched to `worker` at
+impl PrefillBound {
+    /// The bound for a side of `prompt_tokens` dispatched to `worker` at
     /// `dispatched`; `None` when the rule is off.
     fn at(worker: &Arc<dyn Worker>, prompt_tokens: u64, dispatched: Instant) -> Option<Self> {
         let bound = liveness::prefill_leg_bound(worker, prompt_tokens)?;
-        // A bound past the clock's range never expires: the leg stays unbounded.
+        // A bound past the clock's range never expires: the side stays unbounded.
         let deadline = dispatched.checked_add(bound)?;
         Some(Self {
             dispatched,
@@ -1522,19 +1522,19 @@ impl PrefillLegBound {
     }
 }
 
-/// The verdict on a prefill leg that produced nothing within its bound, in
+/// The verdict on a prefill side that produced nothing within its bound, in
 /// `phase` (`dispatch`: the call returned no stream; `first_response`: the
-/// stream yielded nothing), while its worker answered no other leg within
+/// stream yielded nothing), while its worker answered no other side within
 /// the bound either (see [`liveness::prefill_leg_reprieve`]): one WARN
 /// naming the worker, the request and how long ago the worker last
 /// answered anything, the worker-error counter under the timeout class, and
-/// the status the leg's failure is reported with. Nothing else bounds this
+/// the status the side's failure is reported with. Nothing else bounds this
 /// wait below the request's own timeout: the engine's health probes keep
 /// passing, the queue timeout ended at worker selection, and the admission
 /// gate only gates the dispatch. The attempt fails here; the retry layer
 /// takes the request to another prefill worker when one is available (see
 /// [`prefill_silence_response`]).
-fn prefill_leg_silent(
+fn prefill_side_silent(
     worker: &Arc<dyn Worker>,
     connection: &'static str,
     request_id: &str,
@@ -1553,7 +1553,7 @@ fn prefill_leg_silent(
         prompt_tokens,
         bound_ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
         worker_last_answer = %worker_last_answer,
-        "PD prefill leg produced nothing within its silence bound, and its worker answered no other leg within it; giving up on it"
+        "PD prefill side produced nothing within its silence bound, and its worker answered no other side within it; giving up on it"
     );
     Metrics::record_worker_error(
         metrics_labels::WORKER_PREFILL,
@@ -1565,23 +1565,23 @@ fn prefill_leg_silent(
     ))
 }
 
-/// Whether `status` is a prefill leg's silence verdict.
+/// Whether `status` is a prefill side's silence verdict.
 fn is_prefill_silence(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::DeadlineExceeded
         && status.message().starts_with(PREFILL_SILENCE_MESSAGE)
 }
 
-/// The decode partner of a prefill leg whose silence bound passed, when the
+/// The decode partner of a prefill side whose silence bound passed, when the
 /// silence is the partner's: on the parallel dispatch shape the prefill
-/// leg's first response waits for the decode side, so a decode worker that
-/// stopped producing makes every prefill leg look silent and the prefill
-/// worker answer no leg at all. A decode worker that still holds streams it
+/// side's first response waits for the decode side, so a decode worker that
+/// stopped producing makes every prefill side look silent and the prefill
+/// worker answer no side at all. A decode worker that still holds streams it
 /// had been producing for and has produced nothing for the bound has
 /// stalled ([`Worker::output_silence`]); one that is still producing, or
 /// holds no such stream (its streams ended, or its in-flight work has shown
 /// nothing yet: a frozen prefill in front of an idle decode looks like that,
 /// and the prefill keeps the verdict as before), is not read as the cause.
-/// `None` without a partner (the sequential shape sends the decode leg
+/// `None` without a partner (the sequential shape sends the decode side
 /// after the prefill answered, so a silent prefill there is its own).
 fn stalled_decode_partner(
     partner: Option<&Arc<dyn Worker>>,
@@ -1594,7 +1594,7 @@ fn stalled_decode_partner(
     Some((Arc::clone(decode), silence))
 }
 
-/// The verdict on a prefill leg that produced nothing within its bound
+/// The verdict on a prefill side that produced nothing within its bound
 /// while its decode partner had stalled mid-stream (see
 /// [`stalled_decode_partner`]): one WARN naming the decode worker, the
 /// prefill worker and the request, the worker-error counter under the
@@ -1619,7 +1619,7 @@ fn decode_partner_silent(
         phase,
         bound_ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
         decode_silence_ms = u64::try_from(silence.as_millis()).unwrap_or(u64::MAX),
-        "PD decode worker has produced nothing for the silence bound on the streams it was serving, and the prefill leg waits on it; giving up on the pair and charging the decode worker"
+        "PD decode worker has produced nothing for the silence bound on the streams it was serving, and the prefill side waits on it; giving up on the pair and charging the decode worker"
     );
     Metrics::record_worker_error(
         metrics_labels::WORKER_DECODE,
@@ -1652,12 +1652,12 @@ fn decode_silence_response(status: &tonic::Status, decode: &Arc<dyn Worker>) -> 
     response
 }
 
-/// The breaker samples of a parallel dispatch whose two legs both answered
+/// The breaker samples of a parallel dispatch whose two sides both answered
 /// (client errors don't count as failures). A dispatch that succeeded is
-/// sampled once the leg's first response is in: the prefill's where its
+/// sampled once the side's first response is in: the prefill's where its
 /// first response is awaited, as the sequential path samples it after the
-/// drain; the decode's by the tracked leg (`attribute_pd_legs`), since its
-/// first response waits for the handoff. A leg that was accepted into
+/// drain; the decode's by the tracked side (`attribute_pd_sides`), since its
+/// first response waits for the handoff. A side that was accepted into
 /// silence, or whose stream fails at once, is one failure of its worker,
 /// not a success and then a failure, which would reset the breaker's streak
 /// every time. A prefill dispatch that ended with the decode verdict (its
@@ -1683,7 +1683,7 @@ fn record_pd_dispatch_outcomes(
     }
 }
 
-/// The breaker sample of a prefill leg's silence verdict: on the worker the
+/// The breaker sample of a prefill side's silence verdict: on the worker the
 /// verdict charged (the decode partner that stalled, else the prefill).
 fn record_silence_outcome(
     workers: &WorkerSelection,
@@ -1699,8 +1699,8 @@ fn record_silence_outcome(
     }
 }
 
-/// The client answer for a prefill leg's silence: a 504 under its own error
-/// code, replayable on another prefill worker. The leg's worker is marked on
+/// The client answer for a prefill side's silence: a 504 under its own error
+/// code, replayable on another prefill worker. The side's worker is marked on
 /// the response so the retry window closes on it alone (its decode partner
 /// stays selectable) and the answer stands when no other prefill worker is
 /// available (see `attempt_ledger::FailedSide`).
@@ -1713,8 +1713,8 @@ fn prefill_silence_response(status: &tonic::Status, prefill: &Arc<dyn Worker>) -
     response
 }
 
-/// Await a prefill leg's dispatch within its bound. Past the deadline the
-/// leg waits on while its worker keeps answering other legs (a bound past
+/// Await a prefill side's dispatch within its bound. Past the deadline the
+/// side waits on while its worker keeps answering other sides (a bound past
 /// the worker's latest answer, re-read each time: see
 /// [`liveness::prefill_leg_reprieve`]); once the worker has answered
 /// nothing for a bound, the still-pending call is retired off the request
@@ -1724,8 +1724,8 @@ fn prefill_silence_response(status: &tonic::Status, prefill: &Arc<dyn Worker>) -
 /// passes the decode worker, the sequential shape none). Without a bound or
 /// a worker to charge, the call is awaited as it is.
 async fn dispatch_prefill_within(
-    bound: Option<PrefillLegBound>,
-    mut dispatch: PdLegDispatch,
+    bound: Option<PrefillBound>,
+    mut dispatch: SideDispatch,
     worker: Option<Arc<dyn Worker>>,
     partner: Option<Arc<dyn Worker>>,
     connection: &'static str,
@@ -1743,8 +1743,8 @@ async fn dispatch_prefill_within(
         let Some(more) =
             liveness::prefill_leg_reprieve(&worker, bound.bound, bound.dispatched.elapsed())
         else {
-            retire_pd_leg(
-                PdLeg::Prefill,
+            retire_pd_side(
+                PdSide::Prefill,
                 connection,
                 Arc::clone(&worker),
                 dispatch,
@@ -1761,7 +1761,7 @@ async fn dispatch_prefill_within(
                         silence,
                         "dispatch",
                     ),
-                    None => prefill_leg_silent(
+                    None => prefill_side_silent(
                         &worker,
                         connection,
                         &request_id,
@@ -1776,15 +1776,15 @@ async fn dispatch_prefill_within(
     }
 }
 
-/// Wait for a prefill leg's first item within what is left of its bound,
+/// Wait for a prefill side's first item within what is left of its bound,
 /// with the same reprieves as [`dispatch_prefill_within`], and say what it
 /// was. The item stays on the stream for its reader; past the bound, with
-/// the worker silent, the silence verdict (the caller drops the leg, which
-/// aborts its room). Without a bound nothing is pulled ahead and the leg
+/// the worker silent, the silence verdict (the caller drops the side, which
+/// aborts its room). Without a bound nothing is pulled ahead and the side
 /// counts as answered, as its dispatch did.
 async fn first_prefill_response_within(
     stream: &mut ProtoStream,
-    bound: Option<PrefillLegBound>,
+    bound: Option<PrefillBound>,
     worker: Option<&Arc<dyn Worker>>,
     partner: Option<&Arc<dyn Worker>>,
     connection: &'static str,
@@ -1812,7 +1812,7 @@ async fn first_prefill_response_within(
                     silence,
                     "first_response",
                 ),
-                None => prefill_leg_silent(
+                None => prefill_side_silent(
                     worker,
                     connection,
                     request_id,
@@ -1826,36 +1826,36 @@ async fn first_prefill_response_within(
     }
 }
 
-/// The bound on a sequential decode leg's first token, counted from its
+/// The bound on a sequential decode side's first token, counted from its
 /// dispatch (see [`liveness::decode_leg_bound`]).
 #[derive(Clone, Copy, Debug)]
-struct DecodeLegBound {
+struct DecodeBound {
     deadline: Instant,
     bound: Duration,
 }
 
-impl DecodeLegBound {
-    /// The bound for a leg of `prompt_tokens` dispatched at `dispatched`,
+impl DecodeBound {
+    /// The bound for a side of `prompt_tokens` dispatched at `dispatched`,
     /// sized from `prefills`, the worker whose prefill of the prompt stands
-    /// before the leg's first token (see [`liveness::decode_leg_bound`]);
+    /// before the side's first token (see [`liveness::decode_leg_bound`]);
     /// `None` when the rule is off.
     fn at(prefills: &Arc<dyn Worker>, prompt_tokens: u64, dispatched: Instant) -> Option<Self> {
         let bound = liveness::decode_leg_bound(prefills, prompt_tokens)?;
-        // A bound past the clock's range never expires: the leg stays unbounded.
+        // A bound past the clock's range never expires: the side stays unbounded.
         let deadline = dispatched.checked_add(bound)?;
         Some(Self { deadline, bound })
     }
 }
 
 /// The worker whose prefill of the prompt stands before a sequential decode
-/// leg's first token, which sizes the leg's bound: the prefill worker when
-/// the decode leg pulls its prompt KV from it, which takes both a handoff
+/// side's first token, which sizes the side's bound: the prefill worker when
+/// the decode side pulls its prompt KV from it, which takes both a handoff
 /// and a request the KV parameters were relayed for (`handed_off` alone does
 /// not say so: the legacy Mooncake arm hands off a fan-out in name only and
 /// the decode engine recomputes the prompt); else the decode worker, which
 /// recomputes the prompt itself (a fan-out, or a prefill that returned no
 /// transfer parameters). The decode worker's prefill rate is never measured
-/// under PD (its decode legs book no prefill), so that bound follows the
+/// under PD (its decode sides book no prefill), so that bound follows the
 /// cold rate with an empty backlog, the conservative side.
 fn worker_prefilling_before_decode(
     workers: &WorkerSelection,
@@ -1869,19 +1869,19 @@ fn worker_prefilling_before_decode(
     }
 }
 
-/// The verdict on a sequential decode leg that produced nothing within its
+/// The verdict on a sequential decode side that produced nothing within its
 /// first-token bound, in `phase` (`dispatch`: the call returned no stream;
 /// `first_response`: the stream yielded nothing): one WARN naming the
 /// worker and the request, the worker-error counter under the timeout
-/// class, and the status the leg's failure is reported with. The prefill
-/// leg has answered by then, so its silence bound no longer covers the
+/// class, and the status the side's failure is reported with. The prefill
+/// side has answered by then, so its silence bound no longer covers the
 /// request, and nothing else bounds this wait below the request's own
 /// timeout: the engines' health probes keep passing while the KV handoff
 /// waits on a prefill engine that stalled right after answering, and the
 /// admission gate only gated the dispatch. The attempt fails here; the
 /// retry layer takes the request to another decode worker when one is
 /// available (see [`decode_silence_response`]).
-fn decode_leg_silent(
+fn decode_side_silent(
     worker: &Arc<dyn Worker>,
     connection: &'static str,
     request_id: &str,
@@ -1896,7 +1896,7 @@ fn decode_leg_silent(
         phase,
         prompt_tokens,
         bound_ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
-        "PD decode leg produced nothing within its first-token bound after the prefill leg had answered (the handoff did not complete, or the decode engine never scheduled it); giving up on it"
+        "PD decode side produced nothing within its first-token bound after the prefill side had answered (the handoff did not complete, or the decode engine never scheduled it); giving up on it"
     );
     Metrics::record_worker_error(
         metrics_labels::WORKER_DECODE,
@@ -1904,30 +1904,30 @@ fn decode_leg_silent(
         metrics_labels::ERROR_TIMEOUT,
     );
     tonic::Status::deadline_exceeded(format!(
-        "{DECODE_LEG_SILENCE_MESSAGE} {bound:.1?} of its dispatch ({phase})"
+        "{DECODE_SIDE_SILENCE_MESSAGE} {bound:.1?} of its dispatch ({phase})"
     ))
 }
 
-/// Whether `status` is a sequential decode leg's silence verdict. Its
+/// Whether `status` is a sequential decode side's silence verdict. Its
 /// client answer is the one a stalled decode partner gets on the parallel
 /// shape ([`decode_silence_response`]): a 504 `decode_worker_silent`,
 /// replayable on another decode worker, this one excluded.
-fn is_decode_leg_silence(status: &tonic::Status) -> bool {
+fn is_decode_side_silence(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::DeadlineExceeded
-        && status.message().starts_with(DECODE_LEG_SILENCE_MESSAGE)
+        && status.message().starts_with(DECODE_SIDE_SILENCE_MESSAGE)
 }
 
-/// Await a sequential decode leg's dispatch within its bound. Past the
+/// Await a sequential decode side's dispatch within its bound. Past the
 /// deadline the still-pending call is retired off the request path (its
 /// room is aborted once the handoff it may be in the middle of has produced
 /// a first item, or the deferral's cap passes) and the silence verdict takes
 /// its place. Without a bound or a worker to charge, the call is awaited as
-/// it is. No reprieve: unlike a prefill leg queued on a busy worker, a
-/// decode leg was admitted to a room before its dispatch, so nothing of the
-/// worker's other legs stands between it and its first token.
+/// it is. No reprieve: unlike a prefill side queued on a busy worker, a
+/// decode side was admitted to a room before its dispatch, so nothing of the
+/// worker's other sides stands between it and its first token.
 async fn dispatch_decode_within(
-    bound: Option<DecodeLegBound>,
-    mut dispatch: PdLegDispatch,
+    bound: Option<DecodeBound>,
+    mut dispatch: SideDispatch,
     worker: Option<Arc<dyn Worker>>,
     connection: &'static str,
     request_id: String,
@@ -1939,14 +1939,14 @@ async fn dispatch_decode_within(
     match tokio::time::timeout_at(bound.deadline.into(), &mut dispatch).await {
         Ok(result) => result,
         Err(_) => {
-            retire_pd_leg(
-                PdLeg::Decode,
+            retire_pd_side(
+                PdSide::Decode,
                 connection,
                 Arc::clone(&worker),
                 dispatch,
                 Retirement::HandoffSilent,
             );
-            Err(decode_leg_silent(
+            Err(decode_side_silent(
                 &worker,
                 connection,
                 &request_id,
@@ -1958,14 +1958,14 @@ async fn dispatch_decode_within(
     }
 }
 
-/// Wait for a sequential decode leg's first item within what is left of its
+/// Wait for a sequential decode side's first item within what is left of its
 /// bound, and say what it was. The item stays on the stream for its reader;
-/// past the bound, the silence verdict (the caller drops the leg, whose
+/// past the bound, the silence verdict (the caller drops the side, whose
 /// abort is deferred past the handoff). Without a bound nothing is pulled
-/// ahead and the leg counts as answered, as its dispatch did.
+/// ahead and the side counts as answered, as its dispatch did.
 async fn first_decode_response_within(
     stream: &mut ProtoStream,
-    bound: Option<DecodeLegBound>,
+    bound: Option<DecodeBound>,
     worker: Option<&Arc<dyn Worker>>,
     connection: &'static str,
     request_id: &str,
@@ -1976,7 +1976,7 @@ async fn first_decode_response_within(
     };
     match stream.first_response_within(bound.deadline).await {
         Ok(first) => Ok(first),
-        Err(_) => Err(decode_leg_silent(
+        Err(_) => Err(decode_side_silent(
             worker,
             connection,
             request_id,
@@ -1987,7 +1987,7 @@ async fn first_decode_response_within(
     }
 }
 
-/// The attempt's answer for a decode leg that failed to start or fell
+/// The attempt's answer for a decode side that failed to start or fell
 /// silent on the sequential path: the breaker sample, the worker-error
 /// counter (the silence verdict counted itself) and the client response.
 fn sequential_decode_failure(
@@ -1999,22 +1999,22 @@ fn sequential_decode_failure(
     if let Some(status) = e.breaker_status() {
         workers.record_outcome_decode(ledger, status);
     }
-    if is_decode_leg_silence(e) {
+    if is_decode_side_silence(e) {
         if let Some(decode) = workers.decode_worker() {
             return decode_silence_response(e, decode);
         }
     }
     UpstreamClass::account_dispatch_failure(metrics_labels::WORKER_DECODE, connection, e);
-    account_pd_leg_failure(metrics_labels::WORKER_DECODE, e);
+    account_pd_side_failure(metrics_labels::WORKER_DECODE, e);
     start_failure_response(
         e,
         "execute_sequential_pd",
-        PdLeg::Decode.error_message(),
-        PdLeg::Decode.error_code(),
+        PdSide::Decode.error_message(),
+        PdSide::Decode.error_code(),
     )
 }
 
-/// The attempt's answer for a prefill leg that failed to start or fell
+/// The attempt's answer for a prefill side that failed to start or fell
 /// silent on the sequential path: the breaker sample, the worker-error
 /// counter (the silence verdict counted itself) and the client response.
 fn sequential_prefill_failure(
@@ -2032,16 +2032,16 @@ fn sequential_prefill_failure(
         }
     }
     UpstreamClass::account_dispatch_failure(metrics_labels::WORKER_PREFILL, connection, e);
-    account_pd_leg_failure(metrics_labels::WORKER_PREFILL, e);
+    account_pd_side_failure(metrics_labels::WORKER_PREFILL, e);
     start_failure_response(
         e,
         "execute_sequential_pd",
-        PdLeg::Prefill.error_message(),
-        PdLeg::Prefill.error_code(),
+        PdSide::Prefill.error_message(),
+        PdSide::Prefill.error_code(),
     )
 }
 
-/// How the vLLM sequential-PD decode leg is built from the request.
+/// How the vLLM sequential-PD decode side is built from the request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SequentialPdDecodeForm {
     /// Full payload: no KV handoff (n>1), decode recomputes the prompt
@@ -2057,7 +2057,7 @@ enum SequentialPdDecodeForm {
     TextPlusHashes,
 }
 
-/// Pick the decode-leg form, failing fast when the selected decode worker is
+/// Pick the decode-side form, failing fast when the selected decode worker is
 /// language-model-only and the request is one that pairing cannot serve.
 /// Worker selection keeps such a request off such workers while the model
 /// pairs a decode worker with the vision encoder (`decode_needs_vision`), so
@@ -2091,7 +2091,7 @@ fn sequential_pd_decode_form(
         return Err(response);
     }
     if request.has_vllm_media_refs() {
-        // Media references reach each leg as unexpanded anchors the leg
+        // Media references reach each side as unexpanded anchors the side
         // expands itself; a language-model-only decode worker cannot.
         let mut response = error::bad_request(
             "pd_decode_language_model_only_media_refs",
@@ -2153,7 +2153,7 @@ impl SequentialPlan {
     ) -> Result<Self, Response> {
         let mode = match workers.decode_worker() {
             // A MoRI-IO decode engine never recomputes the prompt, whatever the
-            // prefill leg runs.
+            // prefill side runs.
             Some(decode) if is_moriio_worker(decode.as_ref()) => KvConnectorMode::MoriIo,
             _ => workers
                 .prefill_worker()
@@ -2213,7 +2213,7 @@ impl SequentialPlan {
         // vLLM P/D shape) has no vision encoder and
         // an encoder-cache budget of 0, so even the identity payload fails to
         // schedule there. Its model info reports supports_vision=false; for such
-        // a worker the decode leg is stripped down to what such an engine takes: the
+        // a worker the decode side is stripped down to what such an engine takes: the
         // prefill-expanded input_ids, the KV handoff, and the per-image content
         // hashes that the servicer folds into cache_salt so different images
         // cannot alias in the decode prefix cache.
@@ -2254,15 +2254,15 @@ impl SequentialPlan {
         // Decode normally reuses the request minus pixels: it receives KV via
         // the P/D transfer, and prefill reads and unlinks any /dev/shm
         // segments, so a reused ShmHandle would be unreadable. Same request_id
-        // on both legs is load-bearing for NIXL P/D correlation on vLLM <
-        // 0.13. The pixel-free leg is the clone, so pixel tensors are never
+        // on both sides is load-bearing for NIXL P/D correlation on vLLM <
+        // 0.13. The pixel-free side is the clone, so pixel tensors are never
         // duplicated and die with the prefill send; the per-image mm identity
         // and grid tensors survive for decode-side hashing and positions.
-        // Media references are resolved by the prefill leg and relayed to
+        // Media references are resolved by the prefill side and relayed to
         // decode as that same identity once prefill completes.
         // Without a KV handoff (n>1) decode recomputes the prompt locally and
-        // must run the vision encoder, so that leg keeps the full multimodal
-        // payload (SHM-backed tensors cannot serve both legs and fail loudly
+        // must run the vision encoder, so that side keeps the full multimodal
+        // payload (SHM-backed tensors cannot serve both sides and fail loudly
         // on the decode read).
         let decode_request = match self.decode_form {
             SequentialPdDecodeForm::Full => proto_request.clone(),
@@ -2383,10 +2383,10 @@ async fn execute_sequential_pd(
         decode_sent.duration_since(prefill_done),
     );
 
-    // The client's prompt-side usage is the prefill leg's: the decode leg's
-    // responses carry the prefix-cache hit the prefill leg reported, not the
-    // transfer the decode leg counts as cached.
-    let decode_stream = decode_stream.decode_leg(prefill_cached_tokens);
+    // The client's prompt-side usage is the prefill side's: the decode side's
+    // responses carry the prefix-cache hit the prefill side reported, not the
+    // transfer the decode side counts as cached.
+    let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
     // Surface the PD shape (not `Single`) so the streaming layer anchors TTFT
     // at prefill dispatch. Without this, the decode stream is established only
@@ -2394,7 +2394,7 @@ async fn execute_sequential_pd(
     // headers lazily with the first message — the first decode chunk is
     // already buffered when the stream task starts, so a task-local timer
     // measures ~0. The prefill stream is fully drained and its load guard
-    // already released, so the prefill leg carries no live guard.
+    // already released, so the prefill side carries no live guard.
     Ok(ExecutionResult::PrefillDecode {
         prefill: prefill_stream,
         decode: Box::new(decode_stream),
@@ -2425,8 +2425,8 @@ async fn sequential_prefill_side(
         "vLLM PD: sending prefill request (max_tokens=1)"
     );
 
-    // Send to prefill, wait for completion. The leg's silence is bounded
-    // from its dispatch (see `prefill_leg_silent`): a call that returns no
+    // Send to prefill, wait for completion. The side's silence is bounded
+    // from its dispatch (see `prefill_side_silent`): a call that returns no
     // stream (a servicer that holds its headers until the first message in
     // front of a frozen engine), or a stream with nothing on it, within the
     // bound fails the attempt here, where the retry layer can still take
@@ -2434,7 +2434,7 @@ async fn sequential_prefill_side(
     let prefill_worker = workers.prefill_worker();
     let prefill_start = Instant::now();
     let bound = prefill_worker
-        .and_then(|worker| PrefillLegBound::at(worker, sides.prompt_tokens, prefill_start));
+        .and_then(|worker| PrefillBound::at(worker, sides.prompt_tokens, prefill_start));
     if let Some(prefill) = prefill_worker {
         Metrics::record_worker_request(prefill.url(), prefill.model_id());
     }
@@ -2459,7 +2459,7 @@ async fn sequential_prefill_side(
     // takes the booking over.
     let mut prefill_stream = match prefill_worker {
         Some(worker) => {
-            prefill_stream.tracked_prefill_leg_booked(Arc::clone(worker), prefill_ticket)
+            prefill_stream.tracked_prefill_side_booked(Arc::clone(worker), prefill_ticket)
         }
         None => prefill_stream,
     };
@@ -2474,7 +2474,7 @@ async fn sequential_prefill_side(
     )
     .await
     {
-        // Dropping the stream aborts the leg's room: nothing was handed off.
+        // Dropping the stream aborts the side's room: nothing was handed off.
         drop(prefill_stream);
         return Err(sequential_prefill_failure(
             &e,
@@ -2516,7 +2516,7 @@ async fn sequential_prefill_side(
                     sides.prefill_label,
                     &e,
                 );
-                account_pd_leg_failure(metrics_labels::WORKER_PREFILL, &e);
+                account_pd_side_failure(metrics_labels::WORKER_PREFILL, &e);
                 error!(function = "execute_sequential_pd", error = %e, "Prefill stream error");
                 return Err(e.to_http_error(
                     "prefill_stream_error",
@@ -2625,7 +2625,7 @@ fn relay_to_decode(
         prefill_media_identity,
     );
 
-    // A stripped multimodal leg cannot fall back to a local recompute: the
+    // A stripped multimodal side cannot fall back to a local recompute: the
     // image KV exists only on the prefill worker, so without a handoff the
     // decode engine would recompute the prompt as pure text and answer
     // image-blind. Fail instead of dispatching.
@@ -2668,25 +2668,25 @@ async fn sequential_decode_side(
     }
     // The relay phase ends at the decode dispatch. Everything after this
     // instant, including the engines' KV transfer and the decode scheduling,
-    // is the decode leg's time to first token; the instant is taken before the
+    // is the decode side's time to first token; the instant is taken before the
     // call so a worker that holds its response headers until the first token
     // still lands in the decode phase.
     let decode_sent = Instant::now();
-    // The decode leg owes its first token within a bound counted from here
+    // The decode side owes its first token within a bound counted from here
     // (see `liveness::decode_leg_bound`): the KV handoff from the prefill
-    // leg and the decode engine's first step. The prefill leg has answered,
+    // side and the decode engine's first step. The prefill side has answered,
     // so its silence bound no longer covers the request, and nothing else
     // bounds this wait below the request's own timeout while the engines'
     // health probes keep passing (a prefill engine that stalls right after
     // answering leaves the handoff waiting on it).
-    // The bound covers a streaming request only: a non-streaming leg's first
+    // The bound covers a streaming request only: a non-streaming side's first
     // item is its whole generation (the servicers send nothing of a
     // non-streaming request before it finishes), no first-token signal. Its
     // size follows the worker whose prefill of the prompt stands before the
     // first token (see `worker_prefilling_before_decode`).
     let decode_bound = if plan.streaming {
         worker_prefilling_before_decode(workers, handed_off, plan.relay_kv_params)
-            .and_then(|worker| DecodeLegBound::at(worker, sides.prompt_tokens, decode_sent))
+            .and_then(|worker| DecodeBound::at(worker, sides.prompt_tokens, decode_sent))
     } else {
         None
     };
@@ -2706,19 +2706,19 @@ async fn sequential_decode_side(
     // transfer; aborting decode mid-transfer on a client disconnect can
     // crash or leak on the engine side. Defer the abort until the first
     // decode response proves the handoff finished (see the parallel PD
-    // path for the same invariant). The leg is tracked on its worker here,
+    // path for the same invariant). The side is tracked on its worker here,
     // before its first item is waited for: its responses are the worker's
     // progress, it joins no pile (its silence is bounded per request), and
-    // the worker's breaker success is sampled at the leg's first response
-    // (`ProtoStream::tracked_decode_leg`), never at the dispatch; the
-    // attribution stage leaves a leg tracked here as it is.
+    // the worker's breaker success is sampled at the side's first response
+    // (`ProtoStream::tracked_decode_side`), never at the dispatch; the
+    // attribution stage leaves a side tracked here as it is.
     let mut decode_stream = match &decode_worker {
         Some(worker) => decode_stream
             .defer_abort_until_first_item()
-            .tracked_decode_leg(Arc::clone(worker)),
+            .tracked_decode_side(Arc::clone(worker)),
         None => decode_stream.defer_abort_until_first_item(),
     };
-    // Without a bound nothing is pulled ahead and the leg counts as answered,
+    // Without a bound nothing is pulled ahead and the side counts as answered,
     // as before; a first item that is a failure, or an end with nothing on
     // the stream, is met by the reader and earns no success either way.
     if let Err(e) = first_decode_response_within(
@@ -2756,7 +2756,7 @@ mod tests {
         },
     };
 
-    /// A decode leg retired because its prefill fell silent is not charged
+    /// A decode side retired because its prefill fell silent is not charged
     /// for failing late: the handoff it waited for never came, and the
     /// request charged the prefill where the bound passed. A partner that
     /// failed to start still charges, as before.
@@ -2772,10 +2772,10 @@ mod tests {
                 })
                 .build(),
         );
-        let late: PdLegDispatch =
+        let late: SideDispatch =
             Box::pin(async { Err(tonic::Status::unavailable("the handoff never came")) });
-        retire_pd_leg(
-            PdLeg::Decode,
+        retire_pd_side(
+            PdSide::Decode,
             "grpc",
             Arc::clone(&decode),
             late,
@@ -2793,12 +2793,12 @@ mod tests {
         assert!(!Retirement::Silent.charges());
     }
 
-    /// A leg retired because its partner failed to start samples only a late
+    /// A side retired because its partner failed to start samples only a late
     /// failure on its worker: its late stream is aborted and earns no success
-    /// (the leg never produced anything), so a failure before it stands and
+    /// (the side never produced anything), so a failure before it stands and
     /// the next one opens a breaker set to two.
     #[tokio::test]
-    async fn the_late_stream_of_a_leg_retired_for_its_partners_failure_earns_no_breaker_success() {
+    async fn the_late_stream_of_a_side_retired_for_its_partners_failure_earns_no_breaker_success() {
         use crate::worker::circuit_breaker::CircuitState;
         let decode: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("grpc://decode:30002")
@@ -2811,10 +2811,10 @@ mod tests {
                 .build(),
         );
         decode.record_outcome(504);
-        let late: PdLegDispatch =
+        let late: SideDispatch =
             Box::pin(async { Ok(ProtoStream::Fanout(FanoutStream::new(Vec::new()))) });
-        retire_pd_leg(
-            PdLeg::Decode,
+        retire_pd_side(
+            PdSide::Decode,
             "grpc",
             Arc::clone(&decode),
             late,
@@ -2843,7 +2843,7 @@ mod tests {
     }
 
     fn tokenspeed_pair() -> WorkerSelection {
-        let leg = |url: &str, worker_type: WorkerType| -> Arc<dyn Worker> {
+        let worker = |url: &str, worker_type: WorkerType| -> Arc<dyn Worker> {
             Arc::new(
                 BasicWorkerBuilder::new(url)
                     .worker_type(worker_type)
@@ -2854,23 +2854,23 @@ mod tests {
         };
         WorkerSelection::Disaggregated {
             encode_assignments: None,
-            prefill: leg("grpc://prefill:30000", WorkerType::Prefill),
-            decode: leg("grpc://decode:30000", WorkerType::Decode),
+            prefill: worker("grpc://prefill:30000", WorkerType::Prefill),
+            decode: worker("grpc://decode:30000", WorkerType::Decode),
             runtime_type: RuntimeType::TokenSpeed,
         }
     }
 
-    /// A leg whose dispatch fails with the engine's rendezvous verdict is
-    /// counted under the rendezvous family, by leg and phase; any other
-    /// dispatch failure of a leg is not.
+    /// A side whose dispatch fails with the engine's rendezvous verdict is
+    /// counted under the rendezvous family, by side and phase; any other
+    /// dispatch failure of a side is not.
     #[test]
-    fn a_leg_that_fails_its_rendezvous_at_dispatch_is_counted() {
+    fn a_side_that_fails_its_rendezvous_at_dispatch_is_counted() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let workers = tokenspeed_pair();
         metrics::with_local_recorder(&recorder, || {
-            pd_leg_error(
-                PdLeg::Prefill,
+            pd_side_error(
+                PdSide::Prefill,
                 metrics_labels::CONNECTION_GRPC,
                 &tonic::Status::internal(
                     "Prefill bootstrap failed for request rank=0 req.rid='r1' \
@@ -2879,8 +2879,8 @@ mod tests {
                 ),
                 &workers,
             );
-            pd_leg_error(
-                PdLeg::Decode,
+            pd_side_error(
+                PdSide::Decode,
                 metrics_labels::CONNECTION_GRPC,
                 &tonic::Status::unavailable("connection reset"),
                 &workers,
@@ -2933,19 +2933,19 @@ mod tests {
         );
     }
 
-    /// A leg start the worker's side cancelled (its connection closed under
+    /// A side's start the worker cancelled (its connection closed under
     /// the call) is the worker's failure, not a rejection of the request: a
-    /// 502 under the leg's code, which the retry layer replays on another
+    /// 502 under the side's code, which the retry layer replays on another
     /// worker, never a 400 the client would read as its own mistake.
     #[test]
-    fn a_leg_start_the_worker_cancelled_is_a_retryable_502_not_a_rejection() {
+    fn a_side_start_the_worker_cancelled_is_a_retryable_502_not_a_rejection() {
         use crate::routers::common::retry::is_retryable_response;
 
         let cancelled = start_failure_response(
             &tonic::Status::cancelled("operation was canceled"),
             "execute_sequential_pd",
-            PdLeg::Decode.error_message(),
-            PdLeg::Decode.error_code(),
+            PdSide::Decode.error_message(),
+            PdSide::Decode.error_code(),
         );
         assert_eq!(cancelled.status(), http::StatusCode::BAD_GATEWAY);
         assert_eq!(
@@ -2958,12 +2958,12 @@ mod tests {
         assert!(is_retryable_response(&cancelled));
     }
 
-    /// A leg start that failed in the HTTP/2 layer (the connection to the
+    /// A side start that failed in the HTTP/2 layer (the connection to the
     /// worker went away under the call) is the worker's transport failure: a
     /// retryable 502, not the worker's own answer for the payload, whatever
     /// code tonic picked from the frame's reason.
     #[test]
-    fn a_leg_start_lost_to_an_http2_fault_is_a_retryable_502_not_the_workers_answer() {
+    fn a_side_start_lost_to_an_http2_fault_is_a_retryable_502_not_the_workers_answer() {
         use smg_grpc_client::h2::{Error, Reason};
 
         use crate::routers::common::{
@@ -2975,8 +2975,8 @@ mod tests {
             let failed = start_failure_response(
                 &status,
                 "execute_parallel_pd",
-                PdLeg::Prefill.error_message(),
-                PdLeg::Prefill.error_code(),
+                PdSide::Prefill.error_message(),
+                PdSide::Prefill.error_code(),
             );
             assert_eq!(failed.status(), http::StatusCode::BAD_GATEWAY, "{reason:?}");
             assert!(is_retryable_response(&failed), "{reason:?}");
@@ -3145,58 +3145,58 @@ mod tests {
         assert_eq!(plan_sub_requests(&batch, Some(&workers)), 3);
     }
 
-    /// A leg that never answers — the decode leg stuck behind the engine's
-    /// transfer deadline while the prefill leg has already given up.
-    fn never_answers() -> PdLegDispatch {
+    /// A side that never answers — the decode side stuck behind the engine's
+    /// transfer deadline while the prefill side has already given up.
+    fn never_answers() -> SideDispatch {
         Box::pin(std::future::pending())
     }
 
-    fn fails_now(message: &'static str) -> PdLegDispatch {
+    fn fails_now(message: &'static str) -> SideDispatch {
         Box::pin(async move { Err(tonic::Status::deadline_exceeded(message)) })
     }
 
-    fn answers_after(delay: Duration) -> PdLegDispatch {
+    fn answers_after(delay: Duration) -> SideDispatch {
         Box::pin(async move {
             tokio::time::sleep(delay).await;
-            Err(tonic::Status::unavailable("late leg"))
+            Err(tonic::Status::unavailable("late side"))
         })
     }
 
     /// A prefill that times out must be reported without waiting for the
-    /// decode leg, and the decode's dispatch must come back so its room can
+    /// decode side, and the decode's dispatch must come back so its room can
     /// be released instead of being left to the engine's own deadline.
     #[tokio::test(start_paused = true)]
-    async fn a_failed_prefill_answers_without_waiting_for_the_decode_leg() {
+    async fn a_failed_prefill_answers_without_waiting_for_the_decode_side() {
         let started = tokio::time::Instant::now();
-        let outcome = dispatch_pd_legs(fails_now("bootstrap timeout"), never_answers()).await;
+        let outcome = dispatch_pd_sides(fails_now("bootstrap timeout"), never_answers()).await;
 
         assert_eq!(
             started.elapsed(),
             Duration::ZERO,
-            "the prefill error must not wait on the decode leg"
+            "the prefill error must not wait on the decode side"
         );
         match outcome {
-            PdDispatchOutcome::FailedFirst { leg, error, .. } => {
-                assert_eq!(leg, PdLeg::Prefill);
+            PdDispatchOutcome::FailedFirst { side, error, .. } => {
+                assert_eq!(side, PdSide::Prefill);
                 assert_eq!(error.message(), "bootstrap timeout");
             }
             PdDispatchOutcome::Both(..) => panic!("expected a fail-fast outcome"),
         }
     }
 
-    /// The mirror case: a decode leg that cannot start is answered without
+    /// The mirror case: a decode side that cannot start is answered without
     /// waiting out the prefill's bootstrap deadline.
     #[tokio::test(start_paused = true)]
-    async fn a_failed_decode_answers_without_waiting_for_the_prefill_leg() {
-        let outcome = dispatch_pd_legs(
+    async fn a_failed_decode_answers_without_waiting_for_the_prefill_side() {
+        let outcome = dispatch_pd_sides(
             answers_after(Duration::from_secs(120)),
             fails_now("decode refused"),
         )
         .await;
 
         match outcome {
-            PdDispatchOutcome::FailedFirst { leg, error, .. } => {
-                assert_eq!(leg, PdLeg::Decode);
+            PdDispatchOutcome::FailedFirst { side, error, .. } => {
+                assert_eq!(side, PdSide::Decode);
                 assert_eq!(error.message(), "decode refused");
             }
             PdDispatchOutcome::Both(..) => panic!("expected a fail-fast outcome"),
@@ -3211,9 +3211,9 @@ mod tests {
         }
     }
 
-    fn three_second_bound() -> PrefillLegBound {
+    fn three_second_bound() -> PrefillBound {
         let dispatched = Instant::now();
-        PrefillLegBound {
+        PrefillBound {
             dispatched,
             deadline: dispatched + Duration::from_secs(3),
             bound: Duration::from_secs(3),
@@ -3248,8 +3248,8 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
         assert!(is_prefill_silence(&status), "{status:?}");
 
-        let response = pd_leg_error(
-            PdLeg::Prefill,
+        let response = pd_side_error(
+            PdSide::Prefill,
             metrics_labels::CONNECTION_GRPC,
             &status,
             &workers,
@@ -3291,7 +3291,7 @@ mod tests {
             )
             .await,
         );
-        assert_eq!(status.message(), "late leg");
+        assert_eq!(status.message(), "late side");
         assert!(!is_prefill_silence(&status));
         assert!(!is_prefill_silence(&tonic::Status::deadline_exceeded(
             "bootstrap timeout"
@@ -3319,7 +3319,7 @@ mod tests {
         let workers = tokenspeed_pair();
         let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
         let mut stream = ProtoStream::Fanout(FanoutStream::new(Vec::new()))
-            .tracked_prefill_leg(Arc::clone(&prefill), 256);
+            .tracked_prefill_side(Arc::clone(&prefill), 256);
         let first = first_prefill_response_within(
             &mut stream,
             Some(three_second_bound()),
@@ -3336,8 +3336,8 @@ mod tests {
     }
 
     /// A prefill call past its bound waits on while its worker answers other
-    /// legs: the verdict is on the worker, not the leg. The worker answers
-    /// another leg half a second in, so the call is given up on a bound
+    /// sides: the verdict is on the worker, not the side. The worker answers
+    /// another side half a second in, so the call is given up on a bound
     /// after that answer, not at its own bound. (Real time: the worker's
     /// stamps are on the gateway clock, which a paused runtime does not
     /// move.)
@@ -3347,7 +3347,7 @@ mod tests {
         let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
         let bound = Duration::from_secs(1);
         let answered_at = Duration::from_millis(500);
-        let other_leg = async {
+        let other_side = async {
             tokio::time::sleep(answered_at).await;
             prefill.note_prefill_started(256, true);
             prefill.note_prefill_ended(256, true, Some(0));
@@ -3355,7 +3355,7 @@ mod tests {
         let started = Instant::now();
         let (result, ()) = tokio::join!(
             dispatch_prefill_within(
-                Some(PrefillLegBound {
+                Some(PrefillBound {
                     dispatched: started,
                     deadline: started + bound,
                     bound,
@@ -3367,7 +3367,7 @@ mod tests {
                 "chatcmpl-queued".to_string(),
                 256,
             ),
-            other_leg
+            other_side
         );
         let elapsed = started.elapsed();
         let status = failure(result);
@@ -3378,9 +3378,9 @@ mod tests {
         );
     }
 
-    /// A leg's bound is read at its dispatch. The longest prompt yet landing
-    /// on the worker behind it blocks the engine for the leg too while it
-    /// builds, so the leg is not given up on at its own bound: it waits out
+    /// A side's bound is read at its dispatch. The longest prompt yet landing
+    /// on the worker behind it blocks the engine for the side too while it
+    /// builds, so the side is not given up on at its own bound: it waits out
     /// the cold-shape grace a bound at a time, and once the shape is shown
     /// (the longer prompt's first token) it is judged by the worker's
     /// answers as before, a bound after that answer. (Real time, as above.)
@@ -3402,7 +3402,7 @@ mod tests {
         let started = Instant::now();
         let (result, ()) = tokio::join!(
             dispatch_prefill_within(
-                Some(PrefillLegBound {
+                Some(PrefillBound {
                     dispatched: started,
                     deadline: started + bound,
                     bound,
@@ -3425,7 +3425,7 @@ mod tests {
         );
     }
 
-    /// On the parallel shape a prefill leg's first response waits for the
+    /// On the parallel shape a prefill side's first response waits for the
     /// decode side, so a decode worker that stopped producing mid-stream
     /// makes the prefill look silent. At the prefill's exhausted reprieve
     /// the decode partner is read: holding a stream it had been producing
@@ -3441,7 +3441,7 @@ mod tests {
         let handle = recorder.handle();
         let bound = Duration::from_secs(1);
         let at = |started: Instant| {
-            Some(PrefillLegBound {
+            Some(PrefillBound {
                 dispatched: started,
                 deadline: started + bound,
                 bound,
@@ -3482,8 +3482,8 @@ mod tests {
                 );
                 assert!(is_decode_silence(&status), "{status:?}");
                 assert!(!is_prefill_silence(&status), "{status:?}");
-                let response = pd_leg_error(
-                    PdLeg::Prefill,
+                let response = pd_side_error(
+                    PdSide::Prefill,
                     metrics_labels::CONNECTION_GRPC,
                     &status,
                     &workers,
@@ -3505,7 +3505,7 @@ mod tests {
                     "another decode worker may take the request"
                 );
 
-                // The same decode still producing while the prefill leg
+                // The same decode still producing while the prefill side
                 // waits: the prefill's verdict, as before. (The producer runs
                 // beside the dispatch and ends with it.)
                 let producing = async {
@@ -3572,17 +3572,17 @@ mod tests {
     }
 
     /// When the decode's call returned its stream before the prefill's
-    /// dispatch ended with a verdict, both legs answered and the dispatch's
+    /// dispatch ended with a verdict, both sides answered and the dispatch's
     /// samples are taken together: a decode verdict is the decode worker's
     /// breaker failure and no success for its dispatch, the prefill
     /// untouched; a prefill verdict stays the prefill's, with the decode's
     /// dispatch sampled as before.
     #[test]
-    fn a_decode_verdict_on_the_prefills_dispatch_is_charged_to_the_decode_when_both_legs_answered()
+    fn a_decode_verdict_on_the_prefills_dispatch_is_charged_to_the_decode_when_both_sides_answered()
     {
         use crate::worker::circuit_breaker::CircuitState;
         let pair = || {
-            let leg = |url: &str, worker_type: WorkerType| -> Arc<dyn Worker> {
+            let worker = |url: &str, worker_type: WorkerType| -> Arc<dyn Worker> {
                 Arc::new(
                     BasicWorkerBuilder::new(url)
                         .worker_type(worker_type)
@@ -3597,8 +3597,8 @@ mod tests {
             };
             WorkerSelection::Disaggregated {
                 encode_assignments: None,
-                prefill: leg("grpc://prefill:30000", WorkerType::Prefill),
-                decode: leg("grpc://decode:30000", WorkerType::Decode),
+                prefill: worker("grpc://prefill:30000", WorkerType::Prefill),
+                decode: worker("grpc://decode:30000", WorkerType::Decode),
                 runtime_type: RuntimeType::TokenSpeed,
             }
         };
@@ -3635,7 +3635,7 @@ mod tests {
 
         let workers = pair();
         let (prefill, decode) = workers.disaggregated_pair().expect("a pair");
-        let verdict = prefill_leg_silent(
+        let verdict = prefill_side_silent(
             prefill,
             metrics_labels::CONNECTION_GRPC,
             "chatcmpl-both-prefill",
@@ -3653,8 +3653,8 @@ mod tests {
         assert_eq!(decode.circuit_breaker_state(), CircuitState::Closed);
     }
 
-    fn three_second_decode_bound() -> DecodeLegBound {
-        DecodeLegBound {
+    fn three_second_decode_bound() -> DecodeBound {
+        DecodeBound {
             deadline: Instant::now() + Duration::from_secs(3),
             bound: Duration::from_secs(3),
         }
@@ -3686,7 +3686,7 @@ mod tests {
         );
         let status = failure(result);
         assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
-        assert!(is_decode_leg_silence(&status), "{status:?}");
+        assert!(is_decode_side_silence(&status), "{status:?}");
         assert!(!is_prefill_silence(&status), "{status:?}");
 
         let ledger = AttemptLedger::default();
@@ -3728,9 +3728,9 @@ mod tests {
             )
             .await,
         );
-        assert_eq!(status.message(), "late leg");
-        assert!(!is_decode_leg_silence(&status));
-        assert!(!is_decode_leg_silence(&tonic::Status::deadline_exceeded(
+        assert_eq!(status.message(), "late side");
+        assert!(!is_decode_side_silence(&status));
+        assert!(!is_decode_side_silence(&tonic::Status::deadline_exceeded(
             "bootstrap timeout"
         )));
         let status = failure(
@@ -3754,7 +3754,7 @@ mod tests {
         let workers = tokenspeed_pair();
         let decode = Arc::clone(workers.decode_worker().expect("a pair"));
         let mut stream = ProtoStream::Fanout(FanoutStream::new(Vec::new()))
-            .tracked_decode_leg(Arc::clone(&decode));
+            .tracked_decode_side(Arc::clone(&decode));
         let first = first_decode_response_within(
             &mut stream,
             Some(three_second_decode_bound()),
@@ -3788,7 +3788,7 @@ mod tests {
     }
 
     #[test]
-    fn pd_leg_labels_reflect_each_legs_transport() {
+    fn pd_side_labels_reflect_each_sides_transport() {
         let prefill: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("ipc:///tmp/smg-test-prefill")
                 .worker_type(WorkerType::Prefill)
@@ -3808,19 +3808,19 @@ mod tests {
             runtime_type: RuntimeType::TokenSpeed,
         };
         assert_eq!(
-            pd_leg_labels(&selection),
+            pd_side_labels(&selection),
             (
                 metrics_labels::CONNECTION_ZMQ,
                 metrics_labels::CONNECTION_GRPC
             ),
-            "each PD leg must carry its own transport label"
+            "each PD side must carry its own transport label"
         );
     }
 
-    /// The decode leg's first-token bound is sized from the prefill worker
-    /// only when the decode leg pulls its prompt KV from it: a handoff on a
+    /// The decode side's first-token bound is sized from the prefill worker
+    /// only when the decode side pulls its prompt KV from it: a handoff on a
     /// request the KV parameters were relayed for. A fan-out the legacy
-    /// Mooncake arm hands off in name only, and any leg without a handoff,
+    /// Mooncake arm hands off in name only, and any side without a handoff,
     /// recompute the prompt on the decode worker, whose rate sizes the bound.
     #[test]
     fn the_decode_bound_follows_the_worker_that_prefills_the_prompt() {
@@ -3910,10 +3910,10 @@ mod tests {
         let ProtoGenerateRequest::Vllm(decode) = clone else {
             panic!("expected vLLM clone");
         };
-        assert!(original.mm_inputs.is_some(), "prefill leg keeps pixels");
+        assert!(original.mm_inputs.is_some(), "prefill side keeps pixels");
         assert!(
             decode.mm_inputs.is_none(),
-            "hash-less mm payload is dropped whole on the decode leg"
+            "hash-less mm payload is dropped whole on the decode side"
         );
         assert_eq!(decode.request_id, "pd-1");
     }
@@ -3921,7 +3921,7 @@ mod tests {
     #[test]
     fn clone_without_mm_pixels_keeps_vllm_media_refs() {
         // The clone keeps the references; on the sequential path they are
-        // replaced by the prefill leg's identity before decode is sent.
+        // replaced by the prefill side's identity before decode is sent.
         let refs = vllm::MediaRefs {
             items: vec![vllm::MediaRef {
                 modality: smg_grpc_client::common_proto::Modality::Image as i32,
@@ -4002,7 +4002,7 @@ mod tests {
     }
 
     /// A media_refs request under parallel PD dispatch would otherwise become
-    /// n pairs, each processing the media on both legs.
+    /// n pairs, each processing the media on both sides.
     #[test]
     fn media_refs_request_never_fans_out() {
         let sglang = PdProtocol::for_runtime(RuntimeType::Sglang).unwrap();
@@ -4025,9 +4025,9 @@ mod tests {
         assert!(request.mm_inputs.is_none());
     }
 
-    /// Legacy Mooncake injects its host and port into every decode leg, n>1
+    /// Legacy Mooncake injects its host and port into every decode side, n>1
     /// included, so `handed_off` alone does not say that decode will pull
-    /// its prompt KV from prefill: an n>1 leg recomputes locally and keeps
+    /// its prompt KV from prefill: an n>1 side recomputes locally and keeps
     /// its references whatever the prefill returned.
     #[test]
     fn n_greater_than_one_keeps_media_refs_despite_a_legacy_mooncake_handoff() {
@@ -4052,7 +4052,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_leg_from_media_identity_has_no_refs_and_no_pixels() {
+    fn decode_side_from_media_identity_has_no_refs_and_no_pixels() {
         let mut decode = media_refs_request("relay", 1).clone_without_mm_pixels();
         apply_prefill_media_identity(&mut decode, true, true, true, Some(&identity()));
         assert!(!decode.has_vllm_media_refs());
@@ -4072,11 +4072,11 @@ mod tests {
         assert_eq!(tokenized.original_text, "describe <|image|>");
     }
 
-    /// An identity the leg cannot take, empty ids or a leg that is not
+    /// An identity the side cannot take, empty ids or a side that is not
     /// tokenized, leaves the references in place: better a reprocessed
     /// decode than an empty prompt.
     #[test]
-    fn an_unusable_identity_leaves_the_decode_leg_untouched() {
+    fn an_unusable_identity_leaves_the_decode_side_untouched() {
         let mut empty = identity();
         empty.prompt_token_ids.clear();
         let mut decode = media_refs_request("empty", 1).clone_without_mm_pixels();
@@ -4105,11 +4105,11 @@ mod tests {
         ));
     }
 
-    /// An older servicer returns no identity: the decode leg keeps its
+    /// An older servicer returns no identity: the decode side keeps its
     /// references and reprocesses, as before; the same when no identity was
     /// asked for (a prefill request without KV params).
     #[test]
-    fn missing_identity_leaves_the_decode_leg_untouched() {
+    fn missing_identity_leaves_the_decode_side_untouched() {
         for solicited in [true, false] {
             let mut decode = media_refs_request("old", 1).clone_without_mm_pixels();
             apply_prefill_media_identity(&mut decode, true, true, solicited, None);
@@ -4119,7 +4119,7 @@ mod tests {
 
     #[test]
     fn clone_without_mm_pixels_keeps_vllm_identity_and_grid_tensors() {
-        // The decode leg drops the pixel tensors but keeps the per-image
+        // The decode side drops the pixel tensors but keeps the per-image
         // identity and the inline M-RoPE grid tensors.
         let grid = vllm::TensorData {
             shape: vec![1, 3],
@@ -4169,17 +4169,17 @@ mod tests {
         let ProtoGenerateRequest::Vllm(decode) = clone else {
             panic!("expected vLLM clone");
         };
-        let original_mm = original.mm_inputs.expect("prefill leg keeps mm_inputs");
+        let original_mm = original.mm_inputs.expect("prefill side keeps mm_inputs");
         assert!(
             original_mm.pixel_values.is_some(),
-            "prefill leg keeps pixels"
+            "prefill side keeps pixels"
         );
         assert_eq!(original_mm.model_specific_tensors.len(), 6);
         assert_eq!(original_mm.batched_keys.len(), 3);
-        let decode_mm = decode.mm_inputs.expect("decode leg keeps identity");
+        let decode_mm = decode.mm_inputs.expect("decode side keeps identity");
         assert!(
             decode_mm.pixel_values.is_none(),
-            "decode leg never carries pixels"
+            "decode side never carries pixels"
         );
         let mut decode_keys: Vec<_> = decode_mm.model_specific_tensors.keys().collect();
         decode_keys.sort();
@@ -4230,17 +4230,17 @@ mod tests {
         let original_item = &original.mm_inputs.as_ref().unwrap().items[0];
         assert!(
             original_item.encoder_input.is_some(),
-            "prefill leg keeps encoder input"
+            "prefill side keeps encoder input"
         );
         let decode_item = &decode.mm_inputs.as_ref().unwrap().items[0];
         assert!(
             decode_item.encoder_input.is_none(),
-            "decode leg drops encoder input"
+            "decode side drops encoder input"
         );
         assert_eq!(
             decode_item.placeholder_token_id,
             Some(7),
-            "decode leg keeps per-item metadata"
+            "decode side keeps per-item metadata"
         );
     }
 
@@ -4304,7 +4304,7 @@ mod tests {
             panic!("expected vLLM clone");
         };
 
-        // The original (prefill leg) is untouched.
+        // The original (prefill side) is untouched.
         let original_mm = original
             .mm_inputs
             .as_ref()
@@ -4315,7 +4315,7 @@ mod tests {
         // The expanded placeholder-token run survives: it names the sequence
         // whose KV the decode worker pulls from prefill.
         let Some(vllm::generate_request::Input::Tokenized(tokenized)) = &decode.input else {
-            panic!("decode leg stays tokenized");
+            panic!("decode side stays tokenized");
         };
         assert_eq!(tokenized.input_ids, vec![1, 2, 151_655, 151_655, 3]);
 
@@ -4398,7 +4398,7 @@ mod tests {
     }
 
     #[test]
-    fn sequential_pd_decode_form_picks_the_leg_for_the_worker() {
+    fn sequential_pd_decode_form_picks_the_side_for_the_worker() {
         let mm_request = vllm_pd_mm_request();
 
         // Full-vision decode worker: today's forms, untouched.
@@ -4412,7 +4412,7 @@ mod tests {
         );
 
         // Language-model-only decode worker, no grids (MiniMax-style): the
-        // fully stripped leg. A text request takes the same leg harmlessly.
+        // fully stripped side. A text request takes the same side harmlessly.
         let mut stripable = vllm_pd_mm_request();
         let ProtoGenerateRequest::Vllm(req) = &mut stripable else {
             panic!("expected vLLM request");
@@ -4424,7 +4424,7 @@ mod tests {
             .model_specific_tensors
             .clear();
         assert_eq!(
-            sequential_pd_decode_form(&stripable, true, true).expect("stripped leg"),
+            sequential_pd_decode_form(&stripable, true, true).expect("stripped side"),
             SequentialPdDecodeForm::TextPlusHashes
         );
         let text = ProtoGenerateRequest::Vllm(Box::default());
@@ -4480,7 +4480,7 @@ mod tests {
             .await
             .contains("pd_decode_language_model_only_mrope"));
 
-        // Media references + language-model-only decode: the leg would have
+        // Media references + language-model-only decode: the side would have
         // to expand the anchors itself.
         let mut refs_only = vllm_pd_mm_request();
         let ProtoGenerateRequest::Vllm(req) = &mut refs_only else {

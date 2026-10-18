@@ -1,8 +1,8 @@
 //! Through a prefill/decode pair the client's `cached_tokens` is the prefill
-//! leg's prefix-cache hit. The decode leg receives the prompt's KV from the
-//! prefill leg and reports what it loaded as cached (the prompt less one
+//! side's prefix-cache hit. The decode side receives the prompt's KV from the
+//! prefill side and reports what it loaded as cached (the prompt less one
 //! token) whatever the cache held, so a deployment reading its hit rate from
-//! the decode leg's number saw a full hit on every request.
+//! the decode side's number saw a full hit on every request.
 use std::time::Instant;
 
 use openai_protocol::chat::ChatCompletionRequest;
@@ -20,8 +20,8 @@ use crate::routers::grpc::{
     proto_wrapper::{PrefillCachedTokens, ProtoGenerateComplete},
 };
 
-/// The prompt's length; the decode leg reports all but its last token as
-/// cached, the prefill leg the cache's real hit.
+/// The prompt's length; the decode side reports all but its last token as
+/// cached, the prefill side the cache's real hit.
 const PROMPT_TOKENS: u32 = 2_081;
 const PREFILL_HIT: u32 = 1_000;
 const DECODE_VIEW: u32 = PROMPT_TOKENS - 1;
@@ -43,7 +43,7 @@ fn pd_timing() -> context::PdTiming {
     }
 }
 
-/// A leg's terminal frame reporting `cached` of the prompt's tokens as a
+/// A side's terminal frame reporting `cached` of the prompt's tokens as a
 /// prefix-cache hit.
 fn complete_with_cached(cached: u32) -> proto::GenerateResponse {
     let mut response = complete_with_prompt(0, "stop", PROMPT_TOKENS);
@@ -53,7 +53,7 @@ fn complete_with_cached(cached: u32) -> proto::GenerateResponse {
     response
 }
 
-/// A decode-leg chunk that, like the engine's, repeats the leg's own counts.
+/// A decode-side chunk that, like the engine's, repeats the side's own counts.
 fn chunk_with_cached(text: &str, cached: u32) -> proto::GenerateResponse {
     let mut response = chunk(0, text);
     if let Some(GenerationEvent::Chunk(chunk)) = &mut response.response {
@@ -73,7 +73,7 @@ fn spec(continuous_usage: bool) -> ChatResponseSpec {
     )
 }
 
-/// Stream a disaggregated chat answer from the two legs and return its SSE
+/// Stream a disaggregated chat answer from the two sides and return its SSE
 /// events; the processor must succeed.
 async fn stream_pd(
     prefill: ProtoStream,
@@ -105,10 +105,10 @@ fn cached_tokens_of(usage: &Value) -> &Value {
     &usage["prompt_tokens_details"]["cached_tokens"]
 }
 
-/// The parallel protocol: the prefill leg's completion reaches the streaming
-/// layer, which drains it before it reads the decode leg.
+/// The parallel protocol: the prefill side's completion reaches the streaming
+/// layer, which drains it before it reads the decode side.
 #[tokio::test]
-async fn a_streamed_pd_answer_reports_the_prefill_legs_cache_hit() {
+async fn a_streamed_pd_answer_reports_the_prefill_sides_cache_hit() {
     for continuous_usage in [false, true] {
         let (prefill, prefill_server) =
             scripted_stream(vec![complete_with_cached(PREFILL_HIT)], "0").await;
@@ -138,11 +138,11 @@ async fn a_streamed_pd_answer_reports_the_prefill_legs_cache_hit() {
     }
 }
 
-/// The sequential protocol: the execution stage drains the prefill leg itself
-/// and hands the streaming layer an exhausted prefill stream and a decode leg
-/// stamped with the prefill's hit (`ProtoStream::decode_leg`).
+/// The sequential protocol: the execution stage drains the prefill side itself
+/// and hands the streaming layer an exhausted prefill stream and a decode side
+/// stamped with the prefill's hit (`ProtoStream::decode_side`).
 #[tokio::test]
-async fn a_decode_leg_stamped_by_the_execution_stage_reports_the_prefill_legs_cache_hit() {
+async fn a_decode_side_stamped_by_the_execution_stage_reports_the_prefill_sides_cache_hit() {
     let (prefill, prefill_server) = scripted_stream(vec![], "0").await;
     let (decode, decode_server) = scripted_stream(
         vec![
@@ -160,7 +160,7 @@ async fn a_decode_leg_stamped_by_the_execution_stage_reports_the_prefill_legs_ca
             ..Default::default()
         },
     )));
-    let events = stream_pd(prefill, decode.decode_leg(prefill_hit), true).await;
+    let events = stream_pd(prefill, decode.decode_side(prefill_hit), true).await;
     prefill_server.abort();
     decode_server.abort();
 
@@ -173,11 +173,11 @@ async fn a_decode_leg_stamped_by_the_execution_stage_reports_the_prefill_legs_ca
     assert_eq!(usage["prompt_tokens"], PROMPT_TOKENS, "{usage}");
 }
 
-/// The unary path: `collect_responses` drains the prefill leg and collects
-/// the decode leg's completions, which every non-streamed chat, completion,
+/// The unary path: `collect_responses` drains the prefill side and collects
+/// the decode side's completions, which every non-streamed chat, completion,
 /// generate and Responses answer builds its usage from.
 #[tokio::test]
-async fn a_unary_pd_answer_reports_the_prefill_legs_cache_hit() {
+async fn a_unary_pd_answer_reports_the_prefill_sides_cache_hit() {
     let (prefill, prefill_server) =
         scripted_stream(vec![complete_with_cached(PREFILL_HIT)], "0").await;
     let (decode, decode_server) =
@@ -191,7 +191,7 @@ async fn a_unary_pd_answer_reports_the_prefill_legs_cache_hit() {
     };
     let completes = collect_responses(result, false)
         .await
-        .unwrap_or_else(|_| panic!("the decode leg's completion"));
+        .unwrap_or_else(|_| panic!("the decode side's completion"));
     prefill_server.abort();
     decode_server.abort();
 

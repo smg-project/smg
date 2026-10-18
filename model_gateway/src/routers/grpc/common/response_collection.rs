@@ -16,7 +16,7 @@ use crate::{
                 ProtoStream,
             },
             utils::{
-                account_pd_leg_failure, stream_failure::UpstreamClass, tonic_ext::TonicStatusExt,
+                account_pd_side_failure, stream_failure::UpstreamClass, tonic_ext::TonicStatusExt,
             },
         },
     },
@@ -29,8 +29,8 @@ use crate::{
 /// Collectors continue to EOF to preserve their metadata collection behavior;
 /// streaming handlers can stop once all dispatched Prefill samples complete.
 /// Returns the prefix-cache hit each completed sample reported: the client's
-/// prompt-side usage, which the decode leg's responses are restamped with
-/// (`ProtoStream::decode_leg`); empty for a stream the execution stage
+/// prompt-side usage, which the decode side's responses are restamped with
+/// (`ProtoStream::decode_side`); empty for a stream the execution stage
 /// drained itself.
 pub(crate) async fn drain_prefill<S: FanoutChild>(
     stream: &mut S,
@@ -42,10 +42,11 @@ pub(crate) async fn drain_prefill<S: FanoutChild>(
     let single_dispatch = remaining == 1;
     let mut cached_tokens = PrefillCachedTokens::default();
     while let Some(response) = stream.next_item().await {
-        // A prefill leg the engine retires with its rendezvous verdict is
+        // A prefill side the engine retires with its rendezvous verdict is
         // counted under the rendezvous family before the failure propagates.
-        let response = response
-            .inspect_err(|status| account_pd_leg_failure(metrics_labels::WORKER_PREFILL, status))?;
+        let response = response.inspect_err(|status| {
+            account_pd_side_failure(metrics_labels::WORKER_PREFILL, status);
+        })?;
         if let ProtoResponseVariant::Complete(complete) = response.into_response() {
             // Fan-out responses are restamped with their dispatch positions.
             // For a single dispatch, preserve the collector's existing guard
@@ -75,10 +76,10 @@ pub(crate) async fn drain_prefill<S: FanoutChild>(
 
 /// The `Complete` frames of an execution result, one per choice (`n`), as
 /// the non-streamed answer is built from. A single worker's stream is
-/// collected to EOF; a disaggregated pair's prefill leg is drained first and
+/// collected to EOF; a disaggregated pair's prefill side is drained first and
 /// its `input_logprobs` copied onto the decode responses when
 /// `merge_logprobs` asks for them (chat with `logprobs: true`). The streams
-/// are marked completed only once every leg succeeded, so a failure still
+/// are marked completed only once every side succeeded, so a failure still
 /// aborts them on drop.
 pub(crate) async fn collect_responses(
     execution_result: ExecutionResult,
@@ -123,8 +124,8 @@ pub(crate) async fn collect_responses(
     Ok(all_responses)
 }
 
-/// [`collect_responses`] for a disaggregated pair: the prefill leg drained
-/// through its `Complete`, then the decode leg collected with the prefill's
+/// [`collect_responses`] for a disaggregated pair: the prefill side drained
+/// through its `Complete`, then the decode side collected with the prefill's
 /// prompt-side usage.
 async fn collect_prefill_decode(
     mut prefill: ProtoStream,
@@ -132,8 +133,8 @@ async fn collect_prefill_decode(
     prefill_guards: Vec<Option<PrefillLoadGuard>>,
     merge_logprobs: bool,
 ) -> Result<Vec<ProtoGenerateComplete>, Response> {
-    // The leg's worker, when its stream is tracked (the parallel dispatch
-    // books the leg on it and leaves the leg's breaker sample to its reader):
+    // The side's worker, when its stream is tracked (the parallel dispatch
+    // books the side on it and leaves the side's breaker sample to its reader):
     // a failure met here is the worker's, sampled on its breaker and counted
     // once, as a streamed answer's reader does it.
     let prefill_worker = prefill.worker().cloned();
@@ -152,8 +153,8 @@ async fn collect_prefill_decode(
         stream_failed("Prefill", &status)
     })?;
 
-    // The client's prompt-side usage is the prefill leg's.
-    let mut decode_stream = decode.decode_leg(prefill_cached_tokens);
+    // The client's prompt-side usage is the prefill side's.
+    let mut decode_stream = decode.decode_side(prefill_cached_tokens);
     let mut decode_responses = collect_stream_responses(
         &mut decode_stream,
         "Decode",
@@ -161,7 +162,7 @@ async fn collect_prefill_decode(
     )
     .await?;
 
-    // Both legs succeeded: neither stream aborts on drop any more.
+    // Both sides succeeded: neither stream aborts on drop any more.
     prefill.mark_completed();
     decode_stream.mark_completed();
 
@@ -189,31 +190,31 @@ fn merge_prefill_logprobs(
     }
 }
 
-/// The client's answer when `leg`'s stream ended with `status` before its
+/// The client's answer when `side`'s stream ended with `status` before its
 /// `Complete`: the status's own HTTP class with the wording clients know.
-fn stream_failed(leg: &str, status: &tonic::Status) -> Response {
+fn stream_failed(side: &str, status: &tonic::Status) -> Response {
     status.to_http_error(
         "worker_stream_failed",
-        format!("{leg} stream failed: {}", status.message()),
+        format!("{side} stream failed: {}", status.message()),
     )
 }
 
 /// Collect all `Complete` frames of a gRPC stream; chunks carry nothing a
-/// collected answer needs. `leg` names the disaggregated leg the stream
+/// collected answer needs. `side` names the disaggregated side the stream
 /// belongs to, whose rendezvous failures are counted before they become the
 /// client's answer; a single worker's stream has none. A failed stream is not
 /// marked completed, so its drop sends the abort.
 async fn collect_stream_responses<S: FanoutChild>(
     stream: &mut S,
     worker_name: &str,
-    leg: Option<&'static str>,
+    side: Option<&'static str>,
 ) -> Result<Vec<ProtoGenerateComplete>, Response> {
     let mut all_responses = Vec::new();
 
     while let Some(response) = stream.next_item().await {
         let gen_response = response.map_err(|status| {
-            if let Some(leg) = leg {
-                account_pd_leg_failure(leg, &status);
+            if let Some(side) = side {
+                account_pd_side_failure(side, &status);
             }
             trace_error!(function = "collect_stream_responses", worker = %worker_name, grpc_code = ?status.code(), error = ?status, "Worker stream error");
             // The worker's failure counts against it as a streamed answer's
@@ -277,7 +278,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_prefill_leg_retired_at_its_rendezvous_is_counted_while_draining() {
+    async fn a_prefill_side_retired_at_its_rendezvous_is_counted_while_draining() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let status = tonic::Status::internal(
@@ -311,13 +312,13 @@ mod tests {
         );
     }
 
-    /// The decode leg of a non-streamed request (every unary chat,
+    /// The decode side of a non-streamed request (every unary chat,
     /// completion, generate and Harmony request collects it here) that the
     /// engine retired at its handshake is counted, as the streaming path's
-    /// decode leg is; a single worker's stream ending the same way is not a
+    /// decode side is; a single worker's stream ending the same way is not a
     /// rendezvous failure.
     #[tokio::test]
-    async fn a_decode_leg_retired_at_its_handshake_is_counted_while_collecting() {
+    async fn a_decode_side_retired_at_its_handshake_is_counted_while_collecting() {
         let status = tonic::Status::internal(
             "Decode handshake failed for request rank=0 req.rid='r2' req.bootstrap_room=42 \
              with exception KVTransferError(bootstrap_room=42): Request 42 timed out after \
@@ -353,10 +354,10 @@ mod tests {
         );
     }
 
-    /// A leg's stream failure read into a non-streamed answer is counted
-    /// under the leg's own labels, and only when it is the worker's failure.
+    /// A side's stream failure read into a non-streamed answer is counted
+    /// under the side's own labels, and only when it is the worker's failure.
     #[test]
-    fn a_collected_leg_failure_counts_against_the_legs_worker_when_it_is_the_workers_failure() {
+    fn a_collected_side_failure_counts_against_the_sides_worker_when_it_is_the_workers_failure() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let decode: Arc<dyn Worker> = Arc::new(

@@ -270,7 +270,7 @@ pub(crate) struct RequestPipeline {
     stages: Arc<PipelineStages>,
     /// Backend type for metrics labeling
     backend_type: &'static str,
-    /// Disaggregation mode, for per-leg retry metric labels.
+    /// Disaggregation mode, for per-side retry metric labels.
     mode: Mode,
     /// The registry, read at dispatch for `--worker-overload-shed`.
     worker_registry: Arc<WorkerRegistry>,
@@ -1994,7 +1994,7 @@ mod request_release_tests {
     /// its tokens (or, with `gate_rpc`, the generate RPC itself) until the
     /// probe reaches zero strong references or a deadline passes, recording
     /// the outcome in `released`. An ungated stub (no probe) answers
-    /// immediately -- used for the PD prefill leg. `fail_first` makes the
+    /// immediately -- used for the PD prefill side. `fail_first` makes the
     /// first generate call return UNAVAILABLE, for retry-replay tests;
     /// `fail_always` fails every call, `fail_internal` answers every call with
     /// INTERNAL (an engine that took the request and failed on it),
@@ -3000,7 +3000,7 @@ mod request_release_tests {
         );
     }
 
-    /// grpc_pd twin: the decode leg's stream task must not pin the parsed
+    /// grpc_pd twin: the decode side's stream task must not pin the parsed
     /// request either (the prefill stub answers immediately).
     #[tokio::test]
     async fn pd_streaming_releases_parsed_request_before_first_token() {
@@ -3080,7 +3080,7 @@ mod request_release_tests {
         );
     }
 
-    /// grpc_pd twin of the dispatch-release probe: the gated decode leg
+    /// grpc_pd twin of the dispatch-release probe: the gated decode side
     /// answers only after the parsed request is freed.
     #[tokio::test]
     async fn pd_buffered_dispatch_releases_parsed_request_before_upstream_responds() {
@@ -3120,13 +3120,13 @@ mod request_release_tests {
         );
         assert!(
             released.load(Ordering::SeqCst),
-            "the parsed request must be freed before the decode leg answers"
+            "the parsed request must be freed before the decode side answers"
         );
     }
 
     /// The one `smg_worker_errors_total` sample of the gRPC workers of
     /// `worker_type`, if any.
-    fn leg_worker_error_line<'a>(rendered: &'a str, worker_type: &str) -> Option<&'a str> {
+    fn side_worker_error_line<'a>(rendered: &'a str, worker_type: &str) -> Option<&'a str> {
         let worker_label = format!("worker_type=\"{worker_type}\"");
         rendered.lines().find(|line| {
             line.starts_with("smg_worker_errors_total{")
@@ -3135,14 +3135,14 @@ mod request_release_tests {
         })
     }
 
-    /// A decode leg's stream that fails after its first frame while a
+    /// A decode side's stream that fails after its first frame while a
     /// non-streamed disaggregated answer is collected is the decode worker's
     /// failure, as it is for a streamed answer: one sample of
-    /// `smg_worker_errors_total` under the leg's labels per attempt
-    /// (`engine_error` for the engine's own report), none for the prefill leg
+    /// `smg_worker_errors_total` under the side's labels per attempt
+    /// (`engine_error` for the engine's own report), none for the prefill side
     /// that completed.
     #[test]
-    fn a_decode_leg_that_fails_mid_way_counts_against_its_worker_for_a_non_streamed_answer() {
+    fn a_decode_side_that_fails_mid_way_counts_against_its_worker_for_a_non_streamed_answer() {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let attempts = metrics::with_local_recorder(&recorder, || {
@@ -3173,12 +3173,12 @@ mod request_release_tests {
                     "the engine's error ends a non-streamed answer with a 500"
                 );
                 let attempts = calls_seen(&decode_calls);
-                assert!(attempts >= 1, "the decode leg was dispatched");
+                assert!(attempts >= 1, "the decode side was dispatched");
                 attempts
             })
         });
         let rendered = handle.render();
-        let line = leg_worker_error_line(&rendered, "decode")
+        let line = side_worker_error_line(&rendered, "decode")
             .unwrap_or_else(|| panic!("the decode worker's failure is counted:\n{rendered}"));
         assert!(line.contains("error_type=\"engine_error\""), "{line}");
         assert!(
@@ -3186,16 +3186,16 @@ mod request_release_tests {
             "one sample per attempt ({attempts}): {line}"
         );
         assert!(
-            leg_worker_error_line(&rendered, "prefill").is_none(),
-            "the prefill leg completed:\n{rendered}"
+            side_worker_error_line(&rendered, "prefill").is_none(),
+            "the prefill side completed:\n{rendered}"
         );
     }
 
-    /// The prefill leg's stream, drained before the answer, counts the same
+    /// The prefill side's stream, drained before the answer, counts the same
     /// way under its own labels when it fails after its first frame; the
-    /// decode leg, dropped unread, is not charged.
+    /// decode side, dropped unread, is not charged.
     #[test]
-    fn a_prefill_leg_that_fails_mid_way_counts_against_its_worker_for_a_non_streamed_answer() {
+    fn a_prefill_side_that_fails_mid_way_counts_against_its_worker_for_a_non_streamed_answer() {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
@@ -3222,21 +3222,21 @@ mod request_release_tests {
             });
         });
         let rendered = handle.render();
-        let line = leg_worker_error_line(&rendered, "prefill")
+        let line = side_worker_error_line(&rendered, "prefill")
             .unwrap_or_else(|| panic!("the prefill worker's failure is counted:\n{rendered}"));
         assert!(line.contains("error_type=\"engine_error\""), "{line}");
         assert!(line.ends_with(" 1"), "{line}");
         assert!(
-            leg_worker_error_line(&rendered, "decode").is_none(),
-            "the decode leg did not fail:\n{rendered}"
+            side_worker_error_line(&rendered, "decode").is_none(),
+            "the decode side did not fail:\n{rendered}"
         );
     }
 
-    /// The streamed answer's accounting is unchanged by the legs' attribution:
-    /// a decode leg that fails mid-way is one sample, counted where the stream
+    /// The streamed answer's accounting is unchanged by the sides' attribution:
+    /// a decode side that fails mid-way is one sample, counted where the stream
     /// is written, not a second time where it is read.
     #[test]
-    fn a_decode_leg_that_fails_mid_way_is_counted_once_for_a_streamed_answer() {
+    fn a_decode_side_that_fails_mid_way_is_counted_once_for_a_streamed_answer() {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
@@ -3274,7 +3274,7 @@ mod request_release_tests {
             });
         });
         let rendered = handle.render();
-        let line = leg_worker_error_line(&rendered, "decode")
+        let line = side_worker_error_line(&rendered, "decode")
             .unwrap_or_else(|| panic!("the decode worker's failure is counted:\n{rendered}"));
         assert!(line.contains("error_type=\"engine_error\""), "{line}");
         assert!(line.ends_with(" 1"), "counted once: {line}");
@@ -3599,8 +3599,8 @@ mod request_release_tests {
         assert!(!is_retryable_response(&response));
     }
 
-    /// A prefill leg that cannot start must answer the client immediately
-    /// rather than waiting out the decode leg's own deadline, and the decode
+    /// A prefill side that cannot start must answer the client immediately
+    /// rather than waiting out the decode side's own deadline, and the decode
     /// room it stranded must be aborted rather than left for the engine to
     /// time out. The decode stub here answers only after `DECODE_DELAY`,
     /// standing in for an engine whose transfer deadline is what the client
@@ -3651,10 +3651,10 @@ mod request_release_tests {
         );
         assert!(
             answered_in < DECODE_DELAY,
-            "the prefill failure must not wait for the decode leg, took {answered_in:?}"
+            "the prefill failure must not wait for the decode side, took {answered_in:?}"
         );
 
-        // The decode leg is retired off the request path: once its dispatch
+        // The decode side is retired off the request path: once its dispatch
         // lands, its stream drops and that is what sends the abort.
         let deadline = Instant::now() + DECODE_DELAY + Duration::from_secs(8);
         loop {
@@ -3678,7 +3678,7 @@ mod request_release_tests {
         assert_eq!(
             aborted.as_slice(),
             dispatched.as_slice(),
-            "the abort must name the decode leg's own request id"
+            "the abort must name the decode side's own request id"
         );
     }
 
@@ -3797,9 +3797,9 @@ mod request_release_tests {
         drop(hold);
     }
 
-    /// gRPC PD path: the prefill leg answers on its own and reports when its
-    /// phase ends; the decode leg is still owed its first token when the
-    /// client leaves, and reports with the dropped body. Both legs end with
+    /// gRPC PD path: the prefill side answers on its own and reports when its
+    /// phase ends; the decode side is still owed its first token when the
+    /// client leaves, and reports with the dropped body. Both sides end with
     /// their load released, exactly once each.
     #[tokio::test]
     async fn cancelled_pd_stream_reports_the_prefill_and_decode_completions() {
@@ -3817,7 +3817,7 @@ mod request_release_tests {
         assert_eq!(
             decode.load(),
             1,
-            "the decode leg holds its load until the stream ends"
+            "the decode side holds its load until the stream ends"
         );
 
         drop(response);
@@ -3826,13 +3826,13 @@ mod request_release_tests {
         urls.sort();
         let mut expected = vec![prefill.url().to_string(), decode.url().to_string()];
         expected.sort();
-        assert_eq!(urls, expected, "each leg reports exactly once");
+        assert_eq!(urls, expected, "each side reports exactly once");
         assert_eq!(prefill.load(), 0);
         assert_eq!(decode.load(), 0);
         drop(hold);
     }
 
-    /// gRPC PD path under prefill admission: the prefill leg's load is a
+    /// gRPC PD path under prefill admission: the prefill side's load is a
     /// reservation in the admission gate rather than a bare guard, and it
     /// still reports the completion when the phase ends, so a cancelled
     /// request frees its slot for the next one.
@@ -3860,7 +3860,7 @@ mod request_release_tests {
         urls.sort();
         let mut expected = vec![prefill.url().to_string(), decode.url().to_string()];
         expected.sort();
-        assert_eq!(urls, expected, "each leg reports exactly once");
+        assert_eq!(urls, expected, "each side reports exactly once");
         assert_eq!(
             prefill.load(),
             0,

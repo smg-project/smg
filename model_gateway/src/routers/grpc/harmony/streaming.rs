@@ -523,14 +523,14 @@ impl HarmonyStreamingProcessor {
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
     ) -> Result<ResponsesIterationResult, String> {
         // Phase 1: Drain prefill stream. The client's prompt-side usage is the
-        // prefill leg's prefix-cache hit: the decode leg counts the KV it was
+        // prefill side's prefix-cache hit: the decode side counts the KV it was
         // handed as cached, so its responses are restamped with the prefill
-        // leg's number before the decode phase reads them.
+        // side's number before the decode phase reads them.
         let prefill_cached_tokens =
             drain_prefill(&mut prefill_stream, prefill_guards, false, |_| {})
                 .await
                 .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
-        let decode_stream = decode_stream.decode_leg(prefill_cached_tokens);
+        let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
         // Phase 2: Process decode stream
         let result =
@@ -595,8 +595,8 @@ struct ResponsesDecode {
     /// Each call's output index, item id and response format, by the parser's call index.
     calls: HashMap<usize, (usize, String, Option<ResponseFormat>)>,
     finalized_analysis: Option<String>,
-    // The terminal frame's counters (a disaggregated request's decode leg carries the prefill
-    // leg's cache hit, see `ProtoStream::decode_leg`); completion tokens are counted per chunk on
+    // The terminal frame's counters (a disaggregated request's decode side carries the prefill
+    // side's cache hit, see `ProtoStream::decode_side`); completion tokens are counted per chunk on
     // a delta stream and taken from the terminal frame on a cumulative one.
     prompt_tokens: u32,
     completion_tokens: u32,
@@ -833,7 +833,7 @@ impl ResponsesDecode {
     ) {
         let finish_reason = complete.finish_reason().to_string();
         self.prompt_tokens = complete.prompt_tokens();
-        // The prefill leg's hit through a prefill/decode pair, the engine's own through a
+        // The prefill side's hit through a prefill/decode pair, the engine's own through a
         // single engine
         self.cached_tokens = complete.cached_tokens();
         // Delta streams keep the count accumulated per chunk; cumulative streams take it from

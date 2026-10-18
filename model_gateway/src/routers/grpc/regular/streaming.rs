@@ -438,12 +438,12 @@ impl StreamingProcessor {
     ) -> Result<(), utils::StreamFailure> {
         // Phase 1.5: Drain prefill stream. Streaming chat does not emit prompt
         // logprobs, but the Prefill reservation must end with this phase, and
-        // the client's prompt-side usage is the prefill leg's.
+        // the client's prompt-side usage is the prefill side's.
         let prefill_cached_tokens =
             drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
                 .await
                 .map_err(utils::StreamFailure::prefill)?;
-        let decode_stream = decode_stream.decode_leg(prefill_cached_tokens);
+        let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
         // Phase 2-5: Process decode stream (same as single mode). Pass pd_timing
         // so the first decode token yields honest PD TTFT.
@@ -770,8 +770,8 @@ impl StreamingProcessor {
             })
             .await
             .map_err(utils::StreamFailure::prefill)?;
-        // The client's prompt-side usage is the prefill leg's.
-        let decode_stream = decode_stream.decode_leg(prefill_cached_tokens);
+        // The client's prompt-side usage is the prefill side's.
+        let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
         // Process decode stream with input_logprobs prepended. Pass pd_timing so
         // the first decode token yields honest PD TTFT.
@@ -1007,7 +1007,7 @@ impl StreamingProcessor {
         pd_timing: Option<&context::PdTiming>,
         ctx: &GenerateStreamContext,
     ) {
-        // PD mode: the stream task starts after the prefill leg was dispatched
+        // PD mode: the stream task starts after the prefill side was dispatched
         // (sequential PD: after it completes, with the first decode chunk
         // already buffered), so anchor TTFT at prefill dispatch. Generation
         // duration shares the base or TPOT underflows.
@@ -1793,12 +1793,12 @@ impl StreamingProcessor {
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
         // Consume prefill stream (Messages API does not expose prompt logprobs);
-        // the client's prompt-side usage is the prefill leg's.
+        // the client's prompt-side usage is the prefill side's.
         let prefill_cached_tokens =
             drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
                 .await
                 .map_err(utils::StreamFailure::prefill)?;
-        let decode_stream = decode_stream.decode_leg(prefill_cached_tokens);
+        let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
         let result = self
             .process_messages_streaming_chunks(
@@ -2397,12 +2397,12 @@ impl StreamingProcessor {
         tx: &SseSender,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
     ) -> Result<CompletionStreamOutcome, utils::StreamFailure> {
-        // The client's prompt-side usage is the prefill leg's.
+        // The client's prompt-side usage is the prefill side's.
         let prefill_cached_tokens =
             drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
                 .await
                 .map_err(utils::StreamFailure::prefill)?;
-        let decode_stream = decode_stream.decode_leg(prefill_cached_tokens);
+        let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
         let result = self
             .process_completion_streaming_chunks(

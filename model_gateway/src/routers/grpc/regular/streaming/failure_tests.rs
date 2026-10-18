@@ -1,6 +1,6 @@
 //! A worker stream that fails after the response started reaches the
-//! accounting against the leg it came from: the engine's own failure on the
-//! decode leg as an `engine_error`, a prefill leg lost before its completion
+//! accounting against the side it came from: the engine's own failure on the
+//! decode side as an `engine_error`, a prefill side lost before its completion
 //! as a `backend_error` of the prefill worker.
 use std::time::Instant;
 
@@ -17,7 +17,7 @@ use crate::{
     routers::grpc::{
         context::WorkerSelection,
         proto_wrapper::ENGINE_ERROR_MESSAGE,
-        utils::{stream_failure::UpstreamLeg, StreamFailure, StreamSource},
+        utils::{stream_failure::UpstreamStream, StreamFailure, StreamSource},
     },
     worker::{BasicWorkerBuilder, Worker, WorkerRegistry},
 };
@@ -81,7 +81,7 @@ fn series<'a>(rendered: &'a str, family: &str, labels: &[&str]) -> Option<&'a st
     })
 }
 
-/// Stream a disaggregated chat answer whose legs are `prefill` and `decode`
+/// Stream a disaggregated chat answer whose sides are `prefill` and `decode`
 /// and return the failure the streaming layer reports.
 async fn stream_pd(
     prefill: Vec<proto::GenerateResponse>,
@@ -131,7 +131,7 @@ fn the_warn(lines: &[&str], needles: &[&str]) -> Result<(), String> {
 
 #[test]
 #[traced_test]
-fn a_decode_leg_the_engine_fails_is_an_engine_error_of_the_decode_worker() {
+fn a_decode_side_the_engine_fails_is_an_engine_error_of_the_decode_worker() {
     let failure = runtime().block_on(stream_pd(
         vec![complete(0, "stop")],
         "0",
@@ -141,7 +141,7 @@ fn a_decode_leg_the_engine_fails_is_an_engine_error_of_the_decode_worker() {
         matches!(
             &failure,
             StreamFailure::Upstream {
-                leg: UpstreamLeg::Answer,
+                stream: UpstreamStream::Answer,
                 completion_tokens: 1,
                 ..
             }
@@ -175,7 +175,7 @@ fn a_decode_leg_the_engine_fails_is_an_engine_error_of_the_decode_worker() {
             &[r#"worker_type="decode""#, r#"error_type="engine_error""#],
         )
         .is_some_and(|line| line.ends_with(" 1")),
-        "the decode leg carries the failure:\n{rendered}"
+        "the decode side carries the failure:\n{rendered}"
     );
     assert!(
         series(
@@ -184,7 +184,7 @@ fn a_decode_leg_the_engine_fails_is_an_engine_error_of_the_decode_worker() {
             &[r#"worker_type="prefill""#]
         )
         .is_none(),
-        "the prefill leg, which completed, is not blamed:\n{rendered}"
+        "the prefill side, which completed, is not blamed:\n{rendered}"
     );
     logs_assert(|lines: &[&str]| {
         the_warn(
@@ -204,8 +204,8 @@ fn a_decode_leg_the_engine_fails_is_an_engine_error_of_the_decode_worker() {
 
 #[test]
 #[traced_test]
-fn a_prefill_leg_lost_before_its_completion_is_a_backend_error_of_the_prefill_worker() {
-    // The prefill leg's RPC ends with UNAVAILABLE before its Complete.
+fn a_prefill_side_lost_before_its_completion_is_a_backend_error_of_the_prefill_worker() {
+    // The prefill side's RPC ends with UNAVAILABLE before its Complete.
     let failure = runtime().block_on(stream_pd(
         vec![],
         "14",
@@ -215,7 +215,7 @@ fn a_prefill_leg_lost_before_its_completion_is_a_backend_error_of_the_prefill_wo
         matches!(
             &failure,
             StreamFailure::Upstream {
-                leg: UpstreamLeg::Prefill,
+                stream: UpstreamStream::Prefill,
                 completion_tokens: 0,
                 ..
             }
@@ -234,7 +234,7 @@ fn a_prefill_leg_lost_before_its_completion_is_a_backend_error_of_the_prefill_wo
             &[r#"worker_type="prefill""#, r#"error_type="backend_error""#],
         )
         .is_some_and(|line| line.ends_with(" 1")),
-        "the prefill leg carries the failure as a backend error:\n{rendered}"
+        "the prefill side carries the failure as a backend error:\n{rendered}"
     );
     assert!(
         series(
@@ -243,7 +243,7 @@ fn a_prefill_leg_lost_before_its_completion_is_a_backend_error_of_the_prefill_wo
             &[r#"worker_type="decode""#]
         )
         .is_none(),
-        "the decode leg is not blamed:\n{rendered}"
+        "the decode side is not blamed:\n{rendered}"
     );
     assert!(
         series(

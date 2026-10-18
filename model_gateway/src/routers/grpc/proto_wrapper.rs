@@ -1003,7 +1003,7 @@ fn collect_tokenspeed_tensor_shm_handles(
 }
 
 /// The identity of a multimodal batch without its pixels, for the PD decode
-/// leg: hashes, placeholders and the M-RoPE grid tensors (a few ints per item,
+/// side: hashes, placeholders and the M-RoPE grid tensors (a few ints per item,
 /// inline payloads only, since an SHM segment is unreadable after the prefill
 /// send). A hash-less batch carries no identity worth keeping.
 pub(crate) fn vllm_mm_identity(mm: &vllm::MultimodalInputs) -> Option<vllm::MultimodalInputs> {
@@ -1021,7 +1021,7 @@ pub(crate) fn vllm_mm_identity(mm: &vllm::MultimodalInputs) -> Option<vllm::Mult
         .filter_map(|key| inline_tensor(key).map(|tensor| (key.to_string(), tensor)))
         .collect();
     // A flat-classified grid key needs its sizes tensor to keep per-item
-    // slicing on the decode leg.
+    // slicing on the decode side.
     let mut flat_keys = HashMap::new();
     for (key, sizes_key) in &mm.flat_keys {
         if !grid_tensors.contains_key(key) {
@@ -1036,7 +1036,7 @@ pub(crate) fn vllm_mm_identity(mm: &vllm::MultimodalInputs) -> Option<vllm::Mult
                 tracing::warn!(
                     grid_key = %key,
                     sizes_key = %sizes_key,
-                    "dropping grid tensor from the PD decode leg: its sizes tensor is not inline"
+                    "dropping grid tensor from the PD decode side: its sizes tensor is not inline"
                 );
                 grid_tensors.remove(key);
             }
@@ -1063,7 +1063,7 @@ pub(crate) fn vllm_mm_identity(mm: &vllm::MultimodalInputs) -> Option<vllm::Mult
 }
 
 /// The content identity of a multimodal batch for a language-model-only PD
-/// decode leg: only the per-image hashes survive. The servicer folds them
+/// decode side: only the per-image hashes survive. The servicer folds them
 /// into the request's `cache_salt`, so two requests whose text and expanded
 /// placeholder-token runs match but whose images differ cannot alias in the
 /// decode-side prefix cache. A hash-less batch carries no identity worth
@@ -1435,10 +1435,10 @@ impl ProtoGenerateRequest {
         matches!(self, Self::TokenSpeed(_))
     }
 
-    /// Sanitize sampling params for the prefill-only leg (vLLM PD mode).
+    /// Sanitize sampling params for the prefill-only side (vLLM PD mode).
     /// max_tokens=1 computes KV without generating; min_tokens is cleared so the
     /// engine accepts it; n=1 so the prefill returns a single kv_transfer_params dict.
-    /// Stop criteria are cleared and EOS ignored so the leg always finishes
+    /// Stop criteria are cleared and EOS ignored so the side always finishes
     /// length-capped — vLLM < 0.20 returns the NIXL handoff only for that status.
     pub fn sanitize_sampling_for_prefill(&mut self, max_tokens: u32) {
         match self {
@@ -1494,7 +1494,7 @@ impl ProtoGenerateRequest {
         }
     }
 
-    /// Clone for a PD leg that carries no multimodal pixels (see
+    /// Clone for a PD side that carries no multimodal pixels (see
     /// `clear_mm_pixel_values`), without ever duplicating them: detach,
     /// clone, reattach to `self`. vLLM keeps `mm_hashes`/placeholders and the
     /// M-RoPE grid tensors in the clone: the servicer rebuilds pixel-less
@@ -1546,7 +1546,7 @@ impl ProtoGenerateRequest {
         }
     }
 
-    /// Clone for a PD decode leg on a language-model-only decode worker (no
+    /// Clone for a PD decode side on a language-model-only decode worker (no
     /// vision encoder, encoder-cache budget 0 — the production vLLM P/D
     /// shape). The prefill-expanded `input_ids` and the KV handoff stay, but
     /// every multimodal payload beyond the content hashes goes: pixels,
@@ -1578,7 +1578,7 @@ impl ProtoGenerateRequest {
     }
 
     /// Whether any vLLM multimodal batch carries M-RoPE grid tensors. The
-    /// decode leg of a grid-dependent model (Qwen-VL family) derives its
+    /// decode side of a grid-dependent model (Qwen-VL family) derives its
     /// positions from them, so they cannot be stripped for a
     /// language-model-only decode worker.
     pub fn has_vllm_mrope_grids(&self) -> bool {
@@ -1594,7 +1594,7 @@ impl ProtoGenerateRequest {
 
     /// Drop raw multimodal encoder tensors while keeping item metadata.
     ///
-    /// Used by the EPD prefill leg: multimodal embeddings arrive from encode workers,
+    /// Used by the EPD prefill side: multimodal embeddings arrive from encode workers,
     /// but prefill still needs placeholders/model-specific metadata to slot them.
     pub fn clear_mm_pixel_values(&mut self) {
         match self {
@@ -1710,10 +1710,10 @@ impl ProtoGenerateRequest {
     }
 
     /// Replace this vLLM request's media references with the identity the
-    /// prefill leg produced: the expanded prompt ids and the pixel-less
-    /// per-modality inputs, in the shape a router-preprocessed decode leg has.
-    /// Applied whole or not at all: an identity without ids, or a leg whose
-    /// input is not tokenized, leaves the leg as it is (`false`), so it
+    /// prefill side produced: the expanded prompt ids and the pixel-less
+    /// per-modality inputs, in the shape a router-preprocessed decode side has.
+    /// Applied whole or not at all: an identity without ids, or a side whose
+    /// input is not tokenized, leaves the side as it is (`false`), so it
     /// reprocesses the references rather than run an empty prompt.
     pub fn apply_media_identity(&mut self, identity: &vllm::MediaIdentity) -> bool {
         let Self::Vllm(req) = self else {
@@ -2100,11 +2100,11 @@ impl ProtoGenerateResponse {
         }
     }
 
-    /// Stamp a disaggregated request's decode-leg response with the prefill
-    /// leg's prefix-cache hit (see [`PrefillCachedTokens`]). The decode leg
+    /// Stamp a disaggregated request's decode-side response with the prefill
+    /// side's prefix-cache hit (see [`PrefillCachedTokens`]). The decode side
     /// loads the prefix it was handed and reports it as cached, so its own
     /// number is the transfer's size, not the request's cache hit; a chunk or
-    /// complete whose sample the prefill leg did not report keeps its own.
+    /// complete whose sample the prefill side did not report keeps its own.
     pub fn restamp_cached_tokens(&mut self, prefill: &PrefillCachedTokens) {
         match self {
             Self::Sglang(resp) => match resp.response.as_mut() {
@@ -2480,7 +2480,7 @@ fn is_reported_version(version: &str) -> bool {
 #[derive(Clone)]
 pub enum ProtoGenerateComplete {
     Sglang(sglang::GenerateComplete),
-    // Boxed: the media identity a PD prefill leg returns made this variant
+    // Boxed: the media identity a PD prefill side returns made this variant
     // several times the size of the others, and completions move through
     // the same channel as every streamed chunk.
     Vllm(Box<vllm::GenerateComplete>),
@@ -2807,7 +2807,7 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// The media identity a prefill leg returned for its processed
+    /// The media identity a prefill side returned for its processed
     /// references (vLLM only; absent from older servicers).
     pub fn media_identity(&self) -> Option<&vllm::MediaIdentity> {
         match self {
@@ -2848,30 +2848,30 @@ pub enum ProtoStream {
     /// Any of the above, with the worker it came from: every response is a
     /// sign of life for that worker (see [`crate::worker::liveness`]).
     Tracked(Box<TrackedStream>),
-    /// The decode leg of a disaggregated request: every response restamped
-    /// with the prefill leg's prefix-cache hit (see [`PrefillCachedTokens`]).
-    DecodeLeg(Box<DecodeLegStream>),
+    /// The decode side of a disaggregated request: every response restamped
+    /// with the prefill side's prefix-cache hit (see [`PrefillCachedTokens`]).
+    DecodeSide(Box<DecodeStream>),
 }
 
-/// A disaggregated request's decode leg. Its engine loads the prompt's KV
-/// from the prefill leg and reports what it loaded as cached, so every chunk
-/// and complete it yields is restamped with the prefill leg's prefix-cache
-/// hit before the gateway reads it. Decode legs are not tracked today; if one
+/// A disaggregated request's decode side. Its engine loads the prompt's KV
+/// from the prefill side and reports what it loaded as cached, so every chunk
+/// and complete it yields is restamped with the prefill side's prefix-cache
+/// hit before the gateway reads it. Decode sides are not tracked today; if one
 /// ever is, the tracking must sit inside this wrapper, so that a
 /// [`PrefillTicket`] reads the engine's own `cached_tokens`, not the
 /// restamped value.
-pub struct DecodeLegStream {
+pub struct DecodeStream {
     inner: ProtoStream,
     prefill: PrefillCachedTokens,
 }
 
 /// The prefix-cache hit of a disaggregated request, by sample index, as its
-/// prefill leg reported it on each `Complete`. The prefill leg is the one
-/// that computed the prompt against its prefix cache; the decode leg receives
+/// prefill side reported it on each `Complete`. The prefill side is the one
+/// that computed the prompt against its prefix cache; the decode side receives
 /// that prefix over the KV connector and counts it as cached, so read from the
-/// decode leg every request's `cached_tokens` is the transfer (the prompt
-/// less its last token), whatever the cache held. The decode leg's responses
-/// are restamped with these values (see [`ProtoStream::decode_leg`]) so the
+/// decode side every request's `cached_tokens` is the transfer (the prompt
+/// less its last token), whatever the cache held. The decode side's responses
+/// are restamped with these values (see [`ProtoStream::decode_side`]) so the
 /// client's usage, and everything the gateway derives from it, carries the
 /// request's real cache hit.
 #[derive(Debug, Clone, Default)]
@@ -2887,12 +2887,12 @@ impl PrefillCachedTokens {
     }
 
     /// Whether no prefill completion was recorded (a stream another stage
-    /// drained, or a prefill leg that ended without one).
+    /// drained, or a prefill side that ended without one).
     pub fn is_empty(&self) -> bool {
         self.by_index.is_empty()
     }
 
-    /// The prefill leg's cache hit for sample `index`: the sample's own
+    /// The prefill side's cache hit for sample `index`: the sample's own
     /// entry, or the one entry of a prefill that completed once for the
     /// whole request.
     pub fn for_index(&self, index: u32) -> Option<u32> {
@@ -2925,7 +2925,7 @@ pub struct TrackedStream {
     output: Option<OutputTicket>,
     /// Whether the worker's circuit-breaker success for this dispatch is
     /// still to be sampled, at the stream's first response (a disaggregated
-    /// decode leg: see [`ProtoStream::tracked_decode_leg`]).
+    /// decode side: see [`ProtoStream::tracked_decode_side`]).
     samples_success: bool,
     /// A response (or the stream's end) pulled ahead of the stream's reader
     /// by [`ProtoStream::first_response_within`], handed to the next `next`
@@ -2937,7 +2937,7 @@ pub struct TrackedStream {
 /// item, held for the reader.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FirstItem {
-    /// A response: the leg answered.
+    /// A response: the side answered.
     Response,
     /// A failure (the engine's own report, or the transport's): the reader
     /// meets it next and accounts for it.
@@ -3006,14 +3006,14 @@ pub(crate) struct PrefillTicket {
 
 impl PrefillTicket {
     /// Book `prompt_tokens` as pending prefill on `worker` from this moment,
-    /// timed: the dispatch paths book a leg before its call is polled, so the
+    /// timed: the dispatch paths book a side before its call is polled, so the
     /// span the worker's rate learns runs from the dispatch to the first
     /// response whether the servicer sends its headers at once or, as the
     /// gRPC servicers do, with the first message (a booking at the call's
     /// return would then time nothing and teach a rate the worker does not
-    /// have, and the legs waiting in dispatch would be missing from the
-    /// backlog). `None` for an empty prompt. The ticket is handed to the leg's
-    /// stream by [`ProtoStream::tracked_prefill_leg_booked`]; dropped before
+    /// have, and the sides waiting in dispatch would be missing from the
+    /// backlog). `None` for an empty prompt. The ticket is handed to the side's
+    /// stream by [`ProtoStream::tracked_prefill_side_booked`]; dropped before
     /// that (the call failed or was retired), it releases the prompt untimed.
     pub(crate) fn book(worker: &Arc<dyn Worker>, prompt_tokens: u64) -> Option<Self> {
         Self::book_as(worker, prompt_tokens, true)
@@ -3193,12 +3193,12 @@ mod tracked_tests {
         assert_eq!(worker.tracked_load(), 0);
     }
 
-    /// A disaggregated decode leg earns its worker's breaker success at its
-    /// first response, never at its dispatch: a leg whose stream ends with
+    /// A disaggregated decode side earns its worker's breaker success at its
+    /// first response, never at its dispatch: a side whose stream ends with
     /// nothing on it leaves a failure before it standing, so the next one
     /// opens a breaker set to two.
     #[tokio::test]
-    async fn a_decode_leg_that_ends_with_nothing_on_it_earns_no_breaker_success() {
+    async fn a_decode_side_that_ends_with_nothing_on_it_earns_no_breaker_success() {
         use crate::worker::circuit_breaker::{CircuitBreakerConfig, CircuitState};
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("grpc://decode:30000")
@@ -3209,9 +3209,9 @@ mod tracked_tests {
                 .build(),
         );
         worker.record_outcome(504);
-        let mut leg = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
-            .tracked_decode_leg(Arc::clone(&worker));
-        match &leg {
+        let mut stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
+            .tracked_decode_side(Arc::clone(&worker));
+        match &stream {
             ProtoStream::Tracked(tracked) => {
                 assert!(tracked.samples_success, "the success waits for a response");
                 assert!(tracked.progress.is_none(), "no pile slot");
@@ -3219,8 +3219,11 @@ mod tracked_tests {
             }
             _ => panic!("a tracked stream"),
         }
-        assert!(leg.next().await.is_none(), "an empty fanout ends at once");
-        drop(leg);
+        assert!(
+            stream.next().await.is_none(),
+            "an empty fanout ends at once"
+        );
+        drop(stream);
         assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
         worker.record_outcome(504);
         assert_eq!(
@@ -3231,7 +3234,7 @@ mod tracked_tests {
     }
 
     #[test]
-    fn a_prefill_leg_booked_at_dispatch_is_pending_before_its_stream_exists() {
+    fn a_prefill_side_booked_at_dispatch_is_pending_before_its_stream_exists() {
         let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
         assert!(
             PrefillTicket::book(&worker, 0).is_none(),
@@ -3244,13 +3247,13 @@ mod tracked_tests {
             "pending from the dispatch, before the call has answered"
         );
         let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
-            .tracked_prefill_leg_booked(Arc::clone(&worker), ticket);
+            .tracked_prefill_side_booked(Arc::clone(&worker), ticket);
         assert_eq!(
             worker.prefill_backlog(),
             std::time::Duration::from_millis(409),
             "handed to the stream: booked once, not again"
         );
-        assert_eq!(worker.tracked_load(), 0, "a leg is never part of a pile");
+        assert_eq!(worker.tracked_load(), 0, "a side is never part of a pile");
         match &stream {
             ProtoStream::Tracked(tracked) => {
                 assert!(tracked.prefill.as_ref().is_some_and(|ticket| ticket.timed));
@@ -3266,7 +3269,7 @@ mod tracked_tests {
     }
 
     #[test]
-    fn a_leg_booked_at_dispatch_whose_call_fails_releases_its_prompt() {
+    fn a_side_booked_at_dispatch_whose_call_fails_releases_its_prompt() {
         let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
         let ticket = PrefillTicket::book(&worker, 1_000);
         assert_eq!(
@@ -3282,11 +3285,11 @@ mod tracked_tests {
     }
 
     #[test]
-    fn a_prefill_leg_books_its_prompt_timed_and_joins_no_pile() {
+    fn a_prefill_side_books_its_prompt_timed_and_joins_no_pile() {
         let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
         let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
-            .tracked_prefill_leg(Arc::clone(&worker), 4_096);
-        assert_eq!(worker.tracked_load(), 0, "a leg is never part of a pile");
+            .tracked_prefill_side(Arc::clone(&worker), 4_096);
+        assert_eq!(worker.tracked_load(), 0, "a side is never part of a pile");
         assert_eq!(
             worker.prefill_backlog(),
             std::time::Duration::from_millis(409),
@@ -3313,7 +3316,7 @@ mod tracked_tests {
         // the reader sees it once more, then the stream as it is.
         let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
         let mut stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
-            .tracked_prefill_leg(Arc::clone(&worker), 16);
+            .tracked_prefill_side(Arc::clone(&worker), 16);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         assert_eq!(
             stream.first_response_within(deadline).await.ok(),
@@ -3421,25 +3424,25 @@ impl ProtoStream {
         }))
     }
 
-    /// Track this stream as the prefill leg of a disaggregated dispatch to
+    /// Track this stream as the prefill side of a disaggregated dispatch to
     /// `worker`: its `prompt_tokens` are pending prefill there until its
     /// first response, which times the prompt's prefill for the worker's
-    /// rate (the leg's first response is the end of its prefill, on either
+    /// rate (the side's first response is the end of its prefill, on either
     /// dispatch shape), and every response is progress for the worker. The
-    /// leg joins no pile: the gateway bounds its silence per request (see
+    /// side joins no pile: the gateway bounds its silence per request (see
     /// [`crate::worker::liveness::prefill_leg_bound`]) instead of judging the
-    /// worker by legs it cannot see progress on.
+    /// worker by sides it cannot see progress on.
     #[must_use]
-    pub fn tracked_prefill_leg(self, worker: Arc<dyn Worker>, prompt_tokens: u64) -> Self {
+    pub fn tracked_prefill_side(self, worker: Arc<dyn Worker>, prompt_tokens: u64) -> Self {
         let prefill = PrefillTicket::book(&worker, prompt_tokens);
-        self.tracked_prefill_leg_booked(worker, prefill)
+        self.tracked_prefill_side_booked(worker, prefill)
     }
 
-    /// [`Self::tracked_prefill_leg`] for a leg booked at its dispatch (see
+    /// [`Self::tracked_prefill_side`] for a side booked at its dispatch (see
     /// [`PrefillTicket::book`]): the stream takes over the ticket, so the
     /// first response ends the span that began before the call was polled.
     #[must_use]
-    pub(crate) fn tracked_prefill_leg_booked(
+    pub(crate) fn tracked_prefill_side_booked(
         self,
         worker: Arc<dyn Worker>,
         prefill: Option<PrefillTicket>,
@@ -3455,19 +3458,19 @@ impl ProtoStream {
         }))
     }
 
-    /// Track this stream as the decode leg of a disaggregated dispatch to
-    /// `worker`: every response is the worker's token progress, the leg
+    /// Track this stream as the decode side of a disaggregated dispatch to
+    /// `worker`: every response is the worker's token progress, the side
     /// joins no pile and books no prefill (as [`Self::tracked`] with no
     /// prompt and no pile does), and the worker's circuit-breaker success
-    /// for the dispatch is sampled at the leg's first response rather than
-    /// when the call returned its stream. A decode leg's first response
-    /// waits for the handoff, so a leg accepted into silence, or one whose
+    /// for the dispatch is sampled at the side's first response rather than
+    /// when the call returned its stream. A decode side's first response
+    /// waits for the handoff, so a side accepted into silence, or one whose
     /// stream fails at once, is one failure of its worker and not a success
     /// and then a failure, which reset the breaker's streak on every
     /// request; a stream that ends with nothing on it earns no success
-    /// either, as a prefill leg's does not.
+    /// either, as a prefill side's does not.
     #[must_use]
-    pub(crate) fn tracked_decode_leg(self, worker: Arc<dyn Worker>) -> Self {
+    pub(crate) fn tracked_decode_side(self, worker: Arc<dyn Worker>) -> Self {
         let mut stream = self.tracked(worker, 0, false);
         if let Self::Tracked(tracked) = &mut stream {
             tracked.samples_success = true;
@@ -3482,7 +3485,7 @@ impl ProtoStream {
     /// deadline the stream has produced nothing, and the caller decides its
     /// fate. Only a tracked stream can hold an item back, so any other
     /// returns at once as if a response had come (the dispatch paths wrap a
-    /// leg before they bound it).
+    /// side before they bound it).
     pub async fn first_response_within(&mut self, deadline: Instant) -> Result<FirstItem, Elapsed> {
         let Self::Tracked(tracked) = self else {
             return Ok(FirstItem::Response);
@@ -3502,21 +3505,21 @@ impl ProtoStream {
     pub fn worker(&self) -> Option<&Arc<dyn Worker>> {
         match self {
             Self::Tracked(tracked) => Some(&tracked.worker),
-            Self::DecodeLeg(leg) => leg.inner.worker(),
+            Self::DecodeSide(side) => side.inner.worker(),
             _ => None,
         }
     }
 
-    /// This stream as a disaggregated request's decode leg: its responses
+    /// This stream as a disaggregated request's decode side: its responses
     /// carry `prefill`'s prefix-cache hit instead of their own (see
-    /// [`PrefillCachedTokens`]). A prefill leg that reported nothing leaves
+    /// [`PrefillCachedTokens`]). A prefill side that reported nothing leaves
     /// the stream as it is.
     #[must_use]
-    pub fn decode_leg(self, prefill: PrefillCachedTokens) -> Self {
+    pub fn decode_side(self, prefill: PrefillCachedTokens) -> Self {
         if prefill.is_empty() {
             return self;
         }
-        Self::DecodeLeg(Box::new(DecodeLegStream {
+        Self::DecodeSide(Box::new(DecodeStream {
             inner: self,
             prefill,
         }))
@@ -3524,20 +3527,20 @@ impl ProtoStream {
 
     /// Get next item from stream
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
-        if let Self::DecodeLeg(leg) = self {
-            // A decode leg's messages are polled in place as a tracked
+        if let Self::DecodeSide(side) = self {
+            // A decode side's messages are polled in place as a tracked
             // stream's are, without a boxed future per message; a wrapper
             // inside the wrapper recurses. The inner stream did its own
             // bookkeeping and engine-error mapping; only the prompt-side usage
             // changes here.
-            let item = if matches!(leg.inner, Self::Tracked(_) | Self::DecodeLeg(_)) {
-                Box::pin(leg.inner.next()).await
+            let item = if matches!(side.inner, Self::Tracked(_) | Self::DecodeSide(_)) {
+                Box::pin(side.inner.next()).await
             } else {
-                leg.inner.next_untracked().await
+                side.inner.next_untracked().await
             };
             return item.map(|result| {
                 result.map(|mut response| {
-                    response.restamp_cached_tokens(&leg.prefill);
+                    response.restamp_cached_tokens(&side.prefill);
                     response
                 })
             });
@@ -3616,8 +3619,8 @@ impl ProtoStream {
             Self::Fanout(stream) => stream.next().await,
             Self::Tracked(_) => return Box::pin(self.next()).await,
             // Reached only with one wrapper inside another: [`Self::next`]
-            // polls a decode leg in place.
-            Self::DecodeLeg(_) => return Box::pin(self.next()).await,
+            // polls a decode side in place.
+            Self::DecodeSide(_) => return Box::pin(self.next()).await,
         };
         item.map(reject_engine_error)
     }
@@ -3633,13 +3636,13 @@ impl ProtoStream {
             Self::Zmq(stream) => stream.mark_completed(),
             Self::Fanout(stream) => stream.mark_completed(),
             Self::Tracked(stream) => stream.inner.mark_completed(),
-            Self::DecodeLeg(leg) => leg.inner.mark_completed(),
+            Self::DecodeSide(side) => side.inner.mark_completed(),
         }
     }
 
     /// Defer the abort-on-drop until the stream yields its first response.
     ///
-    /// Used for the disaggregated decode leg: aborting a decode request while
+    /// Used for the disaggregated decode side: aborting a decode request while
     /// it is still receiving the KV handoff from its prefill peer can tear
     /// down the transfer mid-write; the first response proves the handoff
     /// completed, after which the (deferred) abort is safe. No-op for ZMQ
@@ -3675,9 +3678,9 @@ impl ProtoStream {
                     replay,
                 }))
             }
-            Self::DecodeLeg(leg) => {
-                let DecodeLegStream { inner, prefill } = *leg;
-                Self::DecodeLeg(Box::new(DecodeLegStream {
+            Self::DecodeSide(side) => {
+                let DecodeStream { inner, prefill } = *side;
+                Self::DecodeSide(Box::new(DecodeStream {
                     inner: inner.defer_abort_until_first_item(),
                     prefill,
                 }))
@@ -3736,7 +3739,7 @@ pub trait FanoutChild: Send {
 /// stream. Children are polled together, starting from a rotating cursor so
 /// a chatty child cannot starve its siblings, and are retired as they end;
 /// the fan-out ends with the last child. Dropping it drops every child, so
-/// each leg keeps its abort-on-drop, and `mark_completed` reaches every
+/// each side keeps its abort-on-drop, and `mark_completed` reaches every
 /// child.
 pub struct FanoutStream<C = ProtoStream> {
     children: Vec<Option<C>>,
@@ -4058,12 +4061,12 @@ mod fanout_tests {
     async fn fanout_passes_a_child_error_through() {
         let (first, _) = child(vec![chunk("a")]);
         let second = Scripted {
-            items: VecDeque::from([Err(tonic::Status::internal("leg died"))]),
+            items: VecDeque::from([Err(tonic::Status::internal("side died"))]),
             completed: Arc::new(AtomicBool::new(false)),
         };
         let mut fanout = FanoutStream::new(vec![second, first]);
         let first_item = fanout.next().await.unwrap();
-        assert!(matches!(first_item, Err(status) if status.message() == "leg died"));
+        assert!(matches!(first_item, Err(status) if status.message() == "side died"));
     }
 
     #[tokio::test]
@@ -4242,7 +4245,7 @@ mod engine_error_tests {
         for response in completes("stop") {
             assert!(reject_engine_error(Ok(response)).is_ok());
         }
-        let passed = reject_engine_error(Err(tonic::Status::unavailable("leg died")));
+        let passed = reject_engine_error(Err(tonic::Status::unavailable("side died")));
         assert!(matches!(passed, Err(status) if status.code() == tonic::Code::Unavailable));
     }
 }
