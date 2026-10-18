@@ -67,6 +67,19 @@ use crate::routers::{
     error,
 };
 
+/// Runs `fut`, a storage operation, under the request's storage context
+/// when the request has one, so the store sees the tenant and the request
+/// it serves; without one the operation runs as it is.
+async fn under_context<F: Future>(
+    request_context: Option<StorageRequestContext>,
+    fut: F,
+) -> F::Output {
+    match request_context {
+        Some(ctx) => with_request_context(ctx, fut).await,
+        None => fut.await,
+    }
+}
+
 /// How long a cancel request waits for the task to write its terminal record
 /// before answering from whatever the store holds.
 const CANCEL_SETTLE: Duration = Duration::from_secs(5);
@@ -250,10 +263,7 @@ pub(crate) async fn store_record(
     );
     stored.tenant = tenant.map(str::to_string);
     let store = async { storage.store_response(stored).await.map(|_| ()) };
-    match request_context {
-        Some(ctx) => with_request_context(ctx, store).await,
-        None => store.await,
-    }
+    under_context(request_context, store).await
 }
 
 /// The stored Response object moved to `status`: a terminal status stamps
@@ -375,10 +385,8 @@ async fn transition(
             ConditionalStore::Missing => Ok(Transition::Missing),
         }
     };
-    let transition: Result<Transition, ResponseStorageError> = match request_context.clone() {
-        Some(ctx) => with_request_context(ctx, update).await,
-        None => update.await,
-    };
+    let transition: Result<Transition, ResponseStorageError> =
+        under_context(request_context.clone(), update).await;
     let transition = transition?;
     if let Transition::Moved(raw) = &transition {
         retire_unstored(storage, request_context, id, raw);
@@ -416,10 +424,7 @@ fn retire_unstored(
                 .expire_response(&ResponseId::from(id.as_str()), UNSTORED_RETENTION)
                 .await
         };
-        let expired = match request_context.clone() {
-            Some(ctx) => with_request_context(ctx, expire).await,
-            None => expire.await,
-        };
+        let expired = under_context(request_context.clone(), expire).await;
         // The default answers Ok for a store that keeps no deadline: an error
         // is a store that keeps them and failed to set one, which leaves this
         // gateway's timer as the record's only retirement.
@@ -436,10 +441,7 @@ fn retire_unstored(
                 .delete_response(&ResponseId::from(id.as_str()))
                 .await
         };
-        let deleted = match request_context {
-            Some(ctx) => with_request_context(ctx, delete).await,
-            None => delete.await,
-        };
+        let deleted = under_context(request_context, delete).await;
         match deleted {
             Ok(()) => debug!(
                 response_id = %id,
@@ -892,10 +894,7 @@ async fn watch_stored_status(
     loop {
         tokio::time::sleep(every).await;
         let read = async { storage.get_response(&ResponseId::from(id)).await };
-        let stored = match request_context.clone() {
-            Some(ctx) => with_request_context(ctx, read).await,
-            None => read.await,
-        };
+        let stored = under_context(request_context.clone(), read).await;
         match stored {
             Ok(Some(stored)) => {
                 record_seen = true;
@@ -1088,10 +1087,7 @@ async fn visible_record(
     id: &str,
 ) -> Result<Option<StoredResponse>, Response> {
     let read = async { storage.get_response(&ResponseId::from(id)).await };
-    let stored = match request_context {
-        Some(ctx) => with_request_context(ctx, read).await,
-        None => read.await,
-    };
+    let stored = under_context(request_context, read).await;
     match stored {
         Ok(stored) => Ok(stored.filter(|stored| stored.is_visible_to(tenant))),
         Err(e) => Err(error::storage_failure(
