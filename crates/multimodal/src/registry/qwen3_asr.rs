@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::{
     audio::{AudioPreProcessor, Qwen3AudioProcessor},
@@ -346,10 +346,6 @@ impl ModelProcessorSpec for Qwen3AsrSpec {
         _metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
         Ok(HashMap::from([(Modality::Audio, 10)]))
-    }
-
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
     }
 
     fn audio_processor(

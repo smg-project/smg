@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
@@ -323,10 +323,6 @@ impl ModelProcessorSpec for Gemma4Spec {
             limits.insert(Modality::Audio, usize::MAX);
         }
         Ok(limits)
-    }
-
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
     }
 
     fn prompt_replacements(
@@ -789,7 +785,6 @@ mod tests {
             FrameSampling::UpTo { max_frames: 32 }
         );
         assert_eq!(spec.default_video_sample_fps(), None);
-        assert_eq!(spec.processor_kwargs(&metadata).unwrap(), json!({}));
 
         let image = spec.encoder_field_layouts_for(Modality::Image);
         assert_eq!(image.encoder_input, FieldLayout::Batched);

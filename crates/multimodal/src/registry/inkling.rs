@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::{
     audio::{AudioPreProcessor, InklingAudioProcessor},
@@ -102,10 +102,6 @@ impl ModelProcessorSpec for InklingSpec {
             limits.insert(Modality::Audio, 10);
         }
         Ok(limits)
-    }
-
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
     }
 
     fn audio_processor(

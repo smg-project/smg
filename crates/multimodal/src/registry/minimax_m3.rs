@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
-
 use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     media::FrameSampling,
@@ -389,10 +387,6 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         FrameSampling::Interval
     }
 
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
-    }
-
     fn prompt_replacements(
         &self,
         metadata: &ModelMetadata,
@@ -519,7 +513,7 @@ mod tests {
     use std::sync::OnceLock;
 
     use serde::Deserialize;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     use super::*;
     use crate::registry::{test_helpers::TestTokenizer, ModelMetadata, Tokenizer};

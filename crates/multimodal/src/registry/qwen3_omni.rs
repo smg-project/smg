@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::{
     audio::{AudioPreProcessor, Qwen3AudioProcessor},
@@ -127,10 +127,6 @@ impl ModelProcessorSpec for Qwen3OmniSpec {
             (Modality::Video, 1),
             (Modality::Audio, 10),
         ]))
-    }
-
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({"use_audio_in_video": false}))
     }
 
     fn audio_processor(

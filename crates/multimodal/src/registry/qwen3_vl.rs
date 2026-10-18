@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
-
 use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     media::FrameSampling,
@@ -305,10 +303,6 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
             limits.insert(Modality::Video, 1);
         }
         Ok(limits)
-    }
-
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
     }
 
     fn prompt_replacements(

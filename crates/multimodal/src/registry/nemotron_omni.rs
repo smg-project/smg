@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::{
     audio::{AudioPreProcessor, ParakeetAudioParams, ParakeetAudioProcessor, ParakeetConfigError},
@@ -285,10 +285,6 @@ impl ModelProcessorSpec for NemotronOmniSpec {
             limits.insert(Modality::Audio, MAX_AUDIOS_PER_REQUEST);
         }
         Ok(limits)
-    }
-
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
     }
 
     fn audio_processor(

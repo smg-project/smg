@@ -9,8 +9,6 @@
 
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
-
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     registry::{
@@ -95,10 +93,6 @@ impl ModelProcessorSpec for DeepseekV41VisionSpec {
         )]))
     }
 
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
-    }
-
     fn prompt_replacements(
         &self,
         metadata: &ModelMetadata,
@@ -152,6 +146,7 @@ impl ModelProcessorSpec for DeepseekV41VisionSpec {
 #[cfg(test)]
 mod tests {
     use ndarray::Array2;
+    use serde_json::{json, Value};
 
     use super::*;
     use crate::registry::test_helpers::TestTokenizer;

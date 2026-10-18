@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
-
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     registry::{ModelMetadata, ModelProcessorSpec, RegistryResult},
@@ -54,10 +52,6 @@ impl ModelProcessorSpec for LlavaSpec {
         Ok(HashMap::from([(Modality::Image, 4)]))
     }
 
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
-    }
-
     fn prompt_replacements(
         &self,
         metadata: &ModelMetadata,
@@ -105,10 +99,6 @@ impl ModelProcessorSpec for LlavaNextSpec {
         metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
         LlavaSpec.modality_limits(metadata)
-    }
-
-    fn processor_kwargs(&self, metadata: &ModelMetadata) -> RegistryResult<Value> {
-        LlavaSpec.processor_kwargs(metadata)
     }
 
     fn prompt_replacements(

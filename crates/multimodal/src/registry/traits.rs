@@ -347,8 +347,6 @@ pub trait ModelProcessorSpec: Send + Sync {
         })
     }
 
-    fn processor_kwargs(&self, metadata: &ModelMetadata) -> RegistryResult<Value>;
-
     /// Build the audio preprocessor for this model, if it supports audio.
     ///
     /// This is the single source of truth for audio-processor selection: the
@@ -577,10 +575,6 @@ mod tests {
             _metadata: &ModelMetadata,
         ) -> RegistryResult<HashMap<Modality, usize>> {
             Ok(HashMap::from([(Modality::Image, 2), (Modality::Audio, 1)]))
-        }
-
-        fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-            Ok(json!({}))
         }
 
         fn prompt_replacements(
@@ -877,10 +871,6 @@ mod tests {
             _metadata: &ModelMetadata,
         ) -> RegistryResult<HashMap<Modality, usize>> {
             Ok(HashMap::from([(Modality::Image, 1), (Modality::Video, 1)]))
-        }
-
-        fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-            Ok(json!({}))
         }
 
         fn prompt_replacements(

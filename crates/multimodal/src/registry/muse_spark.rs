@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::{
     audio::{
@@ -466,10 +466,6 @@ impl ModelProcessorSpec for MuseSparkSpec {
             limits.insert(Modality::Audio, MAX_AUDIOS_PER_REQUEST);
         }
         Ok(limits)
-    }
-
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
     }
 
     /// No audio tower is a model without audio; a tower whose geometry the
