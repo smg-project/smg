@@ -1024,10 +1024,7 @@ async fn watch_stored_status(
                         .update_response_object_if_open(&ResponseId::from(id), stored.raw_response)
                         .await
                 };
-                let written = match request_context.clone() {
-                    Some(ctx) => with_request_context(ctx, write).await,
-                    None => write.await,
-                };
+                let written = under_context(request_context.clone(), write).await;
                 match written {
                     Ok(ConditionalStore::Stored) => renewed = Instant::now(),
                     // Closed between the read and the write. A close from
@@ -1177,10 +1174,8 @@ async fn close_lost(
             ConditionalStore::Closed(_) | ConditionalStore::Missing => Ok(Lost::Gone),
         }
     };
-    let lost: Result<Lost, ResponseStorageError> = match request_context.clone() {
-        Some(ctx) => with_request_context(ctx, update).await,
-        None => update.await,
-    };
+    let lost: Result<Lost, ResponseStorageError> =
+        under_context(request_context.clone(), update).await;
     let lost = lost?;
     if let Lost::Closed(_, raw) = &lost {
         // An unstored (`store: false`) record the reaper closed is retired
@@ -1213,10 +1208,7 @@ pub(crate) async fn reap_expired(
     now: i64,
 ) -> Result<Reaped, ResponseStorageError> {
     let list = async { storage.list_open_background_responses(REAP_BATCH).await };
-    let open = match request_context.clone() {
-        Some(ctx) => with_request_context(ctx, list).await,
-        None => list.await,
-    }?;
+    let open = under_context(request_context.clone(), list).await?;
     let mut reaped = Reaped {
         open: open.len(),
         ..Reaped::default()
