@@ -2105,12 +2105,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .as_ref()
         .map(|c| c.advertise_addr.port());
 
-    // The readiness state, the metrics listener, the sweeper and the probe
-    // listener: the router and the app context are built (the storage hooks,
-    // policy files and store connections are behind us), so the listeners
-    // among them bind now, before the admin and HTTP listeners; the mesh TLS
-    // material, the apps and the listener addresses can still fail the start
-    // after this point, with these two bound.
     // The per-tenant usage table, now that the app context and the router
     // are built (what can refuse a configuration is behind us) and before the
     // metrics listener that renders it binds: process-wide, like the
@@ -2123,6 +2117,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         )));
     }
 
+    // The readiness state, the metrics listener, the sweeper and the probe
+    // listener: the router and the app context are built (the storage hooks,
+    // policy files and store connections are behind us), so the listeners
+    // among them bind now, before the admin and HTTP listeners; the mesh TLS
+    // material, the apps and the listener addresses can still fail the start
+    // after this point, with these two bound.
     let probe_state = start_observability(&config, &app_context, metrics_handle).await?;
 
     let app_state = Arc::new(AppState {

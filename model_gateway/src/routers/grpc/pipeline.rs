@@ -925,11 +925,6 @@ impl RequestPipeline {
         );
     }
 
-    /// Book a buffered response to its tenant's usage row, when accounting
-    /// is on: the token counts the response shows, the time since the
-    /// successful attempt's start. A stream books itself at its last token.
-    /// A request is one engine round trip: a Responses call whose tool loop
-    /// runs several iterations books each of them, buffered or streamed.
     /// What a buffered chat or Messages answer books: the engine's prompt and
     /// completion counts the response stage recorded, the counts the streams
     /// book at their last token and the settlement charges, not the usage
@@ -942,6 +937,13 @@ impl RequestPipeline {
             .map_or((0, 0), |counts| (counts.prompt, counts.completion))
     }
 
+    /// Book a buffered response to its tenant's usage row, when accounting
+    /// is on: the token counts the caller passes (the engine's, see
+    /// `engine_counts_booked`, where the response's usage differs), the time
+    /// since the successful attempt's start. A stream books itself at its
+    /// last token. A request is one engine round trip: a Responses call whose
+    /// tool loop runs several iterations books each of them, buffered or
+    /// streamed.
     fn record_usage(
         dctx: &DispatchContext,
         prompt_tokens: u32,
