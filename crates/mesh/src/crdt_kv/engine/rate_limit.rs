@@ -8,7 +8,7 @@
 //! State owned by this engine:
 //! - `entries: DashMap<String, ShardEntry>` — typed per-key state. Same-key
 //!   writes serialise via DashMap's `entry` API (per-shard lock).
-//! - `log: OperationLog` — gossip-visible operation log
+//! - `log: OpLogKeeper` — the gossip-visible operation log with its counter
 //! - shared `LamportClock` (per node, cloned from `CrdtOrMap`)
 //! - `generation: AtomicU64` — mutation counter for change-detection callers
 
@@ -21,13 +21,15 @@ use std::{
 };
 
 use dashmap::{mapref::entry::Entry as MapEntry, DashMap};
-use parking_lot::RwLock;
 use tracing::debug;
 
-use super::NamespaceCrdtEngine;
+use super::{
+    op_log::{changes, values_before, OpLogKeeper},
+    NamespaceCrdtEngine,
+};
 use crate::crdt_kv::{
     epoch_max_wins::{self as ratelimit, RateLimitState, RateLimitVersion},
-    operation::{CrdtChange, Operation, OperationLog},
+    operation::{CrdtChange, Operation},
     replica::{LamportClock, ReplicaId},
 };
 
@@ -42,71 +44,41 @@ struct ShardEntry {
 
 pub(crate) struct RateLimitEngine {
     entries: Arc<DashMap<String, ShardEntry>>,
-    log: Arc<RwLock<OperationLog>>,
+    log: OpLogKeeper,
     // Shared per-node Lamport clock — same Arc held by the router and every
     // other engine. See the equivalent note in `engine::lww`.
     clock: Arc<LamportClock>,
     replica_id: ReplicaId,
     generation: AtomicU64,
-    /// Bumped on every log mutation; invalidation key for shared op-log
-    /// snapshots.
-    op_generation: AtomicU64,
 }
 
 impl RateLimitEngine {
     pub(crate) fn new(replica_id: ReplicaId, clock: Arc<LamportClock>) -> Self {
         Self {
             entries: Arc::new(DashMap::new()),
-            log: Arc::new(RwLock::new(OperationLog::new())),
+            log: OpLogKeeper::new("RateLimitEngine"),
             clock,
             replica_id,
             generation: AtomicU64::new(0),
-            op_generation: AtomicU64::new(0),
         }
     }
 
-    /// Compact once the log carries more than twice the shard count
-    /// (min 64): a compacted log holds one op per key, so this bounds
-    /// resident log memory at O(keys) while amortizing the fold.
-    fn compact_trigger(&self) -> usize {
-        (self.entries.len() * 2).max(64)
-    }
-
+    /// A local write's op: appended, and past the keeper's trigger the log
+    /// is compacted per EpochMaxWins rules (`epoch_max_wins_fold`) with the
+    /// memory backstop.
     fn append_op(&self, op: Operation) {
-        let mut log = self.log.write();
-        log.append(op);
-        self.op_generation.fetch_add(1, Ordering::Release);
-        // The trigger floor is 64, so a short log skips the DashMap len()
-        // (an O(shards) scan) on this per-write path.
-        if log.len() > 64 && log.len() > self.compact_trigger() {
-            Self::compact_log(&mut log);
-            // Local-write path only: dropping oldest on the remote-merge path
-            // would shed remotely-learned shards (see the helper's docs).
-            let dropped = log.truncate_oldest_over_threshold();
-            if dropped > 0 {
-                tracing::warn!(
-                    dropped,
-                    total = log.len(),
-                    "RateLimitEngine log over threshold after compaction; dropped oldest \
-                     entries (out-of-spec distinct-key count)"
-                );
-            }
-        }
+        self.log
+            .append(op, || self.entries.len(), Self::epoch_max_wins_fold);
     }
 
     /// EpochMaxWins per-key fold: defer to `epoch_max_wins::compact_operations`,
     /// which folds every op for the key through `RateLimitState::merge`,
     /// respecting tombstone boundaries and embedding the merged
-    /// `tombstone_version` into the compacted snapshot.
+    /// `tombstone_version` into the compacted snapshot. Compaction never
+    /// drops keys outright - the truncate-oldest safety valve lives only on
+    /// the `append_op` local-write path.
     fn epoch_max_wins_fold(ops: &[Operation]) -> Option<Operation> {
         ratelimit::compact_operations(ops.iter())
-    }
-
-    /// Compact the log via EpochMaxWins per-key fold. Never drops keys
-    /// outright - the truncate-oldest safety valve lives only on the
-    /// `append_op` local-write path.
-    fn compact_log(log: &mut OperationLog) {
-        log.compact_by_key(Self::epoch_max_wins_fold);
     }
 
     fn current_encoded(&self, key: &str) -> Option<Vec<u8>> {
@@ -357,11 +329,11 @@ impl NamespaceCrdtEngine for RateLimitEngine {
     }
 
     fn op_generation(&self) -> u64 {
-        self.op_generation.load(Ordering::Acquire)
+        self.log.generation()
     }
 
     fn export_ops(&self) -> Vec<Operation> {
-        self.log.read().operations().to_vec()
+        self.log.export()
     }
 
     fn apply_remote_ops(&self, mut ops: Vec<Operation>) -> Vec<CrdtChange> {
@@ -385,16 +357,9 @@ impl NamespaceCrdtEngine for RateLimitEngine {
         // (the bug class addressed in #1469) with no separate op-id index.
         // `RateLimitState::merge` is associative, so folding the whole group at
         // once matches the prior incremental per-op-id fold; identical ops fold
-        // idempotently, so no duplicate survives. compact_log does not truncate,
-        // so remotely-learned keys are never dropped.
-        {
-            let mut log = self.log.write();
-            for op in &ops {
-                log.append(op.clone());
-            }
-            Self::compact_log(&mut log);
-            self.op_generation.fetch_add(1, Ordering::Release);
-        }
+        // idempotently, so no duplicate survives. The merge path does not
+        // truncate, so remotely-learned keys are never dropped.
+        self.log.merge_batch(&ops, Self::epoch_max_wins_fold);
 
         // Snapshot the observable (encoded-live) value of every key this batch
         // touches before applying, so we emit a `CrdtChange` only when `get`
@@ -402,15 +367,7 @@ impl NamespaceCrdtEngine for RateLimitEngine {
         // that leave `encode_live` unchanged (e.g. Tombstone -> newer
         // Tombstone, both encoding to `None`) bump generation/state but fire no
         // subscriber event.
-        let mut before: std::collections::HashMap<String, Option<Vec<u8>>> =
-            std::collections::HashMap::new();
-        for op in &ops {
-            // `contains_key` with a borrowed key avoids allocating a `String`
-            // for keys already snapshotted (a batch may repeat a key).
-            if !before.contains_key(op.key()) {
-                before.insert(op.key().to_string(), self.current_encoded(op.key()));
-            }
-        }
+        let before = values_before(&ops, |key| self.current_encoded(key));
 
         for op in ops {
             self.clock.update(op.timestamp());
@@ -438,16 +395,10 @@ impl NamespaceCrdtEngine for RateLimitEngine {
             }
         }
 
-        // Emit one CrdtChange per key whose observable value changed, carrying
+        // One CrdtChange per key whose observable value changed, carrying
         // the canonical post-merge value (the encoded live shard, matching
         // `get`).
-        before
-            .into_iter()
-            .filter_map(|(key, prior)| {
-                let value = self.current_encoded(&key);
-                (value != prior).then_some(CrdtChange { key, value })
-            })
-            .collect()
+        changes(before, |key| self.current_encoded(key))
     }
 
     fn gc_tombstones(&self, grace: Duration) -> usize {
@@ -487,13 +438,11 @@ impl NamespaceCrdtEngine for RateLimitEngine {
             // tracking the entry count (the compaction trigger) and dead
             // tombstones stop gossiping. Newer concurrent ops for a reused
             // key survive the version filter.
-            let mut log = self.log.write();
-            log.retain_ops(|op| {
+            self.log.retain(|op| {
                 purged.get(op.key()).is_none_or(|tombstone| {
                     RateLimitVersion::new(op.timestamp(), op.replica_id()) > *tombstone
                 })
             });
-            self.op_generation.fetch_add(1, Ordering::Release);
         }
         removed
     }
