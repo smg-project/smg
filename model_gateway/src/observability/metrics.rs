@@ -512,16 +512,16 @@ pub(crate) fn init_metrics() {
     );
 
     // Layer 2: PD disaggregation metrics (signals only SMG can measure — it is the
-    // only component that observes both the prefill and decode legs of a request).
+    // only component that observes both the prefill and decode sides of a request).
     //
     // The PD time to first token is split into phases the gateway bounds itself.
-    // Under sequential dispatch (the gRPC router relays the legs) the three
+    // Under sequential dispatch (the gRPC router relays the sides) the three
     // phase families add up to `smg_pd_ttft_seconds` exactly:
     //   prefill  smg_pd_prefill_duration_seconds    prefill dispatch -> prefill response drained
     //   relay    smg_pd_kv_transfer_duration_seconds prefill drained -> decode dispatch (gateway work only)
     //   decode   smg_pd_decode_ttft_seconds          decode dispatch -> first decode token
     // The engines' own KV transfer runs inside the decode phase. Parallel
-    // dispatch sends both legs together: the decode phase is the whole TTFT and
+    // dispatch sends both sides together: the decode phase is the whole TTFT and
     // there is no relay phase.
     describe_histogram!(
         "smg_pd_prefill_duration_seconds",
@@ -1846,7 +1846,7 @@ impl Metrics {
     // Layer 2: PD disaggregation metrics
     //
     // Per-request, engine-agnostic signals that no backend can self-report: SMG
-    // is the only component that sees both the prefill and decode legs. All
+    // is the only component that sees both the prefill and decode sides. All
     // durations come from a monotonic clock and are recorded once per request
     // (never per retry attempt).
     // ========================================================================
@@ -1893,7 +1893,7 @@ impl Metrics {
 
     /// Record the PD decode phase: decode dispatch to the first decode token.
     /// Under sequential dispatch this is where the engines' KV transfer and the
-    /// decode scheduling show up; under parallel dispatch both legs go out
+    /// decode scheduling show up; under parallel dispatch both sides go out
     /// together and the value is the end-to-end TTFT.
     /// Uses string interning for model_id; runtime is a static label.
     pub fn record_pd_decode_ttft(
@@ -1952,15 +1952,15 @@ impl Metrics {
         counter!("smg_pd_bootstrap_failures_total").increment(1);
     }
 
-    /// Record a PD rendezvous failure by `leg` (the worker type of the leg
+    /// Record a PD rendezvous failure by `side` (the worker type of the side
     /// that failed) and `phase` (`probe` at registration; `bootstrap` or
     /// `transfer` as the engine reported it). Its own family: the injection
     /// failures above keep their unlabelled series, so a bare selector on
     /// it still reads them alone.
-    pub fn record_pd_rendezvous_failure(leg: &'static str, phase: &'static str) {
+    pub fn record_pd_rendezvous_failure(side: &'static str, phase: &'static str) {
         counter!(
             "smg_pd_rendezvous_failures_total",
-            "leg" => leg,
+            "leg" => side,
             "phase" => phase
         )
         .increment(1);
@@ -2211,7 +2211,7 @@ impl Metrics {
     }
 
     /// Set running requests per worker
-    /// A request dispatched to a worker (each attempt, each PD leg), counted
+    /// A request dispatched to a worker (each attempt, each PD side), counted
     /// at the send. The per-worker gauges miss short requests and cannot be
     /// summed over a window, so this is how the share of traffic per worker
     /// is read from the scrape.
@@ -3675,7 +3675,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_pd_rendezvous_failure_by_leg_and_phase() {
+    fn test_record_pd_rendezvous_failure_by_side_and_phase() {
         let (rendered, ()) = with_test_recorder(|| {
             Metrics::record_pd_bootstrap_failure();
             Metrics::record_pd_rendezvous_failure(metrics_labels::WORKER_PREFILL, "probe");

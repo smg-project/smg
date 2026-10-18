@@ -1497,9 +1497,9 @@ const DECODE_SILENCE_MESSAGE: &str = "decode worker produced nothing within";
 const DECODE_SIDE_SILENCE_MESSAGE: &str = "decode leg produced nothing within";
 
 /// The bound on one prefill side's silence, counted from its dispatch (see
-/// [`liveness::prefill_leg_bound`]); the dispatch instant stays with it,
+/// [`liveness::prefill_side_bound`]); the dispatch instant stays with it,
 /// as a reprieve past the deadline may count from there (see
-/// [`liveness::prefill_leg_reprieve`]).
+/// [`liveness::prefill_side_reprieve`]).
 #[derive(Clone, Copy, Debug)]
 struct PrefillBound {
     dispatched: Instant,
@@ -1511,7 +1511,7 @@ impl PrefillBound {
     /// The bound for a side of `prompt_tokens` dispatched to `worker` at
     /// `dispatched`; `None` when the rule is off.
     fn at(worker: &Arc<dyn Worker>, prompt_tokens: u64, dispatched: Instant) -> Option<Self> {
-        let bound = liveness::prefill_leg_bound(worker, prompt_tokens)?;
+        let bound = liveness::prefill_side_bound(worker, prompt_tokens)?;
         // A bound past the clock's range never expires: the side stays unbounded.
         let deadline = dispatched.checked_add(bound)?;
         Some(Self {
@@ -1525,7 +1525,7 @@ impl PrefillBound {
 /// The verdict on a prefill side that produced nothing within its bound, in
 /// `phase` (`dispatch`: the call returned no stream; `first_response`: the
 /// stream yielded nothing), while its worker answered no other side within
-/// the bound either (see [`liveness::prefill_leg_reprieve`]): one WARN
+/// the bound either (see [`liveness::prefill_side_reprieve`]): one WARN
 /// naming the worker, the request and how long ago the worker last
 /// answered anything, the worker-error counter under the timeout class, and
 /// the status the side's failure is reported with. Nothing else bounds this
@@ -1716,7 +1716,7 @@ fn prefill_silence_response(status: &tonic::Status, prefill: &Arc<dyn Worker>) -
 /// Await a prefill side's dispatch within its bound. Past the deadline the
 /// side waits on while its worker keeps answering other sides (a bound past
 /// the worker's latest answer, re-read each time: see
-/// [`liveness::prefill_leg_reprieve`]); once the worker has answered
+/// [`liveness::prefill_side_reprieve`]); once the worker has answered
 /// nothing for a bound, the still-pending call is retired off the request
 /// path (its room is aborted when it lands) and the silence verdict takes
 /// its place: the prefill's, or its decode `partner`'s when the partner had
@@ -1741,7 +1741,7 @@ async fn dispatch_prefill_within(
             return result;
         }
         let Some(more) =
-            liveness::prefill_leg_reprieve(&worker, bound.bound, bound.dispatched.elapsed())
+            liveness::prefill_side_reprieve(&worker, bound.bound, bound.dispatched.elapsed())
         else {
             retire_pd_side(
                 PdSide::Prefill,
@@ -1800,7 +1800,7 @@ async fn first_prefill_response_within(
             return Ok(first);
         }
         let Some(more) =
-            liveness::prefill_leg_reprieve(worker, bound.bound, bound.dispatched.elapsed())
+            liveness::prefill_side_reprieve(worker, bound.bound, bound.dispatched.elapsed())
         else {
             return Err(match stalled_decode_partner(partner, bound.bound) {
                 Some((decode, silence)) => decode_partner_silent(
@@ -1827,7 +1827,7 @@ async fn first_prefill_response_within(
 }
 
 /// The bound on a sequential decode side's first token, counted from its
-/// dispatch (see [`liveness::decode_leg_bound`]).
+/// dispatch (see [`liveness::decode_side_bound`]).
 #[derive(Clone, Copy, Debug)]
 struct DecodeBound {
     deadline: Instant,
@@ -1837,10 +1837,10 @@ struct DecodeBound {
 impl DecodeBound {
     /// The bound for a side of `prompt_tokens` dispatched at `dispatched`,
     /// sized from `prefills`, the worker whose prefill of the prompt stands
-    /// before the side's first token (see [`liveness::decode_leg_bound`]);
+    /// before the side's first token (see [`liveness::decode_side_bound`]);
     /// `None` when the rule is off.
     fn at(prefills: &Arc<dyn Worker>, prompt_tokens: u64, dispatched: Instant) -> Option<Self> {
-        let bound = liveness::decode_leg_bound(prefills, prompt_tokens)?;
+        let bound = liveness::decode_side_bound(prefills, prompt_tokens)?;
         // A bound past the clock's range never expires: the side stays unbounded.
         let deadline = dispatched.checked_add(bound)?;
         Some(Self { deadline, bound })
@@ -2673,7 +2673,7 @@ async fn sequential_decode_side(
     // still lands in the decode phase.
     let decode_sent = Instant::now();
     // The decode side owes its first token within a bound counted from here
-    // (see `liveness::decode_leg_bound`): the KV handoff from the prefill
+    // (see `liveness::decode_side_bound`): the KV handoff from the prefill
     // side and the decode engine's first step. The prefill side has answered,
     // so its silence bound no longer covers the request, and nothing else
     // bounds this wait below the request's own timeout while the engines'

@@ -1,15 +1,15 @@
-//! A bounded TCP probe of the rendezvous port a disaggregated leg advertises.
+//! A bounded TCP probe of the rendezvous port a disaggregated worker advertises.
 //!
-//! A leg registered with a `bootstrap_port` hands that port to every partner
+//! A worker registered with a `bootstrap_port` hands that port to every partner
 //! it is paired with: the partner's engine connects there to rendezvous
-//! before the KV handoff. A leg registered without one (the CLI's
+//! before the KV handoff. A worker registered without one (the CLI's
 //! `--prefill <url>` with no port, a `POST /workers` without the field, a
 //! discovered pod without the bootstrap annotation) is handed the default
 //! port on the request path instead, so that is the port probed for it. The
 //! gateway itself never connects to the port on the request path, so a port
 //! nothing listens on used to be found only by the engines, one request at a
 //! time, after their own bootstrap deadline. This probe connects once, after
-//! the leg has been registered, off the registration path: the leg serves
+//! the worker has been registered, off the registration path: the worker serves
 //! either way, and a port that does not accept the connection is named in one
 //! WARN and counted.
 
@@ -36,11 +36,11 @@ pub(crate) const PROBE_PHASE: &str = "probe";
 /// Where the port a probe connects to came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BootstrapPortSource {
-    /// The port the leg was registered with: the worker API's
+    /// The port the worker was registered with: the worker API's
     /// `bootstrap_port`, the CLI's `--prefill <url> <port>`, or the
     /// discovery annotation.
     Registered,
-    /// The leg was registered without a port, so the request path hands its
+    /// The worker was registered without a port, so the request path hands its
     /// partners [`DEFAULT_BOOTSTRAP_PORT`].
     Default,
 }
@@ -55,10 +55,10 @@ impl BootstrapPortSource {
     }
 }
 
-/// A prefill leg whose connector writes to a shared store: its partners read
+/// A prefill worker whose connector writes to a shared store: its partners read
 /// its blocks back from the store and are handed no port, whatever port the
-/// leg was registered with.
-fn is_store_prefill_leg(worker: &dyn Worker) -> bool {
+/// worker was registered with.
+fn is_store_prefill_worker(worker: &dyn Worker) -> bool {
     matches!(worker.worker_type(), WorkerType::Prefill)
         && worker.pd_pairing().profile() == Some(KvTransferProfile::Store)
 }
@@ -66,18 +66,18 @@ fn is_store_prefill_leg(worker: &dyn Worker) -> bool {
 /// The bootstrap port the gateway hands a partner of `worker`, and where it
 /// comes from; `None` when no partner is handed one.
 ///
-/// A registered port is the one, for any worker but a prefill leg on a KV
-/// store (see [`is_store_prefill_leg`]). Without one, the request path
-/// applies [`DEFAULT_BOOTSTRAP_PORT`] to the legs whose partners rendezvous
-/// on a bootstrap server: an encode leg, and a prefill leg of every runtime
+/// A registered port is the one, for any worker but a prefill worker on a KV
+/// store (see [`is_store_prefill_worker`]). Without one, the request path
+/// applies [`DEFAULT_BOOTSTRAP_PORT`] to the workers whose partners rendezvous
+/// on a bootstrap server: an encode worker, and a prefill worker of every runtime
 /// whose rendezvous travels in the request (the SGLang-style bootstrap
 /// metadata and the KV bootstrap room), or of vLLM on the Mooncake connector,
-/// whose decode-leg `remote_bootstrap_addr` is minted with it. A vLLM prefill
-/// leg on another connector (NIXL, MoRI-IO, a store, none) carries its own
+/// whose decode-side `remote_bootstrap_addr` is minted with it. A vLLM prefill
+/// worker on another connector (NIXL, MoRI-IO, a store, none) carries its own
 /// side channel or meets its partners in the store and is never handed a
 /// bootstrap port, and neither is a decode or a regular worker.
 pub(crate) fn effective_bootstrap_port(worker: &dyn Worker) -> Option<(u16, BootstrapPortSource)> {
-    if is_store_prefill_leg(worker) {
+    if is_store_prefill_worker(worker) {
         return None;
     }
     if let Some(port) = worker.bootstrap_port() {
@@ -121,16 +121,16 @@ pub(crate) async fn probe_bootstrap_port(
 /// Probe the bootstrap port the partners of `worker` are handed (see
 /// [`effective_bootstrap_port`]), off the registration path. Nothing happens
 /// for a worker no partner is handed one for, or for a transport that
-/// carries no host; a port registered on a prefill leg whose partners meet
+/// carries no host; a port registered on a prefill worker whose partners meet
 /// it in a KV store is said to be unused instead of probed.
 pub(crate) fn spawn_bootstrap_port_probe(worker: &dyn Worker) {
-    if is_store_prefill_leg(worker) {
+    if is_store_prefill_worker(worker) {
         if let Some(port) = worker.bootstrap_port() {
             info!(
                 worker = %worker.url(),
                 bootstrap_port = port,
                 kv_connector = worker.metadata().spec.kv_connector.as_deref().unwrap_or(""),
-                "Bootstrap port registered on a prefill leg whose KV connector writes to a \
+                "Bootstrap port registered on a prefill worker whose KV connector writes to a \
                  shared store is not used: its decode partners read the blocks back from \
                  the store, nothing rendezvous on the port"
             );
@@ -146,25 +146,25 @@ pub(crate) fn spawn_bootstrap_port_probe(worker: &dyn Worker) {
     }
     let host = host.to_string();
     let url = worker.url().to_string();
-    let leg = worker.worker_type().as_metric_label();
+    let worker_type = worker.worker_type().as_metric_label();
     #[expect(
         clippy::disallowed_methods,
         reason = "an advisory probe that ends within its own timeout; nothing waits on it at shutdown"
     )]
     tokio::spawn(async move {
-        report_bootstrap_port_probe(&url, leg, &host, port, source).await;
+        report_bootstrap_port_probe(&url, worker_type, &host, port, source).await;
     });
 }
 
 /// Run the probe and report its verdict: a port that did not accept the
 /// connection is one WARN naming the worker, the port, where the port came
-/// from (`bootstrap_port_source`: `registered`, or `default` for a leg
+/// from (`bootstrap_port_source`: `registered`, or `default` for a worker
 /// registered without one) and the error, and one count under
 /// `smg_pd_rendezvous_failures_total{leg, phase="probe"}`; a port that did is
 /// a DEBUG line. Returns whether the port accepted.
 pub(crate) async fn report_bootstrap_port_probe(
     url: &str,
-    leg: &'static str,
+    worker_type: &'static str,
     host: &str,
     port: u16,
     source: BootstrapPortSource,
@@ -173,7 +173,7 @@ pub(crate) async fn report_bootstrap_port_probe(
         Ok(()) => {
             debug!(
                 worker = url,
-                worker_type = leg,
+                worker_type = worker_type,
                 bootstrap_host = host,
                 bootstrap_port = port,
                 bootstrap_port_source = source.label(),
@@ -184,15 +184,15 @@ pub(crate) async fn report_bootstrap_port_probe(
         Err(error) => {
             warn!(
                 worker = url,
-                worker_type = leg,
+                worker_type = worker_type,
                 bootstrap_host = host,
                 bootstrap_port = port,
                 bootstrap_port_source = source.label(),
                 error = %error,
-                "Bootstrap port did not accept a connection at registration: the leg is \
+                "Bootstrap port did not accept a connection at registration: the worker is \
                  registered, but its disaggregated partners cannot rendezvous there"
             );
-            Metrics::record_pd_rendezvous_failure(leg, PROBE_PHASE);
+            Metrics::record_pd_rendezvous_failure(worker_type, PROBE_PHASE);
             false
         }
     }
@@ -221,7 +221,7 @@ mod tests {
 
     /// A worker of one type and runtime, with the connector and the
     /// bootstrap port it was registered with.
-    fn leg(
+    fn worker_of(
         worker_type: WorkerType,
         runtime: RuntimeType,
         kv_connector: Option<&str>,
@@ -237,10 +237,10 @@ mod tests {
         builder.build()
     }
 
-    /// The port a leg was registered with is the one probed, whatever the
-    /// leg: the operator said so.
+    /// The port a worker was registered with is the one probed, whatever the
+    /// worker: the operator said so.
     #[test]
-    fn a_registered_bootstrap_port_is_the_one_probed_whatever_the_leg() {
+    fn a_registered_bootstrap_port_is_the_one_probed_whatever_the_worker() {
         for (worker_type, runtime, connector) in [
             (WorkerType::Prefill, RuntimeType::Sglang, None),
             (
@@ -252,7 +252,7 @@ mod tests {
             (WorkerType::Decode, RuntimeType::TokenSpeed, None),
             (WorkerType::Regular, RuntimeType::Vllm, None),
         ] {
-            let worker = leg(worker_type, runtime, connector, Some(9090));
+            let worker = worker_of(worker_type, runtime, connector, Some(9090));
             assert_eq!(
                 effective_bootstrap_port(&worker),
                 Some((9090, BootstrapPortSource::Registered)),
@@ -261,12 +261,12 @@ mod tests {
         }
     }
 
-    /// A leg registered without a port whose partners are handed the default
-    /// on the request path is probed on that default: a prefill leg of a
-    /// runtime whose rendezvous travels in the request, a vLLM prefill leg on
-    /// the Mooncake connector, an encode leg.
+    /// A worker registered without a port whose partners are handed the default
+    /// on the request path is probed on that default: a prefill worker of a
+    /// runtime whose rendezvous travels in the request, a vLLM prefill worker on
+    /// the Mooncake connector, an encode worker.
     #[test]
-    fn a_leg_without_a_bootstrap_port_is_probed_on_the_default_its_partners_are_handed() {
+    fn a_worker_without_a_bootstrap_port_is_probed_on_the_default_its_partners_are_handed() {
         for (worker_type, runtime, connector) in [
             (WorkerType::Prefill, RuntimeType::Sglang, None),
             (WorkerType::Prefill, RuntimeType::TokenSpeed, None),
@@ -280,7 +280,7 @@ mod tests {
             (WorkerType::Encode, RuntimeType::Sglang, None),
             (WorkerType::Encode, RuntimeType::Vllm, None),
         ] {
-            let worker = leg(worker_type, runtime, connector, None);
+            let worker = worker_of(worker_type, runtime, connector, None);
             assert_eq!(
                 effective_bootstrap_port(&worker),
                 Some((DEFAULT_BOOTSTRAP_PORT, BootstrapPortSource::Default)),
@@ -289,11 +289,11 @@ mod tests {
         }
     }
 
-    /// A leg no partner is handed a bootstrap port for is not probed: a
-    /// decode or regular worker, and a vLLM prefill leg whose connector
+    /// A worker no partner is handed a bootstrap port for is not probed: a
+    /// decode or regular worker, and a vLLM prefill worker whose connector
     /// carries its own side channel.
     #[test]
-    fn a_leg_no_partner_is_handed_a_bootstrap_port_for_is_not_probed() {
+    fn a_worker_no_partner_is_handed_a_bootstrap_port_for_is_not_probed() {
         for (worker_type, runtime, connector) in [
             (WorkerType::Decode, RuntimeType::Sglang, None),
             (
@@ -319,7 +319,7 @@ mod tests {
                 Some("LMCacheConnector"),
             ),
         ] {
-            let worker = leg(worker_type, runtime, connector, None);
+            let worker = worker_of(worker_type, runtime, connector, None);
             assert_eq!(
                 effective_bootstrap_port(&worker),
                 None,
@@ -328,19 +328,19 @@ mod tests {
         }
     }
 
-    /// A prefill leg whose connector writes to a shared store hands no
+    /// A prefill worker whose connector writes to a shared store hands no
     /// partner a port, whatever port it was registered with: its decode
     /// partners read the blocks back from the store. The rendezvous variant
     /// of the same family keeps its probe.
     #[test]
-    fn a_store_prefill_leg_is_not_probed_whatever_port_it_was_registered_with() {
+    fn a_store_prefill_worker_is_not_probed_whatever_port_it_was_registered_with() {
         for connector in [
             "MooncakeStoreConnector",
             "SharedStorageConnector",
             "FlexKVConnectorV1",
         ] {
             for port in [Some(8998), Some(9090), None] {
-                let worker = leg(
+                let worker = worker_of(
                     WorkerType::Prefill,
                     RuntimeType::Vllm,
                     Some(connector),
@@ -353,7 +353,7 @@ mod tests {
                 );
             }
         }
-        let rendezvous = leg(
+        let rendezvous = worker_of(
             WorkerType::Prefill,
             RuntimeType::Vllm,
             Some(MOONCAKE_CONNECTOR),
@@ -365,9 +365,9 @@ mod tests {
         );
     }
 
-    /// For a vLLM prefill leg the probe's decision is the request path's: the
-    /// default is probed exactly when the connector mode minted for the leg
-    /// hands the decode leg a bootstrap address on that port.
+    /// For a vLLM prefill worker the probe's decision is the request path's: the
+    /// default is probed exactly when the connector mode minted for the worker
+    /// hands the decode worker a bootstrap address on that port.
     #[test]
     fn the_default_port_decision_follows_the_connector_mode_the_request_path_mints() {
         for connector in [
@@ -377,7 +377,7 @@ mod tests {
             Some("MoRIIOConnector"),
             Some("LMCacheConnector"),
         ] {
-            let worker = leg(WorkerType::Prefill, RuntimeType::Vllm, connector, None);
+            let worker = worker_of(WorkerType::Prefill, RuntimeType::Vllm, connector, None);
             let minted = matches!(
                 kv_connector_mode(connector, worker.bootstrap_host(), None, None),
                 KvConnectorMode::Mooncake { port, .. } if port == u32::from(DEFAULT_BOOTSTRAP_PORT)

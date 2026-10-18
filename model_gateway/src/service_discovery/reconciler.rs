@@ -948,15 +948,15 @@ mod tests {
         .await;
     }
 
-    /// A prefill leg discovered without a bootstrap annotation carries no
+    /// A prefill worker discovered without a bootstrap annotation carries no
     /// bootstrap port into its spec and is handed the default port on the
-    /// request path (here a vLLM leg on the Mooncake connector, as the
+    /// request path (here a vLLM worker on the Mooncake connector, as the
     /// provider reports it). Registered, it is probed on that default port:
     /// with nothing listening there, the failed probe is counted like a
     /// registered port's.
     #[tokio::test]
-    async fn a_discovered_prefill_leg_without_a_bootstrap_annotation_is_probed_on_the_default_port()
-    {
+    async fn a_discovered_prefill_worker_without_a_bootstrap_annotation_is_probed_on_the_default_port(
+    ) {
         use std::{
             net::{SocketAddr, TcpStream},
             sync::Arc,
@@ -991,7 +991,7 @@ mod tests {
         };
         let mut spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &app_context);
         assert_eq!(spec.bootstrap_port, None, "no annotation, no port");
-        // The runtime the leg's engine reports when the registration detects it.
+        // The runtime the worker's engine reports when the registration detects it.
         spec.runtime_type = RuntimeType::Vllm;
 
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();

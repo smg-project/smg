@@ -831,15 +831,15 @@ fn normalize_url(url: &str, connection_mode: ConnectionMode) -> String {
     }
 }
 
-/// Reject a disaggregated leg the ZMQ path cannot serve.
+/// Reject a disaggregated worker the ZMQ path cannot serve.
 ///
 /// The ZMQ wire carries no KV-transfer rendezvous: neither the vLLM
 /// `EngineCoreRequest` nor the TokenSpeed `TokenizedGenerateReqInput` has a
-/// field for the bootstrap info PD injects, so a ZMQ prefill/decode leg would
+/// field for the bootstrap info PD injects, so a ZMQ prefill/decode worker would
 /// silently drop it and degrade to a decode-side recompute or a stalled KV
 /// wait. Encode fares no better: encode dispatch is a gRPC encoder RPC a
 /// direct-ZMQ worker has no path for. `Regular` is therefore the only role the
-/// ZMQ lane serves, and every disaggregated leg is rejected at registration —
+/// ZMQ lane serves, and every disaggregated worker is rejected at registration —
 /// matching the gRPC-only PD/EPD selection folds, which would otherwise leave
 /// such a worker registered but never selected.
 fn validate_zmq_worker_type(
@@ -1228,13 +1228,13 @@ mod tests {
         listener.local_addr().expect("address").port()
     }
 
-    /// A registration context for a disaggregated leg at a loopback URL.
-    fn leg_context(
+    /// A registration context for a disaggregated worker at a loopback URL.
+    fn worker_context(
         worker_type: WorkerType,
         bootstrap_port: Option<u16>,
         registration_mode: WorkerRegistrationMode,
     ) -> WorkflowContext<WorkerWorkflowData> {
-        leg_context_on(
+        worker_context_on(
             worker_type,
             bootstrap_port,
             registration_mode,
@@ -1243,9 +1243,9 @@ mod tests {
         )
     }
 
-    /// A registration context for a disaggregated leg of `runtime` on
+    /// A registration context for a disaggregated worker of `runtime` on
     /// `kv_connector`, at a loopback URL.
-    fn leg_context_on(
+    fn worker_context_on(
         worker_type: WorkerType,
         bootstrap_port: Option<u16>,
         registration_mode: WorkerRegistrationMode,
@@ -1292,12 +1292,12 @@ mod tests {
         }
     }
 
-    /// This step builds a prefill leg with the bootstrap port and host its
-    /// spec carries and probes nothing: the port is probed once the leg is
+    /// This step builds a prefill worker with the bootstrap port and host its
+    /// spec carries and probes nothing: the port is probed once the worker is
     /// registered (the register step), so a workflow that fails between the
-    /// two is not reported as a registered leg with a dead port.
+    /// two is not reported as a registered worker with a dead port.
     #[tokio::test]
-    async fn a_prefill_legs_bootstrap_port_is_probed_once_the_leg_is_registered() {
+    async fn a_prefill_workers_bootstrap_port_is_probed_once_the_worker_is_registered() {
         use crate::workflow::steps::RegisterWorkersStep;
 
         let closed_port = closed_loopback_port();
@@ -1305,7 +1305,7 @@ mod tests {
         let handle = recorder.handle();
         let _guard = metrics::set_default_local_recorder(&recorder);
 
-        let mut ctx = leg_context(
+        let mut ctx = worker_context(
             WorkerType::Prefill,
             Some(closed_port),
             WorkerRegistrationMode::Upsert,
@@ -1338,12 +1338,13 @@ mod tests {
         );
     }
 
-    /// A leg whose registration the register step refuses never joined the
+    /// A worker whose registration the register step refuses never joined the
     /// registry, so its port is not probed and no probe failure is counted
-    /// for it; a decode leg without a bootstrap port is not probed either,
+    /// for it; a decode worker without a bootstrap port is not probed either,
     /// since no partner is handed a port for it.
     #[tokio::test]
-    async fn a_leg_the_registry_refuses_or_a_decode_leg_without_a_bootstrap_port_is_not_probed() {
+    async fn a_worker_the_registry_refuses_or_a_decode_worker_without_a_bootstrap_port_is_not_probed(
+    ) {
         use crate::workflow::steps::RegisterWorkersStep;
 
         let closed_port = closed_loopback_port();
@@ -1356,14 +1357,14 @@ mod tests {
             worker_id: "worker-gone".to_string(),
             expected_revision: 0,
         };
-        let mut ctx = leg_context(WorkerType::Prefill, Some(closed_port), refused);
+        let mut ctx = worker_context(WorkerType::Prefill, Some(closed_port), refused);
         assert_eq!(
             CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
             StepResult::Success
         );
         assert!(RegisterWorkersStep.execute(&mut ctx).await.is_err());
 
-        let mut ctx = leg_context(WorkerType::Decode, None, WorkerRegistrationMode::Upsert);
+        let mut ctx = worker_context(WorkerType::Decode, None, WorkerRegistrationMode::Upsert);
         assert_eq!(
             CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
             StepResult::Success
@@ -1382,7 +1383,7 @@ mod tests {
     }
 
     /// Whether something on this host answers on the default bootstrap port:
-    /// the tests of a leg registered without a port cannot tell a probe that
+    /// the tests of a worker registered without a port cannot tell a probe that
     /// found a listener there from one that never ran, so they stand down.
     fn something_listens_on_the_default_bootstrap_port() -> bool {
         use std::net::{SocketAddr, TcpStream};
@@ -1391,13 +1392,13 @@ mod tests {
         TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_ok()
     }
 
-    /// A prefill leg registered without a bootstrap port (a `POST /workers`
+    /// A prefill worker registered without a bootstrap port (a `POST /workers`
     /// without the field, a discovered pod without the annotation) is handed
     /// the default port on the request path, so the default port is what is
     /// probed for it: with nothing listening there, the failed probe is
-    /// counted once the leg is registered, like a registered port's.
+    /// counted once the worker is registered, like a registered port's.
     #[tokio::test]
-    async fn a_prefill_leg_registered_without_a_bootstrap_port_is_probed_on_the_default_port() {
+    async fn a_prefill_worker_registered_without_a_bootstrap_port_is_probed_on_the_default_port() {
         use crate::workflow::steps::RegisterWorkersStep;
 
         if something_listens_on_the_default_bootstrap_port() {
@@ -1407,7 +1408,7 @@ mod tests {
         let handle = recorder.handle();
         let _guard = metrics::set_default_local_recorder(&recorder);
 
-        let mut ctx = leg_context(WorkerType::Prefill, None, WorkerRegistrationMode::Upsert);
+        let mut ctx = worker_context(WorkerType::Prefill, None, WorkerRegistrationMode::Upsert);
         assert_eq!(
             CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
             StepResult::Success
@@ -1431,11 +1432,11 @@ mod tests {
         );
     }
 
-    /// A prefill leg on a KV store registered with the bootstrap port the
+    /// A prefill worker on a KV store registered with the bootstrap port the
     /// rendezvous recipe carries: no partner is ever handed it, so nothing is
-    /// probed and no probe failure is counted once the leg is registered.
+    /// probed and no probe failure is counted once the worker is registered.
     #[tokio::test]
-    async fn a_store_prefill_legs_registered_bootstrap_port_is_not_probed() {
+    async fn a_store_prefill_workers_registered_bootstrap_port_is_not_probed() {
         use crate::workflow::steps::RegisterWorkersStep;
 
         let closed_port = closed_loopback_port();
@@ -1443,7 +1444,7 @@ mod tests {
         let handle = recorder.handle();
         let _guard = metrics::set_default_local_recorder(&recorder);
 
-        let mut ctx = leg_context_on(
+        let mut ctx = worker_context_on(
             WorkerType::Prefill,
             Some(closed_port),
             WorkerRegistrationMode::Upsert,
@@ -1829,7 +1830,7 @@ mod tests {
     }
 
     #[test]
-    fn zmq_disaggregated_legs_are_rejected_as_a_create_worker_failure() {
+    fn zmq_disaggregated_workers_are_rejected_as_a_create_worker_failure() {
         for worker_type in [WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode] {
             let err = validate_zmq_worker_type(
                 ConnectionMode::Zmq,

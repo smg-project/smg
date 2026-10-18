@@ -3430,7 +3430,7 @@ impl ProtoStream {
     /// rate (the side's first response is the end of its prefill, on either
     /// dispatch shape), and every response is progress for the worker. The
     /// side joins no pile: the gateway bounds its silence per request (see
-    /// [`crate::worker::liveness::prefill_leg_bound`]) instead of judging the
+    /// [`crate::worker::liveness::prefill_side_bound`]) instead of judging the
     /// worker by sides it cannot see progress on.
     #[must_use]
     pub fn tracked_prefill_side(self, worker: Arc<dyn Worker>, prompt_tokens: u64) -> Self {

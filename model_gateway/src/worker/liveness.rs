@@ -53,7 +53,7 @@
 //!   this gateway has no silent pile of its own. The requests counted are the
 //!   tracked ones, streaming generations to the worker over gRPC, whose
 //!   responses the gateway sees one by one ([`Worker::tracked_load`]): an
-//!   HTTP worker, a PD leg or a non-streaming generation gives no signal
+//!   HTTP worker, a PD side or a non-streaming generation gives no signal
 //!   between dispatch and completion, so it never forms a pile and is never
 //!   judged by one; a non-streaming generation's one answer is progress all
 //!   the same, and its prompt counts in the prefill backlog (but times no
@@ -76,14 +76,14 @@
 //!   once per new longest prompt; a worker that has answered nothing is
 //!   judged as before. A zero threshold
 //!   turns the rule off. The same bound, read per request, caps how long a
-//!   disaggregated prefill leg may stay silent ([`prefill_leg_bound`]): a
-//!   leg is not part of any pile, so its request is what fails, over to
-//!   another prefill worker when one is available. A leg past its bound is
+//!   disaggregated prefill side may stay silent ([`prefill_side_bound`]): a
+//!   side is not part of any pile, so its request is what fails, over to
+//!   another prefill worker when one is available. A side past its bound is
 //!   given up on only while its worker has answered nothing within the
-//!   bound ([`prefill_leg_reprieve`]): a worker that keeps answering other
-//!   legs is backed up (on the parallel dispatch shape a leg's first
-//!   response also waits for the decode side), not frozen, and its leg
-//!   waits on; a leg in flight when the longest prompt yet lands behind
+//!   bound ([`prefill_side_reprieve`]): a worker that keeps answering other
+//!   sides is backed up (on the parallel dispatch shape a side's first
+//!   response also waits for the decode side), not frozen, and its side
+//!   waits on; a side in flight when the longest prompt yet lands behind
 //!   it is given what is left of the cold-shape grace since its dispatch.
 //!
 //! - **stale records** (an unreachable veto by another rule): a worker whose
@@ -174,22 +174,22 @@ fn bound_over(wedge: Duration, eta: Duration) -> Duration {
     wedge.max(eta).min(wedge.max(WEDGE_BOUND_CAP))
 }
 
-/// How long a disaggregated prefill leg of `prompt_tokens` dispatched to
+/// How long a disaggregated prefill side of `prompt_tokens` dispatched to
 /// `worker` now may produce nothing before its request gives up on it: the
-/// wedge rule's bound, with the leg's own prompt behind what the worker is
+/// wedge rule's bound, with the side's own prompt behind what the worker is
 /// already prefilling ([`Worker::prefill_eta`]), so a long prompt on a busy
 /// worker gets the time its measured rate says it needs, a short one the
 /// configured threshold, a prompt longer than any the worker has answered
-/// the cold-shape grace, and nothing more than the cap. A PD leg joins no
+/// the cold-shape grace, and nothing more than the cap. A PD side joins no
 /// pile and is never vetoed by one; the request is what the bound ends.
 /// `None` when the rule is off (a zero threshold).
-pub(crate) fn prefill_leg_bound(worker: &Arc<dyn Worker>, prompt_tokens: u64) -> Option<Duration> {
+pub(crate) fn prefill_side_bound(worker: &Arc<dyn Worker>, prompt_tokens: u64) -> Option<Duration> {
     let (_, wedge, _) = thresholds();
-    prefill_leg_bound_with(worker, prompt_tokens, wedge)
+    prefill_side_bound_with(worker, prompt_tokens, wedge)
 }
 
-/// [`prefill_leg_bound`] at the given wedge threshold.
-fn prefill_leg_bound_with(
+/// [`prefill_side_bound`] at the given wedge threshold.
+fn prefill_side_bound_with(
     worker: &Arc<dyn Worker>,
     prompt_tokens: u64,
     wedge: Duration,
@@ -200,43 +200,46 @@ fn prefill_leg_bound_with(
     })
 }
 
-/// How long a sequential disaggregated decode leg of `prompt_tokens`
+/// How long a sequential disaggregated decode side of `prompt_tokens`
 /// dispatched now may produce nothing before its request gives up on it:
-/// the prefill leg's bound for the same prompt on `prefills`, the worker
-/// whose prefill of the prompt stands before the leg's first token
-/// ([`prefill_leg_bound`]): the prefill worker when the leg was handed its
+/// the prefill side's bound for the same prompt on `prefills`, the worker
+/// whose prefill of the prompt stands before the side's first token
+/// ([`prefill_side_bound`]): the prefill worker when the side was handed its
 /// KV (the handoff moves what that prefill produced), the decode worker when
 /// it recomputes the prompt itself (no handoff: a fan-out, or a prefill that
 /// returned no transfer parameters). The configured threshold for a short
 /// prompt, the time the worker's measured prefill rate says a long prompt
-/// takes, and nothing more than the cap. The leg was admitted to a room on
+/// takes, and nothing more than the cap. The side was admitted to a room on
 /// its decode worker before its dispatch. `None` when the rule is off (a
 /// zero threshold).
-pub(crate) fn decode_leg_bound(prefills: &Arc<dyn Worker>, prompt_tokens: u64) -> Option<Duration> {
-    prefill_leg_bound(prefills, prompt_tokens)
+pub(crate) fn decode_side_bound(
+    prefills: &Arc<dyn Worker>,
+    prompt_tokens: u64,
+) -> Option<Duration> {
+    prefill_side_bound(prefills, prompt_tokens)
 }
 
-/// Whether a prefill leg past its own bound waits on, and how much longer.
-/// A leg is given up on only when its worker is silent as a whole, with no
+/// Whether a prefill side past its own bound waits on, and how much longer.
+/// A side is given up on only when its worker is silent as a whole, with no
 /// first response on any prompt within the bound, as the pile rule judges
 /// a worker by its pile and not by one request. A worker that answered
-/// another leg a moment ago is backed up, not frozen (on the parallel
-/// dispatch shape a leg's first response also waits for the decode side to
-/// admit it), so the leg waits until a bound has passed since that answer.
-/// The bound was read at the leg's dispatch, `dispatched_ago` back: a
+/// another side a moment ago is backed up, not frozen (on the parallel
+/// dispatch shape a side's first response also waits for the decode side to
+/// admit it), so the side waits until a bound has passed since that answer.
+/// The bound was read at the side's dispatch, `dispatched_ago` back: a
 /// prompt longer than any the worker has answered that landed behind the
-/// leg since blocks the engine for the leg too while it builds, so while
-/// the worker is on that shape the leg is given what is left of the
-/// cold-shape grace since its dispatch, as a leg dispatched now would be
-/// ([`prefill_leg_bound`]), a bound at a time so the shape's first token
+/// side since blocks the engine for the side too while it builds, so while
+/// the worker is on that shape the side is given what is left of the
+/// cold-shape grace since its dispatch, as a side dispatched now would be
+/// ([`prefill_side_bound`]), a bound at a time so the shape's first token
 /// returns it to the rule above. `None` when the worker has answered
 /// nothing within the bound, or ever, and no grace is left: the verdict.
-pub(crate) fn prefill_leg_reprieve(
+pub(crate) fn prefill_side_reprieve(
     worker: &Arc<dyn Worker>,
     bound: Duration,
     dispatched_ago: Duration,
 ) -> Option<Duration> {
-    leg_reprieve(
+    side_reprieve(
         cold_shape_grace(worker, 0),
         worker.prefill_answered_ago(),
         bound,
@@ -244,11 +247,11 @@ pub(crate) fn prefill_leg_reprieve(
     )
 }
 
-/// [`prefill_leg_reprieve`] for a worker under a cold-shape `grace` (zero:
+/// [`prefill_side_reprieve`] for a worker under a cold-shape `grace` (zero:
 /// on no such shape) whose latest first response was `answered_ago`
-/// (`None`: never). A grace the leg's own bound already covers (a longer
+/// (`None`: never). A grace the side's own bound already covers (a longer
 /// configured threshold) adds nothing.
-fn leg_reprieve(
+fn side_reprieve(
     grace: Duration,
     answered_ago: Option<Duration>,
     bound: Duration,
@@ -265,7 +268,7 @@ fn leg_reprieve(
     reprieve(answered_ago, bound)
 }
 
-/// [`prefill_leg_reprieve`] for a worker whose latest first response was
+/// [`prefill_side_reprieve`] for a worker whose latest first response was
 /// `answered_ago` (`None`: never).
 fn reprieve(answered_ago: Option<Duration>, bound: Duration) -> Option<Duration> {
     bound
@@ -1094,60 +1097,60 @@ mod tests {
     }
 
     #[test]
-    fn a_prefill_legs_bound_follows_its_prompt_the_workers_rate_and_the_cap() {
-        // A disaggregated prefill leg is bounded like the pile rule bounds a
+    fn a_prefill_sides_bound_follows_its_prompt_the_workers_rate_and_the_cap() {
+        // A disaggregated prefill side is bounded like the pile rule bounds a
         // worker: the threshold for a short prompt on an idle worker, the
         // prefill time its prompt needs behind what is already pending at
         // the worker's rate (the cold prior of 10k tokens/s until one is
         // measured), never more than the cap.
         let w = worker();
         assert_eq!(
-            prefill_leg_bound_with(&w, 256, DEFAULT_WEDGE),
+            prefill_side_bound_with(&w, 256, DEFAULT_WEDGE),
             Some(DEFAULT_WEDGE),
             "26 ms of prefill is inside the threshold"
         );
         assert_eq!(
-            prefill_leg_bound_with(&w, 32_768, DEFAULT_WEDGE),
+            prefill_side_bound_with(&w, 32_768, DEFAULT_WEDGE),
             Some(Duration::from_millis(3_276)),
             "a 32k prompt on a cold worker"
         );
         w.note_prefill_started(8 * 32_768, true);
         assert_eq!(
-            prefill_leg_bound_with(&w, 32_768, DEFAULT_WEDGE),
+            prefill_side_bound_with(&w, 32_768, DEFAULT_WEDGE),
             Some(Duration::from_millis(29_491)),
             "behind eight pending 32k prompts"
         );
         w.note_prefill_ended(8 * 32_768, true, Some(0));
         assert_eq!(
-            prefill_leg_bound_with(&w, 100_000_000, DEFAULT_WEDGE),
+            prefill_side_bound_with(&w, 100_000_000, DEFAULT_WEDGE),
             Some(WEDGE_BOUND_CAP),
             "capped"
         );
         assert_eq!(
-            prefill_leg_bound_with(&w, 100_000_000, Duration::from_secs(600)),
+            prefill_side_bound_with(&w, 100_000_000, Duration::from_secs(600)),
             Some(Duration::from_secs(600)),
             "a longer configured threshold stands"
         );
         assert_eq!(
-            prefill_leg_bound_with(&w, 32_768, Duration::ZERO),
+            prefill_side_bound_with(&w, 32_768, Duration::ZERO),
             None,
             "a zero threshold turns the bound off"
         );
     }
 
     #[test]
-    fn a_prefill_leg_past_its_bound_waits_on_while_its_worker_answers_other_legs() {
-        // The verdict is on the worker, not the leg: a worker that has
-        // answered nothing (ever, or within the bound) is silent and the leg
-        // is given up on; one that answered another leg a moment ago is
-        // backed up, and the leg waits until a bound has passed since that
+    fn a_prefill_side_past_its_bound_waits_on_while_its_worker_answers_other_sides() {
+        // The verdict is on the worker, not the side: a worker that has
+        // answered nothing (ever, or within the bound) is silent and the side
+        // is given up on; one that answered another side a moment ago is
+        // backed up, and the side waits until a bound has passed since that
         // answer.
         let bound = DEFAULT_WEDGE;
         assert_eq!(reprieve(None, bound), None, "never answered: silent");
         assert_eq!(
             reprieve(Some(Duration::from_millis(600)), bound),
             Some(Duration::from_millis(2_400)),
-            "answered 0.6 s ago: the leg waits the rest of a bound"
+            "answered 0.6 s ago: the side waits the rest of a bound"
         );
         assert_eq!(
             reprieve(Some(bound), bound),
@@ -1157,26 +1160,26 @@ mod tests {
         assert_eq!(reprieve(Some(Duration::from_secs(10)), bound), None);
         let w = worker();
         assert_eq!(
-            prefill_leg_reprieve(&w, bound, Duration::ZERO),
+            prefill_side_reprieve(&w, bound, Duration::ZERO),
             None,
             "a fresh worker has answered nothing"
         );
         w.note_prefill_started(256, true);
         w.note_prefill_ended(256, true, Some(0));
         assert!(
-            prefill_leg_reprieve(&w, bound, Duration::ZERO)
+            prefill_side_reprieve(&w, bound, Duration::ZERO)
                 .is_some_and(|left| left > Duration::from_secs(2)),
             "answered just now: a bound's reprieve, less the moment since"
         );
     }
 
-    /// A leg's bound is read at its dispatch; the longest prompt yet
-    /// landing behind it blocks the engine for the leg too while it builds,
-    /// so the leg in flight is given what is left of the grace since its
+    /// A side's bound is read at its dispatch; the longest prompt yet
+    /// landing behind it blocks the engine for the side too while it builds,
+    /// so the side in flight is given what is left of the grace since its
     /// dispatch, a bound at a time, and the verdict as before once the
     /// shape is shown or the grace has passed.
     #[test]
-    fn a_prefill_leg_in_flight_before_a_longer_prompt_waits_through_the_build() {
+    fn a_prefill_side_in_flight_before_a_longer_prompt_waits_through_the_build() {
         let bound = DEFAULT_WEDGE;
         let silent = Some(Duration::from_secs(10));
         assert_eq!(
@@ -1185,12 +1188,12 @@ mod tests {
             "silent for a bound: the verdict"
         );
         assert_eq!(
-            leg_reprieve(COLD_SHAPE_GRACE, silent, bound, Duration::from_secs(10)),
+            side_reprieve(COLD_SHAPE_GRACE, silent, bound, Duration::from_secs(10)),
             Some(bound),
             "on a cold shape: the grace since the dispatch, a bound at a time"
         );
         assert_eq!(
-            leg_reprieve(
+            side_reprieve(
                 COLD_SHAPE_GRACE,
                 silent,
                 bound,
@@ -1200,22 +1203,22 @@ mod tests {
             "what is left of it"
         );
         assert_eq!(
-            leg_reprieve(COLD_SHAPE_GRACE, silent, bound, COLD_SHAPE_GRACE),
+            side_reprieve(COLD_SHAPE_GRACE, silent, bound, COLD_SHAPE_GRACE),
             None,
             "the grace has passed: the verdict"
         );
         assert_eq!(
-            leg_reprieve(Duration::ZERO, silent, bound, Duration::from_secs(10)),
+            side_reprieve(Duration::ZERO, silent, bound, Duration::from_secs(10)),
             None,
             "on no cold shape: the rule above"
         );
         let long = Duration::from_secs(600);
         assert_eq!(
-            leg_reprieve(COLD_SHAPE_GRACE, silent, long, Duration::from_secs(10)),
+            side_reprieve(COLD_SHAPE_GRACE, silent, long, Duration::from_secs(10)),
             reprieve(silent, long),
             "a longer configured threshold already covers the grace: the rule above alone"
         );
-        // The worker: a short leg dispatched, then the longest prompt yet
+        // The worker: a short side dispatched, then the longest prompt yet
         // behind it.
         let w = worker();
         w.note_prefill_started(1_024, true);
@@ -1226,15 +1229,16 @@ mod tests {
         assert!(w.prefill_cold_shape(0));
         let late = COLD_SHAPE_GRACE - Duration::from_secs(1);
         assert_eq!(
-            prefill_leg_reprieve(&w, bound, late),
+            prefill_side_reprieve(&w, bound, late),
             Some(Duration::from_secs(1)),
-            "the short leg, dispatched before the longer prompt, waits out the grace"
+            "the short side, dispatched before the longer prompt, waits out the grace"
         );
-        // The shape shown: the leg is judged by the worker's answers again.
+        // The shape shown: the side is judged by the worker's answers again.
         w.note_prefill_ended(8_192, true, Some(0));
         assert!(!w.prefill_cold_shape(0));
         assert!(
-            prefill_leg_reprieve(&w, bound, late).is_some_and(|left| left > Duration::from_secs(2)),
+            prefill_side_reprieve(&w, bound, late)
+                .is_some_and(|left| left > Duration::from_secs(2)),
             "answered just now: a bound's reprieve"
         );
     }
@@ -1361,7 +1365,7 @@ mod tests {
         // flight for longer than the wedge bound, no token signal because
         // HTTP responses are not tracked, and before the fix the sweep vetoed
         // it as wedged 3 s into its busy run with nothing to clear it. The
-        // same for a PD leg and a non-streaming gRPC generation.
+        // same for a PD side and a non-streaming gRPC generation.
         let w = worker();
         for _ in 0..4 {
             w.increment_load();
@@ -2013,14 +2017,14 @@ mod tests {
         assert!(w.prefill_cold_shape(0));
         assert_eq!(wedge_bound(&w, DEFAULT_WEDGE), COLD_SHAPE_GRACE);
         assert_eq!(
-            prefill_leg_bound_with(&w, 8_192, DEFAULT_WEDGE),
+            prefill_side_bound_with(&w, 8_192, DEFAULT_WEDGE),
             Some(COLD_SHAPE_GRACE),
-            "a prefill leg of the new shape"
+            "a prefill side of the new shape"
         );
         assert_eq!(
-            prefill_leg_bound_with(&w, 512, DEFAULT_WEDGE),
+            prefill_side_bound_with(&w, 512, DEFAULT_WEDGE),
             Some(COLD_SHAPE_GRACE),
-            "any leg while the worker is on the new shape"
+            "any side while the worker is on the new shape"
         );
         for secs in [3, 60, 119] {
             on_load_report_with(
@@ -2099,7 +2103,7 @@ mod tests {
         assert!(!w.prefill_cold_shape(0));
         assert_eq!(wedge_bound(&w, DEFAULT_WEDGE), DEFAULT_WEDGE);
         assert_eq!(
-            prefill_leg_bound_with(&w, 8_192, DEFAULT_WEDGE),
+            prefill_side_bound_with(&w, 8_192, DEFAULT_WEDGE),
             Some(DEFAULT_WEDGE)
         );
         on_load_report_with(&w, 0, Some(DEFAULT_WEDGE), true, None, DEFAULT_WEDGE);

@@ -162,11 +162,11 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
             worker_ids.push(worker_id);
         }
 
-        // The rendezvous port a disaggregated leg advertises is probed once
-        // the leg is in the registry (DP ranks share the port), off the
+        // The rendezvous port a disaggregated worker advertises is probed once
+        // the worker is in the registry (DP ranks share the port), off the
         // registration path: a registration refused above, or a workflow
         // that failed before this step, is never reported as a registered
-        // leg with a dead port.
+        // worker with a dead port.
         if let Some(worker) = workers.first() {
             bootstrap_probe::spawn_bootstrap_port_probe(worker.as_ref());
         }
