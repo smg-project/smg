@@ -977,10 +977,13 @@ mod tests {
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
-        // Verify boundaries adjusted to: [0, 20], [21, 26], [27, MAX]
+        // Verify boundaries adjusted to: [0, 20], [21, 24], [25, MAX]: a share
+        // of 33; the second worker stops at 24 because the one class left, 26,
+        // is the third worker's (an open end no seen size reaches is never
+        // written while a class remains).
         {
             let boundaries = boundaries(&policy, &prefill_workers);
-            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 26));
+            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 24));
         }
 
         // ===Phase S2: Second set of  requests to trigger boundary adjustment ===
@@ -1041,10 +1044,11 @@ mod tests {
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
-        // Verify boundaries adjusted to: [0, 40], [41, 57], [58, MAX]
+        // Verify boundaries adjusted to: [0, 40], [41, 45], [46, MAX]: a share
+        // of 67; the second worker stops at 45, 57 being the third worker's.
         {
             let boundaries = boundaries(&policy, &prefill_workers);
-            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (40, 57));
+            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (40, 45));
         }
     }
 
@@ -1225,9 +1229,10 @@ mod tests {
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
+        // [0, 20] [21, 24] [25, MAX], as in test_adjust_boundary_1's first phase.
         {
             let boundaries = boundaries(&policy, &prefill_workers);
-            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 26));
+            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 24));
         }
 
         policy
@@ -1286,9 +1291,11 @@ mod tests {
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
+        // The second set moves the per-worker share from 33 to 64, within the
+        // factor of two: the partition stays.
         {
             let boundaries = boundaries(&policy, &prefill_workers);
-            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 26));
+            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 24));
         }
     }
 
