@@ -101,68 +101,70 @@ async fn tools_of<S: rmcp::service::Service<RoleClient>>(
     }
 }
 
-/// What a server lists: its tools as inventory entries (`None` when the tool
-/// listing failed, after one warning), its prompts and its resources (empty,
-/// after a debug line, when their listing failed).
-struct Listed {
-    tools: Option<Vec<ToolEntry>>,
-    prompts: Vec<(String, Prompt)>,
-    resources: Vec<(String, RawResource)>,
-}
-
-/// A server's listing: the three round-trips, logged as before.
-async fn listed<S: rmcp::service::Service<RoleClient>>(
+/// A server's prompts by name: `None`, after a debug line, when the listing
+/// failed (a server without prompts answers so).
+async fn prompts_of<S: rmcp::service::Service<RoleClient>>(
     client: &RunningService<RoleClient, S>,
     server_key: &str,
-    category: ToolCategory,
-) -> Listed {
-    let tools = tools_of(client, server_key, category).await;
-    let prompts = match client.peer().list_all_prompts().await {
+) -> Option<Vec<(String, Prompt)>> {
+    match client.peer().list_all_prompts().await {
         Ok(prompts) => {
             info!("Discovered {} prompts from '{}'", prompts.len(), server_key);
-            prompts
-                .into_iter()
-                .map(|prompt| (prompt.name.clone(), prompt))
-                .collect()
+            Some(
+                prompts
+                    .into_iter()
+                    .map(|prompt| (prompt.name.clone(), prompt))
+                    .collect(),
+            )
         }
         Err(e) => {
             debug!("No prompts from '{}': {}", server_key, e);
-            Vec::new()
+            None
         }
-    };
-    let resources = match client.peer().list_all_resources().await {
+    }
+}
+
+/// A server's resources by uri: `None`, after a debug line, when the listing
+/// failed (a server without resources answers so).
+async fn resources_of<S: rmcp::service::Service<RoleClient>>(
+    client: &RunningService<RoleClient, S>,
+    server_key: &str,
+) -> Option<Vec<(String, RawResource)>> {
+    match client.peer().list_all_resources().await {
         Ok(resources) => {
             info!(
                 "Discovered {} resources from '{}'",
                 resources.len(),
                 server_key
             );
-            resources
-                .into_iter()
-                .map(|resource| (resource.uri.clone(), resource.raw))
-                .collect()
+            Some(
+                resources
+                    .into_iter()
+                    .map(|resource| (resource.uri.clone(), resource.raw))
+                    .collect(),
+            )
         }
         Err(e) => {
             debug!("No resources from '{}': {}", server_key, e);
-            Vec::new()
+            None
         }
-    };
-    Listed {
-        tools,
-        prompts,
-        resources,
     }
 }
 
-/// Puts a listing into the inventory under `server_key`.
-fn install(inventory: &ToolInventory, server_key: &str, listed: Listed) {
-    for entry in listed.tools.unwrap_or_default() {
-        inventory.insert_entry(entry);
-    }
-    for (name, prompt) in listed.prompts {
+/// Puts a server's prompts into the inventory.
+fn install_prompts(inventory: &ToolInventory, server_key: &str, prompts: Vec<(String, Prompt)>) {
+    for (name, prompt) in prompts {
         inventory.insert_prompt(name, server_key.to_string(), prompt);
     }
-    for (uri, resource) in listed.resources {
+}
+
+/// Puts a server's resources into the inventory.
+fn install_resources(
+    inventory: &ToolInventory,
+    server_key: &str,
+    resources: Vec<(String, RawResource)>,
+) {
+    for (uri, resource) in resources {
         inventory.insert_resource(uri, server_key.to_string(), resource);
     }
 }
@@ -740,8 +742,18 @@ impl McpOrchestrator {
 
     /// Load tools, prompts, and resources from a server into the inventory.
     async fn load_server_inventory(&self, server_key: &str, client: &Arc<McpClientWithHandler>) {
-        let listed = listed(client.as_ref(), server_key, ToolCategory::Static).await;
-        install(&self.tool_inventory, server_key, listed);
+        for entry in tools_of(client.as_ref(), server_key, ToolCategory::Static)
+            .await
+            .unwrap_or_default()
+        {
+            self.tool_inventory.insert_entry(entry);
+        }
+        if let Some(prompts) = prompts_of(client.as_ref(), server_key).await {
+            install_prompts(&self.tool_inventory, server_key, prompts);
+        }
+        if let Some(resources) = resources_of(client.as_ref(), server_key).await {
+            install_resources(&self.tool_inventory, server_key, resources);
+        }
     }
 
     /// Spawn background handler for inventory refresh requests.
@@ -773,26 +785,41 @@ impl McpOrchestrator {
                             .get(&request.server_key)
                             .map(|entry| (Arc::clone(&entry.client), entry.config.clone()));
                         if let Some((client, config)) = found {
-                            // The listings first: a failed tool listing keeps
-                            // everything the server had instead of leaving it
-                            // with nothing until its next notification. A
-                            // clear drops the server's tools, prompts,
-                            // resources and aliases, so the rebuild is what a
-                            // connect does: install all three, then the
-                            // config's aliases and argument mappings.
-                            let listed =
-                                listed(client.as_ref(), &request.server_key, ToolCategory::Static)
-                                    .await;
-                            if listed.tools.is_some() {
-                                tool_inventory.clear_server_tools(&request.server_key);
-                                install(&tool_inventory, &request.server_key, listed);
-                                apply_tool_configs(&tool_inventory, &config);
-                                info!(
-                                    "Refreshed '{}'; the inventory now holds {} tools",
-                                    request.server_key,
-                                    tool_inventory.counts().0
-                                );
+                            // The tool listing first: when it fails nothing
+                            // changes and the other two listings are not
+                            // made. Each kind is cleared only when its own
+                            // listing succeeded, so a prompt or resource
+                            // listing that fails keeps what the server had.
+                            // The tool clear drops the aliases that targeted
+                            // the server, so the rebuild is what a connect
+                            // does: the tools, then the config's aliases and
+                            // argument mappings.
+                            let key = request.server_key.as_str();
+                            let Some(tools) =
+                                tools_of(client.as_ref(), key, ToolCategory::Static).await
+                            else {
+                                continue;
+                            };
+                            let prompts = prompts_of(client.as_ref(), key).await;
+                            let resources = resources_of(client.as_ref(), key).await;
+                            tool_inventory.clear_server_tool_entries(key);
+                            for entry in tools {
+                                tool_inventory.insert_entry(entry);
                             }
+                            if let Some(prompts) = prompts {
+                                tool_inventory.clear_server_prompts(key);
+                                install_prompts(&tool_inventory, key, prompts);
+                            }
+                            if let Some(resources) = resources {
+                                tool_inventory.clear_server_resources(key);
+                                install_resources(&tool_inventory, key, resources);
+                            }
+                            apply_tool_configs(&tool_inventory, &config);
+                            info!(
+                                "Refreshed '{}'; the inventory now holds {} tools",
+                                key,
+                                tool_inventory.counts().0
+                            );
                         }
                     }
 
