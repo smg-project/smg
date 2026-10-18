@@ -19,7 +19,7 @@ use openai_protocol::{
 };
 use serde_json::{json, Value};
 use smg_mcp::{McpToolSession, ToolExecutionOutput};
-use tracing::warn;
+use tracing::{trace, warn};
 
 use crate::{
     middleware::TenantRequestMeta,
@@ -169,6 +169,49 @@ pub(super) struct ExtractedToolCall {
 pub(super) enum McpToolCallLimit {
     User,
     Safety,
+}
+
+/// One iteration's extracted tool calls, traced and split into the MCP
+/// calls (those the session exposes) and the function calls, the MCP calls
+/// capped to the request's remaining allowance (see
+/// [`apply_mcp_tool_call_limit`], whose verdict comes with them). The traces
+/// log under this module's target; `streaming` tells the two loops' lines
+/// apart.
+pub(super) fn partition_tool_calls(
+    tool_calls: Vec<ExtractedToolCall>,
+    session: &McpToolSession,
+    state: &ToolLoopState,
+    max_tool_calls: Option<usize>,
+    streaming: bool,
+) -> (
+    Vec<ExtractedToolCall>,
+    Vec<ExtractedToolCall>,
+    Option<McpToolCallLimit>,
+) {
+    trace!(
+        streaming,
+        "Tool loop iteration {}: found {} tool call(s)",
+        state.iteration,
+        tool_calls.len()
+    );
+
+    // Separate MCP and function tool calls using session-exposed names.
+    let (mut mcp_tool_calls, function_tool_calls): (Vec<ExtractedToolCall>, Vec<_>) = tool_calls
+        .into_iter()
+        .partition(|tc| session.has_exposed_tool(tc.name.as_str()));
+
+    trace!(
+        streaming,
+        "Separated tool calls: {} MCP, {} function",
+        mcp_tool_calls.len(),
+        function_tool_calls.len()
+    );
+
+    // Only execute calls that fit; preserve their results before ending
+    // the response when this batch exceeds the remaining allowance.
+    let tool_call_limit =
+        apply_mcp_tool_call_limit(&mut mcp_tool_calls, state.total_calls, max_tool_calls);
+    (mcp_tool_calls, function_tool_calls, tool_call_limit)
 }
 
 /// Keep the prefix of MCP calls that fits the remaining request budget.
