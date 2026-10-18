@@ -76,8 +76,6 @@ fn chat(no_stop_trim: bool) -> serde_json::Result<ChatCompletionRequest> {
     }))
 }
 
-/// The three chat builders reachable without a client; the fourth engine's is
-/// pinned in its own module through a client that is built but never dialled.
 #[test]
 fn a_chat_requests_no_stop_trim_reaches_every_engine_client() {
     for asked in [true, false] {
@@ -122,6 +120,19 @@ fn a_chat_requests_no_stop_trim_reaches_every_engine_client() {
             tokenspeed.sampling_params.unwrap().no_stop_trim,
             asked,
             "tokenspeed_scheduler, asked {asked}"
+        );
+        let trtllm = TrtllmServiceClient::build_generate_request_from_chat_parts(
+            "r".into(),
+            &request,
+            "hi".into(),
+            vec![1],
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            trtllm.include_stop_token_in_output, asked,
+            "trtllm_service, asked {asked}"
         );
     }
 }

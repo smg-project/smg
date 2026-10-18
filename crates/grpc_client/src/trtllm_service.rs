@@ -96,6 +96,25 @@ impl TrtllmServiceClient {
         multimodal_input: Option<proto::MultimodalInput>,
         tool_call_constraint: Option<(String, String)>, // (constraint_type, constraint_value)
     ) -> Result<proto::GenerateRequest, String> {
+        Self::build_generate_request_from_chat_parts(
+            request_id,
+            body,
+            processed_text,
+            token_ids,
+            multimodal_input,
+            tool_call_constraint,
+        )
+    }
+
+    /// [`Self::build_generate_request_from_chat`] without a receiver.
+    pub fn build_generate_request_from_chat_parts(
+        request_id: String,
+        body: &ChatCompletionRequest,
+        processed_text: String,
+        token_ids: Vec<u32>,
+        multimodal_input: Option<proto::MultimodalInput>,
+        tool_call_constraint: Option<(String, String)>,
+    ) -> Result<proto::GenerateRequest, String> {
         // Build sampling config
         let sampling_config = Self::build_sampling_config_from_chat(body);
 
@@ -600,12 +619,8 @@ impl TrtllmServiceClient {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use tonic::transport::Endpoint;
-
     use super::*;
-    use crate::{channel::testing::refused_endpoint, NoopTraceInjector};
+    use crate::channel::testing::refused_endpoint;
 
     #[test]
     fn plain_sampling_seed_and_stop_token_ids_reach_the_request() {
@@ -851,35 +866,5 @@ mod tests {
             );
         }
         assert_eq!(TrtllmServiceClient::guide_of(None), None);
-    }
-
-    /// A chat request's `no_stop_trim` reaches the engine's field, through a
-    /// client that is built but never dialled.
-    #[tokio::test]
-    async fn chat_no_stop_trim_reaches_include_stop_token_in_output() {
-        let client = TrtllmServiceClient {
-            client: proto::trtllm_service_client::TrtllmServiceClient::new(
-                Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
-            ),
-            trace_injector: Arc::new(NoopTraceInjector),
-        };
-        for asked in [true, false] {
-            let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
-                "model": "m", "messages": [{"role": "user", "content": "hi"}],
-                "stop": ["\n"], "no_stop_trim": asked
-            }))
-            .unwrap();
-            let request = client
-                .build_generate_request_from_chat(
-                    "r".into(),
-                    &chat,
-                    "hi".into(),
-                    vec![1],
-                    None,
-                    None,
-                )
-                .unwrap();
-            assert_eq!(request.include_stop_token_in_output, asked, "asked {asked}");
-        }
     }
 }
