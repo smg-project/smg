@@ -325,10 +325,11 @@ pub(crate) struct PrecomputedMultimodalIntermediate {
 
 /// Sets the decoder availability gauges (`smg_mm_turbojpeg_available`,
 /// `smg_mm_webp_available`) on the recorder in force and returns what they
-/// read: the one call [`report_jpeg_decoder`] makes once per process, kept
+/// read: the call [`report_jpeg_decoder`] makes every time it runs, kept
 /// apart so a test can run it against a recorder of its own. The gateway
-/// installs its Prometheus recorder before the report (`server.rs`): a gauge
-/// set before that lands in the no-op recorder and never reaches /metrics.
+/// installs its Prometheus recorder before its report (`server.rs`): a gauge
+/// set before that lands in the no-op recorder and never reaches /metrics,
+/// which is why the gauges are set on every report and not once.
 pub(crate) fn record_decoder_availability() -> (bool, bool) {
     use crate::observability::metrics::Metrics;
     let available = llm_multimodal::jpeg_turbo::turbojpeg_available();
@@ -344,8 +345,12 @@ pub(crate) fn record_decoder_availability() -> (bool, bool) {
 /// without libwebp the WebP fallback is correct but several times slower.
 pub(crate) fn report_jpeg_decoder() {
     static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    // The gauges on every call, the log lines once: a caller that builds the
+    // multimodal components before the start-up installs its recorder would
+    // otherwise consume the once block on the no-op recorder, and the
+    // start-up's own call could set neither gauge.
+    let (available, _webp) = record_decoder_availability();
     ONCE.get_or_init(|| {
-        let (available, _webp) = record_decoder_availability();
         if available {
             tracing::info!("JPEG decode uses libjpeg-turbo with PIL's defaults");
         } else {
@@ -400,7 +405,7 @@ mod tests {
 
     use super::{
         encoder_budget::ItemOverEncoderBudget, processing_failed_message,
-        processing_failed_response, record_decoder_availability, Response,
+        processing_failed_response, record_decoder_availability, report_jpeg_decoder, Response,
     };
 
     async fn status_and_error(response: Response) -> (u16, serde_json::Value) {
@@ -590,5 +595,30 @@ mod tests {
         };
         assert!(reads("smg_mm_turbojpeg_available", available), "{rendered}");
         assert!(reads("smg_mm_webp_available", webp), "{rendered}");
+    }
+
+    /// The report sets the gauges on every call, the log lines once: a report
+    /// made before the gateway's recorder exists (a caller building the
+    /// components early) does not leave the start-up's own report with
+    /// nothing to set.
+    #[test]
+    fn a_second_report_still_sets_the_gauges_on_the_recorder_in_force() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        // The first report, on whatever recorder is in force here: the once
+        // block is consumed by it (or was, by another test of this process).
+        report_jpeg_decoder();
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        ::metrics::with_local_recorder(&recorder, report_jpeg_decoder);
+        let rendered = handle.render();
+        for gauge in ["smg_mm_turbojpeg_available", "smg_mm_webp_available"] {
+            assert!(
+                rendered.lines().any(|line| line.starts_with(gauge)
+                    && (line.ends_with(" 1") || line.ends_with(" 0"))),
+                "{gauge} is set by the second report:\n{rendered}"
+            );
+        }
     }
 }
