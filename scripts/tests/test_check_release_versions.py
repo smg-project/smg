@@ -245,6 +245,18 @@ def run(mod, root, *, mode="check", tag=None, override=None, answer="n", ask=Non
     return code, stream.getvalue()
 
 
+def test_the_repo_reads_its_root_whatever_git_variables_the_caller_carries(mod, repo, monkeypatch):
+    """A hook's GIT_DIR / GIT_WORK_TREE would point every git call at another repository
+    regardless of ``cwd``; the tool's calls drop them and read the root they were given."""
+    monkeypatch.setenv("GIT_DIR", "/nonexistent/.git")
+    monkeypatch.setenv("GIT_WORK_TREE", "/nonexistent")
+    r = mod.Repo(repo)
+    assert "GIT_DIR" not in r.env and "GIT_WORK_TREE" not in r.env
+    assert r.newest_tag() is not None
+    assert r.has_ref("HEAD")
+    assert r.show("HEAD", "Cargo.toml") is not None
+
+
 def test_the_verdicts(mod, repo):
     code, out = run(mod, repo)
     assert code == 1

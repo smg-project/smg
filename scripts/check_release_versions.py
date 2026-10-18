@@ -230,20 +230,39 @@ def with_legacy(path: str) -> list[str]:
     return [path, path[len("crates/") :]] if path.startswith("crates/") else [path]
 
 
+# The variables through which a hook or a wrapper points git at another repository; they
+# take precedence over ``cwd``, so the tool's own calls drop them and read ``root`` alone.
+_GIT_LOCATION_VARS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+)
+
+
 class Repo:
     def __init__(self, root: Path) -> None:
         self.root = root
+        self.env = {k: v for k, v in os.environ.items() if k not in _GIT_LOCATION_VARS}
+
+    def _run(self, *args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args],
+            cwd=self.root,
+            env=self.env,
+            check=check,
+            capture_output=True,
+            text=True,
+        )
 
     def git(self, *args: str) -> str:
-        return subprocess.run(
-            ["git", *args], cwd=self.root, check=True, capture_output=True, text=True
-        ).stdout
+        return self._run(*args, check=True).stdout
 
     def has_ref(self, ref: str) -> bool:
-        probe = subprocess.run(
-            ["git", "rev-parse", "--verify", "-q", ref], cwd=self.root, capture_output=True
-        )
-        return probe.returncode == 0
+        return self._run("rev-parse", "--verify", "-q", ref).returncode == 0
 
     def newest_tag(self) -> str | None:
         tags = self.git("tag", "--sort=-creatordate").split()
@@ -251,9 +270,7 @@ class Repo:
 
     def show(self, ref: str, path: str) -> str | None:
         """A file's text at a ref; None when it is not there."""
-        result = subprocess.run(
-            ["git", "show", f"{ref}:{path}"], cwd=self.root, capture_output=True, text=True
-        )
+        result = self._run("show", f"{ref}:{path}")
         return result.stdout if result.returncode == 0 else None
 
     def changed_since(self, tag: str, paths: Sequence[str]) -> list[str]:
@@ -272,10 +289,10 @@ class Repo:
         return [(subject, body) for subject, _, body in entries]
 
     def read(self, path: str) -> str:
-        return (self.root / path).read_text()
+        return (self.root / path).read_text(encoding="utf-8")
 
     def write(self, path: str, text: str) -> None:
-        (self.root / path).write_text(text)
+        (self.root / path).write_text(text, encoding="utf-8")
 
 
 # --- one component's verdict --------------------------------------------------
