@@ -16,16 +16,19 @@ use engine_zmq_client::{
         connect_to_frontend, default_ready_response, hello, EngineInbound, MockEngineInput,
         MockEngineOutput, MOCK_DEADLINE,
     },
-    protocol::vllm::{
-        multimodal::MmKwargValue,
-        output::{
-            EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
-            SpecDecodeMetrics, StopReason,
+    protocol::{
+        handshake::EngineCoreReadyResponse,
+        vllm::{
+            multimodal::MmKwargValue,
+            output::{
+                EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
+                SpecDecodeMetrics, StopReason,
+            },
+            pooling::{PoolingOutput, PoolingParams},
+            request::{EngineCoreRequest, MmFeaturesPayload},
+            stats::{PrefillStats, SchedulerStats},
+            structured_outputs::{StructuredOutputBackend, StructuredOutputConstraint},
         },
-        pooling::{PoolingOutput, PoolingParams},
-        request::{EngineCoreRequest, MmFeaturesPayload},
-        stats::SchedulerStats,
-        structured_outputs::{StructuredOutputBackend, StructuredOutputConstraint},
     },
     EngineId,
 };
@@ -171,6 +174,45 @@ async fn harness_with(
         client,
         _dir: dir,
     }
+}
+
+/// A bound servicer over two data-parallel ranks (two handshaken mock
+/// engines, independent ranks) and a gRPC client: the harness holds rank 0,
+/// the pair returned with it is rank 1.
+async fn two_rank_harness(model: VllmModelInfo) -> (Harness, MockEngineInput, MockEngineOutput) {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let mut config = config(dir.path(), &handshake, model);
+    config.servicer.engine_count = 2;
+    let server = VllmServicerServer::start(config).expect("servicer starts");
+    let rank = |index: u32| {
+        connect_to_frontend(
+            &handshake,
+            EngineId::from_engine_index(index),
+            EngineCoreReadyResponse {
+                data_parallel_rank: index,
+                ..default_ready_response()
+            },
+        )
+    };
+    let (rank0, rank1) = tokio::join!(rank(0), rank(1));
+    let rank0 = rank0.expect("rank 0 handshake");
+    let rank1 = rank1.expect("rank 1 handshake");
+    wait_until(|| server.engine_ready()).await;
+    let client = VllmEngineClient::new(grpc_channel(server.address()).await);
+    let (engine_in, engine_out) = rank0.split();
+    let (rank1_in, rank1_out) = rank1.split();
+    (
+        Harness {
+            server,
+            engine_in,
+            engine_out,
+            client,
+            _dir: dir,
+        },
+        rank1_in,
+        rank1_out,
+    )
 }
 
 fn batch(
@@ -1417,6 +1459,120 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
         assert_eq!(batch.sequence_number, expected);
     }
     assert_eq!(relay.counts().served_from_history, 1);
+    drop(stream);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Two ranks behind one servicer: the request the second rank serves is
+/// credited to that rank's hit rate and throughput, on the poll and on the
+/// pushed record, and the first rank reads idle rather than carrying the
+/// second's figures (or the second reading zero while it serves).
+#[tokio::test]
+async fn a_second_rank_reports_its_own_hit_rate_and_throughput() {
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    let (mut h, mut rank1_in, mut rank1_out) = two_rank_harness(model).await;
+
+    let mut request = generate_request("r1", true, vec![]);
+    request.data_parallel_rank = Some(1);
+    let mut stream = h.client.generate(request).await.unwrap().into_inner();
+    let added = recv_add(&mut rank1_in).await;
+    assert_eq!(added.request_id, "r1");
+
+    // Rank 1 starts the request with its whole prompt cached and streams
+    // four tokens.
+    let step = |running: u64| SchedulerStats {
+        num_running_reqs: running,
+        ..Default::default()
+    };
+    rank1_out
+        .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 1,
+            outputs: vec![EngineCoreOutput {
+                request_id: "r1".to_string(),
+                new_token_ids: vec![10, 11, 12, 13],
+                prefill_stats: Some(PrefillStats {
+                    num_prompt_tokens: 3,
+                    num_cached_tokens: 3,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            scheduler_stats: Some(Box::new(step(1))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![10, 11, 12, 13]
+    );
+    // Rank 0 has not reported a scheduler step: a batch of its gets no
+    // record rather than rank 1's figures.
+    let source = LoadFromState(Arc::downgrade(&h.server.state));
+    assert!(kv_events::LoadSource::load(&source, Some(0)).is_none());
+    // Then rank 0 reports an idle step.
+    h.engine_out
+        .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 0,
+            scheduler_stats: Some(Box::new(step(0))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    wait_until(|| {
+        h.server
+            .state
+            .engine()
+            .is_ok_and(|client| client.get_loads().loads.len() == 2)
+    })
+    .await;
+
+    let loads = h
+        .client
+        .get_loads(vllm::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.dp_rank_count, 2);
+    let by_rank = |rank: i32| {
+        loads
+            .loads
+            .iter()
+            .find(|load| load.dp_rank == rank)
+            .unwrap_or_else(|| panic!("rank {rank} reports"))
+    };
+    let rank1 = by_rank(1);
+    assert_eq!(rank1.num_running_reqs, 1);
+    assert!(
+        (rank1.cache_hit_rate - 1.0).abs() < f64::EPSILON,
+        "rank 1 cached the whole prompt: {rank1:?}"
+    );
+    assert!(
+        rank1.gen_throughput > 0.0,
+        "rank 1 streamed the tokens: {rank1:?}"
+    );
+    let rank0 = by_rank(0);
+    assert_eq!(
+        (rank0.cache_hit_rate, rank0.gen_throughput),
+        (0.0, 0.0),
+        "rank 0 served nothing: {rank0:?}"
+    );
+
+    // The record the relay would stamp on rank 1's batches carries the
+    // same figures, and rank 0's its own.
+    let record = kv_events::LoadSource::load(&source, Some(1)).expect("rank 1's record");
+    assert_eq!(record.running_requests, 1);
+    assert_eq!(record.cache_hit_rate, Some(1.0));
+    assert!(record.gen_throughput > 0.0, "{record:?}");
+    assert_eq!(record.waiting_uncached_tokens, Some(0));
+    let record = kv_events::LoadSource::load(&source, Some(0)).expect("rank 0's record");
+    assert_eq!(
+        (record.cache_hit_rate, record.gen_throughput),
+        (Some(0.0), 0.0),
+        "{record:?}"
+    );
+
     drop(stream);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

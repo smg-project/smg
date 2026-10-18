@@ -202,8 +202,8 @@ fn max_num_seqs(state: &State) -> i32 {
 /// response shape, with the handshake's capacity figures and, from this
 /// servicer's own bookkeeping ([`crate::load_tracker`]), the queued
 /// token-work, generation throughput and hit rate that vLLM's stats do not
-/// carry. The servicer forwards to one engine process, so those three go on
-/// the first rank's entry.
+/// carry, each rank's own: the servicer picks the rank a request goes to
+/// and sees what that rank cached and streamed for it.
 pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
     let client = state.engine()?;
     let ready = client.ready_response();
@@ -219,6 +219,7 @@ pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
         .into_iter()
         .map(|load| {
             let num_used_tokens = (load.token_usage * f64::from(max_total_num_tokens)).round();
+            let estimate = state.loads.estimate(load.dp_rank, load.num_waiting_reqs);
             vllm::SchedulerLoad {
                 dp_rank: load.dp_rank,
                 num_running_reqs: load.num_running_reqs,
@@ -229,16 +230,12 @@ pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
                 utilization: load.token_usage,
                 max_running_requests,
                 max_total_num_tokens,
-                ..Default::default()
+                num_waiting_uncached_tokens: estimate.queued_token_work,
+                gen_throughput: estimate.gen_throughput,
+                cache_hit_rate: estimate.cache_hit_rate,
             }
         })
         .collect();
-    if let Some(first) = loads.first_mut() {
-        let estimate = state.loads.estimate(first.num_waiting_reqs);
-        first.num_waiting_uncached_tokens = estimate.queued_token_work;
-        first.gen_throughput = estimate.gen_throughput;
-        first.cache_hit_rate = estimate.cache_hit_rate;
-    }
     if loads.is_empty() {
         // No output batch has carried a snapshot yet. The Python servicer
         // reports a zero-filled entry per rank, and the Router reads an

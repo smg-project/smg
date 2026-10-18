@@ -1614,6 +1614,13 @@ impl<P: EngineProtocol> RequestStream<P> {
     pub fn request_id(&self) -> &str {
         &self.request_id
     }
+
+    /// The data-parallel rank the request went to (the engine's index, see
+    /// [`EngineId::engine_index`]); `None` for an engine whose identity
+    /// names no index.
+    pub fn engine_index(&self) -> Option<u32> {
+        self.engine_id.engine_index()
+    }
 }
 
 impl<P: EngineProtocol> Stream for RequestStream<P> {

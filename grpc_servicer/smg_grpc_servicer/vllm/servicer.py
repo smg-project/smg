@@ -134,6 +134,67 @@ def _first_rank(engine) -> int:
     return EngineConfigView(getattr(engine, "vllm_config", None)).parallel.data_parallel_rank
 
 
+def _rank_in_flight(engine, request_id: str, choice: int = 0) -> int | None:
+    """The data-parallel rank vLLM's load-balancing engine client routed
+    ``request_id`` to, while the request is in flight: for an ``n > 1``
+    request the rank of its ``choice``, each choice being a request of its
+    own to the engine. The client keeps the engine of every request it
+    routed, to route its abort (``reqs_in_flight``, keyed by the engine's
+    internal request id, valued with the engine's two-byte identity, which
+    is its rank), and the output processor keeps the internal ids under the
+    id the caller gave (``external_req_ids``; a choice's id starts with its
+    index). ``None`` when the client keeps no such table (one engine), the
+    request is not routed yet, or it has finished."""
+    table = getattr(getattr(engine, "engine_core", None), "reqs_in_flight", None)
+    names = getattr(getattr(engine, "output_processor", None), "external_req_ids", None)
+    if not isinstance(table, dict) or not isinstance(names, dict):
+        return None
+    internal_ids = list(names.get(request_id) or ())
+    own = [internal_id for internal_id in internal_ids if internal_id.startswith(f"{choice}_")]
+    for internal_id in own + [
+        internal_id for internal_id in internal_ids if internal_id not in own
+    ]:
+        identity = table.get(internal_id)
+        if isinstance(identity, (bytes, bytearray)) and len(identity) == 2:
+            return int.from_bytes(identity, "little")
+    return None
+
+
+def _routed_rank(engine, request_id: str, choice: int = 0) -> int | None:
+    """The rank an unpinned request (its ``choice``) went to, for its queued
+    prompt: the one the engine's load-balancing client routed it to (see
+    :func:`_rank_in_flight`), this servicer's first rank when the client
+    keeps no routing table (one engine: every request is its), ``None``
+    while the request is not routed yet."""
+    if not isinstance(getattr(getattr(engine, "engine_core", None), "reqs_in_flight", None), dict):
+        return _first_rank(engine)
+    return _rank_in_flight(engine, request_id, choice)
+
+
+def _request_rank(
+    engine,
+    request_id: str,
+    pinned: int | None,
+    choice: int = 0,
+    remembered: int | None = None,
+) -> int:
+    """The rank serving ``request_id`` (its ``choice``) from its first output
+    on, for the load tracker: the one the engine's client routed it to while
+    it is in flight (a pinned request is in that table too); else the rank
+    the tracker learned for it while it was queued (``remembered``: a
+    request the engine has already retired, whose only output was its last,
+    is in neither table any more); else the rank the request named; else
+    this servicer's first rank."""
+    rank = _routed_rank(engine, request_id, choice)
+    if rank is not None:
+        return rank
+    if remembered is not None:
+        return remembered
+    if pinned is not None:
+        return int(pinned)
+    return _first_rank(engine)
+
+
 def _latest_scheduler_stats(engine, engine_idx: int = 0):
     """Best-effort read of the most recent ``SchedulerStats`` snapshot.
 
@@ -215,8 +276,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # vLLM was started with --kv-events-config enabling the ZMQ publisher.
         self._kv_events_config = resolve_kv_events_config(async_llm)
         # Queued token-work, generation throughput and hit rate for GetLoads,
-        # from the requests this servicer forwards (vLLM's stats carry none).
-        self._loads = LoadTracker()
+        # per rank, from the requests this servicer forwards (vLLM's stats
+        # carry none); an unpinned request's queued prompt counts on the rank
+        # the engine routes it to, read once it has.
+        self._loads = LoadTracker(rank_of=lambda request_id: _routed_rank(async_llm, request_id))
         # Flag > env > default, resolved once so each value names its source.
         self._mm_settings = (mm_settings or launcher_settings() or MmSettings()).resolve()
         # Worker-side media processing (media_refs); None keeps refs rejected.
@@ -451,25 +514,54 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             # Track which indices have sent their first chunk
             seen_indices: set[int] = set()
 
-            self._loads.submitted(request_id, _prompt_length(prompt))
+            pinned_rank = (
+                request.data_parallel_rank if request.HasField("data_parallel_rank") else None
+            )
+            # The rank the request goes to: the pin, else the engine's choice,
+            # which the tracker reads once the engine has routed it (at every
+            # load read while the request is queued) and this loop reads when
+            # a choice first shows up (each choice of an n > 1 request is
+            # routed on its own); a non-streamed request's only output comes
+            # once the engine has retired it, so the tracker's reading is
+            # what names its rank then.
+            self._loads.submitted(request_id, _prompt_length(prompt), rank=pinned_rank)
+            ranks: dict[int, int] = {}
+            remembered: int | None = None
+
+            def rank_of(choice: int) -> int:
+                nonlocal remembered
+                if choice not in ranks:
+                    if not ranks:
+                        # Read once, at the first choice: the first output
+                        # takes the request out of the tracker's queue, and
+                        # the other choices of a retired request need it too.
+                        remembered = self._loads.pending_rank(request_id)
+                    ranks[choice] = _request_rank(
+                        self.engine, request_id, pinned_rank, choice, remembered=remembered
+                    )
+                return ranks[choice]
+
             async for output in self.engine.generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
                 request_id=request_id,
                 tokenization_kwargs=tokenization_kwargs,
                 trace_headers=trace_headers(context.invocation_metadata()),
-                data_parallel_rank=(
-                    request.data_parallel_rank if request.HasField("data_parallel_rank") else None
-                ),
+                data_parallel_rank=pinned_rank,
             ):
                 if not engine_started:
+                    # The prompt's cached count is the reporting choice's
+                    # (the first output of an n > 1 request is whichever
+                    # choice stepped first).
                     self._loads.first_output(
                         request_id,
                         len(output.prompt_token_ids or ()),
                         getattr(output, "num_cached_tokens", 0) or 0,
+                        rank=rank_of(output.outputs[0].index if output.outputs else 0),
                     )
                 engine_started = True
-                self._loads.generated(sum(len(c.token_ids) for c in output.outputs))
+                for completion in output.outputs:
+                    self._loads.generated(len(completion.token_ids), rank=rank_of(completion.index))
                 # For streaming, send chunks for EACH completion output (n outputs)
                 if request.stream:
                     for completion in output.outputs:
@@ -780,8 +872,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         carries KV-cache utilization ([0,1)) and ``num_running_reqs`` /
         ``num_waiting_reqs`` report queue depth. ``num_waiting_uncached_tokens``,
         ``gen_throughput`` and ``cache_hit_rate`` come from this servicer's own
-        bookkeeping of the requests it forwards (``smg_grpc_servicer.vllm.loads``),
-        since vLLM's stats do not carry them.
+        bookkeeping of the requests it forwards, per rank
+        (``smg_grpc_servicer.vllm.loads``), since vLLM's stats do not carry them.
 
         Always returns exactly one SchedulerLoad entry (zero-filled when no
         snapshot is available yet, e.g. with --disable-log-stats or before the
@@ -808,7 +900,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 num_running,
                 num_waiting,
                 kv_usage,
-                self._loads.estimate(num_waiting),
+                self._loads.estimate(num_waiting, rank=first_rank),
                 dp_rank=first_rank,
                 max_total_num_tokens=_kv_capacity_tokens(self.engine),
                 max_running_requests=_max_running_requests(self.engine),
@@ -840,12 +932,12 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
     def _load_record(self, dp_rank: int | None) -> common_pb2.EngineLoad | None:
         """The load record the KV-event stream carries for the batch's rank
         (the servicer's first rank when it names none, see ``_first_rank``):
-        that rank's own scheduler counts, with this servicer's queued-work
-        estimate on the first rank only, as the Rust servicer stamps its
-        batches. A rank whose snapshot the servicer cannot read gets no
-        record rather than another rank's figures; the first rank reports
-        zeros before its first snapshot, as ``GetLoads`` does. A read that
-        raises is the recorder's to report."""
+        that rank's own scheduler counts and this servicer's own queued-work,
+        throughput and hit-rate figures for that rank, as the Rust servicer
+        stamps its batches. A rank whose snapshot the servicer cannot read
+        gets no record rather than another rank's figures; the first rank
+        reports zeros before its first snapshot, as ``GetLoads`` does. A read
+        that raises is the recorder's to report."""
         first_rank = _first_rank(self.engine)
         rank = first_rank if dp_rank is None else dp_rank
         counts = self._scheduler_counts(rank)
@@ -858,7 +950,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             num_running,
             num_waiting,
             kv_usage,
-            self._loads.estimate(num_waiting) if rank == first_rank else None,
+            self._loads.estimate(num_waiting, rank=rank),
             dp_rank=rank,
             max_total_num_tokens=_kv_capacity_tokens(self.engine),
             max_running_requests=_max_running_requests(self.engine),

@@ -203,18 +203,22 @@ impl crate::kv_events::LoadSource for LoadFromState {
     fn load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
         let state = self.0.upgrade()?;
         let response = info::loads(&state).ok()?;
-        let rank = dp_rank.unwrap_or(0);
-        let load = response
-            .loads
-            .iter()
-            .find(|load| load.dp_rank == rank)
-            .or_else(|| response.loads.first())?;
-        // The queued token-work is this servicer's estimate for the first
-        // rank (see `info::loads`); the other ranks do not report it.
-        let estimated = response.loads.first().map(|first| first.dp_rank) == Some(load.dp_rank);
+        let load = match dp_rank {
+            // A rank the report has no entry for (it has not reported a
+            // scheduler step while another rank has) gets no record rather
+            // than another rank's figures, as under the Python servicer.
+            Some(rank) => response.loads.iter().find(|load| load.dp_rank == rank)?,
+            None => response
+                .loads
+                .iter()
+                .find(|load| load.dp_rank == 0)
+                .or_else(|| response.loads.first())?,
+        };
+        // The queued token-work is this servicer's own estimate for the
+        // rank (see `info::loads`), so every rank's record reports it.
         let mut record = smg_grpc_client::common_proto::EngineLoad::from(load);
         record.waiting_uncached_tokens =
-            estimated.then(|| u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
+            Some(u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
         record.engine_silence_ms = state.engine.output_silence_ms();
         record.engine_reports_steps = state.engine.reports_steps();
         record.prefill_pending_tokens = state.engine.prefill_pending_tokens();
@@ -229,7 +233,7 @@ pub(super) struct State {
     pub(super) kv_relay: Option<Arc<crate::kv_events::KvEventRelay>>,
     pub(super) stats: Stats,
     /// Queued token-work, generation throughput and hit rate from the
-    /// requests this servicer forwards, for `GetLoads`.
+    /// requests this servicer forwards, per rank, for `GetLoads`.
     pub(super) loads: crate::load_tracker::LoadTracker,
     /// The local tokenizer directory the servicer loaded (`GetTokenizer`
     /// bundles it); `None` when none resolved.

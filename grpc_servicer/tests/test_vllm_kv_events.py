@@ -359,7 +359,15 @@ def _load_record_method():
     loads_mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(loads_mod)
     source_path = package / "servicer.py"
-    wanted = {"_latest_scheduler_stats", "_scheduler_counts", "_load_record", "_first_rank"}
+    wanted = {
+        "_latest_scheduler_stats",
+        "_scheduler_counts",
+        "_load_record",
+        "_first_rank",
+        "_rank_in_flight",
+        "_routed_rank",
+        "_request_rank",
+    }
     defs = [
         node
         for node in ast.walk(ast.parse(source_path.read_text()))
@@ -405,7 +413,7 @@ def _core(record):
 
 
 @pytest.mark.parametrize("shape", ["aggregated_logger", "per_engine_loggers"])
-def test_the_record_is_the_batch_ranks_own_with_the_estimate_on_the_first_rank(shape):
+def test_the_record_is_the_batch_ranks_own_with_that_ranks_estimate(shape):
     from types import SimpleNamespace
 
     first, second = _stats(3, 2, 0.25), _stats(5, 1, 0.5)
@@ -419,15 +427,78 @@ def test_the_record_is_the_batch_ranks_own_with_the_estimate_on_the_first_rank(s
             }
         )
     servicer = _servicer_over(stat_logger)
+    # Rank 1 served a request whose prompt it had cached and streamed 200
+    # tokens; rank 0 served nothing yet.
+    servicer._loads.submitted("r", 100, rank=1)
+    servicer._loads.first_output("r", 100, 100, rank=1)
+    servicer._loads.generated(200, rank=1)
 
     rank_one = servicer._load_record(1)
     assert _core(rank_one) == (5, 1, 0.5)
-    # The queued-work estimate is the servicer's: the first rank's record carries it, no other.
-    assert not rank_one.HasField("waiting_uncached_tokens")
+    # Rank 1's own figures ride its record, where the servicer's whole-pod
+    # figures used to ride the first rank's and rank 1 read zero.
+    assert rank_one.HasField("waiting_uncached_tokens")
+    assert rank_one.cache_hit_rate == 1.0 and rank_one.gen_throughput == 100.0
     rank_zero = servicer._load_record(0)
     assert _core(rank_zero) == (3, 2, 0.25)
     assert rank_zero.HasField("waiting_uncached_tokens")
+    assert (rank_zero.cache_hit_rate, rank_zero.gen_throughput) == (0.0, 0.0)
     assert servicer._load_record(None) == rank_zero
+
+
+def test_a_request_is_credited_to_the_rank_the_engine_routed_it_to():
+    """The rank of a request, for the tracker: the engine client's own
+    in-flight table, keyed by the engine's internal request id (the output
+    processor maps the caller's id to it) and valued with the two-byte
+    identity that is the rank; else the pin the request named; else the
+    servicer's first rank."""
+    from types import SimpleNamespace
+
+    _, namespace = _load_record_method()
+    request_rank, routed_rank = namespace["_request_rank"], namespace["_routed_rank"]
+    engine = SimpleNamespace(
+        engine_core=SimpleNamespace(
+            reqs_in_flight={"routed-ab12cd34": (1).to_bytes(2, "little")},
+            engine_ranks_managed=[0, 1],
+        ),
+        output_processor=SimpleNamespace(external_req_ids={"routed": ["routed-ab12cd34"]}),
+    )
+    assert request_rank(engine, "routed", None) == 1
+    # The table wins over the pin (the client lists a pinned request too).
+    assert request_rank(engine, "routed", 0) == 1
+    # The caller's id is not a key of the table: the map is what finds it.
+    engine.output_processor.external_req_ids = {}
+    assert request_rank(engine, "routed", None) == 0
+    # A request the table no longer lists: the pin, else the first rank.
+    assert request_rank(engine, "finished", 1) == 1
+    assert request_rank(engine, "finished", None) == 0
+    # Each choice of an n > 1 request is routed on its own; its id starts
+    # with its index.
+    engine.output_processor.external_req_ids = {"fan": ["0_fan-ab12cd34", "1_fan-ab12cd34"]}
+    engine.engine_core.reqs_in_flight = {
+        "0_fan-ab12cd34": (0).to_bytes(2, "little"),
+        "1_fan-ab12cd34": (1).to_bytes(2, "little"),
+    }
+    assert (request_rank(engine, "fan", None, 0), request_rank(engine, "fan", None, 1)) == (0, 1)
+    # A choice already retired reads as its sibling's rank rather than none.
+    del engine.engine_core.reqs_in_flight["0_fan-ab12cd34"]
+    assert request_rank(engine, "fan", None, 0) == 1
+    # A request the engine has retired from both tables (a non-streamed
+    # request's only output is its last): what the tracker learned while
+    # it was queued, before the pin and the first rank.
+    engine.engine_core.reqs_in_flight = {}
+    engine.output_processor.external_req_ids = {}
+    assert request_rank(engine, "gone", None, 0, remembered=1) == 1
+    assert request_rank(engine, "gone", 0, 0, remembered=1) == 1
+    assert request_rank(engine, "gone", None, 0) == 0
+    # Not routed yet: its queued prompt counts nowhere; a client without a
+    # table (one engine) routes everything to the first rank.
+    assert routed_rank(engine, "pending") is None
+    one_engine = SimpleNamespace(engine_core=SimpleNamespace())
+    assert routed_rank(one_engine, "r") == 0
+    assert request_rank(one_engine, "r", None) == 0
+    # A pin cannot name another rank on a client with one engine.
+    assert request_rank(SimpleNamespace(), "r", 3) == 0
 
 
 def test_a_rank_the_stat_loggers_do_not_keep_apart_gets_no_record():
@@ -465,7 +536,8 @@ def test_a_servicer_managing_a_slice_of_the_ranks_counts_from_its_first_rank():
     first = servicer._load_record(None)
     assert _core(first) == (3, 2, 0.25) and first.HasField("waiting_uncached_tokens")
     assert servicer._load_record(4) == first
-    assert not servicer._load_record(5).HasField("waiting_uncached_tokens")
+    assert _core(servicer._load_record(5)) == (5, 1, 0.5)
+    assert servicer._load_record(5).HasField("waiting_uncached_tokens")
     assert servicer._load_record(0) is None
 
 

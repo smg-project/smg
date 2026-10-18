@@ -31,61 +31,126 @@ class Clock:
 
 def test_queued_token_work_is_the_youngest_waiting_prompts_discounted_by_the_hit_rate(loads_mod):
     tracker = loads_mod.LoadTracker(clock=Clock())
-    assert tracker.estimate(5) == loads_mod.LoadEstimate()
+    assert tracker.estimate(5, rank=0) == loads_mod.LoadEstimate()
 
     # Three in flight, none started: the engine says two are waiting, so the
     # oldest is in prefill and the two youngest are queued work.
-    tracker.submitted("a", 1000)
-    tracker.submitted("b", 300)
-    tracker.submitted("c", 200)
-    assert tracker.estimate(2).queued_token_work == 500
-    assert tracker.estimate(0).queued_token_work == 0
-    assert tracker.estimate(10).queued_token_work == 1500, "never more than we hold"
+    tracker.submitted("a", 1000, rank=0)
+    tracker.submitted("b", 300, rank=0)
+    tracker.submitted("c", 200, rank=0)
+    assert tracker.estimate(2, rank=0).queued_token_work == 500
+    assert tracker.estimate(0, rank=0).queued_token_work == 0
+    assert tracker.estimate(10, rank=0).queued_token_work == 1500, "never more than we hold"
 
     # The first output of `a`: half its prompt was cached; queued prompts are
     # discounted by that rate.
-    tracker.first_output("a", 1000, 500)
+    tracker.first_output("a", 1000, 500, rank=0)
     assert tracker.pending() == 2
-    estimate = tracker.estimate(2)
+    estimate = tracker.estimate(2, rank=0)
     assert estimate.cache_hit_rate == 0.5
     assert estimate.queued_token_work == 250
 
     tracker.finished("b")  # ended before it started
-    assert tracker.estimate(2).queued_token_work == 100
-    tracker.first_output("c", 200, 200)
+    assert tracker.estimate(2, rank=0).queued_token_work == 100
+    tracker.first_output("c", 200, 200, rank=0)
     assert tracker.pending() == 0
-    assert tracker.estimate(3).queued_token_work == 0
-    assert tracker.estimate(0).cache_hit_rate == pytest.approx(700 / 1200)
+    assert tracker.estimate(3, rank=0).queued_token_work == 0
+    assert tracker.estimate(0, rank=0).cache_hit_rate == pytest.approx(700 / 1200)
 
 
 def test_throughput_counts_tokens_inside_the_window_only(loads_mod):
     clock = Clock()
     tracker = loads_mod.LoadTracker(clock=clock)
-    tracker.generated(1000)
+    tracker.generated(1000, rank=0)
     clock.now += 1.0
-    tracker.generated(3000)
-    assert tracker.estimate(0).gen_throughput == 2000.0
+    tracker.generated(3000, rank=0)
+    assert tracker.estimate(0, rank=0).gen_throughput == 2000.0
     clock.now += 1.5  # the first sample falls out of the two-second window
-    assert tracker.estimate(0).gen_throughput == 1500.0
+    assert tracker.estimate(0, rank=0).gen_throughput == 1500.0
     clock.now += 2.0
-    assert tracker.estimate(0).gen_throughput == 0.0
-    tracker.generated(0)
-    assert tracker.estimate(0).gen_throughput == 0.0
+    assert tracker.estimate(0, rank=0).gen_throughput == 0.0
+    tracker.generated(0, rank=0)
+    assert tracker.estimate(0, rank=0).gen_throughput == 0.0
 
 
 def test_the_hit_rate_averages_recent_first_outputs_and_ignores_empty_prompts(loads_mod):
     tracker = loads_mod.LoadTracker(clock=Clock())
-    tracker.submitted("x", 0)
-    tracker.first_output("x", 0, 0)
-    assert tracker.estimate(0).cache_hit_rate == 0.0
+    tracker.submitted("x", 0, rank=0)
+    tracker.first_output("x", 0, 0, rank=0)
+    assert tracker.estimate(0, rank=0).cache_hit_rate == 0.0
     for index in range(loads_mod.HIT_RATE_SAMPLES):
-        tracker.first_output(f"old-{index}", 100, 0)
-    assert tracker.estimate(0).cache_hit_rate == 0.0
+        tracker.first_output(f"old-{index}", 100, 0, rank=0)
+    assert tracker.estimate(0, rank=0).cache_hit_rate == 0.0
     for index in range(loads_mod.HIT_RATE_SAMPLES):
-        tracker.first_output(f"new-{index}", 100, 100)
-    assert tracker.estimate(0).cache_hit_rate == 1.0, "the old samples aged out"
-    tracker.first_output("odd", 10, 50)
-    assert tracker.estimate(0).cache_hit_rate <= 1.0
+        tracker.first_output(f"new-{index}", 100, 100, rank=0)
+    assert tracker.estimate(0, rank=0).cache_hit_rate == 1.0, "the old samples aged out"
+    tracker.first_output("odd", 10, 50, rank=0)
+    assert tracker.estimate(0, rank=0).cache_hit_rate <= 1.0
+
+
+def test_each_rank_keeps_its_own_hit_rate_throughput_and_queue(loads_mod):
+    """Two ranks serve: each rank's figures are its own, and a rank that
+    served nothing reads as idle, not as its peer."""
+    tracker = loads_mod.LoadTracker(clock=Clock())
+    tracker.submitted("a", 1000, rank=0)
+    tracker.submitted("b", 400, rank=1)
+    tracker.submitted("c", 600, rank=1)
+    tracker.first_output("a", 1000, 0, rank=0)
+    tracker.first_output("b", 400, 400, rank=1)
+    tracker.generated(100, rank=0)
+    tracker.generated(900, rank=1)
+
+    rank0, rank1 = tracker.estimate(1, rank=0), tracker.estimate(1, rank=1)
+    assert (rank0.cache_hit_rate, rank1.cache_hit_rate) == (0.0, 1.0)
+    assert (rank0.gen_throughput, rank1.gen_throughput) == (50.0, 450.0)
+    # Rank 0 has nothing waiting; rank 1's `c` waits behind `b`, with rank
+    # 1's own hit rate discounting it to nothing.
+    assert (rank0.queued_token_work, rank1.queued_token_work) == (0, 0)
+    tracker.first_output("b", 400, 0, rank=1)
+    assert tracker.estimate(1, rank=1).queued_token_work == 300
+    assert tracker.estimate(1, rank=2) == loads_mod.LoadEstimate()
+
+
+def test_an_unpinned_requests_queue_counts_on_the_rank_the_engine_names(loads_mod):
+    """A request submitted without a rank (the engine picks one) counts
+    toward no rank's queue until ``rank_of`` names where it went, then
+    toward that rank, read once."""
+    routed: dict[str, int] = {}
+    tracker = loads_mod.LoadTracker(clock=Clock(), rank_of=routed.get)
+    tracker.submitted("a", 1000, rank=None)
+    tracker.submitted("b", 300, rank=None)
+    tracker.submitted("c", 600, rank=1)
+    assert tracker.estimate(5, rank=0).queued_token_work == 0
+    assert tracker.estimate(5, rank=1).queued_token_work == 600
+    routed["a"] = 0
+    routed["b"] = 1
+    assert tracker.estimate(5, rank=0).queued_token_work == 1000
+    assert tracker.estimate(5, rank=1).queued_token_work == 900
+    # Known once: a later answer does not move the request.
+    routed["a"] = 1
+    assert tracker.estimate(5, rank=0).queued_token_work == 1000
+    tracker.first_output("a", 1000, 0, rank=0)
+    assert tracker.pending() == 2
+    # Without a resolver an unpinned request's queue counts nowhere.
+    bare = loads_mod.LoadTracker(clock=Clock())
+    bare.submitted("x", 100, rank=None)
+    assert bare.estimate(1, rank=0).queued_token_work == 0
+
+
+def test_the_tracker_tells_the_rank_it_learned_for_a_queued_request(loads_mod):
+    """What a caller falls back on when the engine's own record of a request
+    is gone by its first output (a non-streamed request's only output)."""
+    routed: dict[str, int] = {}
+    tracker = loads_mod.LoadTracker(clock=Clock(), rank_of=routed.get)
+    tracker.submitted("a", 100, rank=None)
+    tracker.submitted("p", 100, rank=1)
+    assert tracker.pending_rank("a") is None
+    assert tracker.pending_rank("p") == 1
+    routed["a"] = 1
+    assert tracker.pending_rank("a") == 1
+    tracker.first_output("a", 100, 50, rank=1)
+    assert tracker.pending_rank("a") is None, "no longer queued"
+    assert tracker.pending_rank("unknown") is None
 
 
 def test_scheduler_load_fields_carry_vllms_counts_and_the_estimate(loads_mod):
@@ -150,13 +215,16 @@ def test_the_load_record_before_the_first_step_is_zero_filled_with_the_capacity_
     assert record.max_total_num_tokens == 0 and record.max_running_requests == 0
 
 
-def test_the_load_record_of_another_rank_carries_its_own_counts_and_no_estimate(loads_mod):
-    fields = loads_mod.scheduler_load_fields(4, 1, 0.5, None, dp_rank=1, max_total_num_tokens=8_000)
+def test_the_load_record_of_another_rank_carries_its_own_counts_and_estimate(loads_mod):
+    estimate = loads_mod.LoadEstimate(queued_token_work=96, gen_throughput=80.0, cache_hit_rate=0.9)
+    fields = loads_mod.scheduler_load_fields(
+        4, 1, 0.5, estimate, dp_rank=1, max_total_num_tokens=8_000
+    )
     assert fields["dp_rank"] == 1
-    assert not {"num_waiting_uncached_tokens", "gen_throughput", "cache_hit_rate"} & fields.keys()
-    record = loads_mod.load_record(4, 1, 0.5, None, dp_rank=1, max_total_num_tokens=8_000)
+    assert (fields["gen_throughput"], fields["cache_hit_rate"]) == (80.0, 0.9)
+    record = loads_mod.load_record(4, 1, 0.5, estimate, dp_rank=1, max_total_num_tokens=8_000)
     assert (record.running_requests, record.waiting_requests, record.token_usage) == (4, 1, 0.5)
     assert record.num_used_tokens == 4_000
-    # The estimate is the servicer's and rides the first rank's record: absent here, not 0.
-    assert not record.HasField("waiting_uncached_tokens")
-    assert (record.gen_throughput, record.cache_hit_rate) == (0.0, 0.0)
+    # The rank's own estimate rides its record, as the first rank's does.
+    assert record.waiting_uncached_tokens == 96
+    assert (record.gen_throughput, record.cache_hit_rate) == (80.0, 0.9)
