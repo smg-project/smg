@@ -1581,7 +1581,8 @@ async fn a_second_rank_reports_its_own_hit_rate_and_throughput() {
 /// entry per rank from the handshake's figures; the servicer's own
 /// bookkeeping (what a rank cached and streamed, the work queued to it)
 /// rides on those entries too, so a rank that served a request before the
-/// engine's first snapshot reports its hit rate and throughput, not zeros.
+/// engine's first snapshot reports its hit rate and throughput, not zeros,
+/// and every request submitted to it and not started counts as queued.
 #[tokio::test]
 async fn the_entries_before_the_first_snapshot_carry_the_servicers_own_figures() {
     let mut h = harness(model_info(), None).await;
@@ -1594,8 +1595,8 @@ async fn the_entries_before_the_first_snapshot_carry_the_servicers_own_figures()
     let added = recv_add(&mut h.engine_in).await;
     assert_eq!(added.request_id, "r1");
 
-    // The rank streams with its whole prompt cached and sends no scheduler
-    // stats: the engine's snapshot is still empty.
+    // The rank streams with one of three prompt tokens cached and sends no
+    // scheduler stats: the engine's snapshot is still empty.
     h.engine_out
         .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             engine_index: 0,
@@ -1604,7 +1605,7 @@ async fn the_entries_before_the_first_snapshot_carry_the_servicers_own_figures()
                 new_token_ids: vec![10, 11, 12, 13],
                 prefill_stats: Some(PrefillStats {
                     num_prompt_tokens: 3,
-                    num_cached_tokens: 3,
+                    num_cached_tokens: 1,
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -1618,6 +1619,16 @@ async fn the_entries_before_the_first_snapshot_carry_the_servicers_own_figures()
         chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
         vec![10, 11, 12, 13]
     );
+    // A second request the engine has not started: three prompt tokens
+    // pending, two of them uncached at the rank's hit rate.
+    let second = h
+        .client
+        .generate(generate_request("r2", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    let added = recv_add(&mut h.engine_in).await;
+    assert_eq!(added.request_id, "r2");
 
     let loads = h
         .client
@@ -1630,12 +1641,16 @@ async fn the_entries_before_the_first_snapshot_carry_the_servicers_own_figures()
     let rank0 = &loads.loads[0];
     assert_eq!(rank0.dp_rank, 0);
     assert!(
-        (rank0.cache_hit_rate - 1.0).abs() < f64::EPSILON,
-        "the rank cached the whole prompt: {rank0:?}"
+        (rank0.cache_hit_rate - 1.0 / 3.0).abs() < 1e-9,
+        "the rank cached one token in three: {rank0:?}"
     );
     assert!(
         rank0.gen_throughput > 0.0,
         "the rank streamed the tokens: {rank0:?}"
+    );
+    assert_eq!(
+        rank0.num_waiting_uncached_tokens, 2,
+        "the pending request's three prompt tokens at the rank's hit rate: {rank0:?}"
     );
     assert_eq!(
         (rank0.num_running_reqs, rank0.num_waiting_reqs),
@@ -1643,6 +1658,7 @@ async fn the_entries_before_the_first_snapshot_carry_the_servicers_own_figures()
         "the engine's own counts stay the zero fill until its first snapshot: {rank0:?}"
     );
 
+    drop(second);
     drop(stream);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

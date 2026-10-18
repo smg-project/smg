@@ -251,8 +251,13 @@ pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
                 let dp_rank = i32::try_from(rank).unwrap_or(i32::MAX);
                 // The servicer's own figures do not wait for the engine's
                 // first snapshot: what this rank cached and streamed so far,
-                // and the token-work queued to it.
-                let estimate = state.loads.estimate(dp_rank, 0);
+                // and the token-work queued to it. The engine has not said
+                // how many requests it holds waiting, and before its first
+                // snapshot that is every request submitted to the rank and
+                // not started, so all of them count (an overestimate by
+                // what is already in prefill, better than a zero that reads
+                // as known-empty).
+                let estimate = state.loads.estimate(dp_rank, i32::MAX);
                 vllm::SchedulerLoad {
                     dp_rank,
                     max_running_requests,
