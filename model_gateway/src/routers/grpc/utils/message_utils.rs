@@ -323,9 +323,13 @@ pub(crate) async fn resolve_messages_media(
     tokenizer: &dyn Tokenizer,
     messages: &[InputMessage],
 ) -> Result<ResolvedMedia, Response> {
-    resolve_media(components, model_id, tokenizer, || {
-        multimodal::media_plan_messages(messages)
-    })
+    resolve_media(
+        components,
+        model_id,
+        tokenizer,
+        "resolve_messages_media",
+        || multimodal::media_plan_messages(messages),
+    )
     .await
 }
 
@@ -335,11 +339,13 @@ pub(crate) async fn resolve_messages_media(
 /// engine's own limits applied). A renderer that writes media as template
 /// text has no plan and keeps the authored order. The chat and Messages
 /// preparation stages and count_tokens resolve through here, so the three
-/// refuse a request alike.
+/// refuse a request alike; `stage` names the caller in the log lines, as
+/// each caller's own lines named it before.
 pub(crate) async fn resolve_media(
     components: &SharedComponents,
     model_id: &str,
     tokenizer: &dyn Tokenizer,
+    stage: &'static str,
     plan: impl FnOnce() -> MediaPlan,
 ) -> Result<ResolvedMedia, Response> {
     if tokenizer.renderer_capabilities().media_handling == MediaHandling::TemplateText {
@@ -382,7 +388,7 @@ pub(crate) async fn resolve_media(
     }
     let Some(mm_components) = components.multimodal.as_ref() else {
         error!(
-            function = "resolve_media",
+            function = stage,
             "Multimodal content detected but multimodal components not initialized"
         );
         return Err(error::bad_request(
@@ -392,7 +398,7 @@ pub(crate) async fn resolve_media(
     };
     let Some(entry) = tokenizer_entry else {
         error!(
-            function = "resolve_media",
+            function = stage,
             model = %model_id,
             "Tokenizer entry not found for multimodal processing"
         );
@@ -418,7 +424,7 @@ pub(crate) async fn resolve_media(
     .await
     .map_err(|e| {
         error!(
-            function = "resolve_media",
+            function = stage,
             model = %model_id,
             error = %e,
             "Failed to prepare the multimodal prompt plan"

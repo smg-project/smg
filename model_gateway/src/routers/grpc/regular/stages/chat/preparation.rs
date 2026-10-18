@@ -109,9 +109,13 @@ pub(crate) async fn prepare_chat_like(
         // the placeholder tokens, resolved from the registries as the
         // Messages stage resolves them (`utils::resolve_media`).
         let model_id = ctx.input.model_id.as_str();
-        let media = utils::resolve_media(&ctx.components, model_id, &*tokenizer, || {
-            multimodal::media_plan_chat(&request.messages)
-        })
+        let media = utils::resolve_media(
+            &ctx.components,
+            model_id,
+            &*tokenizer,
+            "ChatPreparationStage::execute",
+            || multimodal::media_plan_chat(&request.messages),
+        )
         .await?;
         let media_order = media.media_order;
 

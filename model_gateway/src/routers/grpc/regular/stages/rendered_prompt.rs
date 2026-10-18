@@ -180,12 +180,14 @@ pub(crate) async fn prepare_rendered_prompt(
 mod tests {
     use std::sync::Arc;
 
+    use axum::http::StatusCode;
+    use llm_multimodal::{MediaContentPart, Modality};
     use llm_tokenizer::{
         mock::MockTokenizer,
         traits::{PromptEncoding, Tokenizer},
         TokenizerRegistry,
     };
-    use openai_protocol::chat::ChatCompletionRequest;
+    use openai_protocol::{chat::ChatCompletionRequest, worker::MmProcessingMode};
     use reasoning_parser::ParserFactory as ReasoningParserFactory;
     use tool_parser::ParserFactory as ToolParserFactory;
 
@@ -195,12 +197,141 @@ mod tests {
             common::placement::PipelinePin,
             grpc::{
                 context::{RequestContext, SharedComponents},
+                multimodal::{
+                    media_refs_pipeline_pin, MediaPlan, MultimodalComponents,
+                    MultimodalConfigRegistry, MultimodalSettings, PlaceholderTokens,
+                },
                 regular::symphony::template::Templates,
-                utils::ParserResolver,
+                utils::{MediaContext, ParserResolver},
             },
         },
         worker::WorkerRegistry,
     };
+
+    /// A request context for model "m" over the mock tokenizer, and the
+    /// tokenizer.
+    async fn context() -> (RequestContext, Arc<dyn Tokenizer>) {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
+        let loaded = tokenizer.clone();
+        tokenizer_registry
+            .load("tokenizer-id", "m", "test", || async move { Ok(loaded) })
+            .await
+            .unwrap();
+        let components = Arc::new(SharedComponents {
+            templates: Arc::new(Templates::new(tokenizer_registry.clone())),
+            tokenizer_registry,
+            worker_registry: Arc::new(WorkerRegistry::new()),
+            tool_parser_factory: ToolParserFactory::default(),
+            reasoning_parser_factory: ReasoningParserFactory::default(),
+            parser_resolver: ParserResolver::disabled(),
+            multimodal: None,
+            tokenizer_autoload: true,
+            tokenizer_load_failures: Arc::default(),
+            parser: crate::config::ParserChoice::Legacy,
+        });
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "Hello world"}]
+        }))
+        .unwrap();
+        (
+            RequestContext::for_chat(Arc::new(request), None, "m".into(), components),
+            tokenizer,
+        )
+    }
+
+    /// A media context for one image, under multimodal components in `mode`.
+    fn media(mode: MmProcessingMode, placeholders: PlaceholderTokens) -> MediaContext {
+        let mut components = MultimodalComponents::new(
+            Arc::new(MultimodalConfigRegistry::new()),
+            None,
+            None,
+            &MultimodalSettings::default(),
+        )
+        .unwrap();
+        components.processing = mode;
+        MediaContext {
+            plan: MediaPlan::new([MediaContentPart::ImageUrl {
+                url: "https://a/1.png".to_string(),
+                detail: None,
+                uuid: None,
+                max_long_side_pixel: None,
+            }]),
+            placeholders,
+            components: Arc::new(components),
+            tokenizer_id: "tokenizer-id".to_string(),
+            tokenizer_source: "test".to_string(),
+        }
+    }
+
+    /// A rendered prompt whose anchors do not match the plan is refused by
+    /// name before any media is fetched: one image planned, no anchor
+    /// token in the prompt.
+    #[tokio::test]
+    async fn a_prompt_whose_anchors_miss_the_plan_is_refused_by_name() {
+        let (mut ctx, tokenizer) = context().await;
+        let mut placeholders = PlaceholderTokens::default();
+        placeholders.insert(Modality::Image, "token".to_string());
+        let media = media(MmProcessingMode::Router, placeholders);
+
+        let Err(response) = prepare_rendered_prompt(
+            &mut ctx,
+            &tokenizer,
+            "Hello world",
+            PromptEncoding::FromText,
+            Some(media),
+            &[],
+            "test",
+        )
+        .await
+        else {
+            panic!("a prompt without its anchor is refused");
+        };
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-smg-error-code")
+                .and_then(|v| v.to_str().ok()),
+            Some("multimodal_prompt_contract_mismatch")
+        );
+    }
+
+    /// Media a worker processes itself leaves as references: the tokens are
+    /// the renderer's, no intermediate is built, and the pipeline pin the
+    /// worker selection reads is set from the plan.
+    #[tokio::test]
+    async fn media_a_worker_processes_itself_leaves_as_references_with_the_pin_set() {
+        let (mut ctx, tokenizer) = context().await;
+        let placeholders = PlaceholderTokens::worker_only();
+        let media = media(MmProcessingMode::Worker, placeholders.clone());
+        let expected_pin = media_refs_pipeline_pin(&media.plan, &placeholders);
+
+        let Ok(rendered) = prepare_rendered_prompt(
+            &mut ctx,
+            &tokenizer,
+            "Hello world",
+            PromptEncoding::FromText,
+            Some(media),
+            &[],
+            "test",
+        )
+        .await
+        else {
+            panic!("worker-side media is prepared as references");
+        };
+        let expected = tokenizer.encode("Hello world", false).unwrap();
+        assert_eq!(rendered.token_ids, expected.token_ids());
+        assert!(rendered.multimodal_intermediate.is_none());
+        assert_eq!(
+            rendered
+                .multimodal_refs
+                .as_ref()
+                .map(|plan| plan.parts().len()),
+            Some(1)
+        );
+        assert_eq!(ctx.state.media_refs_pipeline, expected_pin);
+    }
 
     /// A prompt without media is the renderer's tokens and nothing else: no
     /// intermediate, no references, no pipeline pin.
