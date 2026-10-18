@@ -129,10 +129,12 @@ impl ResponseProcessor {
         } = self.split_reasoning(
             final_text,
             &token_ends,
-            original_request.separate_reasoning && reasoning_parser_available,
-            original_request.reasoning_in_prefill,
-            reasoning_parser_name,
-            model,
+            ReasoningSource {
+                wanted: original_request.separate_reasoning && reasoning_parser_available,
+                in_prefill: original_request.reasoning_in_prefill,
+                parser_name: reasoning_parser_name,
+                model,
+            },
         );
         let (tool_calls, processed_text) = self
             .parse_calls(
@@ -488,19 +490,16 @@ impl ResponseProcessor {
         Ok((response, counts))
     }
 
-    /// Split the reasoning out of a decoded choice when `wanted`, with a fresh
-    /// parser (non-streaming extraction keeps no state across requests, so
-    /// the shared pooled mutex is not serialized on); a prompt that ends inside
-    /// the thinking block starts the parser in reasoning mode. A parse error
-    /// leaves the text whole, as before.
+    /// Split the reasoning out of a decoded choice when the request wants
+    /// it, with a fresh parser (non-streaming extraction keeps no state
+    /// across requests, so the shared pooled mutex is not serialized on); a
+    /// prompt that ends inside the thinking block starts the parser in
+    /// reasoning mode. A parse error leaves the text whole, as before.
     fn split_reasoning(
         &self,
         text: String,
         token_ends: &[usize],
-        wanted: bool,
-        reasoning_in_prefill: bool,
-        parser_name: Option<&str>,
-        model: &str,
+        source: ReasoningSource<'_>,
     ) -> ReasoningSplit {
         let mut split = ReasoningSplit {
             content: text,
@@ -508,15 +507,17 @@ impl ResponseProcessor {
             reasoning_tokens: 0,
             content_from: 0,
         };
-        if !wanted {
+        if !source.wanted {
             return split;
         }
-        let Some(mut parser) =
-            utils::create_reasoning_parser(&self.reasoning_parser_factory, parser_name, model)
-        else {
+        let Some(mut parser) = utils::create_reasoning_parser(
+            &self.reasoning_parser_factory,
+            source.parser_name,
+            source.model,
+        ) else {
             return split;
         };
-        if reasoning_in_prefill {
+        if source.in_prefill {
             parser.mark_reasoning_started();
         }
         match parser.detect_and_parse_reasoning(&split.content) {
@@ -868,10 +869,12 @@ impl ResponseProcessor {
         } = self.split_reasoning(
             final_text,
             &token_ends,
-            reasoning_parser_available,
-            messages_request.reasoning_in_prefill,
-            reasoning_parser_name.as_deref(),
-            model,
+            ReasoningSource {
+                wanted: reasoning_parser_available,
+                in_prefill: messages_request.reasoning_in_prefill,
+                parser_name: reasoning_parser_name.as_deref(),
+                model,
+            },
         );
         let chat_tool_choice = messages_request.tool_choice.as_ref().map(ToolChoice::from);
         let (tool_calls, processed_text) = self
@@ -1140,6 +1143,17 @@ struct ReasoningSplit {
     reasoning: Option<String>,
     reasoning_tokens: u32,
     content_from: usize,
+}
+
+/// What the reasoning split reads from the request: whether the request
+/// wants the split at all (its separate-reasoning switch, with a parser
+/// available), whether the rendered prompt ends inside the thinking block,
+/// the parser the request resolved to, and the model.
+struct ReasoningSource<'a> {
+    wanted: bool,
+    in_prefill: bool,
+    parser_name: Option<&'a str>,
+    model: &'a str,
 }
 
 /// What a tool-call parse reads from the request: the tools it offered (none
@@ -1679,10 +1693,12 @@ mod responses_finish_reason_tests {
         let split = processor.split_reasoning(
             "<think>a</think>b".to_string(),
             &[8, 9, 17],
-            true,
-            false,
-            None,
-            "no-such-model",
+            ReasoningSource {
+                wanted: true,
+                in_prefill: false,
+                parser_name: None,
+                model: "no-such-model",
+            },
         );
         assert_eq!(split.content, "<think>a</think>b");
         assert_eq!(
