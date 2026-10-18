@@ -28,10 +28,11 @@
 //! worst live latency another subscriber sees while a snapshot is taken;
 //! the ordering pass and the chunk encoding that follow run off the lock.
 //!
-//! The chunks of one snapshot carry consecutive sequence numbers ending at
-//! the sequence the state was taken at, so the gateway's per-rank cursor
-//! continues into the live stream with no gap and no duplicate; chunk 0
-//! begins with an `AllBlocksCleared`, and every chunk is marked with
+//! Each rank's chunks carry consecutive sequence numbers ending at the
+//! sequence that rank's record was taken at ([`RankCut`]; every publisher
+//! numbers its own batches), so the gateway's per-rank cursor continues into
+//! the live stream with no gap and no duplicate; chunk 0 begins with an
+//! `AllBlocksCleared`, and every chunk is marked with
 //! [`KvSnapshotChunk`](common::KvSnapshotChunk). A chunk holds at most
 //! [`CHUNK_BLOCKS`] blocks and at most [`CHUNK_BYTES`] of encoded block
 //! entries, whichever is reached first: with large token blocks the bytes
@@ -355,7 +356,7 @@ impl LiveState {
         }
     }
 
-    fn clear_rank(&mut self, rank: Option<i32>) {
+    pub(crate) fn clear_rank(&mut self, rank: Option<i32>) {
         if let Some(blocks) = self.ranks.remove(&rank) {
             let copies: u64 = blocks.iter().map(|entry| u64::from(entry.copies)).sum();
             self.blocks -= copies;
@@ -441,6 +442,17 @@ impl Snapshot {
     }
 }
 
+/// Where one rank's record stood when a snapshot was taken: the sequence the
+/// rank's state is current through, which its last chunk is stamped with so
+/// that the rank's live events continue right after it, and how many of the
+/// rank's publisher sequences before the relay's record the snapshot cannot
+/// cover (0 for a record from the rank's first batch).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RankCut {
+    pub through: u64,
+    pub unknown_before: u64,
+}
+
 /// A snapshot ordered and cut into the batches a subscriber receives, built
 /// lazily chunk by chunk.
 pub struct SnapshotChunks {
@@ -450,27 +462,28 @@ pub struct SnapshotChunks {
     /// The units of each chunk, `(rank index, start, end)`, in order; empty
     /// for an empty state, whose one chunk is the clear.
     cuts: Vec<(usize, usize, usize)>,
+    /// Each chunk's sequence stamp and `unknown_before`, in chunk order.
+    stamps: Vec<(u64, u64)>,
     count: u32,
     next: u32,
-    through: u64,
     timestamp: f64,
     blocks: u64,
-    unknown_before: u64,
 }
 
 impl SnapshotChunks {
-    /// Order `snapshot`, taken at sequence `through`, and size its chunks so
-    /// that they can be stamped `through - count + 1 ..= through`; `timestamp`
-    /// is what the chunks carry (the gateway reads it as the publish time),
-    /// `unknown_before` how many publisher sequences before the relay's
-    /// record the snapshot cannot cover (0 for a record from the start).
-    pub fn new(snapshot: Snapshot, through: u64, timestamp: f64, unknown_before: u64) -> Self {
+    /// Order `snapshot` and size its chunks so that each rank's can be
+    /// stamped `through - chunks + 1 ..= through` of that rank's cut in
+    /// `cuts` (a rank without one is cut at 0); `timestamp` is what the
+    /// chunks carry (the gateway reads it as the publish time). An empty
+    /// state is one chunk, the clear, stamped with the first cut.
+    pub fn new(snapshot: Snapshot, cuts: &BTreeMap<Option<i32>, RankCut>, timestamp: f64) -> Self {
         let blocks = snapshot.blocks;
         let ranks: Vec<(Option<i32>, Vec<Arc<LiveBlock>>)> = snapshot
             .ranks
             .into_iter()
             .map(|(rank, entries)| (rank, order_rank(entries)))
             .collect();
+        let cut_of = |rank: &Option<i32>| cuts.get(rank).copied().unwrap_or_default();
         let largest_units = ranks
             .iter()
             .map(|(_, units)| units.len())
@@ -482,29 +495,68 @@ impl SnapshotChunks {
             .max()
             .unwrap_or(0);
         // Every rank in the state came from at least one relayed batch, so
-        // one chunk per rank always fits under `through + 1`; the loop only
-        // runs when the default bounds would need more sequences than exist,
-        // and stops at the latest once every rank is one chunk.
+        // one chunk per rank always fits under its `through + 1`; the loop
+        // only runs when the default bounds would need more sequences than a
+        // rank has, and stops at the latest once every rank is one chunk.
         let (mut chunk_blocks, mut chunk_bytes) = (CHUNK_BLOCKS, CHUNK_BYTES);
-        let mut cuts = cut_chunks(&ranks, chunk_blocks, chunk_bytes);
-        while cuts.len().max(1) as u64 > through.saturating_add(1)
-            && (chunk_blocks < largest_units || chunk_bytes < largest_bytes)
-        {
+        let mut chunks = cut_chunks(&ranks, chunk_blocks, chunk_bytes);
+        let too_many = |chunks: &[(usize, usize, usize)]| {
+            chunks_per_rank(ranks.len(), chunks)
+                .iter()
+                .enumerate()
+                .any(|(index, &count)| {
+                    count as u64 > cut_of(&ranks[index].0).through.saturating_add(1)
+                })
+        };
+        while too_many(&chunks) && (chunk_blocks < largest_units || chunk_bytes < largest_bytes) {
             chunk_blocks = chunk_blocks.saturating_mul(2);
             chunk_bytes = chunk_bytes.saturating_mul(2);
-            cuts = cut_chunks(&ranks, chunk_blocks, chunk_bytes);
+            chunks = cut_chunks(&ranks, chunk_blocks, chunk_bytes);
         }
-        let count = u32::try_from(cuts.len().max(1)).unwrap_or(u32::MAX);
+        let per_rank = chunks_per_rank(ranks.len(), &chunks);
+        let mut seen = vec![0u64; ranks.len()];
+        let mut stamps: Vec<(u64, u64)> = chunks
+            .iter()
+            .map(|&(rank_index, _, _)| {
+                let cut = cut_of(&ranks[rank_index].0);
+                let stamp = cut
+                    .through
+                    .saturating_sub(per_rank[rank_index] as u64 - 1)
+                    .saturating_add(seen[rank_index]);
+                seen[rank_index] += 1;
+                (stamp, cut.unknown_before)
+            })
+            .collect();
+        if stamps.is_empty() {
+            let first = cuts.values().next().copied().unwrap_or_default();
+            stamps.push((first.through, first.unknown_before));
+        }
+        let count = u32::try_from(stamps.len()).unwrap_or(u32::MAX);
         Self {
             ranks,
-            cuts,
+            cuts: chunks,
+            stamps,
             count,
             next: 0,
-            through,
             timestamp,
             blocks,
-            unknown_before,
         }
+    }
+
+    /// [`Self::new`] with one cut for every rank: a state whose ranks all
+    /// stand at `through` with `unknown_before` sequences before the record.
+    pub fn at(snapshot: Snapshot, through: u64, timestamp: f64, unknown_before: u64) -> Self {
+        let cut = RankCut {
+            through,
+            unknown_before,
+        };
+        let mut cuts: BTreeMap<Option<i32>, RankCut> = snapshot
+            .ranks
+            .iter()
+            .map(|(rank, _)| (*rank, cut))
+            .collect();
+        cuts.entry(None).or_insert(cut);
+        Self::new(snapshot, &cuts, timestamp)
     }
 
     /// Chunks in the snapshot (at least one: the clear).
@@ -517,11 +569,6 @@ impl SnapshotChunks {
         self.blocks
     }
 
-    /// The sequence the state was taken at: the last chunk's stamp.
-    pub fn through(&self) -> u64 {
-        self.through
-    }
-
     /// The next chunk, or `None` once all `count` have been produced.
     pub(crate) fn next_chunk(&mut self) -> Option<common::KvEventBatch> {
         if self.next >= self.count {
@@ -529,10 +576,7 @@ impl SnapshotChunks {
         }
         let index = self.next;
         self.next += 1;
-        let sequence_number = self
-            .through
-            .saturating_sub(u64::from(self.count) - 1)
-            .saturating_add(u64::from(index));
+        let (sequence_number, unknown_before) = self.stamps[index as usize];
         let mut events = Vec::new();
         if index == 0 {
             events.push(common::KvCacheEvent {
@@ -557,11 +601,20 @@ impl SnapshotChunks {
                 index,
                 count: self.count,
                 blocks: self.blocks,
-                unknown_before: self.unknown_before,
+                unknown_before,
             }),
             load: None,
         })
     }
+}
+
+/// How many of `chunks` each of `ranks` rank indices got.
+fn chunks_per_rank(ranks: usize, chunks: &[(usize, usize, usize)]) -> Vec<usize> {
+    let mut counts = vec![0usize; ranks];
+    for &(rank_index, _, _) in chunks {
+        counts[rank_index] += 1;
+    }
+    counts
 }
 
 impl Iterator for SnapshotChunks {
@@ -808,7 +861,7 @@ mod tests {
     }
 
     fn chunks_of(state: &LiveState, through: u64) -> Vec<common::KvEventBatch> {
-        SnapshotChunks::new(state.snapshot(), through, 2.0, 0).collect()
+        SnapshotChunks::at(state.snapshot(), through, 2.0, 0).collect()
     }
 
     #[test]
@@ -943,12 +996,13 @@ mod tests {
         state.apply(&batch(2, Some(1), vec![stored(None, &[1, 2], device)]));
         let chunks = chunks_of(&state, 40);
         assert_eq!(chunks.len(), 3, "rank 0 takes two chunks, rank 1 one");
+        // Each rank's chunks end at its own cut (both ranks stand at 40 here).
         assert_eq!(
             chunks
                 .iter()
                 .map(|chunk| (chunk.sequence_number, chunk.dp_rank))
                 .collect::<Vec<_>>(),
-            vec![(38, Some(0)), (39, Some(0)), (40, Some(1))]
+            vec![(39, Some(0)), (40, Some(0)), (40, Some(1))]
         );
         for (index, chunk) in chunks.iter().enumerate() {
             let marker = chunk.snapshot.as_ref().unwrap();
@@ -1191,7 +1245,7 @@ mod tests {
         assert_eq!(chunks[0].dp_rank, None);
         // A record that starts late says so on every chunk.
         let late: Vec<common::KvEventBatch> =
-            SnapshotChunks::new(state.snapshot(), 12, 2.0, 7).collect();
+            SnapshotChunks::at(state.snapshot(), 12, 2.0, 7).collect();
         assert_eq!(
             late[0].snapshot.as_ref().map(|chunk| chunk.unknown_before),
             Some(7)
@@ -1221,7 +1275,7 @@ mod tests {
         let snapshot = state.snapshot();
         let collected = started.elapsed();
         let started = Instant::now();
-        let mut chunks = SnapshotChunks::new(snapshot, 20_000, 3.0, 0);
+        let mut chunks = SnapshotChunks::at(snapshot, 20_000, 3.0, 0);
         let ordered = started.elapsed();
         let started = Instant::now();
         let mut blocks = 0;

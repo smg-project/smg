@@ -1750,3 +1750,84 @@ async fn a_shutdown_after_the_engines_completion_ends_the_stream_cleanly() {
     );
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
+
+/// A worker with two attention-DP ranks publishes on `port` and `port + 1`,
+/// each under its own sequence counter. The launcher's width
+/// (`data_parallel_size`) tells the relay how many publishers to follow: a
+/// gateway's stream carries both ranks' batches, each under its rank's own
+/// numbers and stamped with its socket's rank, which is what the gateway's
+/// per-rank admission cursors expect.
+#[tokio::test]
+async fn every_rank_of_a_data_parallel_publisher_reaches_the_gateway() {
+    use zeromq::prelude::*;
+
+    use crate::{kv_events::golden, testing::consecutive_publishers};
+
+    let (base, mut publishers) = consecutive_publishers(2).await;
+    let mut model = model_info();
+    model.kv_events_endpoint = format!("tcp://*:{base}");
+    model.kv_events_topic = "kv".to_string();
+    model.data_parallel_size = 2;
+    let mut h = harness(model).await;
+    let relay = h
+        .server
+        .state
+        .kv_relay
+        .clone()
+        .expect("a relay for the publishers");
+    // Each SUB connect is asynchronous: publish sequence 0 on both ranks
+    // until the relay has taken both (repeats are duplicates).
+    let batch2 = golden::bytes(golden::BATCH2);
+    for _ in 0..250 {
+        for publisher in &mut publishers {
+            publisher
+                .send(golden::frame(b"kv", 0, &batch2))
+                .await
+                .expect("publish");
+        }
+        if relay.counts().relayed >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        relay.counts().relayed,
+        2,
+        "both ranks' sequence 0 reached the relay"
+    );
+
+    let mut stream = h
+        .client
+        .subscribe_kv_events(common::SubscribeKvEventsRequest::default())
+        .await
+        .expect("subscribe")
+        .into_inner();
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
+            .await
+            .expect("a batch in time")
+            .expect("stream open")
+            .expect("a batch");
+        seen.push((batch.dp_rank, batch.sequence_number));
+    }
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        vec![(Some(0), 0), (Some(1), 0)],
+        "each rank under its own sequence, stamped with its socket's rank"
+    );
+    // Each rank continues its own count.
+    publishers[1]
+        .send(golden::frame(b"kv", 1, &batch2))
+        .await
+        .expect("publish");
+    let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
+        .await
+        .expect("a batch in time")
+        .expect("stream open")
+        .expect("a batch");
+    assert_eq!((batch.dp_rank, batch.sequence_number), (Some(1), 1));
+    drop(stream);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}

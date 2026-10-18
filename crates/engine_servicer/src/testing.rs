@@ -41,3 +41,38 @@ pub(crate) trait Bounded: Future + Sized {
 }
 
 impl<F: Future> Bounded for F {}
+
+/// `count` publishers bound on consecutive ports from the returned base, as
+/// a data-parallel engine lays its ranks' publishers out (rank `r` on the
+/// base port plus `r`).
+pub(crate) async fn consecutive_publishers(count: u16) -> (u16, Vec<zeromq::PubSocket>) {
+    use zeromq::prelude::*;
+
+    for _ in 0..20 {
+        let Some(base) = portpicker::pick_unused_port() else {
+            continue;
+        };
+        let Some(last) = base.checked_add(count.saturating_sub(1)) else {
+            continue;
+        };
+        if (base..=last).any(|port| !portpicker::is_free_tcp(port)) {
+            continue;
+        }
+        let mut publishers = Vec::with_capacity(usize::from(count));
+        for port in base..=last {
+            let mut publisher = zeromq::PubSocket::new();
+            if publisher
+                .bind(&format!("tcp://127.0.0.1:{port}"))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            publishers.push(publisher);
+        }
+        if publishers.len() == usize::from(count) {
+            return (base, publishers);
+        }
+    }
+    panic!("no run of {count} consecutive free ports");
+}

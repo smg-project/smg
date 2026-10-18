@@ -840,6 +840,12 @@ impl Normalizer {
         self.hash_check
     }
 
+    /// Forget what the stream remembers of `dp_rank` (its stored hashes, its
+    /// groups, its window-only marks): the rank's publisher started over.
+    pub fn forget_rank(&mut self, dp_rank: Option<i32>) {
+        self.ranks.remove(&dp_rank.unwrap_or(-1));
+    }
+
     fn drop(&mut self, reason: DropReason, event_id: u64) -> DropReason {
         let count = self.counts.dropped.entry(reason).or_insert(0);
         *count += 1;

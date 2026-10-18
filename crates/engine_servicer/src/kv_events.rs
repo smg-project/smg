@@ -1,7 +1,23 @@
-//! `SubscribeKvEvents`: an engine's ZMQ KV-cache event publisher relayed into
+//! `SubscribeKvEvents`: an engine's ZMQ KV-cache event publishers relayed into
 //! gRPC streams through one [`KvEventRelay`] per engine.
 //!
-//! The relay subscribes to the publisher once, for the servicer's lifetime,
+//! An engine runs one publisher per data-parallel rank (rank `r` on the base
+//! port plus `r`, its replay socket laid out the same way, its own sequence
+//! counter), and the relay follows every rank ([`RankSource`], derived from
+//! the engine's data-parallel width as the Python relay's `rank_sources`
+//! derives them): one SUB socket, one window and one cursor per rank, and
+//! every batch stamped with its socket's rank (the socket's rank wins over
+//! what the payload names, as in the Python relay). Each rank's own sequence
+//! numbers are kept, which is what the gateway's per-rank admission cursors
+//! expect. A subscription's `start_sequence_number` is rank 0's cursor (the
+//! request carries one): rank 0 resumes after it from its window, the other
+//! ranks resume live (nothing below a cursor the relay was not given may be
+//! resent on a fresh stream: the gateway reads that as a publisher restart),
+//! and a gap on them from the outage is settled by the gateway's own replay
+//! round. A subscription from zero gets every rank's window, or a state
+//! snapshot whose chunks are stamped at each rank's own cursor.
+//!
+//! The relay subscribes to the publishers once, for the servicer's lifetime,
 //! when the servicer starts serving (so it sees the engine from its first
 //! batch, and a servicer that outlives a gateway outage or restarts beside a
 //! warm engine is not blind until eviction; `SMG_KV_EVENT_RELAY_START=lazy`
@@ -36,9 +52,9 @@
 //!   gateway clears, resubscribes from zero and receives the snapshot. Before
 //!   anything was relayed, zero is live only.
 //!
-//! The publisher's own sequence numbers are kept. A sequence the relay did
-//! not receive is asked of the engine's replay socket (vLLM's and SGLang's
-//! ROUTER, the mock engine's too); what the replay cannot give leaves a hole
+//! The publisher's own sequence numbers are kept, per rank. A sequence the
+//! relay did not receive is asked of that rank's replay socket (vLLM's and
+//! SGLang's ROUTER, the mock engine's too); what the replay cannot give leaves a hole
 //! in the window, counted, which a subscriber skips the way the live stream
 //! did. A payload that does not decode relays as an empty batch under its
 //! sequence, so nobody sees a gap for it. The batches before the first one
@@ -65,10 +81,11 @@
 //! start carries `AllBlocksCleared`, vLLM's does not): the sequence goes
 //! backwards on the same socket; the engine's startup clear arrives under a
 //! sequence the relay already passed; the counter is back at 0 or 1 after a
-//! cursor above them. Each starts a new incarnation: the history is cleared,
-//! live subscribers end with `DATA_LOSS`, and the gateway clears and
-//! resubscribes from zero, where the new incarnation's complete history is
-//! waiting for it. A repeated sequence without a clear is a duplicate.
+//! cursor above them. Each starts a new incarnation of that rank: its window
+//! and its live blocks are cleared, live subscribers end with `DATA_LOSS`, and
+//! the gateway clears and resubscribes from zero, where the new incarnation's
+//! complete history is waiting for it (the other ranks' windows stay). A
+//! repeated sequence without a clear is a duplicate.
 //!
 //! Every batch a subscriber receives carries the servicer's load record
 //! ([`LoadSource`], the figures `GetLoads` answers with, as `KvEventBatch.
@@ -106,7 +123,7 @@
 //! [`crate::kv_wire`].
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     ops::RangeInclusive,
     sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -125,8 +142,8 @@ use zeromq::{
 
 use crate::{
     kv_history::{History, Window},
-    kv_state::{LiveState, Snapshot, SnapshotChunks},
-    kv_wire::{low64_big_endian, Counts as WireCounts, Normalizer, WireBatch, WireEvent},
+    kv_state::{LiveState, RankCut, Snapshot, SnapshotChunks},
+    kv_wire::{low64_big_endian, Normalizer, WireBatch, WireEvent},
     BoxStream,
 };
 
@@ -172,13 +189,22 @@ pub(crate) const DEFAULT_HEARTBEAT_BACKOFF: Duration = Duration::from_secs(5);
 /// The replay socket's end marker, eight 0xff bytes on both wires.
 const END_SEQUENCE: [u8; 8] = [0xff; 8];
 
-/// One publisher's relay settings.
-#[derive(Clone, Debug)]
-pub struct RelayConfig {
-    /// The connectable SUB endpoint of rank 0's publisher.
+/// One rank's publisher: where to subscribe and where to ask for replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RankSource {
+    /// The rank the batches of this source are stamped with.
+    pub rank: i32,
+    /// The connectable SUB endpoint of the rank's publisher.
     pub endpoint: String,
     /// Its replay ROUTER, when the engine runs one.
     pub replay_endpoint: Option<String>,
+}
+
+/// One engine's relay settings.
+#[derive(Clone, Debug)]
+pub struct RelayConfig {
+    /// The publishers to relay, one per data-parallel rank, in rank order.
+    pub sources: Vec<RankSource>,
     pub topic: String,
     pub history_batches: usize,
     pub history_bytes: usize,
@@ -194,18 +220,17 @@ pub struct RelayConfig {
 }
 
 impl RelayConfig {
-    /// Rank 0 of the publisher at `kv_events_endpoint` (bind wildcards
-    /// resolved), with the history caps from the environment.
+    /// Every rank of the publisher at `kv_events_endpoint` (bind wildcards
+    /// resolved; see [`rank_sources`]), with the history caps from the
+    /// environment.
     pub(crate) fn for_publisher(
         kv_events_endpoint: &str,
         replay_endpoint: Option<&str>,
         topic: &str,
+        ranks: u32,
     ) -> Self {
         Self {
-            endpoint: endpoint_for_rank(kv_events_endpoint, 0),
-            replay_endpoint: replay_endpoint
-                .filter(|endpoint| !endpoint.is_empty())
-                .map(|endpoint| endpoint_for_rank(endpoint, 0)),
+            sources: rank_sources(kv_events_endpoint, replay_endpoint, ranks),
             topic: topic.to_string(),
             history_batches: env_usize(HISTORY_BATCHES_ENV, DEFAULT_HISTORY_BATCHES),
             history_bytes: env_usize(HISTORY_BYTES_ENV, DEFAULT_HISTORY_BYTES),
@@ -215,6 +240,32 @@ impl RelayConfig {
             heartbeat_backoff: DEFAULT_HEARTBEAT_BACKOFF,
         }
     }
+
+    /// What log lines and refusals name the relay by: rank 0's endpoint.
+    fn label(&self) -> &str {
+        self.sources
+            .first()
+            .map_or("", |source| source.endpoint.as_str())
+    }
+}
+
+/// The sources of `ranks` publishers laid out from `kv_events_endpoint` and
+/// `replay_endpoint` (empty: none): rank `r` on the base port plus `r`, as
+/// the engines lay their ranks out and the Python relay's `rank_sources`
+/// derives them. Fewer than one rank counts as one.
+pub(crate) fn rank_sources(
+    kv_events_endpoint: &str,
+    replay_endpoint: Option<&str>,
+    ranks: u32,
+) -> Vec<RankSource> {
+    let replay = replay_endpoint.filter(|endpoint| !endpoint.is_empty());
+    (0..ranks.max(1))
+        .map(|rank| RankSource {
+            rank: i32::try_from(rank).unwrap_or(i32::MAX),
+            endpoint: endpoint_for_rank(kv_events_endpoint, rank),
+            replay_endpoint: replay.map(|endpoint| endpoint_for_rank(endpoint, rank)),
+        })
+        .collect()
 }
 
 /// Where the relay reads the engine's load for the record it attaches to
@@ -324,12 +375,9 @@ pub struct RelayCounts {
     pub subscribers_lagged: u64,
 }
 
-/// The state the publisher task and the subscribers share.
-struct Shared {
+/// One rank's record: its window and where its publisher's count stands.
+struct RankRecord {
     history: History,
-    /// The engine's live blocks as the relayed stream describes them,
-    /// current through `cursor`.
-    state: LiveState,
     /// The last sequence relayed in this incarnation, or none yet.
     cursor: Option<u64>,
     /// The first sequence relayed in this incarnation: the relay holds
@@ -339,13 +387,24 @@ struct Shared {
     /// Sequences of this incarnation before the record that even the
     /// engine's replay no longer had: what a snapshot cannot cover.
     unknown_before: u64,
-    /// Counts the publisher's restarts; sequences compare within one.
+}
+
+/// The state the publisher tasks and the subscribers share.
+struct Shared {
+    /// Per source, in [`RelayConfig::sources`] order.
+    ranks: Vec<RankRecord>,
+    /// The engine's live blocks as the relayed streams describe them,
+    /// current through each rank's cursor.
+    state: LiveState,
+    /// Counts the publishers' restarts; a rank's sequences compare within one.
     generation: u64,
     counts: RelayCounts,
-    /// The normalizer's counters as of the last relayed batch: what was
-    /// forwarded, dropped by reason, and the engine-hash check's tally.
-    wire: WireCounts,
-    /// Why the publisher task gave up, when it did.
+    /// Normalizes every rank's events (its state is kept per rank); its
+    /// counters are what the summary and closing lines print.
+    normalizer: Normalizer,
+    /// Event ids advance once per event over every rank.
+    event_id: u64,
+    /// Why a publisher task gave up, when one did.
     failed: Option<String>,
 }
 
@@ -381,7 +440,16 @@ impl RestartReason {
     }
 }
 
-impl Shared {
+impl RankRecord {
+    fn new(history_batches: usize, history_bytes: usize) -> Self {
+        Self {
+            history: History::new(history_batches, history_bytes),
+            cursor: None,
+            started_at: None,
+            unknown_before: 0,
+        }
+    }
+
     /// Classify `seq` against the cursor; `startup_clear` says the batch
     /// begins with the engine's `AllBlocksCleared`.
     fn admit(&self, seq: u64, startup_clear: bool) -> Admission {
@@ -409,17 +477,60 @@ impl Shared {
         }
         Admission::Duplicate
     }
+}
 
-    /// Start a new incarnation: the window is the old publisher's.
-    fn restart(&mut self) -> u64 {
+impl Shared {
+    /// Start a new incarnation of the rank at `index`: its window and its
+    /// live blocks were the old publisher's; the other ranks' stay.
+    fn restart_rank(&mut self, index: usize, dp_rank: Option<i32>) -> u64 {
         self.generation += 1;
-        self.history.clear();
-        self.state.clear();
-        self.cursor = None;
-        self.started_at = None;
-        self.unknown_before = 0;
+        let record = &mut self.ranks[index];
+        record.history.clear();
+        record.cursor = None;
+        record.started_at = None;
+        record.unknown_before = 0;
+        self.state.clear_rank(dp_rank);
+        self.normalizer.forget_rank(dp_rank);
         self.counts.publisher_restarts += 1;
         self.generation
+    }
+
+    fn relayed_anything(&self) -> bool {
+        self.ranks.iter().any(|record| record.cursor.is_some())
+    }
+
+    /// Every rank's window holds every batch its publisher ever numbered, and
+    /// at least one rank relayed something: a subscriber without a cursor
+    /// can take the windows as the engine's whole state.
+    fn complete_from_start(&self) -> bool {
+        self.relayed_anything()
+            && self
+                .ranks
+                .iter()
+                .all(|record| record.history.is_empty() || record.history.complete_from_start())
+    }
+
+    fn window(&self) -> usize {
+        self.ranks.iter().map(|record| record.history.len()).sum()
+    }
+
+    fn holes(&self) -> usize {
+        self.ranks.iter().map(|record| record.history.holes()).sum()
+    }
+
+    fn bytes(&self) -> usize {
+        self.ranks.iter().map(|record| record.history.bytes()).sum()
+    }
+
+    fn unknown_before(&self) -> u64 {
+        self.ranks.iter().map(|record| record.unknown_before).sum()
+    }
+
+    fn oldest(&self) -> Option<u64> {
+        self.ranks
+            .iter()
+            .filter_map(|record| record.history.oldest())
+            .min()
     }
 }
 
@@ -434,16 +545,17 @@ enum Live {
     Restart { generation: u64 },
 }
 
-/// One engine's KV-event relay: the publisher subscription, its history and
-/// the live channel its subscribers read.
+/// One engine's KV-event relay: the publisher subscriptions (one per rank),
+/// their histories and the live channel its subscribers read.
 pub struct KvEventRelay {
-    config: RelayConfig,
+    config: Arc<RelayConfig>,
     shared: Arc<Mutex<Shared>>,
     live: broadcast::Sender<Live>,
-    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// A subscriber came while the relay holds nothing: the publisher task
-    /// asks the engine's replay for the publisher's start again.
-    prime_request: Arc<Notify>,
+    /// The publisher tasks, one per source.
+    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// A subscriber came while the relay holds nothing: each publisher task
+    /// asks its engine replay for the publisher's start again.
+    prime_requests: Vec<Arc<Notify>>,
     /// The servicer's load, attached to every batch sent; none until the
     /// servicer installs it.
     load_source: OnceLock<Arc<dyn LoadSource>>,
@@ -451,23 +563,24 @@ pub struct KvEventRelay {
 
 impl Drop for KvEventRelay {
     fn drop(&mut self) {
-        if let Some(task) = self
-            .task
+        for task in self
+            .tasks
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take()
+            .drain(..)
         {
             task.abort();
         }
         let counts = self.counts();
         let shared = lock(&self.shared);
         info!(
-            endpoint = %self.config.endpoint,
+            endpoint = %self.config.label(),
+            ranks = self.config.sources.len(),
             ?counts,
-            wire = ?shared.wire,
-            window = shared.history.len(),
-            holes = shared.history.holes(),
-            bytes = shared.history.bytes(),
+            wire = ?shared.normalizer.counts(),
+            window = shared.window(),
+            holes = shared.holes(),
+            bytes = shared.bytes(),
             live_blocks = shared.state.blocks(),
             live_entries = shared.state.entries(),
             state = ?shared.state.counts(),
@@ -477,24 +590,34 @@ impl Drop for KvEventRelay {
 }
 
 impl KvEventRelay {
+    /// A relay over `config.sources` (at least one: a config without any
+    /// relays rank 0 of nothing and fails at its first subscription).
     pub fn new(config: RelayConfig) -> Arc<Self> {
         let (live, _) = broadcast::channel(LIVE_CHANNEL);
+        let ranks = config
+            .sources
+            .iter()
+            .map(|_| RankRecord::new(config.history_batches, config.history_bytes))
+            .collect();
+        let prime_requests = config
+            .sources
+            .iter()
+            .map(|_| Arc::new(Notify::new()))
+            .collect();
         Arc::new(Self {
             shared: Arc::new(Mutex::new(Shared {
-                history: History::new(config.history_batches, config.history_bytes),
+                ranks,
                 state: LiveState::new(),
-                cursor: None,
-                started_at: None,
-                wire: WireCounts::default(),
-                unknown_before: 0,
                 generation: 0,
                 counts: RelayCounts::default(),
+                normalizer: Normalizer::from_env(),
+                event_id: 0,
                 failed: None,
             })),
-            config,
+            config: Arc::new(config),
             live,
-            task: Mutex::new(None),
-            prime_request: Arc::new(Notify::new()),
+            tasks: Mutex::new(Vec::new()),
+            prime_requests,
             load_source: OnceLock::new(),
         })
     }
@@ -505,18 +628,21 @@ impl KvEventRelay {
         let _ = self.load_source.set(source);
     }
 
-    /// The relay for an engine's publisher, or `None` when events are off
-    /// (an empty endpoint).
+    /// The relay for an engine's publishers, `ranks` of them laid out from
+    /// `kv_events_endpoint` (see [`rank_sources`]), or `None` when events are
+    /// off (an empty endpoint).
     pub(crate) fn for_publisher(
         kv_events_endpoint: &str,
         replay_endpoint: Option<&str>,
         topic: &str,
+        ranks: u32,
     ) -> Option<Arc<Self>> {
         (!kv_events_endpoint.is_empty()).then(|| {
             Self::new(RelayConfig::for_publisher(
                 kv_events_endpoint,
                 replay_endpoint,
                 topic,
+                ranks,
             ))
         })
     }
@@ -529,24 +655,38 @@ impl KvEventRelay {
     /// dropped by reason, the engine-hash check's tally); what the summary
     /// and closing log lines print.
     #[cfg(test)]
-    pub(crate) fn wire_counts(&self) -> WireCounts {
-        lock(&self.shared).wire.clone()
+    pub(crate) fn wire_counts(&self) -> crate::kv_wire::Counts {
+        lock(&self.shared).normalizer.counts().clone()
     }
 
-    /// Record `batches` as relayed without a publisher: the history, the
+    /// Ranks holding live blocks in the relay's record.
+    #[cfg(test)]
+    pub(crate) fn live_ranks(&self) -> usize {
+        lock(&self.shared).state.ranks()
+    }
+
+    /// Record `batches` as relayed without a publisher, each under the source
+    /// of its rank (the first source when none matches): the history, the
     /// live state and the cursor as [`Relaying::relay`] would leave them.
     #[cfg(test)]
     fn preload(&self, batches: impl IntoIterator<Item = common::KvEventBatch>) {
         let mut shared = lock(&self.shared);
         for batch in batches {
             let sequence = batch.sequence_number;
+            let index = self
+                .config
+                .sources
+                .iter()
+                .position(|source| Some(source.rank) == batch.dp_rank)
+                .unwrap_or(0);
             let batch = Arc::new(batch);
-            shared.history.push(sequence, Arc::clone(&batch));
-            shared.state.apply(&batch);
-            if shared.started_at.is_none() {
-                shared.started_at = Some(sequence);
+            let record = &mut shared.ranks[index];
+            record.history.push(sequence, Arc::clone(&batch));
+            if record.started_at.is_none() {
+                record.started_at = Some(sequence);
             }
-            shared.cursor = Some(sequence);
+            record.cursor = Some(sequence);
+            shared.state.apply(&batch);
             shared.counts.relayed += 1;
         }
     }
@@ -558,33 +698,36 @@ impl KvEventRelay {
             self.start();
         } else {
             info!(
-                endpoint = %self.config.endpoint,
+                endpoint = %self.config.label(),
                 "{RELAY_START_ENV}=lazy: the KV event relay subscribes at the first SubscribeKvEvents"
             );
         }
     }
 
-    /// Subscribe to the publisher if not yet subscribed. Called at the
-    /// servicer's start ([`Self::start_at_boot`]) and by
+    /// Subscribe to every rank's publisher if not yet subscribed. Called at
+    /// the servicer's start ([`Self::start_at_boot`]) and by
     /// [`Self::subscribe`]; needs a Tokio runtime.
     pub fn start(&self) {
-        let mut task = self.task.lock().unwrap_or_else(PoisonError::into_inner);
-        if task.as_ref().is_some_and(|task| !task.is_finished()) {
+        let mut tasks = self.tasks.lock().unwrap_or_else(PoisonError::into_inner);
+        if tasks.iter().any(|task| !task.is_finished()) {
             return;
         }
-        let config = self.config.clone();
-        let shared = Arc::clone(&self.shared);
-        let live = self.live.clone();
-        let prime_request = Arc::clone(&self.prime_request);
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the publisher subscription outlives any one RPC; aborted when the relay drops"
-        )]
-        let handle = tokio::spawn(run(config, shared, live, prime_request));
-        *task = Some(handle);
+        tasks.clear();
+        for (index, prime_request) in self.prime_requests.iter().enumerate() {
+            let config = Arc::clone(&self.config);
+            let shared = Arc::clone(&self.shared);
+            let live = self.live.clone();
+            let prime_request = Arc::clone(prime_request);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the publisher subscription outlives any one RPC; aborted when the relay drops"
+            )]
+            let handle = tokio::spawn(run(config, index, shared, live, prime_request));
+            tasks.push(handle);
+        }
     }
 
-    /// Handle one `SubscribeKvEvents` call: the history after the cursor, or
+    /// Handle one `SubscribeKvEvents` call: the windows after the cursor, or
     /// a state snapshot, then live events; see the module docs for the
     /// cursor rules.
     pub fn subscribe(
@@ -597,65 +740,97 @@ impl KvEventRelay {
         let rx = self.live.subscribe();
         let cursor = request.start_sequence_number;
         let records_before_first_batch = request.load_records_before_first_batch;
+        let label = self.config.label();
         let serve = {
             let mut shared = lock(&self.shared);
             if let Some(error) = &shared.failed {
                 return Err(Status::internal(format!(
-                    "SubscribeKvEvents: the relay for {} is down: {error}",
-                    self.config.endpoint
+                    "SubscribeKvEvents: the relay for {label} is down: {error}"
                 )));
             }
             if cursor == 0 {
-                if shared.history.complete_from_start() {
+                if shared.complete_from_start() {
                     shared.counts.served_from_history += 1;
                     Serve::History {
-                        batches: shared.history.all(),
-                        last_sent: None,
+                        batches: shared
+                            .ranks
+                            .iter()
+                            .flat_map(|record| record.history.all())
+                            .collect(),
+                        last_sent: BTreeMap::new(),
                     }
-                } else if let Some(through) = shared.cursor {
-                    // The window no longer reaches back to the publisher's
-                    // first batch: the live set as of `through`, taken under
-                    // the guard that admits batches, so every later batch
-                    // reaches this subscriber through the live channel.
+                } else if shared.relayed_anything() {
+                    // A window no longer reaches back to its publisher's
+                    // first batch: the live set as of each rank's cursor,
+                    // taken under the guard that admits batches, so every
+                    // later batch reaches this subscriber through the live
+                    // channel.
                     let started = Instant::now();
                     let snapshot = shared.state.snapshot();
                     let collected = started.elapsed();
                     shared.counts.served_snapshots += 1;
+                    let cuts: BTreeMap<Option<i32>, RankCut> = self
+                        .config
+                        .sources
+                        .iter()
+                        .zip(&shared.ranks)
+                        .filter_map(|(source, record)| {
+                            let through = record.cursor?;
+                            Some((
+                                Some(source.rank),
+                                RankCut {
+                                    through,
+                                    unknown_before: record.unknown_before,
+                                },
+                            ))
+                        })
+                        .collect();
                     Serve::Snapshot {
                         snapshot,
-                        through,
+                        cuts,
                         collected,
-                        oldest: shared.history.oldest(),
-                        holes: shared.history.holes(),
-                        unknown_before: shared.unknown_before,
+                        oldest: shared.oldest(),
+                        holes: shared.holes(),
+                        unknown_before: shared.unknown_before(),
                     }
                 } else {
-                    // Nothing relayed yet: the publisher may have spoken
+                    // Nothing relayed yet: a publisher may have spoken
                     // before the subscription reached it and after the
                     // start replay answered; ask its replay once more.
-                    if self.config.replay_endpoint.is_some() {
-                        self.prime_request.notify_one();
+                    for (source, prime_request) in
+                        self.config.sources.iter().zip(&self.prime_requests)
+                    {
+                        if source.replay_endpoint.is_some() {
+                            prime_request.notify_one();
+                        }
                     }
                     Serve::Live
                 }
             } else {
-                match shared.history.after(cursor) {
+                // The cursor is rank 0's (the request carries one): its
+                // window resumes after it, the other ranks resume live.
+                let Some((source, record)) = self.config.sources.first().zip(shared.ranks.first())
+                else {
+                    return Err(Status::internal(
+                        "SubscribeKvEvents: the relay has no publisher to resume from",
+                    ));
+                };
+                match record.history.after(cursor) {
                     Ok(batches) => {
+                        let last_sent = BTreeMap::from([(Some(source.rank), cursor)]);
                         shared.counts.served_from_history += 1;
-                        Serve::History {
-                            batches,
-                            last_sent: Some(cursor),
-                        }
+                        Serve::History { batches, last_sent }
                     }
                     Err(window) => {
+                        let started_at = record.started_at;
                         shared.counts.out_of_range += 1;
-                        let endpoint = &self.config.endpoint;
+                        let endpoint = label;
                         let message = match window {
                             Window::Empty => format!(
                                 "SubscribeKvEvents: the relay for {endpoint} holds no history \
                                  yet (it started after the publisher); resubscribe from zero"
                             ),
-                            Window::Behind { oldest } => match shared.started_at {
+                            Window::Behind { oldest } => match started_at {
                                 Some(started) if cursor + 1 < started => format!(
                                     "SubscribeKvEvents: the relay for {endpoint} started at \
                                      sequence {started} and holds nothing before it; resubscribe \
@@ -675,8 +850,8 @@ impl KvEventRelay {
                         };
                         info!(
                             counts = ?shared.counts,
-                            window = shared.history.len(),
-                            holes = shared.history.holes(),
+                            window = shared.window(),
+                            holes = shared.holes(),
                             "{message}"
                         );
                         return Err(Status::out_of_range(message));
@@ -684,11 +859,11 @@ impl KvEventRelay {
                 }
             }
         };
-        let (replay, last_sent, snapshot) = match serve {
+        let (replay, sent, snapshot) = match serve {
             Serve::History { batches, last_sent } => {
                 if !batches.is_empty() {
                     debug!(
-                        endpoint = %self.config.endpoint,
+                        endpoint = %label,
                         cursor,
                         batches = batches.len(),
                         "SubscribeKvEvents: serving from history"
@@ -698,15 +873,15 @@ impl KvEventRelay {
             }
             Serve::Snapshot {
                 snapshot,
-                through,
+                cuts,
                 collected,
                 oldest,
                 holes,
                 unknown_before,
             } => {
                 info!(
-                    endpoint = %self.config.endpoint,
-                    through,
+                    endpoint = %label,
+                    through = ?cuts.values().map(|cut| cut.through).collect::<Vec<_>>(),
                     blocks = snapshot.blocks,
                     entries = snapshot.entries(),
                     ranks = snapshot.ranks.len(),
@@ -714,26 +889,36 @@ impl KvEventRelay {
                     oldest,
                     holes,
                     unknown_before,
-                    "SubscribeKvEvents: the history no longer starts at the publisher's first \
+                    "SubscribeKvEvents: a window no longer starts at its publisher's first \
                      batch; serving a state snapshot"
                 );
                 let timestamp = unix_seconds();
+                let sent = cuts
+                    .iter()
+                    .map(|(rank, cut)| (*rank, cut.through))
+                    .collect();
                 // Ordering and sizing the chunks is a pass over every live
                 // block: off the runtime's workers, and off the lock.
                 let ordering = tokio::task::spawn_blocking(move || {
-                    SnapshotChunks::new(snapshot, through, timestamp, unknown_before)
+                    SnapshotChunks::new(snapshot, &cuts, timestamp)
                 });
-                (Vec::new(), Some(through), SnapshotPhase::Ordering(ordering))
+                (Vec::new(), sent, SnapshotPhase::Ordering(ordering))
             }
-            Serve::Live => (Vec::new(), None, SnapshotPhase::None),
+            Serve::Live => (Vec::new(), BTreeMap::new(), SnapshotPhase::None),
         };
         let subscriber = Subscriber {
             snapshot,
             replay: replay.into(),
             rx,
-            last_sent,
+            sent,
+            ranks: self
+                .config
+                .sources
+                .iter()
+                .map(|source| source.rank)
+                .collect(),
             shared: Arc::clone(&self.shared),
-            endpoint: self.config.endpoint.clone(),
+            endpoint: label.to_string(),
             done: false,
             source: self.load_source.get().cloned(),
             records_before_first_batch,
@@ -741,6 +926,7 @@ impl KvEventRelay {
             heartbeat_interval: self.config.heartbeat_interval,
             heartbeat_backoff: self.config.heartbeat_backoff,
             last_rank: None,
+            last_sequence: None,
             last_record: None,
             last_sent_at: Instant::now(),
             idle_heartbeats: 0,
@@ -757,11 +943,13 @@ impl KvEventRelay {
 enum Serve {
     History {
         batches: Vec<Arc<common::KvEventBatch>>,
-        last_sent: Option<u64>,
+        /// Per rank, the sequence the subscriber is known to hold.
+        last_sent: BTreeMap<Option<i32>, u64>,
     },
     Snapshot {
         snapshot: Snapshot,
-        through: u64,
+        /// Each rank's cursor and unknown count at the cut.
+        cuts: BTreeMap<Option<i32>, RankCut>,
         collected: Duration,
         oldest: Option<u64>,
         holes: usize,
@@ -789,12 +977,17 @@ fn unix_seconds() -> f64 {
 type Item = Result<common::KvEventBatch, Status>;
 
 /// One `SubscribeKvEvents` stream: the snapshot it owes, what it still owes
-/// from the history, then the live channel, deduplicated by sequence.
+/// from the histories, then the live channel, deduplicated by sequence per
+/// rank.
 struct Subscriber {
     snapshot: SnapshotPhase,
     replay: VecDeque<Arc<common::KvEventBatch>>,
     rx: broadcast::Receiver<Live>,
-    last_sent: Option<u64>,
+    /// Per rank, the last sequence sent (or the cursor the subscriber came
+    /// with): what a live batch is a duplicate of.
+    sent: BTreeMap<Option<i32>, u64>,
+    /// The ranks of the relay's sources, in source order.
+    ranks: Vec<i32>,
     shared: Arc<Mutex<Shared>>,
     endpoint: String,
     done: bool,
@@ -808,8 +1001,10 @@ struct Subscriber {
     load_tick: Duration,
     heartbeat_interval: Duration,
     heartbeat_backoff: Duration,
-    /// The rank of the last batch sent: what a `load_only` batch names.
+    /// The rank and sequence of the last batch sent: what a `load_only`
+    /// batch names and repeats.
     last_rank: Option<i32>,
+    last_sequence: Option<u64>,
     /// The last record sent, for the change check.
     last_record: Option<common::EngineLoad>,
     /// When the last batch of any kind went out.
@@ -830,6 +1025,7 @@ impl Subscriber {
     /// Attach the load record to a batch about to go out and note it went.
     fn stamped(&mut self, mut batch: common::KvEventBatch) -> common::KvEventBatch {
         self.last_rank = batch.dp_rank;
+        self.last_sequence = Some(batch.sequence_number);
         self.last_sent_at = Instant::now();
         self.idle_heartbeats = 0;
         batch.load = self.record(batch.dp_rank, false);
@@ -861,7 +1057,7 @@ impl Subscriber {
         // silence on its first request reaches it in time; a gateway that
         // predates the field would take the publisher's first batch for a
         // duplicate of such a heartbeat, and waits for that batch.
-        let sequence_number = match self.last_sent {
+        let sequence_number = match self.last_sequence {
             Some(sequence) => sequence,
             None if self.records_before_first_batch => 0,
             None => return None,
@@ -919,7 +1115,6 @@ impl Subscriber {
                         endpoint = %self.endpoint,
                         chunks = chunks.chunk_count(),
                         blocks = chunks.blocks(),
-                        through = chunks.through(),
                         "SubscribeKvEvents: snapshot ordered"
                     );
                     self.snapshot = SnapshotPhase::Serving(chunks);
@@ -934,7 +1129,7 @@ impl Subscriber {
                 SnapshotPhase::None => {}
             }
             if let Some(batch) = self.replay.pop_front() {
-                self.last_sent = Some(batch.sequence_number);
+                self.sent.insert(batch.dp_rank, batch.sequence_number);
                 return Some(Ok(self.stamped((*batch).clone())));
             }
             let waited = if self.source.is_some() {
@@ -958,12 +1153,13 @@ impl Subscriber {
             match received {
                 Ok(Live::Batch(batch)) => {
                     if self
-                        .last_sent
-                        .is_some_and(|last| batch.sequence_number <= last)
+                        .sent
+                        .get(&batch.dp_rank)
+                        .is_some_and(|&last| batch.sequence_number <= last)
                     {
                         continue;
                     }
-                    self.last_sent = Some(batch.sequence_number);
+                    self.sent.insert(batch.dp_rank, batch.sequence_number);
                     return Some(Ok(self.stamped((*batch).clone())));
                 }
                 Ok(Live::Restart { generation }) => {
@@ -975,13 +1171,32 @@ impl Subscriber {
                     ))));
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    // Each rank's window after what this stream sent of it;
+                    // a rank it sent nothing of yet is owed its whole window,
+                    // which only a window from the publisher's start can be.
                     let refill = {
                         let mut shared = lock(&self.shared);
                         shared.counts.subscribers_lagged += 1;
-                        match self.last_sent {
-                            Some(last) => shared.history.after(last),
-                            None => Err(Window::Empty),
+                        let mut batches = Vec::new();
+                        let mut refilled = Ok(());
+                        for (rank, record) in self.ranks.iter().zip(&shared.ranks) {
+                            let owed = match self.sent.get(&Some(*rank)) {
+                                Some(&last) => record.history.after(last),
+                                None if record.history.is_empty() => Ok(Vec::new()),
+                                None if record.history.complete_from_start() => {
+                                    Ok(record.history.all())
+                                }
+                                None => Err(Window::Empty),
+                            };
+                            match owed {
+                                Ok(owed) => batches.extend(owed),
+                                Err(window) => {
+                                    refilled = Err(window);
+                                    break;
+                                }
+                            }
                         }
+                        refilled.map(|()| batches)
                     };
                     match refill {
                         Ok(batches) => {
@@ -1026,14 +1241,17 @@ fn decode(payload: &[u8], sequence: u64) -> Decoded {
     }
 }
 
-/// The publisher task: one SUB socket for the relay's lifetime.
+/// The publisher task of the source at `index`: one SUB socket for the
+/// relay's lifetime.
 async fn run(
-    config: RelayConfig,
+    config: Arc<RelayConfig>,
+    index: usize,
     shared: Arc<Mutex<Shared>>,
     live: broadcast::Sender<Live>,
     prime_request: Arc<Notify>,
 ) {
-    let mut socket = match connect(&config.endpoint, &config.topic).await {
+    let source = &config.sources[index];
+    let mut socket = match connect(&source.endpoint, &config.topic).await {
         Ok(socket) => socket,
         Err(status) => {
             lock(&shared).failed = Some(status.message().to_string());
@@ -1042,23 +1260,25 @@ async fn run(
     };
     let mut relay = Relaying {
         config: &config,
+        source,
+        index,
         shared: &shared,
         live: &live,
-        normalizer: Normalizer::from_env(),
-        event_id: 0,
     };
-    if let Some(check) = relay.normalizer.hash_check() {
-        info!(
-            endpoint = %config.endpoint,
-            check = check.as_str(),
-            "KV event engine-hash check on; its tally is in the relay's summary and closing lines"
-        );
+    if index == 0 {
+        if let Some(check) = lock(&shared).normalizer.hash_check() {
+            info!(
+                endpoint = %source.endpoint,
+                check = check.as_str(),
+                "KV event engine-hash check on; its tally is in the relay's summary and closing lines"
+            );
+        }
     }
     // The publisher may have been counting before the subscription reached
     // it: take what its replay still holds before the first live batch, and
     // keep asking until the engine answers (it may still be starting). A
     // live batch arriving first settles the start on its own path.
-    let mut primed = config.replay_endpoint.is_none();
+    let mut primed = source.replay_endpoint.is_none();
     let mut next_prime = tokio::time::Instant::now();
     loop {
         let received = tokio::select! {
@@ -1068,8 +1288,8 @@ async fn run(
                 next_prime = tokio::time::Instant::now() + PRIME_RETRY;
                 continue;
             }
-            () = prime_request.notified(), if config.replay_endpoint.is_some() => {
-                if lock(&shared).cursor.is_none() {
+            () = prime_request.notified(), if source.replay_endpoint.is_some() => {
+                if lock(&shared).ranks[index].cursor.is_none() {
                     primed = false;
                     next_prime = tokio::time::Instant::now();
                 }
@@ -1080,7 +1300,12 @@ async fn run(
         let message = match received {
             Ok(message) => message,
             Err(error) => {
-                warn!(endpoint = %config.endpoint, %error, "KV event receive failed; retrying");
+                warn!(
+                    endpoint = %source.endpoint,
+                    rank = source.rank,
+                    %error,
+                    "KV event receive failed; retrying"
+                );
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
@@ -1096,20 +1321,21 @@ async fn run(
         );
         let (first, mut admission) = {
             let shared = lock(&shared);
+            let record = &shared.ranks[index];
             (
-                shared.cursor.is_none(),
-                shared.admit(sequence, startup_clear),
+                record.cursor.is_none(),
+                record.admit(sequence, startup_clear),
             )
         };
         if first && admission == Admission::Accept && joined_late(sequence, startup_clear) {
             relay.recover_start(sequence).await;
             // The replay may have given this sequence too.
-            admission = lock(&shared).admit(sequence, startup_clear);
+            admission = lock(&shared).ranks[index].admit(sequence, startup_clear);
         }
         if let Admission::Gap { from, to } = admission {
             relay.recover_gap(from..=to).await;
             // The replay may have run past the live sequence.
-            admission = lock(&shared).admit(sequence, startup_clear);
+            admission = lock(&shared).ranks[index].admit(sequence, startup_clear);
         }
         match admission {
             Admission::Accept => relay.relay(sequence, decoded),
@@ -1117,11 +1343,12 @@ async fn run(
             Admission::Restart { reason, last } => {
                 let (generation, counts) = {
                     let mut shared = lock(&shared);
-                    let generation = shared.restart();
+                    let generation = shared.restart_rank(index, Some(source.rank));
                     (generation, shared.counts.clone())
                 };
                 warn!(
-                    endpoint = %config.endpoint,
+                    endpoint = %source.endpoint,
+                    rank = source.rank,
                     sequence,
                     last,
                     generation,
@@ -1130,11 +1357,12 @@ async fn run(
                     "KV event publisher restarted; live subscribers end with DATA_LOSS"
                 );
                 let _ = live.send(Live::Restart { generation });
-                relay.normalizer = Normalizer::from_env();
                 // The SUB re-joins a restarted publisher a moment late too.
                 if joined_late(sequence, startup_clear) {
                     relay.recover_start(sequence).await;
-                    if lock(&shared).admit(sequence, startup_clear) != Admission::Accept {
+                    if lock(&shared).ranks[index].admit(sequence, startup_clear)
+                        != Admission::Accept
+                    {
                         continue;
                     }
                 }
@@ -1161,57 +1389,65 @@ struct Filled {
     unknown_before: u64,
 }
 
-/// The publisher task's per-batch work.
+/// A publisher task's per-batch work, for the source at `index`.
 struct Relaying<'a> {
     config: &'a RelayConfig,
+    source: &'a RankSource,
+    index: usize,
     shared: &'a Mutex<Shared>,
     live: &'a broadcast::Sender<Live>,
-    normalizer: Normalizer,
-    event_id: u64,
 }
 
 impl Relaying<'_> {
-    /// Normalize, remember and broadcast one batch under `sequence`.
+    /// Normalize, remember and broadcast one batch under `sequence`, stamped
+    /// with this source's rank (the socket's rank wins over the payload's,
+    /// as in the Python relay: it is what the gateway keys its cursors by).
     fn relay(&mut self, sequence: u64, decoded: Decoded) {
-        let (batch, undecodable) = match decoded {
-            Decoded::Batch(batch) => (
-                self.normalizer
-                    .normalize_batch(batch, sequence, &mut self.event_id),
-                false,
-            ),
-            Decoded::Undecodable => (
-                common::KvEventBatch {
-                    sequence_number: sequence,
-                    ..common::KvEventBatch::default()
-                },
-                true,
-            ),
-        };
-        let batch = Arc::new(batch);
-        {
+        let batch = {
             let mut shared = lock(self.shared);
-            shared.history.push(sequence, Arc::clone(&batch));
-            shared.state.apply(&batch);
-            if shared.started_at.is_none() {
-                shared.started_at = Some(sequence);
+            let (batch, undecodable) = match decoded {
+                Decoded::Batch(mut batch) => {
+                    batch.dp_rank = Some(self.source.rank);
+                    let Shared {
+                        normalizer,
+                        event_id,
+                        ..
+                    } = &mut *shared;
+                    (normalizer.normalize_batch(batch, sequence, event_id), false)
+                }
+                Decoded::Undecodable => (
+                    common::KvEventBatch {
+                        sequence_number: sequence,
+                        dp_rank: Some(self.source.rank),
+                        ..common::KvEventBatch::default()
+                    },
+                    true,
+                ),
+            };
+            let batch = Arc::new(batch);
+            let record = &mut shared.ranks[self.index];
+            record.history.push(sequence, Arc::clone(&batch));
+            if record.started_at.is_none() {
+                record.started_at = Some(sequence);
             }
-            shared.cursor = Some(sequence);
+            record.cursor = Some(sequence);
+            shared.state.apply(&batch);
             shared.counts.relayed += 1;
             if undecodable {
                 shared.counts.undecodable_batches += 1;
             }
-            shared.wire = self.normalizer.counts().clone();
             if shared.counts.relayed.is_multiple_of(SUMMARY_EVERY_BATCHES) {
                 info!(
-                    endpoint = %self.config.endpoint,
+                    endpoint = %self.config.label(),
                     counts = ?shared.counts,
-                    wire = ?shared.wire,
+                    wire = ?shared.normalizer.counts(),
                     live_blocks = shared.state.blocks(),
                     live_entries = shared.state.entries(),
                     "KV event relay summary"
                 );
             }
-        }
+            batch
+        };
         let _ = self.live.send(Live::Batch(batch));
     }
 
@@ -1223,7 +1459,8 @@ impl Relaying<'_> {
         let filled = self.fill(gap).await;
         let counts = lock(self.shared).counts.clone();
         warn!(
-            endpoint = %self.config.endpoint,
+            endpoint = %self.source.endpoint,
+            rank = self.source.rank,
             from,
             to,
             recovered = filled.recovered,
@@ -1241,13 +1478,14 @@ impl Relaying<'_> {
         let filled = self.fill(0..=first_seen - 1).await;
         let counts = {
             let mut shared = lock(self.shared);
-            shared.unknown_before = filled.unknown_before;
+            shared.ranks[self.index].unknown_before = filled.unknown_before;
             shared.counts.unknown_before_start += filled.unknown_before;
             shared.counts.clone()
         };
         if filled.unknown_before == 0 {
             info!(
-                endpoint = %self.config.endpoint,
+                endpoint = %self.source.endpoint,
+                rank = self.source.rank,
                 first_seen,
                 recovered = filled.recovered,
                 ?counts,
@@ -1256,7 +1494,8 @@ impl Relaying<'_> {
             );
         } else {
             warn!(
-                endpoint = %self.config.endpoint,
+                endpoint = %self.source.endpoint,
+                rank = self.source.rank,
                 first_seen,
                 recovered = filled.recovered,
                 unknown_before = filled.unknown_before,
@@ -1274,7 +1513,7 @@ impl Relaying<'_> {
     /// engine is up and has nothing yet), `false` when it could not be
     /// reached or did not finish, to be asked again.
     async fn prime_from_replay(&mut self) -> bool {
-        let Some(endpoint) = &self.config.replay_endpoint else {
+        let Some(endpoint) = &self.source.replay_endpoint else {
             return true;
         };
         let timeout = self.config.replay_timeout;
@@ -1286,19 +1525,20 @@ impl Relaying<'_> {
         {
             Ok(Ok(answer)) => answer,
             Ok(Err(error)) => {
-                debug!(endpoint = %self.config.endpoint, %error, "KV event replay not answering yet");
+                debug!(endpoint = %self.source.endpoint, %error, "KV event replay not answering yet");
                 return false;
             }
             Err(_) => return false,
         };
-        if lock(self.shared).cursor.is_some() {
+        if lock(self.shared).ranks[self.index].cursor.is_some() {
             // A live batch got in first and settled the start.
             return true;
         }
         if replies.is_empty() {
             if complete {
                 info!(
-                    endpoint = %self.config.endpoint,
+                    endpoint = %self.source.endpoint,
+                    rank = self.source.rank,
                     "KV event relay asked the publisher's replay at start; it holds nothing yet"
                 );
             }
@@ -1327,14 +1567,15 @@ impl Relaying<'_> {
         }
         let counts = {
             let mut shared = lock(self.shared);
-            shared.unknown_before = unknown_before;
+            shared.ranks[self.index].unknown_before = unknown_before;
             shared.counts.unknown_before_start += unknown_before;
             shared.counts.primed_batches += taken;
             shared.counts.clone()
         };
         if unknown_before == 0 {
             info!(
-                endpoint = %self.config.endpoint,
+                endpoint = %self.source.endpoint,
+                rank = self.source.rank,
                 first,
                 last,
                 batches = taken,
@@ -1343,7 +1584,8 @@ impl Relaying<'_> {
             );
         } else {
             warn!(
-                endpoint = %self.config.endpoint,
+                endpoint = %self.source.endpoint,
+                rank = self.source.rank,
                 first,
                 last,
                 batches = taken,
@@ -1361,12 +1603,13 @@ impl Relaying<'_> {
     /// ran ahead of the live socket), what it does not becomes holes.
     async fn fill(&mut self, gap: RangeInclusive<u64>) -> Filled {
         let (from, to) = (*gap.start(), *gap.end());
-        let replies = match &self.config.replay_endpoint {
+        let replies = match &self.source.replay_endpoint {
             Some(endpoint) => match replay(endpoint, from, self.config.replay_timeout).await {
                 Ok((replies, _)) => replies,
                 Err(error) => {
                     warn!(
-                        endpoint = %self.config.endpoint,
+                        endpoint = %self.source.endpoint,
+                        rank = self.source.rank,
                         %error,
                         "KV event replay failed; the gap stays"
                     );
@@ -1406,11 +1649,12 @@ impl Relaying<'_> {
         filled
     }
 
-    /// `from..=to` passed without batches: holes in the window.
+    /// `from..=to` passed without batches: holes in the rank's window.
     fn lose(&mut self, from: u64, to: u64) {
         let mut shared = lock(self.shared);
-        shared.history.push_lost_range(from, to);
-        shared.cursor = Some(to);
+        let record = &mut shared.ranks[self.index];
+        record.history.push_lost_range(from, to);
+        record.cursor = Some(to);
         shared.counts.gap_batches_lost += to + 1 - from;
     }
 }
@@ -1556,7 +1800,7 @@ mod tests {
     use zeromq::{PubSocket, RouterSocket, SocketEvent};
 
     use super::{golden, *};
-    use crate::kv_wire::WireBatch;
+    use crate::kv_wire::{Counts as WireCounts, WireBatch};
 
     fn decode(hex: &str) -> WireBatch {
         rmp_serde::from_slice::<TrailingTolerant<WireBatch>>(&golden::bytes(hex))
@@ -1613,6 +1857,53 @@ mod tests {
         );
         assert_eq!(endpoint_for_rank("tcp://host:port", 1), "tcp://host:port");
         assert_eq!(endpoint_for_rank("ipc:///tmp/kv", 1), "ipc:///tmp/kv");
+    }
+
+    /// The sources of a data-parallel publisher are laid out as the engines
+    /// lay their ranks out (and as the Python relay derives them): rank `r`
+    /// on the base port plus `r`, its replay socket likewise.
+    #[test]
+    fn rank_sources_lay_the_ranks_out_like_the_python_relay() {
+        assert_eq!(
+            rank_sources("tcp://*:5557", Some("tcp://*:5600"), 2),
+            vec![
+                RankSource {
+                    rank: 0,
+                    endpoint: "tcp://127.0.0.1:5557".to_string(),
+                    replay_endpoint: Some("tcp://127.0.0.1:5600".to_string()),
+                },
+                RankSource {
+                    rank: 1,
+                    endpoint: "tcp://127.0.0.1:5558".to_string(),
+                    replay_endpoint: Some("tcp://127.0.0.1:5601".to_string()),
+                },
+            ]
+        );
+        // No replay socket; a width below one is one rank.
+        let lone = rank_sources("tcp://*:6000", Some(""), 0);
+        assert_eq!(lone.len(), 1);
+        assert_eq!(
+            (
+                lone[0].rank,
+                lone[0].endpoint.as_str(),
+                lone[0].replay_endpoint.as_deref()
+            ),
+            (0, "tcp://127.0.0.1:6000", None)
+        );
+        let config = RelayConfig::for_publisher("tcp://0.0.0.0:5557", None, "kv", 3);
+        assert_eq!(
+            config
+                .sources
+                .iter()
+                .map(|source| source.endpoint.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "tcp://127.0.0.1:5557",
+                "tcp://127.0.0.1:5558",
+                "tcp://127.0.0.1:5559"
+            ]
+        );
+        assert_eq!(config.label(), "tcp://127.0.0.1:5557");
     }
 
     /// The golden batches convert to exactly what the Python relay produced
@@ -1760,8 +2051,11 @@ mod tests {
             (None, None)
         };
         let relay = KvEventRelay::new(RelayConfig {
-            endpoint,
-            replay_endpoint,
+            sources: vec![RankSource {
+                rank: 0,
+                endpoint,
+                replay_endpoint,
+            }],
             topic: "kv".to_string(),
             history_batches,
             history_bytes: 64 << 20,
@@ -1855,8 +2149,11 @@ mod tests {
             .expect("publisher binds")
             .to_string();
         let relay = KvEventRelay::new(RelayConfig {
-            endpoint,
-            replay_endpoint: None,
+            sources: vec![RankSource {
+                rank: 0,
+                endpoint,
+                replay_endpoint: None,
+            }],
             topic: "kv".to_string(),
             history_batches: 100,
             history_bytes: 64 << 20,
@@ -2044,8 +2341,11 @@ mod tests {
             portpicker::pick_unused_port().expect("a free replay port")
         );
         let relay = KvEventRelay::new(RelayConfig {
-            endpoint,
-            replay_endpoint: Some(replay_endpoint.clone()),
+            sources: vec![RankSource {
+                rank: 0,
+                endpoint,
+                replay_endpoint: Some(replay_endpoint.clone()),
+            }],
             topic: "kv".to_string(),
             history_batches: 100,
             history_bytes: 64 << 20,
@@ -2307,7 +2607,11 @@ mod tests {
             }),
             "the five sequences before the relay joined are unknown"
         );
-        assert_eq!(chunk.dp_rank, Some(1));
+        assert_eq!(
+            chunk.dp_rank,
+            Some(0),
+            "the socket's rank, not the rank the payload names"
+        );
         assert!(is_cleared(&chunk.events[0]));
         assert_eq!(stored_hashes(&chunk), vec![(Some(41), vec![42])]);
         late.publish(6, &batch2).await;
@@ -2492,65 +2796,60 @@ mod tests {
 
     #[test]
     fn restart_rules_read_the_same_on_every_wire() {
-        let mut shared = Shared {
+        let mut record = RankRecord {
             history: History::new(10, usize::MAX),
-            state: LiveState::new(),
             cursor: Some(500),
             started_at: Some(0),
             unknown_before: 0,
-            generation: 0,
-            counts: RelayCounts::default(),
-            wire: WireCounts::default(),
-            failed: None,
         };
         let restart = |reason| Admission::Restart { reason, last: 500 };
-        assert_eq!(shared.admit(501, false), Admission::Accept);
+        assert_eq!(record.admit(501, false), Admission::Accept);
         assert_eq!(
-            shared.admit(501, true),
+            record.admit(501, true),
             Admission::Accept,
             "a flush continues the sequence"
         );
         assert_eq!(
-            shared.admit(503, false),
+            record.admit(503, false),
             Admission::Gap { from: 501, to: 502 }
         );
-        assert_eq!(shared.admit(500, false), Admission::Duplicate);
+        assert_eq!(record.admit(500, false), Admission::Duplicate);
         assert_eq!(
-            shared.admit(500, true),
+            record.admit(500, true),
             restart(RestartReason::StartupClear)
         );
         assert_eq!(
-            shared.admit(499, false),
+            record.admit(499, false),
             restart(RestartReason::SequenceRegression)
         );
         assert_eq!(
-            shared.admit(0, false),
+            record.admit(0, false),
             restart(RestartReason::CounterRestarted)
         );
         assert_eq!(
-            shared.admit(1, true),
+            record.admit(1, true),
             restart(RestartReason::CounterRestarted)
         );
         // Under a cursor of 1, a repeated 1 is a duplicate unless it clears.
-        shared.cursor = Some(1);
-        assert_eq!(shared.admit(1, false), Admission::Duplicate);
+        record.cursor = Some(1);
+        assert_eq!(record.admit(1, false), Admission::Duplicate);
         assert_eq!(
-            shared.admit(1, true),
+            record.admit(1, true),
             Admission::Restart {
                 reason: RestartReason::StartupClear,
                 last: 1
             }
         );
         assert_eq!(
-            shared.admit(0, false),
+            record.admit(0, false),
             Admission::Restart {
                 reason: RestartReason::SequenceRegression,
                 last: 1
             }
         );
-        shared.cursor = None;
+        record.cursor = None;
         assert_eq!(
-            shared.admit(7, true),
+            record.admit(7, true),
             Admission::Accept,
             "no cursor yet: anything goes"
         );
@@ -2745,7 +3044,7 @@ mod tests {
         );
         let mut fresh = late.subscribe(0).expect("a snapshot");
         let chunk = read(&mut fresh).await;
-        assert_eq!((chunk.sequence_number, chunk.dp_rank), (5, Some(1)));
+        assert_eq!((chunk.sequence_number, chunk.dp_rank), (5, Some(0)));
         assert_eq!(
             chunk.snapshot.as_ref().map(|chunk| chunk.unknown_before),
             Some(5)
@@ -2920,6 +3219,248 @@ mod tests {
         .expect("the publisher notices in time");
         assert!(disconnected);
     }
+    /// One publisher per rank, as a data-parallel engine runs them, each on
+    /// its own port, with a started relay over all of them.
+    struct RankLab {
+        publishers: Vec<PubSocket>,
+        relay: Arc<KvEventRelay>,
+    }
+
+    async fn start_rank_lab(ranks: i32, history_batches: usize) -> RankLab {
+        let mut publishers = Vec::new();
+        let mut sources = Vec::new();
+        for rank in 0..ranks {
+            let mut publisher = PubSocket::new();
+            let endpoint = publisher
+                .bind("tcp://127.0.0.1:0")
+                .await
+                .expect("publisher binds")
+                .to_string();
+            publishers.push(publisher);
+            sources.push(RankSource {
+                rank,
+                endpoint,
+                replay_endpoint: None,
+            });
+        }
+        let relay = KvEventRelay::new(RelayConfig {
+            sources,
+            topic: "kv".to_string(),
+            history_batches,
+            history_bytes: 64 << 20,
+            replay_timeout: Duration::from_secs(2),
+            load_tick: DEFAULT_LOAD_TICK,
+            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            heartbeat_backoff: DEFAULT_HEARTBEAT_BACKOFF,
+        });
+        relay.start();
+        RankLab { publishers, relay }
+    }
+
+    impl RankLab {
+        async fn publish(&mut self, rank: usize, sequence: u64, payload: &[u8]) {
+            self.publishers[rank]
+                .send(golden::frame(b"kv", sequence, payload))
+                .await
+                .expect("publish");
+        }
+
+        /// Each subscription reaches its publisher a moment after the
+        /// connect: publish sequence 0 (a store of block 1) on every rank
+        /// until the relay has them all.
+        async fn prime(&mut self) {
+            let payload = store_payload(0.0, &[1], None);
+            let ranks = self.publishers.len();
+            for _ in 0..250 {
+                for rank in 0..ranks {
+                    self.publish(rank, 0, &payload).await;
+                }
+                if self.relay.counts().relayed >= ranks as u64 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("the relay never saw every rank's sequence 0");
+        }
+
+        async fn wait_relayed(&self, count: u64) {
+            for _ in 0..250 {
+                if self.relay.counts().relayed >= count {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!(
+                "the relay relayed {} batches, not {count}",
+                self.relay.counts().relayed
+            );
+        }
+
+        fn subscribe(&self, cursor: u64) -> Result<BoxStream<common::KvEventBatch>, Status> {
+            self.relay.subscribe(common::SubscribeKvEventsRequest {
+                start_sequence_number: cursor,
+                load_records_before_first_batch: false,
+            })
+        }
+    }
+
+    /// `(rank, sequence)` of the next `count` batches of `stream`.
+    async fn tagged(
+        stream: &mut BoxStream<common::KvEventBatch>,
+        count: usize,
+    ) -> Vec<(Option<i32>, u64)> {
+        let mut seen = Vec::with_capacity(count);
+        for _ in 0..count {
+            let batch = read(stream).await;
+            seen.push((batch.dp_rank, batch.sequence_number));
+        }
+        seen
+    }
+
+    /// A worker with two attention-DP ranks publishes two streams, each under
+    /// its own sequence counter: the relay subscribes to both endpoints,
+    /// keeps each rank's own numbers, stamps every batch with its socket's
+    /// rank (the payloads here all name rank 0) and records both ranks'
+    /// blocks; a subscriber from zero gets both windows, rank by rank, then
+    /// the live stream of each.
+    #[tokio::test]
+    async fn every_rank_of_a_data_parallel_publisher_is_relayed_under_its_own_sequence() {
+        let mut lab = start_rank_lab(2, 100).await;
+        lab.prime().await;
+        lab.publish(0, 1, &store_payload(1.0, &[2], Some(1))).await;
+        lab.publish(0, 2, &store_payload(2.0, &[3], Some(2))).await;
+        lab.publish(1, 1, &store_payload(1.0, &[12], Some(1))).await;
+        lab.wait_relayed(5).await;
+        assert_eq!(lab.relay.live_ranks(), 2, "both ranks' blocks are recorded");
+
+        let mut stream = lab.subscribe(0).expect("both windows");
+        assert_eq!(
+            tagged(&mut stream, 5).await,
+            vec![
+                (Some(0), 0),
+                (Some(0), 1),
+                (Some(0), 2),
+                (Some(1), 0),
+                (Some(1), 1)
+            ]
+        );
+        lab.publish(1, 2, &store_payload(2.0, &[13], Some(12)))
+            .await;
+        lab.publish(0, 3, &store_payload(3.0, &[4], Some(3))).await;
+        let mut live = tagged(&mut stream, 2).await;
+        live.sort_unstable();
+        assert_eq!(live, vec![(Some(0), 3), (Some(1), 2)]);
+        assert_eq!(lab.relay.counts().served_from_history, 1);
+    }
+
+    /// The cursor a subscriber resumes with is rank 0's: its window is
+    /// served after it; the other ranks, whose cursors the request does not
+    /// carry, resume live (a fresh stream may send nothing below a cursor
+    /// the gateway holds, which it would read as a publisher restart).
+    #[tokio::test]
+    async fn a_resume_cursor_serves_rank_zero_from_its_window_and_the_other_ranks_live() {
+        let mut lab = start_rank_lab(2, 100).await;
+        lab.prime().await;
+        lab.publish(0, 1, &store_payload(1.0, &[2], Some(1))).await;
+        lab.publish(0, 2, &store_payload(2.0, &[3], Some(2))).await;
+        lab.publish(1, 1, &store_payload(1.0, &[12], Some(1))).await;
+        lab.wait_relayed(5).await;
+
+        let mut stream = lab.subscribe(1).expect("inside rank 0's window");
+        assert_eq!(tagged(&mut stream, 1).await, vec![(Some(0), 2)]);
+        lab.publish(1, 2, &store_payload(2.0, &[13], Some(12)))
+            .await;
+        assert_eq!(tagged(&mut stream, 1).await, vec![(Some(1), 2)]);
+        lab.publish(0, 3, &store_payload(3.0, &[4], Some(3))).await;
+        assert_eq!(tagged(&mut stream, 1).await, vec![(Some(0), 3)]);
+    }
+
+    /// Once a window rolled, a subscriber from zero gets the state snapshot:
+    /// one chunk per rank here, each stamped at its own rank's cursor, so
+    /// each rank's live stream continues right after its chunk.
+    #[tokio::test]
+    async fn a_snapshot_stamps_each_rank_at_its_own_cursor() {
+        let mut lab = start_rank_lab(2, 2).await;
+        lab.prime().await;
+        for seq in 1..=4 {
+            lab.publish(0, seq, &store_payload(seq as f64, &[seq as i64 * 10], None))
+                .await;
+        }
+        lab.publish(1, 1, &store_payload(1.0, &[100], None)).await;
+        lab.wait_relayed(7).await;
+
+        let mut stream = lab.subscribe(0).expect("a snapshot");
+        let first = read(&mut stream).await;
+        let second = read(&mut stream).await;
+        assert_eq!((first.dp_rank, first.sequence_number), (Some(0), 4));
+        assert_eq!(
+            first
+                .snapshot
+                .as_ref()
+                .map(|chunk| (chunk.index, chunk.count)),
+            Some((0, 2))
+        );
+        assert!(is_cleared(&first.events[0]));
+        assert_eq!(
+            stored_hashes(&first)
+                .into_iter()
+                .flat_map(|(_, hashes)| hashes)
+                .collect::<Vec<_>>(),
+            vec![1, 10, 20, 30, 40],
+            "rank 0's live set, the rolled window included"
+        );
+        assert_eq!((second.dp_rank, second.sequence_number), (Some(1), 1));
+        assert_eq!(
+            second
+                .snapshot
+                .as_ref()
+                .map(|chunk| (chunk.index, chunk.count)),
+            Some((1, 2))
+        );
+        assert_eq!(
+            stored_hashes(&second),
+            vec![(None, vec![1]), (None, vec![100])]
+        );
+
+        lab.publish(0, 5, &store_payload(5.0, &[50], None)).await;
+        lab.publish(1, 2, &store_payload(2.0, &[101], None)).await;
+        let mut live = tagged(&mut stream, 2).await;
+        live.sort_unstable();
+        assert_eq!(live, vec![(Some(0), 5), (Some(1), 2)]);
+        assert_eq!(lab.relay.counts().served_snapshots, 1);
+    }
+
+    /// One rank's publisher starting over ends live streams as any restart
+    /// does, but clears that rank's window and blocks only: a fresh
+    /// subscriber gets the other rank's window as it was and the restarted
+    /// rank's new incarnation from its start.
+    #[tokio::test]
+    async fn a_restart_on_one_rank_clears_that_ranks_window_only() {
+        let mut lab = start_rank_lab(2, 100).await;
+        lab.prime().await;
+        lab.publish(0, 1, &store_payload(1.0, &[2], Some(1))).await;
+        lab.publish(1, 1, &store_payload(1.0, &[12], Some(1))).await;
+        lab.publish(1, 2, &store_payload(2.0, &[13], Some(12)))
+            .await;
+        lab.wait_relayed(5).await;
+        let mut stream = lab.subscribe(0).expect("both windows");
+        assert_eq!(tagged(&mut stream, 5).await.len(), 5);
+
+        lab.publish(1, 0, &store_payload(9.0, &[99], None)).await;
+        let status = read_error(&mut stream).await;
+        assert_eq!(status.code(), tonic::Code::DataLoss);
+        assert!(status.message().contains("restarted"));
+        lab.wait_relayed(6).await;
+        assert_eq!(lab.relay.counts().publisher_restarts, 1);
+
+        let mut fresh = lab.subscribe(0).expect("both windows again");
+        assert_eq!(
+            tagged(&mut fresh, 3).await,
+            vec![(Some(0), 0), (Some(0), 1), (Some(1), 0)]
+        );
+        assert_eq!(lab.relay.live_ranks(), 2);
+    }
+
     /// A publisher batch on rank 0 with one `BlockStored`: `hashes` chained
     /// from `parent`, two tokens per block, stamped `ts`.
     fn store_payload(ts: f64, hashes: &[i64], parent: Option<i64>) -> Vec<u8> {

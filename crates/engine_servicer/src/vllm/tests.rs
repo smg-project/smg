@@ -1842,7 +1842,9 @@ async fn subscribe_kv_events_relays_a_publisher_or_is_unimplemented() {
         }
     };
     assert_eq!(second.sequence_number, 1);
-    assert_eq!(second.dp_rank, Some(1));
+    // The socket's rank (the relay follows rank 0's publisher here) wins over
+    // the rank the payload names.
+    assert_eq!(second.dp_rank, Some(0));
     let stored = match &second.events[0].data {
         Some(common::kv_cache_event::Data::Stored(stored)) => stored,
         other => panic!("expected a stored event, got {other:?}"),

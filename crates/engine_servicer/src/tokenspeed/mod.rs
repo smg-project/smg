@@ -221,10 +221,13 @@ impl TokenSpeedServicerServer {
                 "model_path must not be empty".to_string(),
             ));
         }
+        // One publisher per data-parallel rank: the launcher's width (the
+        // handshake's figure, which may differ, is not known yet).
         let kv_relay = crate::kv_events::KvEventRelay::for_publisher(
             &config.model.kv_events_endpoint,
             Some(&config.model.kv_events_replay_endpoint),
             &config.model.kv_events_topic,
+            u32::try_from(config.model.data_parallel_size).unwrap_or(1),
         );
         let state = Arc::new(State {
             tokenizer_dir: config.servicer.tokenizer_dir.clone(),
