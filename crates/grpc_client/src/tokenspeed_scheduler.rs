@@ -7,8 +7,6 @@
 //! native types — the router consumes them through dedicated
 //! `ModelInfo::TokenSpeed` / `ServerInfo::TokenSpeed` enum arms.
 
-use std::{future::Future, pin::Pin, sync::Arc};
-
 use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
     messages::CreateMessageRequest, responses::ResponsesRequest,
@@ -22,7 +20,7 @@ use crate::{
         completion_constraint, plain_constraint, response_format_schema, stop_strings,
         ConstraintKind, PlainSampling,
     },
-    AbortOnDropClient, BoxedTraceInjector, NoopTraceInjector,
+    BoxedTraceInjector,
 };
 
 #[expect(clippy::allow_attributes)]
@@ -48,76 +46,14 @@ pub struct TokenSpeedSchedulerClient {
     trace_injector: BoxedTraceInjector,
 }
 
-impl AbortOnDropClient for TokenSpeedSchedulerClient {
-    fn abort_for_drop(
-        self,
-        request_id: String,
-    ) -> Pin<Box<dyn Future<Output = Result<(), tonic::Status>> + Send>> {
-        Box::pin(async move {
-            self.abort_request(request_id, "Stream dropped".to_string())
-                .await
-        })
-    }
-}
+crate::impl_abort_for_drop_with_reason!(TokenSpeedSchedulerClient);
 
 impl TokenSpeedSchedulerClient {
-    pub async fn connect(endpoint: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::connect_with_trace_injector(endpoint, Arc::new(NoopTraceInjector)).await
-    }
-
-    pub async fn connect_with_trace_injector(
-        endpoint: &str,
-        trace_injector: BoxedTraceInjector,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        debug!("Connecting to TokenSpeed scheduler at {}", endpoint);
-        let channel = crate::channel::connect_channel(endpoint).await?;
-        let client =
-            tokenspeed_proto::token_speed_scheduler_client::TokenSpeedSchedulerClient::new(channel);
-
-        Ok(Self {
-            client,
-            trace_injector,
-        })
-    }
-
-    #[must_use]
-    pub fn with_trace_injector(mut self, trace_injector: BoxedTraceInjector) -> Self {
-        self.trace_injector = trace_injector;
-        self
-    }
-
-    /// Submit a generation request.
-    pub async fn generate(
-        &self,
-        req: tokenspeed_proto::GenerateRequest,
-    ) -> Result<AbortOnDropStream, tonic::Status> {
-        let request_id = req.request_id.clone();
-
-        let mut client = self.client.clone();
-        let mut request = Request::new(req);
-
-        if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
-            warn!("Failed to inject trace context: {}", e);
-        }
-
-        let response = client.generate(request).await?;
-
-        Ok(AbortOnDropStream::new(
-            response.into_inner(),
-            request_id,
-            self.clone(),
-        ))
-    }
-
-    pub async fn health_check(
-        &self,
-    ) -> Result<tokenspeed_proto::HealthCheckResponse, tonic::Status> {
-        debug!("Sending TokenSpeed health check request");
-        let request = Request::new(tokenspeed_proto::HealthCheckRequest {});
-        let mut client = self.client.clone();
-        let response = client.health_check(request).await?;
-        Ok(response.into_inner())
-    }
+    crate::impl_engine_client_basics!(
+        tokenspeed_proto,
+        tokenspeed_proto::token_speed_scheduler_client::TokenSpeedSchedulerClient<Channel>,
+        "TokenSpeed"
+    );
 
     pub async fn abort_request(
         &self,
@@ -141,24 +77,6 @@ impl TokenSpeedSchedulerClient {
             response.get_ref().message
         );
         Ok(())
-    }
-
-    pub async fn get_model_info(
-        &self,
-    ) -> Result<tokenspeed_proto::GetModelInfoResponse, tonic::Status> {
-        let request = Request::new(tokenspeed_proto::GetModelInfoRequest {});
-        let mut client = self.client.clone();
-        let response = client.get_model_info(request).await?;
-        Ok(response.into_inner())
-    }
-
-    pub async fn get_server_info(
-        &self,
-    ) -> Result<tokenspeed_proto::GetServerInfoResponse, tonic::Status> {
-        let request = Request::new(tokenspeed_proto::GetServerInfoRequest {});
-        let mut client = self.client.clone();
-        let response = client.get_server_info(request).await?;
-        Ok(response.into_inner())
     }
 
     pub async fn get_loads(

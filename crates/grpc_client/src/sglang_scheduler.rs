@@ -1,5 +1,3 @@
-use std::{future::Future, pin::Pin};
-
 use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
     messages::CreateMessageRequest, responses::ResponsesRequest,
@@ -13,7 +11,7 @@ use crate::{
         completion_constraint, plain_constraint, response_format_schema, stop_strings,
         ConstraintKind, PlainSampling,
     },
-    AbortOnDropClient, BoxedTraceInjector,
+    BoxedTraceInjector,
 };
 
 // Include the generated protobuf code
@@ -43,51 +41,14 @@ pub struct SglangGenerateRequestOptions {
     pub require_reasoning: bool,
 }
 
-impl AbortOnDropClient for SglangSchedulerClient {
-    fn abort_for_drop(
-        self,
-        request_id: String,
-    ) -> Pin<Box<dyn Future<Output = Result<(), tonic::Status>> + Send>> {
-        Box::pin(async move {
-            self.abort_request(request_id, "Stream dropped".to_string())
-                .await
-        })
-    }
-}
+crate::impl_abort_for_drop_with_reason!(SglangSchedulerClient);
 
 impl SglangSchedulerClient {
     crate::impl_engine_client_basics!(
+        proto,
         proto::sglang_scheduler_client::SglangSchedulerClient<Channel>,
         "SGLang scheduler"
     );
-
-    /// Submit a generation request (returns auto-aborting streaming response)
-    ///
-    /// The returned stream automatically sends an abort request when dropped,
-    /// ensuring proper cleanup even if the HTTP client disconnects or an error occurs.
-    /// Call `mark_completed()` on the stream after successful completion to prevent
-    /// unnecessary abort RPCs.
-    pub async fn generate(
-        &self,
-        req: proto::GenerateRequest,
-    ) -> Result<AbortOnDropStream, tonic::Status> {
-        let request_id = req.request_id.clone();
-        let mut client = self.client.clone();
-        let mut request = Request::new(req);
-
-        // Inject W3C trace context into gRPC metadata for distributed tracing
-        if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
-            warn!("Failed to inject trace context: {}", e);
-        }
-
-        let response = client.generate(request).await?;
-
-        Ok(AbortOnDropStream::new(
-            response.into_inner(),
-            request_id,
-            self.clone(),
-        ))
-    }
 
     /// Submit an embedding request
     pub async fn embed(

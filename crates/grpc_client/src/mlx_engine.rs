@@ -1,4 +1,4 @@
-use std::{collections::HashMap, future::Future, pin::Pin};
+use std::collections::HashMap;
 
 use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
@@ -6,9 +6,9 @@ use openai_protocol::{
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
 use tonic::{transport::Channel, Request};
-use tracing::{debug, warn};
+use tracing::debug;
 
-use crate::{AbortOnDropClient, BoxedTraceInjector};
+use crate::BoxedTraceInjector;
 
 // Include the generated protobuf code
 #[expect(clippy::allow_attributes)]
@@ -28,42 +28,14 @@ pub struct MlxEngineClient {
     trace_injector: BoxedTraceInjector,
 }
 
-impl AbortOnDropClient for MlxEngineClient {
-    fn abort_for_drop(
-        self,
-        request_id: String,
-    ) -> Pin<Box<dyn Future<Output = Result<(), tonic::Status>> + Send>> {
-        Box::pin(async move {
-            self.abort_request(request_id, "Stream dropped".to_string())
-                .await
-        })
-    }
-}
+crate::impl_abort_for_drop_with_reason!(MlxEngineClient);
 
 impl MlxEngineClient {
-    crate::impl_engine_client_basics!(proto::mlx_engine_client::MlxEngineClient<Channel>, "MLX");
-
-    /// Submit a generation request (returns auto-aborting streaming response)
-    pub async fn generate(
-        &self,
-        req: proto::GenerateRequest,
-    ) -> Result<AbortOnDropStream, tonic::Status> {
-        let request_id = req.request_id.clone();
-        let mut client = self.client.clone();
-        let mut request = Request::new(req);
-
-        if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
-            warn!("Failed to inject trace context: {}", e);
-        }
-
-        let response = client.generate(request).await?;
-
-        Ok(AbortOnDropStream::new(
-            response.into_inner(),
-            request_id,
-            self.clone(),
-        ))
-    }
+    crate::impl_engine_client_basics!(
+        proto,
+        proto::mlx_engine_client::MlxEngineClient<Channel>,
+        "MLX"
+    );
 
     /// Abort a request
     pub async fn abort_request(

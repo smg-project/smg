@@ -53,37 +53,10 @@ impl AbortOnDropClient for TrtllmServiceClient {
 
 impl TrtllmServiceClient {
     crate::impl_engine_client_basics!(
+        proto,
         proto::trtllm_service_client::TrtllmServiceClient<Channel>,
         "TensorRT-LLM"
     );
-
-    /// Submit a generation request (returns auto-aborting streaming response)
-    ///
-    /// The returned stream automatically sends an abort request when dropped,
-    /// ensuring proper cleanup even if the HTTP client disconnects or an error occurs.
-    /// Call `mark_completed()` on the stream after successful completion to prevent
-    /// unnecessary abort RPCs.
-    pub async fn generate(
-        &self,
-        req: proto::GenerateRequest,
-    ) -> Result<AbortOnDropStream, tonic::Status> {
-        let request_id = req.request_id.clone();
-        let mut client = self.client.clone();
-        let mut request = Request::new(req);
-
-        // Inject W3C trace context into gRPC metadata for distributed tracing
-        if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
-            warn!("Failed to inject trace context: {}", e);
-        }
-
-        let response = client.generate(request).await?;
-
-        Ok(AbortOnDropStream::new(
-            response.into_inner(),
-            request_id,
-            self.clone(),
-        ))
-    }
 
     /// Abort a request
     pub async fn abort_request(
