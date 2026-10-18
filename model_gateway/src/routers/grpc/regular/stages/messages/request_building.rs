@@ -352,7 +352,10 @@ impl BuildStage for MessageRequestBuildingStage {
 
         // Symphony's assignment, taken while the rendered prompt is still here (see
         // `regular::symphony`): the response spec carries it to the drivers, and the state
-        // records which parser reads the message for the response's header.
+        // records which parser reads the message for the response's header. It takes the
+        // constraint as the request carries it, before the worker's shaping in the plan
+        // builder below: the assignment reads the constraint's kind alone, which the shaping
+        // leaves as it is, in the order the chat builder has.
         let assignment = symphony::assign(
             parser,
             &names,
