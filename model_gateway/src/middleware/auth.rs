@@ -142,14 +142,17 @@ pub async fn auth_middleware(
         // The gateway's key is spent: it identifies the caller and nothing
         // else, and it must not travel on as an upstream's credential; a
         // gateway key presented a second time under a provider's own header
-        // name goes with it, where a caller's own provider key there stays.
+        // name goes with it (every value of a repeated header is read, since
+        // the removal takes the whole name), where a caller's own provider
+        // key there stays.
         request.headers_mut().remove(header::AUTHORIZATION);
         for name in PROVIDER_KEY_HEADERS {
             let is_a_gateway_key = request
                 .headers()
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| auth_config.contains_token(value.trim()));
+                .get_all(name)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .any(|value| auth_config.contains_token(value.trim()));
             if is_a_gateway_key {
                 request.headers_mut().remove(name);
             }
@@ -263,8 +266,9 @@ mod tests {
     }
 
     /// A gateway key presented under a provider's own header name beside the
-    /// bearer ends at the middleware too; a caller's own provider key in
-    /// those headers (bring your own key) stays.
+    /// bearer ends at the middleware too, wherever it sits among a repeated
+    /// header's values; a caller's own provider key in those headers (bring
+    /// your own key) stays.
     #[tokio::test]
     async fn a_gateway_key_under_a_providers_header_name_ends_at_the_middleware_too() {
         let app = || {
@@ -295,6 +299,20 @@ mod tests {
         let response = app().oneshot(own).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_text(response).await, "x-api-key=providers-own-key");
+
+        // The caller's own key first, the gateway's key in a later value of
+        // the same header: the whole name goes, since one value is the
+        // gateway's and a header is removed by name.
+        let repeated = Request::builder()
+            .uri("/")
+            .header(header::AUTHORIZATION, "Bearer shared-secret")
+            .header("x-api-key", "providers-own-key")
+            .header("x-api-key", "shared-secret")
+            .body(Body::empty())
+            .unwrap();
+        let response = app().oneshot(repeated).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_text(response).await, "");
     }
 
     async fn authorization_after(auth_config: AuthConfig, bearer: Option<&str>) -> String {
