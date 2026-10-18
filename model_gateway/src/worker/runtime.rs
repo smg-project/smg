@@ -140,6 +140,10 @@ pub struct WorkerRuntime {
     /// Clock before which this thin worker, with requests in flight, takes
     /// no further diverted hit.
     divert_until_ms: AtomicU64,
+    /// When a re-discovery of the worker's models was last claimed (see
+    /// [`Worker::claim_models_refresh`]), in [`super::liveness::now_ms`]
+    /// milliseconds; zero until the first claim.
+    models_refresh_claimed_ms: AtomicU64,
     /// When the current run of in-flight requests began (the load counter
     /// left zero), in [`super::liveness::now_ms`] milliseconds; zero while
     /// idle. The no-progress clock of the wedged rule starts here, not at
@@ -445,6 +449,7 @@ impl WorkerRuntime {
             warmup_base_admitted_ms: AtomicU64::new(u64::MAX),
             warmup_base_blocks: AtomicUsize::new(0),
             divert_until_ms: AtomicU64::new(0),
+            models_refresh_claimed_ms: AtomicU64::new(0),
             busy_since_ms: AtomicU64::new(0),
             tracked_in_flight: AtomicUsize::new(0),
             producing_streams: AtomicUsize::new(0),
@@ -467,6 +472,20 @@ impl WorkerRuntime {
 
     pub fn note_diverted(&self, until_ms: u64) {
         self.divert_until_ms.store(until_ms, Ordering::Relaxed);
+    }
+
+    /// Claim a models refresh at `now_ms` unless one was claimed less than
+    /// `interval_ms` ago: one compare-exchange on the stamp, so of several
+    /// concurrent claimants exactly one wins. Zero means never claimed, so a
+    /// claim in the clock's first millisecond is recorded as 1.
+    pub fn claim_models_refresh(&self, now_ms: u64, interval_ms: u64) -> bool {
+        let last = self.models_refresh_claimed_ms.load(Ordering::Relaxed);
+        if last != 0 && now_ms.saturating_sub(last) < interval_ms {
+            return false;
+        }
+        self.models_refresh_claimed_ms
+            .compare_exchange(last, now_ms.max(1), Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
     }
 
     /// Blocks the index has gained for the worker since its current admission.

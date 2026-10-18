@@ -45,8 +45,9 @@ impl<'a> WorkerSelector<'a> {
     /// 1. Filter available workers by the request criteria.
     /// 2. Pick the least-loaded worker that supports the model.
     /// 3. On miss, re-discover the external workers' models with the key the
-    ///    operator configured for each (registration's discovery, run again),
-    ///    then retry.
+    ///    operator configured for each (registration's discovery, run again,
+    ///    at most once per [`REFRESH_MIN_INTERVAL_MS`] per worker), then
+    ///    retry.
     /// 4. Return an error distinguishing "model not found" from "all
     ///    workers circuit-broken".
     pub async fn select_worker(
@@ -164,7 +165,8 @@ impl<'a> WorkerSelector<'a> {
     }
 
     /// Re-discover the models of the healthy external workers in parallel,
-    /// each with the key the operator configured for it.
+    /// each with the key the operator configured for it and at most once per
+    /// [`REFRESH_MIN_INTERVAL_MS`] per worker.
     ///
     /// When `router` is set, only workers it takes are refreshed: the others
     /// cannot serve this request, so re-reading their catalogues would be a
@@ -233,13 +235,31 @@ fn filter_by_router(
     }
 }
 
+/// The least time between two re-discoveries of one worker's models. A miss
+/// is one request's doing and a provider's catalogue changes rarely; without
+/// a floor, a run of requests for unknown model ids (a loop of made-up names,
+/// a client retrying a typo) made the gateway send its own `/v1/models`
+/// request on the operator's key once per request per worker, concurrently,
+/// and spend the operator's provider rate limit on it. Within the interval a
+/// miss is answered from the cards as they stand; a model the provider added
+/// since is admitted by the first miss after it. The claim counts the
+/// attempt, so a refresh that fails (a refused key, a transient error, the
+/// refresh timeout) is not repeated per miss either: the next attempt is the
+/// first miss after the interval.
+pub(crate) const REFRESH_MIN_INTERVAL_MS: u64 = 30_000;
+
 /// Re-discover one external worker's models and store them: the registration
 /// discovery run again, with the key the operator configured for the worker
 /// (the provider's admin key from the environment, else the worker's
 /// `api_key`), the cards grouped as registration groups them and narrowed to
 /// the providers this build routes. A worker without a configured key was
 /// registered as a wildcard, which admits every model and had nothing to
-/// discover, and is left alone.
+/// discover, and is left alone. So is a worker refreshed within
+/// [`REFRESH_MIN_INTERVAL_MS`]; of concurrent misses one asks the provider
+/// and the others are answered from the cards as they stand, without waiting
+/// for its answer (see [`Worker::claim_models_refresh`]): concurrent first
+/// requests for a model the provider just added see the winner served and
+/// the rest refused until its refresh lands.
 ///
 /// No credential of the caller's request takes part: the cards are shared by
 /// every caller, so only the operator's view of the provider may be written
@@ -252,6 +272,14 @@ async fn refresh_worker_models(worker: &Arc<dyn Worker>) {
     else {
         return;
     };
+    if !worker.claim_models_refresh(REFRESH_MIN_INTERVAL_MS) {
+        tracing::debug!(
+            "Model refresh from {} skipped: one was claimed within the last {} ms",
+            spec.url,
+            REFRESH_MIN_INTERVAL_MS
+        );
+        return;
+    }
 
     let cards = match fetch_models(&spec.url, Some(&api_key), provider.as_ref()).await {
         Ok(cards) => cards,
@@ -568,6 +596,57 @@ mod tests {
         let ids: Vec<&str> = cards.iter().map(|card| card.id.as_str()).collect();
         assert_eq!(ids, ["operator-model", "released-later"]);
         assert_eq!(cards[1].aliases, ["released-later-2026-01-01"]);
+    }
+
+    /// A burst of misses asks the provider once: of concurrent misses for
+    /// distinct unknown ids one refreshes, a miss after them within the
+    /// interval makes no request, and the cards hold what that one refresh
+    /// found. Before, every miss sent its own `/v1/models` request.
+    #[tokio::test]
+    async fn a_burst_of_misses_asks_the_provider_once_per_interval() {
+        let (url, seen, server) =
+            stub_provider(|_| Some(vec!["operator-model", "released-later"])).await;
+        let registry = WorkerRegistry::new();
+        let keyed = external_worker(&url, Some("operator-key"), &["operator-model"]);
+        registry.register_or_replace(Arc::clone(&keyed));
+
+        let ids: Vec<String> = (0..16).map(|i| format!("unknown-{i}")).collect();
+        let misses = ids.iter().map(|id| async {
+            WorkerSelector::new(&registry)
+                .select_worker(&SelectWorkerRequest {
+                    model_id: id,
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        });
+        assert!(
+            join_all(misses).await.into_iter().all(|refused| refused),
+            "unknown ids stay unknown"
+        );
+        assert_eq!(
+            seen.lock().expect("record").len(),
+            1,
+            "one refresh for the burst"
+        );
+
+        let refused = WorkerSelector::new(&registry)
+            .select_worker(&SelectWorkerRequest {
+                model_id: "unknown-later",
+                ..Default::default()
+            })
+            .await;
+        assert!(refused.is_err());
+        server.abort();
+        assert_eq!(
+            seen.lock().expect("record").len(),
+            1,
+            "a miss within the interval asks nothing"
+        );
+        assert!(
+            keyed.supports_model("released-later"),
+            "the one refresh's cards stand"
+        );
     }
 
     /// A worker registered without a key is a wildcard: registration
