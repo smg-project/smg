@@ -492,7 +492,14 @@ async fn run_health_loop(
             signal = recv_connect_signal(&mut connect_rx) => {
                 match signal {
                     Some(connected) => {
-                        apply_connect_signal(&registry, connected, &mut next_check, &config);
+                        apply_connect_signal_and_refresh(
+                            &registry,
+                            connected,
+                            &mut next_check,
+                            &config,
+                            job_queue.as_ref(),
+                        )
+                        .await;
                     }
                     // Every sender lives on the registry (Arc), so recv() only
                     // returns None if the registry itself is gone. Drop the
@@ -760,22 +767,45 @@ async fn recv_connect_signal(
     }
 }
 
+/// A connect signal is a transition into service like a probe's: the
+/// promoted worker's labels follow its engine under the same rule
+/// (`labels_follow_the_engine`, a job queue to run the refresh on).
+async fn apply_connect_signal_and_refresh(
+    registry: &Arc<WorkerRegistry>,
+    connected: WorkerConnected,
+    next_check: &mut HashMap<WorkerId, tokio::time::Instant>,
+    config: &WorkerManagerConfig,
+    job_queue: Option<&Arc<JobQueue>>,
+) {
+    let Some((worker_id, worker)) = apply_connect_signal(registry, connected, next_check, config)
+    else {
+        return;
+    };
+    if let Some(jq) = job_queue {
+        if labels_follow_the_engine(registry, &worker_id, &worker) {
+            submit_label_refresh(&worker, jq).await;
+        }
+    }
+}
+
 /// Promote a worker whose backend handshake just completed, or that the
 /// health checker demoted and that has just answered a contact (see
 /// `worker::liveness::on_contact`), without waiting for its next scheduled
 /// poll. Resolves the URL to a live worker id and flips the status through the
 /// revision-checked setter, so a signal that lost a race with a same-URL
-/// replacement — or a worker already removed — is discarded.
+/// replacement — or a worker already removed — is discarded. Returns the
+/// worker the signal moved into service, for what follows a transition
+/// (the label refresh); `None` when nothing moved.
 fn apply_connect_signal(
     registry: &Arc<WorkerRegistry>,
     connected: WorkerConnected,
     next_check: &mut HashMap<WorkerId, tokio::time::Instant>,
     config: &WorkerManagerConfig,
-) {
+) -> Option<(WorkerId, Arc<dyn Worker>)> {
     let WorkerConnected { url, revision } = connected;
     let Some(worker_id) = registry.get_id_by_url(&url) else {
         debug!(worker_url = %url, "Connect signal for an unknown worker; ignoring");
-        return;
+        return None;
     };
     // A Failed worker under removal is on its way out: the contact that
     // signalled it was a last poll, not a return.
@@ -789,7 +819,7 @@ fn apply_connect_signal(
         ) == ProbeSlot::Removal
     }) {
         debug!(worker_url = %url, "Connect signal for a worker being removed; ignoring");
-        return;
+        return None;
     }
     match registry.transition_status_if_revision(&worker_id, revision, WorkerStatus::Ready) {
         Some((old, new)) => {
@@ -798,21 +828,22 @@ fn apply_connect_signal(
             // here whatever its slot was (a Failed worker's may have gone):
             // otherwise a later engine death would leave it Ready with a dead
             // client forever.
-            if let Some(worker) = registry.get(&worker_id) {
-                let slot = ProbeSlot::of_worker(registry, &worker_id, worker.as_ref(), new, config);
-                schedule_at(
-                    next_check,
-                    worker_id,
-                    slot,
-                    tokio::time::Instant::now(),
-                    false,
-                );
-            }
+            let worker = registry.get(&worker_id)?;
+            let slot = ProbeSlot::of_worker(registry, &worker_id, worker.as_ref(), new, config);
+            schedule_at(
+                next_check,
+                worker_id.clone(),
+                slot,
+                tokio::time::Instant::now(),
+                false,
+            );
+            Some((worker_id, worker))
         }
         None => {
             // No transition: already Ready (idempotent), or a stale revision
             // after a same-URL replacement. Polling covers either case.
             debug!(worker_url = %url, "Connect signal applied no transition");
+            None
         }
     }
 }
@@ -928,16 +959,23 @@ fn labels_follow_the_engine(
 /// registered on provisional information. Its labels, and everything derived
 /// from them (the decode admission window, multimodal placement, PD pairing),
 /// are re-read through the update workflow, which rebuilds the worker only if
-/// they changed. A failed submission is logged; the next transition retries.
+/// they changed. While another job for the worker is in flight (its
+/// registration, which just read the labels; an update) nothing is submitted:
+/// the refresh would take that job's status under the URL. A skipped or
+/// failed submission is logged; the next transition retries.
 async fn submit_label_refresh(worker: &Arc<dyn Worker>, job_queue: &Arc<JobQueue>) {
     let url = worker.url().to_string();
     match job_queue
-        .submit(Job::RefreshWorkerLabels { url: url.clone() })
+        .submit_unless_in_flight(Job::RefreshWorkerLabels { url: url.clone() })
         .await
     {
-        Ok(()) => debug!(
+        Ok(true) => debug!(
             worker_url = %url,
             "Submitted a label refresh for a worker that came into service"
+        ),
+        Ok(false) => debug!(
+            worker_url = %url,
+            "A job for the worker is in flight; its label refresh waits for the next transition into service"
         ),
         Err(error) => warn!(
             worker_url = %url,
@@ -2074,6 +2112,81 @@ mod tests {
         assert!(
             next_check.contains_key(&worker_id),
             "a promoted worker must be probed again"
+        );
+    }
+
+    /// The signal's promotion is reported for what follows a transition into
+    /// service (the label refresh): the worker it moved, and nothing when the
+    /// signal moved nothing (already Ready, or an unknown URL).
+    #[test]
+    fn apply_connect_signal_reports_the_promoted_worker() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker = make_worker("http://w:1", 2, 3);
+        worker.set_status(WorkerStatus::NotReady);
+        let revision = worker.revision();
+        let worker_id = registry.register(worker.clone()).unwrap();
+        let mut next_check = HashMap::new();
+        let signal = || WorkerConnected {
+            url: "http://w:1".to_string(),
+            revision,
+        };
+
+        let (promoted_id, promoted) =
+            apply_connect_signal(&registry, signal(), &mut next_check, &test_config())
+                .expect("a NotReady worker answering a contact is promoted");
+        assert!(promoted_id == worker_id);
+        assert_eq!(promoted.url(), "http://w:1");
+        assert!(
+            apply_connect_signal(&registry, signal(), &mut next_check, &test_config()).is_none(),
+            "a second signal moves nothing: the worker is Ready already"
+        );
+        assert!(
+            apply_connect_signal(
+                &registry,
+                WorkerConnected {
+                    url: "http://elsewhere:1".to_string(),
+                    revision,
+                },
+                &mut next_check,
+                &test_config(),
+            )
+            .is_none(),
+            "an unknown URL moves nothing"
+        );
+    }
+
+    /// A promotion by contact is a transition into service like one by probe:
+    /// the label refresh is submitted for a locally registered worker.
+    #[tokio::test]
+    async fn a_connect_signal_promotion_submits_a_label_refresh() {
+        use crate::{
+            service_discovery::testing::create_test_app_context, workflow::JobQueueConfig,
+        };
+        let app_context = create_test_app_context();
+        let registry = Arc::clone(&app_context.worker_registry);
+        let job_queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&app_context));
+
+        let worker = discovered_worker("http://local:11");
+        worker.set_status(WorkerStatus::NotReady);
+        let revision = worker.revision();
+        registry.register(worker.clone()).unwrap();
+        let mut next_check = HashMap::new();
+        apply_connect_signal_and_refresh(
+            &registry,
+            WorkerConnected {
+                url: "http://local:11".to_string(),
+                revision,
+            },
+            &mut next_check,
+            &test_config(),
+            Some(&job_queue),
+        )
+        .await;
+
+        assert_eq!(worker.status(), WorkerStatus::Ready);
+        assert!(
+            job_queue.get_status("http://local:11").is_some(),
+            "a refresh job was submitted for the worker the contact promoted"
         );
     }
 

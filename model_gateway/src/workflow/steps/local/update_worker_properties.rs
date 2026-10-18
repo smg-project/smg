@@ -3,7 +3,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
-use openai_protocol::worker::{WorkerModels, WorkerStatus};
+use openai_protocol::worker::{WorkerModels, WorkerSpec, WorkerStatus};
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
@@ -41,7 +41,17 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
         // rebuilds a worker only when that changes something; an API update
         // merges the request's labels into the existing ones.
         let refresh = context.data.refresh_discovered_labels;
-        let fresh_engine_labels = context.data.fresh_engine_labels.clone();
+        // The engine's KV transfer metadata travels in its report under label
+        // names and is never a label (registration takes it out the same way,
+        // `create_worker::take_kv_transfer_metadata`): out of the report before
+        // any merge, applied to the worker's dedicated fields below.
+        let (fresh_engine_labels, fresh_kv) = match context.data.fresh_engine_labels.clone() {
+            Some(mut fresh) => {
+                let kv = EngineKvMetadata::take(&mut fresh);
+                (Some(fresh), kv)
+            }
+            None => (None, EngineKvMetadata::default()),
+        };
         let snapshot = context.data.snapshot.clone();
         if refresh && fresh_engine_labels.is_none() {
             debug!("No engine labels were re-read; nothing to update");
@@ -165,7 +175,17 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
         for (index, (worker, (updated_labels, models, card_fields))) in
             workers_to_update.iter().zip(merged).enumerate()
         {
-            if refresh && updated_labels == worker.metadata().spec.labels {
+            if refresh {
+                // The engine's id is the worker's live id from here, rebuilt
+                // or not (a rebuilt worker shares the cell): the id a handoff
+                // must target is the one the engine reports, as the recovery
+                // re-read holds.
+                fresh_kv.apply_engine_id(worker);
+            }
+            if refresh
+                && updated_labels == worker.metadata().spec.labels
+                && !fresh_kv.fills_a_field_of(&worker.metadata().spec)
+            {
                 debug!(
                     worker_url = %worker.url(),
                     "Engine labels unchanged; the worker is kept as it is"
@@ -273,6 +293,12 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             if let Some(config) = circuit_breaker_config {
                 builder = builder.circuit_breaker_config(config);
             }
+            if refresh {
+                // A connector or role the operator configured none of follows
+                // the engine's report; a configured one stands, as at
+                // registration.
+                builder = fresh_kv.fill_fields(builder, &worker.metadata().spec);
+            }
 
             // Adopt the old worker's client only if it was materialized: a
             // never-HTTP worker (ZMQ) keeps a deferred slot instead of having
@@ -379,6 +405,66 @@ fn models_for_labels(
             (WorkerModels::Single(Box::new(card)), changed)
         }
         models => (models.clone(), Vec::new()),
+    }
+}
+
+/// The engine's KV transfer metadata, which its report carries under label
+/// names (`kv_connector`, `kv_role`, `kv_engine_id`) and the worker holds in
+/// dedicated fields, as at registration (`create_worker::take_kv_transfer_metadata`).
+#[derive(Debug, Default)]
+struct EngineKvMetadata {
+    connector: Option<String>,
+    role: Option<String>,
+    engine_id: Option<String>,
+}
+
+impl EngineKvMetadata {
+    /// Takes the three keys out of the report; an empty value is none.
+    fn take(report: &mut HashMap<String, String>) -> Self {
+        let mut take = |key: &str| report.remove(key).filter(|value| !value.is_empty());
+        Self {
+            connector: take("kv_connector"),
+            role: take("kv_role"),
+            engine_id: take("kv_engine_id"),
+        }
+    }
+
+    /// Whether a rebuild would set a field the operator left unset.
+    fn fills_a_field_of(&self, spec: &WorkerSpec) -> bool {
+        (self.connector.is_some() && spec.kv_connector.is_none())
+            || (self.role.is_some() && spec.kv_role.is_none())
+    }
+
+    /// The fields the operator left unset, from the engine's report.
+    fn fill_fields(
+        &self,
+        mut builder: BasicWorkerBuilder,
+        spec: &WorkerSpec,
+    ) -> BasicWorkerBuilder {
+        if let (Some(connector), None) = (&self.connector, &spec.kv_connector) {
+            builder = builder.kv_connector(connector);
+        }
+        if let (Some(role), None) = (&self.role, &spec.kv_role) {
+            builder = builder.kv_role(role);
+        }
+        builder
+    }
+
+    /// A reported engine id is the worker's live id, confirmed by this read.
+    fn apply_engine_id(&self, worker: &Arc<dyn Worker>) {
+        let Some(engine_id) = &self.engine_id else {
+            return;
+        };
+        let previous = worker.kv_engine_id();
+        if worker.refresh_kv_engine_id(Some(engine_id.clone())) {
+            info!(
+                worker_url = %worker.url(),
+                ?previous,
+                engine_id,
+                "The worker's KV engine id follows its engine's report"
+            );
+        }
+        worker.set_kv_engine_id_confirmed(true);
     }
 }
 
@@ -908,6 +994,95 @@ mod tests {
             "an unchanged engine report rebuilds nothing"
         );
         assert!(again.data.updated_workers.as_ref().unwrap().is_empty());
+    }
+
+    /// The engine's KV transfer metadata arrives in its report under label
+    /// names: it is never a label (as at registration), a reported role fills
+    /// a field the operator left unset while a configured connector stands,
+    /// and the engine's id is the worker's live id from then on, rebuilt or
+    /// not.
+    #[tokio::test]
+    async fn a_label_refresh_keeps_the_engines_kv_metadata_out_of_the_labels_and_in_its_fields() {
+        let discovered = labels_of(&[("max_num_seqs", "256")]);
+        let mut spec = WorkerSpec::new("grpc://decode:8000");
+        spec.worker_type = WorkerType::Decode;
+        spec.connection_mode = ConnectionMode::Grpc;
+        spec.kv_connector = Some("NixlConnector".to_string());
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::from_spec(spec)
+                .labels(discovered.clone())
+                .discovered_labels(discovered)
+                .status(WorkerStatus::Ready)
+                .build(),
+        );
+        assert_eq!(worker.kv_engine_id(), None);
+        let app_ctx = make_app_context(std::slice::from_ref(&worker));
+
+        let fresh = labels_of(&[
+            ("max_num_seqs", "8"),
+            ("kv_connector", "MooncakeConnector"),
+            ("kv_role", "kv_consumer"),
+            ("kv_engine_id", "engine-late"),
+        ]);
+        let mut refresh = make_refresh_context(Arc::clone(&app_ctx), Arc::clone(&worker), fresh);
+        assert_eq!(
+            UpdateWorkerPropertiesStep
+                .execute(&mut refresh)
+                .await
+                .unwrap(),
+            StepResult::Success
+        );
+        let rebuilt = app_ctx
+            .worker_registry
+            .get_by_url("grpc://decode:8000")
+            .expect("the worker stays registered");
+        assert_eq!(
+            rebuilt.metadata().spec.labels,
+            labels_of(&[("max_num_seqs", "8")]),
+            "the KV metadata is not a label"
+        );
+        assert_eq!(
+            *rebuilt.metadata().discovered_labels,
+            labels_of(&[("max_num_seqs", "8")])
+        );
+        assert_eq!(
+            rebuilt.metadata().spec.kv_connector.as_deref(),
+            Some("NixlConnector"),
+            "a configured connector stands"
+        );
+        assert_eq!(
+            rebuilt.metadata().spec.kv_role.as_deref(),
+            Some("kv_consumer"),
+            "a role the operator left unset follows the engine"
+        );
+        assert_eq!(
+            rebuilt.kv_engine_id().as_deref(),
+            Some("engine-late"),
+            "the engine's id is the live id"
+        );
+        assert!(rebuilt.kv_engine_id_confirmed());
+
+        // The same labels with a new engine id: no rebuild, the live id follows.
+        let revision = rebuilt.revision();
+        let fresh = labels_of(&[("max_num_seqs", "8"), ("kv_engine_id", "engine-restarted")]);
+        let mut again = make_refresh_context(Arc::clone(&app_ctx), Arc::clone(&rebuilt), fresh);
+        assert_eq!(
+            UpdateWorkerPropertiesStep
+                .execute(&mut again)
+                .await
+                .unwrap(),
+            StepResult::Success
+        );
+        let current = app_ctx
+            .worker_registry
+            .get_by_url("grpc://decode:8000")
+            .unwrap();
+        assert_eq!(
+            current.revision(),
+            revision,
+            "an unchanged engine report rebuilds nothing"
+        );
+        assert_eq!(current.kv_engine_id().as_deref(), Some("engine-restarted"));
     }
 
     /// An engine that reports a `constrained_decoding` naming no policy is

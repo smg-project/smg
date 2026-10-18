@@ -26,11 +26,6 @@ impl StepExecutor<WorkerUpdateWorkflowData> for RediscoverLabelsStep {
         if !context.data.refresh_discovered_labels {
             return Ok(StepResult::Skip);
         }
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
         let workers =
             context.data.workers_to_update.as_ref().ok_or_else(|| {
                 WorkflowError::ContextValueNotFound("workers_to_update".to_string())
@@ -48,9 +43,11 @@ impl StepExecutor<WorkerUpdateWorkflowData> for RediscoverLabelsStep {
         let spec = &worker.metadata().spec;
         // A strict read: an endpoint that fails is an error (the step retries,
         // then the next transition into service tries again), never a gap
-        // that would read as labels the engine dropped.
+        // that would read as labels the engine dropped. Through the worker's
+        // own client, the one registration read with (built for its pool and
+        // HTTP/2 setting); the gRPC read ignores it.
         let (fresh, _) = discover_engine_labels(
-            &app_context.client,
+            worker.http_client(),
             worker.base_url(),
             connection_mode,
             spec.runtime_type.as_str(),

@@ -263,6 +263,40 @@ impl JobQueue {
         }
     }
 
+    /// Submit unless a job of any type is pending or processing for this URL.
+    /// For a best-effort submission that must not replace an in-flight job's
+    /// status under the key: a label refresh while the worker's registration
+    /// is still processing would take that job's entry (and let the in-flight
+    /// guard admit a second registration). Returns `Ok(false)` when one is in
+    /// flight; the caller's next occasion submits again.
+    pub async fn submit_unless_in_flight(&self, job: Job) -> Result<bool, String> {
+        let worker_url = job.worker_url().to_string();
+        if !Self::claim_unless_in_flight(&self.status_map, &worker_url, job.job_type()) {
+            return Ok(false);
+        }
+        self.submit(job).await.map(|()| true).inspect_err(|_| {
+            // A failed submission owns no job, so its claim must not block the next one.
+            self.status_map.remove(&worker_url);
+        })
+    }
+
+    /// Any in-flight job under the key blocks the claim, whatever its type.
+    fn claim_unless_in_flight(
+        status_map: &DashMap<String, JobStatus>,
+        url: &str,
+        job_type: &'static str,
+    ) -> bool {
+        match status_map.entry(url.to_string()) {
+            Entry::Occupied(e) if matches!(e.get().status.as_str(), "pending" | "processing") => {
+                false
+            }
+            entry => {
+                entry.insert(JobStatus::pending(job_type, url));
+                true
+            }
+        }
+    }
+
     /// Submit a job with detailed queue status
     pub async fn submit(&self, job: Job) -> Result<(), String> {
         // Check if context is still alive before accepting jobs
@@ -1087,6 +1121,37 @@ mod tests {
             JobStatus::pending("RegisterMcpServer", "http://w:8000"),
         );
         assert!(JobQueue::claim(&map, "http://w:8000", "AddWorker"));
+    }
+
+    /// A claim that yields to any in-flight job never replaces that job's
+    /// status under the URL; a terminal status under it is taken over.
+    #[test]
+    fn claim_unless_in_flight_yields_to_a_job_of_another_type() {
+        let map: DashMap<String, JobStatus> = DashMap::new();
+        map.insert(
+            "http://w:8000".to_string(),
+            JobStatus::processing("AddWorker", "http://w:8000"),
+        );
+        assert!(!JobQueue::claim_unless_in_flight(
+            &map,
+            "http://w:8000",
+            "RefreshWorkerLabels"
+        ));
+        assert_eq!(map.get("http://w:8000").unwrap().job_type, "AddWorker");
+
+        map.insert(
+            "http://w:8000".to_string(),
+            JobStatus::failed("AddWorker", "http://w:8000", "boom".to_string()),
+        );
+        assert!(JobQueue::claim_unless_in_flight(
+            &map,
+            "http://w:8000",
+            "RefreshWorkerLabels"
+        ));
+        assert_eq!(
+            map.get("http://w:8000").unwrap().job_type,
+            "RefreshWorkerLabels"
+        );
     }
 
     /// A submission that fails must not leave its claim behind, or the next
