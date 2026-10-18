@@ -261,11 +261,7 @@ mod tests {
             ("{\"city\": \"Paris\", }", "{\"city\": \"Paris\", ", "}"),
         ] {
             let (whole, _) = run(&[text]);
-            let pieces: Vec<&str> = text
-                .char_indices()
-                .map(|(i, c)| &text[i..i + c.len_utf8()])
-                .collect();
-            let (by_char, _) = run(&pieces);
+            let (by_char, _) = run(&per_char(text));
             for (events, how) in [(&whole, "whole"), (&by_char, "by the character")] {
                 assert_eq!(bytes(events), text, "{text:?} {how}");
                 assert_eq!(arguments(events), expected_arguments, "{text:?} {how}");

@@ -9,9 +9,9 @@
 //!
 //! Ported from `crates/tool_parser/src/partial_json.rs` (smg 897ef9a9) under ground rule 27. What
 //! changed in form: an error type of its own, the cursor's literal parsing shared by `true`,
-//! `false` and `null`, names and documentation (the original's `is_complete` has no caller
-//! here since the strict reader decides whole arguments itself). What
-//! changed in behaviour, twice. A word of letters that is no literal never advances the cursor: the
+//! `false` and `null`, names and documentation (the original's `is_complete` has no caller here,
+//! since the prefix judge decides whole arguments itself, `Prefix::whole`). What changed in
+//! behaviour, twice. A word of letters that is no literal never advances the cursor: the
 //! original looked ahead over at most the longest literal of the kind (five bytes for either
 //! boolean, four for `null`), so `truex` was rejected unseen but `false` or `null` followed by
 //! letters passed the look-ahead, was consumed, and was rejected only then (`[1, falsex` consumed
