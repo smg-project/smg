@@ -2241,41 +2241,22 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let admin_handle_clone = admin_handle.clone();
     let admin_stop = admin_handle.clone();
     let inflight_tracker = app_context.inflight_tracker.clone();
-    let grace = Duration::from_secs(config.shutdown_grace_period_secs);
-    // Keep accepting for a short settle window before gating, so requests still
-    // routed here during load-balancer / EndpointSlice propagation lag are
-    // served instead of connection-refused — readiness already reports 503 by
-    // then (#1694), so the orchestrator is removing this endpoint meanwhile.
-    // Carved out of the grace budget (never more than half, capped at 5s — the
-    // per-worker `drain_settle_secs` default) so total shutdown stays within
-    // `shutdown_grace_period_secs` and never overruns terminationGracePeriod.
-    let settle = (grace / 2).min(Duration::from_secs(5));
-    let drain_timeout = grace.saturating_sub(settle);
+    let budget = ShutdownBudget::from_grace_secs(config.shutdown_grace_period_secs);
+    let drain_timeout = budget.drain;
     #[expect(
         clippy::disallowed_methods,
         reason = "shutdown signal handler must outlive the server to trigger graceful shutdown"
     )]
     spawn(async move {
         shutdown_signal().await;
-
-        // Phase 1: Flip readiness to 503, hold the listener open through the
-        // settle window so propagation-lagged requests still land, then gate
-        // new connections.
-        info!(
-            in_flight = inflight_tracker.len(),
-            "Beginning graceful shutdown: readiness draining"
-        );
-        // Everything below shares the grace: the drain takes what the settle
-        // window and the leave of the mesh leave of it.
-        let deadline = tokio::time::Instant::now() + grace;
-        inflight_tracker.begin_drain();
         // The mesh hears of the stop first: `Leaving` goes to the live
         // members during the settle window (the broadcast is bounded by 3 s,
         // then a second for propagation, then the gossip loop stops), so
         // they know as soon as this member stops serving, instead of finding
         // out from failed probes once it is gone. The leave gets the window
         // and no more (with no window, what the grace allows); cut short, its
-        // broadcast tasks run on and the gossip loop is stopped below.
+        // broadcast tasks run on and the gossip loop is stopped by
+        // `stop_mesh`.
         let leave_mesh = async {
             if let Some(mesh) = &mesh_handler {
                 if let Err(e) = mesh.graceful_shutdown().await {
@@ -2283,53 +2264,25 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                 }
             }
         };
-        let left_in_time = if settle.is_zero() {
-            tokio::time::timeout(grace, leave_mesh).await.is_ok()
-        } else {
-            info!(
-                settle_secs = settle.as_secs(),
-                "Keeping listener open during load-balancer propagation window"
-            );
-            let (left, ()) = tokio::join!(
-                tokio::time::timeout(settle, leave_mesh),
-                tokio::time::sleep(settle)
-            );
-            left.is_ok()
-        };
-        if !left_in_time {
-            // The leave's own stop of the gossip loop did not run: stop it
-            // here, as a finished leave would have, so both paths end the
-            // same way; the broadcast tasks the leave spawned run on.
+        // The leave's own stop of the gossip loop did not run: stop it as a
+        // finished leave would have, so both paths end the same way; the
+        // broadcast tasks the leave spawned run on.
+        let stop_mesh = || {
             if let Some(mesh) = &mesh_handler {
                 mesh.shutdown();
             }
-            if !grace.is_zero() {
-                info!(
-                    "Leaving the mesh was cut short by the settle window; its broadcast runs on \
-                     and the gossip loop is stopped now"
-                );
-            }
-        }
-        let drain_timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
-        handle_clone.graceful_shutdown(Some(drain_timeout));
-        admin_handle_clone.graceful_shutdown(Some(drain_timeout));
-
-        // Phase 2: Drain — wait for in-flight requests to complete
-        // Re-check after gating to catch requests that arrived between the
-        // snapshot and graceful_shutdown stopping the accept loop.
-        if !inflight_tracker.is_empty() {
-            let drained = inflight_tracker.wait_for_drain(drain_timeout).await;
-            if drained {
-                info!("All in-flight requests drained");
-            } else {
-                warn!(
-                    remaining = inflight_tracker.len(),
-                    timeout_secs = drain_timeout.as_secs(),
-                    "Drain timed out, forcing shutdown with requests still in-flight"
-                );
-            }
-        }
-        // Phase 3: Teardown proceeds after axum server stops (in the main task)
+        };
+        graceful_shutdown(
+            &inflight_tracker,
+            budget,
+            leave_mesh,
+            stop_mesh,
+            |drain_timeout| {
+                handle_clone.graceful_shutdown(Some(drain_timeout));
+                admin_handle_clone.graceful_shutdown(Some(drain_timeout));
+            },
+        )
+        .await;
     });
 
     // Bounds on connections that carry no request (a head that never
@@ -2456,6 +2409,291 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     match (server_result, admin_result) {
         (Err(e), _) | (Ok(()), Err(e)) => Err(Box::new(e) as Box<dyn std::error::Error>),
         (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+/// The graceful shutdown's time: the grace the process has
+/// (`shutdown_grace_period_secs`), the settle window carved out of it, and
+/// the drain that is left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ShutdownBudget {
+    grace: Duration,
+    /// Accepting goes on for a short settle window before gating, so
+    /// requests still routed here during load-balancer / EndpointSlice
+    /// propagation lag are served instead of connection-refused; readiness
+    /// already reports 503 by then (#1694), so the orchestrator is removing
+    /// this endpoint meanwhile.
+    settle: Duration,
+    /// What the settle window leaves of the grace for the in-flight requests.
+    drain: Duration,
+}
+
+impl ShutdownBudget {
+    /// The settle window is carved out of the grace budget (never more than
+    /// half, capped at 5 s, the per-worker `drain_settle_secs` default) so
+    /// total shutdown stays within `shutdown_grace_period_secs` and never
+    /// overruns terminationGracePeriod.
+    fn from_grace_secs(grace_secs: u64) -> Self {
+        let grace = Duration::from_secs(grace_secs);
+        let settle = (grace / 2).min(Duration::from_secs(5));
+        Self {
+            grace,
+            settle,
+            drain: grace.saturating_sub(settle),
+        }
+    }
+}
+
+/// The graceful shutdown after the signal, in its phases. Phase 1: readiness
+/// flips to 503 and the listeners stay open through the settle window, during
+/// which `leave_mesh` runs (with no window, it gets what the grace allows;
+/// one that does not finish in time is cut short and `stop_mesh` is called),
+/// then `stop_listeners` gates new connections with what is left of the
+/// grace. Phase 2: the in-flight requests drain within that, or the drain
+/// gives up and says so. Phase 3, the teardown, is the caller's once the
+/// listeners have stopped.
+async fn graceful_shutdown(
+    inflight_tracker: &InFlightRequestTracker,
+    budget: ShutdownBudget,
+    leave_mesh: impl Future<Output = ()>,
+    stop_mesh: impl FnOnce(),
+    stop_listeners: impl FnOnce(Duration),
+) {
+    // Phase 1: Flip readiness to 503, hold the listener open through the
+    // settle window so propagation-lagged requests still land, then gate
+    // new connections.
+    info!(
+        in_flight = inflight_tracker.len(),
+        "Beginning graceful shutdown: readiness draining"
+    );
+    // Everything below shares the grace: the drain takes what the settle
+    // window and the leave of the mesh leave of it.
+    let deadline = tokio::time::Instant::now() + budget.grace;
+    inflight_tracker.begin_drain();
+    let left_in_time = if budget.settle.is_zero() {
+        tokio::time::timeout(budget.grace, leave_mesh).await.is_ok()
+    } else {
+        info!(
+            settle_secs = budget.settle.as_secs(),
+            "Keeping listener open during load-balancer propagation window"
+        );
+        let (left, ()) = tokio::join!(
+            tokio::time::timeout(budget.settle, leave_mesh),
+            tokio::time::sleep(budget.settle)
+        );
+        left.is_ok()
+    };
+    if !left_in_time {
+        stop_mesh();
+        if !budget.grace.is_zero() {
+            info!(
+                "Leaving the mesh was cut short by the settle window; its broadcast runs on \
+                 and the gossip loop is stopped now"
+            );
+        }
+    }
+    let drain_timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+    stop_listeners(drain_timeout);
+
+    // Phase 2: Drain — wait for in-flight requests to complete
+    // Re-check after gating to catch requests that arrived between the
+    // snapshot and graceful_shutdown stopping the accept loop.
+    if !inflight_tracker.is_empty() {
+        let drained = inflight_tracker.wait_for_drain(drain_timeout).await;
+        if drained {
+            info!("All in-flight requests drained");
+        } else {
+            warn!(
+                remaining = inflight_tracker.len(),
+                timeout_secs = drain_timeout.as_secs(),
+                "Drain timed out, forcing shutdown with requests still in-flight"
+            );
+        }
+    }
+    // Phase 3: Teardown proceeds after axum server stops (in the main task)
+}
+
+#[cfg(test)]
+mod graceful_shutdown_tests {
+    use std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        },
+        time::Duration,
+    };
+
+    use super::{graceful_shutdown, InFlightRequestTracker, ShutdownBudget};
+
+    /// The settle window is half the grace, capped at 5 s; the drain is the
+    /// rest; a zero grace has neither.
+    #[test]
+    fn the_budget_splits_the_grace() {
+        let secs = |s| Duration::from_secs(s);
+        assert_eq!(
+            ShutdownBudget::from_grace_secs(30),
+            ShutdownBudget {
+                grace: secs(30),
+                settle: secs(5),
+                drain: secs(25)
+            }
+        );
+        assert_eq!(
+            ShutdownBudget::from_grace_secs(6),
+            ShutdownBudget {
+                grace: secs(6),
+                settle: secs(3),
+                drain: secs(3)
+            }
+        );
+        assert_eq!(
+            ShutdownBudget::from_grace_secs(0),
+            ShutdownBudget {
+                grace: secs(0),
+                settle: secs(0),
+                drain: secs(0)
+            }
+        );
+    }
+
+    /// The phases in order, on a paused clock: readiness drains at once;
+    /// the leave finishes inside the settle window and the listeners stay
+    /// open through the whole of it; they are then gated with what the
+    /// settle left of the grace; the drain ends when the last request does,
+    /// well before the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn the_phases_run_in_order_within_the_grace() {
+        let tracker = InFlightRequestTracker::new();
+        let request = tracker.track();
+        let budget = ShutdownBudget::from_grace_secs(30);
+        let start = tokio::time::Instant::now();
+        let left = Arc::new(AtomicBool::new(false));
+        let leave_mesh = {
+            let left = Arc::clone(&left);
+            async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                left.store(true, Ordering::SeqCst);
+            }
+        };
+        let gated = Arc::new(Mutex::new(None));
+        let stop_listeners = {
+            let gated = Arc::clone(&gated);
+            let tracker = Arc::clone(&tracker);
+            move |drain_timeout| {
+                *gated.lock().expect("no poison") =
+                    Some((start.elapsed(), drain_timeout, tracker.is_draining()));
+            }
+        };
+        // The request ends 8 s in, during the drain.
+        let release = async {
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            drop(request);
+        };
+        let shutdown = graceful_shutdown(
+            &tracker,
+            budget,
+            leave_mesh,
+            || panic!("the leave finished inside the settle window"),
+            stop_listeners,
+        );
+        tokio::join!(shutdown, release);
+        assert!(left.load(Ordering::SeqCst), "the leave ran");
+        assert_eq!(
+            gated.lock().expect("no poison").take(),
+            Some((Duration::from_secs(5), Duration::from_secs(25), true)),
+            "the listeners are gated after the settle window, with the rest of the grace, while \
+             draining"
+        );
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(8),
+            "the drain ended with the request"
+        );
+        assert!(tracker.is_empty());
+    }
+
+    /// A leave that outlasts the settle window is cut short and the mesh is
+    /// stopped outright; the listeners are still gated on time; a request
+    /// that never ends does not hold the shutdown past the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_leave_is_cut_short_and_a_stuck_request_holds_nothing_past_the_deadline() {
+        let tracker = InFlightRequestTracker::new();
+        let _stuck = tracker.track();
+        let budget = ShutdownBudget::from_grace_secs(10);
+        let start = tokio::time::Instant::now();
+        let mesh_stopped = Arc::new(AtomicBool::new(false));
+        let gated = Arc::new(Mutex::new(None));
+        graceful_shutdown(
+            &tracker,
+            budget,
+            std::future::pending::<()>(),
+            {
+                let mesh_stopped = Arc::clone(&mesh_stopped);
+                move || mesh_stopped.store(true, Ordering::SeqCst)
+            },
+            {
+                let gated = Arc::clone(&gated);
+                move |drain_timeout| {
+                    *gated.lock().expect("no poison") = Some((start.elapsed(), drain_timeout));
+                }
+            },
+        )
+        .await;
+        assert!(
+            mesh_stopped.load(Ordering::SeqCst),
+            "the leave was cut short"
+        );
+        assert_eq!(
+            gated.lock().expect("no poison").take(),
+            Some((Duration::from_secs(5), Duration::from_secs(5)))
+        );
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(10),
+            "the deadline held"
+        );
+        assert_eq!(
+            tracker.len(),
+            1,
+            "the stuck request is reported, not waited for"
+        );
+    }
+
+    /// With no grace there is no settle window: the leave gets no time (a
+    /// pending one is cut short and the mesh is stopped outright), the
+    /// listeners are gated at once with nothing left, and with nothing in
+    /// flight the drain is skipped.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_grace_gates_at_once() {
+        let tracker = InFlightRequestTracker::new();
+        let start = tokio::time::Instant::now();
+        let mesh_stopped = Arc::new(AtomicBool::new(false));
+        let gated = Arc::new(Mutex::new(None));
+        graceful_shutdown(
+            &tracker,
+            ShutdownBudget::from_grace_secs(0),
+            std::future::pending::<()>(),
+            {
+                let mesh_stopped = Arc::clone(&mesh_stopped);
+                move || mesh_stopped.store(true, Ordering::SeqCst)
+            },
+            {
+                let gated = Arc::clone(&gated);
+                move |drain_timeout| {
+                    *gated.lock().expect("no poison") = Some((start.elapsed(), drain_timeout));
+                }
+            },
+        )
+        .await;
+        assert!(
+            mesh_stopped.load(Ordering::SeqCst),
+            "a zero grace cuts the leave short"
+        );
+        assert_eq!(
+            gated.lock().expect("no poison").take(),
+            Some((Duration::ZERO, Duration::ZERO))
+        );
+        assert!(tracker.is_draining());
     }
 }
 
