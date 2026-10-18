@@ -1943,11 +1943,6 @@ impl RouterConfig {
         }
         cfg
     }
-
-    /// Check if running in IGW (Inference Gateway) mode
-    pub fn is_igw_mode(&self) -> bool {
-        self.enable_igw
-    }
 }
 
 #[cfg(test)]

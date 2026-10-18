@@ -1490,21 +1490,7 @@ impl ClientSelection {
         }
     }
 
-    pub fn prefill_client_mut(&mut self) -> Option<&mut BackendClient> {
-        match self {
-            Self::Disaggregated { prefill, .. } => Some(prefill),
-            Self::Single { .. } => None,
-        }
-    }
-
     pub fn decode_client(&self) -> Option<&BackendClient> {
-        match self {
-            Self::Disaggregated { decode, .. } => Some(decode),
-            Self::Single { .. } => None,
-        }
-    }
-
-    pub fn decode_client_mut(&mut self) -> Option<&mut BackendClient> {
         match self {
             Self::Disaggregated { decode, .. } => Some(decode),
             Self::Single { .. } => None,

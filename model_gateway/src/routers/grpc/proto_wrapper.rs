@@ -3890,11 +3890,6 @@ impl ProtoEmbedRequest {
         matches!(self, Self::Vllm(_))
     }
 
-    /// Clone the inner request (for passing to embed())
-    pub fn clone_inner(&self) -> Self {
-        self.clone()
-    }
-
     /// Get request ID
     pub fn request_id(&self) -> &str {
         match self {

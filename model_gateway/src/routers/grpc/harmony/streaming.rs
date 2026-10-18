@@ -64,10 +64,8 @@ use crate::{
 /// `file_search_call`, `image_generation_call`) instead surface their
 /// progress through structured events emitted by the shared
 /// [`ResponseStreamEventEmitter`] helpers (`emit_tool_call_in_progress`,
-/// `emit_tool_call_searching`, `emit_tool_call_completed` — plus
-/// `emit_image_generation_partial_image` for the image_generation
-/// partial-image frame). Those builtins therefore skip argument
-/// streaming here.
+/// `emit_tool_call_searching`, `emit_tool_call_completed`). Those
+/// builtins therefore skip argument streaming here.
 ///
 /// `None` (plain function tools) and `Some(Passthrough)` (MCP `mcp_call`)
 /// are the only formats that stream arguments through this router.

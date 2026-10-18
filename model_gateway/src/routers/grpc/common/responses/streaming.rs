@@ -691,31 +691,6 @@ impl ResponseStreamEventEmitter {
         Some(self.emit_tool_event(event_type, output_index, item_id))
     }
 
-    /// Emit a `response.image_generation_call.partial_image` event. Returns
-    /// `None` for formats with no partial-image frame.
-    #[expect(
-        dead_code,
-        reason = "partial_image emission is wired by per-router integrations"
-    )]
-    pub fn emit_image_generation_partial_image(
-        &mut self,
-        output_index: usize,
-        item_id: &str,
-        response_format: ResponseFormat,
-        partial_image_index: u32,
-        partial_image_b64: &str,
-    ) -> Option<serde_json::Value> {
-        let event_type = descriptor(response_format).partial_image_event?;
-        Some(json!({
-            "type": event_type,
-            "sequence_number": self.next_sequence(),
-            "output_index": output_index,
-            "item_id": item_id,
-            "partial_image_index": partial_image_index,
-            "partial_image_b64": partial_image_b64
-        }))
-    }
-
     pub fn emit_tool_call_completed(
         &mut self,
         output_index: usize,

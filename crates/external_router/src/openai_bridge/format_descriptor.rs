@@ -24,8 +24,6 @@ pub struct FormatDescriptor {
     pub searching_event: Option<&'static str>,
     pub completed_event: &'static str,
     pub streams_arguments: bool,
-    /// `None` for formats without a partial-image-style intermediate frame.
-    pub partial_image_event: Option<&'static str>,
 }
 
 /// Reverse lookup for routers that have already received an item-type
@@ -58,7 +56,6 @@ pub const fn descriptor(format: ResponseFormat) -> FormatDescriptor {
             searching_event: Some(WebSearchCallEvent::SEARCHING),
             completed_event: WebSearchCallEvent::COMPLETED,
             streams_arguments: false,
-            partial_image_event: None,
         },
         ResponseFormat::CodeInterpreterCall => FormatDescriptor {
             type_str: ItemType::CODE_INTERPRETER_CALL,
@@ -67,7 +64,6 @@ pub const fn descriptor(format: ResponseFormat) -> FormatDescriptor {
             searching_event: Some(CodeInterpreterCallEvent::INTERPRETING),
             completed_event: CodeInterpreterCallEvent::COMPLETED,
             streams_arguments: false,
-            partial_image_event: None,
         },
         ResponseFormat::FileSearchCall => FormatDescriptor {
             type_str: ItemType::FILE_SEARCH_CALL,
@@ -76,7 +72,6 @@ pub const fn descriptor(format: ResponseFormat) -> FormatDescriptor {
             searching_event: Some(FileSearchCallEvent::SEARCHING),
             completed_event: FileSearchCallEvent::COMPLETED,
             streams_arguments: false,
-            partial_image_event: None,
         },
         ResponseFormat::ImageGenerationCall => FormatDescriptor {
             type_str: ItemType::IMAGE_GENERATION_CALL,
@@ -85,7 +80,6 @@ pub const fn descriptor(format: ResponseFormat) -> FormatDescriptor {
             searching_event: Some(ImageGenerationCallEvent::GENERATING),
             completed_event: ImageGenerationCallEvent::COMPLETED,
             streams_arguments: false,
-            partial_image_event: Some(ImageGenerationCallEvent::PARTIAL_IMAGE),
         },
         ResponseFormat::Passthrough => FormatDescriptor {
             type_str: ItemType::MCP_CALL,
@@ -94,7 +88,6 @@ pub const fn descriptor(format: ResponseFormat) -> FormatDescriptor {
             searching_event: None,
             completed_event: McpEvent::CALL_COMPLETED,
             streams_arguments: true,
-            partial_image_event: None,
         },
     }
 }
