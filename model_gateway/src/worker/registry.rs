@@ -99,7 +99,7 @@ pub(crate) enum RoutingPool {
     GrpcPipelineRegular,
     /// Strictly gRPC, unlike [`Self::GrpcPipelineRegular`]: the ZMQ wire
     /// carries no KV-transfer rendezvous, so a ZMQ worker must never join a
-    /// PD leg even though it rides the gRPC pipeline elsewhere.
+    /// PD pool even though it rides the gRPC pipeline elsewhere.
     GrpcPrefill,
     /// Strictly gRPC (see [`Self::GrpcPrefill`]).
     GrpcDecode,
@@ -174,7 +174,7 @@ impl RoutingPool {
 /// lazily once and then shared by every request until membership changes
 /// publish a replacement snapshot.
 ///
-/// Multi-leg selection (PD/EPD) must derive every leg from ONE snapshot: two
+/// Multi-role selection (PD/EPD) must derive every role from ONE snapshot: two
 /// separate registry lookups can straddle a concurrent membership change and
 /// pair workers that never coexisted.
 #[derive(Debug)]
@@ -654,8 +654,8 @@ impl WorkerRegistry {
     }
 
     /// One membership snapshot for a model (alias-aware), from which several
-    /// leg pools can be derived atomically: a PD/EPD selection must draw all
-    /// its legs from a single generation, and two separate pool lookups could
+    /// role pools can be derived atomically: a PD/EPD selection must draw all
+    /// its roles from a single generation, and two separate pool lookups could
     /// straddle a concurrent membership change.
     pub(crate) fn model_routing_snapshot(
         &self,
@@ -684,7 +684,7 @@ impl WorkerRegistry {
         })
     }
 
-    /// One membership snapshot for multi-leg selection, with the wildcard
+    /// One membership snapshot for multi-role selection, with the wildcard
     /// model mapping to the global snapshot and an unknown model to a shared
     /// empty one.
     pub(crate) fn get_routing_snapshot(&self, model_id: &str) -> Arc<ModelWorkerSnapshot> {
@@ -3929,7 +3929,7 @@ mod tests {
             urls(RoutingPool::GrpcPipelineRegular),
             HashSet::from(["grpc://regular".to_string(), "zmq://regular".to_string()])
         );
-        // PD/EPD legs are strictly gRPC: a ZMQ prefill worker that slipped
+        // PD/EPD pools are strictly gRPC: a ZMQ prefill worker that slipped
         // past registration must not appear.
         assert_eq!(
             urls(RoutingPool::GrpcPrefill),
@@ -3943,7 +3943,7 @@ mod tests {
             urls(RoutingPool::GrpcEncode),
             HashSet::from(["grpc://encode".to_string()])
         );
-        // The HTTP PD legs are HTTP-only: the router proxies plain HTTP to
+        // The HTTP PD pools are HTTP-only: the router proxies plain HTTP to
         // the selected URL, so gRPC and ZMQ workers must never be selectable.
         assert_eq!(
             urls(RoutingPool::HttpPrefill),

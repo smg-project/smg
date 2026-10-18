@@ -46,7 +46,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{CacheNamespace, PolicyRegistry, WorkerLeg},
+    policies::{CacheNamespace, PolicyRegistry, WorkerRole},
     routers::{
         common::{
             attach_sized_body, header_utils,
@@ -470,7 +470,7 @@ impl PDRouter {
             RefusalSite {
                 function: "PDRouter::execute_dual_dispatch_attempt",
                 mode: "PrefillDecode",
-                legs: &[
+                pools: &[
                     ("prefill", RoutingPool::HttpPrefill),
                     ("decode", RoutingPool::HttpDecode),
                 ],
@@ -2178,10 +2178,10 @@ impl PDRouter {
     /// Map a leg's placement verdict to this router's selection failure,
     /// keeping the operator-facing messages the legs always produced.
     fn pair_failure(failure: PairFailure) -> PdSelectionFailure {
-        let leg = match failure.leg {
-            WorkerLeg::Prefill => "prefill",
-            WorkerLeg::Decode => "decode",
-            WorkerLeg::Single => "worker",
+        let leg = match failure.role {
+            WorkerRole::Prefill => "prefill",
+            WorkerRole::Decode => "decode",
+            WorkerRole::Single => "worker",
         };
         match failure.verdict {
             PlacementFailure::AllOverloaded(shed) => PdSelectionFailure::Shed(shed),

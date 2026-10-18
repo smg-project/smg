@@ -315,11 +315,11 @@ pub(crate) struct RoutingSnapshot {
     /// The request carries pixel media (an image or a video), noted at first
     /// selection: a retry keeps the workers that take it (regular mode's
     /// single worker; the prefill leg of prefill/decode mode, see worker
-    /// selection's `prefill_leg_needs_vision`) on ones with a vision encoder,
+    /// selection's `prefill_side_needs_vision`) on ones with a vision encoder,
     /// as the first attempt did.
     pub needs_vision: bool,
     /// The request's disaggregated decode leg needs a worker with a vision
-    /// encoder (worker selection's `decode_leg_needs_vision`: prefill/decode
+    /// encoder (worker selection's `decode_side_needs_vision`: prefill/decode
     /// mode only), noted at first selection so a retry re-selects under the
     /// same demand.
     pub decode_needs_vision: bool,

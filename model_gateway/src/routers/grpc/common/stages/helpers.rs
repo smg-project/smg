@@ -826,12 +826,12 @@ fn inject_sglang_bootstrap_metadata(
 /// prefill and decode worker (`execute_parallel_pd` clones the request after
 /// this stage). Host/port name the PREFILL worker's Mooncake bootstrap server
 /// (the KV data source); the decode worker discovers it there by `bootstrap_room`.
-/// This KV leg is independent of any per-item encode->prefill bootstrap info.
+/// This KV handoff is independent of any per-item encode->prefill bootstrap info.
 pub(crate) fn maybe_inject_pd_rendezvous(
     request: &mut ProtoGenerateRequest,
     workers: &WorkerSelection,
 ) {
-    // The KV bootstrap leg is identical for plain PD and EPD; EPD just layers
+    // The KV bootstrap handoff is identical for plain PD and EPD; EPD just layers
     // encode assignments on the disaggregated worker selection.
     let (prefill, runtime_type) = match workers {
         WorkerSelection::Disaggregated {
@@ -904,7 +904,7 @@ pub(crate) async fn assemble_prompt_media(
 /// execution to take); the prefill->decode KV rendezvous for the backends
 /// that carry it in the request; and, for worker-side multimodal processing,
 /// the media references now that the wire is known. The last two land before
-/// the disaggregated dispatch clones the request, so both legs carry them.
+/// the disaggregated dispatch clones the request, so both sides carry them.
 pub(crate) fn finish_generate_request(
     ctx: &mut RequestContext,
     proto_request: &mut ProtoGenerateRequest,

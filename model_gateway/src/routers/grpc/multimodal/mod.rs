@@ -185,8 +185,8 @@ impl MultimodalIntermediate {
         &self.batches
     }
 
-    /// Whether a batch carries the grid tensors a disaggregated decode leg
-    /// derives its positions from ([`VLLM_MROPE_GRID_KEYS`]): such a leg
+    /// Whether a batch carries the grid tensors a disaggregated decode side
+    /// derives its positions from ([`VLLM_MROPE_GRID_KEYS`]): such a side
     /// cannot be served by a decode worker without a vision encoder.
     pub(crate) fn has_mrope_grids(&self) -> bool {
         self.batches.iter().any(|batch| {

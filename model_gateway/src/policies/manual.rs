@@ -23,7 +23,7 @@ use tracing::info;
 
 use super::{
     get_healthy_worker_indices, utils::PeriodicTask, LoadBalancingPolicy, SelectWorkerInfo,
-    WorkerLeg,
+    WorkerRole,
 };
 use crate::{
     config::ManualAssignmentMode, observability::metrics::Metrics,
@@ -295,13 +295,13 @@ impl ManualPolicy {
             .or_else(|| extract_routing_key_hint(info.headers))
             .or(info.rid_key);
         if let Some(routing_id) = routing_id {
-            // Single is the common leg; route on the bare key to skip the
-            // per-request allocation. PD legs namespace so prefill and decode
+            // Single is the common role; route on the bare key to skip the
+            // per-request allocation. PD roles namespace so prefill and decode
             // stick independently.
-            let (idx, branch) = if info.leg == WorkerLeg::Single {
+            let (idx, branch) = if info.role == WorkerRole::Single {
                 self.select_by_routing_id(workers, routing_id, &healthy_indices)
             } else {
-                let namespaced = format!("{}{}", info.leg.routing_id_prefix(), routing_id);
+                let namespaced = format!("{}{}", info.role.routing_id_prefix(), routing_id);
                 self.select_by_routing_id(workers, &namespaced, &healthy_indices)
             };
             return (Some(idx), branch);
@@ -432,26 +432,26 @@ mod tests {
     }
 
     #[test]
-    fn test_manual_leg_namespaces_sticky_entries() {
+    fn test_manual_role_namespaces_sticky_entries() {
         let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let headers = headers_with_routing_key("user-123");
 
         let prefill = SelectWorkerInfo {
             headers: Some(&headers),
-            leg: WorkerLeg::Prefill,
+            role: WorkerRole::Prefill,
             ..Default::default()
         };
         let decode = SelectWorkerInfo {
             headers: Some(&headers),
-            leg: WorkerLeg::Decode,
+            role: WorkerRole::Decode,
             ..Default::default()
         };
 
         let (p1, _) = policy.select_worker_impl(&workers, &prefill);
         let (d1, _) = policy.select_worker_impl(&workers, &decode);
 
-        // Same key under two legs -> two independent sticky entries.
+        // Same key under two roles -> two independent sticky entries.
         assert_eq!(policy.routing_map.len(), 2);
         for _ in 0..5 {
             assert_eq!(policy.select_worker_impl(&workers, &prefill).0, p1);
@@ -487,25 +487,25 @@ mod tests {
     }
 
     #[test]
-    fn test_manual_rid_key_namespaces_per_leg() {
+    fn test_manual_rid_key_namespaces_per_role() {
         let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let prefill = SelectWorkerInfo {
             rid_key: Some("conv"),
-            leg: WorkerLeg::Prefill,
+            role: WorkerRole::Prefill,
             ..Default::default()
         };
         let decode = SelectWorkerInfo {
             rid_key: Some("conv"),
-            leg: WorkerLeg::Decode,
+            role: WorkerRole::Decode,
             ..Default::default()
         };
 
         let (p1, _) = policy.select_worker_impl(&workers, &prefill);
         let (d1, _) = policy.select_worker_impl(&workers, &decode);
 
-        // Same rid under two legs -> two independent sticky entries.
+        // Same rid under two roles -> two independent sticky entries.
         assert_eq!(policy.routing_map.len(), 2);
         for _ in 0..5 {
             assert_eq!(policy.select_worker_impl(&workers, &prefill).0, p1);

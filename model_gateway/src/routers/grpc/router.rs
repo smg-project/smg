@@ -2531,8 +2531,8 @@ mod pd_tests {
             .expect("register worker");
     }
 
-    /// The worker types of a mode's legs.
-    fn legs(mode: Mode) -> &'static [WorkerType] {
+    /// The worker types of a mode's roles.
+    fn roles(mode: Mode) -> &'static [WorkerType] {
         match mode {
             Mode::Regular => &[WorkerType::Regular],
             Mode::PrefillDecode => &[WorkerType::Prefill, WorkerType::Decode],
@@ -2666,7 +2666,7 @@ mod pd_tests {
                 (V13_OUTPUT, V13_OUTPUT_ID),
             )
             .await;
-            for worker_type in legs(mode) {
+            for worker_type in roles(mode) {
                 for (model, output_id) in [
                     (KNOWN_MODEL, TABLE_OUTPUT_ID),
                     (UNKNOWN_MODEL, V13_OUTPUT_ID),

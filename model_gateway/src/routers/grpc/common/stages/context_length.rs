@@ -218,7 +218,7 @@ fn enforce_output(max_tokens: Option<u32>, limit: u32, model_id: &str) -> Result
     ))
 }
 
-/// Tightest context window across the selected legs, `None` if no leg
+/// Tightest context window across the selected sides, `None` if no side
 /// advertises one. A disaggregated prompt must fit both the prefill and the
 /// decode engine, so the smaller window governs. Encode workers process media,
 /// not the token prompt, and are not consulted.
@@ -231,7 +231,7 @@ fn selection_context_length(workers: &WorkerSelection, model_id: &str) -> Option
     }
 }
 
-/// Tightest known bound of two token-processing legs. An unknown leg adds no
+/// Tightest known bound of two token-processing sides. An unknown side adds no
 /// bound, but cannot erase the known constraint on its partner.
 pub(super) fn pair_context_length(
     prefill: &dyn Worker,
@@ -447,7 +447,7 @@ mod tests {
 
     /// A disaggregated prompt has to fit both engines; the tighter one wins.
     #[test]
-    fn disaggregated_uses_the_tighter_leg() {
+    fn disaggregated_uses_the_tighter_side() {
         assert!(enforce_context_length(&input(10), &pd(Some(16), Some(16)), MODEL).is_ok());
         assert_rejected(enforce_context_length(
             &input(10),
@@ -462,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn disaggregated_with_one_unknown_leg_uses_the_known_one() {
+    fn disaggregated_with_one_unknown_side_uses_the_known_one() {
         assert!(enforce_context_length(&input(10), &pd(None, Some(16)), MODEL).is_ok());
         assert_rejected(enforce_context_length(
             &input(10),

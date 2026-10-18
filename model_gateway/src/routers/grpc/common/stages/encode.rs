@@ -8,7 +8,7 @@
 //! - request building injects the per-item bootstrap info into the prefill
 //!   request and drops the prefill pixels;
 //! - request execution dispatches the encode jobs alongside the prefill/decode
-//!   leg.
+//!   dispatch.
 //!
 //! Also owns the backend wire details for EPD encode: item assembly,
 //! transport-specific tensor payloads, and the encode-worker RPC.

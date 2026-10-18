@@ -15,8 +15,8 @@ pub(crate) enum Mode {
 
 impl Mode {
     /// The pools whose workers a request of this mode can be served by, the
-    /// legs its pixels can reach: the regular pool; the prefill and decode
-    /// legs; the encode, prefill and decode legs. The multimodal wire dtype
+    /// pools its pixels can reach: the regular pool; the prefill and decode
+    /// pools; the encode, prefill and decode pools. The multimodal wire dtype
     /// is resolved over them before any worker is selected.
     pub(crate) fn multimodal_wire_pools(self) -> &'static [RoutingPool] {
         match self {
@@ -129,7 +129,7 @@ mod tests {
             assert_eq!(m.plan_kind(), pk, "plan_kind {m:?}");
             assert_eq!(m.inject_pd_metadata(), inject, "inject_pd_metadata {m:?}");
             assert_eq!(m.router_type(), rt, "router_type {m:?}");
-            // The legs a request of the mode can reach: the wire dtype is
+            // The pools a request of the mode can reach: the wire dtype is
             // resolved over exactly these before any worker is selected.
             assert_eq!(
                 m.multimodal_wire_pools(),

@@ -134,7 +134,7 @@ fn read_env_nonempty(name: &str) -> Option<String> {
 /// Resolve whether large multimodal tensors should use the SHM transport for
 /// this request: per-worker override → router default. `shm` forces SHM whenever
 /// SMG can write `/dev/shm` (the operator asserts co-location); `auto` also
-/// requires the receiving worker leg to be verified as sharing SMG's `/dev/shm`;
+/// requires the receiving worker to be verified as sharing SMG's `/dev/shm`;
 /// `inline` (the default) keeps the gRPC path.
 pub(super) fn resolve_mm_shm_enabled(
     workers: Option<&WorkerSelection>,
@@ -497,7 +497,7 @@ impl DtypeOverrides {
 }
 
 /// The dtype every worker of the model's routing pools `pools` (the
-/// pipeline mode's legs) reads its image encoder input in, resolved before
+/// pipeline mode's pools) reads its image encoder input in, resolved before
 /// any of them is selected from what each already advertises (its runtime,
 /// its `multimodal_encoder_dtype` label) and the router's overrides, by the
 /// rules assembly applies to the selected worker. The pools are read as the
@@ -902,13 +902,13 @@ mod tests {
         );
     }
 
-    /// The dtype is resolved over the legs a mode's request can reach:
+    /// The dtype is resolved over the pools a mode's request can reach:
     /// the regular workers for the regular pipeline, the prefill and decode
-    /// legs for a disaggregated one. A fleet whose legs read another width
+    /// pools for a disaggregated one. A fleet whose pools read another width
     /// than its regular workers keeps the per-destination write (`None`)
-    /// over the union, never a wire for the wrong leg.
+    /// over the union, never a wire for the wrong pool.
     #[test]
-    fn the_wire_dtype_over_a_modes_pools_is_the_legs_the_pixels_can_reach() {
+    fn the_wire_dtype_is_resolved_over_the_pools_a_modes_pixels_can_reach() {
         use crate::{
             routers::grpc::mode::Mode,
             worker::{ConnectionMode, WorkerRegistry},
@@ -916,39 +916,40 @@ mod tests {
 
         let plain = DtypeOverrides::default();
         let registry = WorkerRegistry::new();
-        let leg = |url: &str, worker_type: WorkerType, runtime: RuntimeType| -> Arc<dyn Worker> {
-            Arc::new(
-                BasicWorkerBuilder::new(url)
-                    .model(ModelCard::new("qwen3-vl"))
-                    .worker_type(worker_type)
-                    .connection_mode(ConnectionMode::Grpc)
-                    .runtime_type(runtime)
-                    .health_config(HealthCheckConfig {
-                        disable_health_check: true,
-                        ..Default::default()
-                    })
-                    .build(),
-            )
-        };
+        let worker =
+            |url: &str, worker_type: WorkerType, runtime: RuntimeType| -> Arc<dyn Worker> {
+                Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new("qwen3-vl"))
+                        .worker_type(worker_type)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .runtime_type(runtime)
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .build(),
+                )
+            };
         // Regular workers reading bfloat16 (the TokenSpeed default) next to
-        // prefill and decode legs pinned to float32 (SGLang).
+        // prefill and decode workers pinned to float32 (SGLang).
         for worker in [
-            leg(
+            worker(
                 "grpc://regular-1:8000",
                 WorkerType::Regular,
                 RuntimeType::TokenSpeed,
             ),
-            leg(
+            worker(
                 "grpc://regular-2:8000",
                 WorkerType::Regular,
                 RuntimeType::TokenSpeed,
             ),
-            leg(
+            worker(
                 "grpc://prefill-1:8000",
                 WorkerType::Prefill,
                 RuntimeType::Sglang,
             ),
-            leg(
+            worker(
                 "grpc://decode-1:8000",
                 WorkerType::Decode,
                 RuntimeType::Sglang,
@@ -970,7 +971,7 @@ mod tests {
         assert_eq!(
             over(Mode::EncodePrefillDecode.multimodal_wire_pools()),
             Some(EncoderDtype::Float32),
-            "no encode leg registered: the prefill and decode legs decide"
+            "no encode worker registered: the prefill and decode workers decide"
         );
         assert_eq!(
             over(&[
@@ -979,7 +980,7 @@ mod tests {
                 RoutingPool::GrpcDecode,
             ]),
             None,
-            "legs that disagree with the regular workers keep the per-destination write"
+            "pools that disagree with the regular workers keep the per-destination write"
         );
         assert_eq!(
             over(&[RoutingPool::GrpcEncode]),

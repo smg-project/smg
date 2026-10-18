@@ -7,7 +7,7 @@ use llm_multimodal::{TransparencyPolicy, VisionProcessorRegistry};
 use crate::worker::{RoutingPool, RuntimeType, WorkerRegistry};
 
 /// The policy for the frames of a request to `model_id` served from the
-/// routing pools `pools`: the legs of the pipeline's mode, read as the
+/// routing pools `pools`: the pools of the pipeline's mode, read as the
 /// selection reads them, so the workers resolved here are the workers that
 /// can be picked (the image wire dtype is resolved over the same pools).
 ///
@@ -102,10 +102,10 @@ mod tests {
     const REGULAR: &[RoutingPool] = &[RoutingPool::GrpcPipelineRegular];
 
     fn worker(url: &str, runtime: RuntimeType) -> Arc<dyn Worker> {
-        leg(url, WorkerType::Regular, runtime)
+        worker_of(url, WorkerType::Regular, runtime)
     }
 
-    fn leg(url: &str, worker_type: WorkerType, runtime: RuntimeType) -> Arc<dyn Worker> {
+    fn worker_of(url: &str, worker_type: WorkerType, runtime: RuntimeType) -> Arc<dyn Worker> {
         Arc::new(
             BasicWorkerBuilder::new(url)
                 .model(ModelCard::new(MODEL))
@@ -195,27 +195,27 @@ mod tests {
         );
     }
 
-    /// Regular workers of one family next to prefill and decode legs of
-    /// another: the whole model's workers disagree, the legs a mode's request
+    /// Regular workers of one family next to prefill and decode workers of
+    /// another: the whole model's workers disagree, the pools a mode's request
     /// can reach do not.
-    fn fleet_with_legs() -> WorkerRegistry {
+    fn fleet_with_every_role() -> WorkerRegistry {
         registry_with(vec![
-            leg(
+            worker_of(
                 "grpc://regular-1:8000",
                 WorkerType::Regular,
                 RuntimeType::Vllm,
             ),
-            leg(
+            worker_of(
                 "grpc://regular-2:8000",
                 WorkerType::Regular,
                 RuntimeType::Vllm,
             ),
-            leg(
+            worker_of(
                 "grpc://prefill-1:8000",
                 WorkerType::Prefill,
                 RuntimeType::Sglang,
             ),
-            leg(
+            worker_of(
                 "grpc://decode-1:8000",
                 WorkerType::Decode,
                 RuntimeType::Sglang,
@@ -223,13 +223,13 @@ mod tests {
         ])
     }
 
-    /// The policy is resolved over the legs a mode's request can reach, as
+    /// The policy is resolved over the pools a mode's request can reach, as
     /// the wire dtype is: the regular pipeline sees its regular workers, a
-    /// disaggregated one its prefill and decode legs; only a mode whose own
-    /// legs disagree, or an empty one, keeps the frame as decoded.
+    /// disaggregated one its prefill and decode pools; only a mode whose own
+    /// pools disagree, or an empty one, keeps the frame as decoded.
     #[test]
-    fn the_policy_over_a_modes_pools_is_the_legs_the_request_can_reach() {
-        let registry = fleet_with_legs();
+    fn the_policy_is_resolved_over_the_pools_a_modes_request_can_reach() {
+        let registry = fleet_with_every_role();
         assert_eq!(
             engine_transparency_policy(&registry, MODEL, Mode::Regular.multimodal_wire_pools()),
             TransparencyPolicy::CompositeOverWhite,
@@ -242,7 +242,7 @@ mod tests {
                 Mode::PrefillDecode.multimodal_wire_pools()
             ),
             TransparencyPolicy::DropAlpha,
-            "the disaggregated pipeline reaches the SGLang legs only"
+            "the disaggregated pipeline reaches the SGLang workers only"
         );
         assert_eq!(
             engine_transparency_policy(
@@ -251,7 +251,7 @@ mod tests {
                 Mode::EncodePrefillDecode.multimodal_wire_pools()
             ),
             TransparencyPolicy::DropAlpha,
-            "no encode leg registered: the prefill and decode legs decide"
+            "no encode worker registered: the prefill and decode workers decide"
         );
         assert_eq!(
             engine_transparency_policy(
@@ -264,7 +264,7 @@ mod tests {
                 ]
             ),
             TransparencyPolicy::KeepAlpha,
-            "legs of two families keep the frame as decoded"
+            "pools of two families keep the frame as decoded"
         );
         assert_eq!(
             engine_transparency_policy(&registry, MODEL, &[RoutingPool::GrpcEncode]),
@@ -280,7 +280,7 @@ mod tests {
     #[ignore = "timing; run in release with --nocapture"]
     #[expect(clippy::print_stderr, reason = "a timing, read from the test output")]
     fn resolution_cost_over_pools_and_over_the_model() {
-        let registry = fleet_with_legs();
+        let registry = fleet_with_every_role();
         let pools = Mode::PrefillDecode.multimodal_wire_pools();
         let rounds = 200_000u32;
         let started = Instant::now();

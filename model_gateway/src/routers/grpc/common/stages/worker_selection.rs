@@ -18,7 +18,7 @@ use crate::observability::log_throttle::KeyedLogThrottle;
 use crate::{
     middleware::{tenant_resolution::AcceptedAt, SHED_RETRY_AFTER_SECS},
     observability::metrics::{metrics_labels, Metrics},
-    policies::{CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerLeg},
+    policies::{CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerRole},
     routers::{
         common::{
             placement::{
@@ -56,8 +56,8 @@ type PdWorkerPair = (Arc<dyn Worker>, Arc<dyn Worker>, RuntimeType);
 #[cfg(test)]
 const ACCEPTS_MEDIA_REFS: CandidateFilter<'static> = &accepts_media_refs;
 
-/// Why an EPD selection produced nothing. Only a full Prefill leg is told
-/// apart, for admission; every other failure is judged per leg afterwards by
+/// Why an EPD selection produced nothing. Only a full Prefill pool is told
+/// apart, for admission; every other failure is judged per role afterwards by
 /// [`WorkerSelectionStage::selection_failure`].
 #[derive(Clone, Copy)]
 enum EpdSelectionFailure {
@@ -72,7 +72,7 @@ impl PrefillCandidateError for EpdSelectionFailure {
 }
 
 /// Why a prefill/decode selection produced nothing: the placement's own
-/// verdict for the leg that failed, or a request carrying pixel media for a
+/// verdict for the role that failed, or a request carrying pixel media for a
 /// model that pairs no prefill worker with a vision encoder.
 #[derive(Debug)]
 enum PdSelectionFailure {
@@ -312,7 +312,7 @@ struct SelectionInputs<'a> {
     media_refs: bool,
     /// Pixel media (an image or a video) only goes to workers that accept
     /// vision input: regular mode's single worker takes the whole request,
-    /// and the disaggregated legs their shares of it (see `PairDemands`).
+    /// and the disaggregated sides their shares of it (see `PairDemands`).
     needs_vision: bool,
     context_requirements: ContextRequirements,
     demand: PairDemands,
@@ -328,7 +328,7 @@ struct SelectionInputs<'a> {
     keep_text: bool,
     cache_namespace: Option<CacheNamespace>,
     /// The request's media demands. The single worker takes the whole
-    /// request, so it must meet every one of them; the disaggregated legs
+    /// request, so it must meet every one of them; the disaggregated sides
     /// take the references' predicate (a worker that processes them, on
     /// the side of the pipeline pin the plan carries) from the inputs and
     /// their vision demands from `PairDemands` in the pair selection.
@@ -354,8 +354,8 @@ impl<'a> SelectionInputs<'a> {
             ContextRequirements::new(prep, &input.request_type)
         };
         let demand = PairDemands::new(
-            stage.prefill_leg_needs_vision(needs_vision),
-            stage.decode_leg_needs_vision(&input.request_type, intermediate, media_refs),
+            stage.prefill_side_needs_vision(needs_vision),
+            stage.decode_side_needs_vision(&input.request_type, intermediate, media_refs),
         )
         .with_media_refs(media_refs, media_refs_pipeline)
         .with_context(context_requirements);
@@ -503,7 +503,7 @@ impl WorkerSelectionStage {
 
         // Reject an unsupported (backend, modality) combination now that the
         // runtime is known, before request building assembles the payload only
-        // to fail deep in assembly. The prefill leg builds the request in
+        // to fail deep in assembly. The prefill side builds the request in
         // disaggregated mode, so its runtime is the one that must support the
         // request's modalities.
         if let Some(intermediate) = inputs.intermediate {
@@ -749,7 +749,7 @@ impl WorkerSelectionStage {
                         wire,
                         media,
                         PairDemands::new(
-                            self.prefill_leg_needs_vision(ctx.routing.needs_vision),
+                            self.prefill_side_needs_vision(ctx.routing.needs_vision),
                             ctx.routing.decode_needs_vision,
                         )
                         .with_media_refs(media_refs, ctx.wire.pipeline)
@@ -765,14 +765,14 @@ impl WorkerSelectionStage {
         Ok(())
     }
 
-    /// Whether this stage's decode leg needs a vision encoder for the
+    /// Whether this stage's decode side needs a vision encoder for the
     /// request ([`decode_needs_vision`]), recorded in the routing snapshot
     /// and paired under: in prefill/decode mode only. In
     /// encode/prefill/decode mode the encode workers take the pixels and the
-    /// decode leg is dispatched without them, so it never needs the encoder
+    /// decode side is dispatched without them, so it never needs the encoder
     /// and a retry must not be held to a worker with one; regular mode has
-    /// no decode leg.
-    fn decode_leg_needs_vision(
+    /// no decode side.
+    fn decode_side_needs_vision(
         &self,
         request: &RequestType,
         intermediate: Option<&multimodal::MultimodalIntermediate>,
@@ -782,13 +782,13 @@ impl WorkerSelectionStage {
             && decode_needs_vision(request, intermediate, media_refs)
     }
 
-    /// Whether this stage's prefill leg needs a vision encoder for a request
+    /// Whether this stage's prefill side needs a vision encoder for a request
     /// that carries pixel media (`needs_vision`, see
     /// [`multimodal::request_needs_vision`]), paired under in prefill/decode
-    /// mode only, where the prefill leg takes the request's media whole. In
+    /// mode only, where the prefill side takes the request's media whole. In
     /// encode/prefill/decode mode the encode workers take the pixels; regular
     /// mode holds its single worker to the demand itself ([`MediaDemands`]).
-    fn prefill_leg_needs_vision(&self, needs_vision: bool) -> bool {
+    fn prefill_side_needs_vision(&self, needs_vision: bool) -> bool {
         self.mode == WorkerSelectionMode::PrefillDecode && needs_vision
     }
 
@@ -842,15 +842,15 @@ impl WorkerSelectionStage {
         .await
         .map_err(|error| {
             Self::acquire_failure(model_id, error, |_| {
-                // Encode is a demanded leg only when the request carries
+                // Encode is a demanded role only when the request carries
                 // encode items; an idle-but-vetoed encode pool must not shed
                 // a text-only request.
-                let legs: &[WorkerType] = if encode_item_hashes.is_empty() {
+                let roles: &[WorkerType] = if encode_item_hashes.is_empty() {
                     &[WorkerType::Prefill, WorkerType::Decode]
                 } else {
                     &[WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode]
                 };
-                self.selection_failure(model_id, legs, None, MediaDemands::NONE)
+                self.selection_failure(model_id, roles, None, MediaDemands::NONE)
             })
         })
     }
@@ -882,7 +882,7 @@ fn accepts_media_refs(worker: &dyn Worker) -> bool {
     multimodal::worker_accepts_media_refs(worker)
 }
 
-/// Candidate predicate for a request, or a disaggregated leg of one, that
+/// Candidate predicate for a request, or a disaggregated side of one, that
 /// needs a vision encoder: a worker that advertises none
 /// (`supports_vision=false`) admits such a request and never schedules it. A
 /// worker without the label reads as capable, as today.
@@ -890,13 +890,13 @@ fn vision_capable(worker: &dyn Worker) -> bool {
     !multimodal::worker_language_model_only(worker)
 }
 
-/// Whether a request's disaggregated decode leg cannot be served by a decode
+/// Whether a request's disaggregated decode side cannot be served by a decode
 /// worker that accepts no vision input: the shapes dispatch refuses with a
 /// non-retryable 400 once such a worker is selected (media references, which
-/// each leg expands itself; a multimodal request with `n > 1`, whose decode
-/// leg recomputes the prompt locally; grid tensors, which the leg derives
+/// each side expands itself; a multimodal request with `n > 1`, whose decode
+/// side recomputes the prompt locally; grid tensors, which the side derives
 /// its positions from). A text request of any `n` and a single-sample image
-/// request without grids take such a worker's stripped leg, so they are not
+/// request without grids take such a worker's stripped side, so they are not
 /// steered away from it.
 fn decode_needs_vision(
     request: &RequestType,
@@ -908,13 +908,13 @@ fn decode_needs_vision(
             .is_some_and(|intermediate| request.sampling_n() > 1 || intermediate.has_mrope_grids())
 }
 
-/// Context bounds for both token-processing legs, and which legs need a vision
-/// encoder. The prefill leg takes the request's media whole (the processed
+/// Context bounds for both token-processing sides, and which sides need a vision
+/// encoder. The prefill side takes the request's media whole (the processed
 /// pixel tensors, or the references it expands itself), so any image or
 /// video is a demand on it: a prefill worker without the encoder admits
 /// such a request and never schedules it, and no dispatch check catches
-/// that. The decode leg's demand is [`decode_needs_vision`]'s, and holds
-/// on the prefill leg too (neither leg runs those shapes without the
+/// that. The decode side's demand is [`decode_needs_vision`]'s, and holds
+/// on the prefill side too (neither side runs those shapes without the
 /// encoder).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PairDemands {
@@ -922,7 +922,7 @@ struct PairDemands {
     prefill: bool,
     decode: bool,
     /// The request forwards media references, which only a worker that
-    /// processes them can take: the prefill leg's refusal check then wants
+    /// processes them can take: the prefill side's refusal check then wants
     /// a worker with the encoder among those, or the request could never
     /// pair and a retryable 503 would send the client back for ever.
     refs: bool,
@@ -934,7 +934,7 @@ struct PairDemands {
 
 impl PairDemands {
     /// The demand of a request that carries pixel media (`pixel_media`, see
-    /// [`multimodal::request_needs_vision`]) and whose decode leg needs the encoder
+    /// [`multimodal::request_needs_vision`]) and whose decode side needs the encoder
     /// (`decode`, see [`decode_needs_vision`]).
     fn new(pixel_media: bool, decode: bool) -> Self {
         Self {
@@ -948,7 +948,7 @@ impl PairDemands {
 
     /// The same demand for a request that forwards media references (`refs`,
     /// the caller's references predicate) on the side of `pipeline`: the
-    /// prefill leg's refusal and the capacity refusal are judged among the
+    /// prefill side's refusal and the capacity refusal are judged among the
     /// workers that take them there.
     fn with_media_refs(self, refs: bool, pipeline: PipelinePin) -> Self {
         Self {
@@ -958,12 +958,12 @@ impl PairDemands {
         }
     }
 
-    /// Context bounds shared by both token-processing legs, never the encoder.
+    /// Context bounds shared by both token-processing sides, never the encoder.
     fn with_context(self, context: ContextRequirements) -> Self {
         Self { context, ..self }
     }
 
-    /// The demand on the leg `worker` serves.
+    /// The demand on the side `worker` serves.
     fn on(self, worker: &dyn Worker) -> bool {
         match worker.worker_type() {
             WorkerType::Prefill => self.prefill,
@@ -972,8 +972,8 @@ impl PairDemands {
     }
 }
 
-/// The predicate of a request whose prefill leg needs a vision encoder, on
-/// either leg: a prefill worker with the encoder, any decode worker.
+/// The predicate of a request whose prefill side needs a vision encoder, on
+/// either side: a prefill worker with the encoder, any decode worker.
 fn prefill_vision_capable(worker: &dyn Worker) -> bool {
     !matches!(worker.worker_type(), WorkerType::Prefill) || vision_capable(worker)
 }
@@ -1041,7 +1041,7 @@ impl MediaDemands {
 
     /// Whether `worker` may take the request's references: it processes
     /// them, on the side of the pipeline pin the plan carries. The vision
-    /// demand is the leg's own (see [`Self::accepts`]).
+    /// demand is the side's own (see [`Self::accepts`]).
     fn accepts_refs(self, worker: &dyn Worker) -> bool {
         (!self.media_refs || accepts_media_refs(worker)) && pipeline_admits(self.pipeline, worker)
     }
@@ -1067,11 +1067,11 @@ fn pipeline_admits(pin: PipelinePin, worker: &dyn Worker) -> bool {
     }
 }
 
-/// A leg as a refusal names it, and the pool the gRPC pipeline draws it
-/// from: the one table behind every leg verdict, refusal line and pair
+/// A role as a refusal names it, and the pool the gRPC pipeline draws it
+/// from: the one table behind every role verdict, refusal line and pair
 /// failure of this stage.
-const fn leg_entry(leg: WorkerType) -> (&'static str, RoutingPool) {
-    match leg {
+const fn role_entry(role: WorkerType) -> (&'static str, RoutingPool) {
+    match role {
         WorkerType::Regular => ("regular", RoutingPool::GrpcPipelineRegular),
         WorkerType::Prefill => ("prefill", RoutingPool::GrpcPrefill),
         WorkerType::Decode => ("decode", RoutingPool::GrpcDecode),
@@ -1079,40 +1079,40 @@ const fn leg_entry(leg: WorkerType) -> (&'static str, RoutingPool) {
     }
 }
 
-/// A leg's name in a refusal's text.
-fn leg_name(leg: WorkerType) -> &'static str {
-    leg_entry(leg).0
+/// A role's name in a refusal's text.
+fn role_name(role: WorkerType) -> &'static str {
+    role_entry(role).0
 }
 
-/// The pool a leg's candidates come from.
-fn leg_pool(leg: WorkerType) -> RoutingPool {
-    leg_entry(leg).1
+/// The pool a role's candidates come from.
+fn role_pool(role: WorkerType) -> RoutingPool {
+    role_entry(role).1
 }
 
-/// The leg of a pair placement as the leg table knows it; `Single` is the
+/// The role of a pair placement as the role table knows it; `Single` is the
 /// pair's whole and has no entry.
-fn pair_leg(leg: WorkerLeg) -> Option<WorkerType> {
-    match leg {
-        WorkerLeg::Prefill => Some(WorkerType::Prefill),
-        WorkerLeg::Decode => Some(WorkerType::Decode),
-        WorkerLeg::Single => None,
+fn pair_role(role: WorkerRole) -> Option<WorkerType> {
+    match role {
+        WorkerRole::Prefill => Some(WorkerType::Prefill),
+        WorkerRole::Decode => Some(WorkerType::Decode),
+        WorkerRole::Single => None,
     }
 }
 
-/// The legs each selection mode draws from, in the order a refusal line
+/// The roles each selection mode draws from, in the order a refusal line
 /// names them.
-const REGULAR_LEGS: [(&str, RoutingPool); 1] = [leg_entry(WorkerType::Regular)];
-const PREFILL_DECODE_LEGS: [(&str, RoutingPool); 2] = [
-    leg_entry(WorkerType::Prefill),
-    leg_entry(WorkerType::Decode),
+const REGULAR_ROLES: [(&str, RoutingPool); 1] = [role_entry(WorkerType::Regular)];
+const PREFILL_DECODE_ROLES: [(&str, RoutingPool); 2] = [
+    role_entry(WorkerType::Prefill),
+    role_entry(WorkerType::Decode),
 ];
-const ENCODE_PREFILL_DECODE_LEGS: [(&str, RoutingPool); 3] = [
-    leg_entry(WorkerType::Encode),
-    leg_entry(WorkerType::Prefill),
-    leg_entry(WorkerType::Decode),
+const ENCODE_PREFILL_DECODE_ROLES: [(&str, RoutingPool); 3] = [
+    role_entry(WorkerType::Encode),
+    role_entry(WorkerType::Prefill),
+    role_entry(WorkerType::Decode),
 ];
 
-/// Runtime of the leg that builds the generate request: the sole worker in
+/// Runtime of the role that builds the generate request: the sole worker in
 /// regular mode, the prefill worker in disaggregated (PD/EPD) mode.
 fn selection_runtime(workers: &WorkerSelection) -> RuntimeType {
     match workers {
@@ -1173,44 +1173,44 @@ impl WorkerSelectionStage {
         }
     }
 
-    /// Response for a selection that produced nothing: a 503 shed when a leg's
+    /// Response for a selection that produced nothing: a 503 shed when a role's
     /// whole candidate pool is vetoed, the existing 404 otherwise.
     ///
-    /// `legs` must be exactly the legs this selection demanded — the verdict is
-    /// per leg because a whole-model predicate is false exactly when one
-    /// saturated leg made the set unselectable, and an undemanded leg (EPD
+    /// `roles` must be exactly the roles this selection demanded — the verdict is
+    /// per role because a whole-model predicate is false exactly when one
+    /// saturated role made the set unselectable, and an undemanded role (EPD
     /// without encode items) must not be able to shed a request that never
     /// needed it.
     /// `wire` narrows the verdict to the retained plan's runtime/transport on
     /// the retry path: a drained pinned pool must not answer 404 just because
     /// other runtimes still serve the model.
-    /// `media` are the request's media demands: a leg with candidates but
+    /// `media` are the request's media demands: a role with candidates but
     /// none meeting them is a capability verdict ([`Self::media_failure`]).
     fn selection_failure(
         &self,
         model_id: &str,
-        legs: &[WorkerType],
+        roles: &[WorkerType],
         wire: Option<WireConstraint>,
         media: MediaDemands,
     ) -> Response {
         let media = media.with_wire(wire);
         if media.any() {
-            return self.media_failure(model_id, legs, wire, media);
+            return self.media_failure(model_id, roles, wire, media);
         }
         let mut unavailable = false;
         let mut missing: Vec<&'static str> = Vec::new();
-        for leg in legs {
-            let verdict = match leg {
-                // The regular leg is judged from exactly the pool the shared
+        for role in roles {
+            let verdict = match role {
+                // The regular role is judged from exactly the pool the shared
                 // placement drew from.
                 WorkerType::Regular => placement::single_failure(
                     &self.worker_registry,
                     model_id,
-                    leg_pool(WorkerType::Regular),
+                    role_pool(WorkerType::Regular),
                     wire,
                 ),
                 WorkerType::Prefill | WorkerType::Decode | WorkerType::Encode => {
-                    self.disaggregated_leg_verdict(model_id, leg_pool(*leg), wire)
+                    self.disaggregated_role_verdict(model_id, role_pool(*role), wire)
                 }
             };
             match verdict {
@@ -1221,15 +1221,15 @@ impl WorkerSelectionStage {
                 | PlacementFailure::PrefillAtCapacity => {
                     unavailable = true;
                 }
-                PlacementFailure::NoCandidates => missing.push(leg_name(*leg)),
+                PlacementFailure::NoCandidates => missing.push(role_name(*role)),
             }
         }
         if unavailable {
-            // A leg with workers beside a leg with none: the pair is
-            // incomplete (a leg restarting, or not yet discovered), which the
-            // refusal says, instead of calling the registered leg unhealthy.
+            // A role with workers beside a role with none: the pair is
+            // incomplete (a role restarting, or not yet discovered), which the
+            // refusal says, instead of calling the registered role unhealthy.
             if !missing.is_empty() {
-                return Self::leg_missing(model_id, &missing);
+                return Self::role_missing(model_id, &missing);
             }
             return Self::workers_unavailable(model_id);
         }
@@ -1237,11 +1237,11 @@ impl WorkerSelectionStage {
     }
 
     /// The refusal for a disaggregated request whose model has workers on
-    /// some leg and none on `missing`: the `no_available_workers` 503 with
-    /// its `Retry-After`, naming the missing leg for the client and for the
-    /// refusal's line. A model with no leg at all is not this: it stays the
+    /// some role and none on `missing`: the `no_available_workers` 503 with
+    /// its `Retry-After`, naming the missing role for the client and for the
+    /// refusal's line. A model with no role at all is not this: it stays the
     /// 404 of a model nobody serves.
-    fn leg_missing(model_id: &str, missing: &[&'static str]) -> Response {
+    fn role_missing(model_id: &str, missing: &[&'static str]) -> Response {
         placement::no_available_workers(format!(
             "No {} worker is registered for model '{model_id}' at the moment (its other leg \
              is): the pair is incomplete",
@@ -1251,21 +1251,21 @@ impl WorkerSelectionStage {
 
     /// Selection failure for a request with media demands, judged from the
     /// capability-filtered pool: an absent model stays 404, an overloaded
-    /// capable pool keeps its shed, and only a leg with candidates but no
+    /// capable pool keeps its shed, and only a role with candidates but no
     /// capable one is a capability verdict. The vision encoder is judged
     /// first: a pool with no worker that can take the request's pixels is
     /// the request's own 400, whichever workers process references.
     fn media_failure(
         &self,
         model_id: &str,
-        legs: &[WorkerType],
+        roles: &[WorkerType],
         wire: Option<WireConstraint>,
         media: MediaDemands,
     ) -> Response {
         let mut unavailable = false;
-        for leg in legs {
+        for role in roles {
             let candidates =
-                placement::candidates(&self.worker_registry, model_id, leg_pool(*leg), wire);
+                placement::candidates(&self.worker_registry, model_id, role_pool(*role), wire);
             let candidates = candidates.as_slice();
             if candidates.is_empty() {
                 continue;
@@ -1387,7 +1387,7 @@ impl WorkerSelectionStage {
     }
 
     /// [`Self::workers_unavailable`] with the verdict the stage has as its
-    /// line's reason (the policy that declined a leg, the leg at its
+    /// line's reason (the policy that declined a role, the role at its
     /// admission limit); the client's message stays the one above.
     fn workers_unavailable_because(model_id: &str, reason: String) -> Response {
         placement::no_available_workers_because(Self::workers_unavailable_message(model_id), reason)
@@ -1447,17 +1447,18 @@ impl WorkerSelectionStage {
     /// How the stage's refusal line names the stage and the pools its mode
     /// draws from.
     fn refusal_site(&self, function: &'static str) -> RefusalSite<'static> {
-        let (mode, legs): (&'static str, &'static [(&'static str, RoutingPool)]) = match self.mode {
-            WorkerSelectionMode::Regular => ("Regular", &REGULAR_LEGS),
-            WorkerSelectionMode::PrefillDecode => ("PrefillDecode", &PREFILL_DECODE_LEGS),
+        let (mode, pools): (&'static str, &'static [(&'static str, RoutingPool)]) = match self.mode
+        {
+            WorkerSelectionMode::Regular => ("Regular", &REGULAR_ROLES),
+            WorkerSelectionMode::PrefillDecode => ("PrefillDecode", &PREFILL_DECODE_ROLES),
             WorkerSelectionMode::EncodePrefillDecode => {
-                ("EncodePrefillDecode", &ENCODE_PREFILL_DECODE_LEGS)
+                ("EncodePrefillDecode", &ENCODE_PREFILL_DECODE_ROLES)
             }
         };
         RefusalSite {
             function,
             mode,
-            legs,
+            pools,
         }
     }
 
@@ -1482,7 +1483,7 @@ impl WorkerSelectionStage {
         }
     }
 
-    /// `workers` (the regular pool's, or the prefill leg's) serve the model
+    /// `workers` (the regular pool's, or the prefill pool's) serve the model
     /// but none has a vision encoder, so none can take the request's images
     /// or video: the 400 a model without vision gives image input, instead
     /// of a dispatch the engine admits and never schedules. A 400 is
@@ -1506,26 +1507,26 @@ impl WorkerSelectionStage {
     }
 
     /// The response for a failed pair placement. The verdict was judged from
-    /// the leg's own candidates inside the placement, so a shed is answered
-    /// as it was built and counted once; a leg nobody serves is a 404 unless
-    /// its partner leg has workers (the pair is incomplete: the 503 naming
-    /// the missing leg), and a leg whose workers are all unavailable is the
+    /// the role's own candidates inside the placement, so a shed is answered
+    /// as it was built and counted once; a role nobody serves is a 404 unless
+    /// its partner role has workers (the pair is incomplete: the 503 naming
+    /// the missing role), and a role whose workers are all unavailable is the
     /// 503 the HTTP router gives.
     fn pair_failure(&self, model_id: &str, failure: PairFailure) -> Response {
-        let leg = pair_leg(failure.leg).map_or("worker", leg_name);
+        let role = pair_role(failure.role).map_or("worker", role_name);
         match failure.verdict {
             PlacementFailure::AllOverloaded(shed) => shed,
             PlacementFailure::Unavailable => Self::workers_unavailable(model_id),
             // The client reads the 503's usual message; the line names the
-            // policy and the leg, as the HTTP PD router's does.
+            // policy and the role, as the HTTP PD router's does.
             PlacementFailure::PolicyDeclined(policy) => Self::workers_unavailable_because(
                 model_id,
-                format!("Policy {policy} failed to select a {leg} worker"),
+                format!("Policy {policy} failed to select a {role} worker"),
             ),
             // Admission turns a capacity verdict into a wait before it gets here.
             PlacementFailure::PrefillAtCapacity => Self::workers_unavailable_because(
                 model_id,
-                format!("No {leg} workers below their Prefill admission limit"),
+                format!("No {role} workers below their Prefill admission limit"),
             ),
             PlacementFailure::NoCompatiblePair {
                 prefill,
@@ -1550,15 +1551,15 @@ impl WorkerSelectionStage {
                     ),
                 )
             }
-            // A leg nobody serves beside a partner leg with workers: the
-            // pair is incomplete (a leg restarting, or not yet discovered),
-            // which the refusal says; with no worker on either leg the model
+            // A role nobody serves beside a partner role with workers: the
+            // pair is incomplete (a role restarting, or not yet discovered),
+            // which the refusal says; with no worker on either role the model
             // is one nobody serves.
             PlacementFailure::NoCandidates => {
-                let partner = match failure.leg {
-                    WorkerLeg::Prefill => Some(leg_pool(WorkerType::Decode)),
-                    WorkerLeg::Decode => Some(leg_pool(WorkerType::Prefill)),
-                    WorkerLeg::Single => None,
+                let partner = match failure.role {
+                    WorkerRole::Prefill => Some(role_pool(WorkerType::Decode)),
+                    WorkerRole::Decode => Some(role_pool(WorkerType::Prefill)),
+                    WorkerRole::Single => None,
                 };
                 let partner_registered = partner.is_some_and(|pool| {
                     !self
@@ -1567,7 +1568,7 @@ impl WorkerSelectionStage {
                         .is_empty()
                 });
                 if partner_registered {
-                    Self::leg_missing(model_id, &[leg])
+                    Self::role_missing(model_id, &[role])
                 } else {
                     error::model_not_found(model_id)
                 }
@@ -1575,12 +1576,12 @@ impl WorkerSelectionStage {
         }
     }
 
-    /// The verdict for one disaggregated leg, judged from the pool it
-    /// selected over *before* the `is_available()` filter. The legs are
+    /// The verdict for one disaggregated role, judged from the pool it
+    /// selected over *before* the `is_available()` filter. The roles are
     /// gRPC-only (no KV rendezvous on ZMQ), so a retry pins the runtime alone;
-    /// the regular leg is judged by [`placement::single_failure`] instead.
+    /// the regular role is judged by [`placement::single_failure`] instead.
     /// Failure path only.
-    fn disaggregated_leg_verdict(
+    fn disaggregated_role_verdict(
         &self,
         model_id: &str,
         pool: RoutingPool,
@@ -1692,7 +1693,7 @@ impl WorkerSelectionStage {
         )
     }
 
-    /// Workers from one leg pool of `snapshot` that also pass the live
+    /// Workers from one role pool of `snapshot` that also pass the live
     /// `is_available()` check (health, circuit breaker, overload veto).
     fn available_workers(
         snapshot: &ModelWorkerSnapshot,
@@ -1706,8 +1707,8 @@ impl WorkerSelectionStage {
             .collect()
     }
 
-    /// The placement's verdict for a failed pair, unless the failing leg's
-    /// pool explains it by the request's media: no worker of the leg
+    /// The placement's verdict for a failed pair, unless the failing role's
+    /// pool explains it by the request's media: no worker of the role
     /// processes references, or none of those that do is on the side of
     /// the plan's pipeline pin. Both are the request's own 400, as the
     /// regular path answers them, not a retryable 503 over healthy workers.
@@ -1720,8 +1721,8 @@ impl WorkerSelectionStage {
         if media.media_refs {
             let snapshot = self.worker_registry.get_routing_snapshot(model_id);
             let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
-            let pool = match failure.leg {
-                WorkerLeg::Prefill => &pairs.prefill_pool,
+            let pool = match failure.role {
+                WorkerRole::Prefill => &pairs.prefill_pool,
                 _ => &pairs.decode_pool,
             };
             if !pool.is_empty() {
@@ -1748,7 +1749,7 @@ impl WorkerSelectionStage {
     }
 
     /// Apply media and context constraints within the existing compatible-pair
-    /// index, then let the configured policies and admission choose the legs.
+    /// index, then let the configured policies and admission choose the roles.
     fn select_pd_pair(
         &self,
         model_id: &str,
@@ -1757,25 +1758,25 @@ impl WorkerSelectionStage {
         prefill_capacity: Option<&PrefillSelectionContext<'_>>,
         demand: PairDemands,
     ) -> Result<PdWorkerPair, PdSelectionFailure> {
-        // Both legs derive from ONE membership snapshot: separate pool
+        // Both pools derive from ONE membership snapshot: separate pool
         // lookups could straddle a concurrent replacement and pair workers
-        // that never coexisted. The pools are strictly gRPC (a ZMQ leg would
+        // that never coexisted. The pools are strictly gRPC (a ZMQ worker would
         // silently drop the PD bootstrap info, see `RoutingPool::GrpcPrefill`;
-        // the wildcard model maps to the global snapshot). The legs must
+        // the wildcard model maps to the global snapshot). The pools must
         // share a runtime, the rendezvous being runtime-specific, and a retry
         // pins both to the retained plan's runtime.
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
-        // A leg that needs a vision encoder (see `PairDemands`) is kept off
-        // the workers without one. The prefill leg must find one: a request
+        // A side that needs a vision encoder (see `PairDemands`) is kept off
+        // the workers without one. The prefill side must find one: a request
         // carrying pixel media is refused when the index pairs no prefill
-        // worker with the encoder (a leg nobody serves and a fleet without a
+        // worker with the encoder (a role nobody serves and a fleet without a
         // shared transport keep the placement's own verdicts), since no
-        // dispatch check would catch the leg landing on a worker without it.
-        // The decode leg is kept off such workers while the index holds a
-        // pair with the encoder on both legs that the caller's own predicate
+        // dispatch check would catch the side landing on a worker without it.
+        // The decode side is kept off such workers while the index holds a
+        // pair with the encoder on both sides that the caller's own predicate
         // admits too; with none the decode pool is used as it is, and
-        // dispatch refuses the leg naming the gap, as it does for a pool
+        // dispatch refuses the side naming the gap, as it does for a pool
         // with no such worker at all. With media references the worker must
         // take them too (`PairDemands::refs`): a pool whose referencing
         // prefill worker lacks the encoder and whose encoder-bearing one
@@ -1825,7 +1826,7 @@ impl WorkerSelectionStage {
                 && demand.context.admits(worker, model_id)
         };
         // Membership, not health, decides whether a request can ever fit.
-        // Inspect actual partners: independently large legs need not pair.
+        // Inspect actual partners: independently large pools need not pair.
         if !pair_admitted_by(&pairs, wire, &|worker: &dyn Worker| {
             takes_media(worker) && demand.context.admits(worker, model_id)
         }) {
@@ -1874,10 +1875,10 @@ impl WorkerSelectionStage {
     /// Mirrors `select_pd_pair` but also assigns each multimodal item to an
     /// encode worker. prefill+decode are selected as a normal PD pair. All pools
     /// are filtered to a runtime shared by the selected encode/prefill/decode
-    /// legs.
+    /// workers.
     ///
-    /// The error only tells a full Prefill leg apart from every other
-    /// failure; those are judged per leg by [`Self::selection_failure`].
+    /// The error only tells a full Prefill pool apart from every other
+    /// failure; those are judged per role by [`Self::selection_failure`].
     fn select_encode_prefill_decode_workers(
         &self,
         model_id: &str,
@@ -1893,17 +1894,17 @@ impl WorkerSelectionStage {
             cache_namespace,
             ..
         } = inputs;
-        // All three legs derive from ONE membership snapshot (see
+        // All three pools derive from ONE membership snapshot (see
         // select_pd_pair). The pools are strictly gRPC — encode dispatch is
         // a gRPC encoder RPC the direct-ZMQ worker has no path for, and the
         // ZMQ wire carries no KV-transfer rendezvous for the prefill/decode
-        // legs; the wildcard model maps to the global snapshot. Availability
+        // pools; the wildcard model maps to the global snapshot. Availability
         // stays a live per-request check.
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let needs_encode = !encode_item_hashes.is_empty();
-        let all_encode = epd_leg_candidates(&snapshot, WorkerType::Encode, needs_encode)?;
-        let all_prefill = epd_leg_candidates(&snapshot, WorkerType::Prefill, true)?;
-        let all_decode = epd_leg_candidates(&snapshot, WorkerType::Decode, true)?;
+        let all_encode = epd_role_candidates(&snapshot, WorkerType::Encode, needs_encode)?;
+        let all_prefill = epd_role_candidates(&snapshot, WorkerType::Prefill, true)?;
+        let all_decode = epd_role_candidates(&snapshot, WorkerType::Decode, true)?;
 
         let Some(target_runtime) =
             shared_epd_runtime(&all_encode, &all_prefill, &all_decode, needs_encode)
@@ -1972,7 +1973,7 @@ impl WorkerSelectionStage {
             rid_key,
             cache_namespace,
             hash_ring: hash_ring.clone(),
-            leg: WorkerLeg::Prefill,
+            role: WorkerRole::Prefill,
         };
         let prefill_idx = self
             .policy_registry
@@ -1983,7 +1984,7 @@ impl WorkerSelectionStage {
         {
             return Err(EpdSelectionFailure::PrefillAtCapacity);
         }
-        info.leg = WorkerLeg::Decode;
+        info.role = WorkerRole::Decode;
         let decode_idx = self
             .policy_registry
             .select_worker_for_model(&decode_policy, model_id, &available_decode, &info)
@@ -2027,23 +2028,23 @@ impl WorkerSelectionStage {
     }
 }
 
-/// A leg's available candidates from the EPD membership snapshot. A demanded
-/// leg with none fails the selection as unavailable; the encode leg is
+/// A role's available candidates from the EPD membership snapshot. A demanded
+/// role with none fails the selection as unavailable; the encode role is
 /// demanded only when the request carries encode items.
-fn epd_leg_candidates(
+fn epd_role_candidates(
     snapshot: &ModelWorkerSnapshot,
-    leg: WorkerType,
+    role: WorkerType,
     demanded: bool,
 ) -> Result<Vec<Arc<dyn Worker>>, EpdSelectionFailure> {
-    let candidates = WorkerSelectionStage::available_workers(snapshot, leg_pool(leg));
+    let candidates = WorkerSelectionStage::available_workers(snapshot, role_pool(role));
     if demanded && candidates.is_empty() {
-        warn!("No available {} workers", leg_name(leg));
+        warn!("No available {} workers", role_name(role));
         return Err(EpdSelectionFailure::Unavailable);
     }
     Ok(candidates)
 }
 
-/// The runtime the EPD legs share: disaggregated legs must share one, so it
+/// The runtime the EPD pools share: disaggregated pools must share one, so it
 /// is a runtime that has at least one available worker in every required
 /// pool, instead of blindly the first prefill runtime.
 fn shared_epd_runtime(
@@ -2070,7 +2071,7 @@ fn shared_epd_runtime(
         })
 }
 
-/// The candidates of `runtime` among a leg's.
+/// The candidates of `runtime` among a role's.
 fn on_runtime(candidates: Vec<Arc<dyn Worker>>, runtime: RuntimeType) -> Vec<Arc<dyn Worker>> {
     candidates
         .into_iter()
@@ -2113,7 +2114,7 @@ fn assign_encode_workers(
                 rid_key: None,
                 cache_namespace: None,
                 hash_ring: hash_ring.clone(),
-                leg: WorkerLeg::Single,
+                role: WorkerRole::Single,
             };
             let worker_idx = policy.select_worker(encode_workers, &info)?;
             let worker = encode_workers[worker_idx].clone();
@@ -2521,14 +2522,14 @@ mod tests {
         (prefill_hits, decode_hits)
     }
 
-    /// A saturated prefill leg is a pressure condition, not model absence.
+    /// A saturated prefill pool is a pressure condition, not model absence.
     ///
     /// The model's decode workers stay unflagged, so a whole-model shed
     /// predicate reads "not all overloaded" and the request would fall through
     /// to 404 — the exact answer this feature exists to replace, and worse than
     /// the pre-feature behaviour where the prefill worker still served.
     #[test]
-    fn a_fully_vetoed_prefill_leg_sheds_rather_than_404s() {
+    fn a_fully_vetoed_prefill_pool_sheds_rather_than_404s() {
         let model_id = "test-model-prefill-veto";
         let worker_registry = Arc::new(WorkerRegistry::new());
         worker_registry.set_overload_shed(true);
@@ -2584,11 +2585,11 @@ mod tests {
         );
     }
 
-    /// An undemanded leg cannot shed: a text-only EPD request that fails for a
+    /// An undemanded role cannot shed: a text-only EPD request that fails for a
     /// non-overload reason must not 503 just because the (unused) encode pool
     /// is saturated.
     #[test]
-    fn an_undemanded_encode_leg_cannot_shed() {
+    fn an_undemanded_encode_pool_cannot_shed() {
         let model_id = "test-model-encode-veto";
         let worker_registry = Arc::new(WorkerRegistry::new());
         let encode: Arc<dyn Worker> = Arc::new(
@@ -2653,11 +2654,11 @@ mod tests {
     }
 
     #[test]
-    fn select_pd_pair_shared_round_robin_keeps_each_leg_even() {
+    fn select_pd_pair_shared_round_robin_keeps_each_pool_even() {
         // Same correctness bar as the independent test. One shared RoundRobin
         // Arc for P/D used to advance a single counter twice per request and
-        // pin each leg to half its workers; the rotation is per candidate
-        // set now, so even a shared instance covers both legs evenly.
+        // pin each pool to half its workers; the rotation is per candidate
+        // set now, so even a shared instance covers both pools evenly.
         let model_id = "test-model-shared";
         let worker_registry = Arc::new(WorkerRegistry::new());
         let (prefill_urls, decode_urls) = register_pd_workers(&worker_registry, model_id, 4);
@@ -2720,7 +2721,7 @@ mod tests {
     }
 
     #[test]
-    fn select_pd_pair_ignores_zmq_legs() {
+    fn select_pd_pair_ignores_zmq_workers() {
         // The ZMQ wire carries no KV-transfer rendezvous, so ZMQ prefill/decode
         // workers must never be paired even if they reach the registry.
         let model_id = "test-model-zmq";
@@ -2763,7 +2764,7 @@ mod tests {
             "ZMQ-only PD pools must not yield a pair"
         );
 
-        // Adding gRPC legs makes selection succeed, and it never picks the ZMQ ones.
+        // Adding gRPC workers makes selection succeed, and it never picks the ZMQ ones.
         let (prefill_urls, decode_urls) = register_pd_workers(&worker_registry, model_id, 4);
         let (prefill, decode, _) = stage
             .select_pd_pair(
@@ -2967,16 +2968,16 @@ mod tests {
         );
     }
 
-    /// A disaggregated leg whose only worker is down is the same 503, both
-    /// through the per-leg fallback and through the pair verdict; a leg
-    /// nobody serves beside a registered partner leg is that 503 too, naming
-    /// the leg (the pair is incomplete), where it was the 404 of a model
+    /// A disaggregated role whose only worker is down is the same 503, both
+    /// through the per-role fallback and through the pair verdict; a role
+    /// nobody serves beside a registered partner role is that 503 too, naming
+    /// the role (the pair is incomplete), where it was the 404 of a model
     /// nobody serves.
     #[test]
-    fn an_unavailable_decode_leg_answers_503_not_404() {
+    fn an_unavailable_decode_pool_answers_503_not_404() {
         use openai_protocol::worker::WorkerStatus;
 
-        use crate::{policies::WorkerLeg, routers::error::extract_error_code_from_response};
+        use crate::{policies::WorkerRole, routers::error::extract_error_code_from_response};
         let model_id = "test-model-decode-down";
         let worker_registry = Arc::new(WorkerRegistry::new());
         register_pd_workers(&worker_registry, model_id, 1);
@@ -3002,7 +3003,7 @@ mod tests {
         let pair = stage.pair_failure(
             model_id,
             PairFailure {
-                leg: WorkerLeg::Decode,
+                role: WorkerRole::Decode,
                 verdict: PlacementFailure::Unavailable,
             },
         );
@@ -3018,7 +3019,7 @@ mod tests {
         let absent = stage.pair_failure(
             model_id,
             PairFailure {
-                leg: WorkerLeg::Decode,
+                role: WorkerRole::Decode,
                 verdict: PlacementFailure::NoCandidates,
             },
         );
@@ -3030,7 +3031,7 @@ mod tests {
         assert!(
             placement::refusal_reason(&absent)
                 .is_some_and(|reason| reason.contains("No decode worker")),
-            "the refusal names the missing leg"
+            "the refusal names the missing role"
         );
     }
 
@@ -3222,7 +3223,7 @@ mod tests {
 
     /// Capacity and the retained grammar decision are intersected on retry.
     /// Under PD, grammar compatibility constrains D alone; capacity constrains
-    /// both legs. A large incompatible D cannot replace a failed eligible D.
+    /// both pools. A large incompatible D cannot replace a failed eligible D.
     #[tokio::test]
     async fn context_and_grammar_constraints_compose_on_retry() {
         for mode in [
@@ -3318,7 +3319,7 @@ mod tests {
 
     /// The request has been dropped on retry; its longest batched input,
     /// rather than the first prompt's affinity tokens, must still constrain
-    /// regular selection and both PD legs.
+    /// regular selection and both PD pools.
     #[tokio::test]
     async fn context_requirements_survive_retry_selection() {
         for mode in [
@@ -4350,7 +4351,7 @@ mod tests {
 
     /// The steering default: with every worker over the thresholds the gRPC
     /// path routes to the least-loaded one instead of refusing, on the single
-    /// path and on both PD legs.
+    /// path and on both PD pools.
     #[test]
     fn grpc_all_overloaded_steers_to_the_least_loaded_by_default() {
         let model_id = "test-model-overload-steer";
@@ -4389,7 +4390,7 @@ mod tests {
             "the least-loaded serves"
         );
 
-        // PD: both legs vetoed still pair up.
+        // PD: both pools vetoed still pair up.
         let pd_model = "test-model-overload-steer-pd";
         let pd_registry = Arc::new(WorkerRegistry::new());
         let (prefill_urls, decode_urls) = register_pd_workers(&pd_registry, pd_model, 2);
@@ -4411,7 +4412,7 @@ mod tests {
                 None,
                 PairDemands::default(),
             )
-            .expect("both legs over the thresholds still pair");
+            .expect("both pools over the thresholds still pair");
         assert!(prefill_urls.contains(&prefill.url().to_string()));
         assert!(decode_urls.contains(&decode.url().to_string()));
     }
@@ -4466,13 +4467,13 @@ mod tests {
         assert!(!is_retryable_response(&response));
     }
 
-    /// Both PD legs process the references, so both must advertise.
-    /// A leg with no members beside a registered partner leg is the
-    /// incomplete pair's 503 (no worker of that leg), not a capability shed:
+    /// Both PD pools process the references, so both must advertise.
+    /// A role with no members beside a registered partner role is the
+    /// incomplete pair's 503 (no worker of that role), not a capability shed:
     /// the PD path judges emptiness before capability, like the single path.
     #[test]
-    fn media_refs_pd_selection_empty_leg_keeps_its_own_verdict() {
-        let model_id = "test-model-media-refs-pd-empty-leg";
+    fn media_refs_pd_selection_empty_pool_keeps_its_own_verdict() {
+        let model_id = "test-model-media-refs-pd-empty-pool";
         let worker_registry = Arc::new(WorkerRegistry::new());
         worker_registry
             .register(vllm_grpc_worker(
@@ -4579,7 +4580,7 @@ mod tests {
         }
     }
 
-    /// The prefill leg's probes count only the pairs on the side of the plan's
+    /// The prefill side's probes count only the pairs on the side of the plan's
     /// pipeline pin: with the pin on the gateway's own pipeline, a prefill
     /// worker with the encoder on the engine's processor does not stand in
     /// for the pipeline worker without one, so the request gets the vision
@@ -4711,7 +4712,7 @@ mod tests {
     }
 
     #[test]
-    fn media_refs_pd_selection_requires_both_legs() {
+    fn media_refs_pd_selection_requires_both_pools() {
         let model_id = "test-model-media-refs-pd";
         let worker_registry = Arc::new(WorkerRegistry::new());
         worker_registry
@@ -4796,9 +4797,9 @@ mod tests {
         }
     }
 
-    /// The prefill legs `stage` picks for `model_id` over 12 selections,
+    /// The prefill workers `stage` picks for `model_id` over 12 selections,
     /// sorted, under the given demand.
-    fn prefill_legs(
+    fn prefill_workers(
         stage: &WorkerSelectionStage,
         model_id: &str,
         demand: PairDemands,
@@ -4815,8 +4816,8 @@ mod tests {
         urls
     }
 
-    /// The prefill leg needs the encoder for any image or video, processed
-    /// or referenced, and whenever the decode leg does; the decode leg's
+    /// The prefill side needs the encoder for any image or video, processed
+    /// or referenced, and whenever the decode side does; the decode side's
     /// demand is `decode_needs_vision`'s alone.
     #[test]
     fn vision_demand_follows_the_request_s_media() {
@@ -4852,7 +4853,7 @@ mod tests {
                 context: ContextRequirements::default(),
                 pipeline: PipelinePin::Any,
             },
-            "a single-sample image: the prefill leg takes the pixels, the decode leg is stripped"
+            "a single-sample image: the prefill side takes the pixels, the decode side is stripped"
         );
         assert_eq!(
             PairDemands::new(false, true),
@@ -4863,7 +4864,7 @@ mod tests {
                 context: ContextRequirements::default(),
                 pipeline: PipelinePin::Any,
             },
-            "what the decode leg cannot run without the encoder, the prefill leg cannot either"
+            "what the decode side cannot run without the encoder, the prefill side cannot either"
         );
         let stage = |mode| {
             WorkerSelectionStage::new(
@@ -4873,13 +4874,13 @@ mod tests {
                 None,
             )
         };
-        assert!(stage(WorkerSelectionMode::PrefillDecode).prefill_leg_needs_vision(true));
+        assert!(stage(WorkerSelectionMode::PrefillDecode).prefill_side_needs_vision(true));
         assert!(
-            !stage(WorkerSelectionMode::EncodePrefillDecode).prefill_leg_needs_vision(true),
+            !stage(WorkerSelectionMode::EncodePrefillDecode).prefill_side_needs_vision(true),
             "the encode workers take the pixels"
         );
-        assert!(!stage(WorkerSelectionMode::Regular).prefill_leg_needs_vision(true));
-        assert!(!stage(WorkerSelectionMode::PrefillDecode).prefill_leg_needs_vision(false));
+        assert!(!stage(WorkerSelectionMode::Regular).prefill_side_needs_vision(true));
+        assert!(!stage(WorkerSelectionMode::PrefillDecode).prefill_side_needs_vision(false));
 
         let prefill = labeled_worker("grpc://127.0.0.1:9000", "m", WorkerType::Prefill, UNLABELED);
         let decode = labeled_worker("grpc://127.0.0.1:9001", "m", WorkerType::Decode, UNLABELED);
@@ -4899,15 +4900,15 @@ mod tests {
         ));
     }
 
-    /// An image request's prefill leg pairs with a prefill worker that has
+    /// An image request's prefill side pairs with a prefill worker that has
     /// the encoder (or gave no verdict) while the model has one, instead of
     /// being admitted by a worker without it and never scheduled; text
     /// requests still use every prefill worker; a model whose prefill
     /// workers all lack the encoder refuses the request instead of pairing
-    /// it; and a leg nobody serves keeps its own verdict.
+    /// it; and a role nobody serves keeps its own verdict.
     #[test]
-    fn an_image_request_s_prefill_leg_pairs_with_a_prefill_worker_with_a_vision_encoder() {
-        let model_id = "test-model-vision-prefill-leg";
+    fn an_image_request_s_prefill_side_pairs_with_a_prefill_worker_with_a_vision_encoder() {
+        let model_id = "test-model-vision-prefill-side";
         let worker_registry = Arc::new(WorkerRegistry::new());
         for (url, worker_type, labels) in [
             ("grpc://127.0.0.1:9010", WorkerType::Prefill, VISION_ENCODER),
@@ -4927,12 +4928,12 @@ mod tests {
         let image = PairDemands::new(true, false);
 
         assert_eq!(
-            prefill_legs(&stage, model_id, image),
+            prefill_workers(&stage, model_id, image),
             ["grpc://127.0.0.1:9010", "grpc://127.0.0.1:9012"],
-            "the leg goes to a prefill worker with the encoder or without a verdict"
+            "the side goes to a prefill worker with the encoder or without a verdict"
         );
         assert_eq!(
-            prefill_legs(&stage, model_id, PairDemands::default()),
+            prefill_workers(&stage, model_id, PairDemands::default()),
             [
                 "grpc://127.0.0.1:9010",
                 "grpc://127.0.0.1:9011",
@@ -4942,8 +4943,8 @@ mod tests {
         );
 
         // No prefill worker with the encoder: the request is refused, as no
-        // dispatch check would catch the leg; text still pairs.
-        let uniform = "test-model-vision-prefill-leg-none";
+        // dispatch check would catch the side; text still pairs.
+        let uniform = "test-model-vision-prefill-side-none";
         for (url, worker_type, labels) in [
             (
                 "grpc://127.0.0.1:9030",
@@ -4970,12 +4971,12 @@ mod tests {
             "multimodal_not_supported"
         );
         assert_eq!(
-            prefill_legs(&stage, uniform, PairDemands::default()),
+            prefill_workers(&stage, uniform, PairDemands::default()),
             ["grpc://127.0.0.1:9030"]
         );
 
-        // A leg nobody serves is named before the encoder is asked for.
-        let halved = "test-model-vision-prefill-leg-no-decode";
+        // A role nobody serves is named before the encoder is asked for.
+        let halved = "test-model-vision-prefill-side-no-decode";
         worker_registry
             .register(labeled_worker(
                 "grpc://127.0.0.1:9050",
@@ -4998,8 +4999,8 @@ mod tests {
     }
 
     /// Media references forwarded to the workers put the pixels on the
-    /// prefill leg as well: among the workers that process references, the
-    /// leg pairs with one that has the encoder.
+    /// prefill side as well: among the workers that process references, the
+    /// side pairs with one that has the encoder.
     #[test]
     fn media_references_pair_with_a_vision_capable_prefill_worker() {
         const REFS: [(&str, &str); 2] = [
@@ -5058,7 +5059,7 @@ mod tests {
         }
     }
 
-    /// With media references the prefill leg must find a worker that takes
+    /// With media references the prefill side must find a worker that takes
     /// them and has the encoder: a pool whose referencing prefill worker
     /// lacks the encoder and whose encoder-bearing one takes no references
     /// is the terminal refusal (not a retryable 503 over healthy workers);
@@ -5124,15 +5125,15 @@ mod tests {
                 None,
                 PairDemands::new(true, true),
             )
-            .expect("without references the prefill leg pairs with the encoder");
+            .expect("without references the prefill side pairs with the encoder");
         assert_eq!(prefill.url(), "grpc://127.0.0.1:9091");
     }
 
     /// A retry re-selects under the demand the first selection recorded:
-    /// the prefill leg of an image request stays on a worker with the
+    /// the prefill side of an image request stays on a worker with the
     /// encoder.
     #[tokio::test]
-    async fn reselect_keeps_an_image_request_s_prefill_leg_on_a_vision_capable_worker() {
+    async fn reselect_keeps_an_image_request_s_prefill_side_on_a_vision_capable_worker() {
         let model_id = "test-model-vision-prefill-reselect";
         let worker_registry = Arc::new(WorkerRegistry::new());
         for (url, worker_type, labels) in [
@@ -5157,7 +5158,7 @@ mod tests {
         };
 
         let stage = &stage;
-        let prefill_legs = |needs_vision: bool| async move {
+        let prefill_workers = |needs_vision: bool| async move {
             let mut seen = HashMap::new();
             for _ in 0..8 {
                 let mut ctx = dispatch_ctx(model_id, wire);
@@ -5177,9 +5178,9 @@ mod tests {
             urls.sort();
             urls
         };
-        assert_eq!(prefill_legs(true).await, ["grpc://127.0.0.1:9080"]);
+        assert_eq!(prefill_workers(true).await, ["grpc://127.0.0.1:9080"]);
         assert_eq!(
-            prefill_legs(false).await,
+            prefill_workers(false).await,
             ["grpc://127.0.0.1:9080", "grpc://127.0.0.1:9081"]
         );
     }
@@ -5189,7 +5190,7 @@ mod tests {
     /// worker with the encoder, and the routing snapshot records it for
     /// retries; a text request uses every prefill worker.
     #[tokio::test]
-    async fn execute_keeps_an_image_request_s_prefill_leg_on_a_vision_capable_worker() {
+    async fn execute_keeps_an_image_request_s_prefill_side_on_a_vision_capable_worker() {
         let registry = Arc::new(WorkerRegistry::new());
         for (url, worker_type, labels) in [
             ("grpc://127.0.0.1:9100", WorkerType::Prefill, VISION_ENCODER),
@@ -5296,9 +5297,9 @@ mod tests {
     }
 
     /// A decode worker with the encoder over the thresholds next to an idle
-    /// one without it: a request whose decode leg needs the encoder is
+    /// one without it: a request whose decode side needs the encoder is
     /// steered to the vetoed worker by the overload fallback (it is the
-    /// leg's only admitted worker) and, under `--worker-overload-shed`, gets
+    /// side's only admitted worker) and, under `--worker-overload-shed`, gets
     /// the overload shed, not `no_available_workers`; a text request takes
     /// the idle worker.
     #[test]
@@ -5343,7 +5344,7 @@ mod tests {
         worker_registry.set_overload_shed(true);
         let failure = stage
             .select_pd_pair(model_id, PlacementInputs::default(), None, None, demand)
-            .expect_err("the admitted decode leg is all-overloaded under shedding");
+            .expect_err("the admitted decode side is all-overloaded under shedding");
         let response = stage.pd_selection_failure(model_id, failure, MediaDemands::NONE);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
@@ -5508,7 +5509,7 @@ mod tests {
     }
 
     /// A router-processed single-image intermediate, carrying under
-    /// `grid_key` the grid tensor a decode leg derives its positions from.
+    /// `grid_key` the grid tensor a decode side derives its positions from.
     fn image_intermediate(grid_key: Option<&str>) -> multimodal::MultimodalIntermediate {
         use llm_multimodal::{
             EncoderFieldLayouts, ImageDetail, ImageFrame, ImageSource, ModelSpecificValue,
@@ -5563,9 +5564,9 @@ mod tests {
         .unwrap()
     }
 
-    /// The decode legs `stage` picks for `model_id` over 12 selections,
+    /// The decode workers `stage` picks for `model_id` over 12 selections,
     /// sorted, under the given demand.
-    fn decode_legs(
+    fn decode_workers(
         stage: &WorkerSelectionStage,
         model_id: &str,
         needs_vision: bool,
@@ -5588,12 +5589,12 @@ mod tests {
         urls
     }
 
-    /// The decode-leg demand is for what a decode worker without a vision
+    /// The decode-side demand is for what a decode worker without a vision
     /// encoder cannot serve: media references, a multimodal request with
     /// `n > 1`, grid tensors. A text request of any `n` and a single-sample
-    /// image request without grids take such a worker's stripped leg.
+    /// image request without grids take such a worker's stripped side.
     #[test]
-    fn decode_needs_vision_only_for_what_a_stripped_decode_leg_cannot_serve() {
+    fn decode_needs_vision_only_for_what_a_stripped_decode_side_cannot_serve() {
         use openai_protocol::chat::ChatCompletionRequest;
 
         let chat = |n: Option<u32>| -> RequestType {
@@ -5617,29 +5618,29 @@ mod tests {
         );
         assert!(
             decode_needs_vision(&chat(None), None, true),
-            "media references are expanded by each leg"
+            "media references are expanded by each side"
         );
         assert!(
             !decode_needs_vision(&chat(Some(1)), Some(&plain), false),
-            "a single-sample image request takes the stripped leg"
+            "a single-sample image request takes the stripped side"
         );
         assert!(
             decode_needs_vision(&chat(Some(2)), Some(&plain), false),
-            "a multimodal request with n > 1 recomputes the prompt on the decode leg"
+            "a multimodal request with n > 1 recomputes the prompt on the decode side"
         );
         assert!(
             decode_needs_vision(&chat(None), Some(&gridded), false),
-            "grid tensors are read by the decode leg"
+            "grid tensors are read by the decode side"
         );
     }
 
-    /// The demand is recorded in prefill/decode mode only: the decode leg of
+    /// The demand is recorded in prefill/decode mode only: the decode side of
     /// encode/prefill/decode mode is dispatched without the pixels (its
     /// encode workers take them), so neither its first selection nor a retry
     /// is held to a decode worker with the encoder; regular mode has no
-    /// decode leg.
+    /// decode side.
     #[test]
-    fn the_decode_leg_demand_is_recorded_in_prefill_decode_mode_only() {
+    fn the_decode_side_demand_is_recorded_in_prefill_decode_mode_only() {
         use openai_protocol::chat::ChatCompletionRequest;
 
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
@@ -5660,29 +5661,29 @@ mod tests {
         };
 
         let pd = stage(WorkerSelectionMode::PrefillDecode);
-        assert!(pd.decode_leg_needs_vision(&request, Some(&gridded), false));
-        assert!(pd.decode_leg_needs_vision(&request, None, true));
+        assert!(pd.decode_side_needs_vision(&request, Some(&gridded), false));
+        assert!(pd.decode_side_needs_vision(&request, None, true));
 
         let epd = stage(WorkerSelectionMode::EncodePrefillDecode);
         assert!(
-            !epd.decode_leg_needs_vision(&request, Some(&gridded), false),
-            "the encode/prefill/decode decode leg takes no pixels"
+            !epd.decode_side_needs_vision(&request, Some(&gridded), false),
+            "the encode/prefill/decode decode side takes no pixels"
         );
-        assert!(!epd.decode_leg_needs_vision(&request, None, true));
+        assert!(!epd.decode_side_needs_vision(&request, None, true));
 
         let regular = stage(WorkerSelectionMode::Regular);
-        assert!(!regular.decode_leg_needs_vision(&request, Some(&gridded), false));
+        assert!(!regular.decode_side_needs_vision(&request, Some(&gridded), false));
     }
 
-    /// A request whose decode leg needs a vision encoder pairs with a decode
+    /// A request whose decode side needs a vision encoder pairs with a decode
     /// worker that has one (or gave no verdict) while the model has such a
     /// worker, instead of landing on one without it and being refused after
     /// selection; text and single-sample image requests still use every
     /// decode worker; and a model whose decode workers all lack the encoder
     /// is paired as it is, so dispatch names the gap.
     #[test]
-    fn a_vision_demanding_decode_leg_pairs_with_a_vision_capable_decode_worker() {
-        let model_id = "test-model-vision-decode-leg";
+    fn a_vision_demanding_decode_side_pairs_with_a_vision_capable_decode_worker() {
+        let model_id = "test-model-vision-decode-side";
         let worker_registry = Arc::new(WorkerRegistry::new());
         for (url, worker_type, labels) in [
             ("grpc://127.0.0.1:8900", WorkerType::Prefill, VISION_ENCODER),
@@ -5701,12 +5702,12 @@ mod tests {
         let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
 
         assert_eq!(
-            decode_legs(&stage, model_id, true),
+            decode_workers(&stage, model_id, true),
             ["grpc://127.0.0.1:8910", "grpc://127.0.0.1:8912"],
-            "the leg goes to a decode worker with the encoder or without a verdict"
+            "the side goes to a decode worker with the encoder or without a verdict"
         );
         assert_eq!(
-            decode_legs(&stage, model_id, false),
+            decode_workers(&stage, model_id, false),
             [
                 "grpc://127.0.0.1:8910",
                 "grpc://127.0.0.1:8911",
@@ -5716,7 +5717,7 @@ mod tests {
         );
 
         // No decode worker with the encoder: the pool is used as it is.
-        let uniform = "test-model-vision-decode-leg-none";
+        let uniform = "test-model-vision-decode-side-none";
         for (url, worker_type, labels) in [
             ("grpc://127.0.0.1:8920", WorkerType::Prefill, VISION_ENCODER),
             (
@@ -5730,15 +5731,15 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            decode_legs(&stage, uniform, true),
+            decode_workers(&stage, uniform, true),
             ["grpc://127.0.0.1:8930"],
             "dispatch, not selection, refuses a pool with no such worker"
         );
     }
 
     /// Media references forwarded to the workers need the encoder on the
-    /// decode leg as well: among the workers that process references, the
-    /// leg pairs with one that has it.
+    /// decode side as well: among the workers that process references, the
+    /// side pairs with one that has it.
     #[test]
     fn media_references_pair_with_a_vision_capable_decode_worker() {
         const REFS: [(&str, &str); 2] = [
@@ -5798,9 +5799,9 @@ mod tests {
     }
 
     /// A retry re-selects under the demand the first selection recorded:
-    /// the decode leg stays on a worker with the encoder.
+    /// the decode side stays on a worker with the encoder.
     #[tokio::test]
-    async fn reselect_keeps_a_vision_demanding_decode_leg_on_a_vision_capable_worker() {
+    async fn reselect_keeps_a_vision_demanding_decode_side_on_a_vision_capable_worker() {
         let model_id = "test-model-vision-decode-reselect";
         let worker_registry = Arc::new(WorkerRegistry::new());
         for (url, worker_type, labels) in [
@@ -5825,7 +5826,7 @@ mod tests {
         };
 
         let stage = &stage;
-        let decode_legs = |decode_needs_vision: bool| async move {
+        let decode_workers = |decode_needs_vision: bool| async move {
             let mut seen = HashMap::new();
             for _ in 0..8 {
                 let mut ctx = dispatch_ctx(model_id, wire);
@@ -5845,19 +5846,19 @@ mod tests {
             urls.sort();
             urls
         };
-        assert_eq!(decode_legs(true).await, ["grpc://127.0.0.1:8970"]);
+        assert_eq!(decode_workers(true).await, ["grpc://127.0.0.1:8970"]);
         assert_eq!(
-            decode_legs(false).await,
+            decode_workers(false).await,
             ["grpc://127.0.0.1:8970", "grpc://127.0.0.1:8971"]
         );
     }
 
-    /// The stage reads the demand off the request: an image whose decode leg
+    /// The stage reads the demand off the request: an image whose decode side
     /// derives its positions from grid tensors selects a decode worker with
     /// the encoder, and the routing snapshot records the demand for retries;
     /// a single-sample image without grids uses the whole decode pool.
     #[tokio::test]
-    async fn execute_keeps_a_vision_demanding_decode_leg_on_a_vision_capable_worker() {
+    async fn execute_keeps_a_vision_demanding_decode_side_on_a_vision_capable_worker() {
         let registry = Arc::new(WorkerRegistry::new());
         for (url, worker_type, labels) in [
             ("grpc://127.0.0.1:8980", WorkerType::Prefill, VISION_ENCODER),
@@ -6347,14 +6348,15 @@ mod tests {
         );
     }
 
-    /// A pair whose prefill leg is gone while its decode leg is registered
+    /// A pair whose prefill pool is gone while its decode pool is registered
     /// (the prefill restarting) is refused, through the stage's own entry
-    /// point, with the retryable 503 naming the missing leg: not the 404 of
-    /// a model nobody serves, and not a line that calls the registered leg
-    /// unhealthy. The other way round the same; a model with no leg at all
+    /// point, with the retryable 503 naming the missing role: not the 404 of
+    /// a model nobody serves, and not a line that calls the registered role
+    /// unhealthy. The other way round the same; a model with no role at all
     /// stays the 404.
     #[tokio::test]
-    async fn a_pair_with_one_leg_missing_is_refused_with_the_missing_leg_not_as_an_unknown_model() {
+    async fn a_pair_with_one_role_missing_is_refused_with_the_missing_role_not_as_an_unknown_model()
+    {
         let stage_over = |registry: &Arc<WorkerRegistry>| {
             pd_stage(
                 Arc::clone(registry),
@@ -6374,7 +6376,7 @@ mod tests {
             let refused = stage_over(&registry)
                 .execute(&mut ctx)
                 .await
-                .expect_err("one leg of the pair is missing");
+                .expect_err("one role of the pair is missing");
             assert_eq!(
                 refused.status(),
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -6386,20 +6388,20 @@ mod tests {
             );
             assert!(
                 refused.headers().contains_key(RETRY_AFTER),
-                "a client may retry once the leg is back"
+                "a client may retry once the role is back"
             );
             let reason = placement::refusal_reason(&refused).unwrap_or_default();
             assert!(
                 reason.contains(&format!("No {missing} worker")),
-                "the refusal names the missing leg: {reason}"
+                "the refusal names the missing role: {reason}"
             );
             assert!(
                 !reason.contains("unhealthy"),
-                "the registered leg is not called unhealthy: {reason}"
+                "the registered role is not called unhealthy: {reason}"
             );
         }
 
-        // No leg at all: a model nobody serves.
+        // No role at all: a model nobody serves.
         let registry = Arc::new(WorkerRegistry::new());
         let mut ctx = prepared_ctx(Arc::clone(&registry), None);
         let nobody = stage_over(&registry)
@@ -6416,7 +6418,7 @@ mod tests {
     /// A pair placement the policy declined, or one every prefill is at its
     /// admission limit for, is refused with the 503's usual message for the
     /// client and the verdict as its line's reason, naming the policy and
-    /// the leg: the fixed "unavailable" message said the workers were down
+    /// the role: the fixed "unavailable" message said the workers were down
     /// while the pool state on the same line showed them available.
     #[tokio::test]
     async fn a_pair_the_policy_declined_is_refused_with_the_policy_as_the_lines_reason() {
@@ -6425,7 +6427,7 @@ mod tests {
         let declined = stage.pair_failure(
             "test-model",
             PairFailure {
-                leg: WorkerLeg::Prefill,
+                role: WorkerRole::Prefill,
                 verdict: PlacementFailure::PolicyDeclined("cache_aware"),
             },
         );
@@ -6442,7 +6444,7 @@ mod tests {
         let at_capacity = stage.pair_failure(
             "test-model",
             PairFailure {
-                leg: WorkerLeg::Prefill,
+                role: WorkerRole::Prefill,
                 verdict: PlacementFailure::PrefillAtCapacity,
             },
         );
@@ -6454,14 +6456,14 @@ mod tests {
         let unavailable = stage.pair_failure(
             "test-model",
             PairFailure {
-                leg: WorkerLeg::Decode,
+                role: WorkerRole::Decode,
                 verdict: PlacementFailure::Unavailable,
             },
         );
         assert_eq!(
             placement::refusal_reason(&unavailable),
             Some("All workers for model 'test-model' are unavailable (unhealthy or circuit breaker open)"),
-            "a leg that is down keeps the message as its reason"
+            "a role that is down keeps the message as its reason"
         );
 
         let body = axum::body::to_bytes(declined.into_body(), usize::MAX)

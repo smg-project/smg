@@ -21,7 +21,7 @@ use super::{
     get_healthy_worker_indices,
     manual::{ExecutionBranch, PinState},
     normalize_model_key, BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy,
-    ManualConfig, ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerLeg,
+    ManualConfig, ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerRole,
 };
 use crate::{
     config::types::{ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
@@ -406,18 +406,18 @@ impl PolicyRegistry {
         Metrics::record_routing_key_source(source);
 
         // WorkerLoadGuard records the raw session key, so the cap must query
-        // that same key. Model/leg-scoped cap accounting is a separate contract.
+        // that same key. Model/role-scoped cap accounting is a separate contract.
         let load_key = key;
 
-        // Models and PD legs stick independently while sharing one bounded map.
+        // Models and PD roles stick independently while sharing one bounded map.
         // Length-prefix the model so delimiters in model IDs cannot cross fields.
         let model = normalize_model_key(model_id);
-        let leg = match info.leg {
-            WorkerLeg::Single => 's',
-            WorkerLeg::Prefill => 'p',
-            WorkerLeg::Decode => 'd',
+        let role = match info.role {
+            WorkerRole::Single => 's',
+            WorkerRole::Prefill => 'p',
+            WorkerRole::Decode => 'd',
         };
-        let namespaced = format!("{}:{model}:{leg}:{key}", model.len());
+        let namespaced = format!("{}:{model}:{role}:{key}", model.len());
         let key = namespaced.as_str();
 
         let over_cap =
@@ -538,7 +538,7 @@ impl PolicyRegistry {
     }
 
     /// Visit every policy the registry holds once: the default, the PD and
-    /// EPD legs, then the per-model policies. A policy shared between slots
+    /// EPD roles, then the per-model policies. A policy shared between slots
     /// (a model with no hint takes the default) is visited for the first
     /// slot it stands in only, so a visit that does work, a worker's
     /// removal, is not repeated per model.
@@ -552,12 +552,12 @@ impl PolicyRegistry {
             }
         };
         once(&self.default_policy);
-        for leg in [
+        for role in [
             &self.prefill_policy,
             &self.decode_policy,
             &self.encode_policy,
         ] {
-            if let Some(policy) = leg.get() {
+            if let Some(policy) = role.get() {
                 once(policy);
             }
         }
@@ -754,14 +754,14 @@ impl PolicyRegistry {
 
     /// Every distinct policy this registry might dispatch requests
     /// through for `model_id`, ordered from most-specific to least
-    /// (per-model → default → PD/EPD legs). Deduplicated by `Arc`
+    /// (per-model → default → PD/EPD roles). Deduplicated by `Arc`
     /// pointer identity so a policy that appears in multiple slots
     /// (e.g. the same `CacheAwarePolicy` as both default and prefill
-    /// leg) is returned once.
+    /// role) is returned once.
     ///
     /// The tree-sync bridge uses this to reach every `CacheAwarePolicy`
     /// that could have produced a delta for `model_id` — reaching
-    /// only `model_policies` misses PD-leg and default-fallback
+    /// only `model_policies` misses PD-role and default-fallback
     /// deployments, and inbound deltas never resolve.
     pub(crate) fn policies_for_model(&self, model_id: &str) -> Vec<Arc<dyn LoadBalancingPolicy>> {
         let mut out: Vec<Arc<dyn LoadBalancingPolicy>> = Vec::new();
@@ -860,10 +860,10 @@ impl PolicyRegistry {
 
     /// Set the prefill policy for PD mode (set once at startup).
     ///
-    /// The router factory sets the prefill leg after the app context wired the
+    /// The router factory sets the prefill policy after the app context wired the
     /// KV event monitor, the load feed and the mesh tree bridge into the
     /// registry, and those setters only reach policies that already exist,
-    /// so the leg takes that state here, under the shared-state read guards.
+    /// so the policy takes that state here, under the shared-state read guards.
     pub fn set_prefill_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
         self.publish_with_shared_state(&policy, || {
             // OnceLock::set returns Err if already set, which we ignore since
@@ -885,10 +885,10 @@ impl PolicyRegistry {
 
     /// Set the decode policy for PD mode (set once at startup).
     ///
-    /// The router factory sets the decode leg after the app context wired the
+    /// The router factory sets the decode policy after the app context wired the
     /// KV event monitor, the load feed and the mesh tree bridge into the
     /// registry, and those setters only reach policies that already exist,
-    /// so the leg takes that state here, under the shared-state read guards.
+    /// so the policy takes that state here, under the shared-state read guards.
     pub fn set_decode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
         self.publish_with_shared_state(&policy, || {
             // OnceLock::set returns Err if already set, which we ignore since
@@ -899,10 +899,10 @@ impl PolicyRegistry {
 
     /// Set the encode policy for EPD mode (set once at startup).
     ///
-    /// The router factory sets the encode leg after the app context wired the
+    /// The router factory sets the encode policy after the app context wired the
     /// KV event monitor, the load feed and the mesh tree bridge into the
     /// registry, and those setters only reach policies that already exist,
-    /// so the leg takes that state here, under the shared-state read guards.
+    /// so the policy takes that state here, under the shared-state read guards.
     pub fn set_encode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
         self.publish_with_shared_state(&policy, || {
             // OnceLock::set returns Err if already set, which we ignore since
@@ -2598,12 +2598,12 @@ mod tests {
         }
     }
 
-    /// The PD/EPD legs are set after the app context wired the shared state
+    /// The PD/EPD policies are set after the app context wired the shared state
     /// into the registry (the KV event monitor, the load feed, and the mesh
-    /// tree bridge that `MeshAdapters::start` attaches), so the leg setters
+    /// tree bridge that `MeshAdapters::start` attaches), so the policy setters
     /// hand all of it over themselves.
     #[tokio::test]
-    async fn pd_leg_policies_receive_the_shared_state_set_before_them() {
+    async fn pd_role_policies_receive_the_shared_state_set_before_them() {
         use std::collections::BTreeMap;
 
         use smg_mesh::MeshKV;
@@ -2630,19 +2630,19 @@ mod tests {
         registry.set_decode_policy(Arc::clone(&decode));
         registry.set_encode_policy(Arc::clone(&encode));
 
-        for (leg, policy) in [("prefill", prefill), ("decode", decode), ("encode", encode)] {
+        for (role, policy) in [("prefill", prefill), ("decode", decode), ("encode", encode)] {
             let cache_aware = policy.as_any().downcast_ref::<CacheAwarePolicy>().unwrap();
             assert!(
                 cache_aware.kv_event_monitor_is_set_for_test(),
-                "{leg} leg missed the KV event monitor"
+                "{role} policy missed the KV event monitor"
             );
             assert!(
                 cache_aware.has_load_receiver_for_test(),
-                "{leg} leg missed the load feed"
+                "{role} policy missed the load feed"
             );
             assert!(
                 cache_aware.should_populate_hash_index_for_test(),
-                "{leg} leg missed the mesh tree bridge"
+                "{role} policy missed the mesh tree bridge"
             );
         }
     }

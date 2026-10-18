@@ -562,7 +562,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// `WorkerCapacity` uses this to derive total fleet capacity when
     /// every worker reports; falls back to a configured per-worker
     /// estimate otherwise. The PD admission gate uses it as the decode
-    /// leg's admission bound.
+    /// side's admission bound.
     fn max_running_requests(&self) -> Option<u16> {
         let labels = &self.metadata().spec.labels;
         WINDOW_LABELS
@@ -696,7 +696,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Record the start of a request whose responses the gateway sees one by
     /// one (a streaming generation to this worker over gRPC): the pile the
     /// wedged rule counts, and the start of its clock when a run begins.
-    /// Requests without that signal (HTTP, a PD leg, a non-streaming
+    /// Requests without that signal (HTTP, a PD side, a non-streaming
     /// generation) never form a pile.
     fn note_tracked_started(&self) {}
     /// Record the end of a tracked request.
@@ -717,7 +717,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// is open (an idle worker, one whose streams all ended, one whose
     /// in-flight work has shown nothing yet: nothing to judge it by), or for
     /// a worker that does not track it. The signal a disaggregated request
-    /// reads on its decode partner when its prefill leg's silence bound
+    /// reads on its decode partner when its prefill side's silence bound
     /// passes on the parallel dispatch shape, where the prefill's first
     /// response waits for the decode side. The age is that of the last
     /// response the gateway read, not of the engine's last production: a
@@ -2359,7 +2359,7 @@ impl WorkerRuntime {
 
 /// Observer of request completions on a worker. The request's load guard
 /// notifies it when it drops, which is the one point every path that holds
-/// worker load (HTTP, gRPC, both PD legs, admitted prefill) passes through on
+/// worker load (HTTP, gRPC, both PD sides, admitted prefill) passes through on
 /// success, error and client disconnect alike. The policy registry installs
 /// one on each worker it learns about, so policies that book state at
 /// dispatch (reservations, bookings) see the request end.
@@ -3400,7 +3400,7 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
     let metadata = worker.metadata();
     let spec = metadata.spec.clone();
     let status = worker.status();
-    // Only PD legs pair; a regular worker's descriptor would be noise.
+    // Only PD workers pair; a regular worker's descriptor would be noise.
     let pd_pairing = matches!(spec.worker_type, WorkerType::Prefill | WorkerType::Decode)
         .then(|| metadata.pd_pairing.key());
 
@@ -5142,7 +5142,7 @@ mod tests {
 
     #[test]
     fn prefill_eta_adds_a_prompt_about_to_be_dispatched_to_the_backlog() {
-        // The disaggregated prefill leg's bound is read before its prompt is
+        // The disaggregated prefill side's bound is read before its prompt is
         // booked: the ETA is the backlog plus that prompt, at the rate the
         // worker has shown (the cold prior until it has).
         let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
@@ -5207,7 +5207,7 @@ mod tests {
 
     #[test]
     fn the_latest_first_response_is_stamped_on_the_worker() {
-        // A prefill leg past its own bound asks whether its worker answers
+        // A prefill side past its own bound asks whether its worker answers
         // anything at all: the stamp is the latest first response to any
         // prompt dispatched there, never the drop of a stream that got none.
         let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);

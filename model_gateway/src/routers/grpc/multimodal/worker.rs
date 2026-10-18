@@ -251,8 +251,8 @@ pub struct WorkerMediaItem {
 
 /// What the pipeline produced: the prompt with its anchors expanded, the
 /// request's multimodal batches (the first is `mm_inputs`, the rest
-/// `extra_mm_inputs`), and, when asked, the identity a PD prefill leg returns
-/// so the decode leg is served without pixels.
+/// `extra_mm_inputs`), and, when asked, the identity a PD prefill side returns
+/// so the decode side is served without pixels.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkerMediaOutput {
     pub prompt_token_ids: Vec<u32>,

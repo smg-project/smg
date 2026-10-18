@@ -57,10 +57,10 @@ pub(crate) enum MmRefsError {
     /// The model's placeholder anchor is not one the engine's own processor
     /// expands, and the model's workers do not all run the gateway's pipeline.
     ModelNotOptedIn(Modality),
-    /// The selected leg runs the engine's own processor, which does not expand
+    /// The selected worker runs the engine's own processor, which does not expand
     /// this model's anchor; only a worker running the gateway's pipeline does.
     PipelineWorkerRequired,
-    /// The selected leg runs the gateway's own pipeline, which takes no audio.
+    /// The selected worker runs the gateway's own pipeline, which takes no audio.
     PipelineTakesNoAudio,
     /// vLLM does not accept this modality at all.
     ModalityUnsupported(Modality),
@@ -76,7 +76,7 @@ pub(crate) enum MmRefsError {
     SchemeNotAccepted { scheme: String, accepted: String },
     /// EPD encode workers never process references.
     EncodeNotSupported,
-    /// A selected leg does not advertise worker-side processing.
+    /// A selected worker does not advertise worker-side processing.
     WorkerNotCapable,
     /// The model has no registry spec, so the router cannot process its media
     /// itself, and the placement did not give it a worker that does.
@@ -383,12 +383,12 @@ pub(crate) fn resolve_mm_processing(
     Ok(resolved)
 }
 
-/// Post-selection check: every leg must accept references, and every URL
-/// scheme in the plan must be one every leg that advertised schemes fetches
-/// (the prefill leg processes them; the decode leg does too whenever the
+/// Post-selection check: every worker must accept references, and every URL
+/// scheme in the plan must be one every worker that advertised schemes fetches
+/// (the prefill worker processes them; the decode worker does too whenever the
 /// identity relay does not apply, as with n>1). A plan pinned to the
 /// gateway's own pipeline (`pin`, see [`media_refs_pipeline_pin`]) needs
-/// every leg on that pipeline, and a leg on it takes no audio; selection
+/// every worker on that pipeline, and a worker on it takes no audio; selection
 /// draws its candidates by the same pin, so this is the backstop.
 pub(crate) fn ensure_selection_supports_media_refs(
     workers: &WorkerSelection,
@@ -396,18 +396,21 @@ pub(crate) fn ensure_selection_supports_media_refs(
     pin: PipelinePin,
 ) -> Result<(), MmRefsError> {
     let needs_pipeline = pin == PipelinePin::Only;
-    let legs: Vec<&dyn Worker> = match workers {
+    let workers: Vec<&dyn Worker> = match workers {
         WorkerSelection::Single { worker } => vec![worker.as_ref()],
         WorkerSelection::Disaggregated {
             prefill, decode, ..
         } => vec![prefill.as_ref(), decode.as_ref()],
     };
-    if !legs.iter().all(|leg| worker_accepts_media_refs(*leg)) {
+    if !workers
+        .iter()
+        .all(|worker| worker_accepts_media_refs(*worker))
+    {
         return Err(MmRefsError::WorkerNotCapable);
     }
     let carries_audio = plan.modalities().contains(&Modality::Audio);
-    for leg in &legs {
-        let pipeline = worker_runs_gateway_pipeline(*leg);
+    for worker in &workers {
+        let pipeline = worker_runs_gateway_pipeline(*worker);
         if needs_pipeline && !pipeline {
             return Err(MmRefsError::PipelineWorkerRequired);
         }
@@ -416,8 +419,8 @@ pub(crate) fn ensure_selection_supports_media_refs(
         }
     }
     let mut accepted: Option<HashSet<String>> = None;
-    for leg in &legs {
-        let schemes = worker_media_ref_schemes(*leg);
+    for worker in &workers {
+        let schemes = worker_media_ref_schemes(*worker);
         if schemes.is_empty() {
             continue;
         }
@@ -1036,7 +1039,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_check_requires_every_leg_and_scheme() {
+    fn selection_check_requires_every_worker_and_scheme() {
         let plan_https = plan(vec![image_url("https://a/1.png")]);
         let single = WorkerSelection::Single {
             worker: capable("grpc://127.0.0.1:9600"),
@@ -1078,8 +1081,8 @@ mod tests {
             Err(MmRefsError::WorkerNotCapable)
         );
 
-        // Both legs fetch: the accepted schemes are the intersection of what
-        // each advertising leg fetches.
+        // Both workers fetch: the accepted schemes are the intersection of what
+        // each advertising worker fetches.
         let file_prefill = worker(
             "grpc://127.0.0.1:9604",
             RuntimeType::Vllm,
@@ -1096,7 +1099,7 @@ mod tests {
             runtime_type: RuntimeType::Vllm,
         };
         ensure_selection_supports_media_refs(&mixed, &plan_https, PipelinePin::Any)
-            .expect("https on both legs");
+            .expect("https on both workers");
         assert_eq!(
             ensure_selection_supports_media_refs(&mixed, &file_plan, PipelinePin::Any),
             Err(MmRefsError::SchemeNotAccepted {
@@ -1105,7 +1108,7 @@ mod tests {
             })
         );
 
-        // A leg that advertises no schemes leaves the other leg's set in force.
+        // A worker that advertises no schemes leaves the other worker's set in force.
         let silent_decode = worker(
             "grpc://127.0.0.1:9606",
             RuntimeType::Vllm,
@@ -1295,7 +1298,7 @@ mod tests {
     }
 
     /// Selection pins an unopted model's references to pipeline workers on
-    /// every leg, and keeps audio off a pipeline worker, which takes none.
+    /// every worker, and keeps audio off a pipeline worker, which takes none.
     #[test]
     fn selection_check_pins_unopted_models_to_pipeline_workers_and_audio_off_them() {
         let image = plan(vec![image_url("https://a/1.png")]);

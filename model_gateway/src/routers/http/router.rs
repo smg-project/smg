@@ -371,7 +371,7 @@ impl Router {
             RefusalSite {
                 function,
                 mode: "Regular",
-                legs: &[("regular", RoutingPool::HttpRegular)],
+                pools: &[("regular", RoutingPool::HttpRegular)],
             },
             // The line is written inside the request's span, which carries
             // the id.

@@ -140,7 +140,7 @@ const FLEET_SAMPLE: usize = 16;
 const POOL_TABLE_REFRESH_MS: u64 = 1_000;
 
 /// Pool tables kept at once: one per routing pool the policy sees (a model's
-/// regular pool, the PD legs' pools); past this the oldest goes.
+/// regular pool, the PD roles' pools); past this the oldest goes.
 const POOL_TABLES_KEPT: usize = 8;
 
 /// The floor of the swing-sized absolute margin of the spill gate: with a
@@ -2646,8 +2646,8 @@ impl CacheAwarePolicy {
 
     /// The eligible holders of the deepest overlap: one pass over the
     /// scores for the depth, one to place and read those holders. When none
-    /// of them is in this pool and routable (a PD leg's pool sharing the
-    /// model's index with the other leg, a holder down), the full gather
+    /// of them is in this pool and routable (a PD role's pool sharing the
+    /// model's index with the other role, a holder down), the full gather
     /// decides, so the result is always the deepest group a scan of the pool
     /// would have found.
     fn top_group(

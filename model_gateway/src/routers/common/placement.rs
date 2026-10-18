@@ -29,7 +29,7 @@ use crate::{
     },
     policies::{
         policy_filters_unavailable_workers, CacheNamespace, LoadBalancingPolicy, PolicyRegistry,
-        SelectWorkerInfo, WorkerLeg,
+        SelectWorkerInfo, WorkerRole,
     },
     routers::{
         common::{header_utils, overload, retry::mark_non_retryable},
@@ -191,7 +191,7 @@ pub(crate) struct Pair {
 /// site: a shed verdict carries a whole response.
 #[derive(Debug)]
 pub(crate) struct PairFailure {
-    pub leg: WorkerLeg,
+    pub role: WorkerRole,
     pub verdict: PlacementFailure,
 }
 
@@ -327,7 +327,7 @@ pub(crate) fn select_from(
             rid_key: inputs.rid_key,
             cache_namespace: inputs.cache_namespace,
             hash_ring,
-            leg: WorkerLeg::Single,
+            role: WorkerRole::Single,
         },
     ) else {
         // A policy that filters availability itself misses on an
@@ -536,8 +536,8 @@ pub(crate) struct RefusalSite<'a> {
     pub function: &'static str,
     /// The router's mode: `Regular`, `PrefillDecode` or `EncodePrefillDecode`.
     pub mode: &'static str,
-    /// The pools the router draws from for the model, named per leg.
-    pub legs: &'a [(&'static str, RoutingPool)],
+    /// The pools the router draws from for the model, named per role.
+    pub pools: &'a [(&'static str, RoutingPool)],
 }
 
 /// A refusal the gateway answers on its own, with the line it gets and the
@@ -647,11 +647,11 @@ pub(crate) fn report_refusal_under(
     // pool lookup per leg, no walk over the workers; the 404 needs none.
     let registered = matches!(kind, Refusal::NoAvailableWorkers)
         && site
-            .legs
+            .pools
             .iter()
             .any(|(_, pool)| !registry.get_routing_pool(model_id, *pool).is_empty());
     if let Some(admitted) = throttle.admit(kind.key(model_id, registered)) {
-        let pool = PoolState::of(registry, model_id, site.legs);
+        let pool = PoolState::of(registry, model_id, site.pools);
         let reason = refusal_reason(&refusal);
         // The request's span carries the id too; the field is for a line
         // written outside it (a retry's re-selection) and is omitted when
@@ -672,29 +672,33 @@ pub(crate) fn report_refusal_under(
     refusal
 }
 
-/// What a refusal line says about the pools it drew from: per leg, the
+/// What a refusal line says about the pools it drew from: per role, the
 /// workers registered for the model, those healthy, and those routable
 /// (healthy, circuit closed, not vetoed by load or liveness).
 struct PoolState {
-    legs: Vec<LegState>,
+    roles: Vec<RoleState>,
 }
 
-struct LegState {
-    leg: &'static str,
+struct RoleState {
+    role: &'static str,
     workers: usize,
     healthy: usize,
     available: usize,
 }
 
 impl PoolState {
-    fn of(registry: &WorkerRegistry, model_id: &str, legs: &[(&'static str, RoutingPool)]) -> Self {
+    fn of(
+        registry: &WorkerRegistry,
+        model_id: &str,
+        pools: &[(&'static str, RoutingPool)],
+    ) -> Self {
         PoolState {
-            legs: legs
+            roles: pools
                 .iter()
-                .map(|(leg, pool)| {
+                .map(|(role, pool)| {
                     let workers = registry.get_routing_pool(model_id, *pool);
-                    LegState {
-                        leg,
+                    RoleState {
+                        role,
                         workers: workers.len(),
                         healthy: workers.iter().filter(|w| w.is_healthy()).count(),
                         available: workers.iter().filter(|w| w.is_available()).count(),
@@ -705,24 +709,24 @@ impl PoolState {
     }
 
     fn workers(&self) -> usize {
-        self.legs.iter().map(|leg| leg.workers).sum()
+        self.roles.iter().map(|role| role.workers).sum()
     }
 
     fn available(&self) -> usize {
-        self.legs.iter().map(|leg| leg.available).sum()
+        self.roles.iter().map(|role| role.available).sum()
     }
 }
 
 impl fmt::Display for PoolState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, leg) in self.legs.iter().enumerate() {
+        for (i, role) in self.roles.iter().enumerate() {
             if i > 0 {
                 f.write_str(", ")?;
             }
             write!(
                 f,
                 "{} {}/{} available ({} healthy)",
-                leg.leg, leg.available, leg.workers, leg.healthy
+                role.role, role.available, role.workers, role.healthy
             )?;
         }
         Ok(())
@@ -806,7 +810,7 @@ fn relaxed_pair(
     };
     if prefill_capacity.is_some_and(|capacity| !capacity.has_capacity(&prefill)) {
         return Some(Err(Box::new(PairFailure {
-            leg: WorkerLeg::Prefill,
+            role: WorkerRole::Prefill,
             verdict: PlacementFailure::PrefillAtCapacity,
         })));
     }
@@ -864,16 +868,17 @@ pub(crate) fn select_pair(
                 .candidate_filter
                 .is_none_or(|accepts| accepts(w.as_ref()))
     };
-    let fail = |leg: WorkerLeg, verdict: PlacementFailure| Box::new(PairFailure { leg, verdict });
+    let fail =
+        |role: WorkerRole, verdict: PlacementFailure| Box::new(PairFailure { role, verdict });
 
     // A leg with no worker at all names itself before pairing is judged.
     if pairs.prefill_pool.is_empty() {
         debug!("No prefill workers");
-        return Err(fail(WorkerLeg::Prefill, PlacementFailure::NoCandidates));
+        return Err(fail(WorkerRole::Prefill, PlacementFailure::NoCandidates));
     }
     if pairs.decode_pool.is_empty() {
         debug!("No decode workers");
-        return Err(fail(WorkerLeg::Decode, PlacementFailure::NoCandidates));
+        return Err(fail(WorkerRole::Decode, PlacementFailure::NoCandidates));
     }
     if let Some(refusal) = &pairs.refusal {
         warn!(
@@ -885,7 +890,7 @@ pub(crate) fn select_pair(
             "No prefill/decode pair shares a KV transfer protocol"
         );
         return Err(fail(
-            WorkerLeg::Decode,
+            WorkerRole::Decode,
             PlacementFailure::NoCompatiblePair {
                 prefill: refusal.prefill.clone(),
                 decode: refusal.decode.clone(),
@@ -922,7 +927,7 @@ pub(crate) fn select_pair(
         }
         debug!("No available prefill workers");
         return Err(fail(
-            WorkerLeg::Prefill,
+            WorkerRole::Prefill,
             failure_from(&admitted, model_id, registry.overload_shed_enabled()),
         ));
     }
@@ -976,7 +981,7 @@ pub(crate) fn select_pair(
         }
         debug!(?leg_runtime, "No available PD pair");
         return Err(fail(
-            WorkerLeg::Decode,
+            WorkerRole::Decode,
             failure_from(&admitted, model_id, registry.overload_shed_enabled()),
         ));
     }
@@ -995,7 +1000,7 @@ pub(crate) fn select_pair(
         open.retain(|&i| capacity.has_capacity(&pairs.prefill[i]));
         if open.is_empty() {
             return Err(fail(
-                WorkerLeg::Prefill,
+                WorkerRole::Prefill,
                 PlacementFailure::PrefillAtCapacity,
             ));
         }
@@ -1013,25 +1018,25 @@ pub(crate) fn select_pair(
         rid_key: inputs.rid_key,
         cache_namespace: inputs.cache_namespace,
         hash_ring,
-        leg: WorkerLeg::Prefill,
+        role: WorkerRole::Prefill,
     };
     // Both legs were filtered for availability above, so a miss here is the
     // policy's own decision, never an overloaded pool.
-    let declined = |leg: WorkerLeg, policy: &'static str| {
+    let declined = |role: WorkerRole, policy: &'static str| {
         Box::new(PairFailure {
-            leg,
+            role,
             verdict: PlacementFailure::PolicyDeclined(policy),
         })
     };
     let Some(prefill_idx) =
         policies.select_worker_for_model(&prefill_policy, model_id, &prefill, &info)
     else {
-        return Err(declined(WorkerLeg::Prefill, prefill_policy.name()));
+        return Err(declined(WorkerRole::Prefill, prefill_policy.name()));
     };
     let selected_prefill = prefill[prefill_idx].clone();
     if prefill_capacity.is_some_and(|capacity| !capacity.has_capacity(&selected_prefill)) {
         return Err(fail(
-            WorkerLeg::Prefill,
+            WorkerRole::Prefill,
             PlacementFailure::PrefillAtCapacity,
         ));
     }
@@ -1047,13 +1052,13 @@ pub(crate) fn select_pair(
             ?leg_runtime,
             "The selected prefill's partners went unavailable"
         );
-        return Err(fail(WorkerLeg::Decode, PlacementFailure::Unavailable));
+        return Err(fail(WorkerRole::Decode, PlacementFailure::Unavailable));
     }
-    info.leg = WorkerLeg::Decode;
+    info.role = WorkerRole::Decode;
     let Some(decode_idx) =
         policies.select_worker_for_model(&decode_policy, model_id, &decode, &info)
     else {
-        return Err(declined(WorkerLeg::Decode, decode_policy.name()));
+        return Err(declined(WorkerRole::Decode, decode_policy.name()));
     };
     let selected_decode = decode[decode_idx].clone();
     let runtime = selected_prefill.metadata().spec.runtime_type;
@@ -1355,7 +1360,7 @@ mod tests {
         let failure = pair_from(&registry, &policies)
             .err()
             .expect("no pair shares a transport");
-        assert_eq!(failure.leg, WorkerLeg::Decode);
+        assert_eq!(failure.role, WorkerRole::Decode);
         match failure.verdict {
             PlacementFailure::NoCompatiblePair {
                 prefill,
@@ -1533,7 +1538,7 @@ mod tests {
         let failure = pair_from(&only_prefill, &policies)
             .err()
             .expect("no decode worker exists");
-        assert_eq!(failure.leg, WorkerLeg::Decode);
+        assert_eq!(failure.role, WorkerRole::Decode);
         assert!(matches!(failure.verdict, PlacementFailure::NoCandidates));
     }
 
@@ -1600,7 +1605,7 @@ mod tests {
         )
         .err()
         .expect("the retained transport has no decode worker");
-        assert_eq!(failure.leg, WorkerLeg::Decode);
+        assert_eq!(failure.role, WorkerRole::Decode);
         assert!(matches!(failure.verdict, PlacementFailure::Unavailable));
     }
 
@@ -1679,7 +1684,7 @@ mod tests {
         let failure = place(inputs)
             .err()
             .expect("under shedding the admitted leg is all-overloaded");
-        assert_eq!(failure.leg, WorkerLeg::Decode);
+        assert_eq!(failure.role, WorkerRole::Decode);
         assert!(
             matches!(failure.verdict, PlacementFailure::AllOverloaded(_)),
             "{:?}",
@@ -1729,7 +1734,7 @@ mod tests {
         let failure = place(inputs)
             .err()
             .expect("under shedding the admitted leg is all-overloaded");
-        assert_eq!(failure.leg, WorkerLeg::Prefill);
+        assert_eq!(failure.role, WorkerRole::Prefill);
         assert!(
             matches!(failure.verdict, PlacementFailure::AllOverloaded(_)),
             "{:?}",
@@ -1775,7 +1780,7 @@ mod tests {
         )
         .err()
         .expect("no worker on the wire: the pair fails");
-        assert_eq!(failure.leg, WorkerLeg::Prefill);
+        assert_eq!(failure.role, WorkerRole::Prefill);
         assert!(
             matches!(failure.verdict, PlacementFailure::Unavailable),
             "the verdict is the leg's own, not a shed over the other wire's overloaded worker: {:?}",
@@ -2146,7 +2151,7 @@ mod tests {
         let site = RefusalSite {
             function: "Router::route_typed_request",
             mode: "Regular",
-            legs: &[("regular", RoutingPool::HttpRegular)],
+            pools: &[("regular", RoutingPool::HttpRegular)],
         };
         let window = Duration::from_millis(100);
         let throttle = KeyedLogThrottle::new(2, window, REFUSAL_LOG_MODELS);
@@ -2278,7 +2283,7 @@ mod tests {
         let site = RefusalSite {
             function: "PDRouter::execute_dual_dispatch_attempt",
             mode: "PrefillDecode",
-            legs: &[("regular", RoutingPool::HttpRegular)],
+            pools: &[("regular", RoutingPool::HttpRegular)],
         };
         let window = Duration::from_millis(100);
         let throttle = KeyedLogThrottle::new(2, window, REFUSAL_LOG_MODELS);
@@ -2355,7 +2360,7 @@ mod tests {
         let site = RefusalSite {
             function: "WorkerSelectionStage::execute",
             mode: "PrefillDecode",
-            legs: &[("regular", RoutingPool::HttpRegular)],
+            pools: &[("regular", RoutingPool::HttpRegular)],
         };
         let throttle = KeyedLogThrottle::new(2, Duration::from_secs(60), REFUSAL_LOG_MODELS);
         let refused = no_available_workers_because(

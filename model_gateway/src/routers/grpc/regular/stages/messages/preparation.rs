@@ -30,7 +30,7 @@ use crate::{
 /// tokenizes, and builds tool constraints.
 pub(crate) struct MessagePreparationStage {
     /// The pools whose workers this pipeline's requests can reach (the
-    /// mode's legs): the multimodal wire dtype is resolved over them.
+    /// mode's pools): the multimodal wire dtype is resolved over them.
     wire_pools: &'static [RoutingPool],
 }
 
@@ -189,7 +189,7 @@ impl MessagePreparationStage {
                 // switched off, `SMG_MM_ONE_PASS_WIRE=0`): the preprocessor
                 // then writes it directly; otherwise `None`, and the write
                 // happens at assembly. Resolved over the pools of this
-                // pipeline's mode, the legs the pixels can reach, as the
+                // pipeline's mode, the pools the pixels can reach, as the
                 // selection draws them.
                 let image_wire_dtype = multimodal::mm_shared_image_wire_dtype_over(
                     &ctx.components.worker_registry,
@@ -197,7 +197,7 @@ impl MessagePreparationStage {
                     self.wire_pools,
                 );
                 // The frames decode under the destination engine's own
-                // transparency rule, resolved over the same legs as the dtype.
+                // transparency rule, resolved over the same pools as the dtype.
                 let transparency = multimodal::engine_transparency_policy(
                     &ctx.components.worker_registry,
                     model_id,
