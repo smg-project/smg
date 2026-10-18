@@ -240,6 +240,7 @@ _GIT_LOCATION_VARS = (
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_COMMON_DIR",
     "GIT_NAMESPACE",
+    "GIT_SHALLOW_FILE",
 )
 
 
@@ -249,13 +250,15 @@ class Repo:
         self.env = {k: v for k, v in os.environ.items() if k not in _GIT_LOCATION_VARS}
 
     def _run(self, *args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
+        # git's output carries file content (the tag's copy of a version file, the diff,
+        # the commit messages): read as UTF-8, like the working tree, under any locale.
         return subprocess.run(
             ["git", *args],
             cwd=self.root,
             env=self.env,
             check=check,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
         )
 
     def git(self, *args: str) -> str:

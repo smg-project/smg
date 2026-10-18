@@ -257,6 +257,20 @@ def test_the_repo_reads_its_root_whatever_git_variables_the_caller_carries(mod, 
     assert r.show("HEAD", "Cargo.toml") is not None
 
 
+def test_a_shallow_file_the_caller_carries_does_not_cut_the_history(
+    mod, repo, monkeypatch, tmp_path
+):
+    """`GIT_SHALLOW_FILE` makes git treat the listed commits as roots, so an inherited one
+    naming HEAD would cut the commits between the tag and HEAD from the history and with
+    them the bump they ask for; the tool drops it."""
+    head = git(repo, "rev-parse", "HEAD").strip()
+    shallow = tmp_path / "shallow"
+    shallow.write_text(head + "\n")
+    monkeypatch.setenv("GIT_SHALLOW_FILE", str(shallow))
+    subjects = [subject for subject, _ in mod.Repo(repo).commits_since("v1.0.0", ["crates/alpha/"])]
+    assert any(subject.startswith("feat(alpha)") for subject in subjects), subjects
+
+
 def test_the_verdicts(mod, repo):
     code, out = run(mod, repo)
     assert code == 1
