@@ -1086,11 +1086,13 @@ pub(crate) fn generate_tool_call_id(
 
 /// The completion API's finish reason from the engine's: a local stop beats
 /// the engine's reason (which is "length" when stop strings are enforced
-/// gateway-side rather than by the backend); `stop`, `length` and
-/// `content_filter` pass, as a plain word or as a JSON object's `type`;
-/// anything else (an empty reason, an unmapped type, an unrecognized word)
-/// is `stop`, logged once with the raw value. One table for the streamed and
-/// the non-streamed completion.
+/// gateway-side rather than by the backend); the API's words `stop`,
+/// `length` and `content_filter` pass, and so do the engines' own signals
+/// `abort`, `error` and `failed`, which the chat paths pass through too and
+/// clients read as the failure they are; each as a plain word or as a JSON
+/// object's `type`. Anything else (an empty reason, an unmapped type, an
+/// unrecognized word) is `stop`, logged once with the raw value. One table
+/// for the streamed and the non-streamed completion.
 pub(crate) fn completion_finish_reason(local_stop: bool, engine: &str) -> &'static str {
     if local_stop {
         return "stop";
@@ -1100,6 +1102,9 @@ pub(crate) fn completion_finish_reason(local_stop: bool, engine: &str) -> &'stat
             "stop" => Some("stop"),
             "length" => Some("length"),
             "content_filter" => Some("content_filter"),
+            "abort" => Some("abort"),
+            "error" => Some("error"),
+            "failed" => Some("failed"),
             _ => None,
         }
     };
@@ -2737,8 +2742,12 @@ mod tests {
             (false, r#"{"type":"stop"}"#, "stop"),
             (false, r#"{"type":"length","length":7}"#, "length"),
             (false, r#"{"type":"content_filter"}"#, "content_filter"),
-            (false, r#"{"type":"abort"}"#, "stop"),
-            (false, "abort", "stop"),
+            (false, r#"{"type":"abort"}"#, "abort"),
+            (false, "abort", "abort"),
+            (false, "error", "error"),
+            (false, "failed", "failed"),
+            (false, r#"{"type":"timeout"}"#, "stop"),
+            (false, "whatever", "stop"),
             (true, "length", "stop"),
         ] {
             assert_eq!(
