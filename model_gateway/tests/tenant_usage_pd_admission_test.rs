@@ -11,7 +11,11 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use common::grpc_harness::{
     build_grpc_router, grpc_router_config, grpc_worker, serve_canned_worker, Canned,
@@ -29,7 +33,8 @@ const MODEL: &str = "pd-admission-usage-test-model";
 /// How long the canned mock holds each request before answering.
 const HOLD: Duration = Duration::from_secs(2);
 /// Head start the first request gets before the second is sent: the second
-/// then waits about `HOLD - HEAD_START` for the room.
+/// then waits about `HOLD - HEAD_START` for the room, and the two holds run
+/// back to back.
 const HEAD_START: Duration = Duration::from_millis(200);
 /// The admission wait: long enough for the second request to be admitted
 /// once the first completes, far from a shed.
@@ -147,11 +152,19 @@ async fn a_request_that_waited_for_admission_books_its_time_from_the_dispatch() 
         tokio::time::sleep(HEAD_START).await;
         complete(router.as_ref(), SECOND_TENANT).await
     };
+    let started = Instant::now();
     let (first, second) = tokio::join!(first, second);
+    let wall = started.elapsed();
     assert_eq!(
         (first, second),
         (http::StatusCode::OK, http::StatusCode::OK),
         "both requests are admitted, the second after its wait"
+    );
+    // The two holds ran back to back: the second request waited for the
+    // first's room, so its row below is a waiting request's.
+    assert!(
+        wall >= HOLD * 2 - HEAD_START / 2,
+        "the second request waited for the first's room: {wall:?}"
     );
 
     let hold = HOLD.as_secs_f64();
