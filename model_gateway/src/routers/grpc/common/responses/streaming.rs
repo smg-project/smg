@@ -1410,25 +1410,17 @@ impl ResponseStreamEventEmitter {
         }
     }
 
-    /// Emit an error event
-    ///
-    /// Creates and sends an error event with the given error message.
-    /// Uses OpenAI's error event format.
-    /// Use this for terminal errors that should abort the streaming response.
+    /// Emit the `error` event that ends the stream: the one frame every
+    /// router writes for a failure of its own
+    /// ([`SseEncoder::encode_responses_error`]), at the stream's next
+    /// sequence number. Use this for terminal errors that abort the stream.
     pub async fn emit_error(&mut self, error_msg: &str, error_code: Option<&str>, tx: &SseSender) {
         let code = error_code.unwrap_or("internal_error");
         self.last_error = Some(json!({ "code": code, "message": error_msg }));
-        let event = json!({
-            "type": "error",
-            "code": code,
-            "message": error_msg,
-            "param": null,
-            "sequence_number": self.next_sequence()
-        });
-        // The error event goes out on a `data:` line alone, as it always has.
-        let frame = self.encoder.encode_data(&event).unwrap_or_else(|_| {
-            Bytes::from_static(b"data: {\"type\":\"error\",\"code\":\"internal_error\",\"message\":\"serialization failed\",\"param\":null}\n\n")
-        });
+        let sequence_number = self.next_sequence();
+        let frame = self
+            .encoder
+            .encode_responses_error(code, error_msg, sequence_number);
         let _ = tx.send(Ok(frame)).await;
     }
 
@@ -1690,6 +1682,36 @@ mod tests {
         assert_eq!(error["code"], "pipeline_error");
         assert_eq!(error["message"], "Pipeline execution failed");
         assert!(emitter.take_error().is_none(), "taken once");
+    }
+
+    /// The emitter's error event is the frame every router writes for a
+    /// failed Responses stream, at the emitter's own sequence number.
+    #[tokio::test]
+    async fn the_error_frame_is_the_shared_responses_error_frame() {
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        let (tx, mut rx) = sse_channel();
+        let created = emitter.emit_created();
+        emitter.send_event(&created, &tx).await.unwrap();
+        emitter
+            .emit_error(
+                "Stream read error: connection reset",
+                Some("stream_error"),
+                &tx,
+            )
+            .await;
+        drop(tx);
+        let _created = rx.recv().await.expect("the created frame");
+        let frame = rx.recv().await.expect("the error frame").expect("a frame");
+        assert_eq!(
+            frame,
+            SseEncoder::new().encode_responses_error(
+                "stream_error",
+                "Stream read error: connection reset",
+                1
+            )
+        );
+        assert!(rx.recv().await.is_none(), "nothing follows the error event");
     }
 
     #[test]
