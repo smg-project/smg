@@ -2120,8 +2120,10 @@ class RouterArgs:
             default=RouterArgs.request_timeout_secs,
             help=(
                 "Request timeout in seconds: the read of the body overall, and "
-                "each request to a worker, HTTP or gRPC, from its dispatch to "
-                "its last message (504 call_upstream_timeout past it)"
+                "each attempt at a worker, HTTP or gRPC, from its dispatch to "
+                "its last message (504 call_upstream_timeout past it, the "
+                "request's answer on any worker; an HTTP worker's own pool "
+                "timeout_secs takes this value's place)"
             ),
         )
         request_group.add_argument(

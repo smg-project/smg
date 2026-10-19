@@ -171,10 +171,12 @@ pub struct RouterConfig {
     #[serde(default)]
     pub max_connections: usize,
     /// Seconds a request may take: the read of its body overall (`408` past
-    /// it), and each request to a worker, HTTP or gRPC, from its dispatch to
+    /// it), and each attempt at a worker, HTTP or gRPC, from its dispatch to
     /// its last message (`504` `call_upstream_timeout` past it; on a stream,
     /// the error event that ends it; the call to the worker is dropped, which
-    /// cancels the request on a gRPC worker). Must be > 0.
+    /// cancels the request on a gRPC worker). On any worker that `504` is
+    /// the request's answer, not replayed; for an HTTP worker, a worker's own
+    /// pool `timeout_secs` takes this value's place. Must be > 0.
     pub request_timeout_secs: u64,
     /// Seconds of upstream silence after which an open SSE stream carries a
     /// keep-alive frame (an SSE comment; the `ping` event on the Messages
