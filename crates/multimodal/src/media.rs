@@ -2048,7 +2048,7 @@ async fn decode_video_with_ffmpeg(
                 input_path,
                 input_bytes,
                 cfg,
-                metadata,
+                Some(probed),
                 Some(&resized),
             )
             .await
@@ -2072,7 +2072,7 @@ async fn decode_video_with_ffmpeg(
             "smg_mm_timing video_decode_ffmpeg_select_fallback"
         );
     }
-    decode_video_with_ffmpeg_runners(input_path, input_bytes, cfg, metadata, None)
+    decode_video_with_ffmpeg_runners(input_path, input_bytes, cfg, Some(probed), None)
         .await
         .map_err(|fallback_error| {
             let message = format!(
