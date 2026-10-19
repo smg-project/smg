@@ -47,6 +47,7 @@ from sglang.utils import get_exception_traceback
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from smg_grpc_proto.generated import common_pb2
 
+from smg_grpc_servicer.health_probe import await_probe
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.kv_events import subscribe_kv_events
@@ -326,6 +327,12 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         """
         Check the health of the inference server by sending a special request to generate one token.
         Similar to HTTP server's /health endpoint.
+
+        The wait is :func:`await_probe`'s: any scheduler push after the probe
+        started, or the probe's own output, is healthy (a scheduler that aborts
+        the probe answers with a push, which counts); a probe whose submission
+        fails, the send to the scheduler raising, is unhealthy at once; neither
+        within ``HEALTH_CHECK_TIMEOUT`` is unhealthy at the deadline.
         """
         rid = f"HEALTH_CHECK_{time.time()}"
         logger.info(f"Receive health check request: {rid}")
@@ -394,23 +401,30 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 return False
             return False
 
+        started = time.time()
         task = asyncio.create_task(run_health_check())
 
         try:
-            # Wait for response with timeout
-            tic = time.time()
-            while time.time() < tic + HEALTH_CHECK_TIMEOUT:
-                await asyncio.sleep(1)
-                # Check if we got a response from scheduler
-                if self.request_manager.last_receive_tstamp > tic:
-                    return sglang_scheduler_pb2.HealthCheckResponse(
-                        healthy=True, message="Health check passed"
-                    )
-
-            # Timeout - server not responding
-            logger.warning(f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s")
+            verdict = await await_probe(
+                task,
+                started=started,
+                last_receive=lambda: self.request_manager.last_receive_tstamp,
+                timeout=HEALTH_CHECK_TIMEOUT,
+            )
+            if verdict:
+                return sglang_scheduler_pb2.HealthCheckResponse(
+                    healthy=True, message="Health check passed"
+                )
+            if verdict is None:
+                # Neither a push nor the probe's verdict within the deadline.
+                logger.warning(f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s")
+                return sglang_scheduler_pb2.HealthCheckResponse(
+                    healthy=False, message=f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s"
+                )
+            # The probe failed (logged where it did): the answer is now, not
+            # at the deadline.
             return sglang_scheduler_pb2.HealthCheckResponse(
-                healthy=False, message=f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s"
+                healthy=False, message="Health check probe failed"
             )
         finally:
             # The RPC may be cancelled before a scheduler response or the timeout.
