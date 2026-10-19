@@ -900,6 +900,18 @@ mod tests {
             .collect()
     }
 
+    /// The text of every `Malformed` event, one entry per event, whatever its reason: an event of
+    /// no bytes counts here, where the joined text of [`malformed`] does not show it.
+    fn words(events: &[Event]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Malformed { text, .. } => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The malformed text, whole: the events that carry it depend on the cuts, the text does not.
     fn malformed(events: &[Event]) -> String {
         events
@@ -1429,12 +1441,12 @@ mod tests {
                             );
                         }
                         (Found::Whole, _) => {
-                            assert!(malformed(&events).is_empty(), "{place}: no word");
+                            assert!(words(&events).is_empty(), "{place}: no word");
                         }
                         // The wrapping after a whole call is the template's at the close and a
                         // cut region's bytes at the stream's end.
                         (Found::Wrapping, Ending::Close) => {
-                            assert!(malformed(&events).is_empty(), "{place}: no word");
+                            assert!(words(&events).is_empty(), "{place}: no word");
                             assert!(dropped(&events).contains(held), "{place}: wrapping dropped");
                         }
                         (Found::Wrapping, Ending::Stream) => {
@@ -1443,7 +1455,7 @@ mod tests {
                         // A name that never got its `(` is no call either way, and the close
                         // names its reason.
                         (Found::Name, Ending::Close) => {
-                            assert_eq!(malformed(&events), *held, "{place}: the name");
+                            assert_eq!(words(&events), [*held], "{place}: the name");
                             assert!(said(&events).is_empty(), "{place}: the close's own reason");
                         }
                         (Found::Name, Ending::Stream) => {
