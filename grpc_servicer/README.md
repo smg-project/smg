@@ -222,48 +222,18 @@ if resolve_servicer_impl(args) == "rust":
     raise SystemExit(await serve_rust(args))
 ```
 
-##### Metrics HTTP service
+##### Metrics
 
-The SMG vLLM plugin adds `--metrics-port` for Rust gRPC mode, serving `/metrics` on
-`0.0.0.0` at that port. The port must differ from gRPC. The option is disabled
-by default; profiler routes are not exposed and no profiler configuration is
-required. This is an SMG plugin option, not a native vLLM option.
+The SMG plugin adds an optional HTTP `/metrics` listener for Rust gRPC:
 
 ```bash
 vllm serve <model> --grpc --servicer-impl rust --metrics-port 9090
 ```
 
-A small event adapter feeds Rust request lifecycle events into vLLM's original
-`IterationStats`, `ParentRequest` and `StatLoggerManager`. The HTTP endpoint
-uses the public Prometheus exposition API and vLLM's multiprocess registry, retaining
-the installed build's formulas, metric names, labels, buckets and connector
-extensions. No Rust metric registry or duplicate formula implementation is
-maintained. Enabling metrics introduces Python callbacks; tensor auxiliary
-frames remain in Rust. Engine handshake configuration is applied by vLLM itself
-before collectors are initialized, including DP block totals and hybrid cache sizes.
-
-Outputs contribute when the Rust frontend consumes them. It reports the finish
-reason after stop matching, so queued later outputs cannot count towards a
-finished request. Native iteration statistics are recorded once per engine
-batch, including multi-choice requests. `--disable-log-stats` disables request
-statistics. Renderer cache statistics are included when the media processor owns
-a local vLLM renderer. Request latency starts before Rust media preprocessing.
-Formulas match vLLM, but wall-clock values reflect the Rust frontend's execution:
-output consumption/backpressure and batch publication can occur at different
-times from the Python frontend. These are not bit-for-bit timing guarantees.
-Worker metrics use vLLM's existing multiprocess collector.
-
-Startup failures release the HTTP listener; shutdown closes it before stopping
-the engine. Collection failures return HTTP 503 instead of a stale successful
-scrape. CPU tests compare the adapter against native statistics and collectors:
-
-```bash
-SMG_VLLM_SOURCE_ROOT=/path/to/vllm pytest grpc_servicer/tests/test_vllm_rust_ops.py
-```
-
-These tests load the selected source's real metric code with engine-only imports
-stubbed. They verify event accounting and HTTP collection, not GPU inference
-or performance.
+The listener binds `0.0.0.0`; choose a port different from gRPC. It reuses vLLM's
+native statistics and multiprocess registry. `--disable-log-stats` disables request
+statistics. Metrics add Python callbacks; timings reflect Rust frontend processing.
+Profiler routes are not exposed, and collection failures return HTTP 503.
 
 ##### Supported vLLM releases
 
