@@ -10,7 +10,7 @@
 //! a conversation longer than [`MAX_CONVERSATION_HISTORY_ITEMS`] replays its
 //! newest items.
 
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use axum::response::Response;
 use openai_protocol::responses::{
@@ -77,15 +77,14 @@ pub(crate) async fn load_history(
         );
         continues = true;
     }
+    // Where the chain's items end, for the pass below (resolution maps every
+    // item to one item, so it holds after it).
+    let chain_items = history.len();
 
     if let Some(conversation) = &request.conversation {
         history.extend(conversation_items(stores, conversation.as_id(), tenant).await?);
         continues = true;
     }
-
-    // Where the stored items end and the request's own begin, for the pass
-    // below (resolution maps every item to one item, so it holds after it).
-    let stored = history.len();
 
     let mut loaded = request.clone();
     if continues {
@@ -108,12 +107,32 @@ pub(crate) async fn load_history(
         }
     }
 
-    // The stored items, their references resolved (a stored call behind an
+    // The chain's items, their references resolved (a stored call behind an
     // `item_reference` counts as loaded): the results of calls that did not
-    // survive the reload go; the request's own items stay out of it.
-    if continues {
+    // survive the reload go. A chain is cut at the store's depth cap, at an
+    // expired or deleted record or at another tenant's, with no word of it,
+    // and the oldest turn kept then opens with the result of a call the turn
+    // before it issued, which is gone: it answers nothing the request
+    // replays, and the contract profiles refuse a tool result with no call
+    // before it (`ProviderProfile::unanswerable_tool_result`), so keeping it
+    // would refuse every later request on the chain for a call the client
+    // never sent. A conversation's window keeps its own rule
+    // (`conversation_items`), and the request's own items stay out of it: a
+    // result among them with no call before it is the client's and keeps its
+    // refusal.
+    if chain_items > 0 {
         if let ResponseInput::Items(items) = &mut loaded.input {
-            drop_results_of_unloaded_calls(items, stored);
+            let rest = items.split_off(chain_items);
+            let before = items.len();
+            let mut kept = without_outputs_of_missing_calls(std::mem::take(items));
+            if kept.len() < before {
+                debug!(
+                    dropped = before - kept.len(),
+                    "dropped the chain's stored tool results whose calls did not survive the reload"
+                );
+            }
+            kept.extend(rest);
+            *items = kept;
         }
     }
 
@@ -124,52 +143,6 @@ pub(crate) async fn load_history(
     );
 
     Ok(loaded)
-}
-
-/// Drops from the first `stored` of `items` (the loaded history, its
-/// `item_reference`s resolved, so a stored call behind one counts) the tool
-/// results whose calls did not survive the reload. A chain is cut at the
-/// store's depth cap, at an expired or deleted record or at another tenant's,
-/// and a conversation window at its size: the oldest turn kept then opens
-/// with the result of a call the turn before it issued, which is gone. Such a
-/// result answers nothing the request replays, and the contract profiles
-/// refuse a tool result with no call before it
-/// (`ProviderProfile::unanswerable_tool_result`), so keeping it would refuse
-/// every later request on the history for a call the client never sent. The
-/// request's own input items, from `stored` on, are not touched: a result
-/// among them with no call before it is the client's and keeps its refusal.
-fn drop_results_of_unloaded_calls(items: &mut Vec<ResponseInputOutputItem>, stored: usize) {
-    let mut issued: HashSet<String> = HashSet::new();
-    let mut dropped: Vec<String> = Vec::new();
-    let mut index = 0;
-    items.retain(|item| {
-        let is_stored = index < stored;
-        index += 1;
-        if !is_stored {
-            return true;
-        }
-        match item {
-            ResponseInputOutputItem::FunctionToolCall { call_id, .. }
-            | ResponseInputOutputItem::CustomToolCall { call_id, .. } => {
-                issued.insert(call_id.clone());
-                true
-            }
-            ResponseInputOutputItem::FunctionCallOutput { call_id, .. }
-            | ResponseInputOutputItem::CustomToolCallOutput { call_id, .. }
-                if !issued.contains(call_id) =>
-            {
-                dropped.push(call_id.clone());
-                false
-            }
-            _ => true,
-        }
-    });
-    if !dropped.is_empty() {
-        debug!(
-            call_ids = ?dropped,
-            "dropped stored tool results whose calls did not survive the history's reload"
-        );
-    }
 }
 
 /// The request's own input as items: a text input is the user message it
@@ -692,43 +665,6 @@ pub(crate) mod tests {
             ResponseInputOutputItem::FunctionToolCall { name, arguments, .. }
                 if name == "calc" && arguments == "{\"expr\":\"6*7\"}"
         ));
-    }
-
-    /// The results whose calls did not survive a reload are left out of the
-    /// loaded history: the one that opens a cut chain or window, and a later
-    /// one whose call is gone, a custom tool's as a function's; a result
-    /// whose call is loaded stays in its place, and the request's own items
-    /// after the stored ones are not judged here.
-    #[test]
-    fn results_of_unloaded_calls_are_dropped_from_the_loaded_history() {
-        let mut history: Vec<ResponseInputOutputItem> = serde_json::from_value(json!([
-            {"type": "function_call_output", "call_id": "call_0", "output": "gone"},
-            {"type": "message", "id": "msg_1", "role": "assistant", "content": [
-                {"type": "output_text", "text": "Next.", "annotations": []}]},
-            {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "calc",
-             "arguments": "{}", "status": "completed"},
-            {"type": "function_call_output", "call_id": "call_1", "output": "42"},
-            {"type": "custom_tool_call_output", "call_id": "call_x", "output": "gone too"},
-            {"type": "custom_tool_call", "call_id": "call_2", "name": "sh", "input": "ls"},
-            {"type": "custom_tool_call_output", "call_id": "call_2", "output": "ok"},
-            {"type": "function_call_output", "call_id": "call_9", "output": "the client's"}
-        ]))
-        .expect("history items");
-        let stored = history.len() - 1;
-
-        drop_results_of_unloaded_calls(&mut history, stored);
-
-        assert_eq!(
-            shape(&history),
-            [
-                "message:assistant",
-                "function_call:call_1",
-                "function_call_output:call_1",
-                "custom_tool_call",
-                "custom_tool_call_output",
-                "function_call_output:call_9"
-            ]
-        );
     }
 
     /// A stored row of a kind no conversion replays (a hosted image
