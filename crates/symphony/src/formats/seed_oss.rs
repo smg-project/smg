@@ -8,9 +8,19 @@
 //! [`qwen3()`](crate::formats::qwen3()), with the spellings ByteDance-Seed/Seed-OSS-36B-Instruct
 //! writes; a plain `<tool_call>` is text here. The template is not ChatML: a turn opens with
 //! `<seed:bos>assistant`, so the prompt's replay starts there.
+//!
+//! The table carries the one part of its chat template's layout the tags write: after the
+//! thought's close the template writes a newline before every call and before the answer
+//! (`"\n" + <seed:tool_call>`), so a forced call written where the close left the engine begins
+//! on its own line, as the template writes it, and the call's marker is not the grammar's first
+//! text ([`Format::grammar_for`]). Nothing stands before the thought's opener: the template's
+//! newline there is the one the generation prompt ends with. The thought the model opens and
+//! closes itself: a `<seed:tool_call>` inside it is thought text (the model rehearses the format
+//! there), as the template reads it.
 
 use crate::{
     format::{CallSyntax, Emits, Format},
+    shape::{Layout, Message},
     tagged::{Placement, Spelling},
 };
 
@@ -31,6 +41,15 @@ pub fn seed_oss() -> Format {
         .transition("calls", "call_open", "calls")
         .calls(CallSyntax::Tagged(Spelling::Python, Placement::Direct))
         .opens_turn("<seed:bos>assistant")
+        .with_layout(Layout {
+            thought: Some(Message {
+                before: "".into(),
+                after: "\n".into(),
+                stops: false,
+                close: Some("</seed:think>".into()),
+            }),
+            ..Layout::default()
+        })
 }
 
 #[cfg(test)]
@@ -44,7 +63,7 @@ mod tests {
         ids::CallIds,
         input::{EngineFinish, Input},
         parser::Parser,
-        testing::{content, drive, reasoning},
+        testing::{calls, content, drive, reasoning},
         Declared,
     };
 
@@ -498,5 +517,210 @@ mod tests {
         for pieces in cuts(REGIONS) {
             assert_eq!(read(&pieces), whole, "cut as {pieces:?}");
         }
+    }
+
+    /// The thought's tail of a recorded forced answer (`tool_choice` naming the function), as the
+    /// engine wrote it when its reasoning gate took the call marker the model rehearsed inside its
+    /// thought for the thought's end and started the forced tag there: the marker written twice,
+    /// the call, and the end of the output with no `</seed:think>` (smg-lab #845).
+    const FORCED_IN_THE_THOUGHT: &str = "Let me check the parameters again: location is required \
+        (str), days required (int), details required (list). All boxes ticked. Now, format the \
+        function call correctly. The user wants the assistant to call the tool, so I need to use \
+        the proper format with <seed:tool_call><seed:tool_call>\n<function=detailed_weather_forecast>\
+        \n<parameter=location>London, United Kingdom</parameter>\n<parameter=days>3</parameter>\n\
+        <parameter=details>['high_temperature', 'low_temperature', 'humidity', 'precipitation']\
+        </parameter>\n</function>\n</seed:tool_call>";
+
+    /// The same, where the model thought on after the forced tag, closed its thought and wrote the
+    /// call again (the recorded fourth case).
+    const FORCED_THEN_THOUGHT_ON: &str =
+        "Let me structure the function call correctly. The format \
+        is <seed:tool_call><seed:tool_call>\n<function=metropolitan_museum_get_top_artworks>\n\
+        <parameter=number>5</parameter>\n<parameter=sort_by>popularity</parameter>\n</function>\n\
+        </seed:tool_call>. \n\nWait, does the sort_by parameter need to be there if it's the \
+        default? The user asked to sort by popularity, so even though it's the default, including \
+        it is okay. It doesn't hurt. So yes, include both parameters.";
+
+    /// The thought as the model writes it when the marker cannot end it: the rehearsal spelled out
+    /// once, as the hundred-odd recorded answers under no constraint have it.
+    const REHEARSED: &str =
+        "Now, format the function call correctly. The user wants the assistant \
+        to call the tool, so I need to use the proper format with <seed:tool_call>\n\
+        <function=detailed_weather_forecast>\n<parameter=location>London, United Kingdom\
+        </parameter>\n<parameter=days>3</parameter>\n<parameter=details>['high_temperature', \
+        'low_temperature', 'humidity', 'precipitation']</parameter>\n</function>\n\
+        </seed:tool_call>. That should do it.";
+
+    /// The forced call as the tag writes it after the thought's close: the template's newline,
+    /// then the call.
+    const FORCED_AFTER_THE_CLOSE: &str =
+        "\n<seed:tool_call>\n<function=detailed_weather_forecast>\n\
+        <parameter=location>London, United Kingdom</parameter>\n<parameter=days>3</parameter>\n\
+        <parameter=details>['high_temperature', 'low_temperature', 'humidity', 'precipitation']\
+        </parameter>\n</function>\n</seed:tool_call>";
+
+    fn forecast_tools() -> Declared {
+        use openai_protocol::common::{Function, Tool};
+        use serde_json::json as value;
+        Declared::of(&[Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "detailed_weather_forecast".to_string(),
+                description: None,
+                parameters: value!({"type": "object", "properties": {
+                    "location": {"type": "string"},
+                    "days": {"type": "integer"},
+                    "details": {"type": "array", "items": {"type": "string"}},
+                }, "required": ["location", "days", "details"]}),
+                strict: None,
+                extra: Default::default(),
+            },
+        }])
+    }
+
+    /// The events of `output` after the turn's opener, fed in `pieces`, with the forecast tool.
+    fn read_forecast(pieces: &[&str]) -> Vec<Event> {
+        let mut parser = Engine::new(seed_oss(), forecast_tools());
+        let mut out = Events::new();
+        parser
+            .feed(
+                Input::Prompt {
+                    token_ids: &[],
+                    text: "<seed:bos>assistant\n",
+                },
+                &mut out,
+            )
+            .expect("prompt");
+        for piece in pieces {
+            parser
+                .feed(
+                    Input::Delta {
+                        token_ids: &[],
+                        text: piece,
+                        spans: &[],
+                    },
+                    &mut out,
+                )
+                .expect("delta");
+        }
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        out.drain()
+    }
+
+    /// What the reader said of an output: the calls, the finish, the content and the reasoning.
+    #[derive(Debug, PartialEq)]
+    struct Said {
+        calls: Vec<(String, String)>,
+        finish: Option<(FinishReason, u32)>,
+        content: String,
+        reasoning: String,
+    }
+
+    fn said(events: &[Event]) -> Said {
+        let finish = events.iter().find_map(|event| match event {
+            Event::Finish {
+                reason, tool_calls, ..
+            } => Some((reason.clone(), *tool_calls)),
+            _ => None,
+        });
+        Said {
+            calls: calls(events),
+            finish,
+            content: content(events),
+            reasoning: reasoning(events),
+        }
+    }
+
+    /// `output` read whole and at every two-way cut says the same.
+    fn the_same_at_every_cut(output: &str) -> Vec<Event> {
+        let whole = read_forecast(&[output]);
+        let expected = said(&whole);
+        for cut in 1..output.len() {
+            if !output.is_char_boundary(cut) {
+                continue;
+            }
+            let events = read_forecast(&[&output[..cut], &output[cut..]]);
+            assert_eq!(said(&events), expected, "cut at {cut}");
+        }
+        whole
+    }
+
+    #[test]
+    fn a_forced_call_written_after_the_thoughts_close_reads_as_the_call_with_the_rehearsal_as_thought(
+    ) {
+        // The tag's shape on an engine whose grammar starts after the thought's close: the thought
+        // with the format rehearsed inside it, its close, the template's newline and the call. The
+        // rehearsal is thought text, the newline the template's, the call the call.
+        let output = format!("<seed:think>{REHEARSED}</seed:think>{FORCED_AFTER_THE_CLOSE}");
+        let events = the_same_at_every_cut(&output);
+        let Said {
+            calls,
+            finish,
+            content,
+            reasoning,
+        } = said(&events);
+        assert_eq!(
+            calls,
+            [(
+                "detailed_weather_forecast".to_string(),
+                "{\"location\": \"London, United Kingdom\", \"days\": 3, \"details\": \
+                 [\"high_temperature\", \"low_temperature\", \"humidity\", \"precipitation\"]}"
+                    .to_string()
+            )]
+        );
+        assert_eq!(finish, Some((FinishReason::Stop, 1)));
+        assert_eq!(content, "");
+        assert_eq!(reasoning, REHEARSED);
+    }
+
+    #[test]
+    fn a_forced_call_the_engine_started_inside_the_thought_stays_thought_text() {
+        // What the recorded answers hold: an engine whose reasoning gate took the rehearsed marker
+        // for the thought's end wrote the forced call inside the thought, which the table reads as
+        // the template does: thought text, no call, `stop`. The tag no longer lets such an engine
+        // start there (its first text is the newline, not the marker); the reading of what an
+        // older engine still writes is pinned here, whole and at every cut.
+        let output = format!("<seed:think>{FORCED_IN_THE_THOUGHT}");
+        let events = the_same_at_every_cut(&output);
+        let Said {
+            calls,
+            finish,
+            content,
+            reasoning,
+        } = said(&events);
+        assert!(calls.is_empty(), "{calls:?}");
+        assert_eq!(finish, Some((FinishReason::Stop, 0)));
+        assert_eq!(content, "");
+        assert_eq!(reasoning, FORCED_IN_THE_THOUGHT);
+        // The model that thought on, closed its thought and wrote the call again: one call.
+        let output = format!(
+            "<seed:think>{FORCED_THEN_THOUGHT_ON}</seed:think>\n<seed:tool_call>\n\
+             <function=metropolitan_museum_get_top_artworks>\n<parameter=number>5</parameter>\n\
+             <parameter=sort_by>popularity</parameter>\n</function>\n</seed:tool_call>"
+        );
+        let events = the_same_at_every_cut(&output);
+        let Said {
+            calls,
+            finish,
+            content,
+            reasoning,
+        } = said(&events);
+        assert_eq!(
+            calls,
+            [(
+                "metropolitan_museum_get_top_artworks".to_string(),
+                "{\"number\": 5, \"sort_by\": \"popularity\"}".to_string()
+            )]
+        );
+        assert_eq!(finish, Some((FinishReason::Stop, 1)));
+        assert_eq!(content, "");
+        assert_eq!(reasoning, FORCED_THEN_THOUGHT_ON);
     }
 }

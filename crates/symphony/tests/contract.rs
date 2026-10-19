@@ -1531,6 +1531,15 @@ const SEED_OUTPUTS: &[&str] = &[
     "<seed:tool_call>\n<function=get_weather>\n<parameter=city>Paris</parameter>\n</function>\n\
      then\n<function=other>\n</function>\n<function=get_weather>\n<parameter=city>Par\
      </seed:tool_call>",
+    // A forced call as its tag writes it after the thought's close (the template's newline, then
+    // the call), the format rehearsed inside the thought; and the same call an engine's reasoning
+    // gate started inside the thought, marker written twice, the output ending there.
+    "<seed:think>the format with <seed:tool_call>\n<function=get_weather>\n<parameter=city>Paris\
+     </parameter>\n</function>\n</seed:tool_call>. Then call it.</seed:think>\n<seed:tool_call>\n\
+     <function=get_weather>\n<parameter=city>Paris</parameter>\n<parameter=days>3</parameter>\n\
+     </function>\n</seed:tool_call>",
+    "<seed:think>the format with <seed:tool_call><seed:tool_call>\n<function=get_weather>\n\
+     <parameter=city>Paris</parameter>\n</function>\n</seed:tool_call>",
     "",
 ];
 

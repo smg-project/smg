@@ -106,6 +106,23 @@ whose template writes the thought before every call and answer (`Format::thinks_
 written first, its opener, its text and its close, where the prompt has not opened it; every other
 table leaves the thought to the model, as gpt-oss's template leaves its analysis channel.
 
+Where the calls' tag starts after the thought's close, it begins with what the template writes
+there, the layout's `Message::after` of the thought: after the gate of an engine that holds the
+grammar back until its reasoning parser has seen the close (`GrammarStart::AfterReasoning`), after
+the thought the prompt closed, and after the thought a free-text prefix or a tag of the thought
+wrote. A registry table may carry that part of its layout alone (Seed-OSS's newline before every
+call, `"\n" + <seed:tool_call>` in its template), and a table without one writes the calls at once,
+as before. Besides writing what the model was trained on, this keeps the call's marker from being
+the grammar's first text: an engine that takes a call marker the model writes inside its thought
+for the thought's end (Seed-OSS rehearses the call format while thinking) would otherwise start the
+forced call there, and an engine that masks such a marker while the model reasons, when the grammar
+cannot start with it, cannot do so when the tag begins with the newline. Where the prompt leaves
+the thought closed and the engine starts the grammar at the first token, or does not say where
+(the grammar may then start at the turn's own start, where nothing stands after a close), such a
+table's tag is still the calls at once (the thought is not admitted before them: the shape MiniMax
+M3's bare-close row gives is the one that would). An answer's tag keeps the schema alone after the
+close, the engine's own constraint, which the registry's tables leave to it.
+
 A marker that is one token of the model's vocabulary (`Format::marker_tokens`: a terminal, a
 structural token, one of the syntax's own tags (`CallSyntax::tag_texts`), or a token inside one) is
 written as that token (`Grammar::Token`) wherever a tag writes it inside a tag or between tags, so

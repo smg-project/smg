@@ -438,11 +438,13 @@ fn answer_schema(response_format: Option<&ResponseFormat>) -> Option<Value> {
     }
 }
 
-/// The constraint `grammar` gives, for the response template's table too (`compiled`,
-/// [`TEMPLATE_PARSER`]): a registry table with no tag leaves the older registry to decide, as
-/// before; the template's table refuses instead, since its output has no other syntax the older
-/// path could constrain and the table still read, and so does a prompt that `continues` the
-/// assistant's message, since the tag writes a turn from its start.
+/// The constraint `grammar` gives, written straight from the tree as the request carries it
+/// ([`Grammar::payload_text`], the bytes of `payload().to_string()` without the JSON tree in
+/// between), for the response template's table too (`compiled`, [`TEMPLATE_PARSER`]): a registry
+/// table with no tag leaves the older registry to decide, as before; the template's table refuses
+/// instead, since its output has no other syntax the older path could constrain and the table
+/// still read, and so does a prompt that `continues` the assistant's message, since the tag
+/// writes a turn from its start.
 fn tagged(
     grammar: Option<Grammar>,
     compiled: bool,
@@ -455,9 +457,7 @@ fn tagged(
             "model '{model}' constrains {asked} from the start of a new assistant message, as its \
              response template writes one, so it cannot continue the assistant's message"
         ))),
-        Some(grammar) => Ok(Some(ToolConstraint::StructuralTag(
-            grammar.payload().to_string(),
-        ))),
+        Some(grammar) => Ok(Some(ToolConstraint::StructuralTag(grammar.payload_text()))),
         None if compiled => Err(SymphonyError::Constraint(format!(
             "model '{model}' reads its output with its response template, whose table has no \
              structural tag for {asked}"
@@ -942,7 +942,7 @@ fn auto_tag(
                 start,
             },
         )
-        .map(|grammar| ToolConstraint::StructuralTag(grammar.payload().to_string()))
+        .map(|grammar| ToolConstraint::StructuralTag(grammar.payload_text()))
 }
 
 /// The constraint preparation finds for what a request asks, before its worker is known: the
