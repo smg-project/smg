@@ -923,7 +923,9 @@ fn every_measured_opener_and_text_after_the_close_is_the_registrys() {
 /// is the registry's for it: the table's layout, or the group's own `after`. Skipped where the
 /// tree is not given; a model the tree has not recorded, a table without a thought layout or a
 /// close, dots3, whose template writes the call's own lead before every block, and a turn whose
-/// template wrote text of the message there, are not read.
+/// template wrote text of the message there, are not read; a tree under which nothing is read
+/// fails, and so does a measured group ([`MEASURED_AFTER`]) the tree records but this test cannot
+/// read.
 #[test]
 #[expect(
     clippy::print_stderr,
@@ -937,9 +939,17 @@ fn every_recorded_models_text_after_the_thoughts_close_is_the_registrys() {
         );
         return;
     };
-    let mut read = 0;
+    let mut read = Vec::new();
     let mut wrong = Vec::new();
     for (slug, _) in MODELS {
+        // A measured group the tree records must be read: a rendering that cannot be read as
+        // this test reads it would leave its `after` unchecked without a word.
+        let measured = MEASURED_AFTER.iter().any(|(measured, _)| measured == slug);
+        let mut unread = |why: String| {
+            if measured {
+                wrong.push(format!("{slug}: {why}"));
+            }
+        };
         let format =
             for_model(&model_of(slug)).unwrap_or_else(|| panic!("{slug}: not in the registry"));
         let Some(thought) = format.layout().and_then(|layout| layout.thought.as_ref()) else {
@@ -965,9 +975,11 @@ fn every_recorded_models_text_after_the_thoughts_close_is_the_registrys() {
             })
             .and_then(|case| case["reference"]["text"].as_str().map(str::to_string))
         else {
+            unread("no rendered tools-call-arguments-object with a reference text".to_string());
             continue;
         };
         let Some(at) = rendered.find(close) else {
+            unread(format!("no {close:?} in the rendered call turn"));
             continue;
         };
         let rest = &rendered[at + close.len()..];
@@ -975,6 +987,9 @@ fn every_recorded_models_text_after_the_thoughts_close_is_the_registrys() {
         // A turn whose template wrote text of the message between the close and the call (a
         // `None` for a content the request left out) says nothing about the layout.
         if !between.chars().all(|c| c == '\n' || c == ' ') {
+            unread(format!(
+                "{between:?} between {close:?} and the call is message text"
+            ));
             continue;
         }
         if between != &*thought.after {
@@ -984,9 +999,18 @@ fn every_recorded_models_text_after_the_thoughts_close_is_the_registrys() {
                 &*thought.after
             ));
         }
-        read += 1;
+        read.push(*slug);
     }
-    eprintln!("{read} recorded models' rendered call turns read");
+    eprintln!(
+        "{} recorded models' rendered call turns read: {}",
+        read.len(),
+        read.join(", ")
+    );
+    assert!(
+        !read.is_empty(),
+        "no rendered call turn read under {}: is it the fixtures/ directory?",
+        root.display()
+    );
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
