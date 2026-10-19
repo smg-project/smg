@@ -53,7 +53,7 @@
 //! object between a table's markers (`CallSyntax::Json`) is the object reader itself
 //! ([`json::Assembler`](super::Assembler)), not a framing of this one: the engine reports what
 //! follows the object there, where this reader holds the whitespace after a lone object and reads
-//! a `;` or prose after it (`docs/assemblers.md`).
+//! a `;`, another object or prose after it (`docs/assemblers.md`).
 
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
