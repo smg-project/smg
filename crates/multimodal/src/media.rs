@@ -1939,7 +1939,7 @@ async fn decode_video_with_ffmpeg(
     // A probe that fails leaves the clip to the metadata-less runner, which
     // reads the stream as it comes.
     let metadata = probe_video_metadata(input_path).await.ok();
-    let Some((probed, selection)) = metadata.and_then(|probed| {
+    let Some((mut probed, selection)) = metadata.and_then(|probed| {
         FrameSelection::from_metadata(probed, cfg).map(|selection| (probed, selection))
     }) else {
         return decode_video_with_ffmpeg_runners(input_path, input_bytes, cfg, metadata, None)
@@ -1961,7 +1961,13 @@ async fn decode_video_with_ffmpeg(
     if probed.is_unsized() {
         // No seeks.
     } else if let Some(plan) = seek_plan_for(input_path, &selection).await {
-        ensure_decode_work_limit(plan.decoded_frames(), &selection, probed)?;
+        probed = decode_work_limit_on_the_decoders_size(
+            plan.decoded_frames(),
+            &selection,
+            probed,
+            input_path,
+        )
+        .await?;
         let started = Instant::now();
         match decode_video_with_ffmpeg_seek(input_path, probed, &selection, &plan).await {
             Ok(video) => {
@@ -1997,12 +2003,18 @@ async fn decode_video_with_ffmpeg(
             }
         }
     }
-    ensure_decode_work_limit(selection.sequential_frames(), &selection, probed)?;
+    probed = decode_work_limit_on_the_decoders_size(
+        selection.sequential_frames(),
+        &selection,
+        probed,
+        input_path,
+    )
+    .await?;
     let selected_error = match decode_video_with_ffmpeg_runners(
         input_path,
         input_bytes,
         cfg,
-        metadata,
+        Some(probed),
         Some(&selection),
     )
     .await
@@ -2371,6 +2383,44 @@ fn ensure_decode_work_limit(
         metadata.width,
         metadata.height
     )))
+}
+
+/// The work cap judged on `metadata`'s size ([`ensure_decode_work_limit`])
+/// and, where that size is the container's and the cap refuses, judged again
+/// on the probe's size, the decoder's, read once for it: a sample entry that
+/// overstates the stream's size does not refuse a decode the budget fits. A
+/// probe that cannot run, or states no size, leaves the container's refusal
+/// standing (the `0x0` clip keeps its own route, and its cap counts no
+/// pixels). Returns the metadata the decode goes on with.
+async fn decode_work_limit_on_the_decoders_size(
+    frames: usize,
+    selection: &FrameSelection,
+    metadata: VideoMetadata,
+    input_path: &Path,
+) -> Result<VideoMetadata, MediaConnectorError> {
+    let refusal = match ensure_decode_work_limit(frames, selection, metadata) {
+        Ok(()) => return Ok(metadata),
+        Err(refusal) if metadata.from_container => refusal,
+        Err(refusal) => return Err(refusal),
+    };
+    match probe_video_info(input_path)
+        .await
+        .and_then(|info| video_metadata_from(info, false))
+    {
+        Ok(probed) if !probed.is_unsized() => {
+            ensure_decode_work_limit(frames, selection, probed)?;
+            Ok(probed)
+        }
+        probed => {
+            if let Err(error) = probed {
+                info!(
+                    error = %error,
+                    "video probe after a work-cap refusal on the container's size failed; the container's size stands"
+                );
+            }
+            Err(refusal)
+        }
+    }
 }
 
 /// The error of a decode that ran past the process budget, in the clip's
@@ -7558,6 +7608,80 @@ mod seek_decode_tests {
         };
         assert!(ensure_decode_work_limit(4_340_277, &selection, sd).is_ok());
         assert!(ensure_decode_work_limit(4_340_278, &selection, sd).is_err());
+    }
+
+    /// A container that overstates the stream's size is judged again on the
+    /// probe's size before its refusal stands: the decoder's size fits the
+    /// cap, so the decode goes on with it. A probe that states no size or
+    /// cannot run leaves the refusal standing, a size the probe itself stated
+    /// is not probed again, and a size under the cap asks no probe.
+    #[tokio::test]
+    async fn an_overstated_container_size_is_judged_again_on_the_probes_size() {
+        let metadata = long_clip_metadata();
+        let selection = FrameSelection::from_metadata(metadata, VideoFetchConfig::default())
+            .expect("a selection");
+        let overstated = VideoMetadata {
+            width: 65_535,
+            height: 65_535,
+            from_container: true,
+            ..metadata
+        };
+        let frames = 1_000;
+        assert!(ensure_decode_work_limit(frames, &selection, overstated).is_err());
+        let path = Path::new("overstated.mp4");
+        let decoders = ProbedVideoInfo {
+            width: Some(64),
+            height: Some(48),
+            duration_seconds: metadata.duration_seconds,
+            source_fps: metadata.source_fps,
+            total_frames: metadata.total_frames,
+            container_frames: metadata.container_frames,
+        };
+        probe_switch::ANSWER.with(|answer| answer.set(Some(decoders)));
+        let judged = decode_work_limit_on_the_decoders_size(frames, &selection, overstated, path)
+            .await
+            .expect("the decoder's size fits the cap");
+        assert_eq!((judged.width, judged.height), (64, 48));
+        assert!(!judged.from_container);
+        // A probe that states no size leaves the refusal standing.
+        probe_switch::ANSWER.with(|answer| {
+            answer.set(Some(ProbedVideoInfo {
+                width: Some(0),
+                height: Some(0),
+                ..decoders
+            }));
+        });
+        let error = decode_work_limit_on_the_decoders_size(frames, &selection, overstated, path)
+            .await
+            .expect_err("no size from the probe: the container's refusal stands");
+        assert!(is_video_budget_error(&error));
+        probe_switch::ANSWER.with(|answer| answer.set(None));
+        // So does a probe that cannot run.
+        probe_switch::UNAVAILABLE.with(|off| off.set(true));
+        let error = decode_work_limit_on_the_decoders_size(frames, &selection, overstated, path)
+            .await
+            .expect_err("no probe: the container's refusal stands");
+        probe_switch::UNAVAILABLE.with(|off| off.set(false));
+        assert!(is_video_budget_error(&error));
+        // A size the probe itself stated is final: no second probe is asked.
+        probe_switch::ANSWER.with(|answer| answer.set(Some(decoders)));
+        let probed = VideoMetadata {
+            from_container: false,
+            ..overstated
+        };
+        assert!(
+            decode_work_limit_on_the_decoders_size(frames, &selection, probed, path)
+                .await
+                .is_err()
+        );
+        probe_switch::ANSWER.with(|answer| answer.set(None));
+        // A size under the cap goes on as it is, no probe asked.
+        probe_switch::UNAVAILABLE.with(|off| off.set(true));
+        let kept = decode_work_limit_on_the_decoders_size(frames, &selection, metadata, path)
+            .await
+            .expect("under the cap");
+        probe_switch::UNAVAILABLE.with(|off| off.set(false));
+        assert_eq!((kept.width, kept.height), (metadata.width, metadata.height));
     }
 
     #[test]
