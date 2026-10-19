@@ -1616,7 +1616,8 @@ class _TestToolChoiceBase:
         call = calls[0]
         value = json.loads(call.function.arguments)["data"]["value"]
         expected = {"tool1": str, "tool2": (int, float)}[call.function.name]
-        assert isinstance(value, expected), (
+        # A bool is an int to Python: a `true` must not pass as tool2's number.
+        assert isinstance(value, expected) and not isinstance(value, bool), (
             f"{call.function.name} got value {value!r}: not its own DataType definition"
         )
 
