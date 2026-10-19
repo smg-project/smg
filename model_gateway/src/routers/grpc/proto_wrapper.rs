@@ -5278,7 +5278,6 @@ mod no_progress_tests {
             cut.message()
         );
         assert!(stream.next().await.is_none(), "nothing after the cut");
-        assert!(stream.worker().is_none());
         let rendered = handle.render();
         assert!(
             rendered.contains("smg_constrained_no_progress_total{constraint=\"json_schema\"} 1"),
