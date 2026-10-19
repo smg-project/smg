@@ -626,12 +626,14 @@ impl PyVllmGrpcServer {
             ));
         }
         let worker = Arc::new(
-            crate::metrics_observer::MetricsObserver::new(move |event, payload, timestamp| {
+            crate::metrics_observer::MetricsObserver::new(move |events| {
                 Python::attach(|py| {
-                    if let Err(error) =
-                        observer.call1(py, (event, PyBytes::new(py, payload), timestamp))
-                    {
-                        error.write_unraisable(py, None);
+                    for (event, payload, timestamp) in events {
+                        if let Err(error) =
+                            observer.call1(py, (event, PyBytes::new(py, payload), timestamp))
+                        {
+                            error.write_unraisable(py, None);
+                        }
                     }
                 });
             })
@@ -912,13 +914,16 @@ impl PyVllmGrpcServer {
         let timeout = Duration::from_secs_f64(timeout_secs);
         py.detach(|| {
             let start = std::time::Instant::now();
-            let result = self.inner.stop(timeout);
-            if let Some(metrics) = self
+            let metrics = self
                 .metrics
                 .lock()
                 .map_err(|_| ServicerError::Poisoned)?
-                .as_ref()
-            {
+                .clone();
+            if let Some(metrics) = &metrics {
+                metrics.signal_stop();
+            }
+            let result = self.inner.stop(timeout);
+            if let Some(metrics) = metrics {
                 if !metrics.close(timeout.saturating_sub(start.elapsed())) {
                     return Err(ServicerError::StopTimeout);
                 }

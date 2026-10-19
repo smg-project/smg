@@ -13,7 +13,7 @@ use std::{
 const MAX_EVENTS: usize = 4096;
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 
-type Event = (String, Vec<u8>, f64);
+pub(crate) type Event = (String, Vec<u8>, f64);
 
 #[derive(Default)]
 struct State {
@@ -32,15 +32,13 @@ pub(crate) struct MetricsObserver {
 
 impl MetricsObserver {
     /// Start one callback worker with bounded event count and retained payload bytes.
-    pub(crate) fn new(
-        callback: impl Fn(&str, &[u8], f64) + Send + 'static,
-    ) -> std::io::Result<Self> {
+    pub(crate) fn new(callback: impl Fn(&[Event]) + Send + 'static) -> std::io::Result<Self> {
         Self::with_limits(callback, MAX_EVENTS, MAX_BYTES)
     }
 
     /// Construct the same worker with smaller limits for deterministic overload tests.
     fn with_limits(
-        callback: impl Fn(&str, &[u8], f64) + Send + 'static,
+        callback: impl Fn(&[Event]) + Send + 'static,
         capacity: usize,
         max_bytes: usize,
     ) -> std::io::Result<Self> {
@@ -52,13 +50,16 @@ impl MetricsObserver {
             .spawn(move || {
                 while !consumer.stopped.load(Ordering::Acquire) {
                     if consumer.failed.load(Ordering::Acquire) {
-                        callback("overflow", b"", timestamp());
+                        callback(&[("overflow".into(), Vec::new(), timestamp())]);
                         break;
                     }
                     match receiver.recv_timeout(Duration::from_millis(50)) {
-                        Ok((event, payload, time)) => {
-                            consumer.bytes.fetch_sub(payload.len(), Ordering::Relaxed);
-                            callback(&event, &payload, time);
+                        Ok(first) => {
+                            let mut batch = vec![first];
+                            batch.extend(receiver.try_iter().take(255));
+                            let bytes = batch.iter().map(|(_, payload, _)| payload.len()).sum();
+                            consumer.bytes.fetch_sub(bytes, Ordering::Relaxed);
+                            callback(&batch);
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => continue,
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -103,9 +104,14 @@ impl MetricsObserver {
         }
     }
 
+    /// Let an idle worker exit while the server drains its connections.
+    pub(crate) fn signal_stop(&self) {
+        self.state.stopped.store(true, Ordering::Release);
+    }
+
     /// Stop outside the GIL, respecting the remaining server shutdown budget.
     pub(crate) fn close(&self, timeout: Duration) -> bool {
-        self.state.stopped.store(true, Ordering::Release);
+        self.signal_stop();
         let start = Instant::now();
         let mut slot = self
             .worker
@@ -154,12 +160,14 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         let (events_tx, events_rx) = mpsc::channel();
         let observer = MetricsObserver::with_limits(
-            move |event, _, time| {
-                if event == "first" {
-                    entered_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
+            move |events| {
+                for (event, _, time) in events {
+                    if event == "first" {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    }
+                    events_tx.send((event.to_owned(), *time)).unwrap();
                 }
-                events_tx.send((event.to_owned(), time)).unwrap();
             },
             1,
             16,
@@ -188,8 +196,8 @@ mod tests {
     fn payload_limit_fails_without_retaining_large_frames() {
         let (tx, rx) = mpsc::channel();
         let observer = MetricsObserver::with_limits(
-            move |event, _, _| {
-                tx.send(event.to_owned()).unwrap();
+            move |events| {
+                tx.send(events[0].0.clone()).unwrap();
             },
             8,
             2,
@@ -205,8 +213,10 @@ mod tests {
     #[test]
     fn delivery_preserves_event_order_and_producer_time() {
         let (tx, rx) = mpsc::channel();
-        let observer = MetricsObserver::new(move |event, _, time| {
-            tx.send((event.to_owned(), time)).unwrap();
+        let observer = MetricsObserver::new(move |events| {
+            for (event, _, time) in events {
+                tx.send((event.to_owned(), *time)).unwrap();
+            }
         })
         .unwrap();
         let start = timestamp();
@@ -225,7 +235,7 @@ mod tests {
     fn close_respects_timeout_and_can_be_retried() {
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let observer = MetricsObserver::new(move |_, _, _| {
+        let observer = MetricsObserver::new(move |_| {
             entered_tx.send(()).unwrap();
             release_rx.recv().unwrap();
         })

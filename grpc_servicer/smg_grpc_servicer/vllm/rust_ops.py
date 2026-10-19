@@ -145,17 +145,9 @@ class RustOps:
                     from vllm.v1.engine.parallel_sampling import ParentRequest
 
                     parent, count, *arrival = json.loads(payload)
+                    children = {f"{parent}-{i}" for i in range(count)} if count > 1 else {parent}
                     if arrival:
-                        self.arrivals.update(
-                            {
-                                child: arrival[0]
-                                for child in (
-                                    [f"{parent}-{i}" for i in range(count)]
-                                    if count > 1
-                                    else [parent]
-                                )
-                            }
-                        )
+                        self.arrivals.update(dict.fromkeys(children, arrival[0]))
                     if count > 1:
                         group = ParentRequest(
                             NS(
@@ -164,9 +156,9 @@ class RustOps:
                                 params=NS(n=count, output_kind=0),
                             )
                         )
-                        group.child_requests = {f"{parent}-{i}" for i in range(count)}
+                        group.child_requests = children
                         self.parents[parent] = group
-                        self.children.update({child: parent for child in group.child_requests})
+                        self.children.update(dict.fromkeys(children, parent))
                 elif event == "abort":
                     self._forget(payload.decode())
                 elif event == "forget_parent":

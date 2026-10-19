@@ -248,17 +248,7 @@ jobs:
           python3 -m pip install pytest pytest-asyncio pytest-cov pytest-xdist
           pytest -q tests --cov=smg --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80
 
-      - name: Checkout vLLM statistics compatibility source
-        uses: actions/checkout@v7
-        with:
-          repository: vllm-project/vllm
-          ref: 852989f580820849113d67d13fd8053e279d0444
-          path: .test-deps/vllm
-          persist-credentials: false
-
       - name: Run grpc_servicer unit tests
-        env:
-          SMG_VLLM_SOURCE_ROOT: ${{ github.workspace }}/.test-deps/vllm
         run: |
           rm -f crates/grpc_client/python/smg_grpc_proto/proto
           mkdir -p crates/grpc_client/python/smg_grpc_proto/proto
