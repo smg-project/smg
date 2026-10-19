@@ -133,8 +133,9 @@ def test_a_restarted_gateway_rebuilds_the_fleet(gateway, slurm, node_engines):
 
 def test_job_names_map_to_roles_within_the_scope(gateway, slurm, port, mock_worker):
     """Two prefill job names, a decode one, and jobs the mapping or the scope
-    leaves out. Only the mapped jobs of user `svc` in account `acct` and
-    partition `gpu` get workers, with the bootstrap port on prefill alone."""
+    leaves out. Only the local cluster's mapped jobs of user `svc` in account
+    `acct` and partition `gpu` get workers, with the bootstrap port on
+    prefill alone."""
     addresses = ["127.0.0.2", "127.0.0.3", "127.0.0.4", "127.0.0.5", "127.0.0.6", "127.0.0.7"]
     for address in addresses:
         mock_worker(
@@ -149,10 +150,13 @@ def test_job_names_map_to_roles_within_the_scope(gateway, slurm, port, mock_work
     slurm.job(1, "smg-prefill-a", "node1", ["node1"], **scope)
     slurm.job(2, "smg-prefill-b", "node2", ["node2"], **scope)
     slurm.job(3, "smg-decode", "node3", ["node3"], **scope)
-    # A name no flag maps, another user's job, and one in another partition.
+    # A name no flag maps, another user's job, one in another partition, and
+    # one a federation lists from another cluster, on a node named like a
+    # local one: it must not take node1's address.
     slurm.job(4, "smg-other", "node4", ["node4"], **scope)
     slurm.job(5, "smg-decode", "node5", ["node5"], **{**scope, "user": "alice"})
     slurm.job(6, "smg-decode", "node6", ["node6"], **{**scope, "partition": "cpu"})
+    slurm.job(7, "smg-decode", "node1", ["node1"], **{**scope, "cluster": "remote"})
     slurm.write()
     gateway.start(
         "--pd-disaggregation",
@@ -176,6 +180,7 @@ def test_job_names_map_to_roles_within_the_scope(gateway, slurm, port, mock_work
 
     assert slurm.calls("squeue")[-1]["argv"] == [
         "--json",
+        "--local",
         "--states=RUNNING",
         "--name=smg-decode,smg-prefill-a,smg-prefill-b",
         "--user=svc",

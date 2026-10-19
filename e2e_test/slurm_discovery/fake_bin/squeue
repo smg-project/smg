@@ -3,7 +3,8 @@
 
 Accepts exactly the arguments the Slurm provider passes, records every call,
 and answers like Slurm 23.11: the filters are checked but not applied, so the
-provider's own filtering is what keeps other jobs out.
+provider's own filtering is what keeps other jobs out. A job may name another
+cluster, as a federation's listing does.
 """
 
 import json
@@ -24,7 +25,7 @@ def main() -> int:
     with open(os.environ["SMG_FAKE_SLURM"]) as state_file:
         state = json.load(state_file)
 
-    fixed = {"--json", "--states=RUNNING"}
+    fixed = {"--json", "--local", "--states=RUNNING"}
     names = [arg for arg in argv if arg.startswith("--name=")]
     scope = [arg for arg in argv if arg == "--me" or arg.startswith("--user=")]
     optional = [arg for arg in argv if arg.startswith(("--account=", "--partition="))]
@@ -38,7 +39,7 @@ def main() -> int:
 
     jobs = [
         {
-            "cluster": state.get("cluster", "e2e"),
+            "cluster": job.get("cluster", state.get("cluster", "e2e")),
             "job_id": job["id"],
             "name": job["name"],
             "job_state": [job.get("state", "RUNNING")],

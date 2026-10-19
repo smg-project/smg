@@ -4,9 +4,9 @@
 //! Each poll runs three commands, without a shell, each within
 //! [`COMMAND_TIMEOUT`]:
 //!
-//! 1. `squeue --json --states=RUNNING --name=<every mapped name>`, scoped to
-//!    one user (`--me` unless one is configured) and to the configured account
-//!    and partition;
+//! 1. `squeue --json --local --states=RUNNING --name=<every mapped name>`,
+//!    scoped to one user (`--me` unless one is configured) and to the
+//!    configured account and partition;
 //! 2. `scontrol show hostnames <nodes>` for each job, so Slurm's own hostlist
 //!    grammar expands an allocation such as `gpu[01-04]`;
 //! 3. `scontrol --json show nodes <name,...>` once, for every node named.
@@ -16,10 +16,17 @@
 //! command that fails, times out or answers something unusable rejects the
 //! whole poll, and the last good one stays.
 //!
-//! `squeue`'s answer is filtered again here, by state, name, user, account and
-//! partition: under `--json`, Slurm 23.11 ignores every one of those filters
-//! but `--user`, so a pending job, or another user's job with a mapped name,
-//! would otherwise become a worker. 23.11 is the oldest release this reads;
+//! `squeue`'s answer is filtered again here, by cluster, state, name, user,
+//! account and partition: under `--json`, Slurm 23.11 ignores every one of
+//! those filters but `--user`, so a pending job, or another user's job with a
+//! mapped name, would otherwise become a worker.
+//!
+//! Discovery stays within the local cluster, the one `squeue` reports running
+//! in. A federation can show its other clusters' jobs by default
+//! (`FederationParameters=fed_display`, or `SQUEUE_FEDERATION`), but
+//! `scontrol` resolves node names in the local cluster only: a remote job's
+//! `gpu01` would take the local `gpu01`'s address. `--local` asks for local
+//! jobs, and the cluster each job names is checked as well. 23.11 is the oldest release this reads;
 //! `squeue` reports its release, and older ones are refused (21.08, for one,
 //! has no `scontrol --json`).
 //!
@@ -119,6 +126,7 @@ impl SlurmProviderConfig {
         let names: Vec<&str> = self.roles.keys().map(String::as_str).collect();
         let mut args = vec![
             "--json".to_string(),
+            "--local".to_string(),
             "--states=RUNNING".to_string(),
             format!("--name={}", names.join(",")),
             match &self.user {
@@ -139,11 +147,13 @@ impl SlurmProviderConfig {
         args
     }
 
-    /// Whether `job` is one `squeue`'s filters ask for: running, submitted by
-    /// `user` (a name, or a numeric id), and in the configured account and
-    /// partition. Its name is checked against the mapping separately.
-    fn selects(&self, job: &Job, user: &str) -> bool {
-        job.states.iter().any(|state| state == "RUNNING")
+    /// Whether `job` is one `squeue`'s filters ask for: in `cluster`, running,
+    /// submitted by `user` (a name, or a numeric id), and in the configured
+    /// account and partition. Its name is checked against the mapping
+    /// separately.
+    fn selects(&self, job: &Job, cluster: &str, user: &str) -> bool {
+        job.cluster == cluster
+            && job.states.iter().any(|state| state == "RUNNING")
             && (job.user_name == user || user.parse::<u64>() == Ok(job.user_id))
             && self
                 .account
@@ -178,6 +188,9 @@ struct Job {
 /// `squeue`'s answer.
 #[derive(Debug, Clone, PartialEq)]
 struct Jobs {
+    /// The cluster `squeue` ran in, the only one whose nodes `scontrol`
+    /// resolves.
+    cluster: Option<String>,
     /// The user `squeue` ran as, which is who the default scope selects.
     requested_by: Option<String>,
     jobs: Vec<Job>,
@@ -247,13 +260,19 @@ async fn poll(
             ))
         }
     };
+    let cluster = answer.cluster.as_deref().ok_or_else(|| {
+        invalid(
+            "squeue did not name the cluster it ran in, so which jobs' nodes scontrol \
+             resolves is unknown",
+        )
+    })?;
 
     let mut placements = Vec::new();
     for job in answer.jobs {
         let Some(&worker_type) = config.roles.get(&job.name) else {
             continue;
         };
-        if !config.selects(&job, user) {
+        if !config.selects(&job, cluster, user) {
             continue;
         }
         let nodes = client.expand_hostlist(&job.nodes).await?;
@@ -509,6 +528,12 @@ struct SqueueAnswer {
 #[derive(Deserialize)]
 struct SqueueMeta {
     client: Option<SqueueClient>,
+    slurm: Option<SqueueSlurm>,
+}
+
+#[derive(Deserialize)]
+struct SqueueSlurm {
+    cluster: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -618,6 +643,11 @@ fn parse_jobs(stdout: &[u8]) -> Result<Jobs, String> {
         })
         .collect::<Result<_, String>>()?;
     Ok(Jobs {
+        cluster: answer
+            .meta
+            .slurm
+            .and_then(|slurm| slurm.cluster)
+            .filter(|cluster| !cluster.is_empty()),
         requested_by: answer
             .meta
             .client
@@ -810,6 +840,7 @@ mod tests {
             [(SQUEUE_23_11, 8, 6, 7), (SQUEUE_24_11, 6, 7, 8)]
         {
             let jobs = parse_jobs(recording.as_bytes()).unwrap();
+            assert_eq!(jobs.cluster.as_deref(), Some("smgtest"));
             assert_eq!(jobs.requested_by.as_deref(), Some("root"));
             assert_eq!(jobs.jobs.len(), 8);
 
@@ -1163,6 +1194,40 @@ mod tests {
         assert!(slurm.node_lookups.lock().unwrap().is_empty());
     }
 
+    /// A federation can list its other clusters' jobs (an older release may
+    /// ignore `--local` under `--json`, as 23.11 ignores most filters there).
+    /// `scontrol` resolves node names in the local cluster only, so a remote
+    /// job on a node named like a local one must not take that node's
+    /// address, nor a remote-only node reject the poll: both are left out.
+    #[tokio::test]
+    async fn jobs_of_another_cluster_are_left_out() {
+        let mut slurm = FakeSlurm::recorded();
+        // Job 2 runs in a remote cluster, on a node named like job 1's.
+        let remote = slurm.job_mut(2);
+        remote.cluster = "remote".to_string();
+        remote.nodes = "n1".to_string();
+        // Alice's job 8, as root's, runs remotely on a node the local cluster
+        // does not have.
+        let only_remote = slurm.job_mut(8);
+        only_remote.cluster = "remote".to_string();
+        only_remote.user_name = "root".to_string();
+        only_remote.nodes = "remote-only".to_string();
+
+        assert_eq!(
+            urls(&slurm, &config(&["smg-worker"])).await,
+            ["10.0.1.1:8000"]
+        );
+        assert_eq!(*slurm.node_lookups.lock().unwrap(), [vec!["n1"]]);
+    }
+
+    #[tokio::test]
+    async fn the_local_cluster_must_be_named() {
+        let mut slurm = FakeSlurm::recorded();
+        slurm.jobs.cluster = None;
+        let error = poll(&slurm, &config(&["smg-worker"])).await.unwrap_err();
+        assert!(error.to_string().contains("cluster it ran in"), "{error}");
+    }
+
     #[tokio::test]
     async fn the_default_scope_needs_squeue_to_name_its_user() {
         let mut slurm = FakeSlurm::recorded();
@@ -1193,6 +1258,7 @@ mod tests {
             config(&["smg-worker", "a-model"]).squeue_args(),
             [
                 "--json",
+                "--local",
                 "--states=RUNNING",
                 "--name=a-model,smg-worker",
                 "--me"
@@ -1208,6 +1274,7 @@ mod tests {
             scoped.squeue_args(),
             [
                 "--json",
+                "--local",
                 "--states=RUNNING",
                 "--name=w",
                 "--user=svc",
@@ -1281,7 +1348,7 @@ if [ "$1" = show ]; then echo slurmnode; else cat {}; fi"#,
         assert_eq!(workers[0].endpoint.render(), "127.0.0.1:8000");
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
-            "squeue --json --states=RUNNING --name=smg-decode --me\n\
+            "squeue --json --local --states=RUNNING --name=smg-decode --me\n\
              scontrol show hostnames slurmnode\n\
              scontrol --json show nodes slurmnode\n"
         );
