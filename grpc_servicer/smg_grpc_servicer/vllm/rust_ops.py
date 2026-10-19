@@ -117,7 +117,13 @@ class RustOps:
                 self.event_time = time.time() if timestamp is None else timestamp
                 if event == "overflow":
                     raise RuntimeError("vLLM metrics observer queue overflowed")
-                if event == "ready":
+                if event == "log":
+                    try:
+                        if self.stats is not None:
+                            self.stats.log()
+                    except Exception:
+                        logger.exception("vLLM statistics logging failed")
+                elif event == "ready":
                     from vllm.v1.engine.core_client import MPClient
 
                     MPClient._apply_ready_response(self.ready_state, payload)
@@ -168,12 +174,11 @@ class RustOps:
                         self._forget(child)
             except Exception as error:
                 self.error = error
-                self.requests.clear()
-                self.parents.clear()
-                self.children.clear()
-                self.arrivals.clear()
-                self.pending_outputs = 0
+                self._clear()
                 logger.exception("vLLM metrics collection failed")
+            finally:
+                if self.closed:
+                    self._clear()
 
     def _add(self, raw: Any) -> None:
         """Track an admitted child with frontend arrival time and native request statistics."""
@@ -381,33 +386,37 @@ class RustOps:
         await web.TCPSite(runner, self.host, self.port).start()
         if self.log_stats:
             server.set_metrics_observer(self.observe)
-            self.stats_task = asyncio.create_task(self._log_stats())
+            self.stats_task = asyncio.create_task(self._log_stats(server))
         logger.info("Metrics HTTP server listening on %s:%d", self.host, self.port)
 
-    async def _log_stats(self) -> None:
-        """Run native periodic loggers under the same lock as request updates."""
+    async def _log_stats(self, server: Any) -> None:
+        """Schedule native logging on the metrics worker, never the event loop."""
         from vllm import envs
 
         while True:
             await asyncio.sleep(envs.VLLM_LOG_STATS_INTERVAL)
-            try:
-                with self.lock:
-                    if self.stats is not None:
-                        self.stats.log()
-            except Exception:
-                logger.exception("vLLM statistics logging failed")
+            server.log_metrics()
+
+    def _clear(self) -> None:
+        """Release request bookkeeping while holding the observation lock."""
+        self.requests.clear()
+        self.parents.clear()
+        self.children.clear()
+        self.arrivals.clear()
+        self.pending_outputs = 0
 
     async def close(self) -> None:
         """Stop collection and release the listener; repeated closes are harmless."""
         if self.closed:
             return
-        with self.lock:
-            self.closed = True
-            self.requests.clear()
-            self.parents.clear()
-            self.children.clear()
-            self.arrivals.clear()
-            self.pending_outputs = 0
+        self.closed = True
+        # A blocked plugin must not prevent the launcher reaching bounded Rust stop.
+        # An in-flight observer releases its own state in its finally block.
+        if self.lock.acquire(blocking=False):
+            try:
+                self._clear()
+            finally:
+                self.lock.release()
         if self.stats_task is not None:
             self.stats_task.cancel()
             with suppress(asyncio.CancelledError):

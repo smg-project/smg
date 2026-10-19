@@ -195,15 +195,16 @@ async fn submit(
             .as_bytes(),
         );
     }
+    let loads = LoadsGuard {
+        state: Arc::clone(state),
+        request_id: request_id.clone(),
+    };
     let subs = match client
         .generate_vllm_streams_with_media(req, processed_media, trace_headers)
         .await
     {
         Ok(subs) => subs,
         Err(status) => {
-            if let Some(observer) = state.observer.get() {
-                observer("forget_parent", request_id.as_bytes());
-            }
             if let Some(notice) = owed {
                 notice.send();
             }
@@ -219,10 +220,6 @@ async fn submit(
         .or_else(|| subs.first())
         .map_or(0, rank_of);
     state.loads.submitted(rank, &request_id, prompt_tokens);
-    let loads = LoadsGuard {
-        state: Arc::clone(state),
-        request_id: request_id.clone(),
-    };
     let mut choices = SelectAll::new();
     for sub in subs {
         // Each choice decodes its own text: the matcher is per sequence.
@@ -259,8 +256,8 @@ fn rank_of(sub: &VllmGenerateStream) -> i32 {
         .unwrap_or(0)
 }
 
-/// Takes the request out of the load tracker's queue when the stream ends,
-/// in case the engine never started it.
+/// Releases parent metrics on submission cancellation and load tracking when
+/// the stream ends; finishing an unregistered load is harmless.
 struct LoadsGuard {
     state: Arc<State>,
     request_id: String,

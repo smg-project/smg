@@ -2,7 +2,6 @@
 
 import asyncio
 import enum
-import os
 import sys
 from dataclasses import dataclass
 from types import ModuleType
@@ -165,37 +164,45 @@ def test_parallel_children_keep_arrival_and_cancel_together(ops):
 def test_incompatible_api_fails_at_startup(ops, monkeypatch):
     """Reject native signature drift before setting up multiprocess metrics."""
     stats = sys.modules["vllm.v1.metrics.stats"]
+    prometheus = sys.modules["vllm.v1.metrics.prometheus"]
+    prometheus.setup_multiprocess_prometheus.reset_mock()
     monkeypatch.setattr(stats.IterationStats, "update_from_output", lambda self: None)
     with pytest.raises(RuntimeError, match="incompatible with this vLLM"):
         RustOps(ops.config, 0, log_stats=True)
-    assert "PROMETHEUS_MULTIPROC_DIR" not in os.environ
+    prometheus.setup_multiprocess_prometheus.assert_not_called()
 
 
 def test_logging_failure_recovers(ops):
     """A text logger failure must not disable otherwise valid collection."""
+    ops.stats.log.side_effect = [RuntimeError("temporary"), None]
+    ops.observe("log", b"")
+    ops.observe("log", b"")
+    assert ops.stats.log.call_count == 2 and ops.error is None
 
-    async def exercise():
-        """Wait for a successful logging iteration following one injected failure."""
-        done = asyncio.Event()
-        calls = 0
 
-        def log():
-            """Fail once, then signal a successful retry."""
-            nonlocal calls
-            calls += 1
-            if calls == 1:
-                raise RuntimeError("temporary")
-            done.set()
+def test_close_does_not_wait_for_a_blocked_statistics_plugin(ops):
+    """A collector holding the state lock must not block launcher shutdown."""
+    import threading
 
-        ops.stats.log.side_effect = log
-        ops.stats_task = asyncio.create_task(ops._log_stats())
-        try:
-            await asyncio.wait_for(done.wait(), 2)
-            assert ops.error is None
-        finally:
-            await ops.close()
+    entered, release = threading.Event(), threading.Event()
 
-    asyncio.run(exercise())
+    def blocked_record(**kwargs):
+        """Hold observe's lock until the test permits the plugin to return."""
+        entered.set()
+        release.wait(5)
+
+    ops.stats.record.side_effect = blocked_record
+    worker = threading.Thread(target=output, args=(ops, "r"))
+    add(ops, "r")
+    worker.start()
+    try:
+        assert entered.wait(2)
+        asyncio.run(asyncio.wait_for(ops.close(), 1))
+        assert ops.closed and worker.is_alive()
+    finally:
+        release.set()
+        worker.join(2)
+    assert not worker.is_alive() and not ops.requests
 
 
 def test_http_listener_health_host_and_cleanup(ops, monkeypatch):
@@ -217,7 +224,7 @@ def test_http_listener_health_host_and_cleanup(ops, monkeypatch):
 
     async def exercise():
         """Scrape a real loopback socket without a model or vLLM checkout."""
-        server = NS(set_metrics_observer=Mock())
+        server = NS(set_metrics_observer=Mock(), log_metrics=Mock())
         await ops.start(server)
         server.set_metrics_observer.assert_called_once_with(ops.observe)
         port = sites[0]._server.sockets[0].getsockname()[1]

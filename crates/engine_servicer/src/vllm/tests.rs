@@ -3725,3 +3725,31 @@ async fn a_shutdown_after_the_engines_completion_ends_the_stream_cleanly() {
     );
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
+
+/// Cancelling a partially submitted fan-out releases bookkeeping for unsent children too.
+#[tokio::test]
+async fn cancelled_submission_forgets_parent_metrics() {
+    let h = harness(model_info(), None).await;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observed = events.clone();
+    h.server.set_wire_observer(Arc::new(move |event, _| {
+        observed.lock().unwrap().push(event.to_owned());
+    }));
+    let mut request = generate_request("cancel-metrics", true, Vec::new());
+    request.sampling_params.as_mut().unwrap().n = 256;
+    // Fan-out yields on the engine input writer before all choices are submitted.
+    {
+        let submission = generate::generate(&h.server.state, request, None);
+        tokio::pin!(submission);
+        assert!(futures::poll!(&mut submission).is_pending());
+        assert!(events.lock().unwrap().iter().any(|event| event == "parent"));
+    }
+    let events = events.lock().unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| *event == "forget_parent")
+            .count(),
+        1
+    );
+}

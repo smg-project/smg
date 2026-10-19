@@ -1207,6 +1207,9 @@ def test_serve_rust_starts_the_engine_cores_from_this_process(monkeypatch, tmp_p
 
 def test_compiled_metrics_observer_binding(tmp_path):
     """The installed extension accepts the observer before the engine handshake."""
+    import threading
+
+    logged = threading.Event()
     servicer = pytest.importorskip("smg.servicer")
     server = servicer.VllmGrpcServer(
         bind_address="127.0.0.1:0",
@@ -1216,7 +1219,9 @@ def test_compiled_metrics_observer_binding(tmp_path):
         engine_startup_timeout_secs=2.0,
     )
     try:
-        server.set_metrics_observer(lambda event, payload, timestamp: None)
+        server.set_metrics_observer(lambda event, payload, timestamp: logged.set())
+        server.log_metrics()
+        assert logged.wait(2)
         with pytest.raises(ValueError, match="already installed"):
             server.set_metrics_observer(lambda *args: None)
         assert not server.engine_ready

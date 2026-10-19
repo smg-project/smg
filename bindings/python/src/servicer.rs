@@ -648,6 +648,19 @@ impl PyVllmGrpcServer {
         Ok(())
     }
 
+    /// Queue periodic native logging without running plugins on Python's event loop.
+    fn log_metrics(&self) -> PyResult<()> {
+        if let Some(metrics) = self
+            .metrics
+            .lock()
+            .map_err(|_| to_py_err(ServicerError::Poisoned))?
+            .as_ref()
+        {
+            metrics.observe("log", b"");
+        }
+        Ok(())
+    }
+
     #[new]
     #[pyo3(signature = (
         bind_address,
