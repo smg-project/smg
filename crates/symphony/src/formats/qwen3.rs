@@ -13,8 +13,10 @@
 //! first call (`</think>\n\n<tool_call>`), so a forced call written where the close left the
 //! engine begins with them, as the template writes it, and the call's marker is not the grammar's
 //! first text ([`Format::grammar_for`]). MiMo's template writes what follows right after the
-//! close, so the table under the direct placement carries none. The thought the model opens and
-//! closes itself: a `<tool_call>` inside it is thought text, as the template reads it.
+//! close, so the table under the direct placement carries none; the NVIDIA Nemotron 3 groups and
+//! Step 3.5 Flash, which read with the tagged table, write one newline there, which their entries
+//! in `groups.json` carry in the table's place (`after`). The thought the model opens and closes
+//! itself: a `<tool_call>` inside it is thought text, as the template reads it.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 

@@ -2,7 +2,8 @@
 //!
 //! [`for_model`] takes a model id, the Hugging Face id or the name a server gives the model, and
 //! gives the [`Format`] that reads its output: the table of the checkpoint group the model belongs
-//! to, with the group's own turn opener where its template writes one the table does not expect.
+//! to, with the group's own turn opener where its template writes one the table does not expect,
+//! and the text its template writes after the thought's close where that is not the table's.
 //! `None` means the registry does not know the model, and the caller reads its output another
 //! way; the gateway keeps its older parsers for such a model.
 //!
@@ -215,6 +216,11 @@ struct Group {
     /// What the group's own template opens the model's turn with, when it is not the table's
     /// own: the prompt's replay starts at its last occurrence.
     opener: Option<&'static str>,
+    /// What the group's own template writes after the thought's close before the first call,
+    /// when it is not the table's own (the NVIDIA Nemotron 3 groups and Step 3.5 Flash write one
+    /// newline where the Qwen 3.5 template writes two): the group's tags write it in the table's place
+    /// ([`Format::with_thought_after`]).
+    after: Option<&'static str>,
 }
 
 impl Group {
@@ -223,11 +229,16 @@ impl Group {
         std::iter::once(repository(self.model)).chain(self.also.iter().map(|also| repository(also)))
     }
 
-    /// The group's table, with the group's own turn opener where its template writes one.
+    /// The group's table, with the group's own turn opener where its template writes one, and
+    /// its own text after the thought's close where its template writes other than the table's.
     fn format(&self) -> Format {
         let format = self.table.format();
-        match self.opener {
+        let format = match self.opener {
             Some(opener) => format.opens_turn(opener),
+            None => format,
+        };
+        match self.after {
+            Some(after) => format.with_thought_after(after),
             None => format,
         }
     }
@@ -271,7 +282,8 @@ const fn table_named(name: &str) -> Table {
 
 // Every group whose table is on main, in bellwether's slug order, as `const GROUPS: &[Group]`:
 // `groups.json` beside this module is the one place a group is spelled (the primary's id, its
-// other checkpoints, its table by name, its own turn opener), one group per line, and `build.rs`
+// other checkpoints, its table by name, its own turn opener, its own text after the thought's
+// close where the template writes other than the table's), one group per line, and `build.rs`
 // writes it as this constant, so the compiled tables are the literals they were.
 include!(concat!(env!("OUT_DIR"), "/groups.rs"));
 
@@ -347,11 +359,12 @@ mod tests {
             .map(|group| {
                 let also: Vec<String> = group.also.iter().map(|also| text(also)).collect();
                 format!(
-                    r#"  {{"model": {}, "also": [{}], "table": {}, "opener": {}}}"#,
+                    r#"  {{"model": {}, "also": [{}], "table": {}, "opener": {}, "after": {}}}"#,
                     text(group.model),
                     also.join(", "),
                     text(group.table.name()),
                     group.opener.map_or_else(|| "null".to_string(), text),
+                    group.after.map_or_else(|| "null".to_string(), text),
                 )
             })
             .collect();
@@ -534,14 +547,93 @@ mod tests {
         }
     }
 
+    /// What a table writes after the thought's close, where it has a thought layout.
+    fn after_the_close(format: &Format) -> Option<&str> {
+        format
+            .layout()
+            .and_then(|layout| layout.thought.as_ref())
+            .map(|thought| &*thought.after)
+    }
+
     #[test]
-    fn every_table_builds_and_takes_its_groups_opener() {
+    fn every_table_builds_and_takes_its_groups_opener_and_text_after_the_close() {
         for group in GROUPS {
             let format = for_model(group.model).unwrap_or_else(|| panic!("{}", group.model));
             assert_eq!(format.validate(), Ok(()), "{}", group.model);
             let own = group.table.format();
             let expected = group.opener.or_else(|| own.turn_opener());
             assert_eq!(format.turn_opener(), expected, "{}", group.model);
+            // A group's own `after` replaces the table's, the close kept; a group with none keeps
+            // the table's; a group that names one on a table with no thought layout is refused.
+            let expected = group.after.or_else(|| after_the_close(&own));
+            assert_eq!(
+                after_the_close(&format),
+                expected,
+                "{}: the text after the thought's close",
+                group.model
+            );
+            if group.after.is_some() {
+                assert_eq!(
+                    format
+                        .layout()
+                        .and_then(|layout| layout.thought.as_ref())
+                        .and_then(|thought| thought.close.as_deref()),
+                    own.layout()
+                        .and_then(|layout| layout.thought.as_ref())
+                        .and_then(|thought| thought.close.as_deref()),
+                    "{}: the close is the table's",
+                    group.model
+                );
+            }
+        }
+    }
+
+    /// The NVIDIA Nemotron 3 groups and Step 3.5 Flash read with the Qwen 3.5 table, whose template
+    /// writes two newlines after the thought's close before a call; theirs write one (bellwether's rendered
+    /// `tools-call-arguments-object` for the group: `</think>\n<tool_call>`), which their entries
+    /// carry. A forced call written after the close begins with the one newline, and their
+    /// thinking-off prompt ends with the bare `<think></think>`, so the newline stays the tag's,
+    /// as for the table.
+    #[test]
+    fn a_nemotron_3_group_writes_its_templates_one_newline_after_the_thoughts_close() {
+        use openai_protocol::common::{Function, Tool};
+        use serde_json::json;
+
+        use crate::grammar::{GrammarStart, Options};
+        let format = for_model("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16").expect("a table");
+        let own = Table::Qwen3Tagged.format();
+        assert_eq!(after_the_close(&format), Some("\n"));
+        assert_eq!(after_the_close(&own), Some("\n\n"));
+        let off = "<|im_start|>assistant\n<think></think>";
+        assert!(!format.thought_closed(off));
+        assert!(!format.reasoning_open(off));
+        let tools = vec![Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "get_weather".to_string(),
+                description: None,
+                parameters: json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+                strict: None,
+                extra: Default::default(),
+            },
+        }];
+        for (format, newline) in [(&format, "\n"), (&own, "\n\n")] {
+            let tag = format
+                .grammar_for(
+                    &tools,
+                    Options {
+                        at_least_one: true,
+                        reasoning_open: false,
+                        thought_closed: false,
+                        one_call: true,
+                        start: GrammarStart::AfterReasoning,
+                    },
+                )
+                .expect("a tag")
+                .payload();
+            assert_eq!(tag["format"]["type"], "sequence");
+            assert_eq!(tag["format"]["elements"][0]["type"], "const_string");
+            assert_eq!(tag["format"]["elements"][0]["value"], newline);
         }
     }
 

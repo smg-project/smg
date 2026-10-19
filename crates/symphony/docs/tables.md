@@ -26,7 +26,11 @@ The definition is the table below; the `Engine` runs it, and decides everything 
   the content or the first call) as its thought layout, so a forced call written where the close
   left the engine begins with them and not with `<tool_call>` (`grammar`); a prompt with thinking
   switched off has written them itself (`</think>\n\n` at its end), and the tag owes none. MiMo's
-  template writes what follows right after the close, and `qwen3_tagged_direct` carries none.
+  template writes what follows right after the close, and `qwen3_tagged_direct` carries none. The
+  NVIDIA Nemotron 3 groups (Nemotron 3, 3.5 Lightning, Labs 3, Cascade 2, Cosmos3 Edge) and Step
+  3.5 Flash read with `qwen3_tagged` but write one newline there (`</think>\n<tool_call>`), and their thinking-off
+  prompt ends with the bare `<think></think>`: their entries in `groups.json` carry the one newline
+  as the group's `after`, which replaces the table's, the close kept (`registry`).
 
 The tests here are the engine's as much as this format's: they were written against the hand-written
 parser this table replaced, and hold the table to the same events.

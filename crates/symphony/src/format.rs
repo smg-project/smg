@@ -747,6 +747,22 @@ impl Format {
         self
     }
 
+    /// The layout's text after the thought's close replaced by `after`, the close kept: a
+    /// checkpoint group whose template writes other text there than its table's (the registry's
+    /// `after`: the NVIDIA Nemotron 3 groups and Step 3.5 Flash write one newline before a call
+    /// where the Qwen 3.5 template writes two). A table without a thought layout is left as it is.
+    #[must_use]
+    pub fn with_thought_after(mut self, after: &str) -> Self {
+        if let Some(thought) = self
+            .layout
+            .as_mut()
+            .and_then(|layout| layout.thought.as_mut())
+        {
+            thought.after = after.into();
+        }
+        self
+    }
+
     /// The table's layout, if it has one.
     pub fn layout(&self) -> Option<&Layout> {
         self.layout.as_deref()

@@ -192,8 +192,9 @@ lists the groups bellwether has recorded, and the groups it listed before bellwe
 outgrew it; it is written from `tests/readme.rs` and checked by `cargo test`, so it says what this
 branch holds, and a stale table fails the build. It runs newest first: **Released** is the day the
 primary's Hugging Face repository was created. The registry behind `formats::for_model` keeps its
-groups as data, `src/formats/groups.json` (one group per line, compiled in by the crate's build
-script), and the test checks this table against it.
+groups as data, `src/formats/groups.json` (one group per line: the table, the group's own turn
+opener and its own text after the thought's close where its template differs from the table's;
+compiled in by the crate's build script), and the test checks this table against it.
 
 A group is **ready** when its table is on main, bellwether's `main` holds the group's
 benchmark-scale set (the count in **bellwether set**), and a run of the fixture test
