@@ -280,7 +280,7 @@ impl<'a> Asks<'a> {
     }
 
     /// The request's `tool_choice` as a chat one, which a Messages choice converts to.
-    fn choice(self) -> Option<Cow<'a, ToolChoice>> {
+    pub(crate) fn choice(self) -> Option<Cow<'a, ToolChoice>> {
         match self {
             Self::Chat(request) => request.tool_choice.as_ref().map(Cow::Borrowed),
             Self::Messages { request, .. } => request
@@ -335,7 +335,7 @@ impl<'a> Asks<'a> {
     /// The table reads no thought from the output: a chat request that keeps the reasoning in the
     /// content (`separate_reasoning: false`), as the legacy path runs no reasoning parser then; a
     /// Messages request's thinking blocks are always its own.
-    pub(super) fn no_reasoning(self) -> bool {
+    pub(crate) fn no_reasoning(self) -> bool {
         match self {
             Self::Chat(request) => !request.separate_reasoning,
             Self::Messages { .. } => false,

@@ -15,7 +15,10 @@ use crate::{
             common::stages::PipelineStage,
             context::{PreparationOutput, RequestContext},
             regular::{
-                stages::rendered_prompt::{prepare_rendered_prompt, RenderedPrompt},
+                stages::{
+                    reading,
+                    rendered_prompt::{prepare_rendered_prompt, RenderedPrompt},
+                },
                 symphony,
             },
             spec::MessagesResponseSpec,
@@ -142,95 +145,30 @@ impl MessagePreparationStage {
         // parser with a reasoning prefix gets its tag wrapped so a forced call
         // follows the reasoning instead of preempting it. The table's refusal
         // waits for request building, which decides on the selected worker
-        // (`regular::symphony::worker_constraint`).
-        let names = ctx.components.parser_resolver.names(&request.model);
-        // The thinking switch's answer, or the table's replay of the rendered
-        // prompt where a table reads the message: a turn the prompt leaves
-        // unopened starts inside the thought whatever the switch says, and the
-        // tag must read it as the engine will (`regular::symphony::reasoning_open`).
-        let switch = utils::messages_reasoning_starts_in_prefill(
-            request,
-            processed_messages.continued_final_message,
-            tokenizer.as_ref(),
-        );
-        let replay = (!switch)
-            .then(|| {
-                symphony::reasoning_open(
-                    parser,
-                    &names,
-                    &request.model,
-                    &ctx.components.templates,
-                    &processed_messages.text,
-                )
-            })
-            .flatten();
-        let reasoning = switch || replay.is_some_and(|thought| thought.open);
-        // The prompt closed the thought itself and wrote the template's text
-        // after it (thinking switched off): the calls' tag owes none of it.
-        let thought_closed = replay.is_some_and(|thought| thought.closed);
-        let workers = ctx
-            .components
-            .worker_registry
-            .get_by_model(&ctx.input.model_id);
-        let symphony_constraint = symphony::constraint(
-            parser,
-            &names,
+        // (`regular::symphony::worker_constraint`). All of it, and whether the
+        // decoder keeps the special tokens the reader needs, is decided as for
+        // a chat request (`reading::prepare`), over the tools the template
+        // renders.
+        let reading::Prepared {
+            constraint: tool_call_constraint,
+            json_schema: json_schema_constraint,
+            keeps_special_tokens: preserve_reasoning_special_tokens,
+        } = reading::prepare(
+            ctx,
             symphony::Asks::Messages {
                 request,
                 continues: request.continues_final_assistant(),
             },
             &filtered_tools,
-            reasoning,
-            thought_closed,
-            symphony::grammar_start_of(&workers),
-            &ctx.components.templates,
-        );
-        let tool_call_constraint = match (symphony_constraint, chat_tool_choice.as_ref()) {
-            (Ok(None), Some(tool_choice)) if !filtered_tools.is_empty() => Ok(ctx
-                .components
-                .tool_parser_factory
-                .registry()
-                .generate_tool_constraint(
-                    ctx.components.parser_resolver.legacy_tool(&names),
-                    &filtered_tools,
-                    tool_choice,
-                    reasoning,
-                )
-                .map_err(|e| {
-                    error!(function = "MessagePreparationStage::execute", error = %e, "Invalid tool configuration");
-                    error::bad_request(
-                        "invalid_tool_configuration",
-                        format!("Invalid tool configuration: {e}"),
-                    )
-                })?),
-            (prepared, _) => prepared,
-        };
-
-        let json_schema_constraint =
-            matches!(&tool_call_constraint, Ok(Some(c)) if c.is_json_schema());
-        // A Symphony table whose markers the decoder would drop as special tokens needs them
-        // kept: without them the table reads neither the thought nor the calls. Where a table
-        // reads the message its markers alone decide, and no legacy reasoning parser is built to
-        // be asked; under a JSON-schema constraint no table reads (request building makes no
-        // assignment: `regular::symphony::assign_messages`), so the legacy parsers answer for
-        // themselves, as they do where no table reads at all.
-        let preserve_reasoning_special_tokens = match symphony::keeps_special_tokens(
-            parser,
-            &names,
-            &request.model,
-            &ctx.components.templates,
-            &tokenizer,
-        ) {
-            Some(kept) if !json_schema_constraint => kept,
-            _ => utils::reasoning_parser_requires_special_tokens(
-                &ctx.components.reasoning_parser_factory,
-                ctx.components
-                    .parser_resolver
-                    .reasoning_parser(&request.model)
-                    .as_deref(),
-                &request.model,
+            &processed_messages.text,
+            utils::messages_reasoning_starts_in_prefill(
+                request,
+                processed_messages.continued_final_message,
+                tokenizer.as_ref(),
             ),
-        };
+            &tokenizer,
+            "MessagePreparationStage::execute",
+        )?;
 
         // Derive skip_special_tokens from parser and constraint type:
         // - typed reasoning parsers need their control tokens preserved
@@ -238,19 +176,14 @@ impl MessagePreparationStage {
         // - structural_tag or no constraint (auto): parser needs trigger tokens
         let skip_special_tokens = if preserve_reasoning_special_tokens {
             false
+        } else if json_schema_constraint {
+            true
         } else {
-            match &tool_call_constraint {
-                Ok(Some(c)) if c.is_json_schema() => true,
-                _ if !filtered_tools.is_empty()
-                    && !matches!(
-                        chat_tool_choice,
-                        Some(ToolChoice::Value(ToolChoiceValue::None))
-                    ) =>
-                {
-                    false
-                }
-                _ => true,
-            }
+            filtered_tools.is_empty()
+                || matches!(
+                    chat_tool_choice,
+                    Some(ToolChoice::Value(ToolChoiceValue::None))
+                )
         };
 
         // Step 5: the stop sequence decoder, over the stop sequences the spec
