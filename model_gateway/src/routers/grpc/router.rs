@@ -874,8 +874,10 @@ impl GrpcRouter {
     /// with media is counted at the placeholders the template writes for it,
     /// as count_tokens counts it: the media is neither fetched nor decoded, so
     /// the count is the template's, not the expanded prompt's; an image or a
-    /// video to a pool whose every worker is language model only is refused
-    /// with `multimodal_not_supported` here as on every Messages path. A
+    /// video to a pool whose every worker is language model only, and media
+    /// no worker of the model takes (an image to a pool of engines without
+    /// image input), are refused with `multimodal_not_supported` here as on
+    /// every Messages path. A
     /// prompt longer than the smallest context window the model's workers
     /// advertise is refused as the pipeline refuses it after worker selection
     /// (`context_length_exceeded`), so a 200 here means the prompt fits
@@ -1542,6 +1544,76 @@ mod pd_tests {
             error::extract_error_code_from_response(&response),
             "model_not_found"
         );
+    }
+
+    /// count_tokens shares the Messages preparation refusals: an image block
+    /// to a model whose only worker runs an engine without image input in the
+    /// capability matrix is refused with the sentence `/v1/messages` gives,
+    /// instead of counted, before any media is fetched; to an engine that
+    /// takes images the count goes on into media resolution (here, to the
+    /// config lookup the mock tokenizer cannot satisfy).
+    #[tokio::test]
+    async fn count_tokens_refuses_media_no_worker_of_the_model_takes() {
+        for (runtime, code, message) in [
+            (
+                RuntimeType::Mlx,
+                "multimodal_not_supported",
+                Some("backend mlx does not support image inputs"),
+            ),
+            (RuntimeType::Sglang, "invalid_multimodal_request", None),
+        ] {
+            let ctx = grpc_ctx(regular_routing_mode()).await;
+            let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
+                llm_tokenizer::mock::MockTokenizer::new().with_deferred_chat_ids(vec![11, 12, 13]),
+            );
+            ctx.tokenizer_registry
+                .load("m", "m", "mock", || async move { Ok(tokenizer) })
+                .await
+                .expect("register the tokenizer");
+            let worker = BasicWorkerBuilder::new("grpc://worker:30000")
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(runtime)
+                .model(ModelCard::new("m"))
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build();
+            ctx.worker_registry
+                .register(Arc::new(worker))
+                .expect("register worker");
+            let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+            let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+            let request: CountMessageTokensRequest = serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "What colour is this pixel?"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="
+                    }}
+                ]}]
+            }))
+            .expect("count request");
+
+            let response = router
+                .route_messages_count_tokens(None, &tenant_meta, request, "m")
+                .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{runtime}");
+            assert_eq!(
+                error::extract_error_code_from_response(&response),
+                code,
+                "{runtime}"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json error body");
+            assert_eq!(body["error"]["code"], code, "{runtime}: {body}");
+            if let Some(message) = message {
+                assert_eq!(body["error"]["message"], message, "{runtime}: {body}");
+            }
+        }
     }
 
     /// A tokenizer a removed worker left in the registry does not make its

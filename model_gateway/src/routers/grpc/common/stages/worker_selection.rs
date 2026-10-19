@@ -503,9 +503,12 @@ impl WorkerSelectionStage {
 
         // Reject an unsupported (backend, modality) combination now that the
         // runtime is known, before request building assembles the payload only
-        // to fail deep in assembly. The prefill side builds the request in
-        // disaggregated mode, so its runtime is the one that must support the
-        // request's modalities.
+        // to fail deep in assembly. Preparation refused the request before the
+        // decode when no worker of the model took a modality
+        // (`ensure_model_accepts_media`); this answers for the pools it let
+        // through, where the pick may land on a worker whose engine does not.
+        // The prefill side builds the request in disaggregated mode, so its
+        // runtime is the one that must support the request's modalities.
         if let Some(intermediate) = inputs.intermediate {
             if let Err(err) = multimodal::ensure_backend_supports_modalities(
                 selection_runtime(&workers),
