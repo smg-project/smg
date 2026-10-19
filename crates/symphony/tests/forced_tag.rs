@@ -18,8 +18,6 @@ use symphony::{
 /// Where a table writes no tag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Gap {
-    /// In every configuration.
-    Every,
     /// With the prompt's thought open and the grammar started at the first token.
     OpenThoughtAtFirstToken,
 }
@@ -27,21 +25,6 @@ enum Gap {
 /// The tables that write no forced tag today, each with its cause; an entry goes with the change
 /// that makes its table write the tag.
 const KNOWN_GAPS: &[(Table, Gap, &str)] = &[
-    (
-        Table::KimiK2,
-        Gap::Every,
-        "a shaped call with JSON arguments has no tag without a layout, and the table carries none",
-    ),
-    (
-        Table::DeepSeekV3_1,
-        Gap::Every,
-        "the named-arguments builder writes Mistral's shape alone and does not see through the block",
-    ),
-    (
-        Table::DeepSeekV3,
-        Gap::Every,
-        "the same block as V3.1's, read by the same builder",
-    ),
     (
         Table::Inkling,
         Gap::OpenThoughtAtFirstToken,
@@ -134,7 +117,6 @@ fn every_table_that_reads_calls_writes_a_forced_tag_in_every_configuration() {
         let gap = gap_of(table);
         for (configuration, options, passed) in configurations() {
             let expected = match gap {
-                Some(Gap::Every) => true,
                 Some(Gap::OpenThoughtAtFirstToken) => {
                     options.reasoning_open && options.start == GrammarStart::FirstToken
                 }
