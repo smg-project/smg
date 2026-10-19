@@ -107,6 +107,7 @@ use super::{
         self, CandidateInputs, OptimisticAccounting, Pick, RequestInputs, WorkerSelectionPolicy,
     },
     normalize_model_key,
+    prefix_hash::CHARS_PER_TOKEN,
     utils::PeriodicTask,
     CacheAwareConfig, CacheNamespace, LeastLoadPolicy, LoadBalancingPolicy, SelectWorkerInfo,
     TEXT_MARKER_LEN,
@@ -1896,9 +1897,14 @@ impl CacheAwarePolicy {
                 (candidate.device_blocks.max(0.0) * block_size / prompt_tokens).clamp(0.0, 1.0)
             })
             .collect();
-        let selected =
-            self.load_scorer
-                .select_min_total_wait(workers, &rows, &shares, info, self.name())?;
+        let selected = self.load_scorer.select_min_total_wait(
+            workers,
+            &rows,
+            &shares,
+            Self::request_work(request, info),
+            info,
+            self.name(),
+        )?;
         if cache_trace::enabled() {
             let share = rows
                 .iter()
@@ -1930,8 +1936,28 @@ impl CacheAwarePolicy {
             .iter()
             .map(|idx| if holders.contains(idx) { held } else { 0.0 })
             .collect();
-        self.load_scorer
-            .select_min_total_wait(workers, healthy_indices, &shares, info, self.name())
+        self.load_scorer.select_min_total_wait(
+            workers,
+            healthy_indices,
+            &shares,
+            prompt_tokens.max(1) as u64,
+            info,
+            self.name(),
+        )
+    }
+
+    /// The prompt's size in tokens for the cost form, the unit of the queued
+    /// work and of the shares: the request's token count when it carries one
+    /// (the token tree, the hash index), else an estimate from the characters
+    /// the string tree matched on, at the prefix-hash policy's
+    /// [`CHARS_PER_TOKEN`] per token and never under one. The scorer's own
+    /// fallback, the mean prefill, would price the prefix a deep text prompt
+    /// saves no higher than a shallow one's, whatever its length.
+    fn request_work(request: &RequestInputs<'_>, info: &SelectWorkerInfo) -> u64 {
+        info.tokens.map_or_else(
+            || request.prompt_tokens.div_ceil(CHARS_PER_TOKEN).max(1) as u64,
+            |tokens| tokens.len() as u64,
+        )
     }
 
     /// The count-pressure gate's comparison alone, with no trace record: a

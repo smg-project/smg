@@ -517,15 +517,21 @@ impl LeastLoadPolicy {
         info: &SelectWorkerInfo,
         policy: &'static str,
     ) -> Option<usize> {
-        self.select_min_wait(workers, candidates, None, info, policy)
+        self.select_min_wait(workers, candidates, None, None, info, policy)
     }
 
     /// Argmin over `candidates` of the expected wait plus the work the
     /// request itself adds at each worker: `cached_share[i]` is the share of
     /// the prompt `candidates[i]` already holds in its cache (0 for a cold
     /// worker, 1 for a prompt cached whole), so the worker still has
-    /// `request_tokens × (1 − share)` to prefill before the request's first
-    /// token. That work is priced like the queued work ahead of it, at the
+    /// `request_work × (1 − share)` to prefill before the request's first
+    /// token. `request_work` is the prompt's size in tokens, the unit of the
+    /// queued work and of the shares: the caller states it (its token
+    /// count, or its estimate for a prompt it matched as text), since a
+    /// request routed on text carries no tokens, and the mean prefill
+    /// [`Self::request_tokens`] falls back to would price the prefix a
+    /// deep prompt saves no higher than a shallow one's. That work is
+    /// priced like the queued work ahead of it, at the
     /// fleet's nominal drain rate (a dark fleet, scored in requests, prices
     /// it in mean-prefill units). A holder is therefore left for a colder
     /// worker exactly when the holder's wait exceeds the other's by more
@@ -539,11 +545,19 @@ impl LeastLoadPolicy {
         workers: &[Arc<dyn Worker>],
         candidates: &[usize],
         cached_share: &[f64],
+        request_work: u64,
         info: &SelectWorkerInfo,
         policy: &'static str,
     ) -> Option<usize> {
         debug_assert_eq!(candidates.len(), cached_share.len());
-        self.select_min_wait(workers, candidates, Some(cached_share), info, policy)
+        self.select_min_wait(
+            workers,
+            candidates,
+            Some(cached_share),
+            Some(request_work),
+            info,
+            policy,
+        )
     }
 
     /// The shared body of the two selections above: `cached_share`, when
@@ -556,6 +570,7 @@ impl LeastLoadPolicy {
         workers: &[Arc<dyn Worker>],
         candidates: &[usize],
         cached_share: Option<&[f64]>,
+        request_work: Option<u64>,
         info: &SelectWorkerInfo,
         policy: &'static str,
     ) -> Option<usize> {
@@ -626,10 +641,11 @@ impl LeastLoadPolicy {
         let inputs = self.score_inputs(workers, candidates, snapshot, &inflight);
 
         // The request's own work at the candidate in position `pos`: the
-        // whole prompt, or the uncached share of it when shares are given;
-        // and that work in the score's unit (seconds at the nominal drain
-        // rate; requests, in mean-prefill units, over a dark fleet).
-        let request_work = self.request_tokens(info);
+        // whole prompt (the caller's token count, else the request's), or
+        // the uncached share of it when shares are given; and that work in
+        // the score's unit (seconds at the nominal drain rate; requests, in
+        // mean-prefill units, over a dark fleet).
+        let request_work = request_work.unwrap_or_else(|| self.request_tokens(info));
         let own_tokens = |pos: usize| -> u64 {
             match &shares {
                 Some(shares) => {
@@ -1564,8 +1580,14 @@ mod tests {
                 .map(|(worker, queued)| (worker.url().to_string(), make_load(queued, 0.2, 100.0)))
                 .collect();
             feed.publish(&loads);
-            let selected =
-                policy.select_min_total_wait(&workers, &[0, 1, 2], &shares, &info, "test");
+            let selected = policy.select_min_total_wait(
+                &workers,
+                &[0, 1, 2],
+                &shares,
+                tokens.len() as u64,
+                &info,
+                "test",
+            );
             assert_eq!(selected, Some(pick), "queued {queued:?}");
             assert_eq!(
                 policy.load_state_for_test(workers[pick].url()),
@@ -1593,7 +1615,14 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            policy.select_min_total_wait(&workers, &[0, 1], &[1.0, 0.0], &info, "test"),
+            policy.select_min_total_wait(
+                &workers,
+                &[0, 1],
+                &[1.0, 0.0],
+                tokens.len() as u64,
+                &info,
+                "test"
+            ),
             Some(0)
         );
         // The plain selection, which gives no credit for the cache, would
@@ -1625,7 +1654,14 @@ mod tests {
         let picks: Vec<usize> = (0..20)
             .map(|_| {
                 let pick = policy
-                    .select_min_total_wait(&workers, &[0, 1], &[1.0, 0.0], &info, "test")
+                    .select_min_total_wait(
+                        &workers,
+                        &[0, 1],
+                        &[1.0, 0.0],
+                        tokens.len() as u64,
+                        &info,
+                        "test",
+                    )
                     .expect("two candidates");
                 workers[pick].increment_load();
                 pick
@@ -1662,12 +1698,26 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            policy.select_min_total_wait(&workers, &[0, 1], &[1.0, 0.0], &info, "test"),
+            policy.select_min_total_wait(
+                &workers,
+                &[0, 1],
+                &[1.0, 0.0],
+                tokens.len() as u64,
+                &info,
+                "test"
+            ),
             Some(0)
         );
         workers[0].increment_load();
         assert_eq!(
-            policy.select_min_total_wait(&workers, &[0, 1], &[1.0, 0.0], &info, "test"),
+            policy.select_min_total_wait(
+                &workers,
+                &[0, 1],
+                &[1.0, 0.0],
+                tokens.len() as u64,
+                &info,
+                "test"
+            ),
             Some(1)
         );
     }

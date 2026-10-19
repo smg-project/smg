@@ -217,7 +217,9 @@ class Router:
             time the matched prefix saves (every eligible worker ranked on its
             expected wait plus the prefill the request still needs there),
             instead of when its in-flight count clears the absolute and relative
-            thresholds. Needs backend load reports. Default: False
+            thresholds. Uses backend load reports when available; otherwise it
+            ranks workers by in-flight counts plus uncached prefill work in
+            mean-prefill units. Default: False
         eviction_interval_secs: Interval in seconds between cache eviction operations
             in cache-aware routing. Default: 60
         overlap_decay: Cache-aware anti-hotspot decay: each candidate's overlap score

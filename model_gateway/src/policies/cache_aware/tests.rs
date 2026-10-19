@@ -1572,6 +1572,34 @@ fn the_cost_gate_prices_a_partial_prefix_at_its_uncached_share() {
 }
 
 #[test]
+fn the_cost_gate_prices_a_text_prompt_by_its_length_in_tokens() {
+    // The string tree matches on characters and the request carries no
+    // tokens: a 128-character prompt is 32 tokens at four characters per
+    // token, so the home that holds it whole saves 32 tokens of prefill
+    // (0.32 s at the reports' 100 tokens/s), not the scorer's 4-token
+    // mean prefill, and is left only once its queue is more than 32
+    // tokens deeper than the cold worker's; the credit is the work each
+    // must do, the home's at the floor and the cold worker's whole.
+    let text = "the quick brown fox jumps over the lazy dog ".repeat(3)[..128].to_string();
+    for (queued, pick, credited) in [
+        ([0, 0], 0, 4),
+        ([31, 0], 0, 4),
+        ([32, 0], 0, 4),
+        ([33, 0], 1, 32),
+    ] {
+        let policy = CacheAwarePolicy::with_config(cost_gate()).with_load_scorer(
+            LeastLoadPolicy::with_params(DEFAULT_KV_PRESSURE_WEIGHT, 4, DEFAULT_THROUGHPUT, 0),
+        );
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        seed_string_tenants(&policy, &workers, &text, &["http://w1:8000"]);
+        update_expected_wait_loads(&policy, &workers, &queued);
+        let idx = route_text(&policy, &workers, &text).unwrap();
+        assert_eq!(idx, pick, "queued {queued:?}");
+        assert_only_final_worker_credited(&policy, &workers, pick, credited);
+    }
+}
+
+#[test]
 fn without_load_reports_the_cost_gate_weighs_counts_against_the_work_in_mean_prefill_units() {
     // No report anywhere: a worker's wait is its in-flight count, and
     // the uncached work weighs tokens over mean_prefill_tokens (32 /
