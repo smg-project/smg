@@ -46,9 +46,13 @@ def slurm_node() -> Iterator[SlurmNode]:
     assert image, "SMG_SLURM_SMOKE_IMAGE names the image built from the Dockerfile"
     logs = os.environ.get("SMG_SLURM_SMOKE_LOGS")
     node = SlurmNode(image, Path(logs) if logs else None)
-    node.start()
-    yield node
-    node.stop()
+    # A start that fails still leaves Slurm's logs to copy, and a container
+    # to remove.
+    try:
+        node.start()
+        yield node
+    finally:
+        node.stop()
 
 
 @pytest.fixture

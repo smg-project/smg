@@ -8,9 +8,14 @@ name: E2E Slurm Smoke
 # e2e-kind-discovery.yml.
 on:
   pull_request:
+    # The provider, the discovery code it runs on, and the smoke with the
+    # helpers it shares. main.rs is left out: most changes touch it, and the
+    # CLI wiring is covered by its tests and by the CLI-contract lane, which
+    # runs on it.
     paths:
-      - model_gateway/src/service_discovery/slurm.rs
+      - model_gateway/src/service_discovery/**
       - e2e_test/slurm_smoke/**
+      - e2e_test/discovery_common.py
       - .github/workflows/e2e-slurm-smoke.yml
   schedule:
     - cron: '0 6 * * 1'

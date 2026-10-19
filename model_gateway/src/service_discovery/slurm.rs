@@ -151,6 +151,10 @@ impl SlurmProviderConfig {
     /// submitted by `user` (a name, or a numeric id), and in the configured
     /// account and partition. Its name is checked against the mapping
     /// separately.
+    ///
+    /// Slurm stores a job's account lowercased (`-A ML-Team` runs as
+    /// `ml-team`) and `squeue --account` matches it in any case, so the
+    /// account is compared the same way. Partition names are case-sensitive.
     fn selects(&self, job: &Job, cluster: &str, user: &str) -> bool {
         job.cluster == cluster
             && job.states.iter().any(|state| state == "RUNNING")
@@ -158,7 +162,7 @@ impl SlurmProviderConfig {
             && self
                 .account
                 .as_ref()
-                .is_none_or(|account| *account == job.account)
+                .is_none_or(|account| account.eq_ignore_ascii_case(&job.account))
             && self
                 .partition
                 .as_ref()
@@ -177,7 +181,8 @@ struct Job {
     states: Vec<String>,
     /// The allocation as a compressed hostlist, such as `gpu[01-04]`.
     nodes: String,
-    start_time: i64,
+    /// Unset for a pending job with no estimate; a running one has it.
+    start_time: Option<i64>,
     restart_count: u64,
     user_name: String,
     user_id: u64,
@@ -275,8 +280,12 @@ async fn poll(
         if !config.selects(&job, cluster, user) {
             continue;
         }
+        // Part of the instance's identity, so only a placed job needs one.
+        let start_time = job
+            .start_time
+            .ok_or_else(|| invalid(format!("running job {} has no start time", job.id)))?;
         let nodes = client.expand_hostlist(&job.nodes).await?;
-        placements.push((job, worker_type, nodes));
+        placements.push((job, start_time, worker_type, nodes));
     }
     // Asking `scontrol` about no node at all would list every node.
     if placements.is_empty() {
@@ -285,7 +294,7 @@ async fn poll(
 
     let names: BTreeSet<&String> = placements
         .iter()
-        .flat_map(|(_, _, nodes)| nodes.iter())
+        .flat_map(|(_, _, _, nodes)| nodes.iter())
         .collect();
     let names: Vec<String> = names.into_iter().cloned().collect();
     let nodes: HashMap<String, Node> = client
@@ -297,7 +306,7 @@ async fn poll(
 
     let mut workers = Vec::new();
     let mut claimed: HashMap<EndpointKey, String> = HashMap::new();
-    for (job, worker_type, node_names) in &placements {
+    for (job, start_time, worker_type, node_names) in &placements {
         for node_name in node_names {
             let node = nodes.get(node_name).ok_or_else(|| {
                 invalid(format!(
@@ -308,7 +317,7 @@ async fn poll(
             let endpoint = node_endpoint(node, config.port)?;
             let discovery_id = format!(
                 "{}/{}/{}/{}/{}/{worker_type}",
-                job.cluster, job.id, job.start_time, job.restart_count, node.name
+                job.cluster, job.id, start_time, job.restart_count, node.name
             );
             if let Some(other) = claimed.insert(endpoint.key(), discovery_id.clone()) {
                 return Err(invalid(format!(
@@ -623,17 +632,13 @@ fn parse_jobs(stdout: &[u8]) -> Result<Jobs, String> {
         .jobs
         .into_iter()
         .map(|job| {
-            let start_time = job
-                .start_time
-                .value()
-                .ok_or_else(|| format!("listed job {} with no start time", job.job_id))?;
             Ok(Job {
                 cluster: job.cluster,
                 id: job.job_id,
                 name: job.name,
                 states: job.job_state,
                 nodes: job.nodes,
-                start_time,
+                start_time: job.start_time.value(),
                 restart_count: job.restart_cnt,
                 user_name: job.user_name,
                 user_id: job.user_id,
@@ -850,7 +855,7 @@ mod tests {
             assert_eq!(requeued.states, ["RUNNING"]);
             assert_eq!(requeued.nodes, "slurmnode");
             assert_eq!(requeued.cluster, "smgtest");
-            assert!(requeued.start_time > 0);
+            assert!(requeued.start_time.is_some_and(|start| start > 0));
 
             for id in [3, second_task] {
                 assert_eq!(job(&jobs, id).name, "smg-prefill");
@@ -877,6 +882,15 @@ mod tests {
         assert!(check_release("25.05.0").is_ok());
         assert!(check_release("23.02.7").is_err());
         assert!(check_release("garbage").is_err());
+    }
+
+    #[test]
+    fn an_unset_start_time_reads_as_none() {
+        let mut answer: serde_json::Value = serde_json::from_str(SQUEUE_24_11).unwrap();
+        answer["jobs"][0]["start_time"] =
+            serde_json::json!({"set": false, "infinite": false, "number": 0});
+        let jobs = parse_jobs(answer.to_string().as_bytes()).unwrap();
+        assert_eq!(jobs.jobs[0].start_time, None);
     }
 
     #[test]
@@ -1022,6 +1036,41 @@ mod tests {
         assert_eq!(urls(&slurm, &uid).await, ["10.0.1.1:8000", "10.0.1.2:8000"]);
     }
 
+    /// Slurm stores a job's account lowercased (checked against Slurm 24.11:
+    /// `-A ACCT-B` runs as `acct-b`), so a configured account matches in any
+    /// case.
+    #[tokio::test]
+    async fn the_account_matches_in_any_case() {
+        let slurm = FakeSlurm::recorded();
+        let upper = SlurmProviderConfig {
+            account: Some("ACCT-B".to_string()),
+            ..config(&["smg-worker"])
+        };
+        assert_eq!(urls(&slurm, &upper).await, ["10.0.1.2:8000"]);
+    }
+
+    /// 23.11 lists every job of the user, filters or not: one it would have
+    /// filtered out may have no start time, and must not reject the poll. A
+    /// job that is placed needs one, as its identity carries it.
+    #[tokio::test]
+    async fn only_a_placed_job_needs_a_start_time() {
+        let mut slurm = FakeSlurm::recorded();
+        // The pending job, and one with a name no mapping lists.
+        slurm.job_mut(6).start_time = None;
+        slurm.job_mut(5).start_time = None;
+        assert_eq!(
+            urls(&slurm, &config(&["smg-worker"])).await,
+            ["10.0.1.1:8000", "10.0.1.2:8000"]
+        );
+
+        slurm.job_mut(1).start_time = None;
+        let error = poll(&slurm, &config(&["smg-worker"])).await.unwrap_err();
+        assert!(
+            error.to_string().contains("job 1 has no start time"),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn the_answer_is_filtered_by_account_and_partition() {
         let slurm = FakeSlurm::recorded();
@@ -1115,7 +1164,7 @@ mod tests {
             .map(|worker| (worker.endpoint.render(), worker.discovery_id))
             .collect();
         found.sort();
-        let start = |id| job(&slurm.jobs, id).start_time;
+        let start = |id| job(&slurm.jobs, id).start_time.unwrap();
         let on_job_1 = |node| format!("smgtest/1/{}/0/{node}/regular", start(1));
         let mut expected = vec![
             ("10.0.0.11:8000".to_string(), on_job_1("gpu01")),
@@ -1144,7 +1193,7 @@ mod tests {
         let before = poll(&slurm, &config).await.unwrap();
         let job = slurm.job_mut(4);
         job.restart_count += 1;
-        job.start_time += 60;
+        job.start_time = job.start_time.map(|start| start + 60);
         let after = poll(&slurm, &config).await.unwrap();
 
         assert_eq!(before.len(), 1);
