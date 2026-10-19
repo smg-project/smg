@@ -1193,7 +1193,9 @@ impl Format {
     /// MiniMax M3's closes into the text after it, the opener of the row into it from the turn's
     /// own state and those closes, the one the table's layout names first. `None` for a thought
     /// that closes only into the block: its close is its own way in, not a marker the text before
-    /// the calls could write.
+    /// the calls could write. A row that says another body's kind inside the thought
+    /// ([`Self::is_kind_switch`]: Inkling's answer marker inside its thought) is no close: the
+    /// thought's message closes where it did, and the tags keep that close.
     fn thought_markers(&self, reasoning: usize) -> Option<(&str, Vec<&str>)> {
         let turn_close = self.turn_close();
         let closes_to = |within: &dyn Fn(usize) -> bool| -> Vec<&str> {
@@ -1204,6 +1206,7 @@ impl Format {
                     && within(target)
                     && Some(on) != turn_close
                     && !self.stops(on)
+                    && !self.is_kind_switch(source, on, target)
                     && !closes.contains(&text)
                 {
                     closes.push(text);
@@ -1488,11 +1491,18 @@ impl Format {
     }
 
     /// The states with a row into `state`, other than itself and the states `within` it, in the
-    /// order of the states: the states the region is entered from.
+    /// order of the states: the states the region is entered from. A body's kind said again
+    /// inside another body ([`Self::is_kind_switch`]) enters no region: the engine moves between
+    /// the bodies of one message, which closes where it did.
     fn entered_from(&self, state: usize, within: impl Fn(usize) -> bool) -> Vec<usize> {
         let mut from: Vec<usize> = self
             .transitions()
-            .filter(|&(source, _, target)| target == state && source != state && !within(source))
+            .filter(|&(source, on, target)| {
+                target == state
+                    && source != state
+                    && !within(source)
+                    && !self.is_kind_switch(source, on, target)
+            })
             .map(|(source, _, _)| source)
             .collect();
         from.sort_unstable();
@@ -1507,7 +1517,8 @@ impl Format {
     /// markers, not the order of the rows. Where the template closes the region more than one way,
     /// the close is the one the table's layout names for a thought or an answer, the one its chat
     /// template renders, and otherwise the first such row. The turn's own state, where the opener
-    /// leaves the engine, is no region: the rows back into it close the regions it holds.
+    /// leaves the engine, is no region: the rows back into it close the regions it holds. A kind
+    /// said again inside a body ([`Self::is_kind_switch`]) neither enters nor closes one.
     fn region(&self, state: usize, within: impl Fn(usize) -> bool + Copy) -> Option<Region<'_>> {
         if state == 0 {
             return None;
@@ -1520,6 +1531,7 @@ impl Format {
                     && from.contains(&target)
                     && Some(on) != turn_close
                     && !self.stops(on)
+                    && !self.is_kind_switch(source, on, target)
             })
         };
         let written = self.written_close(state);
@@ -1592,7 +1604,9 @@ impl Format {
     /// the state the region opened from, its home ([`Self::region`]); for a region with no such
     /// row, its row into a framing state, as a thought closes into the wrapping between the
     /// template's messages (Inkling's message close). Neither is the end of the turn, a stop token
-    /// or a row into the calls' block; the turn's own state is no region and has no close.
+    /// or a row into the calls' block, nor a kind said again inside a body
+    /// ([`Self::is_kind_switch`]), which leads into a body, not between the messages; the turn's
+    /// own state is no region and has no close.
     fn close_of(&self, state: usize) -> Option<(&str, usize)> {
         if let Some(Region { close, home, .. }) =
             self.region(state, |state| self.is_call_state(state))
@@ -1622,9 +1636,11 @@ impl Format {
     /// The shortest path of rows from `from` to `to` through framing states alone, the terminals
     /// in the order the model writes them; `None` when there is none. One row where `from` has a
     /// row into `to`. The end of the turn is no step of a path, nor is a stop token: a way in that
-    /// wrote either would end the turn before the calls. Rows are tried in the table's order, so
-    /// of two paths of one length the one whose rows come first is taken: the first row into `to`
-    /// when there are two.
+    /// wrote either would end the turn before the calls. Nor is a kind said again inside a body
+    /// ([`Self::is_kind_switch`]): the tags write what the template renders between the
+    /// messages, and a body reaches the next message through its close. Rows are tried in the
+    /// table's order, so of two paths of one length the one whose rows come first is taken: the
+    /// first row into `to` when there are two.
     fn path(&self, from: usize, to: usize) -> Option<Vec<&str>> {
         if from == to {
             return Some(Vec::new());
@@ -1636,7 +1652,12 @@ impl Format {
         let mut frontier = VecDeque::from([from]);
         while let Some(state) = frontier.pop_front() {
             for (source, on, target) in self.transitions() {
-                if source != state || seen[target] || Some(on) == turn_close || self.stops(on) {
+                if source != state
+                    || seen[target]
+                    || Some(on) == turn_close
+                    || self.stops(on)
+                    || self.is_kind_switch(source, on, target)
+                {
                     continue;
                 }
                 seen[target] = true;
@@ -1665,6 +1686,27 @@ impl Format {
     /// in may pass through it.
     fn between_messages(&self, state: usize) -> bool {
         self.emits(state) == Emits::Wrapper || self.is_framing(state)
+    }
+
+    /// Whether the row `(source, on, target)` says a body's kind again inside another body rather
+    /// than close the body it stands in. In a table whose turn starts in the frame between its
+    /// messages (a message header or wrapper: Inkling's, Kimi K3's), the rows from the turn's own
+    /// state into the bodies carry the kinds' markers, and the family reads the kinds as
+    /// self-describing wherever they stand: the same marker on a row from a body into the body it
+    /// names moves the engine there, the message still closes where it did, and no tag writes
+    /// the marker inside a body ([`Self::region`], [`Self::thought_markers`]). Never in a table
+    /// whose turn starts in a body: there a row from the thought into the text is its close
+    /// (ChatML's, back where it opened; MiniMax M3's, into the text after it, which the turn's
+    /// own state closes an empty thought into as well).
+    fn is_kind_switch(&self, source: usize, on: usize, target: usize) -> bool {
+        let body = |state: usize| matches!(self.emits(state), Emits::Content | Emits::Reasoning);
+        source != 0
+            && body(source)
+            && body(target)
+            && !body(0)
+            && self
+                .transitions()
+                .any(|(from, marker, to)| from == 0 && marker == on && to == target)
     }
 
     /// Whether terminal `on` is a token the model stops on ([`Format::is_stop_token`]): the stop
@@ -2525,6 +2567,85 @@ mod tests {
             formats::inkling().grammar(&tools, true, true),
             formats::inkling().grammar(&tools, true, false)
         );
+    }
+
+    #[test]
+    fn a_kind_said_again_inside_a_body_is_no_close_of_the_thought() {
+        // A table whose turn starts in the frame between its messages: the thought and the
+        // answer open from the frame on their kinds' markers and close into the space between
+        // the messages, from where the next message opens. The family reads a kind said again
+        // inside a body as the kind, so the table has the rows between the bodies too; to the
+        // derivation they are no close and no way in: the thought's markers, its close and its
+        // message are the same with the rows and without them. A thought that closes into the
+        // text after it, in a table whose turn starts in that text, keeps that close.
+        let frame = |name: &str| {
+            Format::new(name)
+                .terminal("thinking", "<t>")
+                .terminal("text", "<a>")
+                .terminal("end", "<e>")
+                .terminal("next", "<n>")
+                .state("frame", Emits::Wrapper)
+                .state("thought", Emits::Reasoning)
+                .state("answer", Emits::Content)
+                .state("ended", Emits::Wrapper)
+                .transition("frame", "thinking", "thought")
+                .transition("frame", "text", "answer")
+                .transition("thought", "end", "ended")
+                .transition("answer", "end", "ended")
+                .transition("ended", "next", "frame")
+        };
+        let plain = frame("messages");
+        let restated = frame("messages, kinds said again")
+            .transition("thought", "text", "answer")
+            .transition("thought", "thinking", "thought")
+            .transition("answer", "thinking", "thought")
+            .transition("answer", "text", "answer");
+        for format in [&plain, &restated] {
+            format.validate().expect("a sound table");
+            assert_eq!(format.thought_markers(1), Some(("<t>", vec!["<e>"])));
+            assert_eq!(format.close_of(1), Some(("<e>", 3)));
+            assert_eq!(format.close_of(2), Some(("<e>", 3)));
+            assert_eq!(
+                format.thought_message().map(|thought| thought.to_json()),
+                Some(value!({
+                    "type": "tag",
+                    "begin": "<t>",
+                    "content": {"type": "any_text", "excludes": ["<t>", "<a>", "<e>", "<n>"]},
+                    "end": "<e><n>",
+                }))
+            );
+        }
+        assert!(
+            restated.is_kind_switch(1, 1, 2),
+            "the answer's marker inside the thought"
+        );
+        assert!(
+            restated.is_kind_switch(2, 0, 1),
+            "the thought's opener inside the answer"
+        );
+        assert!(!restated.is_kind_switch(1, 2, 3), "the message's close");
+        for format in [&plain, &restated] {
+            assert_eq!(
+                format.path(1, 2),
+                Some(vec!["<e>", "<n>", "<a>"]),
+                "the way from the thought into the answer is through the message's close"
+            );
+        }
+        assert!(
+            !restated.is_kind_switch(0, 1, 2),
+            "the kind said where the message starts"
+        );
+        let after = Format::new("text after the thought")
+            .terminal("think_open", "<t>")
+            .terminal("think_close", "</t>")
+            .state("start", Emits::Content)
+            .state("thought", Emits::Reasoning)
+            .state("text", Emits::Content)
+            .transition("start", "think_open", "thought")
+            .transition("start", "think_close", "text")
+            .transition("thought", "think_close", "text");
+        assert!(!after.is_kind_switch(1, 1, 2), "the thought's close");
+        assert_eq!(after.thought_markers(1), Some(("<t>", vec!["</t>"])));
     }
 
     #[test]

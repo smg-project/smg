@@ -698,11 +698,12 @@ mod tests {
     #[test]
     fn a_kind_said_again_inside_an_answer_counts_the_output_as_clean() {
         // Through the table whose messages say their kind after their opener, as a request
-        // without tools reads it: a JSON answer whose text marker the model wrote twice, and one
+        // without tools reads it: a JSON answer whose text marker the model wrote twice, one
         // with a second thought opened inside the answer's message, as an engine that starts the
-        // grammar after its own reasoning parser lets the model write them. The markers are
-        // framing, the second thought is reasoning, the JSON is the content, and the tally sees
-        // no malformed run: the output counts as clean, under no reason.
+        // grammar after its own reasoning parser lets the model write them, and one whose text
+        // marker the model wrote inside its thought. The markers are framing, the thoughts are
+        // reasoning, the JSON is the content, and the tally sees no malformed run: the output
+        // counts as clean, under no reason.
         use symphony::{formats::Table, Declared, Engine, EngineFinish, Events, Input, Parser};
         let json = "{\"city\": \"Oslo\"}";
         for output in [
@@ -715,6 +716,7 @@ mod tests {
                  <|content_thinking|>more<|end_message|><|message_model|><|content_text|>{json}\
                  <|end_message|>"
             ),
+            format!("<|content_thinking|>plan<|content_text|>{json}<|end_message|>"),
         ] {
             let mut engine =
                 Engine::new(Table::Inkling.format().without_calls(), Declared::default());

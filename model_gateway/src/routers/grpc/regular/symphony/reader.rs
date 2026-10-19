@@ -715,8 +715,10 @@ mod tests {
         // The table whose messages say their kind after their opener, as a request without tools
         // reads it, over the two outputs an engine that starts a JSON answer's grammar after its
         // own reasoning parser lets the model write: the text marker twice, or a second thought
-        // opened inside the answer's message. The client sees the bare JSON as content, the
-        // thoughts as reasoning, and the reader reads no malformed run.
+        // opened inside the answer's message; and over the answer's marker written inside the
+        // thought, which starts the answer there, as the family's own parsers read it. The
+        // client sees the bare JSON as content, the thoughts as reasoning, and the reader reads
+        // no malformed run.
         let assignment = Assignment {
             format: Arc::new(symphony::formats::inkling().without_calls()),
             prompt: "<|message_model|>".to_string(),
@@ -734,6 +736,10 @@ mod tests {
                      <|content_text|>{json}<|end_message|>"
                 ),
                 "planmore",
+            ),
+            (
+                format!("<|content_thinking|>plan<|content_text|>{json}<|end_message|>"),
+                "plan",
             ),
         ] {
             let mut events = Events::new();

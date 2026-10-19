@@ -126,7 +126,12 @@ prompt (one engine) or only when the request asks for reasoning (another), and t
 So at the gate, past the model's own opener, the tag's thought and the way in are open to the
 model once more, and a model held to a JSON it had not planned writes one of them again about two
 times in three; the table reads the kind said again inside a body as the kind, as the family's own
-parsers do, and the answer is the bare JSON either way (the `inkling` notes in `tables.md`).
+parsers do, and the answer is the bare JSON either way (the `inkling` notes in `tables.md`). A kind
+said again inside a body is no close of the thought to the derivation (`Format::is_kind_switch`: a
+row from one body into another on the marker that opens that body from the turn's own state, in a
+table whose turn starts in the frame between its messages), so the thought's message keeps its
+close in the tag; a thought that closes into the text after it, in a table whose turn starts in
+that text (MiniMax M3's), keeps that close.
 Before this, the tag wrote the way in as its `begin`, and an engine that had consumed the model's
 own opener forced it again: the answer reached the client as `<|content_text|>{...}`; and the
 way in was optional after the thought too, which admitted a message without a kind.
