@@ -57,7 +57,23 @@ What this table says beyond the Qwen ones:
 - **The prompt opens the thought.** The template ends the generation prompt with `<think>`, and
   an empty thought writes `</think>` at once, so most recorded outputs start with
   `</think>\n\n`; the engine's prompt replay puts the output inside the thought first. The
-  turn opener is `<｜Assistant｜>`, so a marker quoted in an earlier turn moves nothing.
+  turn opener is `<｜Assistant｜>`, so a marker quoted in an earlier turn moves nothing. A tool
+  result renders as a user turn, and the model's turn after it opens with `<｜Assistant｜>` and
+  the thought opened or closed (thinking mode, chat mode), so the output always starts in a stay
+  of its own.
+- **The block's opener is the blank line and the tag.** The template writes two newlines between
+  a message's content and its calls block, and the family's reference parser (the checkpoint's
+  `encoding` module) looks for the block as `\n\n<｜DSML｜ calls`, reading the content up to
+  there and otherwise as written: a blank line inside the content, a third newline or a space
+  before the block's blank line, and whitespace at the turn's end stay. The table spells the
+  opener the same way, as a second terminal beside the bare tag, so the blank line leaves with
+  the tag wherever the block opens (after a text preamble, after the thought's close, at a chat
+  turn's start, after a tool result), whole and streamed alike: the scanner takes the longer
+  marker where the blank line stands and holds a newline that may begin it. The bare tag still
+  opens a block written without the blank line, as it did; what precedes it is content. V4 and
+  V3.2 keep their reading (the blank line is content where text precedes it) until their
+  reference parsers are read the same way; the legacy `deepseek_v41` parser strips exactly this
+  blank line too.
 
 ## DeepSeek V4 (`deepseek_v4`)
 
@@ -78,7 +94,8 @@ V4.1's, and the registry reads each checkpoint with its own. Beyond that:
   needs: the table enters the block on its opener wherever it stands, after the thought's text or
   the content's last byte as much as after the newlines, and the newlines the model writes are
   content, the model's own (the legacy parser trims them; bellwether #17's question, as for Qwen3).
-  The family's reference parser is the one that looks for the block after the two newlines. The prompt ends with `<think>` in thinking mode and with `</think>` right after
+  The family's reference parser is the one that looks for the block after the two newlines; the
+  V4.1 table spells its opener that way (its section). The prompt ends with `<think>` in thinking mode and with `</think>` right after
   `<｜Assistant｜>` in chat mode, so the replay starts the output inside the thought or in the content;
   bellwether has not recorded the group's set yet.
 - **A turn the prompt leaves unopened starts inside the thought.** The template writes
