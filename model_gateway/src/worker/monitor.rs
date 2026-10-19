@@ -2121,6 +2121,48 @@ mod worker_monitor_tests {
         assert!(worker.stall_reason().is_none(), "the engine produces again");
     }
 
+    /// A pushed record from a step-reporting wire whose silence is past the
+    /// threshold while the servicer reports a long prefill in hand (the step
+    /// that starts a long multimodal prompt, or a kernel built for it) is no
+    /// veto until twice that prefill's time has passed; the same silence
+    /// with nothing pending, a frozen engine, is the veto it was.
+    #[tokio::test]
+    async fn a_pushed_record_with_a_long_pending_prefill_behind_the_engines_silence_is_no_veto() {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("grpc://w1:9000", "llama-3");
+        registry.register(Arc::clone(&worker)).unwrap();
+        let mut record = pushed(1);
+        record.engine_reports_steps = Some(true);
+        record.prefill_pending_tokens = Some(156_752);
+        for silence in [3_000, 10_000, 31_000] {
+            record.engine_silence_ms = Some(silence);
+            monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+            assert!(
+                worker.stall_reason().is_none(),
+                "{silence} ms of silence inside the prefill's allowance"
+            );
+        }
+        record.engine_silence_ms = Some(32_000);
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert_eq!(
+            worker.stall_reason(),
+            Some(super::super::worker::StallReason::Wedged),
+            "silent past twice the prefill at the cold prior"
+        );
+        record.engine_silence_ms = None;
+        record.prefill_pending_tokens = Some(0);
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert!(worker.stall_reason().is_none(), "the engine produces again");
+        // Nothing pending: the threshold, as before.
+        record.engine_silence_ms = Some(3_000);
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert_eq!(
+            worker.stall_reason(),
+            Some(super::super::worker::StallReason::Wedged),
+            "a frozen engine with nothing to prefill"
+        );
+    }
+
     /// The overload veto's edges are INFO lines with the report's figures:
     /// a record at the waiting threshold sets it, the next under it clears
     /// it, and a record that re-asserts the verdict the worker carries

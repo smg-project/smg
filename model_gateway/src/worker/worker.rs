@@ -1599,7 +1599,7 @@ pub struct WorkerRuntime {
 /// that a cold engine handed a burst of long prompts is not called wedged
 /// before it can have answered (10k tokens/s is a small model on a modest
 /// GPU; a current datacenter GPU prefills 8B weights at ~90k).
-const COLD_PREFILL_TOKENS_PER_SEC: u64 = 10_000;
+pub(crate) const COLD_PREFILL_TOKENS_PER_SEC: u64 = 10_000;
 
 /// First tokens are summed over windows at least this long before they make
 /// a rate sample, so the sample is the engine's aggregate throughput and not
