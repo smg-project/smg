@@ -33,7 +33,12 @@ use crate::format::{CallSyntax, Emits, Format};
 /// The text between a call's name and its arguments: the fence the template opens.
 pub const FENCE_OPEN: &str = "\n```json\n";
 
-/// The DeepSeek V3 table.
+/// The DeepSeek V3 table. The template writes the turn opener after a user message only, so
+/// after a tool result the model's turn is unopened: the table names content as the state it
+/// starts in, with the tool outputs' opener as the end of the turn the model wrote, since the R1
+/// distills' template ends a turn with one call with neither `<｜tool▁calls▁end｜>` nor
+/// `<｜end▁of▁sentence｜>` (nothing of such a prompt is replayed; the model's own `<think>` opens
+/// the thought).
 pub fn deepseek_v3() -> Format {
     Format::new("deepseek_v3")
         .terminal("think_open", "<think>")
@@ -60,6 +65,7 @@ pub fn deepseek_v3() -> Format {
             between_calls: "\n",
         })
         .opens_turn("<｜Assistant｜>")
+        .unopened_turn_starts_in("content", "<｜tool▁outputs▁begin｜>")
 }
 
 #[cfg(test)]
@@ -455,8 +461,9 @@ mod tests {
         assert!(!format.reasoning_open("<｜User｜>Hi<｜Assistant｜>"));
         assert!(format.reasoning_open(THINKING));
         // After a tool result the prompt ends in `<｜tool▁outputs▁end｜>` with no new opener: the
-        // replay walks the previous turn's calls block from its `<｜Assistant｜>` and leaves the
-        // output in content, where the template puts it.
+        // tool outputs ended the model's turn, the walk replays nothing of it, and the output
+        // starts in content, where the template puts it (`replay` still gives the text from the
+        // opener: replayed again, it says the same).
         let prompt = "<｜User｜>Weather in Paris?<｜Assistant｜><｜tool▁calls▁begin｜>\
                       <｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n\
                       {\"city\": \"Paris\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>\
@@ -466,7 +473,26 @@ mod tests {
             format.replay(prompt),
             &prompt[prompt.find("<｜Assistant｜>").expect("the opener")..]
         );
+        assert!(!format.reasoning_open(prompt));
         let events = run(prompt, &["It is 18 degrees."]);
+        assert_eq!(content(&events), "It is 18 degrees.");
+        assert!(calls(&events).is_empty());
+        // The R1 distills' template writes `<｜tool▁calls▁end｜><｜end▁of▁sentence｜>` after the
+        // second call and later only, so a turn with one call ends with neither; replayed, it
+        // would leave the output in the calls block, and the next turn would read as wrapper
+        // text. The tool outputs end it all the same, and the model's own `<think>` opens the
+        // thought from content, as it does after `<｜Assistant｜>`.
+        let one_call = "<｜User｜>Weather in Paris?<｜Assistant｜><｜tool▁calls▁begin｜>\
+                        <｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n\
+                        {\"city\": \"Paris\"}\n```<｜tool▁call▁end｜><｜tool▁outputs▁begin｜>\
+                        <｜tool▁output▁begin｜>{\"temperature\": 18}<｜tool▁output▁end｜>\
+                        <｜tool▁outputs▁end｜>";
+        assert!(
+            !format.reasoning_open(one_call),
+            "the tool outputs ended the turn"
+        );
+        let events = run(one_call, &["<think>Warm.</think>It is 18 degrees."]);
+        assert_eq!(reasoning(&events), "Warm.");
         assert_eq!(content(&events), "It is 18 degrees.");
         assert!(calls(&events).is_empty());
         // A marker quoted in an earlier turn moves nothing.
