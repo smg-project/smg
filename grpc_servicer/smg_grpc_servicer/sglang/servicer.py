@@ -6,7 +6,6 @@ for orchestration without tokenization.
 """
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -66,7 +65,7 @@ from smg_grpc_servicer.sglang.utils import (
     to_token_id_array,
 )
 from smg_grpc_servicer.tensor_wire import tensor_from_parts
-from smg_grpc_servicer.tokenizer_bundle import build_tokenizer_zip, tokenizer_chunks
+from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
 
 from ..constrained_decoding import grammar_start_labels, sglang_constrained_decoding_start
 from ..mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
@@ -814,15 +813,15 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             )
         tokenizer_dir = Path(tokenizer_path)
 
-        # Build ZIP archive in memory
+        # Reading and compressing the tokenizer directory is file I/O and CPU
+        # measured in hundreds of milliseconds: the shared bundle builds it in
+        # a worker thread, once, and the scheduler keeps answering everything
+        # else (streams, health checks, aborts) meanwhile.
         try:
-            zip_buffer = build_tokenizer_zip(tokenizer_dir)
+            zip_data, sha256 = await tokenizer_bundle(tokenizer_dir)
         except Exception as e:
             logger.error(f"Failed to build tokenizer ZIP: {e}\n{get_exception_traceback()}")
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
-
-        zip_data = zip_buffer.getbuffer()
-        sha256 = hashlib.sha256(zip_data).hexdigest()
 
         logger.info(
             "Streaming tokenizer bundle: %d bytes, sha256=%s",

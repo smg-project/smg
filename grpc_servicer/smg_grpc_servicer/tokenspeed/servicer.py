@@ -14,7 +14,6 @@ import asyncio
 import dataclasses
 import enum
 import functools
-import hashlib
 import json
 import logging
 import math
@@ -42,7 +41,7 @@ from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
 
 from smg_grpc_servicer import mm_shm
 from smg_grpc_servicer.mm_rdma import RdmaPixelPuller
-from smg_grpc_servicer.tokenizer_bundle import build_tokenizer_zip, tokenizer_chunks
+from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
 from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
 from smg_grpc_servicer.tokenspeed.kv_events import (
@@ -1101,15 +1100,17 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             )
             return
 
+        # Reading and compressing the tokenizer directory is file I/O and CPU
+        # measured in hundreds of milliseconds: the shared bundle builds it in
+        # a worker thread, once, and the scheduler keeps answering everything
+        # else (streams, health checks, aborts) meanwhile.
         try:
-            zip_buffer = build_tokenizer_zip(Path(tokenizer_path))
+            zip_data, sha256 = await tokenizer_bundle(Path(tokenizer_path))
         except Exception as e:  # noqa: BLE001
             logger.exception("Failed to build tokenizer ZIP")
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
             return
 
-        zip_data = zip_buffer.getbuffer()
-        sha256 = hashlib.sha256(zip_data).hexdigest()
         logger.info("Streaming tokenizer bundle: %d bytes, sha256=%s", len(zip_data), sha256)
 
         for chunk in tokenizer_chunks(zip_data, sha256):
