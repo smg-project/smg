@@ -3329,6 +3329,11 @@ async fn a_cancelled_decode_side_still_notifies_the_engine() {
 #[tokio::test]
 async fn greedy_sampling_with_several_choices_is_refused_before_the_fan_out() {
     let mut h = harness(model_info(), None).await;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observed = events.clone();
+    h.server.set_wire_observer(Arc::new(move |event, _| {
+        observed.lock().unwrap().push(event.to_owned());
+    }));
     let mut request = generate_request("g2", false, Vec::new());
     if let Some(params) = request.sampling_params.as_mut() {
         params.n = 2;
@@ -3340,6 +3345,7 @@ async fn greedy_sampling_with_several_choices_is_refused_before_the_fan_out() {
         status.message(),
         "n must be 1 when using greedy sampling, got 2."
     );
+    assert!(!events.lock().unwrap().iter().any(|event| event == "parent"));
     assert_engine_idle(&mut h.engine_in).await;
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

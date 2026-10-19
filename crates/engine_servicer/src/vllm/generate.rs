@@ -13,8 +13,8 @@ use std::{
 };
 
 use engine_zmq_adapter::{
-    fold_tokenizer_eos_backstop, kv_transfer_rejection_params, stops::take_vllm_string_stops,
-    VllmGenerateStream, ZmqEngineClient,
+    fold_tokenizer_eos_backstop, kv_transfer_rejection_params, refuse_greedy_choices,
+    stops::take_vllm_string_stops, VllmGenerateStream, ZmqEngineClient,
 };
 use futures::{stream::SelectAll, Stream};
 use llm_tokenizer::stop::StopSequenceDecoder;
@@ -161,6 +161,11 @@ async fn submit(
     client.adopt_tokenizer_eos(tokenizer);
     fold_tokenizer_eos_backstop(&mut req, tokenizer);
     let decoder = stop_decoder(state.tokenizer(), &stops, skip_special_tokens)?;
+
+    // Refuse invalid fan-out before metrics allocates per-choice state.
+    if let Some(params) = req.sampling_params.as_ref() {
+        refuse_greedy_choices(params).map_err(Status::invalid_argument)?;
+    }
 
     // Admission ends here: the add is on the wire before `submit_with_aux`
     // returns, and an `n > 1` fan-out has live subs while later ones are
