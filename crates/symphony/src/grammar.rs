@@ -740,13 +740,26 @@ impl Format {
             // A template's patterns do not say which text a run of whitespace or a skipped
             // attribute stands for, and a tag writes only what the template renders: a shaped
             // call's tag is written from the layout its chat template renders, and a table
-            // without one has none. With no call owed, the tag takes no prefix: its own free text
-            // writes the thought, where a prefix before it would let an engine end the prefix
-            // inside the call's terminal and write the rest as free text, a call no tag constrains.
-            CallSyntax::Shaped(shape) => (
-                shaped::calls(self, shape, self.layout()?, &named, count)?,
-                options.at_least_one,
-            ),
+            // without one has none; where the calls sit in a block (Kimi K2's), between the
+            // block's ways in and its close. With no call owed, the tag takes no prefix: its own
+            // free text writes the thought, where a prefix before it would let an engine end the
+            // prefix inside the call's terminal and write the rest as free text, a call no tag
+            // constrains.
+            CallSyntax::Shaped(shape) => {
+                let ways_in = markers.map(|markers| self.ways_into_block(markers));
+                (
+                    shaped::calls(
+                        self,
+                        shape,
+                        self.layout()?,
+                        markers,
+                        ways_in.as_deref().unwrap_or_default(),
+                        &named,
+                        count,
+                    )?,
+                    options.at_least_one,
+                )
+            }
             // The forced call's constraint is the request's own schema, which the gateway writes
             // for the function `tool_choice` names; the format derives nothing of its own.
             CallSyntax::ForcedArguments => return None,

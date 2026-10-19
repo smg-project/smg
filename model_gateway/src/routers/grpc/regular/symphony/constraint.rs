@@ -780,6 +780,74 @@ mod tests {
         assert_eq!(first["format"]["elements"][1], bare["format"]);
     }
 
+    /// A forced or required call on a table whose calls are given as data with JSON arguments
+    /// takes the table's tag and the table reads the answer: the request is not handed to the
+    /// older path. The older path's JSON-schema constraint still leaves the table out, as before.
+    #[test]
+    fn a_forced_call_on_the_kimi_k2_table_takes_its_tag_and_the_table_reads_the_answer() {
+        let kimi = names(Some("kimi_k2"), Some("kimi_k2"));
+        let prompt =
+            "<|im_user|>user<|im_middle|>hi<|im_end|><|im_assistant|>assistant<|im_middle|>";
+        let named = request(json!({
+            "model": "moonshotai/Kimi-K2-Thinking",
+            "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+        }));
+        let required = request(json!({
+            "model": "moonshotai/Kimi-K2-Thinking",
+            "tool_choice": "required",
+        }));
+        for (asked, one_call) in [(&named, true), (&required, false)] {
+            let Some(ToolConstraint::StructuralTag(tag)) = super::constraint(
+                ParserChoice::Symphony,
+                &kimi,
+                Asks::Chat(asked),
+                &tools(),
+                false,
+                symphony::GrammarStart::AfterReasoning,
+                &templates(),
+            )
+            .expect("no hf") else {
+                panic!("the table's tag, not the older registry's schema");
+            };
+            let format = serde_json::from_str::<Value>(&tag).expect("JSON");
+            let format = &format["format"];
+            assert_eq!(format["type"], "triggered_tags");
+            assert_eq!(
+                format["triggers"],
+                json!(["<|tool_calls_section_begin|>", "</think>"])
+            );
+            assert_eq!(format["at_least_one"], true);
+            assert_eq!(
+                format["stop_after_first"],
+                if one_call { json!(true) } else { Value::Null }
+            );
+            let call = if one_call {
+                &format["tags"][0]["content"]["elements"][0]
+            } else {
+                &format["tags"][0]["content"]["content"]["elements"][0]
+            };
+            assert_eq!(
+                call["elements"][0]["value"],
+                "<|tool_call_begin|>functions.lookup:"
+            );
+            assert_eq!(format["tags"][0]["end"], "<|tool_calls_section_end|>");
+            // The constraint is a structural tag, so the table is assigned to the response.
+            let structural = ("structural_tag".to_string(), tag);
+            let assigned = assign(
+                ParserChoice::Symphony,
+                &kimi,
+                asked,
+                Some(&structural),
+                prompt,
+            )
+            .expect("assigned");
+            assert_eq!(assigned.format.name(), "kimi_k2");
+        }
+        // The older path's forced call (a JSON schema) is still read by the older parsers.
+        let schema = ("json_schema".to_string(), "{}".to_string());
+        assert!(assign(ParserChoice::Symphony, &kimi, &named, Some(&schema), prompt).is_none());
+    }
+
     /// The model's workers name the start when they all carry the same label; none, a missing
     /// label or a disagreement leaves it unknown. A worker's own label maps one to one.
     #[test]

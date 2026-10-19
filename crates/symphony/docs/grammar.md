@@ -73,7 +73,12 @@ region's close is never one, no way in steps on one, and an answer a stop token 
 nothing after its JSON. Such a table may also have a layout (`Format::with_layout`): its tags then
 write the thought and the answer with the text the layout writes around them. For a call given as
 data, the tag writes its tagged parameters as the table's layout says the model's chat template
-writes them (the `shaped` module), and a table without a layout has no tag.
+writes them (the `shaped` module), or, where the arguments are one JSON value, the tool's schema
+right after the header the layout spells (Kimi K2's `functions.NAME:N<|tool_call_argument_begin|>`,
+the call's number a place of the layout's own written as a run of digits); where the calls sit in a
+block of the table's, between the block's ways in and its close as the tagged syntaxes' calls are.
+A registry table may carry a layout of its own for this (Kimi K2's), and a table without a layout
+has no tag.
 
 The thought's close a tag writes is the row from the reasoning state back to where the thought
 opened, the one the table's layout names where the template closes the thought more than one way.

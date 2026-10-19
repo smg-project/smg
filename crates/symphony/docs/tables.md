@@ -671,7 +671,21 @@ wrapper state for the block, an arguments state per call):
   Thinking, K2.5 and K2.6 (without `preserve_thinking`) keep the thought of a message that calls
   and render an answer's as `<think></think>`, so the thought-and-answer turn is rendered where
   the template keeps it (K2.7-Code, K2.6 with `preserve_thinking`); and the two Instruct
-  templates differ in a block's indentation alone and render the same turns. What the table
-  leaves open: the structural tag for a forced or required call (`Format::grammar` writes none
-  for a shaped call without a layout; the forced table covers `tool_choice` as for the other
-  tables without one), the recorded sets, and the live reading against the engine's own server.
+  templates differ in a block's indentation alone and render the same turns.
+- **The forced tag is written from the table's layout.** A shaped call's tag needs the one
+  spelling the chat template renders, and the table carries it (`Format::with_layout`): the id as
+  `functions.{name}:{index}<|tool_call_argument_begin|>` with the call's number as a place of its
+  own (`Segment::Index`, written as a run of digits, since the model counts its calls and no
+  request knows the count ahead), the arguments one JSON value (the tool's schema, no parameter
+  and nothing around it), `<|tool_call_end|>` as the call's close, nothing between two calls, and
+  the thought closed by `</think>` with nothing after it. The calls sit in the table's block, so
+  the tag is the block's ways in (from the turn's own state, or `</think>` first) around one or
+  more calls and the block's close, as the tagged syntaxes' tags are. On an engine whose grammar
+  starts after its reasoning parser has seen `</think>`, a K2 Thinking answer keeps its thought
+  and the forced call follows it in the model's own syntax; a prompt that opens the thought (K2.5,
+  K2.6, K2.7-Code) takes the thought closed first from an engine that starts at the first token.
+  Before the table had its layout, the gateway handed a forced or required request to its older
+  path, whose JSON-schema constraint made the model write the bare arguments after the thought,
+  and the older parsers read that back as raw text (the module tests pin how the table reads
+  those bytes: a thought and JSON content, no call). What the table leaves open: the recorded
+  sets, and the live reading against the engine's own server.

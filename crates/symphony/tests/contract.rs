@@ -1266,6 +1266,11 @@ const MUSE_SPARK_OUTPUTS: &[&str] = &[
 /// do.
 const KIMI_K2_OUTPUTS: &[&str] = &[
     "<think>Need the weather.</think><|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_calls_section_end|>",
+    // The forced answers of a live cell (a named function; `required`) in the shape the table's
+    // tag writes after the thought's close: the thought, then the block holding the one call with
+    // the recorded arguments.
+    "<think>I need to use the detailed_weather_forecast function with:\n- location: \"London, United Kingdom\"\n- days: 3\n\nLet me make this function call.</think><|tool_calls_section_begin|><|tool_call_begin|>functions.detailed_weather_forecast:0<|tool_call_argument_begin|>{\"location\": \"London, United Kingdom\", \"days\": 3, \"details\": [\"high_low_temperature\", \"humidity\", \"precipitation\"]}<|tool_call_end|><|tool_calls_section_end|>",
+    "<think>The user wants the top 5 popular artworks, sorted by popularity. Let me make this function call.</think><|tool_calls_section_begin|><|tool_call_begin|>functions.metropolitan_museum_get_top_artworks:0<|tool_call_argument_begin|>{\"number\": 5, \"sort_by\": \"popularity\"}<|tool_call_end|><|tool_calls_section_end|>",
     "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_call_begin|>functions.get_weather:1<|tool_call_argument_begin|>{\"city\": \"Rome\", \"days\": 3}<|tool_call_end|><|tool_calls_section_end|>",
     "Let me check.<|tool_calls_section_begin|><|tool_call_begin|>functions.get_stock_price:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>",
     "<think>Plan.</think>It is sunny.",
