@@ -232,8 +232,6 @@ impl Scanner {
     pub fn feed<'a>(&mut self, bytes: &'a str) -> Scanned<'a> {
         let mut joined = std::mem::take(&mut self.joined);
         let mut spans = std::mem::take(&mut self.spans);
-        joined.clear();
-        spans.clear();
         if self.held.is_empty() {
             self.scan(bytes, true, &mut spans);
         } else {
@@ -265,8 +263,6 @@ impl Scanner {
     pub fn finish(&mut self) -> Scanned<'static> {
         let mut joined = std::mem::take(&mut self.joined);
         let mut spans = std::mem::take(&mut self.spans);
-        joined.clear();
-        spans.clear();
         joined.push_str(&self.held);
         self.held.clear();
         self.scan(&joined, false, &mut spans);
@@ -277,12 +273,14 @@ impl Scanner {
         }
     }
 
-    /// Takes back the buffers on loan to `scanned`, once its pieces are read: the next feed then
-    /// allocates nothing for them. A scan not reclaimed costs the next one the allocation, nothing
-    /// else.
+    /// Takes back the buffers on loan to `scanned`, once its pieces are read, emptied with their
+    /// capacity kept: the next feed then allocates nothing for them. A scan not reclaimed costs
+    /// the next one the allocation, nothing else.
     pub fn reclaim(&mut self, scanned: Scanned<'_>) {
         self.joined = scanned.joined;
+        self.joined.clear();
         self.spans = scanned.spans;
+        self.spans.clear();
     }
 
     /// Split `text` into pieces, as spans of it. With `more_may_come`, a tail that could still
