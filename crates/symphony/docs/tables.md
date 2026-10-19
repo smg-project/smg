@@ -168,7 +168,8 @@ the family's weights.
 
 ## DeepSeek V3 (`deepseek_v3`)
 
-The spelling before V3.1's, the gateway's older `deepseek` parser's: no thought, the call's opener
+The spelling before V3.1's, the gateway's older `deepseek` parser's: no thought in the template
+(the table reads one all the same, below), the call's opener
 is `<｜tool▁call▁begin｜>function<｜tool▁sep｜>` (the call's type before the separator, which the
 template writes from the message and every message writes as `function`), the name runs to the
 `json` fence the template opens on the next line, and the fence's close with `<｜tool▁call▁end｜>`
