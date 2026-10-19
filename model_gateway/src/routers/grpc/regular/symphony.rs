@@ -2613,7 +2613,9 @@ mod tests {
     /// unless the tag is the schema alone, the engine's own constraint, which the engine keeps as
     /// before. A table whose answer is written inside a message (Muse Spark's, Kimi K3's,
     /// Inkling's) takes its tag: the engine's schema writes bare JSON from the turn's own state,
-    /// which such a table drops as framing, so the content came back empty. A table whose output
+    /// which such a table drops as framing, so the content came back empty; where the thought is
+    /// a message of its own (Inkling's), the tag admits it first and leaves the way into the
+    /// answer to the engine unless it says it starts at the first token. A table whose output
     /// starts in content takes the tag with the thought's close before the schema when the prompt
     /// leaves the thought open, and with the thought the model may write first where its table
     /// admits one (MiniMax M3's); a table with no answer state and a prompt that continues the
@@ -2680,19 +2682,49 @@ mod tests {
             begin.ends_with(" to=user<|message|>") && begin.len() > " to=user<|message|>".len(),
             "{open}"
         );
-        // The registry's tables whose answer is a message take theirs too.
-        for model in ["moonshotai/Kimi-K3", "thinkingmachines/Inkling"] {
-            let tag = tag_of(answer(
-                &ModelNames::default(),
-                json!({"model": model, "response_format": {"type": "json_object"}}),
-                false,
-            ));
-            assert_eq!(tag["format"]["type"], "tag", "{model}: {tag}");
-            assert_eq!(
-                tag["format"]["content"]["type"], "json_schema",
-                "{model}: {tag}"
-            );
-        }
+        // The registry's tables whose answer is a message take theirs too: Kimi K3's is the
+        // answer's tag alone.
+        let kimi = tag_of(answer(
+            &ModelNames::default(),
+            json!({"model": "moonshotai/Kimi-K3", "response_format": {"type": "json_object"}}),
+            false,
+        ));
+        assert_eq!(kimi["format"]["type"], "tag", "{kimi}");
+        assert_eq!(kimi["format"]["content"]["type"], "json_schema", "{kimi}");
+        // Inkling's thought is a message of its own: the tag admits it first, closed and the
+        // next message opened, leaves the text marker optional where the engine does not say it
+        // starts at the first token (an engine that starts after its reasoning parser has
+        // consumed the model's own), then the schema and the message's close.
+        let inkling = tag_of(answer(
+            &ModelNames::default(),
+            json!({"model": "thinkingmachines/Inkling", "response_format": {"type": "json_object"}}),
+            false,
+        ));
+        assert_eq!(inkling["format"]["type"], "sequence", "{inkling}");
+        let elements = inkling["format"]["elements"]
+            .as_array()
+            .expect("a sequence");
+        assert_eq!(elements.len(), 4, "{inkling}");
+        assert_eq!(elements[0]["type"], "optional", "{inkling}");
+        assert_eq!(
+            elements[0]["content"]["begin"], "<|content_thinking|>",
+            "{inkling}"
+        );
+        assert_eq!(
+            elements[1],
+            json!({"type": "optional", "content": {"type": "const_string", "value": "<|content_text|>"}}),
+            "{inkling}"
+        );
+        assert_eq!(
+            elements[2],
+            json!({"type": "json_schema", "json_schema": {"type": "object"}}),
+            "{inkling}"
+        );
+        assert_eq!(
+            elements[3],
+            json!({"type": "const_string", "value": "<|end_message|>"}),
+            "{inkling}"
+        );
         // A table whose output starts in content (the registry's Qwen3 table) has the schema
         // alone for its tag with the thought closed: the engine's own constraint, which stands.
         let content_first = json!({"response_format": {"type": "json_object"}});
