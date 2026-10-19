@@ -208,8 +208,8 @@ mod tests {
     /// three calls in one block (a newline before each call after the first), a call after
     /// content, a call with no arguments, nested and non-ASCII values, and content alone; then a
     /// call and content after a thought the prompt opens (R1, R1-Zero and the distills, whose
-    /// template ends the prompt with the opener), and after a thought the model opens itself, the
-    /// prompt ending at the header (R1-0528, R1-0528-Qwen3-8B and the bf16 mirror).
+    /// template writes `<think>` and a newline after the header), and after a thought the model
+    /// opens itself, the prompt ending at the header (R1-0528, R1-0528-Qwen3-8B and the bf16 mirror).
     const RENDERED_TURNS: &[RenderedTurn] = &[
         RenderedTurn {
             tail: PROMPT,
