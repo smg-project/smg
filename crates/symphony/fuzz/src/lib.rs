@@ -226,7 +226,7 @@ pub fn run(data: &[u8], table: Option<Table>) {
 ///
 /// As a replay does: a `feed` that fails is the `feed-failed` breach, and an engine that panics
 /// panics here.
-pub fn events(case: &Case, cuts: &[usize]) -> Vec<Event> {
+pub fn events(case: &Case, cuts: &[usize]) -> Vec<Event<'static>> {
     replay(case, cuts).events
 }
 
@@ -425,7 +425,7 @@ fn quoted(entry: &str) -> String {
 
 /// The events of one replay.
 struct Replayed {
-    events: Vec<Event>,
+    events: Vec<Event<'static>>,
 }
 
 /// The nonce both replays of a case count their call ids from: an engine draws its own at random
@@ -494,12 +494,12 @@ fn replay(case: &Case, cuts: &[usize]) -> Replayed {
     Replayed { events }
 }
 
-fn feed(
+fn feed<'d>(
     case: &Case,
     engine: &mut Engine,
-    input: Input<'_>,
-    out: &mut Events,
-    events: &mut Vec<Event>,
+    input: Input<'d>,
+    out: &mut Events<'d>,
+    events: &mut Vec<Event<'static>>,
 ) {
     let step = input.clone();
     let fed = engine.feed(input, out);
@@ -510,7 +510,7 @@ fn feed(
             .map_or_else(String::new, ToString::to_string);
         format!("{}: feed of {step:?} failed: {why}", describe(case))
     });
-    events.extend(out.drain());
+    events.extend(out.drain().into_iter().map(Event::into_owned));
 }
 
 /// The case, for a message.
@@ -527,13 +527,13 @@ fn describe(case: &Case) -> String {
 }
 
 /// The output bytes `event` accounts for.
-fn bytes_of(event: &Event) -> &str {
+fn bytes_of<'a>(event: &'a Event<'_>) -> &'a str {
     match event {
-        Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-        Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
+        Event::Content(t) | Event::Reasoning(t) => &t.text,
+        Event::Dropped { text, .. } | Event::Malformed { text, .. } => &text.text,
         Event::ToolCallStart { source, .. }
         | Event::ToolCallArguments { source, .. }
-        | Event::ToolCallEnd { source, .. } => source.text.as_str(),
+        | Event::ToolCallEnd { source, .. } => &source.text,
         Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
     }
 }
@@ -1206,7 +1206,7 @@ mod tests {
     /// The name of the breach `check_well_formed` reports on `events`, as the stream of one
     /// replay, or None when it holds: the checks on the shape of a stream, without a parser
     /// behind it, so that a check is tried on the event list it is about.
-    fn breach_in(table: Table, events: Vec<Event>) -> Option<String> {
+    fn breach_in(table: Table, events: Vec<Event<'static>>) -> Option<String> {
         // An allowance would turn a breach into a hold and the assertion into a riddle.
         assert!(
             allowances().is_empty(),
@@ -1235,7 +1235,7 @@ mod tests {
         }
     }
 
-    fn start(index: u32) -> Event {
+    fn start(index: u32) -> Event<'static> {
         Event::ToolCallStart {
             index,
             id: format!("call_{index}"),
@@ -1244,29 +1244,29 @@ mod tests {
         }
     }
 
-    fn arguments(index: u32, json: &str, source: &str) -> Event {
+    fn arguments(index: u32, json: &str, source: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index,
             json: json.to_string(),
-            source: Text::uncounted(source),
+            source: Text::uncounted(source.to_string()),
         }
     }
 
-    fn end(index: u32, source: &str) -> Event {
+    fn end(index: u32, source: &str) -> Event<'static> {
         Event::ToolCallEnd {
             index,
-            source: Text::uncounted(source),
+            source: Text::uncounted(source.to_string()),
         }
     }
 
-    fn malformed() -> Event {
+    fn malformed() -> Event<'static> {
         Event::Malformed {
             text: Text::uncounted(""),
             why: MalformedReason::UnterminatedRegion,
         }
     }
 
-    fn finish(tool_calls: u32) -> Event {
+    fn finish(tool_calls: u32) -> Event<'static> {
         Event::Finish {
             reason: FinishReason::ToolCalls,
             tool_calls,
