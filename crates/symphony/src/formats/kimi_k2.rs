@@ -954,7 +954,7 @@ mod tests {
         }
     }
 
-    fn read(tools: &[Tool], pieces: &[&str]) -> Vec<Event> {
+    fn read(tools: &[Tool], pieces: &[&str]) -> Vec<Event<'static>> {
         drive(
             &mut Engine::new(kimi_k2(), Declared::of(tools)),
             PROMPT,
