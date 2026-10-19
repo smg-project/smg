@@ -379,11 +379,11 @@ pub(crate) fn init_metrics() {
     // (`routers::grpc::regular::symphony::telemetry`).
     describe_counter!(
         symphony_telemetry::OUTPUTS,
-        "Outputs a Symphony table read to their end, by table and outcome: clean, malformed (a call region the table gave up on, folded into the content), failed (the table refused the output and the request failed)"
+        "Outputs a Symphony table read to their end, by table and outcome: clean, malformed (a call region the table gave up on, or a marker of the table where no row leads, kept as content), failed (the table refused the output and the request failed)"
     );
     describe_counter!(
         symphony_telemetry::MALFORMED,
-        "Malformed runs in the outputs a Symphony table read, by table and reason (unterminated_region, invalid_arguments, unknown_tool, other)"
+        "Malformed runs in the outputs a Symphony table read, by table and reason (unterminated_region, invalid_arguments, unknown_tool, marker_out_of_place, other)"
     );
     describe_histogram!(
         symphony_telemetry::MALFORMED_BYTES,
