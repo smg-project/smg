@@ -1948,8 +1948,8 @@ impl CacheAwarePolicy {
 
     /// The prompt's size in tokens for the cost form, the unit of the queued
     /// work and of the shares: the request's token count when it carries one
-    /// (the token tree, the hash index), else an estimate from the characters
-    /// the string tree matched on, at the prefix-hash policy's
+    /// (the token tree, the event-driven index), else an estimate from the
+    /// characters the string tree matched on, at the prefix-hash policy's
     /// [`CHARS_PER_TOKEN`] per token and never under one. The scorer's own
     /// fallback, the mean prefill, would price the prefix a deep text prompt
     /// saves no higher than a shallow one's, whatever its length.
