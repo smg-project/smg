@@ -902,18 +902,7 @@ mod tests {
 
     /// The text of every `Malformed` event, one entry per event, whatever its reason: an event of
     /// no bytes counts here, where the joined text of [`malformed`] does not show it.
-    fn words(events: &[Event]) -> Vec<&str> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// The malformed text, whole: the events that carry it depend on the cuts, the text does not.
-    fn malformed(events: &[Event]) -> String {
+    fn words<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
@@ -921,6 +910,11 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The malformed text, whole: the events that carry it depend on the cuts, the text does not.
+    fn malformed(events: &[Event]) -> String {
+        words(events).concat()
     }
 
     fn tool(name: &str, parameters: serde_json::Value) -> Tool {
