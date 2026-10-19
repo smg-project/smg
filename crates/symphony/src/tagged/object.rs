@@ -83,6 +83,12 @@ impl Object {
         });
     }
 
+    /// The carried bytes refused ([`refuse`](super::refuse)): a `Malformed` event of no bytes
+    /// with `why`, then the bytes as `Dropped { MalformedCall }`; nothing when none.
+    pub(super) fn refuse(&mut self, why: MalformedReason, out: &mut Events) {
+        super::refuse(std::mem::take(&mut self.carried), why, out);
+    }
+
     /// Whitespace carried before text that is reported: the template's, dropped so the report
     /// holds only the text; nothing when none.
     pub(super) fn drop_carried(&mut self, out: &mut Events) {

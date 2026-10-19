@@ -54,7 +54,8 @@ What the engine decides for every format, and what it leaves open:
   the assembler writes closes only at the call's own end, and so does one whose close cut a streamed
   string, in every tag-based syntax (`tagged::end_cut_call`): no closing quote and no closing brace
   are made up for a value the model never finished, and the one event carries the bytes still held,
-  when there are any. Gemma's reader does the same in its own way (`gemma::Assembler::end`): its one
+  when there are any (the keyed syntax refuses them first, as `Dropped { MalformedCall }`, and its
+  event carries none: `tagged::refuse`). Gemma's reader does the same in its own way (`gemma::Assembler::end`): its one
   event names the value's reason, which the engine does not rename, and the bytes held at the marker
   are the string's text, not the event's. A pythonic call the end cut ends as a tagged one does
   (`tagged::end_cut_call`), the cut right after its `(` included, since its object closes only at

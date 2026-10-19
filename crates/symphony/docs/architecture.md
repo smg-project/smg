@@ -140,8 +140,10 @@ Three tiers, two of them at run time:
 - **Dropped**: bytes the format consumed on purpose, each with a `DropReason`: a marker that moved
   the engine or a special token (`ControlToken`, `Wrapper`), the template's wrapping between regions
   (`Wrapper`), whitespace the format treats as structural (`Whitespace`), a call after the first
-  where the request takes one call only (`LaterCall`). Dropped bytes are
-  expected on every well-formed output.
+  where the request takes one call only (`LaterCall`), and the bytes of a call block a syntax
+  whose block is never prose could not read (`MalformedCall`, behind a `Malformed` event of no
+  bytes that counts the failure). Dropped bytes are expected on every well-formed output, the
+  last kind excepted.
 - **Malformed**: bytes of a region the parser gave up on, returned whole, each with a
   `MalformedReason` from a closed set: the stream ended inside a region (`UnterminatedRegion`),
   arguments that did not parse (`InvalidArguments`), a call to a function the request did not
@@ -155,8 +157,11 @@ Three tiers, two of them at run time:
   carries per-syntax known differences and opt-in allowances for the classes the recorded
   references get wrong. Each run counts them on its diagnostic line.
 
-The adapters show malformed text as content and drop nothing, so a client never loses the bytes;
-the reason is for the operator. The set is closed and `Copy` so that a reader can count malformed
+The adapters show malformed text as content and drop nothing, so a client never loses the bytes a
+parser hands back with the event; the keyed syntax, whose block is never prose, hands them back as
+`Dropped { MalformedCall }` behind an event of no bytes instead, so that the failure is counted and
+the format's own tags never reach the answer (`docs/assemblers.md`). The reason is for the
+operator. The set is closed and `Copy` so that a reader can count malformed
 regions by table and reason as a bounded label, log a sample with the table, the reason and the
 bytes' length, and mark the request's span; how a gateway surfaces that (metric, log, span event,
 and whether a request may ask for the reasons on the wire) is the gateway's policy, documented with

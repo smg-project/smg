@@ -163,7 +163,7 @@ What the syntax says, and what the assembler does with it:
   next event's source. The name is known only when that tag arrives, so `ToolCallStart` waits
   for it; names are short. A name holds no whitespace, quote, brace, bracket, parenthesis or
   angle bracket: any other text there (the JSON of a `<tool_call>` block quoted inside a code
-  fence, prose, a call written as Python) is reported, and no call starts, so a block that names
+  fence, prose, a call written as Python) is refused, and no call starts, so a block that names
   no call writes no arguments either.
 - **A value's type comes from the request's tools**, as in the Qwen assembler: a declared string
   is its text, streamed as it arrives; every other value is written whole at `</arg_value>`
@@ -173,18 +173,29 @@ What the syntax says, and what the assembler does with it:
 - **Inside a value only `</arg_value>` is a tag**; the other three there are the value's text.
 - **Two endings.** `Assembler::close` is the call's closing marker, or the block's end before
   it: after the last value it names the call if it has not, closes the object and pushes
-  `ToolCallEnd` with the marker's bytes; inside a value held for its close it reports what was
+  `ToolCallEnd` with the marker's bytes; inside a value held for its close it refuses what was
   held and closes the object without that member; inside a streamed string it closes nothing,
-  since nothing is made up for a value the model never finished, and the one `Malformed` event
-  before the end, with what was held or no bytes, says that the arguments are no whole value
-  (`tagged::end_cut_call`). `Assembler::finish` is a stream that was cut: nothing is closed,
-  and a started call ends as the Qwen assembler's does, after one `Malformed { UnterminatedRegion }`
-  event, with what was held or no bytes, that says its arguments are no whole value
-  (`tagged::end_cut_call`).
+  since nothing is made up for a value the model never finished: what was held is refused, and
+  the one `Malformed` event of no bytes before the end says that the arguments are no whole
+  value (`tagged::end_cut_call`). `Assembler::finish` is a stream that was cut: nothing is
+  closed, what was held is refused, and a started call ends as the Qwen assembler's does, after
+  one `Malformed { UnterminatedRegion }` event of no bytes that says its arguments are no whole
+  value (`tagged::end_cut_call`).
+- **Nothing the syntax cannot read is content** (`tagged::refuse`). The block's markers and its
+  four tags are the format's own tokens, and the text between them where the syntax has no place
+  for text (a value whose key never opened, a tag written twice, a name that is prose, Python or
+  JSON) is the model's failed call: the families' own parsers drop such a block whole, and a
+  client shown it saw the format's tags at the end of the answer (`</arg_key><arg_value>1975
+  </arg_value>`, in 20 of 292 answers of a live cell). Such bytes are refused: a `Malformed`
+  event of no bytes with the reason stands where the bytes do, so a reader counts the failure at
+  its offset, and the bytes leave as `Dropped { MalformedCall }`, never as content; a call that
+  started keeps the pairs it read (`{}` when none), and a block that named no call has every
+  byte refused, the marker that closed it included. The attributed, XML and Qwen-tagged
+  assemblers still carry such bytes in the `Malformed` event, which the adapters show.
 - **Every byte of the call lands in exactly one event**, with the Qwen assembler's accounting:
   the name's bytes in `ToolCallStart`, each tag's and value's bytes in the fragments they
-  produce, text where the syntax has tags as `Malformed` run by run with the whitespace before
-  it as `Dropped { Wrapper }`.
+  produce, the whitespace the template writes between tags as `Dropped { Wrapper }`, and what
+  the syntax cannot read as `Dropped { MalformedCall }` behind its `Malformed` event of no bytes.
 
 ## The attributed assembler (`tagged::attributed`)
 

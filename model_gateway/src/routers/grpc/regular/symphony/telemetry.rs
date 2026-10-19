@@ -7,7 +7,8 @@
 //! - `failed`: output the table could not read at all: the engine refused (`ParseError`); the
 //!   request answers with an error;
 //! - `malformed`: a call region the table read but gave up on (`Event::Malformed`), by its
-//!   reason; the bytes reach the client as content, so nothing is lost and nothing says so;
+//!   reason; the bytes reach the client as content, or are dropped behind an event of no bytes
+//!   where the syntax's block is never prose, so nothing is lost and nothing says so;
 //! - `dropped`: bytes the table treats as the template's wrapping (`Event::Dropped`): correct,
 //!   expected on every output, not counted here;
 //! - `forgiven`: a repair that keeps the answer's shape. Of those, the calls after the first

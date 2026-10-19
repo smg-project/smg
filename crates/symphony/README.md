@@ -40,8 +40,9 @@ one implementation.
 
 Every byte of output lands in exactly one event: content, reasoning, a call's name, a fragment of
 its arguments, bytes the format dropped as wrapping (`Dropped`, with the reason), or bytes a region
-could not be parsed from (`Malformed`, returned whole with the reason). Nothing vanishes silently,
-and a client that wants the raw text back can have it.
+could not be parsed from (`Malformed`, returned whole with the reason, or as `Dropped` bytes behind
+an event of no bytes where the syntax's block is never prose). Nothing vanishes silently, and a
+client that wants the raw text back can have it.
 
 ### The public types
 
