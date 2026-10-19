@@ -24,8 +24,9 @@ The definition is the table below; the `Engine` runs it, and decides everything 
   off): the same rows read both, as the recorded sets of the four groups show.
 - The table carries its template's two newlines after the thought's close (`</think>\n\n` before
   the content or the first call) as its thought layout, so a forced call written where the close
-  left the engine begins with them and not with `<tool_call>` (`grammar`); MiMo's template writes
-  what follows right after the close, and `qwen3_tagged_direct` carries none.
+  left the engine begins with them and not with `<tool_call>` (`grammar`); a prompt with thinking
+  switched off has written them itself (`</think>\n\n` at its end), and the tag owes none. MiMo's
+  template writes what follows right after the close, and `qwen3_tagged_direct` carries none.
 
 The tests here are the engine's as much as this format's: they were written against the hand-written
 parser this table replaced, and hold the table to the same events.
@@ -224,8 +225,9 @@ whose they are is bellwether #17's question, as for Qwen3.
 
 The table carries its template's newline after the thought's close (`</think>\n` before the content
 or the first call) as its thought layout, so a forced call written where the close left the engine
-begins with it and not with `<tool_call>` (`grammar`); a `<tool_call>` inside the thought stays
-thought text, as for Qwen3.
+begins with it and not with `<tool_call>` (`grammar`); a prompt with thinking switched off ends with
+the bare `<think></think>`, so the newline stays the tag's to write. A `<tool_call>` inside the
+thought stays thought text, as for Qwen3.
 
 ## MiniMax M2 (`minimax_m2`)
 
@@ -598,9 +600,9 @@ newlines around the thought and before the calls reach the reasoning and content
 A forced call's structural tag is each call as a tag its opener triggers, the parameter tags with
 nothing between them (`grammar`). The table carries its template's two newlines after the thought's
 close (`</think>\n\n` before the content or the first call) as its thought layout, so a forced call
-written where the close left the engine begins with them and not with `<function name="`; the
-table's row out of the thought on a call's opener reads a call wherever it stands, inside the
-thought too.
+written where the close left the engine begins with them and not with `<function name="`; a prompt
+with thinking switched off has written them itself, and the tag owes none. The table's row out of
+the thought on a call's opener reads a call wherever it stands, inside the thought too.
 
 ## dots3 (`dots3`)
 
@@ -617,7 +619,8 @@ replay starts there.
 
 The table carries its template's two newlines after the thought's close (`</think>\n\n` before the
 content or the calls) as its thought layout, so a forced call written where the close left the
-engine begins with them and not with `<dots_function_call>` (`grammar`). The newline the template
+engine begins with them and not with `<dots_function_call>` (`grammar`); a prompt with thinking
+switched off has written them itself, and the tag owes none. The newline the template
 writes before every block is the call's own lead, which the tag does not write: a block written
 after the two newlines reads as one written after three. The table's row out of the thought on the
 block's opener reads a block wherever it stands, inside the thought too.

@@ -255,18 +255,26 @@ impl MessagePreparationStage {
         // prompt where a table reads the message: a turn the prompt leaves
         // unopened starts inside the thought whatever the switch says, and the
         // tag must read it as the engine will (`regular::symphony::reasoning_open`).
-        let reasoning = utils::messages_reasoning_starts_in_prefill(
+        let switch = utils::messages_reasoning_starts_in_prefill(
             request,
             processed_messages.continued_final_message,
             tokenizer.as_ref(),
-        ) || symphony::reasoning_open(
-            parser,
-            &names,
-            &request.model,
-            &ctx.components.templates,
-            &processed_messages.text,
-        )
-        .is_some_and(|thought| thought.open);
+        );
+        let replay = (!switch)
+            .then(|| {
+                symphony::reasoning_open(
+                    parser,
+                    &names,
+                    &request.model,
+                    &ctx.components.templates,
+                    &processed_messages.text,
+                )
+            })
+            .flatten();
+        let reasoning = switch || replay.is_some_and(|thought| thought.open);
+        // The prompt closed the thought itself and wrote the template's text
+        // after it (thinking switched off): the calls' tag owes none of it.
+        let thought_closed = replay.is_some_and(|thought| thought.closed);
         let workers = ctx
             .components
             .worker_registry
@@ -280,6 +288,7 @@ impl MessagePreparationStage {
             },
             &filtered_tools,
             reasoning,
+            thought_closed,
             symphony::grammar_start_of(&workers),
             &ctx.components.templates,
         );

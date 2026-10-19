@@ -49,7 +49,7 @@ fn reasoning_decision(
     chat_request: &openai_protocol::chat::ChatCompletionRequest,
     processed_text: &str,
     continued_final_message: bool,
-) -> bool {
+) -> (bool, bool) {
     reading::reasoning_decision(ctx, &chat_request.model, processed_text, |tokenizer| {
         utils::chat_reasoning_starts_in_rendered_prefill(
             chat_request,
@@ -94,7 +94,9 @@ pub(crate) async fn build_chat_backed_plan(
         disaggregated,
     );
 
-    let require_reasoning =
+    // The plan needs the decision alone; the prompt's closed thought shapes the
+    // `auto` tag in `reading::decide`, which reads it with the decision.
+    let (require_reasoning, _thought_closed) =
         reasoning_decision(ctx, chat_request, &processed_text, continued_final_message);
 
     // Now that the worker is known, a forced call's grammar takes the shape
@@ -219,14 +221,18 @@ impl BuildStage for ChatRequestBuildingStage {
             &chat_request.effective_tool_list(),
             &processed_messages.text,
             tool_constraints,
-            |ctx| reading::Auto {
-                request: symphony::AutoRequest::Chat(Arc::clone(&chat_request)),
-                reasoning_open: reasoning_decision(
+            |ctx| {
+                let (reasoning_open, thought_closed) = reasoning_decision(
                     ctx,
                     &chat_request,
                     &processed_messages.text,
                     processed_messages.continued_final_message,
-                ),
+                );
+                reading::Auto {
+                    request: symphony::AutoRequest::Chat(Arc::clone(&chat_request)),
+                    reasoning_open,
+                    thought_closed,
+                }
             },
         )?;
         // The table's structural tag stands in for a JSON response_format (see

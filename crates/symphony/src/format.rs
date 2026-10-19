@@ -1140,6 +1140,26 @@ impl Format {
         self.emits(self.prompt_state(prompt)) == Emits::Reasoning
     }
 
+    /// Whether `prompt` closed the thought itself and wrote what the template writes after the
+    /// close (a request with thinking switched off: Qwen3's `<think>\n\n</think>\n\n`), so the
+    /// structural tags owe none of it before their first text
+    /// ([`Options::thought_closed`](crate::grammar::Options::thought_closed)). `false` for a table
+    /// whose layout has no thought, a prompt that leaves the thought open or to the model, and
+    /// one that ends with the bare close (GLM 4.6's `<think></think>`, whose newline the tag still
+    /// writes).
+    pub fn thought_closed(&self, prompt: &str) -> bool {
+        let Some(thought) = self.layout().and_then(|layout| layout.thought.as_ref()) else {
+            return false;
+        };
+        let Some(close) = thought.close.as_deref() else {
+            return false;
+        };
+        !thought.after.is_empty()
+            && prompt
+                .strip_suffix(&*thought.after)
+                .is_some_and(|before| before.ends_with(close))
+    }
+
     /// The format's name.
     pub fn name(&self) -> &str {
         &self.name

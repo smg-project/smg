@@ -314,6 +314,22 @@ mod tests {
                                </invoke>\n</dots_function_call>";
 
     #[test]
+    fn a_prompt_with_thinking_off_has_written_the_templates_two_newlines_itself() {
+        // A request that turns thinking off closes an empty thought in the prompt and writes the
+        // two newlines after it: the table reads that from the prompt, and a forced call written
+        // from there is the calls at once on every start, the newlines not written a second time;
+        // the prompt that leaves the thought to the model has written nothing.
+        use crate::testing::a_forced_tag_after_a_prompt_that_wrote_the_templates_text;
+        a_forced_tag_after_a_prompt_that_wrote_the_templates_text(
+            &dots3(),
+            &tools(),
+            "<|assistant|><think>\n\n</think>\n\n",
+            PROMPT,
+            "<dots_function_call>",
+        );
+    }
+
+    #[test]
     fn a_forced_call_after_the_thoughts_close_begins_with_the_templates_two_newlines() {
         // The template writes two newlines after the thought's close before the content or the
         // calls, and the table carries that part of its layout: where the grammar starts after

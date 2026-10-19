@@ -538,6 +538,7 @@ mod tests {
         Options {
             at_least_one: true,
             reasoning_open,
+            thought_closed: false,
             one_call,
             start,
         }
@@ -683,6 +684,7 @@ mod tests {
             Options {
                 at_least_one: false,
                 reasoning_open: false,
+                thought_closed: false,
                 one_call: false,
                 start: GrammarStart::Unknown,
             },

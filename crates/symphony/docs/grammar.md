@@ -146,8 +146,14 @@ the grammar cannot start with it, cannot do so when the tag begins with the newl
 prompt leaves the thought closed and the engine starts the grammar at the first token, or does not
 say where (the grammar may then start at the turn's own start, where nothing stands after a close),
 such a table's tag is still the calls at once (the thought is not admitted before them: the shape
-MiniMax M3's bare-close row gives is the one that would). An answer's tag keeps the schema alone
-after the close, the engine's own constraint, which the registry's tables leave to it.
+MiniMax M3's bare-close row gives is the one that would). Where the prompt closed the thought itself
+and wrote the template's text after it (a request with thinking switched off: Qwen3's
+`<think>\n\n</think>\n\n`), the tag owes that text on no start, or it would write the newlines a
+second time; the gateway reads it from the rendered prompt as it reads `reasoning_open`
+(`Format::thought_closed`, `Options::thought_closed`), and a thought the model writes anyway carries
+its own. GLM 4.6's thinking-off prompt ends with the bare `<think></think>`, so its newline stays the
+tag's to write. An answer's tag keeps the schema alone after the close, the engine's own constraint,
+which the registry's tables leave to it.
 
 A marker that is one token of the model's vocabulary (`Format::marker_tokens`: a terminal, a
 structural token, one of the syntax's own tags (`CallSyntax::tag_texts`), or a token inside one) is

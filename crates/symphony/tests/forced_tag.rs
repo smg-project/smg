@@ -82,6 +82,7 @@ fn configurations() -> Vec<(String, Options, std::ops::Range<usize>)> {
                     Options {
                         at_least_one: true,
                         reasoning_open,
+                        thought_closed: false,
                         one_call,
                         start,
                     },

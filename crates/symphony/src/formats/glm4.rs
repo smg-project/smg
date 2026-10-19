@@ -226,6 +226,35 @@ mod tests {
                                <arg_value>latte</arg_value>\n</tool_call>";
 
     #[test]
+    fn a_prompt_with_thinking_off_ends_with_the_bare_close_and_the_newline_stays_the_tags() {
+        // The thinking-off prompt closes an empty thought without the newline the template writes
+        // after the close before the content or a call, so the prompt has not written it: a
+        // forced call written after the gate of the engine's reasoning parser still begins with
+        // it, as with the thought left to the model.
+        use crate::grammar::{GrammarStart, Options};
+        let format = glm4();
+        assert!(!format.thought_closed(PROMPT_THINKING_OFF));
+        assert!(!format.thought_closed(PROMPT));
+        assert!(!format.reasoning_open(PROMPT_THINKING_OFF));
+        let tag = format
+            .grammar_for(
+                &tools(),
+                Options {
+                    at_least_one: true,
+                    reasoning_open: format.reasoning_open(PROMPT_THINKING_OFF),
+                    thought_closed: format.thought_closed(PROMPT_THINKING_OFF),
+                    one_call: false,
+                    start: GrammarStart::AfterReasoning,
+                },
+            )
+            .expect("a tag")
+            .payload();
+        assert_eq!(tag["format"]["type"], "sequence");
+        assert_eq!(tag["format"]["elements"][0]["type"], "const_string");
+        assert_eq!(tag["format"]["elements"][0]["value"], "\n");
+    }
+
+    #[test]
     fn a_forced_call_after_the_thoughts_close_begins_with_the_templates_newline() {
         // The GLM 4.5 and 4.6 templates write a newline after the thought's close before the
         // content or the first call, and the table carries that part of its layout: where the

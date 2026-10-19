@@ -316,6 +316,7 @@ pub(crate) fn reasoning_open(
         // tokenizer ships a response template today.
         Ok(Some(format)) => Some(PromptThought {
             open: format.reasoning_open(prompt),
+            closed: format.thought_closed(prompt),
             alone: format.name() == Table::Gemma4.name(),
         }),
         _ => None,
@@ -328,6 +329,9 @@ pub(crate) fn reasoning_open(
 pub(crate) struct PromptThought {
     /// The prompt leaves the model inside its thought.
     pub open: bool,
+    /// The prompt closed the thought itself and wrote what the template writes after the close
+    /// (thinking switched off), so the tag owes none of it ([`Format::thought_closed`]).
+    pub closed: bool,
     /// The replay decides alone, without the request's thinking switch: Gemma 4 prefills an open
     /// thought channel only after a tool response, so thinking enabled on a new turn says nothing
     /// about the prompt. The rule its legacy reasoning parser applied in place of the switch,

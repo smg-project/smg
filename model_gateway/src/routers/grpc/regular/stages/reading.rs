@@ -36,13 +36,15 @@ use crate::{
 /// an open channel only after a tool response), and no legacy parser is built
 /// to be asked; otherwise native Gemma4 channels follow the rendered prompt
 /// when that parser decides, and other parsers keep their tokenizer-driven
-/// preference for the engine's reasoning gate.
+/// preference for the engine's reasoning gate. With it, whether the prompt
+/// closed the thought itself and wrote the template's text after it
+/// (`PromptThought::closed`), which the `auto` tag then owes nothing of.
 pub(crate) fn reasoning_decision(
     ctx: &RequestContext,
     model: &str,
     processed_text: &str,
     switch: impl FnOnce(&dyn Tokenizer) -> bool,
-) -> bool {
+) -> (bool, bool) {
     let switch = || {
         ctx.tokenizer_arc()
             .is_some_and(|tokenizer| switch(tokenizer.as_ref()))
@@ -54,26 +56,31 @@ pub(crate) fn reasoning_decision(
         &ctx.components.templates,
         processed_text,
     ) {
-        Some(thought) => thought.or_switch(switch),
-        None => utils::rendered_prompt_reasoning_in_prefill(
-            &ctx.components.reasoning_parser_factory,
-            ctx.components
-                .parser_resolver
-                .reasoning_parser(model)
-                .as_deref(),
-            model,
-            processed_text,
-        )
-        .unwrap_or_else(switch),
+        Some(thought) => (thought.or_switch(switch), thought.closed),
+        None => (
+            utils::rendered_prompt_reasoning_in_prefill(
+                &ctx.components.reasoning_parser_factory,
+                ctx.components
+                    .parser_resolver
+                    .reasoning_parser(model)
+                    .as_deref(),
+                model,
+                processed_text,
+            )
+            .unwrap_or_else(switch),
+            false,
+        ),
     }
 }
 
 /// What the table's `auto` tag derives for, when the worker's policy asks for
 /// the tag ([`symphony::AutoTag`]): the request, with the tools the tag is
-/// over, and whether the prompt leaves the model inside its thought.
+/// over, and whether the prompt leaves the model inside its thought, or
+/// closed it itself and wrote the template's text after it.
 pub(crate) struct Auto {
     pub request: AutoRequest,
     pub reasoning_open: bool,
+    pub thought_closed: bool,
 }
 
 /// What [`decide`] decided for the response.
@@ -140,6 +147,7 @@ pub(crate) fn decide(
             let Auto {
                 request,
                 reasoning_open,
+                thought_closed,
             } = auto(ctx);
             symphony::AutoTag {
                 parser,
@@ -147,6 +155,7 @@ pub(crate) fn decide(
                 flags: names.flags.clone(),
                 request,
                 reasoning_open,
+                thought_closed,
                 templates: Arc::clone(&ctx.components.templates),
             }
         },

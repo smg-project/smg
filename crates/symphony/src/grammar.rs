@@ -500,6 +500,10 @@ pub struct Options {
     pub at_least_one: bool,
     /// The prompt left the model inside its thought.
     pub reasoning_open: bool,
+    /// The prompt closed the thought itself and wrote what the template writes after the close (a
+    /// request with thinking switched off): the tag owes nothing before its first text, and a
+    /// thought the model writes anyway carries its own ([`Format::thought_closed`]).
+    pub thought_closed: bool,
     /// At most one call: a named function, or `parallel_tool_calls: false`. The tag stops after
     /// the first call, and the call's end carries what the template writes after the last call to
     /// end the turn, so nothing else can follow.
@@ -675,6 +679,7 @@ impl Format {
             Options {
                 at_least_one,
                 reasoning_open,
+                thought_closed: false,
                 one_call: false,
                 start: GrammarStart::Unknown,
             },
@@ -815,6 +820,7 @@ impl Format {
         self.led(
             calls,
             options.reasoning_open,
+            options.thought_closed,
             prefixed,
             options.start,
             after,
@@ -878,7 +884,7 @@ impl Format {
                 _ => Grammar::Sequence(parts),
             };
             return self
-                .led(answer, reasoning_open, true, start, "")
+                .led(answer, reasoning_open, false, true, start, "")
                 .map(|grammar| self.bounded(grammar));
         }
         // The model starts in its thought when the prompt opened it, and otherwise in the turn's
@@ -963,6 +969,7 @@ impl Format {
             Grammar::Tag(Tag::new(begin, answer, end)),
             reasoning_open,
             false,
+            false,
             start,
             "",
         )
@@ -991,11 +998,14 @@ impl Format {
     /// call's marker: an engine that holds the grammar back until the thought ends, and takes a
     /// call marker the model writes inside its thought as that end, cannot start the forced call
     /// there when the tag cannot start with the marker. Empty where the table has no layout, or
-    /// the caller writes `after` itself (an answer's tag).
+    /// the caller writes `after` itself (an answer's tag). Where the prompt closed the thought
+    /// itself and wrote `after` (`thought_closed`: a request with thinking switched off), the tag
+    /// owes it on no start ([`Self::thought_the_model_may_write_first`]).
     fn led(
         &self,
         body: Grammar,
         reasoning_open: bool,
+        thought_closed: bool,
         prefixed: bool,
         start: GrammarStart,
         after: &str,
@@ -1016,7 +1026,12 @@ impl Format {
             };
         }
         if !self.writes_thought_first() {
-            return Some(self.thought_the_model_may_write_first(body, start, after));
+            return Some(self.thought_the_model_may_write_first(
+                body,
+                start,
+                after,
+                thought_closed,
+            ));
         }
         let reasoning = self.state_emitting(Emits::Reasoning)?;
         let thought = self.region(reasoning, |state| self.is_call_state(state))?;
@@ -1159,11 +1174,19 @@ impl Format {
     /// after the close; at the first token, and where the engine does not say (the grammar may
     /// then start at the turn's own start, where nothing stands after a close), `body` at once,
     /// as before.
+    ///
+    /// Where the prompt closed the thought itself and wrote `after` (`thought_closed`: a request
+    /// with thinking switched off, whose generation prompt ends with the close and the template's
+    /// text after it), nothing is owed before `body` on any start, or the tag would write that
+    /// text a second time; a thought or a close the model writes anyway carries its own `after`,
+    /// as where the engine does not say. A prompt that ends with the bare close (GLM 4.6's
+    /// `<think></think>`) has not written it, and the tag still does.
     fn thought_the_model_may_write_first(
         &self,
         body: Grammar,
         start: GrammarStart,
         after: &str,
+        thought_closed: bool,
     ) -> Grammar {
         let Some(reasoning) = self.state_emitting(Emits::Reasoning) else {
             return body;
@@ -1184,9 +1207,10 @@ impl Format {
             .transitions()
             .any(|(source, on, _)| source == 0 && self.terminal_text(on) == close);
         if !closes_from_start {
-            return match start {
-                GrammarStart::AfterReasoning => after_the_close(after, body),
-                GrammarStart::FirstToken | GrammarStart::Unknown => body,
+            return if start == GrammarStart::AfterReasoning && !thought_closed {
+                after_the_close(after, body)
+            } else {
+                body
             };
         }
         let text = Grammar::AnyText {
@@ -1196,9 +1220,10 @@ impl Format {
         let bare = Grammar::ConstString(close.to_string());
         // After the gate of the engine's reasoning parser, which has read the thought or the bare
         // close, `after` is owed once before `body`, whichever of the two the engine read; the
-        // thought or the close the tag still admits there would be a second one. Elsewhere each
-        // of the two carries `after`, and nothing is owed where the model writes neither.
-        let gated = start == GrammarStart::AfterReasoning;
+        // thought or the close the tag still admits there would be a second one. Elsewhere, and
+        // where the prompt wrote `after` after the thought it closed, each of the two carries
+        // `after`, and nothing is owed where the model writes neither.
+        let gated = start == GrammarStart::AfterReasoning && !thought_closed;
         let first = if after.is_empty() || gated {
             Grammar::Or(vec![thought, bare])
         } else {
@@ -2629,6 +2654,7 @@ mod tests {
                 Options {
                     at_least_one,
                     reasoning_open,
+                    thought_closed: false,
                     one_call: true,
                     start: GrammarStart::Unknown,
                 },
@@ -2842,6 +2868,7 @@ mod tests {
                         Options {
                             at_least_one,
                             reasoning_open,
+                            thought_closed: false,
                             one_call: false,
                             start: GrammarStart::Unknown,
                         },
@@ -3223,6 +3250,7 @@ mod tests {
                         Options {
                             at_least_one: true,
                             reasoning_open,
+                            thought_closed: false,
                             one_call,
                             start: GrammarStart::Unknown,
                         },
@@ -3271,6 +3299,7 @@ mod tests {
                     Options {
                         at_least_one: true,
                         reasoning_open,
+                        thought_closed: false,
                         one_call: false,
                         start,
                     },
@@ -3369,6 +3398,7 @@ mod tests {
                 Options {
                     at_least_one: true,
                     reasoning_open: true,
+                    thought_closed: false,
                     one_call: false,
                     start,
                 },
@@ -3487,6 +3517,7 @@ mod tests {
             let options = Options {
                 at_least_one: true,
                 reasoning_open: false,
+                thought_closed: false,
                 one_call,
                 start: GrammarStart::Unknown,
             };
@@ -3637,6 +3668,7 @@ mod tests {
                     Options {
                         at_least_one: true,
                         reasoning_open,
+                        thought_closed: false,
                         one_call: true,
                         start,
                     },
@@ -3681,6 +3713,7 @@ mod tests {
                     Options {
                         at_least_one,
                         reasoning_open: false,
+                        thought_closed: false,
                         one_call,
                         start: GrammarStart::AfterReasoning,
                     },
@@ -3724,6 +3757,7 @@ mod tests {
                 Options {
                     at_least_one: true,
                     reasoning_open: false,
+                    thought_closed: false,
                     one_call: true,
                     start,
                 },
@@ -3769,6 +3803,7 @@ mod tests {
                     Options {
                         at_least_one: true,
                         reasoning_open: false,
+                        thought_closed: false,
                         one_call: false,
                         start,
                     },
@@ -3790,6 +3825,7 @@ mod tests {
                     Options {
                         at_least_one: true,
                         reasoning_open: false,
+                        thought_closed: false,
                         one_call: true,
                         start,
                     },
@@ -4260,6 +4296,7 @@ mod tests {
             let options = Options {
                 at_least_one,
                 reasoning_open,
+                thought_closed: false,
                 one_call,
                 start: GrammarStart::Unknown,
             };
@@ -4534,6 +4571,7 @@ mod tests {
                     Options {
                         at_least_one: true,
                         reasoning_open,
+                        thought_closed: false,
                         one_call: false,
                         start: GrammarStart::Unknown,
                     },

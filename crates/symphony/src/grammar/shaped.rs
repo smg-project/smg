@@ -689,6 +689,7 @@ mod tests {
         Options {
             at_least_one,
             reasoning_open: false,
+            thought_closed: false,
             one_call,
             start: GrammarStart::Unknown,
         }

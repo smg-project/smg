@@ -392,24 +392,33 @@ pub(crate) async fn prepare_chat_like(
         // prompt where a table reads the response: a turn the prompt leaves
         // unopened starts inside the thought whatever the switch says, and the
         // tag must read it as the engine will (`regular::symphony::reasoning_open`).
-        let reasoning = utils::chat_reasoning_starts_in_rendered_prefill(
+        let switch = utils::chat_reasoning_starts_in_rendered_prefill(
             request,
             processed_messages.continued_final_message,
             tokenizer.as_ref(),
-        ) || symphony::reasoning_open(
-            parser,
-            &names,
-            &request.model,
-            &ctx.components.templates,
-            &processed_messages.text,
-        )
-        .is_some_and(|thought| thought.open);
+        );
+        let replay = (!switch)
+            .then(|| {
+                symphony::reasoning_open(
+                    parser,
+                    &names,
+                    &request.model,
+                    &ctx.components.templates,
+                    &processed_messages.text,
+                )
+            })
+            .flatten();
+        let reasoning = switch || replay.is_some_and(|thought| thought.open);
+        // The prompt closed the thought itself and wrote the template's text
+        // after it (thinking switched off): the calls' tag owes none of it.
+        let thought_closed = replay.is_some_and(|thought| thought.closed);
         let symphony_constraint = symphony::constraint(
             parser,
             &names,
             symphony::Asks::Chat(request),
             &constraint_tools,
             reasoning,
+            thought_closed,
             symphony::grammar_start_of(&workers),
             &ctx.components.templates,
         );

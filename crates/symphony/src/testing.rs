@@ -189,9 +189,10 @@ pub(crate) fn the_same_at_every_cut(
 /// its reasoning parser and at the first token. Where the grammar starts after the close, the tag
 /// begins with `after` and then the calls, whose every way in begins with `marker`; with the
 /// thought closed, where the engine does not say or starts at the first token, the calls at once,
-/// as before; with the thought open, the thought closed by its marker (at the first token) or the
-/// free text that may hold the close (where the engine does not say) comes first, then `after`,
-/// then the calls.
+/// as before, and on every start where the prompt wrote `after` itself after the close it wrote
+/// (thinking switched off); with the thought open, the thought closed by its marker (at the first
+/// token) or the free text that may hold the close (where the engine does not say) comes first,
+/// then `after`, then the calls.
 pub(crate) fn a_forced_tag_begins_with_the_templates_text(
     format: &Format,
     tools: &[Tool],
@@ -204,13 +205,14 @@ pub(crate) fn a_forced_tag_begins_with_the_templates_text(
         ("a named function", true, &tools[..1]),
         ("required", false, tools),
     ] {
-        let tag = |reasoning_open: bool, start: GrammarStart| -> Value {
+        let tag_of = |reasoning_open: bool, thought_closed: bool, start: GrammarStart| -> Value {
             format
                 .grammar_for(
                     passed,
                     Options {
                         at_least_one: true,
                         reasoning_open,
+                        thought_closed,
                         one_call,
                         start,
                     },
@@ -218,6 +220,7 @@ pub(crate) fn a_forced_tag_begins_with_the_templates_text(
                 .unwrap_or_else(|| panic!("{choice}: no tag"))
                 .payload()
         };
+        let tag = |reasoning_open: bool, start: GrammarStart| tag_of(reasoning_open, false, start);
         // With the thought closed, where the engine does not say: the calls at once.
         let calls = tag(false, GrammarStart::Unknown);
         let calls = &calls["format"];
@@ -255,6 +258,19 @@ pub(crate) fn a_forced_tag_begins_with_the_templates_text(
             gated,
             "{choice}: after the gate with the thought open"
         );
+        // The prompt closed the thought itself and wrote `after` (thinking switched off): the
+        // calls at once on every start, the template's text not written a second time.
+        for start in [
+            GrammarStart::Unknown,
+            GrammarStart::AfterReasoning,
+            GrammarStart::FirstToken,
+        ] {
+            assert_eq!(
+                tag_of(false, true, start)["format"],
+                *calls,
+                "{choice}: the prompt wrote the template's text, {start:?}"
+            );
+        }
         // The thought open, from the first token: the thought closed by its marker, `after`,
         // the calls.
         let first = tag(true, GrammarStart::FirstToken);
@@ -279,5 +295,64 @@ pub(crate) fn a_forced_tag_begins_with_the_templates_text(
         assert_eq!(elements[0]["type"], "any_text", "{choice}: {unknown}");
         assert_eq!(elements[1], text, "{choice}: {unknown}");
         assert_eq!(elements[2], *calls, "{choice}: {unknown}");
+    }
+}
+
+/// The structural tag of a forced call on `format` after `prompt`, a rendered generation prompt
+/// that closed the thought itself and wrote the template's text after it (a request with
+/// thinking switched off), derived as the gateway derives it: `reasoning_open` and
+/// `thought_closed` read from the prompt ([`Format::thought_closed`]). On every start the calls
+/// at once, whose every way in begins with `marker`: the text the prompt wrote is not written a
+/// second time. `on` is the prompt that leaves the thought to the model, which wrote none of it.
+pub(crate) fn a_forced_tag_after_a_prompt_that_wrote_the_templates_text(
+    format: &Format,
+    tools: &[Tool],
+    prompt: &str,
+    on: &str,
+    marker: &str,
+) {
+    let name = format.name();
+    assert!(
+        format.thought_closed(prompt),
+        "{name}: the prompt wrote the template's text"
+    );
+    assert!(
+        !format.reasoning_open(prompt),
+        "{name}: the prompt closed the thought"
+    );
+    assert!(
+        !format.thought_closed(on),
+        "{name}: the thinking-on prompt wrote nothing"
+    );
+    for start in [
+        GrammarStart::Unknown,
+        GrammarStart::AfterReasoning,
+        GrammarStart::FirstToken,
+    ] {
+        let tag = format
+            .grammar_for(
+                tools,
+                Options {
+                    at_least_one: true,
+                    reasoning_open: format.reasoning_open(prompt),
+                    thought_closed: format.thought_closed(prompt),
+                    one_call: false,
+                    start,
+                },
+            )
+            .unwrap_or_else(|| panic!("{name}: no tag"))
+            .payload();
+        let calls = &tag["format"];
+        assert_eq!(
+            calls["type"], "triggered_tags",
+            "{name}: {start:?}: {calls}"
+        );
+        for tag in calls["tags"].as_array().expect("tags") {
+            let begin = tag["begin"].as_str().expect("a begin");
+            assert!(
+                begin.starts_with(marker),
+                "{name}: {start:?}: {begin:?} does not begin with {marker:?}"
+            );
+        }
     }
 }

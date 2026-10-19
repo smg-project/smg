@@ -1736,6 +1736,32 @@ mod tests {
     }
 
     #[test]
+    fn a_prompt_with_thinking_off_has_written_the_templates_two_newlines_itself() {
+        // A request with thinking switched off closes an empty thought in the prompt and writes
+        // the two newlines after it (`<think>\n\n</think>\n\n` at the prompt's end): the table
+        // reads that from the prompt, as the gateway does beside `reasoning_open`, and a forced
+        // call written from there is the calls at once on every start, the newlines not written a
+        // second time. The thinking-on prompt has written nothing, and MiMo's table carries no
+        // layout to have written.
+        use crate::testing::a_forced_tag_after_a_prompt_that_wrote_the_templates_text;
+        let tools = weather_tools();
+        let off = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        for format in [
+            qwen3(CallSyntax::Json),
+            qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
+        ] {
+            a_forced_tag_after_a_prompt_that_wrote_the_templates_text(
+                &format,
+                &tools,
+                off,
+                "<|im_start|>assistant\n",
+                "<tool_call>",
+            );
+        }
+        assert!(!qwen3(CallSyntax::Tagged(Spelling::Json, Placement::Direct)).thought_closed(off));
+    }
+
+    #[test]
     fn a_forced_call_after_the_thoughts_close_begins_with_the_templates_two_newlines() {
         // The Qwen3 and Qwen 3.5 templates write two newlines after the thought's close before
         // the content or the first call, and the table carries that part of its layout. Where the
@@ -1769,6 +1795,7 @@ mod tests {
                 Options {
                     at_least_one: true,
                     reasoning_open: true,
+                    thought_closed: false,
                     one_call: true,
                     start: GrammarStart::AfterReasoning,
                 },

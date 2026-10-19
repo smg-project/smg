@@ -179,7 +179,7 @@ impl BuildStage for MessageRequestBuildingStage {
         };
 
         let continued_final_message = processed_messages.continued_final_message;
-        let require_reasoning = reading::reasoning_decision(
+        let (require_reasoning, thought_closed) = reading::reasoning_decision(
             ctx,
             &messages_request.model,
             &processed_messages.text,
@@ -238,6 +238,7 @@ impl BuildStage for MessageRequestBuildingStage {
                         continues: continued_final_message,
                     },
                     reasoning_open: require_reasoning,
+                    thought_closed,
                 }
             },
         )?;
