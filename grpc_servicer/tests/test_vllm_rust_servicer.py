@@ -1216,7 +1216,9 @@ def test_compiled_metrics_observer_binding(tmp_path):
         engine_startup_timeout_secs=2.0,
     )
     try:
-        server.set_metrics_observer(lambda event, payload: None)
+        server.set_metrics_observer(lambda event, payload, timestamp: None)
+        with pytest.raises(ValueError, match="already installed"):
+            server.set_metrics_observer(lambda *args: None)
         assert not server.engine_ready
     finally:
         server.stop()
@@ -1564,7 +1566,8 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(
     ops_events = []
 
     class FakeOps:
-        def __init__(self, config, port, *, log_stats):
+        def __init__(self, config, port, *, log_stats, host):
+            assert host == "0.0.0.0"
             assert port == ops_port and log_stats is not disable_stats
             ops_events.append("descriptors")
 

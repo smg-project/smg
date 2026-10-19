@@ -609,20 +609,41 @@ fn native_media_options(
 #[pyclass(name = "VllmGrpcServer")]
 pub struct PyVllmGrpcServer {
     inner: VllmServicerServer,
+    metrics: Mutex<Option<Arc<crate::metrics_observer::MetricsObserver>>>,
 }
 
 #[pymethods]
 impl PyVllmGrpcServer {
-    /// Optional vLLM statistics adapter; tensor auxiliary frames stay in Rust.
-    fn set_metrics_observer(&self, observer: Py<PyAny>) {
-        self.inner
-            .set_wire_observer(Arc::new(move |event, payload| {
+    /// Deliver statistics on a bounded worker so inference never waits for Python.
+    fn set_metrics_observer(&self, observer: Py<PyAny>) -> PyResult<()> {
+        let mut slot = self
+            .metrics
+            .lock()
+            .map_err(|_| to_py_err(ServicerError::Poisoned))?;
+        if slot.is_some() {
+            return Err(PyValueError::new_err(
+                "metrics observer is already installed",
+            ));
+        }
+        let worker = Arc::new(
+            crate::metrics_observer::MetricsObserver::new(move |event, payload, timestamp| {
                 Python::attach(|py| {
-                    if let Err(error) = observer.call1(py, (event, PyBytes::new(py, payload))) {
+                    if let Err(error) =
+                        observer.call1(py, (event, PyBytes::new(py, payload), timestamp))
+                    {
                         error.write_unraisable(py, None);
                     }
                 });
+            })
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
+        );
+        let producer = worker.clone();
+        self.inner
+            .set_wire_observer(Arc::new(move |event, payload| {
+                producer.observe(event, payload);
             }));
+        *slot = Some(worker);
+        Ok(())
     }
 
     #[new]
@@ -835,7 +856,10 @@ impl PyVllmGrpcServer {
             }));
             VllmServicerServer::start_with_tokenizer(config, tokenizer).map_err(to_py_err)
         })?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            metrics: Mutex::new(None),
+        })
     }
 
     /// The bound `ip:port`.
@@ -886,7 +910,22 @@ impl PyVllmGrpcServer {
             ));
         }
         let timeout = Duration::from_secs_f64(timeout_secs);
-        py.detach(|| self.inner.stop(timeout)).map_err(to_py_err)
+        py.detach(|| {
+            let start = std::time::Instant::now();
+            let result = self.inner.stop(timeout);
+            if let Some(metrics) = self
+                .metrics
+                .lock()
+                .map_err(|_| ServicerError::Poisoned)?
+                .as_ref()
+            {
+                if !metrics.close(timeout.saturating_sub(start.elapsed())) {
+                    return Err(ServicerError::StopTimeout);
+                }
+            }
+            result
+        })
+        .map_err(to_py_err)
     }
 }
 

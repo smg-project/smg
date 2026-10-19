@@ -224,7 +224,7 @@ if resolve_servicer_impl(args) == "rust":
 
 ##### Metrics
 
-The SMG plugin adds an optional HTTP `/metrics` listener for Rust gRPC:
+The SMG plugin adds an optional HTTP `/metrics` listener on `--host` for Rust gRPC:
 
 ```bash
 vllm serve <model> --grpc --servicer-impl rust --metrics-port 9090

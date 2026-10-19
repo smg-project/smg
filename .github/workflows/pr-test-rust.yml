@@ -248,7 +248,17 @@ jobs:
           python3 -m pip install pytest pytest-asyncio pytest-cov pytest-xdist
           pytest -q tests --cov=smg --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80
 
+      - name: Checkout vLLM statistics compatibility source
+        uses: actions/checkout@v7
+        with:
+          repository: vllm-project/vllm
+          ref: 852989f580820849113d67d13fd8053e279d0444
+          path: .test-deps/vllm
+          persist-credentials: false
+
       - name: Run grpc_servicer unit tests
+        env:
+          SMG_VLLM_SOURCE_ROOT: ${{ github.workspace }}/.test-deps/vllm
         run: |
           rm -f crates/grpc_client/python/smg_grpc_proto/proto
           mkdir -p crates/grpc_client/python/smg_grpc_proto/proto
@@ -259,7 +269,7 @@ jobs:
           # zmq or vllm still skip here (-rs lists them): the zmq ones import
           # engine servicers that need torch, and the vllm cases run on the
           # vLLM e2e lane.
-          pip install ./crates/grpc_client/python msgspec pydantic numpy pyzmq
+          pip install ./crates/grpc_client/python msgspec pydantic numpy pyzmq aiohttp prometheus-client
           pytest -q grpc_servicer/tests -rs
 
       - name: Run CI tooling unit tests

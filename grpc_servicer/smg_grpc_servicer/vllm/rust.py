@@ -567,7 +567,10 @@ class VllmLauncher(RustLauncher):
             if not 1 <= ops_port <= 65535 or ops_port == args.port:
                 raise ValueError("--metrics-port must be 1..65535 and differ from --port")
             self.ops = RustOps(
-                self.vllm_config, ops_port, log_stats=not engine_args.disable_log_stats
+                self.vllm_config,
+                ops_port,
+                log_stats=not engine_args.disable_log_stats,
+                host=args.host or "0.0.0.0",
             )
         # The engine cores are started with `log_stats=not disable_log_stats`
         # (`launch_engine_cores`); the servicer is told the same.

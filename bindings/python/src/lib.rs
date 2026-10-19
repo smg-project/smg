@@ -25,6 +25,7 @@ pub static MALLOC_CONF: &[u8; 72] = observability::metrics::SERVER_MALLOC_CONF;
 use smg::*;
 use smg_auth as auth;
 
+mod metrics_observer;
 mod servicer;
 use servicer::{
     init_servicer_tracing, PySglangGrpcServer, PyTokenSpeedGrpcServer, PyVllmGrpcServer,

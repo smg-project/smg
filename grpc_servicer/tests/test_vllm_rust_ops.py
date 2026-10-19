@@ -486,7 +486,7 @@ def test_native_http_scrape_and_cleanup(upstream, monkeypatch, tmp_path):
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
-        ops = RustOps(config(), port, log_stats=True)
+        ops = RustOps(config(), port, log_stats=True, host="127.0.0.1")
         ops.observe("ready_done", b"")
         Counter("vllm:worker_test", "worker mmap counter").inc(3)
         await ops.start(NS(set_metrics_observer=observed.append))
@@ -582,7 +582,7 @@ def test_scheduler_snapshots_preserve_batch_order(upstream, monkeypatch, tmp_pat
             )
             == 0
         )
-        assert not ops.batches[1]
+        assert ops.pending_outputs == 0
         ops.observe("abort", b"r")
         assert not ops.requests
     finally:
@@ -697,6 +697,129 @@ def test_control_frames_do_not_require_a_statistics_timestamp(upstream, monkeypa
         for frame in ({"utility_output": {"call_id": 7}}, {"start_wave": 1}):
             ops.observe("output", msgspec.msgpack.encode(frame))
         assert ops.error is None
-        assert not ops.batches
+        assert ops.pending_outputs == 0
+    finally:
+        asyncio.run(ops.close())
+
+
+def test_slow_stream_does_not_hold_new_gauges_or_unrelated_tokens(upstream, monkeypatch, tmp_path):
+    """An unconsumed batch cannot prevent a later completed batch from publishing."""
+    import asyncio
+
+    from prometheus_client import REGISTRY
+
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+    ops = RustOps(config(), 0, log_stats=True)
+    ops.observe("ready_done", b"")
+    labels = {"model_name": "test", "engine": "1"}
+    try:
+        for name in ("slow", "fast"):
+            ops.observe("add", msgspec.msgpack.encode([name, [1], None, {}, None, 100.0]))
+            ops.observe(
+                "output",
+                msgspec.msgpack.encode(
+                    [
+                        1,
+                        [{"request_id": name, "new_token_ids": [7]}],
+                        dataclasses.asdict(
+                            upstream.SchedulerStats(num_running_reqs=2 if name == "slow" else 1)
+                        ),
+                        12,
+                    ]
+                ),
+            )
+        assert REGISTRY.get_sample_value("vllm:num_requests_running", labels) == 1
+        ops.observe("consume", b"fast", 101.0)
+        ops.observe("processed", b'["fast", 0]')
+        assert ops.error is None
+        assert REGISTRY.get_sample_value("vllm:generation_tokens_total", labels) == 1
+        assert REGISTRY.get_sample_value("vllm:time_to_first_token_seconds_sum", labels) == 1.0
+        assert ops.pending_outputs == 1
+        ops.observe("abort", b"slow")
+        assert ops.pending_outputs == 0
+    finally:
+        asyncio.run(ops.close())
+
+
+def test_incompatible_native_api_fails_before_multiprocess_setup(upstream, monkeypatch):
+    """An incompatible vLLM update signature is rejected at launcher initialization."""
+    monkeypatch.setattr(upstream.IterationStats, "update_from_output", lambda self: None)
+    with pytest.raises(RuntimeError, match="incompatible with this vLLM"):
+        RustOps(config(), 0, log_stats=True)
+    assert "PROMETHEUS_MULTIPROC_DIR" not in os.environ
+
+
+def test_observer_overflow_invalidates_scrapes_and_releases_state(upstream, monkeypatch, tmp_path):
+    """Do not expose silently incomplete counters after the bounded queue loses events."""
+    import asyncio
+
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+    ops = RustOps(config(), 0, log_stats=True)
+    try:
+        ops.observe("ready_done", b"")
+        ops.observe("add", msgspec.msgpack.encode(["r", [1], None, {}, None, 100.0]))
+        ops.observe("overflow", b"")
+        assert isinstance(ops.error, RuntimeError)
+        assert not ops.requests
+        ops.observe("add", msgspec.msgpack.encode(["r", [1], None, {}, None, 100.0]))
+        assert not ops.requests
+    finally:
+        asyncio.run(ops.close())
+
+
+def test_logging_failure_does_not_disable_collection(upstream, monkeypatch, tmp_path):
+    """Retry periodic text logging without poisoning otherwise valid Prometheus data."""
+    import asyncio
+
+    from vllm import envs
+
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+    monkeypatch.setattr(envs, "VLLM_LOG_STATS_INTERVAL", 0)
+
+    async def exercise():
+        """Wait for a successful log after the first injected failure."""
+        ops = RustOps(config(), 0, log_stats=True)
+        ops.observe("ready_done", b"")
+        done = asyncio.Event()
+        calls = 0
+
+        def log():
+            """Simulate a transient failure in a text logger."""
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("temporary logging failure")
+            done.set()
+
+        ops.stats.log = log
+        ops.stats_task = asyncio.create_task(ops._log_stats())
+        try:
+            await asyncio.wait_for(done.wait(), timeout=2)
+            assert calls >= 2 and ops.error is None
+        finally:
+            await ops.close()
+
+    asyncio.run(exercise())
+
+
+def test_slow_stream_retention_is_bounded(upstream, monkeypatch, tmp_path):
+    """A stream that never consumes must eventually fail collection and free its backlog."""
+    import asyncio
+
+    from smg_grpc_servicer.vllm import rust_ops
+
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+    monkeypatch.setattr(rust_ops, "MAX_PENDING_OUTPUTS", 2)
+    ops = RustOps(config(), 0, log_stats=True)
+    try:
+        ops.observe("ready_done", b"")
+        ops.observe("add", msgspec.msgpack.encode(["r", [1], None, {}, None, 100.0]))
+        output = msgspec.msgpack.encode([1, [{"request_id": "r", "new_token_ids": [7]}], None, 12])
+        ops.observe("output", output)
+        ops.observe("output", output)
+        assert ops.error is None and ops.pending_outputs == 2
+        ops.observe("output", output)
+        assert isinstance(ops.error, RuntimeError)
+        assert not ops.requests and ops.pending_outputs == 0
     finally:
         asyncio.run(ops.close())

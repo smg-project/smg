@@ -7,16 +7,19 @@ formulas, descriptors, plugins and multiprocess aggregation remain in vLLM.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
 import threading
+import time
 from collections import deque
 from contextlib import AsyncExitStack, suppress
 from types import SimpleNamespace as NS
 from typing import Any
 
 logger = logging.getLogger(__name__)
+MAX_PENDING_OUTPUTS = 65536
 
 
 def _fields(struct: Any, value: Any) -> dict[str, Any]:
@@ -25,7 +28,7 @@ def _fields(struct: Any, value: Any) -> dict[str, Any]:
 
 
 class RustOps:
-    def __init__(self, config: Any, port: int, *, log_stats: bool) -> None:
+    def __init__(self, config: Any, port: int, *, log_stats: bool, host: str = "0.0.0.0") -> None:
         """Prepare native collectors and multiprocess storage before engine processes start."""
         import msgspec
         from prometheus_client import values
@@ -33,11 +36,13 @@ class RustOps:
         from vllm.v1.metrics.prometheus import setup_multiprocess_prometheus
         from vllm.v1.metrics.stats import LoRARequestStates
 
+        if log_stats:
+            self._check_compatibility()
         setup_multiprocess_prometheus()
         # prometheus_client can be imported before the launcher enables mmap.
         if os.environ.get("PROMETHEUS_MULTIPROC_DIR") and not values.ValueClass._multiprocess:
             values.ValueClass = values.MultiProcessValue()
-        self.port = port
+        self.port, self.host = port, host
         self.closed = False
         self.error: Exception | None = None
         self.lock = threading.RLock()
@@ -48,7 +53,8 @@ class RustOps:
         self.parents: dict[str, Any] = {}
         self.children: dict[str, str] = {}
         self.arrivals: dict[str, float] = {}
-        self.batches: dict[int, deque] = {}
+        self.pending_outputs = 0
+        self.event_time = 0.0
         self.decoder = msgspec.msgpack.Decoder(ext_hook=lambda code, data: None)
         self.request_type, self.output_type, self.batch_type = (
             EngineCoreRequest,
@@ -75,12 +81,42 @@ class RustOps:
             _kv_event_sources={},
         )
 
-    def observe(self, event: str, payload: bytes) -> None:
+    @staticmethod
+    def _check_compatibility() -> None:
+        """Reject incompatible native statistics APIs before starting engine workers."""
+        try:
+            from vllm.v1.engine.core_client import MPClient
+            from vllm.v1.engine.parallel_sampling import ParentRequest
+            from vllm.v1.metrics.stats import IterationStats
+
+            inspect.signature(MPClient._apply_ready_response).bind(None, b"")
+            inspect.signature(IterationStats.update_from_output).bind(*([None] * 7))
+            inspect.signature(IterationStats.update_from_finished_request).bind(
+                None,
+                finish_reason=None,
+                request_id="probe",
+                num_prompt_tokens=0,
+                max_tokens_param=None,
+                req_stats=None,
+                num_cached_tokens=0,
+            )
+            ParentRequest(
+                NS(request_id="probe", external_req_id="probe", params=NS(n=2, output_kind=0))
+            )
+        except (ImportError, AttributeError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                "--metrics-port is incompatible with this vLLM statistics API"
+            ) from error
+
+    def observe(self, event: str, payload: bytes, timestamp: float | None = None) -> None:
         """Apply one ordered Rust event; poison the scrape on incompatible engine data."""
         with self.lock:
             if self.closed or self.error is not None or not self.log_stats:
                 return
             try:
+                self.event_time = time.time() if timestamp is None else timestamp
+                if event == "overflow":
+                    raise RuntimeError("vLLM metrics observer queue overflowed")
                 if event == "ready":
                     from vllm.v1.engine.core_client import MPClient
 
@@ -140,6 +176,11 @@ class RustOps:
                         self._forget(child)
             except Exception as error:
                 self.error = error
+                self.requests.clear()
+                self.parents.clear()
+                self.children.clear()
+                self.arrivals.clear()
+                self.pending_outputs = 0
                 logger.exception("vLLM metrics collection failed")
 
     def _add(self, raw: Any) -> None:
@@ -185,19 +226,27 @@ class RustOps:
             remaining=0,
             started=False,
         )
-        self.batches.setdefault(batch.rank, deque()).append(batch)
+        # Publish engine gauges on arrival, independently of stream consumption.
+        self.lora.update_scheduler_stats(batch.scheduler)
+        self.stats.record(
+            scheduler_stats=batch.scheduler,
+            iteration_stats=None,
+            mm_cache_stats=self.mm_cache_stats() if self.mm_cache_stats else None,
+            engine_idx=batch.rank,
+        )
         for output in fields.get("outputs", []):
             output = _fields(self.output_type, output)
             request = self.requests.get(output["request_id"])
             if request is not None:
                 request.pending.append((batch, output))
                 batch.remaining += 1
+                self.pending_outputs += 1
+                if self.pending_outputs > MAX_PENDING_OUTPUTS:
+                    raise RuntimeError("vLLM metrics pending output limit exceeded")
         self._record(batch)
 
     def _consume(self, request_id: str) -> None:
         """Apply native token and timing formulas when Rust consumes an output."""
-        import time
-
         import msgspec
         from vllm.v1.engine import EngineCoreEvent, FinishReason
         from vllm.v1.metrics.stats import PrefillStats
@@ -209,7 +258,7 @@ class RustOps:
         request.active = batch
         request.engine_reason = output.get("finish_reason")
         if not batch.started:
-            batch.iteration.iteration_timestamp = time.time()
+            batch.iteration.iteration_timestamp = self.event_time
             batch.started = True
         prefill = output.get("prefill_stats")
         prefill = msgspec.convert(prefill, PrefillStats) if prefill is not None else None
@@ -273,11 +322,12 @@ class RustOps:
         self._forget(request_id)
 
     def _processed(self, request_id: str) -> None:
-        """Release the consumed output so its batch can be published in order."""
+        """Release the consumed output so its completed batch can be published."""
         request = self.requests.get(request_id)
         if request is not None and request.active is not None:
             batch, request.active = request.active, None
             batch.remaining -= 1
+            self.pending_outputs -= 1
             self._record(batch)
 
     def _forget(self, request_id: str) -> None:
@@ -290,6 +340,7 @@ class RustOps:
             del self.requests[request_id]
             for batch, _ in request.pending:
                 batch.remaining -= 1
+                self.pending_outputs -= 1
                 self._record(batch)
         parent_id = self.children.pop(request_id, None)
         parent = self.parents.get(parent_id)
@@ -299,19 +350,15 @@ class RustOps:
                 del self.parents[parent_id]
 
     def _record(self, batch: Any) -> None:
-        # Preserve scheduler snapshot order even if different request streams
-        # consume their outputs at different times.
-        """Publish completed batches in engine order, preserving scheduler snapshots."""
-        pending = self.batches[batch.rank]
-        while pending and pending[0].remaining == 0:
-            ready = pending.popleft()
-            self.lora.update_scheduler_stats(ready.scheduler)
+        """Publish completed iterations without waiting for unrelated slow streams."""
+        if batch.remaining == 0 and batch.iteration is not None:
             self.stats.record(
-                scheduler_stats=ready.scheduler,
-                iteration_stats=ready.iteration,
-                mm_cache_stats=self.mm_cache_stats() if self.mm_cache_stats else None,
-                engine_idx=ready.rank,
+                scheduler_stats=None,
+                iteration_stats=batch.iteration,
+                mm_cache_stats=None,
+                engine_idx=batch.rank,
             )
+            batch.iteration = None
 
     async def start(self, server: Any) -> None:
         """Bind the scrape listener and attach the observer before launching the engine."""
@@ -339,25 +386,24 @@ class RustOps:
         runner = web.AppRunner(app, access_log=None)
         self.stack.push_async_callback(runner.cleanup)
         await runner.setup()
-        await web.TCPSite(runner, "0.0.0.0", self.port).start()
+        await web.TCPSite(runner, self.host, self.port).start()
         if self.log_stats:
             server.set_metrics_observer(self.observe)
             self.stats_task = asyncio.create_task(self._log_stats())
-        logger.info("Metrics HTTP server listening on 0.0.0.0:%d", self.port)
+        logger.info("Metrics HTTP server listening on %s:%d", self.host, self.port)
 
     async def _log_stats(self) -> None:
         """Run native periodic loggers under the same lock as request updates."""
         from vllm import envs
 
-        try:
-            while True:
-                await asyncio.sleep(envs.VLLM_LOG_STATS_INTERVAL)
+        while True:
+            await asyncio.sleep(envs.VLLM_LOG_STATS_INTERVAL)
+            try:
                 with self.lock:
                     if self.stats is not None:
                         self.stats.log()
-        except Exception as error:
-            self.error = error
-            logger.exception("vLLM statistics logging failed")
+            except Exception:
+                logger.exception("vLLM statistics logging failed")
 
     async def close(self) -> None:
         """Stop collection and release the listener; repeated closes are harmless."""
@@ -369,7 +415,7 @@ class RustOps:
             self.parents.clear()
             self.children.clear()
             self.arrivals.clear()
-            self.batches.clear()
+            self.pending_outputs = 0
         if self.stats_task is not None:
             self.stats_task.cancel()
             with suppress(asyncio.CancelledError):
