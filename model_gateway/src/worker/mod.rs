@@ -26,6 +26,7 @@ pub mod pd_pairing;
 pub mod prefill_admission;
 pub mod registry;
 pub mod resilience;
+pub mod runtime;
 pub mod sampling_defaults;
 pub mod service;
 // FIXME: worker.rs is a 1800-line monolith containing the Worker trait,
