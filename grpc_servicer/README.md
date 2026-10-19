@@ -238,7 +238,7 @@ The SMG plugin adds an optional HTTP `/metrics` listener on `--host` for Rust gR
 vllm serve <model> --grpc --servicer-impl rust --metrics-port 9090
 ```
 
-The listener binds `0.0.0.0`; choose a port different from gRPC. It reuses vLLM's
+The listener binds `--host` (`0.0.0.0` when unset); choose a port different from gRPC. It reuses vLLM's
 native statistics and multiprocess registry. `--disable-log-stats` disables request
 statistics. Metrics add Python callbacks; timings reflect Rust frontend processing.
 Profiler routes are not exposed, and collection failures return HTTP 503.
