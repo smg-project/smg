@@ -214,8 +214,11 @@ pub enum CallSyntax {
 
 impl CallSyntax {
     /// The tags the syntax writes inside a call besides the table's terminals: the markers a
-    /// grammar writes inside a call's region, which free text before a call may not write, and
-    /// which a client that shows a call as text has to strip. JSON, Python and xLAM's list have
+    /// grammar writes inside a call's region, which free text before a call may not write (the
+    /// named-arguments marker excepted: it stands only after the call's opener, a terminal the
+    /// text cannot write, and in one table it is ordinary text a thought may hold, so the
+    /// grammar's `excluded_but` leaves it writable), and which a client that shows a call as
+    /// text has to strip. JSON, Python and xLAM's list have
     /// none, their calls being their own text, and neither has MiniMax M3's XML tree, whose
     /// element tags are the arguments' keys. A call given as data has its parameters' (see
     /// [`CallShape::tag_texts`]).

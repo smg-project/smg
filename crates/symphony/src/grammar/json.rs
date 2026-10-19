@@ -125,7 +125,7 @@ pub(super) fn named_arguments_calls(
             ways_in,
             calls,
             count,
-            |one_call| separated(one_call, syntax.between_calls, count),
+            |one_call| count.calls_between(one_call, syntax.between_calls),
         ));
     }
     let (_, open, _) = format
@@ -143,23 +143,6 @@ pub(super) fn named_arguments_calls(
         })
         .collect();
     Some(count.triggered(vec![open.to_string()], tags))
-}
-
-/// The calls a block holds, as many as the count lets the model write, `between` before every
-/// call after the first: the one call alone with one owed, the calls one after another where
-/// nothing stands between them, and otherwise the first call and then `between` and a call any
-/// number of times.
-fn separated(one_call: Grammar, between: &str, count: Count<'_>) -> Grammar {
-    if count.one || between.is_empty() {
-        return count.calls(one_call);
-    }
-    Grammar::Sequence(vec![
-        one_call.clone(),
-        Grammar::Star(Box::new(Grammar::Sequence(vec![
-            Grammar::ConstString(between.to_string()),
-            one_call,
-        ]))),
-    ])
 }
 
 /// The list of the tools' calls as xLAM and Llama Nemotron write it: `[`, each call as
