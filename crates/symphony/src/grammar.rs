@@ -1773,7 +1773,13 @@ mod tests {
                 "{}",
                 format.name()
             );
-            assert_eq!(wrapped["elements"][1], bare, "{}", format.name());
+            // The calls come last: a table whose layout writes text after the thought's close
+            // (Qwen3's two newlines) puts it between the prefix and them.
+            let last = wrapped["elements"]
+                .as_array()
+                .and_then(|elements| elements.last())
+                .expect("elements");
+            assert_eq!(*last, bare, "{}", format.name());
         }
     }
 
@@ -3435,7 +3441,13 @@ mod tests {
     /// A table whose template writes a thought before every call and answer: `<think>` blocks
     /// and `<tool_call>` blocks of JSON calls, everything else content, the turn's thought first.
     fn thinking_first() -> Format {
-        Format::new("thinking_first")
+        qwen3_rows().thinks_first()
+    }
+
+    /// Qwen3's rows alone: neither the property nor the registry table's layout (whose newlines
+    /// after the thought's close would stand before the calls), as a control.
+    fn qwen3_rows() -> Format {
+        Format::new("qwen3_rows")
             .terminal("think_open", "<think>")
             .terminal("think_close", "</think>")
             .terminal("call_open", "<tool_call>")
@@ -3448,7 +3460,6 @@ mod tests {
             .transition("content", "call_open", "call")
             .transition("call", "call_close", "content")
             .calls(CallSyntax::Json)
-            .thinks_first()
     }
 
     /// The thought a table that thinks first writes before a tag, as a payload node.
@@ -3471,7 +3482,7 @@ mod tests {
         let tools = weather_tools();
         let format = thinking_first();
         let excludes = value!(["<think>", "</think>", "<tool_call>", "</tool_call>"]);
-        let plain = formats::qwen3(CallSyntax::Json);
+        let plain = qwen3_rows();
         for one_call in [false, true] {
             let options = Options {
                 at_least_one: true,
@@ -3498,7 +3509,7 @@ mod tests {
             format.grammar(&tools, true, true),
             plain.grammar(&tools, true, true)
         );
-        // The same rows without the property, Qwen3's, give the tag alone.
+        // The same rows without the property give the tag alone.
         assert_eq!(
             plain
                 .grammar(&tools, true, false)
@@ -3767,7 +3778,7 @@ mod tests {
             );
         }
         // A table without a layout: the calls at once at every start, as before.
-        let plain = formats::qwen3(CallSyntax::Json);
+        let plain = qwen3_rows();
         for start in [
             GrammarStart::Unknown,
             GrammarStart::AfterReasoning,

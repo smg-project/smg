@@ -29,6 +29,15 @@
 //! </dots_function_call>
 //! ```
 //!
+//! The table carries the one part of its chat template's layout the tags write: after the
+//! thought's close the template writes two newlines before the content or the calls
+//! (`</think>\n\n`), so a forced call written where the close left the engine begins with them,
+//! as the template writes it, and the block's marker is not the grammar's first text
+//! ([`Format::grammar_for`]). The newline the template writes before every block
+//! (`\n<dots_function_call>`) is the call's own lead, which the tag does not write; the table
+//! reads a block with or without it. A block's opener inside the thought opens the block (the
+//! row out of `reasoning` on it), so a call an engine started there is read as the call.
+//!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 use crate::{
     format::{CallSyntax, Emits, Format},
@@ -58,6 +67,7 @@ pub fn dots3() -> Format {
         .transition("call", "call_close", "content")
         .calls(CallSyntax::Attributed(attributed::Tags::DOTS3))
         .opens_turn("<|assistant|>")
+        .with_layout(super::thought_layout("</think>", "\n\n"))
 }
 
 #[cfg(test)]
@@ -68,29 +78,44 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{Event, Events},
+        event::{Event, Events, FinishReason},
         input::{EngineFinish, Input},
         parser::Parser,
-        testing::{arguments_of, bytes, content, drive, reasoning},
+        testing::{
+            a_forced_tag_begins_with_the_templates_text, arguments_of, bytes, content, drive,
+            reasoning, the_same_at_every_cut, Said,
+        },
         Declared,
     };
 
-    fn declared() -> Declared {
-        Declared::of(&[Tool {
+    /// The recorded tool and one without parameters, as a request lists them.
+    fn tools() -> Vec<Tool> {
+        let tool = |name: &str, parameters: serde_json::Value| Tool {
             tool_type: "function".to_string(),
             function: Function {
-                name: "spotify_play".to_string(),
+                name: name.to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {
+                parameters,
+                strict: None,
+                extra: Default::default(),
+            },
+        };
+        vec![
+            tool(
+                "spotify_play",
+                value!({"type": "object", "properties": {
                     "artist": {"type": "string"},
                     "duration": {"type": "integer"},
                     "shuffle": {"type": "boolean"},
                     "tags": {"type": "array"},
                 }}),
-                strict: None,
-                extra: Default::default(),
-            },
-        }])
+            ),
+            tool("ping", value!({"type": "object", "properties": {}})),
+        ]
+    }
+
+    fn declared() -> Declared {
+        Declared::of(&tools()[..1])
     }
 
     /// The generation prompt's tail when the request leaves thinking to the model.
@@ -280,5 +305,81 @@ mod tests {
     #[test]
     fn the_table_validates() {
         dots3().validate().expect("a valid table");
+    }
+
+    /// One call in its block as the tag writes it after the thought's close, and as the template
+    /// renders one.
+    const FORCED_CALL: &str = "<dots_function_call>\n<invoke name=\"spotify_play\">\n\
+                               <parameter name=\"artist\">\nTaylor Swift\n</parameter>\n\
+                               </invoke>\n</dots_function_call>";
+
+    #[test]
+    fn a_forced_call_after_the_thoughts_close_begins_with_the_templates_two_newlines() {
+        // The template writes two newlines after the thought's close before the content or the
+        // calls, and the table carries that part of its layout: where the grammar starts after
+        // the close, the calls' tag begins with them, so the block's marker is not the grammar's
+        // first text; with the thought closed, at the first token or where the engine does not
+        // say, the calls at once, as before. The newline the template writes before every block
+        // is the call's own lead, which the tag does not write.
+        a_forced_tag_begins_with_the_templates_text(
+            &dots3(),
+            &tools(),
+            "</think>",
+            "\n\n",
+            "<dots_function_call>",
+        );
+    }
+
+    #[test]
+    fn a_forced_call_written_after_the_thoughts_close_reads_as_the_call_after_the_thought() {
+        // The tag's shape on an engine whose grammar starts after the thought's close: the
+        // thought, its close, the template's two newlines and the block; and the template's own
+        // rendering, with the newline it writes before every block as well. The thought is
+        // reasoning, the newlines the template's spacing, the call the call; whole, one character
+        // at a time and at every cut.
+        let thought = "\nThe user wants a song; the call follows.\n";
+        for output in [
+            format!("<think>{thought}</think>\n\n{FORCED_CALL}"),
+            format!("<think>{thought}</think>\n\n\n{FORCED_CALL}"),
+        ] {
+            assert_eq!(
+                the_same_at_every_cut(|pieces| run(PROMPT, pieces), &output),
+                Said {
+                    calls: vec![(
+                        "spotify_play".to_string(),
+                        r#"{"artist": "Taylor Swift"}"#.to_string()
+                    )],
+                    finish: Some((FinishReason::Stop, 1)),
+                    content: String::new(),
+                    reasoning: thought.to_string(),
+                },
+                "{output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_block_opener_inside_the_thought_opens_the_block() {
+        // An engine whose reasoning gate took the block's opener the model wrote inside its
+        // thought for the thought's end, and started a forced call there, wrote the block inside
+        // the thought, the output ending there. The table's row out of the thought on the opener
+        // reads the block wherever it stands: one call, the thought the text before it, no
+        // content. The tag no longer lets such an engine start there (its first text after the
+        // close is the template's newlines, not the opener); the reading is pinned here, whole,
+        // one character at a time and at every cut.
+        let thought = "\nThe user wants a song: ";
+        let output = format!("<think>{thought}{FORCED_CALL}");
+        assert_eq!(
+            the_same_at_every_cut(|pieces| run(PROMPT, pieces), &output),
+            Said {
+                calls: vec![(
+                    "spotify_play".to_string(),
+                    r#"{"artist": "Taylor Swift"}"#.to_string()
+                )],
+                finish: Some((FinishReason::Stop, 1)),
+                content: String::new(),
+                reasoning: thought.to_string(),
+            }
+        );
     }
 }

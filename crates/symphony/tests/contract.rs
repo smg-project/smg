@@ -1820,6 +1820,15 @@ const QWEN3_TAGGED_OUTPUTS: &[&str] = &[
     // Two function blocks in one `<tool_call>` block, as a parallel answer may write them.
     "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n\
      <function=other>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>",
+    // A forced call as its tag writes it after the thought's close (the template's two newlines,
+    // then the call), the format rehearsed inside the thought; and the same call an engine's
+    // reasoning gate started inside the thought, the output ending there.
+    "<think>\nThe format is <tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n\
+     </parameter>\n</function>\n</tool_call>. Then call it.\n</think>\n\n<tool_call>\n\
+     <function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n\
+     </parameter>\n</function>\n</tool_call>",
+    "<think>\nThe format is <tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n\
+     </parameter>\n</function>\n</tool_call>",
 ];
 
 const QWEN3_OUTPUTS: &[&str] = &[
@@ -1872,6 +1881,11 @@ const QWEN3_OUTPUTS: &[&str] = &[
     "<tool_call>{\"name\": \"f\", \"arguments\": {\"flag\": nu}}</tool_call>",
     "<tool_call>{\"name\": \"f\", \"arguments\": 1.}</tool_call>",
     "<tool_call>{\"name\": \"f\", \"arguments\": nu}</tool_call>",
+    // A forced call as its tag writes it after the thought's close (the template's two newlines,
+    // then the call), the format rehearsed inside the thought; and the same call an engine's
+    // reasoning gate started inside the thought, the output ending there.
+    "<think>\nThe format is <tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>. Then call it.\n</think>\n\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"days\": 3}}\n</tool_call>",
+    "<think>\nThe format is <tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>",
 ];
 
 /// The outputs bellwether's common set records for MiMo-V2.5 (Qwen 3.5's tags, the value between
@@ -1997,6 +2011,10 @@ const MINICPM5_OUTPUTS: &[&str] = &[
     "<think>\n97 is not divisible by 2, 3, 5 or 7.\n</think>\n\nYes, 97 is prime.",
     "<function name=\"save_note\"><param name=\"body\"><![CDATA[Line one\nLine two",
     "<function name=\"get_weather\"><param name=\"city\">Par</function>",
+    // A forced call an engine's reasoning gate started inside the thought, the output ending
+    // there (the table's row out of the thought on the opener reads it); the call as its tag
+    // writes it after the close, with the template's two newlines, is the first row.
+    "<think>\nThe user asks about Paris: <function name=\"get_weather\"><param name=\"city\">Paris</param></function>",
 ];
 
 /// The outputs bellwether's common set records for dots3, and one cut short.
@@ -2009,6 +2027,12 @@ const DOTS3_OUTPUTS: &[&str] = &[
     "<think>\n97 is not divisible by 2, 3, 5 or 7.\n</think>\n\nYes, 97 is prime.",
     "<dots_function_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">\nPar",
     "<dots_function_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">\nPar\n</dots_function_call>",
+    // A forced call as its tag writes it after the thought's close (the template's two newlines,
+    // then the block, without the newline the template writes before every block, which the first
+    // row has); and the same call an engine's reasoning gate started inside the thought, the
+    // output ending there (the table's row out of the thought on the opener reads it).
+    "<think>\nThe user asks about Paris.\n</think>\n\n<dots_function_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">\nParis\n</parameter>\n</invoke>\n</dots_function_call>",
+    "<think>\nThe user asks about Paris: <dots_function_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">\nParis\n</parameter>\n</invoke>\n</dots_function_call>",
 ];
 
 /// The outputs bellwether's common set records for GLM 4.6, and one cut short.
@@ -2021,6 +2045,11 @@ const GLM4_OUTPUTS: &[&str] = &[
     "\nHello!",
     "\n<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Par",
     "\n<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Par</tool_call>",
+    // A forced call as its tag writes it after the thought's close (the template's newline, then
+    // the call), the format rehearsed inside the thought; and the same call an engine's reasoning
+    // gate started inside the thought, the output ending there.
+    "\n<think>The format is <tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\n</tool_call>. Then call it.</think>\n<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\n</tool_call>",
+    "\n<think>The format is <tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\n</tool_call>",
 ];
 
 /// The outputs bellwether's common set records for K2-Horizon (the thought the prompt opens
