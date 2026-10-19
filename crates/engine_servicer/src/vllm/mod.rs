@@ -232,6 +232,7 @@ impl crate::kv_events::LoadSource for LoadFromState {
 }
 
 pub(super) struct State {
+    pub(super) observer: OnceLock<engine_zmq_client::observer::WireObserver>,
     pub(super) model: VllmModelInfo,
     /// The KV-event relay for the engine's ZMQ publisher; `None` when events
     /// are off (`SubscribeKvEvents` is then UNIMPLEMENTED).
@@ -308,6 +309,14 @@ pub struct VllmServicerServer {
 }
 
 impl VllmServicerServer {
+    /// Install the metrics consumer before the launcher starts engine cores.
+    pub fn set_wire_observer(&self, observer: engine_zmq_client::observer::WireObserver) {
+        let _ = self.state.observer.set(observer.clone());
+        if let Ok(client) = self.state.engine() {
+            client.set_wire_observer(observer);
+        }
+    }
+
     /// Validate, bind, and serve on a dedicated runtime thread.
     pub fn start(config: VllmServicerConfig) -> Result<Self, ServicerError> {
         Self::start_inner(config, None)
@@ -342,6 +351,7 @@ impl VllmServicerServer {
             u32::try_from(config.model.data_parallel_size).unwrap_or(1),
         );
         let state = Arc::new(State {
+            observer: OnceLock::new(),
             tokenizer_dir: config.servicer.tokenizer_dir.clone(),
             model: config.model,
             kv_relay,

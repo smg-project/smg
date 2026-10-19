@@ -726,7 +726,7 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
 
     monkeypatch.setattr(rust, "launch_scheduler_ranks", fake_launch)
 
-    async def fake_supervise(server, engine, *, drain_secs):
+    async def fake_supervise(server, engine, *, drain_secs, **_kwargs):
         assert isinstance(server, FakeServer) and engine == "engine"
         return 7
 

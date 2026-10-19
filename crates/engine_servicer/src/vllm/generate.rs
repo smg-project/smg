@@ -9,6 +9,7 @@ use std::{
     pin::Pin,
     sync::{atomic::Ordering, Arc},
     task::{Context, Poll},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use engine_zmq_adapter::{
@@ -117,6 +118,7 @@ async fn submit(
     // A PD decode side refused before admission still owes its prefill side
     // the notice: armed from the first refusal below until the engine can
     // hold the request.
+    let request_started = Instant::now();
     let mut notice = ArmedNotice(RejectionNotice::owed_by(client, &req));
     // A pooling runner serves no generation task; vLLM's frontend refuses
     // this before the engine sees it, in these words.
@@ -173,12 +175,35 @@ async fn submit(
         }
         _ => 0,
     };
+    if let Some(observer) = state.observer.get() {
+        let n = req
+            .sampling_params
+            .as_ref()
+            .map_or(1, |params| params.n.max(1));
+        observer(
+            "parent",
+            serde_json::json!([
+                request_id,
+                n,
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .saturating_sub(request_started.elapsed())
+                    .as_secs_f64()
+            ])
+            .to_string()
+            .as_bytes(),
+        );
+    }
     let subs = match client
         .generate_vllm_streams_with_media(req, processed_media, trace_headers)
         .await
     {
         Ok(subs) => subs,
         Err(status) => {
+            if let Some(observer) = state.observer.get() {
+                observer("forget_parent", request_id.as_bytes());
+            }
             if let Some(notice) = owed {
                 notice.send();
             }
@@ -243,6 +268,9 @@ struct LoadsGuard {
 
 impl Drop for LoadsGuard {
     fn drop(&mut self) {
+        if let Some(observer) = self.state.observer.get() {
+            observer("forget_parent", self.request_id.as_bytes());
+        }
         self.state.loads.finished(&self.request_id);
     }
 }
@@ -326,8 +354,9 @@ impl ChoiceStream {
     /// already ended. Dropping the engine stream aborts the engine side.
     fn abort(&mut self) -> Option<vllm::GenerateResponse> {
         if let Some(complete) = self.pending.take() {
+            let complete = self.stamped(complete);
             self.inner = None;
-            return Some(self.stamped(complete));
+            return Some(complete);
         }
         let mut inner = self.inner.take()?;
         let complete = inner.complete_aborted();
@@ -337,6 +366,16 @@ impl ChoiceStream {
     /// A terminal response with the request's media identity on it, when
     /// there is one; anything else passes through.
     fn stamped(&self, mut response: vllm::GenerateResponse) -> vllm::GenerateResponse {
+        if let (Some(observer), Some(vllm::generate_response::Response::Complete(complete))) =
+            (self.state.observer.get(), response.response.as_ref())
+        {
+            observer(
+                "finish",
+                serde_json::json!([self.request_id, complete.index, complete.finish_reason])
+                    .to_string()
+                    .as_bytes(),
+            );
+        }
         if let (Some(identity), Some(vllm::generate_response::Response::Complete(complete))) =
             (self.media_identity.as_deref(), response.response.as_mut())
         {
@@ -355,8 +394,9 @@ impl HeldTerminal for ChoiceStream {
     /// for a choice still open, which is left as it is.
     fn finished(&mut self) -> Option<vllm::GenerateResponse> {
         if let Some(complete) = self.pending.take() {
+            let complete = self.stamped(complete);
             self.inner = None;
-            return Some(self.stamped(complete));
+            return Some(complete);
         }
         let inner = self.inner.as_mut()?;
         if !inner.has_parked_complete() {
@@ -386,8 +426,9 @@ impl Stream for ChoiceStream {
             if let Some(complete) = this.pending.take() {
                 // The frontend ended this choice: drop the engine stream so the
                 // engine-side request is aborted, then deliver the Complete.
+                let complete = this.stamped(complete);
                 this.inner = None;
-                return Poll::Ready(Some(Ok(this.stamped(complete))));
+                return Poll::Ready(Some(Ok(complete)));
             }
             let Some(inner) = this.inner.as_mut() else {
                 return Poll::Ready(None);
@@ -441,6 +482,35 @@ impl Stream for ChoiceStream {
                     return Poll::Ready(Some(Err(status)));
                 }
             };
+            if let Some(observer) = this.state.observer.get() {
+                let reason = if matched.is_some() {
+                    Some("stop")
+                } else {
+                    this.inner
+                        .as_ref()
+                        .and_then(VllmGenerateStream::pending_finish_reason)
+                };
+                if let Some(reason) = reason {
+                    observer(
+                        "finish",
+                        serde_json::json!([
+                            this.request_id,
+                            chunk.index,
+                            reason,
+                            matched.is_some()
+                        ])
+                        .to_string()
+                        .as_bytes(),
+                    );
+                } else {
+                    observer(
+                        "processed",
+                        serde_json::json!([this.request_id, chunk.index])
+                            .to_string()
+                            .as_bytes(),
+                    );
+                }
+            }
             {
                 if let Some(matched) = matched {
                     if let Some(inner) = this.inner.as_mut() {

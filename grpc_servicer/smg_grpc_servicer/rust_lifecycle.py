@@ -946,6 +946,7 @@ async def supervise(
     stop_timeout: float = SERVER_STOP_SECS,
     stop_event: asyncio.Event | None = None,
     poll_secs: float = _POLL_SECS,
+    before_stop: Callable[[], Any] | None = None,
 ) -> int:
     """Run until a shutdown signal, an engine exit, or a server failure.
 
@@ -990,11 +991,19 @@ async def supervise(
                 pass
     finally:
         mark_not_serving(server)
-        if stop_event.is_set() and drain_secs > 0 and engine.poll() is None:
-            logger.info("Draining for %.1fs before stopping", drain_secs)
-            await asyncio.sleep(drain_secs)
-        await stop_server(server, stop_timeout)
-        terminate_engine(engine)
+        try:
+            if stop_event.is_set() and drain_secs > 0 and engine.poll() is None:
+                logger.info("Draining for %.1fs before stopping", drain_secs)
+                await asyncio.sleep(drain_secs)
+        finally:
+            try:
+                try:
+                    if before_stop is not None:
+                        await before_stop()
+                finally:
+                    await stop_server(server, stop_timeout)
+            finally:
+                terminate_engine(engine)
     return exit_code
 
 
@@ -1076,6 +1085,12 @@ class RustLauncher:
 
     def launched(self, engine: Any) -> None:
         """Once the engine started, before the supervision (nothing by default)."""
+
+    async def server_started(self, server: Any) -> None:
+        """Start optional control endpoints before launching engine processes."""
+
+    async def before_stop(self) -> None:
+        """Close control endpoints before stopping the engine connection."""
 
     def announce_capabilities(self, facts: Mapping[str, Any], tokenizer_dir: str | None) -> None:
         """What a cache-aware router and a tokenizer-backed feature get from
@@ -1167,6 +1182,14 @@ class RustLauncher:
             **facts,
         )
         self.announce(server, knobs, handshake_port, engine_count)
+        try:
+            await self.server_started(server)
+        except BaseException:
+            mark_not_serving(server)
+            await stop_server(server, SERVER_STOP_SECS)
+            raise
         engine = await launch_or_stop(server, lambda: self.launch(args, handshake_port, facts))
         self.launched(engine)
-        return await supervise(server, engine, drain_secs=knobs.drain_secs)
+        return await supervise(
+            server, engine, drain_secs=knobs.drain_secs, before_stop=self.before_stop
+        )

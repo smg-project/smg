@@ -93,6 +93,19 @@ def add_mm_arguments_to_grpc_parser(parser: argparse.ArgumentParser) -> list[str
     return add_mm_arguments(parser)
 
 
+def add_metrics_argument(parser: argparse.ArgumentParser) -> None:
+    """Add the opt-in HTTP scrape port to gRPC parsers, without replacing upstream flags."""
+    if serves_grpc(parser) and "--metrics-port" not in parser._option_string_actions:
+        parser._smg_metrics_port = True
+        parser.add_argument(
+            "--metrics-port",
+            type=int,
+            default=None,
+            help="HTTP /metrics port for the Rust gRPC servicer (disabled by default). "
+            "Request statistics follow --disable-log-stats.",
+        )
+
+
 def handoff_mm_flags(parser: argparse.ArgumentParser, parsed: Any) -> Any | None:
     """After a parse by a parser that serves gRPC: its `--mm-*` values go to
     the servicer this process builds and into the environment, whether this
@@ -178,6 +191,7 @@ def register() -> None:
 
     @functools.wraps(original)
     def parse_known_args(self: Any, args: Any = None, namespace: Any = None) -> Any:
+        """Register SMG options at parse time and validate them before engine startup."""
         # The launcher's own parse runs inside its main(), after its body
         # defined serve_grpc: a launcher running as __main__ (python -m on the
         # launcher module) is bound here when register() ran before that
@@ -189,6 +203,7 @@ def register() -> None:
         # subcommand parse `vllm serve` dispatches to.
         add_servicer_impl_argument(self)
         add_mm_arguments_to_grpc_parser(self)
+        add_metrics_argument(self)
         parsed, extras = original(self, args, namespace)
         impl = getattr(parsed, "servicer_impl", None)
         if impl:
@@ -200,7 +215,14 @@ def register() -> None:
         # ahead: a launcher the switch cannot bind is refused here, not by the
         # Python servicer after the model loaded, and the refusal is the only
         # line such a launch prints.
-        check_servicer_impl(self, parsed)
+        impl = check_servicer_impl(self, parsed)
+        if getattr(self, "_smg_metrics_port", False) and parsed.metrics_port is not None:
+            if impl != "rust":
+                self.error("--metrics-port requires --grpc --servicer-impl rust")
+            if not 1 <= parsed.metrics_port <= 65535 or parsed.metrics_port == getattr(
+                parsed, "port", None
+            ):
+                self.error("--metrics-port must be 1..65535 and differ from --port")
         # Upstream's launcher builds the Python servicer without its
         # namespace: a gRPC parser's parsed settings are kept for it in this
         # process (so a flag stays `source=flag`), and the set values go into

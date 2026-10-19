@@ -916,6 +916,17 @@ impl ZmqEngineClient {
         Ok(results.iter().all(|result| result.as_bool() == Some(true)))
     }
 
+    /// Attach the native vLLM statistics consumer before requests are admitted.
+    pub fn set_wire_observer(&self, observer: engine_zmq_client::observer::WireObserver) {
+        if let ZmqBackend::Vllm(client) = &self.backend {
+            for engine in client.engines() {
+                observer("ready", &engine.ready_payload);
+            }
+            observer("ready_done", &[]);
+            client.set_wire_observer(observer);
+        }
+    }
+
     /// Latest per-rank load for one engine index, if the backend has reported
     /// it: every dialect piggybacks it on its output batches.
     fn engine_load(&self, engine_index: u32) -> Option<EngineLoad> {

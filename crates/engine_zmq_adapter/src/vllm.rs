@@ -95,6 +95,14 @@ pub struct VllmGenerateStream {
 }
 
 impl VllmGenerateStream {
+    /// Engine terminal held behind its last token chunk, for frontend metrics.
+    pub fn pending_finish_reason(&self) -> Option<&str> {
+        match self.pending.as_ref()?.response.as_ref()? {
+            vllm::generate_response::Response::Complete(complete) => Some(&complete.finish_reason),
+            vllm::generate_response::Response::Chunk(_) => None,
+        }
+    }
+
     pub(crate) fn new(
         inner: EngineCoreStream,
         index: u32,

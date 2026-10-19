@@ -539,8 +539,16 @@ async fn non_streaming_yields_only_the_complete() {
 /// the engine-side request.
 #[tokio::test]
 async fn string_stops_are_matched_by_the_servicer() {
+    let events = Arc::new(Mutex::new(Vec::new()));
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
     let mut h = harness(model_info(), Some(tokenizer)).await;
+    let observed = events.clone();
+    h.server.set_wire_observer(Arc::new(move |kind, bytes| {
+        observed
+            .lock()
+            .unwrap()
+            .push((kind.to_owned(), bytes.to_vec()));
+    }));
     // "Hello world" is two mock tokens (1, 2), so it stays a string stop.
     let mut stream = h
         .client
@@ -589,6 +597,23 @@ async fn string_stops_are_matched_by_the_servicer() {
     // The engine is still generating from its point of view: it gets the
     // abort for the choice the servicer ended.
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["r3".to_string()]);
+    let events = events.lock().unwrap();
+    let kinds: Vec<_> = events.iter().map(|(kind, _)| kind.as_str()).collect();
+    assert_eq!(kinds.iter().filter(|kind| **kind == "consume").count(), 2);
+    assert_eq!(kinds.iter().filter(|kind| **kind == "processed").count(), 1);
+    let finished = events
+        .iter()
+        .position(|(kind, _)| kind == "finish")
+        .unwrap();
+    let aborted = events.iter().position(|(kind, _)| kind == "abort").unwrap();
+    assert!(
+        finished < aborted,
+        "record stop before the engine abort discards state"
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&events[finished].1).unwrap(),
+        serde_json::json!(["r3", 0, "stop", true])
+    );
 }
 
 /// A stop string that is one token (`world` is mock token 2) also reaches

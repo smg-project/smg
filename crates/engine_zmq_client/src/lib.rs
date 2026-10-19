@@ -26,6 +26,7 @@
 pub mod codec;
 pub mod connector;
 mod error;
+pub mod observer;
 pub mod protocol;
 pub mod startup;
 pub mod transport;

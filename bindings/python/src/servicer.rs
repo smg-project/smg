@@ -5,13 +5,14 @@
 //! engines bind the same way as their protocols land. Rust owns the
 //! listener, the engine link, and the request path; Python launches the
 //! headless engine, starts and stops the server, and announces draining. The
-//! one request-time crossing is worker-side media processing, when the
+//! worker-side media crossing runs when the
 //! Python processor is chosen: a request's `media_refs` go to a Python object
 //! that runs the engine's own processors (the Python servicer's, with vLLM's
 //! input processor behind them), and what it produces comes back as bytes
 //! the engine reads directly. The other choice, smg's own pipeline
 //! ([`SmgMediaProcessor`]), never crosses: it is the Router's media pipeline
 //! run in this process.
+//! Optional metrics events cross into Python to reuse vLLM statistics and collectors.
 
 use std::{
     collections::HashMap,
@@ -612,6 +613,18 @@ pub struct PyVllmGrpcServer {
 
 #[pymethods]
 impl PyVllmGrpcServer {
+    /// Optional vLLM statistics adapter; tensor auxiliary frames stay in Rust.
+    fn set_metrics_observer(&self, observer: Py<PyAny>) {
+        self.inner
+            .set_wire_observer(Arc::new(move |event, payload| {
+                Python::attach(|py| {
+                    if let Err(error) = observer.call1(py, (event, PyBytes::new(py, payload))) {
+                        error.write_unraisable(py, None);
+                    }
+                });
+            }));
+    }
+
     #[new]
     #[pyo3(signature = (
         bind_address,
