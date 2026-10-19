@@ -24,7 +24,6 @@ use tokio::sync::Notify;
 use super::worker::Worker;
 use super::worker::WorkerRoutingKeyLoad;
 
-/// One-shot routing snapshot — see [`Worker::routing_state`].
 /// Why the liveness tracker vetoes a worker (see [`super::liveness`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -54,6 +53,7 @@ impl StallReason {
     }
 }
 
+/// One-shot routing snapshot — see [`Worker::routing_state`].
 #[derive(Clone, Copy, Debug)]
 pub struct RoutingState {
     /// `status == Ready`.
