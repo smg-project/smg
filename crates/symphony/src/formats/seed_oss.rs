@@ -100,7 +100,7 @@ mod tests {
                 &mut out,
             )
             .expect("delta");
-        let events = out.drain();
+        let events = out.into_owned().drain();
         assert_eq!(
             events[0],
             Event::Content(Text::uncounted("It opens a thought."))
@@ -130,7 +130,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        let events = out.drain();
+        let events = out.into_owned().drain();
         assert_eq!(
             events[..3],
             [
@@ -159,7 +159,7 @@ mod tests {
         let content: String = events
             .iter()
             .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
+                Event::Content(text) => Some(&*text.text),
                 _ => None,
             })
             .collect();
@@ -233,7 +233,7 @@ mod tests {
                         &mut out,
                     )
                     .expect("end");
-                let events = out.drain();
+                let events = out.into_owned().drain();
                 let arguments: String = events
                     .iter()
                     .filter_map(|event| match event {
@@ -337,7 +337,7 @@ mod tests {
                 // splits its report, not what is reported.
                 Event::Malformed { text, why } => match malformed.last_mut() {
                     Some((joined, last)) if last == why => joined.push_str(&text.text),
-                    _ => malformed.push((text.text.clone(), *why)),
+                    _ => malformed.push((text.text.to_string(), *why)),
                 },
                 Event::Finish {
                     reason, tool_calls, ..
@@ -579,7 +579,7 @@ mod tests {
     }
 
     /// The events of `output` after the turn's opener, fed in `pieces`, with the forecast tool.
-    fn read_forecast(pieces: &[&str]) -> Vec<Event> {
+    fn read_forecast(pieces: &[&str]) -> Vec<Event<'static>> {
         let mut parser = Engine::new(seed_oss(), forecast_tools());
         let mut out = Events::new();
         parser
@@ -611,7 +611,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     /// What the reader said of an output: the calls, the finish, the content and the reasoning.
@@ -639,7 +639,7 @@ mod tests {
     }
 
     /// `output` read whole and at every two-way cut says the same.
-    fn the_same_at_every_cut(output: &str) -> Vec<Event> {
+    fn the_same_at_every_cut(output: &str) -> Vec<Event<'static>> {
         let whole = read_forecast(&[output]);
         let expected = said(&whole);
         for cut in 1..output.len() {

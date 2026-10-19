@@ -23,7 +23,7 @@ mod tests {
         Declared,
     };
 
-    fn run(output: &str) -> Vec<Event> {
+    fn run(output: &str) -> Vec<Event<'static>> {
         let mut parser = Engine::new(xlam(), Declared::default());
         let mut out = Events::new();
         parser
@@ -53,7 +53,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     /// A call whose arguments are not JSON carries them as the model wrote them and says once,

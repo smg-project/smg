@@ -647,7 +647,7 @@ impl Assembler {
     }
 
     /// `}` (or `{}`) with `source`, then `ToolCallEnd` with the closing parenthesis.
-    fn end_call(&mut self, source: Text, close: &str, out: &mut Events) {
+    fn end_call<'d>(&mut self, source: Text<'d>, close: &str, out: &mut Events<'d>) {
         out.push(Event::ToolCallArguments {
             index: self.index,
             json: if self.written == 0 { "{}" } else { "}" }.to_string(),
@@ -655,7 +655,7 @@ impl Assembler {
         });
         out.push(Event::ToolCallEnd {
             index: self.index,
-            source: Text::uncounted(close),
+            source: Text::uncounted(close.to_owned()),
         });
     }
 
@@ -764,11 +764,11 @@ mod tests {
         CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
     }
 
-    fn run(pieces: &[&str]) -> Vec<Event> {
+    fn run(pieces: &[&str]) -> Vec<Event<'static>> {
         run_with(Dialect::OLMO3, &Declared::default(), pieces)
     }
 
-    fn run_with(dialect: Dialect, declared: &Declared, pieces: &[&str]) -> Vec<Event> {
+    fn run_with(dialect: Dialect, declared: &Declared, pieces: &[&str]) -> Vec<Event<'static>> {
         let mut assembler = Assembler::new(0, ids(), dialect);
         let mut out = Events::new();
         for piece in pieces {
@@ -827,7 +827,7 @@ mod tests {
         assert_eq!(malformed(&events), "");
     }
 
-    fn run_bare(declared: &Declared, pieces: &[&str]) -> Vec<Event> {
+    fn run_bare(declared: &Declared, pieces: &[&str]) -> Vec<Event<'static>> {
         let mut assembler = Assembler::bare(0, ids(), Dialect::LLAMA4);
         let mut out = Events::new();
         for piece in pieces {
@@ -859,7 +859,7 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
+                Event::Content(text) => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -870,7 +870,7 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(text.text.as_str()),
+                Event::Malformed { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -969,7 +969,7 @@ mod tests {
         let dropped: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::Dropped { text, .. } => Some(text.text.as_str()),
+                Event::Dropped { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect();
@@ -1265,7 +1265,7 @@ mod tests {
     }
 
     /// The stream's end after `pieces`: nothing is closed, as the engine ends a cut stream.
-    fn cut(pieces: &[&str]) -> Vec<Event> {
+    fn cut(pieces: &[&str]) -> Vec<Event<'static>> {
         let mut assembler = Assembler::new(0, ids(), Dialect::OLMO3);
         let mut out = Events::new();
         for piece in pieces {
@@ -1280,14 +1280,14 @@ mod tests {
     }
 
     /// The words the end said: the text of every `Malformed { UnterminatedRegion }` event.
-    fn said(events: &[Event]) -> Vec<&str> {
+    fn said<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
                 Event::Malformed {
                     text,
                     why: MalformedReason::UnterminatedRegion,
-                } => Some(text.text.as_str()),
+                } => Some(&*text.text),
                 _ => None,
             })
             .collect()

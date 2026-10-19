@@ -459,7 +459,7 @@ struct Learner<'a, R> {
 struct Reading {
     case: Case,
     output: String,
-    events: Vec<(Range<usize>, Event)>,
+    events: Vec<(Range<usize>, Event<'static>)>,
 }
 
 /// What a reading says, as the Chat API's message holds it: the thought, the content, and each
@@ -756,7 +756,7 @@ impl<R: Fn(Case) -> Option<String>> Learner<'_, R> {
         }
         let mut events = Vec::new();
         let mut at = 0;
-        for event in out.drain() {
+        for event in out.into_owned().drain() {
             let length = bytes_of(&event).len();
             events.push((at..at + length, event));
             at += length;
@@ -1199,7 +1199,7 @@ fn call_layout(turn: &Calls) -> Result<Layout, NoLayout> {
 }
 
 /// The bytes of the output an event accounts for.
-fn bytes_of(event: &Event) -> &str {
+fn bytes_of<'a>(event: &'a Event<'_>) -> &'a str {
     match event {
         Event::Content(text) | Event::Reasoning(text) => &text.text,
         Event::Dropped { text, .. }

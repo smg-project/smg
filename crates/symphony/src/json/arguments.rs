@@ -277,7 +277,7 @@ impl Arguments {
             if let Some(last) = space.chars().next_back() {
                 self.led_by = Some(last);
                 out.push(Event::Dropped {
-                    text: Text::uncounted(space),
+                    text: Text::uncounted(space.to_owned()),
                     why: DropReason::Whitespace,
                 });
             }
@@ -394,7 +394,7 @@ impl Arguments {
             out.push(Event::ToolCallArguments {
                 index: self.index,
                 json: typed.unwrap_or_else(|| self.prefix.escaped(start, raw).into_owned()),
-                source: Text::uncounted(raw),
+                source: Text::uncounted(raw.to_owned()),
             });
             self.emitted = close;
         }
@@ -410,7 +410,7 @@ impl Arguments {
             out.push(Event::ToolCallArguments {
                 index: self.index,
                 json: rest.to_string(),
-                source: Text::uncounted(rest),
+                source: Text::uncounted(rest.to_owned()),
             });
             self.emitted = end;
         }
@@ -424,7 +424,7 @@ impl Arguments {
             out.push(Event::ToolCallArguments {
                 index: self.index,
                 json: self.prefix.escaped(self.emitted, fresh).into_owned(),
-                source: Text::uncounted(fresh),
+                source: Text::uncounted(fresh.to_owned()),
             });
             self.emitted = upto;
         }
@@ -437,7 +437,7 @@ mod tests {
 
     /// The events for `pieces`, what the value took of each, and whether it is whole after the
     /// last piece and after `finish`.
-    fn run(pieces: &[&str]) -> (Vec<Event>, Vec<usize>, bool, bool) {
+    fn run(pieces: &[&str]) -> (Vec<Event<'static>>, Vec<usize>, bool, bool) {
         let mut arguments = Arguments::new(0);
         let mut out = Events::new();
         let taken = pieces
@@ -464,8 +464,8 @@ mod tests {
         events
             .iter()
             .map(|event| match event {
-                Event::ToolCallArguments { source, .. } => source.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
+                Event::ToolCallArguments { source, .. } => &*source.text,
+                Event::Dropped { text, .. } | Event::Malformed { text, .. } => &*text.text,
                 _ => "",
             })
             .collect()

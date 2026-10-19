@@ -87,7 +87,7 @@ pub struct RefusedInput {
 }
 
 /// The message's content and stop reason, folded from a whole event sequence.
-pub fn output<'a>(events: impl IntoIterator<Item = &'a Event>) -> Output {
+pub fn output<'a, 'd: 'a>(events: impl IntoIterator<Item = &'a Event<'d>>) -> Output {
     let folded = fold(events);
     let mut blocks = Vec::new();
     if !folded.reasoning.is_empty() {
@@ -169,7 +169,11 @@ impl Stream {
 
     /// Appends the stream events `event` produces to `out`, in order. Returns the stop reason when
     /// `event` is `Finish`, after closing the open block.
-    pub fn feed(&mut self, event: &Event, out: &mut Vec<MessageStreamEvent>) -> Option<StopReason> {
+    pub fn feed(
+        &mut self,
+        event: &Event<'_>,
+        out: &mut Vec<MessageStreamEvent>,
+    ) -> Option<StopReason> {
         match event {
             Event::Malformed {
                 text,
@@ -380,7 +384,7 @@ mod tests {
         CallSyntax, Declared, Engine, EngineFinish, Events, Input, Parser,
     };
 
-    fn call(index: u32, name: &str) -> Event {
+    fn call(index: u32, name: &str) -> Event<'static> {
         Event::ToolCallStart {
             index,
             id: format!("call_{index}"),
@@ -389,7 +393,7 @@ mod tests {
         }
     }
 
-    fn arguments(index: u32, json: &str) -> Event {
+    fn arguments(index: u32, json: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index,
             json: json.into(),
@@ -397,14 +401,14 @@ mod tests {
         }
     }
 
-    fn end(index: u32) -> Event {
+    fn end(index: u32) -> Event<'static> {
         Event::ToolCallEnd {
             index,
             source: Text::default(),
         }
     }
 
-    fn finish(reason: FinishReason, tool_calls: u32) -> Event {
+    fn finish(reason: FinishReason, tool_calls: u32) -> Event<'static> {
         Event::Finish {
             reason,
             tool_calls,
@@ -1138,7 +1142,7 @@ mod tests {
 
     /// The events of `output` read by the Qwen3 table through an engine of its own, as the gateway
     /// reads each request.
-    fn parsed(output: &str) -> Vec<Event> {
+    fn parsed(output: &str) -> Vec<Event<'static>> {
         let mut engine = Engine::new(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
         engine
@@ -1159,7 +1163,7 @@ mod tests {
                 &mut out,
             )
             .expect("the end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     /// Two calls of Qwen3's syntax in one output.

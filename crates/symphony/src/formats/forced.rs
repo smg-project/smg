@@ -33,7 +33,7 @@ mod tests {
         Declared,
     };
 
-    fn run(pieces: &[&str], declared: Declared) -> Vec<Event> {
+    fn run(pieces: &[&str], declared: Declared) -> Vec<Event<'static>> {
         let mut parser = Engine::new(forced(), declared);
         let mut out = Events::new();
         parser
@@ -65,7 +65,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     fn finish(events: &[Event]) -> (FinishReason, u32) {

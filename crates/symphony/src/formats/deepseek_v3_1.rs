@@ -70,7 +70,7 @@ mod tests {
     /// The generation prompt's tail in thinking mode: the turn's opener and the thought opened.
     const THINKING: &str = "<｜Assistant｜><think>";
 
-    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
+    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         let mut parser = Engine::new(deepseek_v3_1(), Declared::default());
         let mut out = Events::new();
         parser
@@ -102,7 +102,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     /// Every byte the events carry, in order: the output, when the engine accounts for all of it.
@@ -110,11 +110,11 @@ mod tests {
         events
             .iter()
             .map(|event| match event {
-                Event::Content(text) | Event::Reasoning(text) => text.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
+                Event::Content(text) | Event::Reasoning(text) => &*text.text,
+                Event::Dropped { text, .. } | Event::Malformed { text, .. } => &*text.text,
                 Event::ToolCallStart { source, .. }
                 | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
+                | Event::ToolCallEnd { source, .. } => &*source.text,
                 Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
             })
             .collect()
@@ -138,7 +138,7 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
+                Event::Content(text) => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -148,17 +148,17 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
+                Event::Reasoning(text) => Some(&*text.text),
                 _ => None,
             })
             .collect()
     }
 
-    fn malformed(events: &[Event]) -> Vec<&str> {
+    fn malformed<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(text.text.as_str()),
+                Event::Malformed { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect()

@@ -93,7 +93,7 @@ impl Fragments {
             out.push(Event::ToolCallArguments {
                 index,
                 json: self.prefix.escaped(self.emitted, fresh).into_owned(),
-                source: Text::uncounted(fresh),
+                source: Text::uncounted(fresh.to_owned()),
             });
             self.emitted = valid_end;
         }
@@ -114,7 +114,7 @@ impl Fragments {
             out.push(Event::ToolCallArguments {
                 index,
                 json: rest.to_string(),
-                source: Text::uncounted(rest),
+                source: Text::uncounted(rest.to_owned()),
             });
             self.emitted = value.len();
         }
@@ -128,7 +128,7 @@ impl Fragments {
             out.push(Event::ToolCallArguments {
                 index,
                 json: self.prefix.escaped(self.emitted, held).into_owned(),
-                source: Text::uncounted(held),
+                source: Text::uncounted(held.to_owned()),
             });
             self.emitted = value.len();
         }

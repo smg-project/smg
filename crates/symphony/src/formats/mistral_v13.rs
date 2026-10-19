@@ -51,7 +51,7 @@ mod tests {
     /// The generation prompt's tail: the user turn's close, and nothing more.
     const PROMPT: &str = "[/INST]";
 
-    fn run(prompt: &str, output: &str) -> Vec<Event> {
+    fn run(prompt: &str, output: &str) -> Vec<Event<'static>> {
         drive(
             &mut Engine::new(mistral_v13(), Declared::default()),
             prompt,

@@ -698,7 +698,7 @@ impl Format {
         let mut markers: Vec<&str> = self
             .terminals
             .iter()
-            .map(|terminal| terminal.text.as_str())
+            .map(|terminal| &*terminal.text)
             .chain(self.structural_tokens.iter().map(String::as_str))
             .collect();
         let tags = self
@@ -924,11 +924,7 @@ impl Format {
     pub(crate) fn turn_texts(&self) -> Vec<&str> {
         match self.turn_opener() {
             Some(opener) => vec![opener],
-            None => self
-                .anchors
-                .iter()
-                .map(|anchor| anchor.text.as_str())
-                .collect(),
+            None => self.anchors.iter().map(|anchor| &*anchor.text).collect(),
         }
     }
 
@@ -992,9 +988,7 @@ impl Format {
             if anchor.text.is_empty() {
                 return None;
             }
-            prompt[from..]
-                .find(anchor.text.as_str())
-                .map(|at| from + at)
+            prompt[from..].find(&*anchor.text).map(|at| from + at)
         };
         let mut next: Vec<Option<usize>> =
             self.anchors.iter().map(|anchor| find(anchor, 0)).collect();
@@ -1177,7 +1171,7 @@ impl Format {
     /// table's rows move on, and those it ignores. Whoever learns the table's [`Layout`] from a
     /// rendering reads them to tell a marker from the text the layout writes around it.
     pub fn terminal_texts(&self) -> impl Iterator<Item = &str> {
-        self.terminals.iter().map(|terminal| terminal.text.as_str())
+        self.terminals.iter().map(|terminal| &*terminal.text)
     }
 
     /// Whether `tail`, at the end of the output in `state`, is a tag the end cut short: it begins
@@ -1608,7 +1602,7 @@ mod tests {
             .opens_turn("<|im_start|>assistant")
     }
 
-    fn events(format: Format, prompt: &str, output: &str) -> Vec<crate::event::Event> {
+    fn events(format: Format, prompt: &str, output: &str) -> Vec<crate::event::Event<'static>> {
         use crate::{
             engine::Engine,
             event::Events,
@@ -1645,7 +1639,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     fn said(events: &[crate::event::Event]) -> (String, String, usize) {

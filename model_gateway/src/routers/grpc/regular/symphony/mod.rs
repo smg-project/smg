@@ -134,5 +134,5 @@ pub(crate) use self::{
         check_names, keeps_special_tokens, labels_select_nothing, named_table, reasoning_open,
         set_aside_by_the_registry,
     },
-    reader::{assign, engine_finish, finished, Assignment, Reader},
+    reader::{assign, engine_finish, finished, Assignment, Delta, Reader},
 };

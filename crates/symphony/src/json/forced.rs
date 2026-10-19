@@ -115,7 +115,7 @@ impl Assembler {
 /// Bytes with no forced function to name a call for them: reported, not read.
 fn unnamed(bytes: &str, out: &mut Events) {
     out.push(Event::Malformed {
-        text: Text::uncounted(bytes),
+        text: Text::uncounted(bytes.to_owned()),
         why: MalformedReason::NoForcedFunction,
     });
 }
@@ -143,7 +143,7 @@ mod tests {
 
     const ARGUMENTS: &str = "{\"city\": \"Paris\", \"days\": [1, 2]}";
 
-    fn run(pieces: &[&str], declared: &Declared) -> (Vec<Event>, usize) {
+    fn run(pieces: &[&str], declared: &Declared) -> (Vec<Event<'static>>, usize) {
         let mut assembler = Assembler::new(0, "call_0");
         let mut out = Events::new();
         let mut taken = 0;
@@ -222,7 +222,7 @@ mod tests {
                 Event::Malformed {
                     text,
                     why: MalformedReason::NoForcedFunction,
-                } => Some(text.text.as_str()),
+                } => Some(&*text.text),
                 _ => None,
             })
             .collect();

@@ -13,11 +13,11 @@ pub(crate) fn bytes(events: &[Event]) -> String {
     events
         .iter()
         .map(|event| match event {
-            Event::Content(text) | Event::Reasoning(text) => text.text.as_str(),
-            Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
+            Event::Content(text) | Event::Reasoning(text) => &*text.text,
+            Event::Dropped { text, .. } | Event::Malformed { text, .. } => &*text.text,
             Event::ToolCallStart { source, .. }
             | Event::ToolCallArguments { source, .. }
-            | Event::ToolCallEnd { source, .. } => source.text.as_str(),
+            | Event::ToolCallEnd { source, .. } => &*source.text,
             Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
         })
         .collect()
@@ -28,7 +28,7 @@ pub(crate) fn content(events: &[Event]) -> String {
     events
         .iter()
         .filter_map(|event| match event {
-            Event::Content(text) => Some(text.text.as_str()),
+            Event::Content(text) => Some(&*text.text),
             _ => None,
         })
         .collect()
@@ -39,7 +39,7 @@ pub(crate) fn reasoning(events: &[Event]) -> String {
     events
         .iter()
         .filter_map(|event| match event {
-            Event::Reasoning(text) => Some(text.text.as_str()),
+            Event::Reasoning(text) => Some(&*text.text),
             _ => None,
         })
         .collect()
@@ -57,7 +57,7 @@ pub(crate) fn arguments_of(events: &[Event], call: u32) -> String {
 }
 
 /// The names of the calls, in order.
-pub(crate) fn names(events: &[Event]) -> Vec<&str> {
+pub(crate) fn names<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
     events
         .iter()
         .filter_map(|event| match event {
@@ -85,7 +85,11 @@ pub(crate) fn calls(events: &[Event]) -> Vec<(String, String)> {
 
 /// One turn through `parser`: the prompt, the output in `pieces`, a stop; the
 /// events it produced.
-pub(crate) fn drive(parser: &mut impl Parser, prompt: &str, pieces: &[&str]) -> Vec<Event> {
+pub(crate) fn drive(
+    parser: &mut impl Parser,
+    prompt: &str,
+    pieces: &[&str],
+) -> Vec<Event<'static>> {
     drive_to(parser, prompt, pieces, EngineFinish::Stop)
 }
 
@@ -95,7 +99,7 @@ pub(crate) fn drive_to(
     prompt: &str,
     pieces: &[&str],
     finish: EngineFinish,
-) -> Vec<Event> {
+) -> Vec<Event<'static>> {
     let mut out = Events::new();
     parser
         .feed(
@@ -121,5 +125,5 @@ pub(crate) fn drive_to(
     parser
         .feed(Input::End { finish }, &mut out)
         .expect("the end");
-    out.drain()
+    out.into_owned().drain()
 }

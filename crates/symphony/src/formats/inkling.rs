@@ -59,7 +59,7 @@ mod tests {
         "{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|>"
     );
 
-    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
+    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         drive(
             &mut Engine::new(inkling(), Declared::default()),
             prompt,
@@ -67,9 +67,9 @@ mod tests {
         )
     }
 
-    fn dropped(text: &str) -> Event {
+    fn dropped(text: &str) -> Event<'static> {
         Event::Dropped {
-            text: Text::uncounted(text),
+            text: Text::uncounted(text.to_owned()),
             why: DropReason::Wrapper,
         }
     }
@@ -239,7 +239,7 @@ mod tests {
     );
 
     /// One turn through the table as a request without tools reads it.
-    fn run_without_tools(pieces: &[&str]) -> Vec<Event> {
+    fn run_without_tools(pieces: &[&str]) -> Vec<Event<'static>> {
         drive(
             &mut Engine::new(inkling().without_calls(), Declared::default()),
             PROMPT,
@@ -434,7 +434,7 @@ mod answer_tests {
         ]
     }
 
-    fn run(format: Format, pieces: &[String]) -> Vec<Event> {
+    fn run(format: Format, pieces: &[String]) -> Vec<Event<'static>> {
         let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
         drive(
             &mut Engine::new(format, Declared::default()),
@@ -444,11 +444,11 @@ mod answer_tests {
     }
 
     /// The `Malformed` events, as (reason, bytes) pairs.
-    fn malformed(events: &[Event]) -> Vec<(MalformedReason, &str)> {
+    fn malformed<'a>(events: &'a [Event<'_>]) -> Vec<(MalformedReason, &'a str)> {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, why } => Some((*why, text.text.as_str())),
+                Event::Malformed { text, why } => Some((*why, &*text.text)),
                 _ => None,
             })
             .collect()

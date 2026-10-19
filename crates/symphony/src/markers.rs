@@ -81,7 +81,7 @@ pub struct Scanned<'a> {
     spans: Vec<Span>,
 }
 
-impl Scanned<'_> {
+impl<'a> Scanned<'a> {
     /// The pieces, in order: text that cannot be part of a marker, and the markers found.
     pub fn pieces(&self) -> impl Iterator<Item = Piece<'_>> {
         let text = self.text();
@@ -92,10 +92,14 @@ impl Scanned<'_> {
     }
 
     /// The text, when the pieces are one piece of text and nothing else: a caller takes it as one
-    /// without walking the pieces, as it takes a delta that reads as text whole.
-    pub fn whole_text(&self) -> Option<&str> {
+    /// without walking the pieces, as it takes a delta that reads as text whole. Borrowed from
+    /// the bytes fed when nothing was held before them; a copy of the join when something was.
+    pub fn whole_text(&self) -> Option<Cow<'a, str>> {
         match *self.spans.as_slice() {
-            [Span::Text { start, end }] => Some(&self.text()[start..end]),
+            [Span::Text { start, end }] if self.joined.is_empty() => {
+                Some(Cow::Borrowed(&self.bytes[start..end]))
+            }
+            [Span::Text { start, end }] => Some(Cow::Owned(self.joined[start..end].to_owned())),
             _ => None,
         }
     }
@@ -735,7 +739,7 @@ mod tests {
         let mut scanner = Scanner::new(BLANK_LINE);
         let scanned = scanner.feed("x\n");
         assert_eq!(
-            scanned.whole_text(),
+            scanned.whole_text().as_deref(),
             Some("x"),
             "the text before the held newline"
         );
@@ -743,7 +747,7 @@ mod tests {
         scanner.reclaim(scanned);
         let scanned = scanner.feed("yz");
         assert_eq!(
-            scanned.whole_text(),
+            scanned.whole_text().as_deref(),
             Some("\nyz"),
             "the newline was no marker's start"
         );
@@ -752,7 +756,11 @@ mod tests {
         scanner.reclaim(scanned);
         assert_eq!(fed(&mut scanner, "x\n"), vec![Piece::Text("x".into())]);
         let scanned = scanner.feed("\n<a>y");
-        assert_eq!(scanned.whole_text(), None, "a marker among the pieces");
+        assert_eq!(
+            scanned.whole_text().as_deref(),
+            None,
+            "a marker among the pieces"
+        );
         assert_eq!(
             scanned.pieces().collect::<Vec<_>>(),
             vec![Piece::Marker(0), Piece::Text("y".into())]
@@ -761,7 +769,7 @@ mod tests {
         assert_eq!(fed(&mut scanner, "x\n"), vec![Piece::Text("x".into())]);
         let scanned = scanner.feed("y<");
         assert_eq!(
-            scanned.whole_text(),
+            scanned.whole_text().as_deref(),
             Some("\ny"),
             "the bracket at the end is held"
         );
@@ -769,7 +777,7 @@ mod tests {
         scanner.reclaim(scanned);
         let scanned = scanner.feed("");
         assert_eq!(
-            scanned.whole_text(),
+            scanned.whole_text().as_deref(),
             None,
             "nothing came: the bracket stays held"
         );

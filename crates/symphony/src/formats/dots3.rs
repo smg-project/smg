@@ -107,7 +107,7 @@ mod tests {
         "<parameter name=\"artist\">\nMaroon 5\n</parameter>\n</invoke>\n</dots_function_call>"
     );
 
-    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
+    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         drive(&mut Engine::new(dots3(), declared()), prompt, pieces)
     }
 
@@ -115,7 +115,7 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(text.text.clone()),
+                Event::Malformed { text, .. } => Some(text.text.to_string()),
                 _ => None,
             })
             .collect()

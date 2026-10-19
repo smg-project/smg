@@ -31,12 +31,14 @@ use openai_protocol::{
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser};
 use serde::Serialize;
 use serde_json::{json, Value};
-use symphony::{adapt, EngineFinish, Event};
+use symphony::{adapt, EngineFinish, Event, Events};
 use tokio_stream::wrappers::ReceiverStream;
 use tool_parser::{ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser};
 use tracing::{debug, error, warn};
 
-use super::symphony::{engine_finish, finished, reasoning_text_tokens, telemetry::Who, Reader};
+use super::symphony::{
+    engine_finish, finished, reasoning_text_tokens, telemetry::Who, Delta, Reader,
+};
 use crate::{
     observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
     rate_limit::{SharedReservationHandle, UsageSettlement},
@@ -1339,19 +1341,21 @@ impl StreamingProcessor {
     /// delta each event has, the chunk's logprobs on its first text delta. The
     /// `Finish` event writes nothing here: the finish chunk is the loop's, with
     /// the matched stop. The opening chunk carried the role, so the deltas do
-    /// not repeat it, as the older path's do not.
+    /// not repeat it, as the older path's do not. The step's events are consumed
+    /// out of the buffer, which keeps its room for the next step: what an event
+    /// owns moves into its chunk, a borrowed text is copied into it once.
     #[expect(clippy::too_many_arguments)]
     async fn push_events(
         tx: &SseSender,
         buffer: &mut BytesMut,
         frame: &ChatChunkFrame,
         index: u32,
-        events: Vec<Event>,
+        events: &mut Events<'_>,
         mut logprobs: Option<ChatLogProbs>,
         usage: Option<&Usage>,
         emit_usage_null: bool,
     ) -> Result<(), String> {
-        for event in events {
+        for event in events.consume() {
             let Some(mut choice) = adapt::chat::into_delta(index, event) else {
                 continue;
             };
@@ -1437,25 +1441,31 @@ impl StreamingProcessor {
     /// Ends Symphony's reading of the message: `flushed`, the text the decoder released last,
     /// then the engine's `finish`; the events go through the machine ([`Self::send_symphony_blocks`],
     /// `thinking_text` as there) and the reasoning tokens they cost are added to `thinking_tokens`,
-    /// under `who` for the telemetry of the output's end.
+    /// under `who` for the telemetry of the output's end. The stream's `delta` and `spare` buffer
+    /// are read as a step's are, so events that wait in the buffer (the prompt's, when the
+    /// message ends before any chunk) go out in their order.
     #[expect(clippy::too_many_arguments)]
     async fn end_symphony_message(
         tx: &SseSender,
         buffer: &mut Vec<u8>,
         (reader, machine): (&mut Reader, &mut adapt::messages::Stream),
-        flushed: Option<&str>,
+        (delta, spare): (&mut Delta, &mut Events<'static>),
+        flushed: Option<String>,
         finish: EngineFinish,
         who: Who<'_>,
         thinking_text: bool,
         thinking_tokens: &mut u32,
     ) -> Result<Option<messages::StopReason>, utils::StreamFailure> {
-        let mut events = match flushed {
-            Some(text) => reader.tail(text)?,
-            None => Vec::new(),
-        };
-        events.extend(reader.end(finish, who)?);
-        *thinking_tokens += reasoning_text_tokens(&events);
-        Self::send_symphony_blocks(tx, buffer, machine, &events, thinking_text).await
+        let mut events: Events<'_> = std::mem::take(spare);
+        if let Some(text) = flushed {
+            reader.tail(text, delta, &mut events)?;
+        }
+        reader.end(finish, who, &mut events)?;
+        *thinking_tokens += reasoning_text_tokens(events.as_slice());
+        let stop =
+            Self::send_symphony_blocks(tx, buffer, machine, events.as_slice(), thinking_text).await;
+        *spare = events.recycle();
+        stop
     }
 
     /// Feeds Symphony's `events` to the content-block `machine` and sends the stream events it
@@ -1466,7 +1476,7 @@ impl StreamingProcessor {
         tx: &SseSender,
         buffer: &mut Vec<u8>,
         machine: &mut adapt::messages::Stream,
-        events: &[Event],
+        events: &[Event<'_>],
         thinking_text: bool,
     ) -> Result<Option<messages::StopReason>, utils::StreamFailure> {
         let mut stop = None;
@@ -2337,6 +2347,14 @@ struct ChatStream<'a> {
     /// decoder, the finish chunks and the usage are the same; only the
     /// reading of the tokens differs.
     readers: HashMap<u32, Reader>,
+    /// The step's delta and the stream's event buffer, when Symphony reads
+    /// the response: a step's events fill the buffer and borrow the delta's
+    /// text, and the buffer is recycled once the step's chunks are out (the
+    /// crate's `docs/engine.md`, the shape of a step's events). Taken out
+    /// for the step and put back after it; a buffer lost to an error is a
+    /// stream that ended.
+    delta: Delta,
+    spare: Events<'static>,
     /// After the engine's end: the (index, parser-EOF) turns still to take,
     /// one per pass of the loop.
     final_indices: Option<Vec<(u32, bool)>>,
@@ -2482,6 +2500,8 @@ impl<'a> ChatStream<'a> {
             has_tool_calls: HashMap::new(),
             stop_decoders: HashMap::new(),
             readers: HashMap::new(),
+            delta: Delta::default(),
+            spare: Events::new(),
             final_indices: None,
             sse_encoder: SseEncoder::new(),
             chunk_frame,
@@ -2643,16 +2663,26 @@ impl<'a> ChatStream<'a> {
 
         // Process tokens through stop decoder: Symphony's reader takes
         // them with their spans and gives events, the older path the text.
+        // The step's events borrow the delta, so both leave the stream's
+        // state for the step and come back once the chunks are out.
+        let mut delta = std::mem::take(&mut self.delta);
         let symphony_events = match self.spec.symphony.as_ref() {
             Some(assignment) => {
+                let mut events: Events<'_> = std::mem::take(&mut self.spare);
                 let reader = match self.readers.entry(index) {
                     Entry::Occupied(reader) => reader.into_mut(),
                     Entry::Vacant(slot) => slot.insert(
-                        Reader::new(assignment, self.spec.tools.clone().unwrap_or_default())?
-                            .first_call_only(self.spec.first_tool_call_only),
+                        Reader::new(
+                            assignment,
+                            self.spec.tools.clone().unwrap_or_default(),
+                            &mut events,
+                        )?
+                        .first_call_only(self.spec.first_tool_call_only),
                     ),
                 };
-                Some(reader.read(stop_decoder, chunk.token_ids())?)
+                let stopped =
+                    reader.read(stop_decoder, chunk.token_ids(), &mut delta, &mut events)?;
+                Some((events, stopped))
             }
             None => None,
         };
@@ -2678,10 +2708,10 @@ impl<'a> ChatStream<'a> {
             self.stopped_indices.insert(index);
         }
 
-        if let Some((events, _)) = symphony_events {
+        if let Some((mut events, _)) = symphony_events {
             // Recorded before the usage is snapshotted, so a continuous
             // usage counts the reasoning text it rides with.
-            let chunk_reasoning_tokens = reasoning_text_tokens(&events);
+            let chunk_reasoning_tokens = reasoning_text_tokens(events.as_slice());
             if chunk_reasoning_tokens > 0 {
                 *self.parsed_reasoning_tokens.entry(index).or_default() += chunk_reasoning_tokens;
                 if let Some(tracker) = &mut self.continuous_usage {
@@ -2695,14 +2725,17 @@ impl<'a> ChatStream<'a> {
                 &mut self.sse_buffer,
                 &self.chunk_frame,
                 index,
-                events,
+                &mut events,
                 choice_logprobs,
                 usage.as_ref(),
                 self.emit_usage_null,
             )
             .await?;
+            self.spare = events.recycle();
+            self.delta = delta;
             return Ok(None);
         }
+        self.delta = delta;
 
         if chunk_text.is_empty() {
             *self.held_tokens.entry(index).or_default() += chunk.token_ids().len() as u32;
@@ -2798,17 +2831,18 @@ impl<'a> ChatStream<'a> {
                 .finish_reasons
                 .get(&index)
                 .map_or("stop", String::as_str);
-            let mut events = match &flushed {
-                Some(text) => reader.tail(text)?,
-                None => Vec::new(),
-            };
+            let mut delta = std::mem::take(&mut self.delta);
+            let mut events: Events<'_> = std::mem::take(&mut self.spare);
+            if let Some(text) = flushed {
+                reader.tail(text, &mut delta, &mut events)?;
+            }
             let who = Who {
                 request_id,
                 model: &self.dispatch.model,
                 choice: index,
             };
-            events.extend(reader.end(engine_finish(reason), who)?);
-            if let Some(finished) = finished(&events) {
+            reader.end(engine_finish(reason), who, &mut events)?;
+            if let Some(finished) = finished(events.as_slice()) {
                 self.has_tool_calls.insert(index, finished.tool_calls > 0);
                 self.parsed_reasoning_tokens
                     .insert(index, finished.reasoning_tokens);
@@ -2819,12 +2853,14 @@ impl<'a> ChatStream<'a> {
                 &mut self.sse_buffer,
                 &self.chunk_frame,
                 index,
-                events,
+                &mut events,
                 None,
                 usage.as_ref(),
                 self.emit_usage_null,
             )
             .await?;
+            self.spare = events.recycle();
+            self.delta = delta;
             return Ok(None);
         }
 
@@ -2863,7 +2899,8 @@ impl<'a> ChatStream<'a> {
             let Some(reader) = self.readers.get_mut(&index) else {
                 continue;
             };
-            let mut events = Vec::new();
+            let mut delta = std::mem::take(&mut self.delta);
+            let mut events: Events<'_> = std::mem::take(&mut self.spare);
             if let Some(decoder) = self.stop_decoders.get_mut(&index) {
                 let tail = decoder.finish().map_err(|e| e.to_string())?;
                 utils::warn_detokenize_recoveries(request_id, index, decoder);
@@ -2878,7 +2915,7 @@ impl<'a> ChatStream<'a> {
                 if let SequenceDecoderOutput::Text(text)
                 | SequenceDecoderOutput::StoppedWithText(text) = tail
                 {
-                    events.extend(reader.tail(&text)?);
+                    reader.tail(text, &mut delta, &mut events)?;
                 }
             }
             let who = Who {
@@ -2886,11 +2923,11 @@ impl<'a> ChatStream<'a> {
                 model: &self.dispatch.model,
                 choice: index,
             };
-            events.extend(reader.end(EngineFinish::Abort, who)?);
+            reader.end(EngineFinish::Abort, who, &mut events)?;
             // The `Finish` event says what the Complete frame would have:
             // the calls made, for the finish reason, and the reasoning
             // tokens, for the usage.
-            if let Some(finished) = finished(&events) {
+            if let Some(finished) = finished(events.as_slice()) {
                 self.has_tool_calls.insert(index, finished.tool_calls > 0);
                 self.parsed_reasoning_tokens
                     .insert(index, finished.reasoning_tokens);
@@ -2901,12 +2938,14 @@ impl<'a> ChatStream<'a> {
                 &mut self.sse_buffer,
                 &self.chunk_frame,
                 index,
-                events,
+                &mut events,
                 None,
                 usage.as_ref(),
                 self.emit_usage_null,
             )
             .await?;
+            self.spare = events.recycle();
+            self.delta = delta;
         }
 
         // Finish decoder text before sending EOF to the parsers. A
@@ -3517,6 +3556,10 @@ struct MessagesStream<'a> {
     /// not run. The `Finish` event gives the stop reason.
     symphony: Option<(Reader, adapt::messages::Stream)>,
     symphony_stop: Option<messages::StopReason>,
+    /// The step's delta and the stream's event buffer, as the chat stream
+    /// keeps them; the prompt's events wait in the buffer for the first step's.
+    delta: Delta,
+    spare: Events<'static>,
 
     // Token tracking
     completion_tokens: CompletionTokenTracker,
@@ -3658,11 +3701,12 @@ impl<'a> MessagesStream<'a> {
         } else {
             None
         };
+        let mut spare = Events::new();
         let symphony = spec
             .symphony
             .as_ref()
             .map(|assignment| {
-                Reader::new(assignment, Arc::clone(&spec.chat_tools))
+                Reader::new(assignment, Arc::clone(&spec.chat_tools), &mut spare)
                     .map(|reader| reader.first_call_only(spec.first_tool_call_only))
             })
             .transpose()?
@@ -3683,6 +3727,8 @@ impl<'a> MessagesStream<'a> {
             stop_decoder,
             symphony,
             symphony_stop: None,
+            delta: Delta::default(),
+            spare,
             completion_tokens: CompletionTokenTracker::new(),
             prompt_tokens: 0,
             saw_complete: false,
@@ -3801,7 +3847,14 @@ impl<'a> MessagesStream<'a> {
         let mut chunk_tokens = chunk.token_ids().len() as u32;
 
         if let Some((reader, machine)) = self.symphony.as_mut() {
-            let (events, should_stop) = reader.read(&mut self.stop_decoder, chunk.token_ids())?;
+            let mut delta = std::mem::take(&mut self.delta);
+            let mut events: Events<'_> = std::mem::take(&mut self.spare);
+            let should_stop = reader.read(
+                &mut self.stop_decoder,
+                chunk.token_ids(),
+                &mut delta,
+                &mut events,
+            )?;
             if should_stop {
                 self.stopped = true;
                 self.finish_reason_str = "stop".to_string();
@@ -3810,16 +3863,18 @@ impl<'a> MessagesStream<'a> {
                     .matched_stop()
                     .map(|s| Value::String(s.to_string()));
             }
-            self.parsed_thinking_tokens += reasoning_text_tokens(&events);
+            self.parsed_thinking_tokens += reasoning_text_tokens(events.as_slice());
             self.symphony_stop = StreamingProcessor::send_symphony_blocks(
                 self.tx,
                 &mut self.sse_buffer,
                 machine,
-                &events,
+                events.as_slice(),
                 self.spec.thinking_text_returned,
             )
             .await?
             .or_else(|| self.symphony_stop.take());
+            self.spare = events.recycle();
+            self.delta = delta;
             return Ok(None);
         }
 
@@ -3884,7 +3939,8 @@ impl<'a> MessagesStream<'a> {
                 self.tx,
                 &mut self.sse_buffer,
                 (reader, machine),
-                flushed.as_deref(),
+                (&mut self.delta, &mut self.spare),
+                flushed,
                 engine_finish(&self.finish_reason_str),
                 Who {
                     request_id: &self.dispatch.request_id,
@@ -3936,7 +3992,8 @@ impl<'a> MessagesStream<'a> {
                 self.tx,
                 &mut self.sse_buffer,
                 (reader, machine),
-                flushed.as_deref(),
+                (&mut self.delta, &mut self.spare),
+                flushed,
                 finish,
                 Who {
                     request_id: &self.dispatch.request_id,

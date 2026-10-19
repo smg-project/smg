@@ -43,7 +43,7 @@ pub(super) struct Finish {
 }
 
 /// The fold of `events`.
-pub(super) fn fold<'a>(events: impl IntoIterator<Item = &'a Event>) -> Folded {
+pub(super) fn fold<'a, 'd: 'a>(events: impl IntoIterator<Item = &'a Event<'d>>) -> Folded {
     let mut folded = Folded::default();
     for event in events {
         match event {

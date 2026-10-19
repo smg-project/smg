@@ -18,7 +18,7 @@ use openai_protocol::{
     messages::{self, Message},
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
-use symphony::adapt;
+use symphony::{adapt, Events};
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{error, warn};
 
@@ -29,7 +29,7 @@ use crate::routers::{
         context::{DispatchMetadata, ExecutionResult},
         proto_wrapper::ProtoGenerateComplete,
         regular::symphony::{
-            content_spans, engine_finish, finished, telemetry::Who, Assignment, Reader,
+            content_spans, engine_finish, finished, telemetry::Who, Assignment, Delta, Reader,
             SymphonyError,
         },
         spec::{ChatResponseSpec, CompletionResponseSpec, MessagesResponseSpec},
@@ -240,9 +240,14 @@ impl ResponseProcessor {
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<(ChatChoice, u32), String> {
         let tools = original_request.tools.clone().unwrap_or_default();
-        let mut reader =
-            Reader::new(assignment, tools)?.first_call_only(original_request.first_tool_call_only);
-        let (mut events, stopped) = reader.read(stop_decoder, complete.output_ids())?;
+        // The output as one delta, then the decoder's last text: two deltas the events borrow,
+        // both outliving the buffer.
+        let mut delta = Delta::default();
+        let mut flushed = Delta::default();
+        let mut events = Events::new();
+        let mut reader = Reader::new(assignment, tools, &mut events)?
+            .first_call_only(original_request.first_tool_call_only);
+        let stopped = reader.read(stop_decoder, complete.output_ids(), &mut delta, &mut events)?;
         // Complete token decoding, including bytes and a partial stop match, as
         // on the older path; the text it releases is the last token's.
         let tail = stop_decoder
@@ -252,7 +257,7 @@ impl ResponseProcessor {
         if let SequenceDecoderOutput::Text(text) | SequenceDecoderOutput::StoppedWithText(text) =
             tail
         {
-            events.extend(reader.tail(&text)?);
+            reader.tail(text, &mut flushed, &mut events)?;
         }
         let reason = finish_after_local_stop(stopped || stop_decoder.is_stopped(), complete);
         let who = Who {
@@ -260,8 +265,9 @@ impl ResponseProcessor {
             model,
             choice: index as u32,
         };
-        events.extend(reader.end(engine_finish(reason), who)?);
-        let reasoning_tokens = finished(&events).map_or(0, |finished| finished.reasoning_tokens);
+        reader.end(engine_finish(reason), who, &mut events)?;
+        let reasoning_tokens =
+            finished(events.as_slice()).map_or(0, |finished| finished.reasoning_tokens);
         let mut choice = adapt::chat::message(index as u32, &events);
         choice.matched_stop = matched_stop_value(stop_decoder, complete);
         // The content's tokens alone keep their logprobs, as on the older path: none when
@@ -280,7 +286,7 @@ impl ResponseProcessor {
             } = &mut logprobs
             {
                 let keep = if has_content {
-                    content_tokens(reader.token_ends(), &content_spans(&events))
+                    content_tokens(reader.token_ends(), &content_spans(events.as_slice()))
                 } else {
                     Vec::new()
                 };
@@ -309,10 +315,13 @@ impl ResponseProcessor {
         request: &MessagesResponseSpec,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<Message, SymphonyError> {
-        let mut reader = Reader::new(assignment, Arc::clone(&request.chat_tools))?
+        let mut delta = Delta::default();
+        let mut flushed = Delta::default();
+        let mut events = Events::new();
+        let mut reader = Reader::new(assignment, Arc::clone(&request.chat_tools), &mut events)?
             .first_call_only(request.first_tool_call_only);
         stop_decoder.reset();
-        let (mut events, stopped) = reader.read(stop_decoder, complete.output_ids())?;
+        let stopped = reader.read(stop_decoder, complete.output_ids(), &mut delta, &mut events)?;
         let tail = stop_decoder
             .finish()
             .map_err(|e| SymphonyError::Read(format!("Failed to finish token decoding: {e}")))?;
@@ -320,7 +329,7 @@ impl ResponseProcessor {
         if let SequenceDecoderOutput::Text(text) | SequenceDecoderOutput::StoppedWithText(text) =
             tail
         {
-            events.extend(reader.tail(&text)?);
+            reader.tail(text, &mut flushed, &mut events)?;
         }
         let reason = finish_after_local_stop(stopped || stop_decoder.is_stopped(), complete);
         let who = Who {
@@ -328,7 +337,7 @@ impl ResponseProcessor {
             model: &dispatch.model,
             choice: 0,
         };
-        events.extend(reader.end(engine_finish(reason), who)?);
+        reader.end(engine_finish(reason), who, &mut events)?;
         let mut output = adapt::messages::output(&events);
         // A `tool_use` block carries `{}` only where the parser said the arguments are none;
         // arguments that are JSON no `input` value holds would leave as `{}` with no word, so the
@@ -352,7 +361,8 @@ impl ResponseProcessor {
         let stop_sequence = stop_sequence
             .filter(|_| matches!(stop_reason, Some(messages::StopReason::StopSequence)));
         let thinking_requested = request.thinking_requested;
-        let reasoning_tokens = finished(&events).map_or(0, |finished| finished.reasoning_tokens);
+        let reasoning_tokens =
+            finished(events.as_slice()).map_or(0, |finished| finished.reasoning_tokens);
         Ok(Message {
             id: dispatch.request_id.clone(),
             message_type: "message".to_string(),
