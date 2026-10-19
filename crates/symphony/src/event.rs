@@ -75,14 +75,17 @@ pub enum DropReason {
     /// Bytes of a call block the call syntax could not read as the call, for a syntax whose block
     /// is never prose (the keyed syntax: the block's markers and its four tags are the format's
     /// own tokens, and what stands between them where the syntax has no place for text is the
-    /// model's failed call). A `Malformed` event of no bytes with the reason stands before them,
-    /// so the failure is counted; the bytes themselves never reach a client as content.
+    /// model's failed call). A `Malformed` event of no bytes with the reason stands right before
+    /// them, or, for a call the end of the stream or a marker cut, right after them and before
+    /// its `ToolCallEnd` (`tagged::end_cut_call`), so the failure is counted; the bytes
+    /// themselves never reach a client as content.
     MalformedCall,
 }
 
 /// Why a region could not be parsed. Its text is returned, never lost: with the event, or, for a
-/// call syntax whose block is never prose, as `Dropped { MalformedCall }` right after an event of
-/// no bytes ([`DropReason::MalformedCall`]).
+/// call syntax whose block is never prose, as `Dropped { MalformedCall }` beside an event of no
+/// bytes, right after it, or right before it and the call's end where a cut ended the call
+/// ([`DropReason::MalformedCall`]).
 ///
 /// The set is closed: every reason a parser gives is one of these, so a reader can count them
 /// and a client can match on them; a new reason is a new variant. [`Display`](std::fmt::Display)

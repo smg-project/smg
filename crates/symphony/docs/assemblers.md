@@ -188,9 +188,11 @@ What the syntax says, and what the assembler does with it:
   client shown it saw the format's tags at the end of the answer (`</arg_key><arg_value>1975
   </arg_value>`, in 20 of 292 answers of a live cell). Such bytes are refused: a `Malformed`
   event of no bytes with the reason stands where the bytes do, so a reader counts the failure at
-  its offset, and the bytes leave as `Dropped { MalformedCall }`, never as content; a call that
-  started keeps the pairs it read (`{}` when none), and a block that named no call has every
-  byte refused, the marker that closed it included. The attributed, XML and Qwen-tagged
+  its offset, and the bytes leave as `Dropped { MalformedCall }`, never as content (at a cut
+  call's end the bytes held come first and the one event of no bytes stands after them, before
+  `ToolCallEnd`, as `tagged::end_cut_call` has it); a call that started keeps the pairs it read
+  (`{}` when none), and a block that named no call has every byte refused, the marker that
+  closed it included. The attributed, XML and Qwen-tagged
   assemblers still carry such bytes in the `Malformed` event, which the adapters show.
 - **Every byte of the call lands in exactly one event**, with the Qwen assembler's accounting:
   the name's bytes in `ToolCallStart`, each tag's and value's bytes in the fragments they
