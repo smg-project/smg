@@ -428,8 +428,10 @@ class Router:
         kv_engine_id_annotation: Kubernetes annotation containing KV engine IDs,
             aligned with worker_ports_annotation. Default: 'smg.ai/kv-engine-id'
         request_timeout_secs: Request timeout in seconds: the read of the body
-            overall, and each request to a worker, HTTP or gRPC, from its
-            dispatch to its last message. Default: 1800
+            overall, and each attempt at a worker, HTTP or gRPC, from its
+            dispatch to its last message (504 call_upstream_timeout past it,
+            the request's answer on any worker; an HTTP worker's own pool
+            timeout_secs takes this value's place). Default: 1800
         max_concurrent_requests: Maximum standing concurrent requests. -1 derives
             the bound from the host (1024 per available core, at least 4096); 0
             disables it. Default: -1
