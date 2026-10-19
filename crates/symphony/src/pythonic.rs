@@ -1309,6 +1309,25 @@ mod tests {
             assert!(calls(&events).is_empty(), "{prose:?}");
             assert_eq!(malformed(&events), "", "{prose:?}");
         }
+        // A member without a value, at both positions: at the turn's start the list streams as it
+        // arrives, so the call comes with the member reported and left out; after content a held
+        // list is read as calls only when it is well-formed Python, and `city=` is not, so the
+        // whole is content, as any held list with a malformed byte is.
+        let text = "[get_weather(city=, days=3)]";
+        let events = run_bare(&tools(), &[text]);
+        assert_eq!(bytes(&events), text);
+        assert_eq!(content(&events), "");
+        assert_eq!(
+            calls(&events),
+            [(0, "get_weather".to_string(), r#"{"days": 3}"#.to_string())]
+        );
+        assert_eq!(malformed(&events), "city=");
+        let text = "Let me check.[get_weather(city=, days=3)]";
+        let events = run_bare(&tools(), &[text]);
+        assert_eq!(bytes(&events), text);
+        assert_eq!(content(&events), text);
+        assert!(calls(&events).is_empty());
+        assert_eq!(malformed(&events), "");
         // Whitespace between the bracket and the name, and after the name, is Python's.
         let events = run_bare(&tools(), &["[ get_weather (city=\"Paris\") ]"]);
         assert_eq!(calls(&events).len(), 1);
@@ -1359,6 +1378,8 @@ mod tests {
             "f'(a) = lim(h→0)[f(a+h) - f(a)]/h",
             "[Note] see [1, 2] and [a link](https://example.com).",
             "[get_weather(city=\"Paris\")]\n\nDone.",
+            "[get_weather(city=, days=3)]",
+            "Let me check.[get_weather(city=, days=3)]",
         ] {
             let whole = run_bare(&tools(), &[text]);
             for cut in 1..text.len() {
