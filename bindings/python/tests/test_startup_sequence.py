@@ -424,6 +424,17 @@ class TestRouterInitialization:
 
         rust_router.assert_not_called()
 
+    def test_every_discovery_field_is_routed(self):
+        """A discovery field missing from from_args' table would reach _Router
+        as an argument it does not take."""
+        import dataclasses
+
+        from smg.router import _DISCOVERY_FIELDS
+
+        fields = {f.name for f in dataclasses.fields(RouterArgs)}
+        discovery = {f for f in fields if f.startswith(("slurm_", "discovery_"))}
+        assert discovery == set(_DISCOVERY_FIELDS)
+
     def test_discovery_provider_file_enables_igw(self):
         """IGW follows the file provider the same way it follows Kubernetes."""
         args = RouterArgs(discovery_provider="file", discovery_file="/run/smg/workers.json")
