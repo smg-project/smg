@@ -258,9 +258,11 @@ impl Assembler {
         if self.done {
             return;
         }
-        for piece in self.scanner.feed(bytes) {
+        let scanned = self.scanner.feed(bytes);
+        for piece in scanned.pieces() {
             self.take(piece, declared, out);
         }
+        self.scanner.reclaim(scanned);
     }
 
     /// The call's end: `terminal` is the closing marker the engine read (its bytes go into
@@ -307,7 +309,7 @@ impl Assembler {
         self.object.close(source, out);
         out.push(Event::ToolCallEnd {
             index: self.object.index,
-            source: Text::uncounted(terminal),
+            source: Text::uncounted(terminal.to_owned()),
         });
         self.done = true;
     }
@@ -332,7 +334,7 @@ impl Assembler {
         }
     }
 
-    fn take(&mut self, piece: Piece, declared: &Declared, out: &mut Events) {
+    fn take(&mut self, piece: Piece<'_>, declared: &Declared, out: &mut Events) {
         match piece {
             Piece::Text(text) => self.text(&text, out),
             Piece::Marker(tag) => self.tag(tag, declared, out),
@@ -536,7 +538,7 @@ mod tests {
     }
 
     /// The events of one block fed in `pieces`, closed by the call's marker or cut.
-    fn run(pieces: &[&str], cut: bool) -> Vec<Event> {
+    fn run(pieces: &[&str], cut: bool) -> Vec<Event<'static>> {
         let mut assembler = Assembler::new(0, "call_0", Tags::PLAIN);
         let mut out = Events::new();
         let declared = declared();
@@ -551,7 +553,7 @@ mod tests {
         out.drain()
     }
 
-    fn fragments(events: &[Event]) -> Vec<&str> {
+    fn fragments<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
@@ -565,25 +567,25 @@ mod tests {
         fragments(events).concat()
     }
 
-    fn malformed(events: &[Event]) -> Vec<(&str, MalformedReason)> {
+    fn malformed<'a>(events: &'a [Event<'_>]) -> Vec<(&'a str, MalformedReason)> {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, why } => Some((text.text.as_str(), *why)),
+                Event::Malformed { text, why } => Some((&*text.text, *why)),
                 _ => None,
             })
             .collect()
     }
 
     /// The text of a refused call block, in order: the `Dropped { MalformedCall }` events.
-    fn refused(events: &[Event]) -> Vec<&str> {
+    fn refused<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
                 Event::Dropped {
                     text,
                     why: DropReason::MalformedCall,
-                } => Some(text.text.as_str()),
+                } => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -608,11 +610,11 @@ mod tests {
             .count()
     }
 
-    fn ends(events: &[Event]) -> Vec<&str> {
+    fn ends<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::ToolCallEnd { source, .. } => Some(source.text.as_str()),
+                Event::ToolCallEnd { source, .. } => Some(&*source.text),
                 _ => None,
             })
             .collect()

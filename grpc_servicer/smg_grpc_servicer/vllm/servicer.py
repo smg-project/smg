@@ -6,7 +6,6 @@ Implements the VllmEngine gRPC service on top of vLLM's EngineClient.
 """
 
 import asyncio
-import hashlib
 import itertools
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
@@ -33,7 +32,7 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 
 from smg_grpc_servicer.kv_relay import Engine, relay
-from smg_grpc_servicer.tokenizer_bundle import build_tokenizer_zip, tokenizer_chunks
+from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
 from smg_grpc_servicer.trace_context import trace_headers
 from smg_grpc_servicer.vllm import attach_vllm_logging
 from smg_grpc_servicer.vllm.admin import flush_cache
@@ -1026,15 +1025,13 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         tokenizer_dir = Path(tokenizer_path)
 
         # Reading and compressing the tokenizer directory is file I/O and CPU
-        # measured in hundreds of milliseconds, so it stays off the event loop
-        # and the engine keeps answering everything else meanwhile.
+        # measured in hundreds of milliseconds: the shared bundle builds it in
+        # a worker thread, once, and the engine keeps answering everything else.
         try:
-            zip_buffer, sha256 = await asyncio.to_thread(self._tokenizer_bundle, tokenizer_dir)
+            zip_data, sha256 = await tokenizer_bundle(tokenizer_dir)
         except Exception as e:
             logger.exception("Failed to build tokenizer ZIP")
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
-
-        zip_data = zip_buffer.getbuffer()
 
         logger.info(
             "Streaming tokenizer bundle: %d bytes, sha256=%s",
@@ -1046,12 +1043,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             yield chunk
 
     # ========== Helper methods ==========
-
-    @staticmethod
-    def _tokenizer_bundle(tokenizer_dir: Path):
-        """The tokenizer archive and its fingerprint, built in one pass."""
-        zip_buffer = build_tokenizer_zip(tokenizer_dir)
-        return zip_buffer, hashlib.sha256(zip_buffer.getbuffer()).hexdigest()
 
     def _build_preprocessed_mm_inputs(
         self,

@@ -212,6 +212,8 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
         GenerationPrompt::ModelWritesTheThought,
     ),
     // Qwen2.5: no thought at all.
+    ("qwen2.5-0.5b-instruct", GenerationPrompt::Plain),
+    ("qwen2.5-1.5b-instruct", GenerationPrompt::Plain),
     ("qwen2.5-7b-instruct-1m", GenerationPrompt::Plain),
     ("qwen2.5-14b-instruct-1m", GenerationPrompt::Plain),
     ("qwen2.5-vl-3b-instruct", GenerationPrompt::Plain),
@@ -1617,7 +1619,7 @@ fn parity(
     let (mut unreadable, mut undeclared_after_content) = (0, 0);
     let (mut token_plans_run, mut without_pieces, mut content_off_whole) = (0, 0, 0);
     for fixture in fixtures {
-        let text = fixture.reference.text.as_str();
+        let text = &*fixture.reference.text;
         let expected = Said::of_reference(&fixture.reference);
         let finish = engine_finish(&fixture.reference.finish_reason);
         // The whole replay comes first; every other replay is checked against it as it is made,
@@ -2070,7 +2072,7 @@ fn qwen3_token_plans_count_every_token_where_its_first_byte_lands() {
                 fixture.id
             )
         });
-        let text = fixture.reference.text.as_str();
+        let text = &*fixture.reference.text;
         assert_eq!(
             pieces.len(),
             fixture.output_ids.len(),
@@ -2254,7 +2256,7 @@ fn delivered_content(events: &[Event]) -> String {
     events
         .iter()
         .filter_map(|event| match event {
-            Event::Content(text) | Event::Malformed { text, .. } => Some(text.text.as_str()),
+            Event::Content(text) | Event::Malformed { text, .. } => Some(&*text.text),
             _ => None,
         })
         .collect()
@@ -2270,9 +2272,10 @@ fn replay_tokens(
     pieces: &[String],
     sizes: &[usize],
     finish: &EngineFinish,
-) -> Result<Vec<Event>, ParseError> {
-    let mut out = Events::new();
-    parser.feed(prompt, &mut out)?;
+) -> Result<Vec<Event<'static>>, ParseError> {
+    // Each step's text and spans are built first: a step's events borrow its text for as long as
+    // the buffer they are read into lives, here the whole output.
+    let mut steps: Vec<(usize, usize, String, Vec<TokenSpan>)> = Vec::with_capacity(sizes.len());
     let mut first = 0;
     for &size in sizes {
         let last = (first + size).min(ids.len());
@@ -2287,15 +2290,20 @@ fn replay_tokens(
             });
             text.push_str(piece);
         }
+        steps.push((first, last, text, spans));
+        first = last;
+    }
+    let mut out = Events::new();
+    parser.feed(prompt, &mut out)?;
+    for (first, last, text, spans) in &steps {
         parser.feed(
             Input::Delta {
-                token_ids: &ids[first..last],
-                text: &text,
-                spans: &spans,
+                token_ids: &ids[*first..*last],
+                text,
+                spans,
             },
             &mut out,
         )?;
-        first = last;
     }
     parser.feed(
         Input::End {
@@ -2303,7 +2311,7 @@ fn replay_tokens(
         },
         &mut out,
     )?;
-    Ok(out.drain())
+    Ok(out.into_owned().drain())
 }
 
 fn tokens_of(event: &Event) -> Option<u32> {
@@ -2584,7 +2592,7 @@ fn replay_plan(
     text: &str,
     cuts: &[usize],
     finish: &EngineFinish,
-) -> Result<Vec<Event>, String> {
+) -> Result<Vec<Event<'static>>, String> {
     let replayed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         replay_after(&mut new_engine(), tail, text, cuts, finish, false)
     }));

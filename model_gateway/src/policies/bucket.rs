@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -527,6 +527,20 @@ impl Bucket {
         }
     }
 
+    /// Re-partition the sizes among the workers from the requests of the
+    /// last window, once the per-worker share of the load moved by a factor
+    /// of two since the last rebuild (or the membership changed). The walk
+    /// is over the size histogram in ascending order: each worker but the
+    /// last takes whole size classes until its share is reached and its
+    /// range ends at the last class it took; the last worker takes the open
+    /// end, as after the first split. Every bound is a size seen, the size
+    /// after one, or the open end. A class is never split between two
+    /// workers, so with few distinct sizes the shares stay coarse; a worker
+    /// stops short of its share when the classes left are no more than the
+    /// workers after it, so each of them owns a seen size while classes
+    /// remain, and only with fewer classes than workers does a worker own
+    /// no range until the next adjustment; the load spill of
+    /// [`BucketPolicy::select_worker`] evens the load out meanwhile.
     pub fn adjust_boundary(&mut self) {
         if self.t_req_loads.is_empty() {
             return;
@@ -549,63 +563,72 @@ impl Bucket {
 
         info!("Before adjusting boundary | {:?}", self.boundary);
         self.bucket_load = new_single_bucket_load;
-        let mut new_boundary = Vec::new();
-        let mut hist_load: Vec<usize> = self.t_req_loads.values().copied().collect();
-        hist_load.sort_unstable();
-        let mut upper_bound: usize = 0;
-        let mut last_load_index: usize = 0;
-        let max_value = usize::MAX;
-
-        let worker_url = {
-            let guard = self.prefill_worker_urls.lock();
-            (*guard).clone()
-        };
-
-        let mut iter = worker_url.iter().peekable();
-        // let mut curr_worker_id = 0;
-        while let Some(url) = iter.next() {
-            if last_load_index >= hist_load.len() && iter.peek().is_none() {
-                new_boundary.push(Boundary::new(url.clone(), [upper_bound, max_value]));
+        // The size histogram of the window: each distinct size with the load
+        // its requests add up to.
+        let mut histogram: BTreeMap<usize, usize> = BTreeMap::new();
+        for &size in self.t_req_loads.values() {
+            *histogram.entry(size).or_default() += size;
+        }
+        let worker_urls = self.prefill_worker_urls.lock().clone();
+        let mut classes = histogram.iter();
+        let mut classes_left = histogram.len();
+        let mut new_boundary = Vec::with_capacity(worker_urls.len());
+        let mut lower = 0;
+        for (i, url) in worker_urls.iter().enumerate() {
+            if i + 1 == worker_urls.len() {
+                new_boundary.push(Boundary::new(url.clone(), [lower, usize::MAX]));
                 break;
             }
-            let mut load_accumulator = 0;
-            let mut break_flag = false;
-            for &load in &hist_load[last_load_index..] {
-                load_accumulator += load;
-                if load_accumulator >= new_single_bucket_load {
-                    if iter.peek().is_none() {
-                        new_boundary.push(Boundary::new(url.clone(), [upper_bound, max_value]));
-                        break_flag = true;
-                        break;
-                    }
-                    let real_load = upper_bound + new_single_bucket_load;
-                    if load <= upper_bound {
-                        new_boundary.push(Boundary::new(url.clone(), [upper_bound, real_load]));
-                        upper_bound = real_load + 1;
-                    } else {
-                        new_boundary.push(Boundary::new(url.clone(), [upper_bound, load]));
-                        upper_bound = load + 1;
-                    }
-                    last_load_index += 1;
-                    break_flag = true;
+            // The workers after this one, each owed a class while classes
+            // remain.
+            let workers_after = worker_urls.len() - i - 1;
+            let mut share = 0;
+            let mut upper = None;
+            for (&size, &load) in classes.by_ref() {
+                share += load;
+                upper = Some(size);
+                classes_left -= 1;
+                // The class that crosses the share goes whole to this worker,
+                // but not the classes the workers after it are owed: with no
+                // more classes left than workers after this one, each of
+                // them takes one, and the last worker holds the largest size
+                // instead of an open end no seen size reaches. The spill
+                // evens the load out from there.
+                if share >= new_single_bucket_load || classes_left <= workers_after {
                     break;
-                } else {
-                    last_load_index += 1;
                 }
             }
-            if !break_flag {
-                let mut right_bound_value = upper_bound + new_single_bucket_load;
-                if iter.peek().is_none() {
-                    right_bound_value = max_value;
-                    new_boundary.push(Boundary::new(url.clone(), [upper_bound, right_bound_value]));
-                    break;
-                }
-                new_boundary.push(Boundary::new(url.clone(), [upper_bound, right_bound_value]));
-                upper_bound = right_bound_value + 1;
+            // A worker that finds the classes used up (fewer classes than
+            // workers) owns no range until the next adjustment.
+            if let Some(size) = upper {
+                new_boundary.push(Boundary::new(url.clone(), [lower, size]));
+                lower = size.saturating_add(1);
             }
         }
+        debug_assert!(
+            Self::partitions_the_sizes(&new_boundary, &histogram),
+            "the adjustment left the size domain: {new_boundary:?} over {histogram:?}"
+        );
         self.boundary = new_boundary;
         info!("After adjusting boundary | {:?}", self.boundary);
+    }
+
+    /// Whether `boundary` partitions the sizes: contiguous from 0, every
+    /// upper bound a size of `histogram`, the last range open-ended.
+    fn partitions_the_sizes(boundary: &[Boundary], histogram: &BTreeMap<usize, usize>) -> bool {
+        let mut next_lower = 0;
+        boundary.iter().enumerate().all(|(i, b)| {
+            let [lower, upper] = b.range;
+            let open_end = i + 1 == boundary.len();
+            let upper_is_a_size = if open_end {
+                upper == usize::MAX
+            } else {
+                histogram.contains_key(&upper)
+            };
+            let contiguous = lower == next_lower && lower <= upper;
+            next_lower = upper.saturating_add(1);
+            contiguous && upper_is_a_size
+        })
     }
 }
 
@@ -718,7 +741,8 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(11)).await;
         {
             let boundaries = boundaries(&policy, &prefill_workers);
-            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (33, 67));
+            // Expected Boundary: [0, 33] [34, 34] [35, MAX]
+            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (33, 34));
         }
         // === Phase S2: Validate load balancing ===
         // Three consecutive len=33 requests (Should route to different buckets)
@@ -953,10 +977,13 @@ mod tests {
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
-        // Verify boundaries adjusted to: [0, 20], [21, 26], [27, MAX]
+        // Verify boundaries adjusted to: [0, 20], [21, 24], [25, MAX]: a share
+        // of 33; the second worker stops at 24 because the one class left, 26,
+        // is the third worker's (an open end no seen size reaches is never
+        // written while a class remains).
         {
             let boundaries = boundaries(&policy, &prefill_workers);
-            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 26));
+            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 24));
         }
 
         // ===Phase S2: Second set of  requests to trigger boundary adjustment ===
@@ -1017,10 +1044,11 @@ mod tests {
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
-        // Verify boundaries adjusted to: [0, 40], [41, 57], [58, MAX]
+        // Verify boundaries adjusted to: [0, 40], [41, 45], [46, MAX]: a share
+        // of 67; the second worker stops at 45, 57 being the third worker's.
         {
             let boundaries = boundaries(&policy, &prefill_workers);
-            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (40, 57));
+            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (40, 45));
         }
     }
 
@@ -1079,7 +1107,10 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(4)).await;
         {
             let boundaries = boundaries(&policy, &prefill_workers);
-            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 27));
+            // Expected Boundary: [0, 20] [21, MAX]: one size seen, the
+            // second worker owns no range, the third takes the open end.
+            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, usize::MAX));
+            assert_eq!(boundaries.len(), 2);
         }
 
         policy
@@ -1095,7 +1126,9 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(4)).await;
         {
             let boundaries = boundaries(&policy, &prefill_workers);
-            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (7, 10));
+            // Expected Boundary: [0, 7] [8, MAX]
+            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (7, usize::MAX));
+            assert_eq!(boundaries.len(), 2);
         }
     }
 
@@ -1196,9 +1229,10 @@ mod tests {
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
+        // [0, 20] [21, 24] [25, MAX], as in test_adjust_boundary_1's first phase.
         {
             let boundaries = boundaries(&policy, &prefill_workers);
-            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 26));
+            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 24));
         }
 
         policy
@@ -1257,9 +1291,11 @@ mod tests {
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
+        // The second set moves the per-worker share from 33 to 64, within the
+        // factor of two: the partition stays.
         {
             let boundaries = boundaries(&policy, &prefill_workers);
-            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 26));
+            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 24));
         }
     }
 
@@ -1418,12 +1454,15 @@ mod tests {
 
         policy.remove_worker("http://w2:8000");
         assert_eq!(bucket.read().bucket_load, 0);
+        // The first rebuild gave each worker a size (w1 [0, 100], w2
+        // [101, 200], w3 the open end from 201): w2's removal hands its
+        // range to w1.
         let merged = boundaries(&policy, &workers);
         assert_eq!(
             merged,
             [
-                ("http://w1:8000".to_string(), [0, 4101]),
-                ("http://w3:8000".to_string(), [4102, usize::MAX]),
+                ("http://w1:8000".to_string(), [0, 200]),
+                ("http://w3:8000".to_string(), [201, usize::MAX]),
             ]
         );
 
@@ -1431,8 +1470,8 @@ mod tests {
         assert_eq!(
             boundaries(&policy, &workers),
             [
-                ("http://w1:8000".to_string(), [0, 3000]),
-                ("http://w3:8000".to_string(), [3001, usize::MAX]),
+                ("http://w1:8000".to_string(), [0, 200]),
+                ("http://w3:8000".to_string(), [201, usize::MAX]),
             ],
             "the tick after a removal re-partitions among the survivors"
         );
@@ -1601,7 +1640,9 @@ mod tests {
     /// adjustment rebuilds the partition from the sizes seen, as the first
     /// adjustment does, without waiting for the per-worker load to double.
     /// The sizes seen are 100, 200, 300, 2000, 2100 and 2200; with three
-    /// workers a third of their sum, 2300, is one worker's share.
+    /// workers a third of their sum, 2300, is one worker's share, and the
+    /// second worker stops short of its share at 2100 so that the third
+    /// holds the largest size instead of an open end no size reaches.
     #[test]
     fn a_changed_membership_lets_the_next_adjustment_re_split_from_the_sizes_seen() {
         let url = |n: usize| format!("http://w{n}:8000");
@@ -1638,8 +1679,8 @@ mod tests {
             bucket_ranges(&bucket),
             [
                 (url(1), [0, 2000]),
-                (url(2), [2001, 2200]),
-                (url(3), [2201, usize::MAX]),
+                (url(2), [2001, 2100]),
+                (url(3), [2101, usize::MAX]),
             ]
         );
     }
@@ -1673,5 +1714,84 @@ mod tests {
         }
         // A normal drain is not worth a warning per request.
         assert!(!logs_contain("randomly selecting"));
+    }
+
+    /// The adjustment walks the size histogram and every bound it writes is
+    /// a size: four workers over four equally frequent sizes own one class
+    /// each, the last of them as the open end (the last worker's, as after
+    /// the first split), the first three stopping short of their share for
+    /// the workers after them. No bound is a load sum.
+    #[test]
+    fn an_adjusted_partitions_bounds_are_sizes_and_each_worker_owns_one_class() {
+        let url = |n: usize| format!("http://w{n}:8000");
+        let mut bucket = Bucket::new(3_600_000);
+        bucket.init_prefill_worker_urls((1..=4).map(url).collect());
+        for _ in 0..10 {
+            for size in [101, 2001, 3001, 4001] {
+                let owner = bucket.find_boundary(size).expect("every size has an owner");
+                bucket.post_process_request(size, owner);
+            }
+        }
+        bucket.adjust_boundary();
+        assert_eq!(
+            bucket_ranges(&bucket),
+            [
+                (url(1), [0, 101]),
+                (url(2), [102, 2001]),
+                (url(3), [2002, 3001]),
+                (url(4), [3002, usize::MAX]),
+            ]
+        );
+    }
+
+    /// Fewer classes than workers: the workers that find the classes used
+    /// up own no range until the next adjustment, the partition stays
+    /// contiguous around them (the last worker's open end follows the last
+    /// class), and the size-domain check accepts it. Four workers over the
+    /// sizes 101 and 2001: the first two own one class each, the third
+    /// nothing, the fourth the open end.
+    #[test]
+    fn a_worker_that_finds_the_classes_used_up_owns_no_range_and_the_partition_stays_contiguous() {
+        let url = |n: usize| format!("http://w{n}:8000");
+        let mut bucket = Bucket::new(3_600_000);
+        bucket.init_prefill_worker_urls((1..=4).map(url).collect());
+        for _ in 0..10 {
+            for size in [101, 2001] {
+                let owner = bucket.find_boundary(size).expect("every size has an owner");
+                bucket.post_process_request(size, owner);
+            }
+        }
+        bucket.adjust_boundary();
+        assert_eq!(
+            bucket_ranges(&bucket),
+            [
+                (url(1), [0, 101]),
+                (url(2), [102, 2001]),
+                (url(4), [2002, usize::MAX]),
+            ]
+        );
+    }
+
+    /// A size class goes whole to one worker: the worker after it starts at
+    /// the next size, its range is never widened by a load share. Three
+    /// workers over the sizes 33, 34 and 34 (a share of 33) own [0, 33],
+    /// [34, 34] and the open end.
+    #[test]
+    fn a_size_class_that_crosses_the_share_goes_whole_to_one_worker() {
+        let url = |n: usize| format!("http://w{n}:8000");
+        let mut bucket = Bucket::new(3_600_000);
+        bucket.init_prefill_worker_urls((1..=3).map(url).collect());
+        for size in [33, 34, 34] {
+            bucket.post_process_request(size, url(1));
+        }
+        bucket.adjust_boundary();
+        assert_eq!(
+            bucket_ranges(&bucket),
+            [
+                (url(1), [0, 33]),
+                (url(2), [34, 34]),
+                (url(3), [35, usize::MAX]),
+            ]
+        );
     }
 }

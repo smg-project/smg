@@ -52,7 +52,7 @@ pub(crate) fn end_cut_call(index: u32, held: String, terminal: &str, out: &mut E
     });
     out.push(Event::ToolCallEnd {
         index,
-        source: Text::uncounted(terminal),
+        source: Text::uncounted(terminal.to_owned()),
     });
 }
 

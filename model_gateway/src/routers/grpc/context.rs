@@ -251,7 +251,7 @@ pub(crate) struct ProcessingState {
 
     /// The selected worker's constrained decoding, set when request building
     /// let its policy choose the request's constraint
-    /// (`regular::symphony::WorkerConstraint::by_policy`), so retry
+    /// (`regular::symphony::constraint::WorkerConstraint::by_policy`), so retry
     /// re-selection stays on workers that decide alike
     /// (`utils::WorkerDecoding::decides_alike`).
     pub constraint_decided_on: Option<WorkerDecoding>,

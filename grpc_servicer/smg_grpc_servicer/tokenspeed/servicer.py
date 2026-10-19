@@ -14,7 +14,6 @@ import asyncio
 import dataclasses
 import enum
 import functools
-import hashlib
 import json
 import logging
 import math
@@ -41,8 +40,9 @@ from tokenspeed.runtime.multimodal.inputs import (
 from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
 
 from smg_grpc_servicer import mm_shm
+from smg_grpc_servicer.health_probe import await_probe
 from smg_grpc_servicer.mm_rdma import RdmaPixelPuller
-from smg_grpc_servicer.tokenizer_bundle import build_tokenizer_zip, tokenizer_chunks
+from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
 from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
 from smg_grpc_servicer.tokenspeed.kv_events import (
@@ -404,7 +404,10 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
     ) -> tokenspeed_scheduler_pb2.HealthCheckResponse:
         """Deep health probe — sends a 1-token generation to the scheduler.
 
-        Any scheduler push within ``HEALTH_CHECK_TIMEOUT`` counts as alive.
+        The wait is :func:`await_probe`'s: any scheduler push after the probe
+        started, or the probe's own output, counts as alive within
+        ``HEALTH_CHECK_TIMEOUT``; a probe the engine refuses at the request
+        (its stream raises, or ends without an output) is unhealthy at once.
         ``log_metrics=False`` so health checks don't skew Prometheus counters.
         """
         rid = f"HEALTH_CHECK_{time.time()}"
@@ -434,7 +437,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         )
         probe.rid = rid
 
-        tic = time.time()
+        started = time.time()
 
         async def _drive_probe() -> bool:
             # Held so the finally can close it, as Generate holds its own: the
@@ -460,23 +463,17 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
         task = asyncio.create_task(_drive_probe())
         try:
-            while time.time() - tic < HEALTH_CHECK_TIMEOUT:
-                await asyncio.sleep(0.5)
-                # Any scheduler push after we started counts as healthy.
-                if self.async_llm.last_receive_tstamp > tic:
-                    return tokenspeed_scheduler_pb2.HealthCheckResponse(
-                        healthy=True,
-                        message="Health check passed",
-                    )
-                if task.done():
-                    return tokenspeed_scheduler_pb2.HealthCheckResponse(
-                        healthy=bool(task.result()),
-                        message=(
-                            "Health check passed"
-                            if task.result()
-                            else "Scheduler returned no output"
-                        ),
-                    )
+            verdict = await await_probe(
+                task,
+                started=started,
+                last_receive=lambda: self.async_llm.last_receive_tstamp,
+                timeout=HEALTH_CHECK_TIMEOUT,
+            )
+            if verdict is not None:
+                return tokenspeed_scheduler_pb2.HealthCheckResponse(
+                    healthy=verdict,
+                    message="Health check passed" if verdict else "Scheduler returned no output",
+                )
         finally:
             if not task.done():
                 task.cancel()
@@ -1101,15 +1098,17 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             )
             return
 
+        # Reading and compressing the tokenizer directory is file I/O and CPU
+        # measured in hundreds of milliseconds: the shared bundle builds it in
+        # a worker thread, once, and the scheduler keeps answering everything
+        # else (streams, health checks, aborts) meanwhile.
         try:
-            zip_buffer = build_tokenizer_zip(Path(tokenizer_path))
+            zip_data, sha256 = await tokenizer_bundle(Path(tokenizer_path))
         except Exception as e:  # noqa: BLE001
             logger.exception("Failed to build tokenizer ZIP")
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
             return
 
-        zip_data = zip_buffer.getbuffer()
-        sha256 = hashlib.sha256(zip_data).hexdigest()
         logger.info("Streaming tokenizer bundle: %d bytes, sha256=%s", len(zip_data), sha256)
 
         for chunk in tokenizer_chunks(zip_data, sha256):

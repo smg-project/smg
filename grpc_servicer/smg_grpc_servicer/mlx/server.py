@@ -112,8 +112,9 @@ def load_model(args):
                 # Chat template sidecars (Gemma 4, Llama 3.1+, newer models).
                 "chat_template.json",
                 "chat_template.jinja",
-                # tiktoken-style tokenizer artifacts — must stay in sync
-                # with MlxEngineServicer._TOKENIZER_FILES / _SUFFIXES.
+                # tiktoken-style tokenizer artifacts; what GetTokenizer bundles
+                # of these is the shared tokenizer_bundle.TOKENIZER_FILES /
+                # TOKENIZER_GLOBS selection.
                 "tiktoken.model",
                 "*.tiktoken",
             ],

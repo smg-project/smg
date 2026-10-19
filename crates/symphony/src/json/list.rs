@@ -257,12 +257,12 @@ impl Assembler {
                 }
             }
             Stage::Content => {
-                out.push(Event::Content(Text::uncounted(text)));
+                out.push(Event::Content(Text::uncounted(text.to_owned())));
                 ""
             }
             Stage::Malformed => {
                 out.push(Event::Malformed {
-                    text: Text::uncounted(text),
+                    text: Text::uncounted(text.to_owned()),
                     why: MalformedReason::TextInPlaceOfTheList,
                 });
                 ""
@@ -301,7 +301,7 @@ impl Assembler {
                             .map_or(text.len(), |(i, _)| at + i);
                         self.drop_carried(out);
                         out.push(Event::Malformed {
-                            text: Text::uncounted(&text[at..end]),
+                            text: Text::uncounted(text[at..end].to_owned()),
                             why: MalformedReason::TextBetweenCalls,
                         });
                         &text[end..]
@@ -434,7 +434,7 @@ mod tests {
         "{\"name\": \"get_stock_price\", \"arguments\": {}}]"
     );
 
-    fn run(pieces: &[&str]) -> Vec<Event> {
+    fn run(pieces: &[&str]) -> Vec<Event<'static>> {
         let mut assembler = Assembler::new(0, ids());
         let mut out = Events::new();
         for piece in pieces {
@@ -506,7 +506,7 @@ mod tests {
         let dropped: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::Dropped { text, .. } => Some(text.text.as_str()),
+                Event::Dropped { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect();
@@ -519,7 +519,7 @@ mod tests {
         let content: String = events
             .iter()
             .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
+                Event::Content(text) => Some(&*text.text),
                 _ => None,
             })
             .collect();
@@ -560,7 +560,7 @@ mod tests {
         let malformed: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(text.text.as_str()),
+                Event::Malformed { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect();
@@ -578,7 +578,7 @@ mod tests {
             let content: String = events
                 .iter()
                 .filter_map(|event| match event {
-                    Event::Content(text) => Some(text.text.as_str()),
+                    Event::Content(text) => Some(&*text.text),
                     _ => None,
                 })
                 .collect();
@@ -587,7 +587,7 @@ mod tests {
         }
     }
 
-    fn run_alone(pieces: &[&str]) -> Vec<Event> {
+    fn run_alone(pieces: &[&str]) -> Vec<Event<'static>> {
         let mut assembler = Assembler::object_or_list(0, ids(), None);
         let mut out = Events::new();
         for piece in pieces {
@@ -609,7 +609,7 @@ mod tests {
         let dropped: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::Dropped { text, .. } => Some(text.text.as_str()),
+                Event::Dropped { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect();
@@ -646,9 +646,7 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, why: reason } if *reason == why => {
-                    Some(text.text.as_str())
-                }
+                Event::Malformed { text, why: reason } if *reason == why => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -658,7 +656,7 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Dropped { text, .. } => Some(text.text.clone()),
+                Event::Dropped { text, .. } => Some(text.text.to_string()),
                 _ => None,
             })
             .collect()
@@ -723,7 +721,7 @@ mod tests {
     }
 
     /// [`run_alone`] with Llama 3.1's call marker named.
-    fn run_opened(pieces: &[&str]) -> Vec<Event> {
+    fn run_opened(pieces: &[&str]) -> Vec<Event<'static>> {
         let mut assembler = Assembler::object_or_list(0, ids(), Some("<|python_tag|>"));
         let mut out = Events::new();
         for piece in pieces {
@@ -735,7 +733,10 @@ mod tests {
 
     /// `output` through `run`, whole and one character at a time: the same bytes, calls,
     /// dropped text and malformed text either way; the events of the whole.
-    fn whole_and_per_char(run: fn(&[&str]) -> Vec<Event>, output: &str) -> Vec<Event> {
+    fn whole_and_per_char(
+        run: fn(&[&str]) -> Vec<Event<'static>>,
+        output: &str,
+    ) -> Vec<Event<'static>> {
         let whole = run(&[output]);
         assert_eq!(bytes(&whole), output);
         let pieces: Vec<String> = output.chars().map(String::from).collect();
@@ -869,7 +870,7 @@ mod tests {
             events
                 .iter()
                 .filter_map(|event| match event {
-                    Event::Content(text) => Some(text.text.as_str()),
+                    Event::Content(text) => Some(&*text.text),
                     _ => None,
                 })
                 .collect::<String>(),

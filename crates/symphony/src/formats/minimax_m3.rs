@@ -94,7 +94,7 @@ mod tests {
         }])
     }
 
-    fn run_with(declared: Declared, prompt: &str, pieces: &[&str]) -> Vec<Event> {
+    fn run_with(declared: Declared, prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         drive(&mut Engine::new(minimax_m3(), declared), prompt, pieces)
     }
 
@@ -122,11 +122,11 @@ mod tests {
         body.replace('<', "]<]minimax[>[<")
     }
 
-    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
+    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         run_with(Declared::default(), prompt, pieces)
     }
 
-    fn fragments_of(events: &[Event], call: u32) -> Vec<&str> {
+    fn fragments_of<'a>(events: &'a [Event<'_>], call: u32) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
@@ -145,9 +145,9 @@ mod tests {
             .count()
     }
 
-    fn dropped(text: &str) -> Event {
+    fn dropped(text: &str) -> Event<'static> {
         Event::Dropped {
-            text: Text::uncounted(text),
+            text: Text::uncounted(text.to_owned()),
             why: DropReason::Wrapper,
         }
     }
@@ -414,7 +414,7 @@ mod tests {
         let malformed: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(text.text.as_str()),
+                Event::Malformed { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect();
@@ -436,7 +436,7 @@ mod tests {
         let ends: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::ToolCallEnd { source, .. } => Some(source.text.as_str()),
+                Event::ToolCallEnd { source, .. } => Some(&*source.text),
                 _ => None,
             })
             .collect();

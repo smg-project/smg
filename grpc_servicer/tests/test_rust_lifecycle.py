@@ -956,3 +956,20 @@ def test_supervise_closes_metrics_before_server_even_when_close_fails(monkeypatc
     else:
         assert asyncio.run(exercise()) == 0
     assert events == ["drain", "metrics", "server", "engine"]
+
+
+def test_the_kv_events_default_announcement_is_one_line_for_both_implementations(caplog):
+    """What the operator reads once the default applied, under either servicer
+    implementation: the engine's name, what is on, and the two ways to decide
+    otherwise; through the caller's own logger when it hands one over."""
+    env = "SMG_TEST_SERVICER_KV_EVENTS"
+    with caplog.at_level("INFO"):
+        rust_lifecycle.announce_kv_events_default("Engine", env)
+        rust_lifecycle.announce_kv_events_default("Engine", env, logging.getLogger("test.entry"))
+    assert [record.name for record in caplog.records] == [rust_lifecycle.logger.name, "test.entry"]
+    line = (
+        "KV event publishing enabled: no --kv-events-config was given, so Engine's ZMQ "
+        "publisher is on at a port found free on this host and SubscribeKvEvents relays "
+        f"it; pass --kv-events-config to name the endpoint, or set {env}=0 to leave it off"
+    )
+    assert [record.getMessage() for record in caplog.records] == [line, line]

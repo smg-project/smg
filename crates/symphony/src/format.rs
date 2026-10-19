@@ -698,7 +698,7 @@ impl Format {
         let mut markers: Vec<&str> = self
             .terminals
             .iter()
-            .map(|terminal| terminal.text.as_str())
+            .map(|terminal| &*terminal.text)
             .chain(self.structural_tokens.iter().map(String::as_str))
             .collect();
         let tags = self
@@ -924,11 +924,7 @@ impl Format {
     pub(crate) fn turn_texts(&self) -> Vec<&str> {
         match self.turn_opener() {
             Some(opener) => vec![opener],
-            None => self
-                .anchors
-                .iter()
-                .map(|anchor| anchor.text.as_str())
-                .collect(),
+            None => self.anchors.iter().map(|anchor| &*anchor.text).collect(),
         }
     }
 
@@ -962,7 +958,7 @@ impl Format {
     }
 
     /// The bytes a piece of the replay stands for.
-    fn piece_len(&self, piece: &Piece) -> usize {
+    fn piece_len(&self, piece: &Piece<'_>) -> usize {
         match piece {
             Piece::Text(text) => text.len(),
             Piece::Marker(index) => self.terminal_text(*index).len(),
@@ -992,9 +988,7 @@ impl Format {
             if anchor.text.is_empty() {
                 return None;
             }
-            prompt[from..]
-                .find(anchor.text.as_str())
-                .map(|at| from + at)
+            prompt[from..].find(&*anchor.text).map(|at| from + at)
         };
         let mut next: Vec<Option<usize>> =
             self.anchors.iter().map(|anchor| find(anchor, 0)).collect();
@@ -1024,7 +1018,7 @@ impl Format {
     /// the start row's state, unless the piece is a terminal whose row from `state` leads into
     /// another one, which wins as the longer match; then `state`. A terminal the table ignores
     /// decides nothing, and gives `None`. A table without a start row starts where it stands.
-    pub(crate) fn opening(&self, state: usize, piece: &Piece) -> Option<usize> {
+    pub(crate) fn opening(&self, state: usize, piece: &Piece<'_>) -> Option<usize> {
         let Some(start) = self.start else {
             return Some(state);
         };
@@ -1068,8 +1062,9 @@ impl Format {
         let mut at = 0;
         // An anchor that names its own state leaves no start to choose.
         let mut at_turn_start = self.start.is_some() && start == 0;
-        let pieces = scanner.feed(turn).into_iter().chain(scanner.finish());
-        for piece in pieces {
+        let fed = scanner.feed(turn);
+        let end = scanner.finish();
+        for piece in fed.pieces().chain(end.pieces()) {
             if at_turn_start {
                 if let Some(opened) = self.opening(state, &piece) {
                     at_turn_start = false;
@@ -1176,7 +1171,7 @@ impl Format {
     /// table's rows move on, and those it ignores. Whoever learns the table's [`Layout`] from a
     /// rendering reads them to tell a marker from the text the layout writes around it.
     pub fn terminal_texts(&self) -> impl Iterator<Item = &str> {
-        self.terminals.iter().map(|terminal| terminal.text.as_str())
+        self.terminals.iter().map(|terminal| &*terminal.text)
     }
 
     /// Whether `tail`, at the end of the output in `state`, is a tag the end cut short: it begins
@@ -1607,7 +1602,7 @@ mod tests {
             .opens_turn("<|im_start|>assistant")
     }
 
-    fn events(format: Format, prompt: &str, output: &str) -> Vec<crate::event::Event> {
+    fn events(format: Format, prompt: &str, output: &str) -> Vec<crate::event::Event<'static>> {
         use crate::{
             engine::Engine,
             event::Events,
@@ -1644,7 +1639,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     fn said(events: &[crate::event::Event]) -> (String, String, usize) {

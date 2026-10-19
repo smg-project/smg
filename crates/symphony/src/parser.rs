@@ -15,8 +15,10 @@ use crate::{event::Events, input::Input};
 /// fed. After a `Lifecycle` error the stream is already over or was never started; the parser holds
 /// nothing and emits nothing more.
 pub trait Parser: Send {
-    /// Feed one lifecycle step and append the resulting events to `out`.
-    fn feed(&mut self, input: Input<'_>, out: &mut Events) -> Result<(), ParseError>;
+    /// Feed one lifecycle step and append the resulting events to `out`. The events may borrow
+    /// the input's text for the life of `out` (`'d`): a text run the parser passed through
+    /// without holding it is a slice of the delta, not a copy; see `Event`.
+    fn feed<'d>(&mut self, input: Input<'d>, out: &mut Events<'d>) -> Result<(), ParseError>;
 }
 
 /// Why a parser could not continue.

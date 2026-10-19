@@ -7,6 +7,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+import smg_grpc_servicer.health_probe as probe_wait
 
 pytest.importorskip("msgspec")
 pytest.importorskip("zmq")
@@ -67,10 +68,8 @@ def servicer(request, tokenspeed_servicer_mod, monkeypatch):
         for _ in range(5):
             await asyncio.sleep(0)
 
-    # Control only the RPC's polling; the probe's task and stream are real.
-    monkeypatch.setattr(
-        mod, "asyncio", SimpleNamespace(create_task=asyncio.create_task, sleep=poll)
-    )
+    # Control only the wait's polling; the probe's task and stream are real.
+    monkeypatch.setattr(probe_wait, "asyncio", SimpleNamespace(sleep=poll))
     return servicer
 
 

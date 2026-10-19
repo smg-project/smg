@@ -853,6 +853,10 @@ async fn create_worker(
     }
 }
 
+async fn inflight_requests(State(state): State<Arc<AppState>>) -> Response {
+    Json(state.context.inflight_tracker.snapshot()).into_response()
+}
+
 async fn list_workers_rest(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListWorkersQuery>,
@@ -1286,6 +1290,7 @@ pub fn build_apps(
 
     // Build admin routes with control plane auth if configured, otherwise use simple API key auth
     let admin_routes = Router::new()
+        .route("/inflight", get(inflight_requests))
         .route("/flush_cache", post(flush_cache))
         .route("/start_profile", post(start_profile))
         .route("/stop_profile", post(stop_profile))

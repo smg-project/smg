@@ -19,10 +19,12 @@ use crate::event::{Event, FinishReason};
 /// The stream choice one event produces for the choice at `choice`, if it produces one. The
 /// choice carries a copy of the text it takes from the event; [`into_delta`] takes the event and
 /// its text.
-pub fn delta(choice: u32, event: &Event) -> Option<ChatStreamChoice> {
+pub fn delta(choice: u32, event: &Event<'_>) -> Option<ChatStreamChoice> {
     match event {
-        Event::Content(text) | Event::Malformed { text, .. } => content(choice, text.text.clone()),
-        Event::Reasoning(text) => reasoning(choice, text.text.clone()),
+        Event::Content(text) | Event::Malformed { text, .. } => {
+            content(choice, text.text.to_string())
+        }
+        Event::Reasoning(text) => reasoning(choice, text.text.to_string()),
         Event::ToolCallStart {
             index, id, name, ..
         } => Some(call_start(choice, *index, id.clone(), name.clone())),
@@ -39,10 +41,12 @@ pub fn delta(choice: u32, event: &Event) -> Option<ChatStreamChoice> {
 
 /// [`delta`] over an event the caller gives up: the choice takes the event's text in place of a
 /// copy, which a stream that renders every delta once need not make.
-pub fn into_delta(choice: u32, event: Event) -> Option<ChatStreamChoice> {
+pub fn into_delta(choice: u32, event: Event<'_>) -> Option<ChatStreamChoice> {
     match event {
-        Event::Content(text) | Event::Malformed { text, .. } => content(choice, text.text),
-        Event::Reasoning(text) => reasoning(choice, text.text),
+        Event::Content(text) | Event::Malformed { text, .. } => {
+            content(choice, text.text.into_owned())
+        }
+        Event::Reasoning(text) => reasoning(choice, text.text.into_owned()),
         Event::ToolCallStart {
             index, id, name, ..
         } => Some(call_start(choice, index, id, name)),
@@ -151,9 +155,9 @@ fn unfinished(choice: u32, delta: ChatMessageDelta) -> ChatStreamChoice {
 }
 
 /// The stream choices a sequence of events produces, in order.
-pub fn deltas<'a>(
+pub fn deltas<'a, 'd: 'a>(
     choice: u32,
-    events: impl IntoIterator<Item = &'a Event>,
+    events: impl IntoIterator<Item = &'a Event<'d>>,
 ) -> Vec<ChatStreamChoice> {
     events
         .into_iter()
@@ -169,7 +173,10 @@ pub fn deltas<'a>(
 /// `Finish` event, so a sequence without one gives a message that is not finished. Argument
 /// fragments for a call that never started cannot occur under the `Event` contract; should one
 /// arrive, its text joins the content so that no byte is lost.
-pub fn message<'a>(choice: u32, events: impl IntoIterator<Item = &'a Event>) -> ChatChoice {
+pub fn message<'a, 'd: 'a>(
+    choice: u32,
+    events: impl IntoIterator<Item = &'a Event<'d>>,
+) -> ChatChoice {
     let folded = fold(events);
     let calls: Vec<ToolCall> = folded
         .calls
@@ -297,7 +304,7 @@ mod tests {
     }
 
     /// One event of every kind, with text where the kind carries it.
-    fn one_of_each() -> Vec<Event> {
+    fn one_of_each() -> Vec<Event<'static>> {
         vec![
             Event::Content(Text::uncounted("Hello")),
             Event::Content(Text::uncounted("")),
@@ -508,7 +515,7 @@ mod tests {
         }
     }
 
-    fn call(index: u32, name: &str) -> Event {
+    fn call(index: u32, name: &str) -> Event<'static> {
         Event::ToolCallStart {
             index,
             id: format!("call_{index}"),
@@ -517,7 +524,7 @@ mod tests {
         }
     }
 
-    fn arguments(index: u32, json: &str) -> Event {
+    fn arguments(index: u32, json: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index,
             json: json.into(),
@@ -525,7 +532,7 @@ mod tests {
         }
     }
 
-    fn finish(reason: FinishReason, tool_calls: u32) -> Event {
+    fn finish(reason: FinishReason, tool_calls: u32) -> Event<'static> {
         Event::Finish {
             reason,
             tool_calls,
@@ -710,7 +717,7 @@ mod tests {
 
     /// The events of `output` read by the Qwen3 table through an engine of its own, as the gateway
     /// reads each request.
-    fn parsed(output: &str) -> Vec<Event> {
+    fn parsed(output: &str) -> Vec<Event<'static>> {
         let mut engine = Engine::new(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
         engine
@@ -731,7 +738,7 @@ mod tests {
                 &mut out,
             )
             .expect("the end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     /// Two calls of Qwen3's syntax in one output.
