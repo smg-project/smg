@@ -77,13 +77,16 @@ fn tools() -> Vec<Tool> {
     ]
 }
 
-/// Every configuration: the request's ask, and where the prompt and the engine leave the model.
-fn configurations() -> Vec<(String, Options)> {
+/// Every configuration: the request's ask, the tools the gateway passes for it (a named function
+/// narrows the list to that one tool, `ToolChoice::narrow_tools`: the one with parameters or the
+/// one without; `required` passes both), and where the prompt and the engine leave the model.
+fn configurations() -> Vec<(String, Options, std::ops::Range<usize>)> {
     let mut all = Vec::new();
-    for (ask, one_call) in [
-        ("a named function", true),
-        ("required", false),
-        ("required with parallel calls off", true),
+    for (ask, one_call, passed) in [
+        ("a named function with parameters", true, 0..1),
+        ("a named function without parameters", true, 1..2),
+        ("required", false, 0..2),
+        ("required with parallel calls off", true, 0..2),
     ] {
         for (thought, reasoning_open) in [("thought closed", false), ("thought open", true)] {
             for start in [
@@ -99,6 +102,7 @@ fn configurations() -> Vec<(String, Options)> {
                         one_call,
                         start,
                     },
+                    passed.clone(),
                 ));
             }
         }
@@ -128,7 +132,7 @@ fn every_table_that_reads_calls_writes_a_forced_tag_in_every_configuration() {
             table.name()
         );
         let gap = gap_of(table);
-        for (configuration, options) in configurations() {
+        for (configuration, options, passed) in configurations() {
             let expected = match gap {
                 Some(Gap::Every) => true,
                 Some(Gap::OpenThoughtAtFirstToken) => {
@@ -136,7 +140,7 @@ fn every_table_that_reads_calls_writes_a_forced_tag_in_every_configuration() {
                 }
                 None => false,
             };
-            let tag = format.grammar_for(&tools, options);
+            let tag = format.grammar_for(&tools[passed], options);
             if expected {
                 assert!(
                     tag.is_none(),
