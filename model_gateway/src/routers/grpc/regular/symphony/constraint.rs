@@ -184,7 +184,7 @@ pub(crate) enum Asks<'a> {
 }
 
 impl<'a> Asks<'a> {
-    pub(super) fn model(self) -> &'a str {
+    pub(crate) fn model(self) -> &'a str {
         match self {
             Self::Chat(request) => &request.model,
             Self::Messages { request, .. } => &request.model,

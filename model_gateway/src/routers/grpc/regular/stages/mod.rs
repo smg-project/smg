@@ -10,6 +10,7 @@ pub(crate) mod embedding;
 pub(crate) mod generate;
 pub(crate) mod messages;
 pub(crate) mod preparation;
+pub(crate) mod reading;
 pub(crate) mod request_building;
 pub(crate) mod response_processing;
 pub(crate) mod transcription;

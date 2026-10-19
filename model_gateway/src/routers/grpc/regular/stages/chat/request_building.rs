@@ -6,24 +6,21 @@ use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
-use crate::{
-    config::ParserChoice,
-    routers::{
-        error,
-        grpc::{
-            client::GenerateRequestBuildOptions,
-            common::stages::{
-                helpers::{self, TagForStart},
-                BuildStage,
-            },
-            context::{
-                stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan,
-                ExecutionPlanKind, PreparationOutput, RequestContext,
-            },
-            regular::symphony,
-            spec::{ChatResponseSpec, ResponseSpec},
-            utils,
+use crate::routers::{
+    error,
+    grpc::{
+        client::GenerateRequestBuildOptions,
+        common::stages::{
+            helpers::{self, TagForStart},
+            BuildStage,
         },
+        context::{
+            stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan,
+            ExecutionPlanKind, PreparationOutput, RequestContext,
+        },
+        regular::{stages::reading, symphony},
+        spec::{ChatResponseSpec, ResponseSpec},
+        utils,
     },
 };
 
@@ -44,50 +41,22 @@ impl ChatRequestBuildingStage {
     }
 }
 
-/// Whether the rendered prompt leaves the model inside its thought, as the
-/// request's grammar, the plan's reasoning state and the response spec all
-/// read it: where a Symphony table reads the response, the table's own replay
-/// of the prompt (a turn the prompt leaves unopened starts inside the thought:
-/// `regular::symphony::reasoning_open`) with the tokenizer-driven switch, or
-/// alone where the family's rule sets the switch aside (Gemma 4 prefills an
-/// open channel only after a tool response), and no legacy parser is built to
-/// be asked; otherwise native Gemma4 channels follow the rendered prompt when
-/// that parser decides, and other parsers keep their tokenizer-driven
-/// preference for the engine's reasoning gate.
+/// [`reading::reasoning_decision`] with a chat request's tokenizer-driven
+/// switch (`utils::chat_reasoning_starts_in_rendered_prefill`);
+/// `continued_final_message` is the rendered prompt's.
 fn reasoning_decision(
     ctx: &RequestContext,
     chat_request: &openai_protocol::chat::ChatCompletionRequest,
     processed_text: &str,
     continued_final_message: bool,
 ) -> bool {
-    let switch = || {
-        ctx.tokenizer_arc().is_some_and(|tokenizer| {
-            utils::chat_reasoning_starts_in_rendered_prefill(
-                chat_request,
-                continued_final_message,
-                tokenizer.as_ref(),
-            )
-        })
-    };
-    match symphony::reasoning_open(
-        ctx.state.parser.unwrap_or_default(),
-        &ctx.components.parser_resolver.names(&chat_request.model),
-        &chat_request.model,
-        &ctx.components.templates,
-        processed_text,
-    ) {
-        Some(thought) => thought.or_switch(switch),
-        None => utils::rendered_prompt_reasoning_in_prefill(
-            &ctx.components.reasoning_parser_factory,
-            ctx.components
-                .parser_resolver
-                .reasoning_parser(&chat_request.model)
-                .as_deref(),
-            &chat_request.model,
-            processed_text,
+    reading::reasoning_decision(ctx, &chat_request.model, processed_text, |tokenizer| {
+        utils::chat_reasoning_starts_in_rendered_prefill(
+            chat_request,
+            continued_final_message,
+            tokenizer,
         )
-        .unwrap_or_else(switch),
-    }
+    })
 }
 
 /// Build the backend `GenerateRequest` from a chat-shaped request, shared by
@@ -233,43 +202,24 @@ impl BuildStage for ChatRequestBuildingStage {
         };
 
         let unbilled_prompt_tokens = processed_messages.unbilled_prompt_tokens;
-        // Symphony's assignment, taken while the rendered prompt is still here (see
-        // `regular::symphony`): the response spec carries it to the drivers. The
-        // parser asked for is the one chat preparation chose for this request;
-        // the one that reads the response is Symphony only when a table takes
-        // the request, so the state records that for the response's header.
-        let names = ctx.components.parser_resolver.names(&chat_request.model);
-        let parser = ctx.state.parser.unwrap_or_default();
-        // What constrains the output is decided here, on the worker selected
-        // for the request (`regular::symphony::worker_constraint`): the whole
-        // turn's grammar on a worker whose engine takes one on every turn from
-        // its first token; else what preparation found, and on a worker that
-        // takes a grammar on every turn the table's tag for the calls the
-        // request allows under `auto`, built on the reasoning state the plan
-        // takes (`reasoning_decision`). When the worker's policy chose the
-        // constraint, a retry re-selects only workers that decide alike
-        // (`utils::WorkerDecoding::decides_alike`); what the request asked for
-        // suits any worker. The attempt stamp carries what derives the `auto`
-        // tag for a worker's start, so the retry's worker gets it shaped for
-        // where its own engine starts the grammar.
-        let decoding = utils::WorkerDecoding::of(ctx.state.workers.as_ref());
-        let decided = symphony::worker_constraint(
-            decoding,
+        // What constrains the output on the selected worker, and Symphony's
+        // assignment, decided as for a Messages request (`reading::decide`):
+        // the `auto` tag derives for the request over the tools its
+        // `tool_choice` leaves callable, on the reasoning state the plan takes
+        // (`reasoning_decision`). The state records which parser reads the
+        // response, for the response's header.
+        let reading::Decided {
+            auto_tag,
             tool_constraints,
-            || {
-                symphony::turn_constraint(
-                    parser,
-                    &names,
-                    symphony::Asks::Chat(&chat_request),
-                    &chat_request.effective_tool_list(),
-                    &processed_messages.text,
-                    &ctx.components.templates,
-                )
-            },
-            || symphony::AutoTag {
-                parser,
-                labels: names.labels.clone(),
-                flags: names.flags.clone(),
+            whole_turn,
+            assignment,
+        } = reading::decide(
+            ctx,
+            symphony::Asks::Chat(&chat_request),
+            &chat_request.effective_tool_list(),
+            &processed_messages.text,
+            tool_constraints,
+            |ctx| reading::Auto {
                 request: symphony::AutoRequest::Chat(Arc::clone(&chat_request)),
                 reasoning_open: reasoning_decision(
                     ctx,
@@ -277,28 +227,8 @@ impl BuildStage for ChatRequestBuildingStage {
                     &processed_messages.text,
                     processed_messages.continued_final_message,
                 ),
-                templates: Arc::clone(&ctx.components.templates),
             },
-        )
-        .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
-        if decided.by_policy {
-            ctx.state.constraint_decided_on = Some(decoding);
-        }
-        let auto_tag = decided.auto.map(|auto| -> Arc<dyn TagForStart> { auto });
-        let tool_constraints = decided.constraint.map(|constraint| constraint.to_tuple());
-        let assignment = symphony::assign(
-            parser,
-            &names,
-            symphony::Asks::Chat(chat_request.as_ref()),
-            tool_constraints.as_ref(),
-            &processed_messages.text,
-            &ctx.components.templates,
-        )
-        .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
-        ctx.state.parser = Some(match assignment {
-            Some(_) => ParserChoice::Symphony,
-            None => ParserChoice::Legacy,
-        });
+        )?;
         // The table's structural tag stands in for a JSON response_format (see
         // `regular::symphony::constraint`), and the whole turn's grammar for a
         // regex or an ebnf too: the engine's request carries the tag alone, so
@@ -308,10 +238,10 @@ impl BuildStage for ChatRequestBuildingStage {
             && tool_constraints
                 .as_ref()
                 .is_some_and(|(kind, _)| kind == "structural_tag");
-        let engine_request = (answered || decided.whole_turn).then(|| {
+        let engine_request = (answered || whole_turn).then(|| {
             let mut request = chat_request.as_ref().clone();
             request.response_format = None;
-            if decided.whole_turn {
+            if whole_turn {
                 request.regex = None;
                 request.ebnf = None;
             }
