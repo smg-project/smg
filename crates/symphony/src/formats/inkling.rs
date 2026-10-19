@@ -6,7 +6,14 @@
 //! message of a turn in its own `<|message_model|>`. The generation prompt is `<|message_model|>`
 //! alone, whatever the request says: the template has no thinking switch (a system message carries
 //! the `reasoning_effort`), so the output starts where a message's kind is said, and the model
-//! writes the thought or not. Everything the markers do not frame is the message's text. Recorded
+//! writes the thought or not. Everything the markers do not frame is the message's text. A kind
+//! said again inside a message's body is the kind, as the family's own parsers read it (the
+//! blocks are self-describing and may repeat in any order): `<|content_text|>` in the answer
+//! starts the answer's text over, `<|content_thinking|>` in the answer or in the thought opens a
+//! thought; neither is the body's text. An engine that holds a JSON answer's grammar back until
+//! its own reasoning parser has seen the model's `<|content_text|>` lets the model write both
+//! there ([`Format::answer_grammar`]: the tag admits the thought and the marker before the schema
+//! for an engine that starts at the first token, and cannot tell the two starts apart). Recorded
 //! as `inkling` (thinkingmachines/Inkling); Inkling-Small and Inkling-NVFP4 ship the same template
 //! byte for byte and read with it.
 //!
@@ -35,6 +42,11 @@ pub fn inkling() -> Format {
         .transition("reasoning", "end_message", "ended")
         .transition("content", "end_message", "ended")
         .transition("ended", "message", "header")
+        // The kind said again inside a body: the answer's marker starts its text over, the
+        // thought's opens a thought from either body. Framing, as from the header.
+        .transition("content", "text", "content")
+        .transition("content", "thinking", "reasoning")
+        .transition("reasoning", "thinking", "reasoning")
         .calls(CallSyntax::NamedJson(INVOKE_JSON))
         .opens_turn("<|message_model|>")
 }
@@ -293,9 +305,8 @@ mod tests {
 
     #[test]
     fn without_tools_a_recorded_json_answer_carries_no_message_framing() {
-        // The second text marker stands inside the answer, where the table has no row for it,
-        // and is the answer's text as any marker out of place is, said by one `Malformed` event
-        // of no bytes before it; the message's framing is not.
+        // The second text marker stands inside the answer and says its kind again: framing,
+        // dropped as the message's is, and the answer is the bare JSON.
         for pieces in [
             vec![RECORDED_JSON_ANSWER.to_string()],
             characters(RECORDED_JSON_ANSWER),
@@ -304,22 +315,17 @@ mod tests {
             let events = run_without_tools(&pieces);
             assert_eq!(bytes(&events), RECORDED_JSON_ANSWER);
             assert!(reasoning(&events).ends_with("I will provide just the JSON."));
-            let content = content(&events);
-            assert!(
-                !content.contains("<|end_message|>") && !content.contains("<|message_model|>"),
-                "{content}"
+            assert_eq!(
+                content(&events),
+                "{\"city\": \"Tokyo\", \"country\": \"Japan\", \"population\": \"13.9 million\"}"
             );
-            assert!(
-                content.ends_with("\"population\": \"13.9 million\"}"),
-                "{content}"
-            );
-            assert_eq!(malformed_count(&events), 1);
-            assert!(
-                events.iter().any(|event| matches!(
-                    event,
-                    Event::Malformed { text, why: crate::event::MalformedReason::MarkerOutOfPlace }
-                        if text.text.is_empty()
-                )),
+            assert_eq!(malformed_count(&events), 0);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| **event == dropped("<|content_text|>"))
+                    .count(),
+                2,
                 "{events:?}"
             );
         }
@@ -347,15 +353,17 @@ mod tests {
     }
 }
 
-/// The JSON answer of a request without tools, from the outputs a live cell recorded: what the
-/// table reads back of the answer tag's output, before and after the tag left the text marker to
-/// the engine ([`Format::answer_grammar`]).
+/// The JSON answer of a request without tools, from the outputs live cells recorded: what the
+/// table reads back of the answer tag's output ([`Format::answer_grammar`]) on an engine that
+/// starts the grammar at the first token, and on one that starts it after its own reasoning
+/// parser has seen the model's `<|content_text|>`, where the tag's optional thought and marker
+/// are open to the model once more and it writes the kind again.
 #[cfg(test)]
 mod answer_tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{Event, MalformedReason},
+        event::{DropReason, Event, MalformedReason, Text},
         testing::{bytes, content, drive, reasoning},
         Declared,
     };
@@ -416,14 +424,82 @@ mod answer_tests {
     const CITY_JSON: &str =
         "{\n  \"city\": \"Nairobi\",\n  \"country\": \"Kenya\",\n  \"population\": 4397073\n}";
 
+    /// A recorded output of a request without tools, on an engine that started the grammar after
+    /// its reasoning parser had seen the model's text marker: the first thought, as the model
+    /// wrote it before the grammar started.
+    const FIRST_THOUGHT: &str = concat!(
+        "The user wants me to triage a bug report: \"A typo in the footer: Copyrigth.\"\n\nTriage ", // codespell:ignore copyrigth
+        "means assessing severity/priority and categorizing the issue. I should consider:\n- What ",
+        "is it? A typo (\"Copyrigth\" instead of \"Copyright\") in the footer.\n- Impact: Very low. ", // codespell:ignore copyrigth
+        "Cosmetic/minor. Doesn't affect functionality.\n- Likelihood: Easy fix.\n- Priority: Low/P3 ",
+        "or similar.\n- Category: UI/UX, typo, copy error.\n\nI should provide a structured triage ",
+        "response: Severity (Low/Minor), Priority (Low), Type (Cosmetic/Typo), Action (Fix in next ",
+        "maintenance/release, quick win).\n\nKeep it concise and practical.",
+    );
+
+    /// The second thought of that output: the tag's optional thought, which the model wrote where
+    /// the grammar started, inside the answer's message.
+    const SECOND_THOUGHT: &str = concat!(
+        "\nThe user asks to \"triage\" a very brief bug report: \"A typo in the footer: Copyrigth.\" ", // codespell:ignore copyrigth
+        "I need to assess severity, priority, category, and recommended action.\n\nKey points:\n- ",
+        "Issue: Typo (\"Copyrigth\" missing the 't' in \"Copyright\").\n- Location: Footer.\n- Impact: ", // codespell:ignore copyrigth
+        "Purely cosmetic / copy error. No functional impact, no security risk, no data loss, minimal ",
+        "user confusion.\n- Fix effort: Trivial (single character/string change).\n- Triage classification: ",
+        "Low severity, Low priority (or \"trivial/quick win\"). Could be batched with other copy ",
+        "fixes.\n\nStructure of answer:\n1. Quick verdict / summary.\n2. Severity / Priority.\n3. ",
+        "Category / Tags.\n4. Rationale (why low).\n5. Recommended action (fix, batch, etc.).\n6. ",
+        "Maybe ask for clarification if needed (e.g., which site/page, but not strictly necessary).\n",
+        "\nI should be direct and use standard triage terms (e.g., P4/Low, Cosmetic, UI Copy).\n\n",
+        "Let's draft:\n- Severity: Low / Minor\n- Priority: Low (P3/P4)\n- Type: Cosmetic / Copy ",
+        "/ UI\n- Status: Ready for fix / Quick win\n- Notes: One-character typo in footer. No user ",
+        "workflow blocked. Suggest fixing in next content pass or as a micro-fix. If this is a legal/copyright ",
+        "notice, slightly more important for legal accuracy, but still cosmetic. I can mention that ",
+        "if it's a legal notice, it might warrant slightly faster fix for compliance, but generally ",
+        "still low.\n\nKeep it short.\n",
+    );
+
+    /// The answer the schema shaped after the second thought, as recorded.
+    const SECOND_THOUGHT_JSON: &str = concat!(
+        "{\"severity\": \"low\", \"summary\": \"Cosmetic typo in footer text ('Copyrigth' → 'Copyright'). ", // codespell:ignore copyrigth
+        "No functional impact.\", \"needs_followup\": false, \"owner\": \"UI/Content team\"}",
+    );
+
     /// A recorded output: the thought's message, then the answer's with the text marker written
-    /// twice, as the answer tag had it before it left the marker to the engine: the engine
-    /// started the grammar after the model's own marker, and the tag's `begin` wrote it again.
+    /// twice. An engine that started the grammar after the model's own marker had it forced by
+    /// the tag's `begin` before the tag left the marker to the engine, and since then may have
+    /// the model write the optional marker again where the grammar starts.
     fn recorded(thought: &str, json: &str) -> String {
         format!(
             "<|content_thinking|>{thought}<|end_message|><|message_model|><|content_text|>\
              <|content_text|>{json}<|end_message|>"
         )
+    }
+
+    /// A recorded output: the thought's message, then the answer's opened and, where an engine
+    /// that starts the grammar after its reasoning parser hands over, the tag's optional thought
+    /// written as a second one, closed and the next message opened, with or without the optional
+    /// text marker, then the JSON and the message's close.
+    fn recorded_with_a_second_thought(
+        thought: &str,
+        second: &str,
+        opener: bool,
+        json: &str,
+    ) -> String {
+        let opener = if opener { "<|content_text|>" } else { "" };
+        format!(
+            "<|content_thinking|>{thought}<|end_message|><|message_model|><|content_text|>\
+             <|content_thinking|>{second}<|end_message|><|message_model|>{opener}{json}\
+             <|end_message|>"
+        )
+    }
+
+    /// The `Dropped { Wrapper }` events among `events` carrying `text`.
+    fn dropped_count(events: &[Event], text: &str) -> usize {
+        let dropped = Event::Dropped {
+            text: Text::uncounted(text),
+            why: DropReason::Wrapper,
+        };
+        events.iter().filter(|event| **event == dropped).count()
     }
 
     /// `output` whole, and one character at a time.
@@ -455,51 +531,138 @@ mod answer_tests {
     }
 
     #[test]
-    fn a_recorded_answer_whose_text_marker_was_written_twice_keeps_its_bytes_and_says_so() {
-        // The second marker stands inside the answer, where no row leads: it is the answer's
-        // text, as any marker out of place is, and the event of no bytes before it counts the
-        // frame the table did not read; the framing around it is read and dropped as always.
+    fn a_text_marker_written_twice_says_the_answers_kind_again_and_the_answer_reads_bare() {
+        // The second marker stands inside the answer and starts its text over: framing, dropped
+        // as the first is, with no malformed run; the answer is the bare JSON, whole and one
+        // character at a time, with the table and with the variant a request without tools reads
+        // with.
         for (thought, json) in [(TRIAGE_THOUGHT, TRIAGE_JSON), (CITY_THOUGHT, CITY_JSON)] {
             let output = recorded(thought, json);
-            for pieces in chunkings(&output) {
-                let events = run(inkling(), &pieces);
-                assert_eq!(bytes(&events), output);
-                assert_eq!(reasoning(&events), thought);
-                assert_eq!(content(&events), format!("<|content_text|>{json}"));
-                assert_eq!(
-                    malformed(&events),
-                    [(MalformedReason::MarkerOutOfPlace, "")],
-                    "{events:?}"
-                );
-                let at = events
-                    .iter()
-                    .position(|event| matches!(event, Event::Malformed { .. }))
-                    .expect("the event");
-                assert!(
-                    matches!(&events[at + 1], Event::Content(text) if text.text.starts_with("<|content_text|>")),
-                    "{events:?}"
-                );
-                assert!(matches!(
-                    events.last(),
-                    Some(Event::Finish { tool_calls: 0, .. })
-                ));
+            for format in [inkling(), inkling().without_calls()] {
+                for pieces in chunkings(&output) {
+                    let events = run(format.clone(), &pieces);
+                    assert_eq!(bytes(&events), output);
+                    assert_eq!(reasoning(&events), thought);
+                    assert_eq!(content(&events), json);
+                    assert_eq!(malformed(&events), [], "{events:?}");
+                    assert_eq!(dropped_count(&events, "<|content_text|>"), 2, "{events:?}");
+                    assert!(matches!(
+                        events.last(),
+                        Some(Event::Finish { tool_calls: 0, .. })
+                    ));
+                }
             }
         }
     }
 
     #[test]
-    fn without_tools_the_second_text_marker_is_said_the_same() {
-        // The variant a request without tools reads with keeps the bytes and says so too.
-        let output = recorded(TRIAGE_THOUGHT, TRIAGE_JSON);
-        for pieces in chunkings(&output) {
-            let events = run(inkling().without_calls(), &pieces);
-            assert_eq!(bytes(&events), output);
-            assert_eq!(reasoning(&events), TRIAGE_THOUGHT);
-            let content = content(&events);
-            assert!(
-                content.contains(&format!("<|content_text|>{TRIAGE_JSON}")),
-                "{content}"
+    fn a_second_thought_written_in_the_answer_is_a_thought_and_the_answer_reads_bare() {
+        // The thought's opener inside the answer opens a thought: its text is reasoning after the
+        // first thought's, its close and the next message's opener are framing, and so is the
+        // text marker the tag owes after the thought; the answer is the bare JSON, whole and one
+        // character at a time, with the table and with its no-tools variant. Without that
+        // marker, which the tag no longer admits, the JSON stands in the next message's header:
+        // the no-tools variant, whose header is content, still reads it as the answer; the table
+        // reads a call's name without a call, as the message says no kind.
+        for opener in [true, false] {
+            let output = recorded_with_a_second_thought(
+                FIRST_THOUGHT,
+                SECOND_THOUGHT,
+                opener,
+                SECOND_THOUGHT_JSON,
             );
+            for (format, with_calls) in [(inkling(), true), (inkling().without_calls(), false)] {
+                for pieces in chunkings(&output) {
+                    let events = run(format.clone(), &pieces);
+                    assert_eq!(bytes(&events), output);
+                    assert_eq!(
+                        reasoning(&events),
+                        format!("{FIRST_THOUGHT}{SECOND_THOUGHT}")
+                    );
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| matches!(event, Event::ReasoningStart))
+                            .count(),
+                        2,
+                        "two thoughts, each opened: {events:?}"
+                    );
+                    assert_eq!(dropped_count(&events, "<|content_thinking|>"), 2);
+                    assert_eq!(
+                        dropped_count(&events, "<|content_text|>"),
+                        if opener { 2 } else { 1 }
+                    );
+                    if opener || !with_calls {
+                        assert_eq!(content(&events), SECOND_THOUGHT_JSON);
+                        assert_eq!(malformed(&events), [], "{events:?}");
+                    } else {
+                        assert_eq!(content(&events), "");
+                        assert_eq!(
+                            malformed(&events),
+                            [(MalformedReason::NameWithoutACall, SECOND_THOUGHT_JSON)],
+                            "{events:?}"
+                        );
+                    }
+                    assert!(matches!(
+                        events.last(),
+                        Some(Event::Finish { tool_calls: 0, .. })
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn whitespace_before_a_text_marker_written_again_is_the_templates() {
+        // The whitespace the answer's stay holds before its first text ends with the stay the
+        // marker ends: the template's spacing, dropped, whole and one character at a time; the
+        // answer's text starts over after the marker.
+        let output = "<|content_text|>\n<|content_text|>{}<|end_message|>";
+        for pieces in chunkings(output) {
+            let events = run(inkling(), &pieces);
+            assert_eq!(bytes(&events), output);
+            assert_eq!(content(&events), "{}");
+            assert_eq!(malformed(&events), []);
+            assert!(
+                events.contains(&Event::Dropped {
+                    text: Text::uncounted("\n"),
+                    why: DropReason::Whitespace,
+                }),
+                "{events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_kind_said_again_after_text_moves_the_body_as_the_familys_parsers_do() {
+        // The kind markers move between the bodies wherever they stand, as the family's own
+        // parsers read them: a thought opened inside the answer's text, a thought's opener
+        // inside a thought; neither is the body's text. The message's opener inside a body has
+        // no row and stays out of place, counted as before.
+        let output = "<|content_text|>Hi <|content_thinking|>more<|end_message|><|message_model|>\
+                      <|content_text|>there<|end_message|>";
+        for pieces in chunkings(output) {
+            let events = run(inkling(), &pieces);
+            assert_eq!(bytes(&events), output);
+            assert_eq!(content(&events), "Hi there");
+            assert_eq!(reasoning(&events), "more");
+            assert_eq!(malformed(&events), []);
+        }
+        let output = "<|content_thinking|>one <|content_thinking|>two<|end_message|>\
+                      <|message_model|><|content_text|>Hi<|end_message|>";
+        for pieces in chunkings(output) {
+            let events = run(inkling(), &pieces);
+            assert_eq!(bytes(&events), output);
+            assert_eq!(reasoning(&events), "one two");
+            assert_eq!(content(&events), "Hi");
+            assert_eq!(malformed(&events), []);
+            assert_eq!(dropped_count(&events, "<|content_thinking|>"), 2);
+        }
+        let output = "<|content_text|>Hi <|message_model|>there<|end_message|>";
+        for pieces in chunkings(output) {
+            let events = run(inkling(), &pieces);
+            assert_eq!(bytes(&events), output);
+            assert_eq!(content(&events), "Hi <|message_model|>there");
             assert_eq!(
                 malformed(&events),
                 [(MalformedReason::MarkerOutOfPlace, "")],
@@ -509,31 +672,31 @@ mod answer_tests {
     }
 
     #[test]
-    fn a_second_text_marker_after_whitespace_is_said_right_before_it() {
-        // The whitespace the answer's stay holds before its first text is the text's once the
-        // marker follows: it comes out first, then the event of no bytes, then the marker, whole
-        // and one character at a time; so the event stands where the marker does.
-        let output = "<|content_text|>\n<|content_text|>{}<|end_message|>";
-        for pieces in chunkings(output) {
-            let events = run(inkling(), &pieces);
-            assert_eq!(bytes(&events), output);
-            assert_eq!(content(&events), "\n<|content_text|>{}");
-            assert_eq!(
-                malformed(&events),
-                [(MalformedReason::MarkerOutOfPlace, "")]
-            );
-            let at = events
-                .iter()
-                .position(|event| matches!(event, Event::Malformed { .. }))
-                .expect("the event");
-            assert!(
-                matches!(&events[at - 1], Event::Content(text) if text.text == "\n"),
-                "{events:?}"
-            );
-            assert!(
-                matches!(&events[at + 1], Event::Content(text) if text.text.starts_with("<|content_text|>")),
-                "{events:?}"
-            );
+    fn without_the_thought_the_kind_markers_stay_dropped() {
+        // The variant for a request that keeps the reasoning in the content shows the thought's
+        // text as content and none of the four markers, with and without tools: the kind markers
+        // frame the messages as much as a call, and their rows between the bodies change nothing
+        // of that.
+        let output = recorded_with_a_second_thought(
+            FIRST_THOUGHT,
+            SECOND_THOUGHT,
+            true,
+            SECOND_THOUGHT_JSON,
+        );
+        for format in [
+            inkling().without_reasoning(),
+            inkling().without_calls().without_reasoning(),
+        ] {
+            for pieces in chunkings(&output) {
+                let events = run(format.clone(), &pieces);
+                assert_eq!(bytes(&events), output);
+                assert_eq!(reasoning(&events), "");
+                assert_eq!(
+                    content(&events),
+                    format!("{FIRST_THOUGHT}{SECOND_THOUGHT}{SECOND_THOUGHT_JSON}")
+                );
+                assert_eq!(malformed(&events), [], "{events:?}");
+            }
         }
     }
 

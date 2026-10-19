@@ -1195,9 +1195,10 @@ mod tests {
         assert_eq!(kimi["format"]["type"], "tag", "{kimi}");
         assert_eq!(kimi["format"]["content"]["type"], "json_schema", "{kimi}");
         // Inkling's thought is a message of its own: the tag admits it first, closed and the
-        // next message opened, leaves the text marker optional where the engine does not say it
-        // starts at the first token (an engine that starts after its reasoning parser has
-        // consumed the model's own), then the schema and the message's close.
+        // next message opened with the text marker owed after it, or the marker alone, or
+        // neither where the engine does not say it starts at the first token (an engine that
+        // starts after its reasoning parser has consumed the model's own), then the schema and
+        // the message's close.
         let inkling = tag_of(answer(
             &ModelNames::default(),
             json!({"model": "thinkingmachines/Inkling", "response_format": {"type": "json_object"}}),
@@ -1207,24 +1208,24 @@ mod tests {
         let elements = inkling["format"]["elements"]
             .as_array()
             .expect("a sequence");
-        assert_eq!(elements.len(), 4, "{inkling}");
+        assert_eq!(elements.len(), 3, "{inkling}");
         assert_eq!(elements[0]["type"], "optional", "{inkling}");
+        let ways = &elements[0]["content"];
+        assert_eq!(ways["type"], "or", "{inkling}");
+        let opener = json!({"type": "const_string", "value": "<|content_text|>"});
         assert_eq!(
-            elements[0]["content"]["begin"], "<|content_thinking|>",
+            ways["elements"][0]["elements"][0]["begin"], "<|content_thinking|>",
             "{inkling}"
         );
+        assert_eq!(ways["elements"][0]["elements"][1], opener, "{inkling}");
+        assert_eq!(ways["elements"][1], opener, "{inkling}");
         assert_eq!(
             elements[1],
-            json!({"type": "optional", "content": {"type": "const_string", "value": "<|content_text|>"}}),
-            "{inkling}"
-        );
-        assert_eq!(
-            elements[2],
             json!({"type": "json_schema", "json_schema": {"type": "object"}}),
             "{inkling}"
         );
         assert_eq!(
-            elements[3],
+            elements[2],
             json!({"type": "const_string", "value": "<|end_message|>"}),
             "{inkling}"
         );

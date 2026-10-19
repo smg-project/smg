@@ -645,6 +645,73 @@ mod tests {
     }
 
     #[test]
+    fn a_kind_said_again_inside_an_answer_counts_the_output_as_clean() {
+        // Through the table whose messages say their kind after their opener, as a request
+        // without tools reads it: a JSON answer whose text marker the model wrote twice, and one
+        // with a second thought opened inside the answer's message, as an engine that starts the
+        // grammar after its own reasoning parser lets the model write them. The markers are
+        // framing, the second thought is reasoning, the JSON is the content, and the tally sees
+        // no malformed run: the output counts as clean, under no reason.
+        use symphony::{formats::Table, Declared, Engine, EngineFinish, Events, Input, Parser};
+        let json = "{\"city\": \"Oslo\"}";
+        for output in [
+            format!(
+                "<|content_thinking|>plan<|end_message|><|message_model|><|content_text|>\
+                 <|content_text|>{json}<|end_message|>"
+            ),
+            format!(
+                "<|content_thinking|>plan<|end_message|><|message_model|><|content_text|>\
+                 <|content_thinking|>more<|end_message|><|message_model|><|content_text|>{json}\
+                 <|end_message|>"
+            ),
+        ] {
+            let mut engine =
+                Engine::new(Table::Inkling.format().without_calls(), Declared::default());
+            let mut out = Events::new();
+            engine
+                .feed(
+                    Input::Prompt {
+                        token_ids: &[],
+                        text: "<|message_model|>",
+                    },
+                    &mut out,
+                )
+                .expect("the prompt");
+            engine
+                .feed(
+                    Input::Delta {
+                        token_ids: &[],
+                        text: &output,
+                        spans: &[],
+                    },
+                    &mut out,
+                )
+                .expect("the delta");
+            engine
+                .feed(
+                    Input::End {
+                        finish: EngineFinish::Stop,
+                    },
+                    &mut out,
+                )
+                .expect("the end");
+            let mut tally = Tally::default();
+            let mut content = String::new();
+            for event in out.as_slice() {
+                tally.see(event, false);
+                if let Event::Content(text) = event {
+                    content.push_str(&text.text);
+                }
+            }
+            assert_eq!(content, json, "{:?}", out.as_slice());
+            assert_eq!(tally.malformed(), 0, "{:?}", out.as_slice());
+            assert_eq!(tally.malformed_bytes, 0);
+            assert_eq!(tally.reasons_seen(), "");
+            assert_eq!(tally.first, None);
+        }
+    }
+
+    #[test]
     fn a_marker_out_of_place_has_a_label_of_its_own_and_counts_the_output_as_malformed() {
         // The crate says so with an event of no bytes before the marker's text: the run counts,
         // the first run stands where the marker does, and its bytes are none.

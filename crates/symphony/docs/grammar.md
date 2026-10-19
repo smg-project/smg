@@ -114,16 +114,22 @@ bounded.
 
 Where the thought is a message of its own before an answer that is another (Inkling's: the
 thought's close ends every message alike, and the next message's opener says what it is), and the
-prompt opens no thought, the tag admits the thought first, closed and the next message opened, and
-leaves the way into the answer optional (`Format::thought_message`). An engine that starts the
-grammar after its reasoning parser hands over at the answer's opener, not at the thought's close,
-and has consumed the way in when the grammar starts; one that starts at the first token writes it.
-The engine's start (`GrammarStart`) says where the grammar starts on a prompt that opens the
-thought; on one that opens none it tells the two apart only when it names the first token, when the
-way in is written outright: an engine that says it starts after its parser may gate on that parser
-whatever the prompt (one engine) or only when the request asks for reasoning (another), and the tag
-fits both. Before this, the tag wrote the way in as its `begin`, and an engine that had consumed
-the model's own opener forced it again: the answer reached the client as `<|content_text|>{...}`.
+prompt opens no thought, the tag admits the thought first, closed and the next message opened, with
+the way into the answer owed after it (the message needs its kind), and leaves the way in optional
+on its own (`Format::thought_message`). An engine that starts the grammar after its reasoning
+parser hands over at the answer's opener, not at the thought's close, and has consumed the way in
+when the grammar starts; one that starts at the first token writes it. The engine's start
+(`GrammarStart`) says where the grammar starts on a prompt that opens the thought; on one that
+opens none it tells the two apart only when it names the first token, when the way in is written
+outright: an engine that says it starts after its parser may gate on that parser whatever the
+prompt (one engine) or only when the request asks for reasoning (another), and the tag fits both.
+So at the gate, past the model's own opener, the tag's thought and the way in are open to the
+model once more, and a model held to a JSON it had not planned writes one of them again about two
+times in three; the table reads the kind said again inside a body as the kind, as the family's own
+parsers do, and the answer is the bare JSON either way (the `inkling` notes in `tables.md`).
+Before this, the tag wrote the way in as its `begin`, and an engine that had consumed the model's
+own opener forced it again: the answer reached the client as `<|content_text|>{...}`; and the
+way in was optional after the thought too, which admitted a message without a kind.
 
 Whether a thought comes before the call or the answer is the table's, not the syntax's: a table
 whose template writes the thought before every call and answer (`Format::thinks_first`) gets it

@@ -703,6 +703,57 @@ mod tests {
     }
 
     #[test]
+    fn a_reader_gives_a_json_answer_bare_when_the_model_said_its_kind_again() {
+        // The table whose messages say their kind after their opener, as a request without tools
+        // reads it, over the two outputs an engine that starts a JSON answer's grammar after its
+        // own reasoning parser lets the model write: the text marker twice, or a second thought
+        // opened inside the answer's message. The client sees the bare JSON as content, the
+        // thoughts as reasoning, and the reader reads no malformed run.
+        let assignment = Assignment {
+            format: Arc::new(symphony::formats::inkling().without_calls()),
+            prompt: "<|message_model|>".to_string(),
+        };
+        let json = "{\"city\": \"Oslo\", \"country\": \"Norway\"}";
+        let thought = "<|content_thinking|>plan<|end_message|><|message_model|><|content_text|>";
+        for (output, reasoning) in [
+            (
+                format!("{thought}<|content_text|>{json}<|end_message|>"),
+                "plan",
+            ),
+            (
+                format!(
+                    "{thought}<|content_thinking|>more<|end_message|><|message_model|>\
+                     <|content_text|>{json}<|end_message|>"
+                ),
+                "planmore",
+            ),
+        ] {
+            let mut reader = Reader::new(&assignment, Arc::default()).expect("a reader");
+            let mut events = reader.tail(&output).expect("read");
+            events.extend(reader.end(EngineFinish::Stop, who()).expect("ended"));
+            assert_eq!(content_of(&events), json, "{events:?}");
+            let thoughts: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Reasoning(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(thoughts, reasoning, "{events:?}");
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::Malformed { .. })),
+                "{events:?}"
+            );
+            let Some(Event::Finish { tool_calls, .. }) = events.last() else {
+                panic!("a finish");
+            };
+            assert_eq!(*tool_calls, 0);
+        }
+    }
+
+    #[test]
     fn a_reader_ends_once() {
         let assignment = Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),

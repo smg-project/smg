@@ -314,9 +314,23 @@ What the table says beyond the others:
   it starts at the first token, then the schema and `<|end_message|>`: an engine that consumed the
   model's own marker writes the JSON at once, one that starts before the thought writes the
   marker itself. Before this, the tag's `begin` wrote the marker again after the model's own on
-  such an engine, and the answer came back as `<|content_text|>{...}`; the table reads that second
-  marker as the answer's text, where no row leads, and says so with a `Malformed` event of no
-  bytes (`MarkerOutOfPlace`), so a reader counts it.
+  such an engine, and the answer came back as `<|content_text|>{...}`.
+- **A kind said again inside a body is the kind.** The family's own parsers read the blocks as
+  self-describing, in any order: `<|content_text|>` inside the answer starts its text over,
+  `<|content_thinking|>` inside the answer or the thought opens a thought, and none of the three
+  is the body's text; the table has the same rows (`content` on `text` back to `content`, on
+  `thinking` to `reasoning`; `reasoning` on `thinking` to itself), so the markers are framing
+  there, dropped, and the whitespace a stay held before one is the template's. The rows are
+  what an engine that starts a JSON answer's grammar after its reasoning parser needs: the tag
+  above cannot tell that engine's start from the first token, so at the gate, past the model's
+  own `<|content_text|>`, its optional thought and marker are open to the model once more, and a
+  model held to a JSON it had not planned writes one of the two before the JSON about two times
+  in three. Read with the rows, such an answer is the bare JSON, the second thought reasoning
+  after the first; read without them, it was `<|content_text|>{...}` or
+  `<|content_thinking|>...{...}` in the content, each counted as a marker out of place. A
+  `<|message_model|>` inside a body still has no row and is still counted so. The variant for a
+  request that keeps the reasoning in the content keeps the four markers dropped
+  (`Format::without_reasoning` leaves the message frame's terminals unshown).
 - **A forced call's tag is the gateway's.** `Format::grammar` writes the tag the gateway's old
   Inkling parser hand-writes: the call marker triggers it inside whatever message the model is
   writing, the first one included, then `{"name":"NAME","args":`, the schema, `}` and
