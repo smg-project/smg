@@ -7,7 +7,10 @@
 //! reclaimed even when the request never completes normally. The stream
 //! itself is released by the worker's own end of it: the cleanup task reads
 //! it, bounded, until the worker ends it after the abort, and resets it only
-//! when the worker does not (see `Drop`).
+//! when the worker does not (see `Drop`). A request's deadline
+//! ([`AbortOnDropStream::with_deadline`]) ends the stream the same way from
+//! the inside: at the deadline the stream is released as a dropped one is,
+//! and its reader meets the deadline's status.
 //!
 //! Engines plug in via the `AbortOnDropClient` trait — they describe how
 //! to translate `(client, request_id)` into the abort future. This keeps
@@ -27,8 +30,11 @@ use std::{
     time::Duration,
 };
 
+use tokio::time::Sleep;
 use tonic::Streaming;
 use tracing::{debug, warn};
+
+use crate::request_deadline::RequestDeadline;
 
 /// Upper bound on how long a deferred abort waits for the stream's first
 /// item before aborting anyway. Bounds the detached drain task when the
@@ -80,6 +86,9 @@ pub struct AbortOnDropStream<T: Send + 'static, C: AbortOnDropClient> {
     /// How long a drop waits for the worker to end the stream after the
     /// abort before releasing it with a reset (see `Drop`).
     release_drain_bound: Duration,
+    /// The request's deadline and its timer, when the stream is bounded by
+    /// one (see [`Self::with_deadline`]).
+    deadline: Option<(RequestDeadline, Pin<Box<Sleep>>)>,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -95,8 +104,21 @@ impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
             defer_abort_until_first_item: false,
             saw_item: false,
             release_drain_bound: RELEASE_DRAIN_MAX_WAIT,
+            deadline: None,
             _marker: PhantomData,
         }
+    }
+
+    /// Bound the stream by the request's `deadline`: a poll at or past it
+    /// ends the stream, whatever the worker has sent since (as an HTTP
+    /// client's timeout ends a body), the stream is released as a dropped
+    /// one is (the abort goes to the worker at once, the deferral and the
+    /// drain apply as on a drop), and the reader meets the deadline's status
+    /// ([`RequestDeadline::status`]), then the end.
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: RequestDeadline) -> Self {
+        self.deadline = Some((deadline, Box::pin(tokio::time::sleep_until(deadline.at()))));
+        self
     }
 
     /// Bound the wait for the worker's own end of a dropped stream (default
@@ -131,6 +153,17 @@ impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
 
 impl<T: Send + 'static, C: AbortOnDropClient> Drop for AbortOnDropStream<T, C> {
     fn drop(&mut self) {
+        self.release();
+    }
+}
+
+impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
+    /// Let go of the stream before its end: the abort goes to the worker
+    /// (deferred past the first item when so configured) and the stream is
+    /// read up to the worker's own end of it, both detached. What a drop
+    /// does, and what the request's deadline does when it passes; nothing
+    /// after `mark_completed`, nothing twice.
+    fn release(&mut self) {
         // Atomically claim the "send abort" responsibility. If
         // `mark_completed` already ran, `compare_exchange` fails and we
         // bail out; otherwise we own the cleanup.
@@ -262,22 +295,41 @@ impl<T: Send + 'static, C: AbortOnDropClient> futures::Stream for AbortOnDropStr
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = &mut *self;
-        match this.inner.as_mut() {
-            Some(inner) => {
-                let polled = Pin::new(inner).poll_next(cx);
-                if matches!(polled, Poll::Ready(Some(_))) {
-                    // Any yielded item — data or error — ends the deferred
-                    // window: the backend has responded, so its handoff
-                    // state is resolved either way.
-                    this.saw_item = true;
-                }
-                polled
-            }
-            // Only reachable if polled after Drop took the stream, which
-            // cannot happen for an owned value; return end-of-stream rather
-            // than panicking to keep the impl total.
-            None => Poll::Ready(None),
+        // The stream went with the deadline's cut (or, unreachably for an
+        // owned value, with Drop): end-of-stream rather than a panic keeps
+        // the impl total.
+        if this.inner.is_none() {
+            return Poll::Ready(None);
         }
+        // The deadline is read first: a stream polled at or past it ends
+        // here, a message the worker sent since included, and the timer's
+        // waker sees to the poll when the worker sends nothing at all. After
+        // `mark_completed` the request is done and the deadline does not
+        // speak again: a later poll reaches the stream's own end.
+        let completed = this.aborted.load(Ordering::Acquire);
+        if let Some((deadline, sleep)) = this.deadline.as_mut().filter(|_| !completed) {
+            if sleep.as_mut().poll(cx).is_ready() {
+                let status = deadline.status();
+                warn!(
+                    request_id = %this.request_id,
+                    timeout = ?deadline.timeout(),
+                    "Request timed out: the worker did not finish it within the request timeout; aborting it on the worker"
+                );
+                this.release();
+                return Poll::Ready(Some(Err(status)));
+            }
+        }
+        let Some(inner) = this.inner.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let polled = Pin::new(inner).poll_next(cx);
+        if matches!(polled, Poll::Ready(Some(_))) {
+            // Any yielded item — data or error — ends the deferred
+            // window: the backend has responded, so its handoff
+            // state is resolved either way.
+            this.saw_item = true;
+        }
+        polled
     }
 }
 

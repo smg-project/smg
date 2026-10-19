@@ -3,14 +3,18 @@
 use axum::response::Response;
 use http::StatusCode;
 use llm_multimodal::MediaErrorCode;
-use smg_grpc_client::{is_constraint_failure, is_transport_failure, WorkerMediaFault};
+use smg_grpc_client::{
+    is_constraint_failure, is_request_timeout, is_transport_failure, WorkerMediaFault,
+};
 use tonic::Code;
 
 use super::metrics::mark_error_reason;
 use crate::{
     observability::metrics::metrics_labels,
     routers::{
-        common::retry::mark_non_retryable, error, grpc::proto_wrapper::ENGINE_ERROR_MESSAGE,
+        common::retry::{mark_non_retryable, request_timeout_response},
+        error,
+        grpc::proto_wrapper::ENGINE_ERROR_MESSAGE,
     },
 };
 
@@ -149,7 +153,16 @@ impl TonicStatusExt for tonic::Status {
     }
 
     fn to_http_error(&self, code: &str, msg: String) -> Response {
-        let mut response = error::create_error(self.http_status(), code, msg);
+        // The gateway's own request timeout (`--request-timeout-secs`): the
+        // answer every path gives an upstream call its request timeout cut
+        // (the 504 under `call_upstream_timeout`, terminal for the retry
+        // layer: a replay would hold the client for a second timeout),
+        // whatever the caller's code.
+        let mut response = if is_request_timeout(self) {
+            request_timeout_response(msg)
+        } else {
+            error::create_error(self.http_status(), code, msg)
+        };
         mark_error_reason(&mut response, self.error_reason());
         response
     }

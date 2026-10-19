@@ -127,6 +127,10 @@ pub(crate) struct PipelineDeps {
     /// `--queue-timeout-secs`: a request still ahead of worker selection this
     /// long after the gateway accepted it is refused instead of dispatched.
     queue_timeout: Duration,
+    /// `--request-timeout-secs`: the deadline of each attempt's calls to its
+    /// workers and of the streams they open, counted from the dispatch;
+    /// `None` leaves them unbounded.
+    request_timeout: Option<Duration>,
 }
 
 impl PipelineDeps {
@@ -157,6 +161,7 @@ impl PipelineDeps {
             configured_reasoning_parser,
             rate_limit_manager,
             queue_timeout,
+            request_timeout: None,
         }
     }
 
@@ -179,7 +184,17 @@ impl PipelineDeps {
             configured_reasoning_parser: None,
             rate_limit_manager,
             queue_timeout,
+            request_timeout: None,
         }
+    }
+
+    /// Bound each attempt's calls to its workers, and the streams they open,
+    /// by `timeout` from the dispatch (`--request-timeout-secs`); zero leaves
+    /// them unbounded.
+    #[must_use]
+    pub(crate) fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = (!timeout.is_zero()).then_some(timeout);
+        self
     }
 
     /// Build the chat/messages response processor pair from the configured
@@ -249,6 +264,7 @@ impl PipelineDeps {
             configured_reasoning_parser: None,
             rate_limit_manager: None,
             queue_timeout: Duration::from_secs(60),
+            request_timeout: None,
         }
     }
 }
@@ -280,6 +296,8 @@ pub(crate) struct RequestPipeline {
     worker_registry: Arc<WorkerRegistry>,
     /// Shapes a forced tool call's constraint for each attempt's worker.
     tool_parser_factory: ToolParserFactory,
+    /// The deadline of each attempt's dispatch and streams, when set.
+    request_timeout: Option<Duration>,
 }
 
 /// Outcome of one full pipeline run.
@@ -465,6 +483,7 @@ impl RequestPipeline {
             mode,
             worker_registry: deps.worker_registry.clone(),
             tool_parser_factory: deps.tool_parser_factory.clone(),
+            request_timeout: deps.request_timeout,
         })
     }
 
@@ -603,7 +622,7 @@ impl RequestPipeline {
             dctx.workers.as_ref(),
         ));
 
-        execute_plan(dctx, attempt_plan, last_attempt).await?;
+        execute_plan(dctx, attempt_plan, last_attempt, self.request_timeout).await?;
         self.stages
             .response_processing
             .process(dctx, attempt_spec)
@@ -5060,6 +5079,270 @@ mod request_release_tests {
             .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
         assert!(line.contains("error_type=\"unavailable\""), "{line}");
         assert!(line.ends_with(" 1"), "{line}");
+    }
+
+    /// The gateway's request timeout on a gRPC worker, in the shapes the
+    /// issue's reproduction had: a streamed completion whose engine takes
+    /// the request and says nothing ends at the deadline with the HTTP
+    /// path's `stream_error` event under the timeout's message and `[DONE]`,
+    /// the engine receives the abort for that request before the client
+    /// reads the event, and the worker's load goes with the body.
+    #[tokio::test]
+    async fn a_streamed_request_to_a_silent_worker_ends_at_the_request_timeout_and_is_aborted() {
+        let (pipeline, worker, scheduler, components) =
+            silent_worker_pipeline(SilentShape::Stream, REQUEST_TIMEOUT).await;
+        let started = Instant::now();
+        let response = pipeline
+            .execute_completion(
+                completion(true),
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let body = tokio::time::timeout(
+            CASE_CAP,
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("the request timeout ends the body: without it the gateway waits on the silent worker as long as the client does")
+        .expect("drain body");
+        let elapsed = started.elapsed();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            elapsed >= REQUEST_TIMEOUT && elapsed < CASE_CAP,
+            "ended after {elapsed:?}: {body}"
+        );
+        assert!(body.contains("\"type\":\"stream_error\""), "{body}");
+        assert!(body.contains("request timed out after 300ms"), "{body}");
+        assert!(body.trim_end().ends_with("data: [DONE]"), "{body}");
+        assert_aborted_and_released(&scheduler, &worker).await;
+    }
+
+    /// The same request non-streamed is the HTTP path's 504 for its client
+    /// timeout, `call_upstream_timeout`, at the deadline; the engine request
+    /// is aborted and the slot released as for the streamed one.
+    #[tokio::test]
+    async fn a_non_streamed_request_to_a_silent_worker_is_the_504_at_the_request_timeout() {
+        let (pipeline, worker, scheduler, components) =
+            silent_worker_pipeline(SilentShape::Stream, REQUEST_TIMEOUT).await;
+        let started = Instant::now();
+        let response = tokio::time::timeout(
+            CASE_CAP,
+            pipeline.execute_completion(
+                completion(false),
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the request timeout answers: without it the gateway waits on the silent worker as long as the client does");
+        let elapsed = started.elapsed();
+        assert_timeout_response(response, elapsed).await;
+        assert_aborted_and_released(&scheduler, &worker).await;
+    }
+
+    /// A worker that never answers the call that opens the stream (the
+    /// request never admitted, the servicer wedged before its first frame)
+    /// is bounded by the same deadline: the call is dropped at the deadline,
+    /// which cancels it on the worker, and the client reads the 504.
+    #[tokio::test]
+    async fn a_call_the_worker_never_answers_is_the_504_at_the_request_timeout() {
+        let (pipeline, worker, _scheduler, components) =
+            silent_worker_pipeline(SilentShape::Call, REQUEST_TIMEOUT).await;
+        let started = Instant::now();
+        let response = tokio::time::timeout(
+            CASE_CAP,
+            pipeline.execute_completion(
+                completion(false),
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the request timeout answers: without it the gateway waits on the call as long as the client does");
+        let elapsed = started.elapsed();
+        assert_timeout_response(response, elapsed).await;
+        assert_eq!(worker.load(), 0, "the slot goes with the answer");
+    }
+
+    /// A worker that answers within the timeout is not touched by it: the
+    /// completion arrives whole, the engine sees no abort.
+    #[tokio::test]
+    async fn a_request_that_completes_before_the_request_timeout_is_unchanged() {
+        let scheduler = GatedScheduler::default();
+        let aborted = Arc::clone(&scheduler.aborted_request_ids);
+        let port = spawn_stub(scheduler).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker(&worker_registry, port, WorkerType::Regular);
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            None,
+            None,
+            Duration::from_secs(60),
+        )
+        .with_request_timeout(Duration::from_secs(30));
+        let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
+            .expect("completion pipeline");
+        let components = components(Arc::clone(&worker_registry)).await;
+        for stream in [true, false] {
+            let response = pipeline
+                .execute_completion(
+                    completion(stream),
+                    None,
+                    MODEL.to_string(),
+                    Arc::clone(&components),
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            assert_eq!(response.status(), http::StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("drain body");
+            let body = String::from_utf8_lossy(&body);
+            assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
+            assert!(!body.contains("timed out"), "{body}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            aborted
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "a completed request sends no abort"
+        );
+        assert_eq!(worker.load(), 0);
+    }
+
+    /// The request timeout under test and the cap a gateway without it fails at.
+    const REQUEST_TIMEOUT: Duration = Duration::from_millis(300);
+    const CASE_CAP: Duration = Duration::from_secs(10);
+
+    /// Where the worker falls silent: after it answered the call with an
+    /// open stream (`Stream`), or before answering the call at all (`Call`).
+    #[derive(Clone, Copy)]
+    enum SilentShape {
+        Stream,
+        Call,
+    }
+
+    /// A completion pipeline with `request_timeout` over one stub worker that
+    /// takes the request and is silent for longer than any case runs.
+    async fn silent_worker_pipeline(
+        shape: SilentShape,
+        request_timeout: Duration,
+    ) -> (
+        RequestPipeline,
+        Arc<dyn Worker>,
+        GatedScheduler,
+        Arc<SharedComponents>,
+    ) {
+        let silence = Duration::from_secs(3600);
+        let scheduler = match shape {
+            SilentShape::Stream => GatedScheduler {
+                frame_gap: Some(silence),
+                ..Default::default()
+            },
+            SilentShape::Call => GatedScheduler {
+                answer_after: Some(silence),
+                ..Default::default()
+            },
+        };
+        let port = spawn_stub(scheduler.clone()).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker(&worker_registry, port, WorkerType::Regular);
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            None,
+            None,
+            Duration::from_secs(60),
+        )
+        .with_request_timeout(request_timeout);
+        let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
+            .expect("completion pipeline");
+        let components = components(Arc::clone(&worker_registry)).await;
+        (pipeline, worker, scheduler, components)
+    }
+
+    fn completion(stream: bool) -> Arc<CompletionRequest> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": MODEL,
+                "prompt": "Hello world",
+                "max_tokens": 8,
+                "stream": stream,
+            }))
+            .expect("completion request"),
+        )
+    }
+
+    /// The HTTP path's 504 for its client timeout, at the deadline.
+    async fn assert_timeout_response(response: Response, elapsed: Duration) {
+        assert_eq!(response.status(), http::StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            elapsed >= REQUEST_TIMEOUT && elapsed < CASE_CAP,
+            "answered after {elapsed:?}"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("drain body");
+        let error: serde_json::Value = serde_json::from_slice(&body).expect("a JSON body");
+        assert_eq!(error["error"]["code"], "call_upstream_timeout", "{error}");
+        assert_eq!(error["error"]["type"], "server_error", "{error}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("request timed out after 300ms")),
+            "{error}"
+        );
+    }
+
+    /// The stub received the abort for the one request it saw, and the
+    /// worker's load is back to zero.
+    async fn assert_aborted_and_released(scheduler: &GatedScheduler, worker: &Arc<dyn Worker>) {
+        let request_id = scheduler
+            .seen_request_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .first()
+            .cloned()
+            .expect("the stub saw the request");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !scheduler
+            .aborted_request_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&request_id)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the stub never received the abort for {request_id}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        while worker.load() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the worker's load never returned to zero"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }
 
