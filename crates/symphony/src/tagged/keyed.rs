@@ -258,9 +258,11 @@ impl Assembler {
         if self.done {
             return;
         }
-        for piece in self.scanner.feed(bytes) {
+        let scanned = self.scanner.feed(bytes);
+        for piece in scanned.pieces() {
             self.take(piece, declared, out);
         }
+        self.scanner.reclaim(scanned);
     }
 
     /// The call's end: `terminal` is the closing marker the engine read (its bytes go into
@@ -332,7 +334,7 @@ impl Assembler {
         }
     }
 
-    fn take(&mut self, piece: Piece, declared: &Declared, out: &mut Events) {
+    fn take(&mut self, piece: Piece<'_>, declared: &Declared, out: &mut Events) {
         match piece {
             Piece::Text(text) => self.text(&text, out),
             Piece::Marker(tag) => self.tag(tag, declared, out),

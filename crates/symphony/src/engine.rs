@@ -24,7 +24,7 @@ use crate::{
     ids::CallIds,
     input::{EngineFinish, Input},
     json,
-    markers::{Piece, Scanner},
+    markers::{Piece, Scanned, Scanner},
     parser::{ParseError, Parser},
     pythonic,
     shape::{self, Values},
@@ -392,18 +392,22 @@ impl Engine {
     /// scan stands where the old one cut the text with nothing held, from which on the two cut it
     /// alike; at the end of the stream everything is scanned to the end, and a header still
     /// undecided is decided once nothing more comes.
-    fn run(&mut self, pieces: Vec<Piece>, at_end: bool, out: &mut Events) {
-        let mut queue = VecDeque::from(pieces);
+    fn run(&mut self, scanned: &Scanned<'_>, at_end: bool, out: &mut Events) {
+        // The pieces are taken as scanned until a header decides; from then on, what the scan
+        // that reads again gives and the pieces not reached yet stand in a queue, which nothing
+        // is allocated for before.
+        let mut pieces = scanned.pieces();
+        let mut queue = VecDeque::new();
+        while let Some(piece) = pieces.next() {
+            if let Some(again) = self.step(piece, at_end, out) {
+                queue.extend(pieces.by_ref());
+                self.scan_again(again, &mut queue, at_end);
+                break;
+            }
+        }
         loop {
             while let Some(piece) = queue.pop_front() {
-                let again = match piece {
-                    Piece::Text(text) if at_end && self.cut_tag(&text) => {
-                        self.drop_cut_tag(&text, out);
-                        None
-                    }
-                    piece => self.take(piece, out),
-                };
-                if let Some(again) = again {
+                if let Some(again) = self.step(piece, at_end, out) {
                     self.scan_again(again, &mut queue, at_end);
                 }
             }
@@ -417,37 +421,42 @@ impl Engine {
         }
     }
 
-    /// The bytes a piece stands for.
-    fn piece_text<'p>(&'p self, piece: &'p Piece) -> &'p str {
+    /// Takes one piece: a tag the end cut short is dropped, anything else is taken as the table
+    /// says ([`Self::take`]). What a header that decided hands back to read again.
+    fn step(&mut self, piece: Piece<'_>, at_end: bool, out: &mut Events) -> Option<String> {
         match piece {
-            Piece::Text(text) => text,
-            Piece::Marker(index) => self.format.terminal_text(*index),
+            Piece::Text(text) if at_end && self.cut_tag(&text) => {
+                self.drop_cut_tag(&text, out);
+                None
+            }
+            piece => self.take(piece, out),
         }
     }
 
     /// Scans `text` afresh, before the pieces in `queue`, and puts what it gives at the queue's
-    /// front. The queued pieces follow it, scanned again too while the new scan holds a possible
-    /// terminal at their edge: once it holds nothing where the old scan began a piece, both cut
-    /// what follows alike, since a scan from a piece's start reads nothing before it. When the
-    /// queue runs out first, what the old scanner held comes after them, and the new scanner takes
-    /// its place; at the end of the stream it is finished.
-    fn scan_again(&mut self, text: String, queue: &mut VecDeque<Piece>, at_end: bool) {
-        let mut scanner = Scanner::new(self.format.terminal_texts());
-        let mut pieces = scanner.feed(&text);
-        while !scanner.held().is_empty() {
+    /// front: the scanner reads it with what it held set aside, as a new scanner would. The
+    /// queued pieces follow it, scanned again too while the new scan holds a possible terminal at
+    /// their edge: once it holds nothing where the old scan began a piece, both cut what follows
+    /// alike, since a scan from a piece's start reads nothing before it, and the scanner takes
+    /// what it held back. When the queue runs out first, what was held comes after them, and the
+    /// new scan stands; at the end of the stream it is finished.
+    fn scan_again(&mut self, text: String, queue: &mut VecDeque<Piece<'_>>, at_end: bool) {
+        let held = self.scanner.set_aside();
+        let mut pieces = owned(&self.scanner.feed(&text));
+        while !self.scanner.held().is_empty() {
             let Some(piece) = queue.pop_front() else {
                 break;
             };
-            pieces.extend(scanner.feed(self.piece_text(&piece)));
+            let text = piece_text(&self.format, &piece);
+            pieces.extend(owned(&self.scanner.feed(text)));
         }
         if queue.is_empty() {
-            pieces.extend(scanner.feed(self.scanner.held()));
+            pieces.extend(owned(&self.scanner.feed(&held)));
             if at_end {
-                pieces.extend(scanner.finish());
-                self.scanner = Scanner::new(self.format.terminal_texts());
-            } else {
-                self.scanner = scanner;
+                pieces.extend(owned(&self.scanner.finish()));
             }
+        } else {
+            self.scanner.resume(held);
         }
         for piece in pieces.into_iter().rev() {
             queue.push_front(piece);
@@ -455,9 +464,9 @@ impl Engine {
     }
 
     /// Takes one piece, and says what to read again when a shaped call's header decided.
-    fn take(&mut self, piece: Piece, out: &mut Events) -> Option<String> {
+    fn take(&mut self, piece: Piece<'_>, out: &mut Events) -> Option<String> {
         if self.pending.is_some() {
-            let text = self.piece_text(&piece).to_string();
+            let text = piece_text(&self.format, &piece).to_string();
             return self.read_header(&text, out);
         }
         if let Piece::Marker(index) = piece {
@@ -482,7 +491,7 @@ impl Engine {
 
     /// Takes one piece where the turn and the table put it: the turn's first piece decides where
     /// the turn starts, then text is the state's and a terminal moves the engine or is text.
-    fn place(&mut self, piece: Piece, out: &mut Events) {
+    fn place(&mut self, piece: Piece<'_>, out: &mut Events) {
         self.open_turn(&piece, out);
         match piece {
             Piece::Text(text) => self.text(&text, out),
@@ -494,12 +503,12 @@ impl Engine {
     /// take it as one text piece, without the piece: the common delta of a content or reasoning
     /// stay, and of a call's arguments, is one.
     fn place_text(&mut self, text: &str, out: &mut Events) {
-        self.open_turn(&Piece::Text(String::new()), out);
+        self.open_turn(&Piece::Text("".into()), out);
         self.text(text, out);
     }
 
     /// The turn's first piece decides where the turn starts, for a table with a start row.
-    fn open_turn(&mut self, piece: &Piece, out: &mut Events) {
+    fn open_turn(&mut self, piece: &Piece<'_>, out: &mut Events) {
         if self.at_turn_start {
             if let Some(state) = self.format.opening(self.state, piece) {
                 self.at_turn_start = false;
@@ -615,7 +624,7 @@ impl Engine {
         first.push_str(&call.into_header_bytes());
         let at = first.chars().next().map_or(0, char::len_utf8);
         let again = first.split_off(at);
-        self.place(Piece::Text(first), out);
+        self.place(Piece::Text(first.into()), out);
         again
     }
 
@@ -1086,13 +1095,11 @@ impl Engine {
     }
 
     fn end(&mut self, finish: EngineFinish, out: &mut Events) {
-        let scanner = std::mem::replace(
-            &mut self.scanner,
-            Scanner::new(self.format.terminal_texts()),
-        );
         // What the scanner held back as a possible terminal is text now that no more bytes come,
         // except a tag the end cut short.
-        self.run(scanner.finish(), true, out);
+        let scanned = self.scanner.finish();
+        self.run(&scanned, true, out);
+        self.scanner.reclaim(scanned);
         self.end_stay(out);
         match self.emits() {
             Emits::Reasoning => out.push(Event::ReasoningEnd),
@@ -1132,6 +1139,20 @@ impl Engine {
     }
 }
 
+/// The bytes a piece stands for.
+fn piece_text<'p>(format: &'p Format, piece: &'p Piece<'_>) -> &'p str {
+    match piece {
+        Piece::Text(text) => text,
+        Piece::Marker(index) => format.terminal_text(*index),
+    }
+}
+
+/// The pieces of a scan, owned: what a scan that reads again gives stands in the queue past the
+/// bytes it was read from.
+fn owned(scanned: &Scanned<'_>) -> Vec<Piece<'static>> {
+    scanned.pieces().map(Piece::into_owned).collect()
+}
+
 impl Parser for Engine {
     fn feed(&mut self, input: Input<'_>, out: &mut Events) -> Result<(), ParseError> {
         match input {
@@ -1159,8 +1180,14 @@ impl Parser for Engine {
                     }
                     return Ok(());
                 }
-                let pieces = self.scanner.feed(text);
-                self.run(pieces, false, out);
+                let scanned = self.scanner.feed(text);
+                // One piece of text (after a held byte, or before one held now) is taken as
+                // [`Self::place`] would take it, without the piece, like a delta read as text.
+                match scanned.whole_text() {
+                    Some(whole) if self.pending.is_none() => self.place_text(whole, out),
+                    _ => self.run(&scanned, false, out),
+                }
+                self.scanner.reclaim(scanned);
                 Ok(())
             }
             Input::End { finish } => {

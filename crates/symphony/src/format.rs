@@ -950,7 +950,7 @@ impl Format {
     }
 
     /// The bytes a piece of the replay stands for.
-    fn piece_len(&self, piece: &Piece) -> usize {
+    fn piece_len(&self, piece: &Piece<'_>) -> usize {
         match piece {
             Piece::Text(text) => text.len(),
             Piece::Marker(index) => self.terminal_text(*index).len(),
@@ -1012,7 +1012,7 @@ impl Format {
     /// the start row's state, unless the piece is a terminal whose row from `state` leads into
     /// another one, which wins as the longer match; then `state`. A terminal the table ignores
     /// decides nothing, and gives `None`. A table without a start row starts where it stands.
-    pub(crate) fn opening(&self, state: usize, piece: &Piece) -> Option<usize> {
+    pub(crate) fn opening(&self, state: usize, piece: &Piece<'_>) -> Option<usize> {
         let Some(start) = self.start else {
             return Some(state);
         };
@@ -1056,8 +1056,9 @@ impl Format {
         let mut at = 0;
         // An anchor that names its own state leaves no start to choose.
         let mut at_turn_start = self.start.is_some() && start == 0;
-        let pieces = scanner.feed(turn).into_iter().chain(scanner.finish());
-        for piece in pieces {
+        let fed = scanner.feed(turn);
+        let end = scanner.finish();
+        for piece in fed.pieces().chain(end.pieces()) {
             if at_turn_start {
                 if let Some(opened) = self.opening(state, &piece) {
                     at_turn_start = false;

@@ -165,9 +165,11 @@ impl Assembler {
     /// the bytes were taken: all of them, since the block's calls follow one another and its
     /// closing marker is the format's to read.
     pub fn feed(&mut self, bytes: &str, declared: &Declared, out: &mut Events) -> usize {
-        for piece in self.scanner.feed(bytes) {
+        let scanned = self.scanner.feed(bytes);
+        for piece in scanned.pieces() {
             self.take(piece, declared, out);
         }
+        self.scanner.reclaim(scanned);
         bytes.len()
     }
 
@@ -341,7 +343,7 @@ impl Assembler {
         }
     }
 
-    fn take(&mut self, piece: Piece, declared: &Declared, out: &mut Events) {
+    fn take(&mut self, piece: Piece<'_>, declared: &Declared, out: &mut Events) {
         match piece {
             Piece::Text(text) => self.text(&text, declared, out),
             Piece::Marker(tag) => self.tag(tag, declared, out),
