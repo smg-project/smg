@@ -22,8 +22,10 @@
 //! alone: the object goes to a [`json::Assembler`](super::Assembler) as a list's object does, and
 //! what follows it reads as what follows a list's `]`: whitespace that ends the output is the
 //! template's wrapping, dropped; text, with the whitespace before and between its words, is
-//! `Malformed`; but a `;` and then another object is another call (Llama 3.1 writes its parallel
-//! calls so, `{…}; {…}`), the `;` and the whitespace around it the template's wrapping, and a `;`
+//! `Malformed`; but another object is another call, after a `;` (Llama 3.1 writes its parallel
+//! calls so, `{…}; {…}`) or after whitespace alone (Llama 3.2 Instruct writes them as consecutive
+//! objects with a blank line between, `{…}\n\n{…}`, as the engines' own readers of the family
+//! read every object of the sequence), the `;` and the whitespace the template's wrapping; a `;`
 //! that no object follows is text after the arguments. Where the table names the family's call
 //! marker (Llama 3.1's `<|python_tag|>`), the output may open with it, after whitespace or not:
 //! the marker is dropped as wrapping, with the whitespace before it, and what follows decides as
@@ -86,8 +88,8 @@ pub struct Assembler {
     /// The family's call marker the output may open with ([`Framing::ObjectOrList`]), until the
     /// first byte that is not whitespace has decided whether it does.
     opener: Option<&'static str>,
-    /// Whether a `;` followed the lone object, so that the next object is another call: the `;`
-    /// is held with the whitespace around it until the next byte decides.
+    /// Whether a `;` followed the lone object: it is held with the whitespace around it until the
+    /// next byte decides whether an object follows it, and a `;` nothing follows is text.
     separated: bool,
 }
 
@@ -100,15 +102,17 @@ pub enum Framing {
     /// The list between the table's markers (Llama Nemotron): a `[` opens it, and anything else
     /// is malformed, since prose has no place inside the markers.
     Framed,
-    /// One object, several with `;` between them, or a list alone in the output (the `json`
-    /// table): a `{` is one call alone, a `[` opens the list, and anything else is prose.
+    /// One object, several with `;` or whitespace between them, or a list alone in the output
+    /// (the `json` table): a `{` is one call alone, a `[` opens the list, and anything else is
+    /// prose.
     /// `opener` is the family's call marker the output may open with (Llama 3.1's
     /// `<|python_tag|>`), dropped as the template's wrapping where it does.
     ObjectOrList { opener: Option<&'static str> },
 }
 
 impl Framing {
-    /// Whether a `{` at the first byte is one call alone, and a `;` after it separates the next.
+    /// Whether a `{` at the first byte is one call alone, and another object after it, behind a
+    /// `;` or whitespace, the next.
     fn lone_object(self) -> bool {
         matches!(self, Self::ObjectOrList { .. })
     }
@@ -347,10 +351,10 @@ impl Assembler {
             Stage::After => {
                 // Whitespace after the object or the list is held: the template's wrapping if
                 // nothing follows it, the model's prose if text does. After a lone object a `;`
-                // is held too, and another object after it is another call, the `;` and the
-                // whitespace around it the template's wrapping. Once text follows, every byte
-                // is prose after the calls, reported malformed with its whitespace, since the
-                // template's reference keeps it as written.
+                // is held too, and another object, after the `;` or after the whitespace alone,
+                // is another call, the `;` and the whitespace the template's wrapping. Once text
+                // follows, every byte is prose after the calls, reported malformed with its
+                // whitespace, since the template's reference keeps it as written.
                 if !self.prose_after {
                     let Some((at, first)) = text.char_indices().find(|(_, c)| !c.is_whitespace())
                     else {
@@ -363,7 +367,9 @@ impl Assembler {
                             self.carried.push_str(&text[..=at]);
                             return &text[at + 1..];
                         }
-                        if first == '{' && self.separated {
+                        // Another object, after a `;` or after whitespace alone: another call,
+                        // the bytes held the template's wrapping.
+                        if first == '{' {
                             self.separated = false;
                             self.carried.push_str(&text[..at]);
                             self.open_object(out);
@@ -860,6 +866,92 @@ mod tests {
             malformed(&events, MalformedReason::TextAfterTheList),
             format!("; {a}")
         );
+    }
+
+    /// `output` through `run` at every two-way cut: the same bytes, calls and wrapping as whole.
+    fn at_every_cut(run: fn(&[&str]) -> Vec<Event<'static>>, output: &str) {
+        let whole = run(&[output]);
+        for cut in 1..output.len() {
+            if !output.is_char_boundary(cut) {
+                continue;
+            }
+            let events = run(&[&output[..cut], &output[cut..]]);
+            assert_eq!(bytes(&events), output, "cut at {cut}");
+            assert_eq!(calls(&events), calls(&whole), "cut at {cut}");
+            assert_eq!(
+                dropped(&events).concat(),
+                dropped(&whole).concat(),
+                "cut at {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn objects_that_follow_a_lone_object_on_whitespace_alone_are_further_calls() {
+        // A checkpoint that writes its parallel calls as consecutive objects, a blank line or a
+        // newline between them and no `;` (Llama 3.2 Instruct), or nothing between them: every
+        // object is a call, as the engines' own readers of the family read them, the whitespace
+        // between them the template's wrapping; two, three and four calls, whole, per character
+        // and at every cut.
+        let objects = [
+            "{\"name\": \"a\", \"parameters\": {\"n\": 1}}",
+            "{\n    \"name\": \"b\",\n    \"parameters\": {\n        \"n\": 2\n    }\n}",
+            "{\"name\": \"c\"}",
+            "{\"name\": \"d\", \"arguments\": {\"n\": 4}}",
+        ];
+        let expected = [
+            (0, "a".to_string(), r#"{"n": 1}"#.to_string()),
+            (1, "b".to_string(), "{\n        \"n\": 2\n    }".to_string()),
+            (2, "c".to_string(), "{}".to_string()),
+            (3, "d".to_string(), r#"{"n": 4}"#.to_string()),
+        ];
+        for count in 2..=4 {
+            for separator in ["\n\n", "\n", " ", "", "\n\n\n", " \n "] {
+                let output = objects[..count].join(separator);
+                let events = whole_and_per_char(run_alone, &output);
+                assert_eq!(calls(&events), expected[..count], "{count} {separator:?}");
+                let wrapping: Vec<&str> = if separator.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![separator; count - 1]
+                };
+                assert_eq!(dropped(&events), wrapping, "{count} {separator:?}");
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, Event::Malformed { .. })),
+                    "{count} {separator:?}: {events:?}"
+                );
+                at_every_cut(run_alone, &output);
+            }
+        }
+        let [a, b, c, _] = objects;
+        // A `;` and whitespace alone mix; whitespace after the last object stays wrapping; prose
+        // after the sequence is text after the arguments, as after one object, and the wrapping
+        // before it is still wrapping.
+        let events = whole_and_per_char(run_alone, &format!("{a}; {b}\n\n{c}\n"));
+        assert_eq!(calls(&events), expected[..3]);
+        assert_eq!(dropped(&events), ["; ", "\n\n", "\n"]);
+        let events = whole_and_per_char(run_alone, &format!("{a}\n\n{b}\n\nDone."));
+        assert_eq!(calls(&events), expected[..2]);
+        assert_eq!(
+            malformed(&events, MalformedReason::TextAfterTheArguments),
+            "\n\nDone."
+        );
+        assert_eq!(dropped(&events), ["\n\n"]);
+        at_every_cut(run_alone, &format!("{a}\n\n{b}\n\nDone."));
+        // Behind the family's call marker too; after a list an object is text after the list, as
+        // before; the list-only reader keeps the first `{` as prose, as before.
+        let events = whole_and_per_char(run_opened, &format!("<|python_tag|>{a}\n\n{b}"));
+        assert_eq!(calls(&events), expected[..2]);
+        assert_eq!(dropped(&events), ["<|python_tag|>", "\n\n"]);
+        let events = whole_and_per_char(run_alone, &format!("[{a}]\n\n{b}"));
+        assert_eq!(calls(&events), expected[..1]);
+        assert_eq!(
+            malformed(&events, MalformedReason::TextAfterTheList),
+            format!("\n\n{b}")
+        );
+        assert!(calls(&run(&[&format!("{a}\n\n{b}")])).is_empty());
     }
 
     #[test]

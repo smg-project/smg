@@ -428,12 +428,14 @@ What the table says beyond the others:
   state and the assembler decides at the first byte that is not whitespace; unlike `xlam`, a `{`
   there is one call alone (`json::list`, `Framing::ObjectOrList`), whose object reads as a
   list's object does, `arguments`, `parameters` or `args` naming the arguments. After the object
-  a `;` and another object is another call, the `;` and the whitespace around it the template's
-  wrapping: Llama 3.1 writes its parallel calls so, `{…}; {…}`, and the engines' own readers of
-  the family split on the `;`. Anything else after the object reads as what follows a list's
-  `]`: whitespace that ends the output is the template's wrapping, dropped; text is malformed,
-  with the whitespace before and between its words, since a model that explains its JSON in a
-  sentence wrote that sentence and the reference keeps it; so is a `;` that no object follows.
+  another object is another call, behind a `;` or behind whitespace alone, the `;` and the
+  whitespace the template's wrapping: Llama 3.1 writes its parallel calls as `{…}; {…}`, Llama
+  3.2 Instruct as consecutive objects with a blank line between them, `{…}\n\n{…}`, and the
+  engines' own readers of the family read every object of either sequence. Anything else after
+  the object reads as what follows a list's `]`: whitespace that ends the output is the
+  template's wrapping, dropped; text is malformed, with the whitespace before and between its
+  words, since a model that explains its JSON in a sentence wrote that sentence and the
+  reference keeps it; so is a `;` that no object follows.
 - **The family's call token opens the output, or does not.** Llama 3.1's template renders a call
   as the bare object, but its models write the call behind `<|python_tag|>`, the token the
   template reserves for a tool call (`CallSyntax::JsonAlone` names it): at the output's start,

@@ -280,7 +280,7 @@ fn assembler(
         // The list reader takes what frames the calls as one value: the list between markers
         // (Llama Nemotron) takes text in place of it as malformed; the bare list the output starts
         // in (xLAM) takes it for prose; the `json` table's output is one object, several with `;`
-        // between them, or a list, behind the family's call marker or not.
+        // or whitespace between them, or a list, behind the family's call marker or not.
         Some(CallSyntax::JsonList) => Box::new(json::list::Assembler::new(
             index,
             ids,

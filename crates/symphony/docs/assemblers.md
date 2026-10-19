@@ -122,7 +122,8 @@ from the engine's `CallIds`. What frames the calls is one value, `Framing`, give
 and mapped from the table's call syntax by the engine's factory: `Bare` (xLAM) is the list alone in
 the output, where anything but a list is prose; `Framed` (Llama Nemotron) is the list between
 markers, where text in place of it is malformed; `ObjectOrList` (the `json` table) also reads a
-`{` at the first byte as one call alone and another call after each `;` that follows it, and
+`{` at the first byte as one call alone and every further object after it, behind a `;` or
+behind whitespace alone, as another call, and
 carries the family's call marker the output may open with (Llama 3.1's `<|python_tag|>`), dropped
 as the template's wrapping where it does. The stages (deciding at the first byte that is not
 whitespace, inside the marker, between objects, inside one, after the `]` or the lone object) and
