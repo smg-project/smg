@@ -236,13 +236,18 @@ impl JobQueue {
     /// exactly one job per URL (#1533).
     pub async fn submit_if_idle(&self, job: Job) -> Result<bool, String> {
         let worker_url = job.worker_url().to_string();
-        if !Self::claim(&self.status_map, &worker_url, job.job_type()) {
+        let job_type = job.job_type();
+        if !Self::claim(&self.status_map, &worker_url, job_type) {
             return Ok(false);
         }
-        self.submit(job).await.map(|()| true).inspect_err(|_| {
-            // A failed submission owns no job, so its claim must not block the next one.
-            self.status_map.remove(&worker_url);
-        })
+        self.submit_inner(job, true)
+            .await
+            .map(|()| true)
+            .inspect_err(|_| {
+                // A failed submission owns no job, so its claim must not block the
+                // next one; only its own entry goes.
+                Self::record_own_status(&self.status_map, &worker_url, job_type, None);
+            })
     }
 
     /// Only an in-flight job of the same type counts: the status map is keyed
@@ -269,17 +274,25 @@ impl JobQueue {
     /// is still processing would take that job's entry (and let the in-flight
     /// guard admit a second registration). Returns `Ok(false)` when one is in
     /// flight; the caller's next occasion submits again. A job of another type
-    /// submitted after the claim keeps its entry too: a job's later status
-    /// writes touch only its own entry (`record_own_status`).
+    /// submitted after the claim keeps its entry too: the pending status
+    /// written once a slot is held, the rollback of a failed submission and a
+    /// job's later status writes touch only this job's own entry
+    /// (`record_own_status`).
     pub async fn submit_unless_in_flight(&self, job: Job) -> Result<bool, String> {
         let worker_url = job.worker_url().to_string();
-        if !Self::claim_unless_in_flight(&self.status_map, &worker_url, job.job_type()) {
+        let job_type = job.job_type();
+        if !Self::claim_unless_in_flight(&self.status_map, &worker_url, job_type) {
             return Ok(false);
         }
-        self.submit(job).await.map(|()| true).inspect_err(|_| {
-            // A failed submission owns no job, so its claim must not block the next one.
-            self.status_map.remove(&worker_url);
-        })
+        self.submit_inner(job, true)
+            .await
+            .map(|()| true)
+            .inspect_err(|_| {
+                // A failed submission owns no job, so its claim must not block the
+                // next one; only its own entry goes (another job's, taken during
+                // the wait for a slot, stays with that job).
+                Self::record_own_status(&self.status_map, &worker_url, job_type, None);
+            })
     }
 
     /// Any in-flight job under the key blocks the claim, whatever its type.
@@ -301,6 +314,15 @@ impl JobQueue {
 
     /// Submit a job with detailed queue status
     pub async fn submit(&self, job: Job) -> Result<(), String> {
+        self.submit_inner(job, false).await
+    }
+
+    /// `submit`, with the pending status written over this job's own claim
+    /// alone when `claimed` ([`Self::submit_if_idle`],
+    /// [`Self::submit_unless_in_flight`]): a job of another type that took the
+    /// URL during the wait for a slot keeps its entry, where a plain submission
+    /// writes its own over whatever is there.
+    async fn submit_inner(&self, job: Job, claimed: bool) -> Result<(), String> {
         // Check if context is still alive before accepting jobs
         let Some(context) = self.context.upgrade() else {
             return Err("Job queue shutting down: AppContext dropped".to_string());
@@ -328,10 +350,7 @@ impl JobQueue {
         };
 
         // Record pending status
-        self.status_map.insert(
-            worker_url.clone(),
-            JobStatus::pending(job_type, &worker_url),
-        );
+        Self::write_pending(&self.status_map, &worker_url, job_type, claimed);
         // A tokenizer load counts as in flight for its model from here (the
         // model is pending until the job ends, whatever was recorded): with
         // the slot held, the job is handed over right after the count, so a
@@ -892,6 +911,29 @@ impl JobQueue {
         }
     }
 
+    /// The pending status under `url` once a slot is held: written over
+    /// whatever is there, or, for a claimed submission (`own_only`), over this
+    /// job's own claim alone (`record_own_status`), so a job of another type
+    /// that took the URL during the wait keeps its entry and the in-flight
+    /// guard that reads it.
+    fn write_pending(
+        status_map: &DashMap<String, JobStatus>,
+        url: &str,
+        job_type: &'static str,
+        own_only: bool,
+    ) {
+        if own_only {
+            Self::record_own_status(
+                status_map,
+                url,
+                job_type,
+                Some(JobStatus::pending(job_type, url)),
+            );
+        } else {
+            status_map.insert(url.to_string(), JobStatus::pending(job_type, url));
+        }
+    }
+
     /// Writes a job's status under its URL (`None` removes it) unless the
     /// entry there is another job's: a job of another type submitted for the
     /// URL after this one was queued keeps its status for its lifetime, since
@@ -1245,6 +1287,41 @@ mod tests {
             )),
         );
         assert_eq!(map.get(url).unwrap().status, "failed");
+    }
+
+    /// The pending status a claimed submission writes once its slot is held
+    /// goes over its own claim alone: a job of another type that took the URL
+    /// during the wait keeps its entry, where a plain submission's write takes
+    /// the key; a vacant entry is written either way.
+    #[test]
+    fn a_claimed_submissions_pending_write_leaves_another_jobs_entry_alone() {
+        let map: DashMap<String, JobStatus> = DashMap::new();
+        let url = "http://w:8000";
+        map.insert(url.to_string(), JobStatus::pending("AddWorker", url));
+        JobQueue::write_pending(&map, url, "RefreshWorkerLabels", true);
+        assert_eq!(map.get(url).unwrap().job_type, "AddWorker");
+        JobQueue::write_pending(&map, url, "RefreshWorkerLabels", false);
+        assert_eq!(map.get(url).unwrap().job_type, "RefreshWorkerLabels");
+        map.remove(url);
+        JobQueue::write_pending(&map, url, "RefreshWorkerLabels", true);
+        let entry = map.get(url).expect("a vacant entry is written");
+        assert_eq!(entry.job_type, "RefreshWorkerLabels");
+        assert_eq!(entry.status, "pending");
+    }
+
+    /// A claimed submission that fails releases its claim, so the caller's
+    /// next occasion submits again; the release is a write of its own entry
+    /// (`record_own_status`), so another job's entry under the URL stays.
+    #[tokio::test]
+    async fn failed_submit_unless_in_flight_releases_its_claim() {
+        let queue = JobQueue::new(JobQueueConfig::default(), Weak::new());
+        let url = "http://w:8000";
+        let job = || Job::RefreshWorkerLabels {
+            url: url.to_string(),
+        };
+        assert!(queue.submit_unless_in_flight(job()).await.is_err());
+        assert!(queue.status_map.get(url).is_none());
+        assert!(queue.submit_unless_in_flight(job()).await.is_err());
     }
 
     /// A submission that fails must not leave its claim behind, or the next
