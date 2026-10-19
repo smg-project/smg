@@ -9,7 +9,7 @@ use std::{
 
 use axum::response::Response;
 use futures::future::{join_all, try_join_all};
-use smg_grpc_client::{is_transport_failure, vllm_proto as vllm};
+use smg_grpc_client::{is_transport_failure, vllm_proto as vllm, RequestDeadline};
 use tracing::{debug, error, info_span, warn, Instrument};
 
 use super::{
@@ -260,11 +260,16 @@ fn pd_side_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
 ///
 /// `last_attempt` says whether a plan is still retained for a replay, which
 /// is what decides when the media bytes stop counting against the in-flight
-/// budget.
+/// budget. `request_timeout` is `--request-timeout-secs`: the attempt's
+/// deadline, counted from its dispatch (after the admission gate below,
+/// which has a bound of its own) over the calls that open the streams and
+/// over every message on them (see [`RequestDeadline`]); `None` leaves the
+/// attempt unbounded.
 pub(crate) async fn execute_plan(
     ctx: &mut DispatchContext,
     mut execution_plan: ExecutionPlan,
     last_attempt: bool,
+    request_timeout: Option<Duration>,
 ) -> Result<(), Response> {
     // One bootstrap room per backend request the plan will post: a batched
     // completion fans out one PD dispatch per sub-request, so admission has
@@ -350,7 +355,10 @@ pub(crate) async fn execute_plan(
         otel.status_code = tracing::field::Empty,
     );
 
-    let result = async {
+    // The deadline runs from here: the admission wait above is the gateway's
+    // own queueing, bounded by its own setting, not time the worker had.
+    let deadline = request_timeout.map(RequestDeadline::after);
+    let dispatch = async {
         match execution_plan {
             ExecutionPlan::Single(request) => match request {
                 ProtoRequest::Generate(req) => execute_single(req, clients, workers, ledger).await,
@@ -392,8 +400,17 @@ pub(crate) async fn execute_plan(
             }
         }
     }
-    .instrument(span.clone())
-    .await;
+    .instrument(span.clone());
+    // The deadline bounds the dispatch itself: a call the worker has not
+    // answered when it passes is dropped, which cancels it on the worker as a
+    // client's leaving does (see `dispatch_timed_out`).
+    let result = match deadline {
+        Some(deadline) => match tokio::time::timeout_at(deadline.at(), dispatch).await {
+            Ok(result) => result,
+            Err(_) => Err(dispatch_timed_out(deadline, workers, ledger, request_id)),
+        },
+        None => dispatch.await,
+    };
     // The engines hold the request bodies now. An earlier attempt keeps its
     // share of the budget: the retained plan still owns the same media, and a
     // replay would send it again.
@@ -407,6 +424,12 @@ pub(crate) async fn execute_plan(
             return Err(response);
         }
     };
+    // The same deadline bounds every stream the dispatch opened (see
+    // `ProtoStream::with_deadline`).
+    let result = match deadline {
+        Some(deadline) => result.with_deadline(deadline),
+        None => result,
+    };
     if let Some(guards) = ctx.load_guards.take() {
         ctx.load_guards = Some(LoadGuards::traced(span, guards));
     }
@@ -414,6 +437,50 @@ pub(crate) async fn execute_plan(
     // Store result in context for response processing
     ctx.response.execution_result = Some(result);
     Ok(())
+}
+
+/// The client's answer for an attempt whose deadline passed before the
+/// worker answered the call that opens the stream (a worker that took the
+/// request and never spoke; on a disaggregated pair, a side the pair's own
+/// silence bounds did not cover): the HTTP path's 504 for its client
+/// timeout. The timeout is charged, as a failed dispatch of the status is
+/// (the breaker sample and the worker-error count), to the one worker the
+/// attempt waited on: the single worker, or the decode side of a pair. The
+/// decode side is the one a pair's answer waits on in every shape: on the
+/// sequential one the prefill side has answered and recorded its outcome
+/// before the decode side is dispatched, and on the parallel one the
+/// prefill side's first response waits for the decode side; a prefill side
+/// that is itself silent is the prefill silence bound's to charge, which
+/// fires before this deadline when it is on. The dropped call is what
+/// cancels the request on the worker(s).
+fn dispatch_timed_out(
+    deadline: RequestDeadline,
+    workers: &WorkerSelection,
+    ledger: &AttemptLedger,
+    request_id: &str,
+) -> Response {
+    let status = deadline.status();
+    let urls: Vec<&str> = workers.workers().map(|worker| worker.url()).collect();
+    warn!(
+        request_id = %request_id,
+        workers = ?urls,
+        timeout = ?deadline.timeout(),
+        "Request timed out before the worker answered its call; the call is dropped, which cancels the request on the worker"
+    );
+    if let Some(worker) = workers.decode_worker().or_else(|| workers.single()) {
+        if let Some(sample) = status.breaker_status() {
+            ledger.record_outcome(worker.as_ref(), sample);
+        }
+        UpstreamClass::account_dispatch_failure(
+            worker.worker_type().as_metric_label(),
+            worker.connection_mode().as_metric_label(),
+            &status,
+        );
+    }
+    status.to_http_error(
+        "start_generation_failed",
+        format!("Failed to start generation: {}", status.message()),
+    )
 }
 
 /// A disaggregated dispatch without the Prefill admission slot worker

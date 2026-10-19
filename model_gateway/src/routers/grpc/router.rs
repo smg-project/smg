@@ -142,6 +142,9 @@ impl GrpcRouter {
         // The admission queue's timeout also bounds how long an accepted
         // request may sit ahead of worker selection.
         let queue_timeout = Duration::from_secs(ctx.router_config.queue_timeout_secs);
+        // The request timeout bounds each attempt's calls to its workers and
+        // the streams they open, as it bounds the HTTP path's calls.
+        let request_timeout = Duration::from_secs(ctx.router_config.request_timeout_secs);
         // Deps for the parser-consuming endpoints (chat/messages/harmony).
         let configured_deps = PipelineDeps::new(
             worker_registry.clone(),
@@ -153,7 +156,8 @@ impl GrpcRouter {
             ctx.configured_reasoning_parser.clone(),
             ctx.rate_limit_manager.clone(),
             queue_timeout,
-        );
+        )
+        .with_request_timeout(request_timeout);
         // Deps for the parser-free endpoints (completion/embeddings/classify/
         // decisions/transcription).
         let pair_deps = PipelineDeps::pair(
@@ -162,7 +166,8 @@ impl GrpcRouter {
             ctx.prefill_admission.clone(),
             ctx.rate_limit_manager.clone(),
             queue_timeout,
-        );
+        )
+        .with_request_timeout(request_timeout);
 
         // Present in every mode: chat/generate, messages, completion.
         let pipeline = RequestPipeline::build(Endpoint::Chat, mode, &configured_deps)
