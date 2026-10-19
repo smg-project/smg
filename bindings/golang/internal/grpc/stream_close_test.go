@@ -37,6 +37,12 @@ func (s *scriptedScheduler) Generate(ctx context.Context, _ *proto.GenerateReque
 	}, nil
 }
 
+// GetModelInfo answers the client's one-time weight-version lookup at the
+// first stream; the embedded nil client would panic on it.
+func (s *scriptedScheduler) GetModelInfo(_ context.Context, _ *proto.GetModelInfoRequest, _ ...grpc.CallOption) (*proto.GetModelInfoResponse, error) {
+	return &proto.GetModelInfoResponse{WeightVersion: "v-test"}, nil
+}
+
 type scriptedGenerateStream struct {
 	grpc.ClientStream
 	ctx       context.Context
