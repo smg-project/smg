@@ -15,7 +15,10 @@ use super::discover_dp::DpInfo;
 use crate::{
     config::ParserChoice,
     routers::grpc::{
-        multimodal::{mm_settings, registration_lacks_media_processing, SUPPORTS_VISION_LABEL},
+        multimodal::{
+            mm_settings, pool_processes_media_refs, registration_lacks_media_processing,
+            SUPPORTS_VISION_LABEL,
+        },
         regular::symphony::{check_names, labels_select_nothing, set_aside_by_the_registry},
         utils::Names,
         zmq_client::zmq_handshake_address,
@@ -318,28 +321,40 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         // A registration that worker-side media placement cannot use is said
         // once, here, with the worker's address: an engine with a vision
         // encoder that does not process media references never receives an
-        // image under `--mm-processing worker`. Its model's multimodal
-        // requests are refused (`no_media_ref_capable_worker`) and `/readiness`
-        // names the model while no worker of it processes references; a
-        // capable worker beside it lifts both, so this warns and does not
-        // refuse the registration. A model on the encode-prefill-decode
-        // pipeline (an encode worker among its registered workers or these)
-        // is not warned about: references never travel on it, and selection
-        // answers with the fix that applies there.
+        // image under `--mm-processing worker`. The line says what follows
+        // for the model, read from its pool (the registered workers and the
+        // ones registering with it): with a capable worker beside this one
+        // the media is served (selection picks that worker); without one the
+        // model's multimodal requests are refused (`no_media_ref_capable_worker`)
+        // and `/readiness` names the model until such a worker registers.
+        // The registration itself is not refused. A model on the
+        // encode-prefill-decode pipeline (an encode worker among its
+        // registered workers or these) is not warned about: references never
+        // travel on it, and selection answers with the fix that applies there.
         if mm_settings().processing.value == MmProcessingMode::Worker {
-            for worker in workers.iter().filter(|worker| {
+            for worker in &workers {
                 let registered = app_context.worker_registry.get_by_model(worker.model_id());
-                registration_lacks_media_processing(
-                    worker.as_ref(),
-                    workers.iter().chain(registered.iter()),
-                )
-            }) {
+                let pool = || {
+                    workers
+                        .iter()
+                        .chain(registered.iter())
+                        .filter(|other| other.model_id() == worker.model_id())
+                };
+                if !registration_lacks_media_processing(worker.as_ref(), pool()) {
+                    continue;
+                }
+                let consequence = if pool_processes_media_refs(pool()) {
+                    "other workers of the model process media references and serve them"
+                } else {
+                    "the model's multimodal requests are refused until a worker of it \
+                     processes media references"
+                };
                 warn!(
                     url = %worker.url(),
                     model = %worker.model_id(),
                     "worker reports a vision encoder but no worker-side media processor (no \
-                     mm_processor label): under --mm-processing worker its multimodal requests \
-                     are refused until a worker of the model processes media references"
+                     mm_processor label): under --mm-processing worker it receives no \
+                     multimodal request; {consequence}"
                 );
             }
         }

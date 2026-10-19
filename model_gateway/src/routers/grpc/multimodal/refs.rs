@@ -292,6 +292,16 @@ pub(crate) fn pool_has_encode_worker<'a>(
         .any(|worker| matches!(worker.worker_type(), WorkerType::Encode))
 }
 
+/// Whether `pool` holds a worker that processes media references
+/// ([`worker_accepts_media_refs`]): under worker-side placement the model's
+/// forwarded media has a worker to go to, and selection picks it.
+pub(crate) fn pool_processes_media_refs<'a>(
+    pool: impl IntoIterator<Item = &'a Arc<dyn Worker>>,
+) -> bool {
+    pool.into_iter()
+        .any(|worker| worker_accepts_media_refs(worker.as_ref()))
+}
+
 /// Whether registering `worker` under worker-side placement is said in the
 /// log: a vision worker that does not process media references
 /// ([`vision_worker_without_media_processing`]) of a model that is not on the
@@ -433,9 +443,7 @@ fn ensure_fleet_processes_media_refs(
     let workers = registry.get_by_model(model_id);
     if workers.is_empty()
         || pool_has_encode_worker(workers.iter())
-        || workers
-            .iter()
-            .any(|worker| worker_accepts_media_refs(worker.as_ref()))
+        || pool_processes_media_refs(workers.iter())
     {
         return Ok(());
     }
@@ -1229,7 +1237,9 @@ mod tests {
         );
         // The registration warning follows the same line: vl-b's worker is
         // said, the encode-prefill-decode pool's vision leg is not, and a
-        // capable worker beside a plain one is not either.
+        // capable worker beside a plain one is not either; the plain one
+        // beside it is said, with the pool serving the media (the line's
+        // consequence reads the pool, `pool_processes_media_refs`).
         let pool_of = |model: &str| {
             workers
                 .iter()
@@ -1248,6 +1258,12 @@ mod tests {
             workers[3].as_ref(),
             pool_of("vl-a").into_iter()
         ));
+        assert!(registration_lacks_media_processing(
+            workers[2].as_ref(),
+            pool_of("vl-a").into_iter()
+        ));
+        assert!(pool_processes_media_refs(pool_of("vl-a").into_iter()));
+        assert!(!pool_processes_media_refs(pool_of("vl-b").into_iter()));
         assert!(pool_has_encode_worker(pool_of("vl-epd").into_iter()));
         assert!(!pool_has_encode_worker(pool_of("vl-a").into_iter()));
         for placement in [MmProcessingMode::Auto, MmProcessingMode::Router] {
