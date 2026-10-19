@@ -1882,6 +1882,11 @@ const DEEPSEEK_V3_2_OUTPUTS: &[&str] = &[
 /// alone, and one cut short.
 const DEEPSEEK_V3_1_OUTPUTS: &[&str] = &[
     "<think>The user asks about Paris.</think><｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{\"city\": \"Paris\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+    // The forced answers of a live cell (a named function; `required`) in the shape the table's
+    // tag writes: the block holding the one call with the recorded arguments, after a thought in
+    // thinking mode and alone in chat mode.
+    "<think>The user wants a three-day forecast for London. I call the function.</think><｜tool▁calls▁begin｜><｜tool▁call▁begin｜>detailed_weather_forecast<｜tool▁sep｜>{\"location\": \"London\", \"days\": 3, \"details\": [\"high_low_temperature\", \"humidity\", \"precipitation\"]}<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+    "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>metropolitan_museum_get_top_artworks<｜tool▁sep｜>{\"number\": 5, \"sort_by\": \"popularity\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
     "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{\"city\": \"Paris\"}<｜tool▁call▁end｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{\"city\": \"Rome\"}<｜tool▁call▁end｜><｜tool▁call▁begin｜>get_stock_price<｜tool▁sep｜>{\"ticker\": \"MSFT\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
     "Let me check.<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{\"city\": \"Paris\", \"unit\": \"celsius\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
     "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_stock_price<｜tool▁sep｜>{}<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
@@ -1896,6 +1901,8 @@ const DEEPSEEK_V3_1_OUTPUTS: &[&str] = &[
 /// content alone, and one cut short inside the fence.
 const DEEPSEEK_V3_OUTPUTS: &[&str] = &[
     "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Paris\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+    // A forced call as the table's tag writes it: the fence's close right after the object.
+    "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Paris\"}```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
     "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Paris\"}\n```<｜tool▁call▁end｜>\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Rome\"}\n```<｜tool▁call▁end｜>\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_stock_price\n```json\n{\"ticker\": \"MSFT\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
     "Let me check.<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Paris\", \"unit\": \"celsius\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
     "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_stock_price\n```json\n{}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",

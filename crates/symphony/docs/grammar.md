@@ -59,7 +59,10 @@ than it reasons.
 Inkling's named JSON takes the tag the gateway's old Inkling parser writes, the call marker its
 trigger inside whatever message the model is writing. Mistral's named arguments take a tag per tool
 from `[TOOL_CALLS]`, the name and `[ARGS]` to the tool's schema, with no end, as the template writes
-nothing after the object. Llama Nemotron's list takes one tag around it, `<TOOLCALL>`, the tools'
+nothing after the object; where the named-arguments call has a close of its own and sits in a block
+(DeepSeek V3.1's `<｜tool▁call▁begin｜>NAME<｜tool▁sep｜>{…}<｜tool▁call▁end｜>`, V3's fenced call), the
+calls go between the block's ways in and its close, each the call's opener, the name and the marker,
+the tool's schema and the call's close, as the tagged syntaxes' calls do. Llama Nemotron's list takes one tag around it, `<TOOLCALL>`, the tools'
 calls as a JSON list, `</TOOLCALL>`; xLAM's bare list is the same list with no tag, alone in the
 turn. A table without calls gives `None`, and the gateway takes the JSON-schema path for it.
 

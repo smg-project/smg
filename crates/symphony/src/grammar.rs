@@ -728,10 +728,22 @@ impl Format {
                 None => (pythonic::list_alone(*dialect, &named, count), false),
                 Some(markers) => (pythonic::calls(markers, *dialect, &named, count), true),
             },
-            CallSyntax::NamedArguments(marker) => (
-                json::named_arguments_calls(self, marker, &named, count)?,
-                true,
-            ),
+            // The named-arguments calls sit in a block (DeepSeek V3.1's, V3's) or stand each from
+            // its own opener (Mistral's): in a block, between the block's ways in and its close.
+            CallSyntax::NamedArguments(marker) => {
+                let ways_in = markers.map(|markers| self.ways_into_block(markers));
+                (
+                    json::named_arguments_calls(
+                        self,
+                        marker,
+                        markers,
+                        ways_in.as_deref().unwrap_or_default(),
+                        &named,
+                        count,
+                    )?,
+                    true,
+                )
+            }
             CallSyntax::Xml => (xml::calls(markers?, self.separator(), &named, count)?, true),
             CallSyntax::Gemma(spelling) => (gemma::calls(markers?, *spelling, &named, count), true),
             CallSyntax::NamedJson(marker) => {

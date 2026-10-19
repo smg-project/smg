@@ -1,12 +1,12 @@
 //! The JSON family's spellings: a call as the call markers around one JSON object (`json`),
-//! xLAM's and Llama Nemotron's lists of such objects, Inkling's named JSON and Mistral's named
-//! arguments. Each builder writes the tag the family's assembler reads back, the tool's schema as
+//! xLAM's and Llama Nemotron's lists of such objects, Inkling's named JSON, and the named
+//! arguments of Mistral and of DeepSeek V3 and V3.1. Each builder writes the tag the family's assembler reads back, the tool's schema as
 //! the arguments' grammar.
 
 use openai_protocol::common::Tool;
 use serde_json::Value;
 
-use super::{CallMarkers, Count, Grammar, Tag};
+use super::{calls, CallMarkers, Count, Grammar, Tag, WayIn};
 use crate::format::{Emits, Format, Whitespace};
 
 /// The JSON family: each call is the call markers around one JSON object whose `name` is the
@@ -74,18 +74,49 @@ pub(super) fn named_calls(
     Some(count.triggered(vec![marker.to_string()], tags))
 }
 
-/// Mistral's named arguments: the call's opener triggers a tag per tool, the opener, the
-/// tool's name and the marker as its `begin`, the arguments the tool's schema accepts as its
-/// content, and nothing as its `end`, since the template writes no closing marker: the object
-/// the schema accepts ends the tag, and the next opener or the end of the turn follows. The
-/// opener is the terminal of the row from the turn's own state into the arguments state;
-/// `None` for a table without one.
+/// The named-arguments syntax: the call's opener, the tool's name and the marker begin a call,
+/// and the arguments the tool's schema accepts follow. Where the call has a close of its own, the
+/// close ends it, and the calls sit between the block's ways in and its close when the table has a
+/// block (DeepSeek V3.1's `<｜tool▁call▁begin｜>NAME<｜tool▁sep｜>{…}<｜tool▁call▁end｜>` inside
+/// `<｜tool▁calls▁begin｜>` … `<｜tool▁calls▁end｜>`; DeepSeek V3's fenced call in the same
+/// block), as the tagged syntaxes' calls do ([`calls::in_block`]). Without one (Mistral's
+/// `[TOOL_CALLS]NAME[ARGS]{…}`), the opener triggers a tag per tool whose `end` is nothing, since
+/// the template writes no closing marker: the object the schema accepts ends the tag, and the next
+/// opener or the end of the turn follows. That opener is the terminal of the row from the turn's
+/// own state into the arguments state; `None` for a table without one.
 pub(super) fn named_arguments_calls(
     format: &Format,
     marker: &str,
+    markers: Option<&CallMarkers<'_>>,
+    ways_in: &[WayIn<'_>],
     tools: &[&Tool],
     count: Count<'_>,
 ) -> Option<Grammar> {
+    let arguments = |tool: &Tool| Grammar::JsonSchema {
+        schema: tool.function.parameters.clone(),
+        style: None,
+        excludes: Vec::new(),
+        whitespace: Whitespace::Free,
+    };
+    if let Some(markers) = markers {
+        let calls = tools
+            .iter()
+            .map(|tool| {
+                (
+                    format!("{}{}{marker}", markers.call_open, tool.function.name),
+                    arguments(tool),
+                    markers.call_close.to_string(),
+                )
+            })
+            .collect();
+        return Some(calls::in_block(
+            markers,
+            ways_in,
+            calls,
+            count,
+            |one_call| count.calls(one_call),
+        ));
+    }
     let (_, open, _) = format
         .transitions()
         .find(|&(source, _, target)| source == 0 && format.emits(target) == Emits::Arguments)?;
@@ -95,12 +126,7 @@ pub(super) fn named_arguments_calls(
         .map(|tool| {
             Tag::new(
                 format!("{open}{}{marker}", tool.function.name),
-                Grammar::JsonSchema {
-                    schema: tool.function.parameters.clone(),
-                    style: None,
-                    excludes: Vec::new(),
-                    whitespace: Whitespace::Free,
-                },
+                arguments(tool),
                 "",
             )
         })

@@ -848,6 +848,81 @@ mod tests {
         assert!(assign(ParserChoice::Symphony, &kimi, &named, Some(&schema), prompt).is_none());
     }
 
+    /// A forced or required call on a table whose calls are named arguments inside a block takes
+    /// the table's tag and the table reads the answer: the request is not handed to the older
+    /// path. The older path's JSON-schema constraint still leaves the table out, as before.
+    #[test]
+    fn a_forced_call_on_the_deepseek_v3_1_table_takes_its_tag_and_the_table_reads_the_answer() {
+        let deepseek = names(Some("deepseek31"), Some("deepseek_v31"));
+        let prompt = "<｜User｜>hi<｜Assistant｜></think>";
+        let named = request(json!({
+            "model": "deepseek-ai/DeepSeek-V3.1",
+            "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+        }));
+        let required = request(json!({
+            "model": "deepseek-ai/DeepSeek-V3.1",
+            "tool_choice": "required",
+        }));
+        for (asked, one_call) in [(&named, true), (&required, false)] {
+            let Some(ToolConstraint::StructuralTag(tag)) = super::constraint(
+                ParserChoice::Symphony,
+                &deepseek,
+                Asks::Chat(asked),
+                &tools(),
+                false,
+                symphony::GrammarStart::AfterReasoning,
+                &templates(),
+            )
+            .expect("no hf") else {
+                panic!("the table's tag, not the older registry's schema");
+            };
+            let format = serde_json::from_str::<Value>(&tag).expect("JSON");
+            let format = &format["format"];
+            assert_eq!(format["type"], "triggered_tags");
+            assert_eq!(
+                format["triggers"],
+                json!(["<｜tool▁calls▁begin｜>", "</think>"])
+            );
+            assert_eq!(format["at_least_one"], true);
+            assert_eq!(
+                format["stop_after_first"],
+                if one_call { json!(true) } else { Value::Null }
+            );
+            let call = if one_call {
+                &format["tags"][0]["content"]["elements"][0]
+            } else {
+                &format["tags"][0]["content"]["content"]["elements"][0]
+            };
+            assert_eq!(
+                call["elements"][0]["value"],
+                "<｜tool▁call▁begin｜>lookup<｜tool▁sep｜>"
+            );
+            assert_eq!(call["elements"][2]["value"], "<｜tool▁call▁end｜>");
+            assert_eq!(format["tags"][0]["end"], "<｜tool▁calls▁end｜>");
+            // The constraint is a structural tag, so the table is assigned to the response.
+            let structural = ("structural_tag".to_string(), tag);
+            let assigned = assign(
+                ParserChoice::Symphony,
+                &deepseek,
+                asked,
+                Some(&structural),
+                prompt,
+            )
+            .expect("assigned");
+            assert_eq!(assigned.format.name(), "deepseek_v3.1");
+        }
+        // The older path's forced call (a JSON schema) is still read by the older parsers.
+        let schema = ("json_schema".to_string(), "{}".to_string());
+        assert!(assign(
+            ParserChoice::Symphony,
+            &deepseek,
+            &named,
+            Some(&schema),
+            prompt
+        )
+        .is_none());
+    }
+
     /// The model's workers name the start when they all carry the same label; none, a missing
     /// label or a disagreement leaves it unknown. A worker's own label maps one to one.
     #[test]

@@ -57,10 +57,14 @@ pub fn deepseek_v3() -> Format {
 
 #[cfg(test)]
 mod tests {
+    use openai_protocol::common::{Function, Tool};
+    use serde_json::json as value;
+
     use super::*;
     use crate::{
         engine::Engine,
         event::{DropReason, Event, Events, FinishReason},
+        grammar::{GrammarStart, Options},
         input::{EngineFinish, Input},
         parser::Parser,
         Declared,
@@ -469,5 +473,84 @@ mod tests {
         format.validate().expect("a valid table");
         assert_eq!(format.name(), "deepseek_v3");
         assert_eq!(format.turn_opener(), Some("<｜Assistant｜>"));
+    }
+
+    #[test]
+    fn a_forced_call_is_the_block_holding_the_fenced_call_and_the_tools_schema() {
+        // The tag is written from the same rows as V3.1's: the block's ways in (from the turn's
+        // own state, or `</think>` first) around the one call, `<｜tool▁call▁begin｜>function
+        // <｜tool▁sep｜>`, the tool's name and the fence the template opens, the arguments the
+        // tool's schema accepts, and the fence's close with `<｜tool▁call▁end｜>`; then the block's
+        // close, and nothing after it for a named function.
+        let tool = Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "get_weather".to_string(),
+                description: None,
+                parameters: value!({"type": "object", "properties": {"city": {"type": "string"}}}),
+                strict: None,
+                extra: Default::default(),
+            },
+        };
+        let got = deepseek_v3()
+            .grammar_for(
+                std::slice::from_ref(&tool),
+                Options {
+                    at_least_one: true,
+                    reasoning_open: false,
+                    one_call: true,
+                    start: GrammarStart::AfterReasoning,
+                },
+            )
+            .expect("a tag")
+            .payload();
+        let one_call = value!({"type": "or", "elements": [{"type": "sequence", "elements": [
+            {"type": "const_string", "value": "<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n"},
+            {"type": "json_schema", "json_schema": tool.function.parameters},
+            {"type": "const_string", "value": "```<｜tool▁call▁end｜>"},
+        ]}]});
+        let tag = |begin: &str| {
+            value!({
+                "type": "tag",
+                "begin": begin,
+                "content": one_call,
+                "end": "<｜tool▁calls▁end｜>",
+            })
+        };
+        assert_eq!(
+            got,
+            value!({"format": {
+                "type": "triggered_tags",
+                "triggers": ["<｜tool▁calls▁begin｜>", "</think>"],
+                "tags": [
+                    tag("<｜tool▁calls▁begin｜>"),
+                    tag("</think><｜tool▁calls▁begin｜>"),
+                ],
+                "at_least_one": true,
+                "stop_after_first": true,
+            }})
+        );
+        // The call as the tag writes it, the fence's close right after the object (the template
+        // puts a newline between them, which the table drops as wrapping either way), reads as
+        // the call whole and at every cut.
+        let output = "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Paris\"}```<｜tool▁call▁end｜><｜tool▁calls▁end｜>";
+        let expected = vec![(
+            "get_weather".to_string(),
+            "{\"city\": \"Paris\"}".to_string(),
+        )];
+        let whole = run(PROMPT, &[output]);
+        assert_eq!(bytes(&whole), output);
+        assert_eq!(calls(&whole), expected);
+        assert_eq!(content(&whole), "");
+        assert_eq!(malformed(&whole), Vec::<&str>::new());
+        assert_eq!(finish(&whole), (FinishReason::Stop, 1));
+        for (at, _) in output.char_indices().skip(1) {
+            let (head, rest) = output.split_at(at);
+            let events = run(PROMPT, &[head, rest]);
+            assert_eq!(calls(&events), expected, "cut at {at}");
+            assert_eq!(content(&events), "", "cut at {at}");
+            assert_eq!(malformed(&events), Vec::<&str>::new(), "cut at {at}");
+            assert_eq!(finish(&events), (FinishReason::Stop, 1), "cut at {at}");
+        }
     }
 }

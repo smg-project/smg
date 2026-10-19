@@ -162,9 +162,22 @@ What the table says beyond the DSML ones:
   calls stand on the turns the template renders with string arguments, held in the module's tests
   at every cut, as the V4 table stands on its encoder's turns.
 
-What the table leaves open: a forced call's tag (`Format::grammar` writes none for the named
-arguments syntax beyond what the Mistral table gets), and the live reading on an engine, owed with
-the family's weights.
+- **A forced call's tag is the block around the calls the table reads.** `Format::grammar` writes
+  the block's ways in (`<｜tool▁calls▁begin｜>` from the turn's own state, or `</think>` first from
+  the thought) around one or more calls, each `<｜tool▁call▁begin｜>`, the tool's name,
+  `<｜tool▁sep｜>`, the arguments the tool's schema accepts and `<｜tool▁call▁end｜>`, with nothing
+  between the calls, and the block's close: the same rows the table reads a call by, written from
+  the named-arguments syntax as the tagged syntaxes' calls are (`docs/grammar.md`). On an engine
+  whose grammar starts after its reasoning parser has seen `</think>`, a thinking answer keeps its
+  thought and the forced call follows it in the model's own syntax; a prompt with the thought
+  closed takes the block at once. Before the builder saw through the block, the gateway handed a
+  forced or required request to its older path, whose JSON-schema constraint made the model write
+  the bare arguments (or the list of calls) and whose parsers read the answer; the module tests
+  pin how the table reads those bytes (a thought and JSON content, no call) beside the tag's
+  shape.
+
+What the table leaves open: the recorded set's calls (the recorder refused them, above) and the
+live reading of a conversation on an engine beyond the forced call, owed with the family's weights.
 
 ## DeepSeek V3 (`deepseek_v3`)
 
@@ -189,6 +202,11 @@ is the terminal that leaves the call. Beyond that:
   table reads as a thought; the recorded sets hold none.
 - **The recorded set holds no call**, for the reason given under V3.1; the calls stand on the turns
   the template renders, held in the module's tests at every cut.
+- **A forced call's tag writes the block**, from the same rows as V3.1's: each call is
+  `<｜tool▁call▁begin｜>function<｜tool▁sep｜>`, the tool's name and the fence the template opens,
+  the arguments the tool's schema accepts, then the fence's close with `<｜tool▁call▁end｜>` right
+  after the object (the template puts a newline between them, which the table drops as wrapping
+  either way), between the block's ways in and its close. Not yet read live on an engine.
 
 ## GLM 4.5 and 4.6 (`glm4`)
 
