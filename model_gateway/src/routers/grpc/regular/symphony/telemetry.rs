@@ -18,12 +18,24 @@
 //!   finish, the empty arguments of a call without an `arguments` member and the chunking rule's
 //!   stated exception are the crate's contract and are not.
 //!
+//! And, before any output, what did not reach a table at all:
+//!
+//! - `fallback`: a request Symphony was configured for (the gateway's flag, or the request's
+//!   header) that the legacy parsers read instead of a table, by the reason the seam names
+//!   ([`Fallback`]): no table for the model, a reasoning name alone, a legacy tool-call name,
+//!   `passthrough`, or a table without a tag for the request's forced call; counted once per
+//!   request where the assignment is decided (`assign`), under the table that had no tag, or
+//!   `none`. The response's `x-smg-parser` header says `legacy` for the same request; the
+//!   counter says how often, and why, across a deployment.
+//!
 //! Cost: a clean output records one counter increment through a key built once per table (the
 //! `metrics` macros build a key, with a `Vec` of labels, on every call), no allocation. A
 //! malformed one adds a histogram observation, the per-reason counters, and, when the table's
 //! token bucket allows it, one `warn` line: the only allocations. The run's text is model output
 //! and is never logged, at any level: `at` and `bytes` locate it in the response for a reader with
-//! access to it. Suppressed calls are counted and write no line.
+//! access to it. Suppressed calls are counted and write no line. A request the legacy parsers
+//! read under Symphony records one counter increment, through a key built once per reason and
+//! table, and nothing where a table reads.
 
 use std::{
     sync::{
@@ -38,6 +50,8 @@ use parking_lot::Mutex;
 use symphony::{formats::Table, DropReason, Event, MalformedReason};
 use tracing::warn;
 
+use super::names::Fallback;
+
 /// Outputs read to their end, by `table` and `outcome` (`clean`, `malformed`, `failed`).
 pub(crate) const OUTPUTS: &str = "smg_symphony_outputs_total";
 /// Malformed runs, by `table` and `reason`.
@@ -46,6 +60,9 @@ pub(crate) const MALFORMED: &str = "smg_symphony_malformed_total";
 pub(crate) const MALFORMED_BYTES: &str = "smg_symphony_malformed_bytes";
 /// Calls after the first dropped under `parallel_tool_calls: false`, by `table`.
 pub(crate) const CALLS_SUPPRESSED: &str = "smg_symphony_calls_suppressed_total";
+/// Requests Symphony was configured for that the legacy parsers read, by `reason` and `table`
+/// ([`record_fallback`]).
+pub(crate) const FALLBACK: &str = "smg_symphony_fallback_total";
 /// The buckets of [`MALFORMED_BYTES`]: a marker's worth to a whole answer.
 pub(crate) const MALFORMED_BYTES_BUCKETS: [f64; 9] = [
     1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 4096.0, 16384.0, 65536.0,
@@ -56,6 +73,8 @@ const TEMPLATE: &str = "response_template";
 /// The `table` label of a format that is neither a registry table's nor the template's: a format
 /// built by hand.
 const OTHER_TABLE: &str = "other";
+/// The `table` label of a request no table reads ([`FALLBACK`]).
+const NO_TABLE: &str = "none";
 
 /// The `reason` labels, in the order of [`Tally::reasons`]: the three reasons that say what the
 /// model got wrong, the table's own marker where no row leads (an answer's opener written again
@@ -71,6 +90,15 @@ const REASONS: [&str; 5] = [
 ];
 /// The `outcome` labels, in the order of [`Series::outputs`].
 const OUTCOMES: [&str; 3] = ["clean", "malformed", "failed"];
+/// The `reason` labels of [`FALLBACK`], in the order of [`fallback_index`]: the four decisions
+/// that leave a model to the legacy parsers, and the table that has no tag for a forced call.
+const FALLBACK_REASONS: [&str; 5] = [
+    "no_table",
+    "reasoning_name_only",
+    "legacy_tool_name",
+    "passthrough",
+    "forced_call_without_tag",
+];
 const CLEAN: usize = 0;
 const MALFORMED_OUTCOME: usize = 1;
 const FAILED: usize = 2;
@@ -103,6 +131,17 @@ fn reason_index(why: MalformedReason) -> usize {
 /// The `reason` label of a malformed run.
 pub(crate) fn reason_label(why: MalformedReason) -> &'static str {
     REASONS[reason_index(why)]
+}
+
+/// The place of a fallback's `reason` label in [`FALLBACK_REASONS`].
+fn fallback_index(why: Fallback) -> usize {
+    match why {
+        Fallback::NoTable => 0,
+        Fallback::ReasoningNameOnly => 1,
+        Fallback::LegacyToolName => 2,
+        Fallback::Passthrough => 3,
+        Fallback::ForcedCallWithoutTag => 4,
+    }
 }
 
 /// The bytes an event accounts for in the output.
@@ -295,6 +334,16 @@ pub(crate) fn record_failed(table: &'static str) {
     increment(&series(table).outputs[FAILED], 1);
 }
 
+/// Records a request Symphony was configured for that the legacy parsers read, for `why`: under
+/// `table` where a table reads the model and had no tag for the request's forced call, under
+/// `none` where no table reads it. One increment through a key built once, no allocation.
+pub(crate) fn record_fallback(why: Fallback, table: Option<&'static str>) {
+    increment(
+        &series(table.unwrap_or(NO_TABLE)).fallback[fallback_index(why)],
+        1,
+    );
+}
+
 /// The metadata of every series here, as the `metrics` macros would set it.
 static METADATA: Metadata<'static> =
     Metadata::new(module_path!(), Level::INFO, Some(module_path!()));
@@ -317,6 +366,9 @@ struct Series {
     malformed: [Key; 5],
     malformed_bytes: Key,
     calls_suppressed: Key,
+    /// [`FALLBACK`] by reason, in the order of [`FALLBACK_REASONS`]: the series of the table
+    /// that had no tag for a forced call, or of `none`, under which the other reasons count.
+    fallback: [Key; 5],
     sampler: Sampler,
 }
 
@@ -336,13 +388,14 @@ impl Series {
             malformed: REASONS.map(|reason| key(MALFORMED, &[("reason", reason)])),
             malformed_bytes: key(MALFORMED_BYTES, &[]),
             calls_suppressed: key(CALLS_SUPPRESSED, &[]),
+            fallback: FALLBACK_REASONS.map(|reason| key(FALLBACK, &[("reason", reason)])),
             sampler: Sampler::new(),
         }
     }
 }
 
 /// Every table's series: the registry's tables in their order, then the template's format,
-/// then the rest ([`OTHER_TABLE`]).
+/// then the rest ([`OTHER_TABLE`]), then the series of a request no table reads ([`NO_TABLE`]).
 static SERIES: OnceLock<Vec<Series>> = OnceLock::new();
 
 /// The series of the table labelled `table`.
@@ -351,19 +404,17 @@ fn series(table: &'static str) -> &'static Series {
         Table::ALL
             .iter()
             .map(|table| table.name())
-            .chain([TEMPLATE, OTHER_TABLE])
+            .chain([TEMPLATE, OTHER_TABLE, NO_TABLE])
             .map(Series::new)
             .collect()
     });
     let index = Table::ALL
         .iter()
         .position(|candidate| candidate.name() == table)
-        .unwrap_or_else(|| {
-            if table == TEMPLATE {
-                Table::ALL.len()
-            } else {
-                Table::ALL.len() + 1
-            }
+        .unwrap_or_else(|| match table {
+            TEMPLATE => Table::ALL.len(),
+            NO_TABLE => Table::ALL.len() + 2,
+            _ => Table::ALL.len() + 1,
         });
     &all[index]
 }
@@ -425,10 +476,10 @@ impl Sampler {
 
 #[cfg(test)]
 mod tests {
-    use metrics_exporter_prometheus::PrometheusBuilder;
     use symphony::{DropReason, FinishReason, Text};
 
     use super::*;
+    use crate::routers::grpc::regular::symphony::testing::{line_with, rendered};
 
     fn malformed(text: &str, why: MalformedReason) -> Event<'static> {
         Event::Malformed {
@@ -730,20 +781,6 @@ mod tests {
         assert_eq!(distinct.len(), Table::ALL.len() + 2);
     }
 
-    /// The rendered scrape after `record` ran under a recorder of its own.
-    fn rendered(record: impl FnOnce()) -> String {
-        let recorder = PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        metrics::with_local_recorder(&recorder, record);
-        handle.render()
-    }
-
-    fn line_with<'a>(scrape: &'a str, name: &str, labels: &[&str]) -> Option<&'a str> {
-        scrape
-            .lines()
-            .find(|line| line.starts_with(name) && labels.iter().all(|label| line.contains(label)))
-    }
-
     #[test]
     fn a_clean_output_records_one_counter_and_no_line() {
         let scrape = rendered(|| {
@@ -929,5 +966,60 @@ mod tests {
             );
         });
         assert!(!logs_contain("req-dropped"));
+    }
+
+    #[test]
+    fn a_request_the_legacy_parsers_read_is_counted_by_reason_under_the_table_or_none() {
+        let scrape = rendered(|| {
+            record_fallback(Fallback::NoTable, None);
+            record_fallback(Fallback::NoTable, None);
+            record_fallback(Fallback::Passthrough, None);
+            record_fallback(Fallback::ForcedCallWithoutTag, Some("qwen3"));
+        });
+        let none = line_with(
+            &scrape,
+            FALLBACK,
+            &["reason=\"no_table\"", "table=\"none\""],
+        )
+        .expect("the no_table counter");
+        assert!(none.ends_with(" 2"), "{none}");
+        let passthrough = line_with(
+            &scrape,
+            FALLBACK,
+            &["reason=\"passthrough\"", "table=\"none\""],
+        )
+        .expect("the passthrough counter");
+        assert!(passthrough.ends_with(" 1"), "{passthrough}");
+        let forced = line_with(
+            &scrape,
+            FALLBACK,
+            &["reason=\"forced_call_without_tag\"", "table=\"qwen3\""],
+        )
+        .expect("the forced call counter");
+        assert!(forced.ends_with(" 1"), "{forced}");
+        assert_eq!(
+            scrape
+                .lines()
+                .filter(|line| line.starts_with(FALLBACK))
+                .count(),
+            3,
+            "{scrape}"
+        );
+        assert!(!scrape.contains(OUTPUTS), "{scrape}");
+        // Every reason has a label of its own, in the spelling the dashboards read.
+        let every = [
+            (Fallback::NoTable, "no_table"),
+            (Fallback::ReasoningNameOnly, "reasoning_name_only"),
+            (Fallback::LegacyToolName, "legacy_tool_name"),
+            (Fallback::Passthrough, "passthrough"),
+            (Fallback::ForcedCallWithoutTag, "forced_call_without_tag"),
+        ];
+        for (why, label) in every {
+            assert_eq!(FALLBACK_REASONS[fallback_index(why)], label);
+        }
+        // `none` has a series of its own, apart from the template's and the hand-built formats'.
+        assert!(!std::ptr::eq(series(NO_TABLE), series(OTHER_TABLE)));
+        assert!(!std::ptr::eq(series(NO_TABLE), series(TEMPLATE)));
+        assert_eq!(series(NO_TABLE).fallback.len(), FALLBACK_REASONS.len());
     }
 }

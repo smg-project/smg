@@ -233,6 +233,21 @@ pub(super) fn message_request(extra: Value) -> CreateMessageRequest {
     serde_json::from_value(request).expect("messages request")
 }
 
+/// The rendered scrape after `record` ran under a recorder of its own.
+pub(super) fn rendered(record: impl FnOnce()) -> String {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, record);
+    handle.render()
+}
+
+/// The sample line of `scrape` under `name` that carries every one of `labels`, if one does.
+pub(super) fn line_with<'a>(scrape: &'a str, name: &str, labels: &[&str]) -> Option<&'a str> {
+    scrape
+        .lines()
+        .find(|line| line.starts_with(name) && labels.iter().all(|label| line.contains(label)))
+}
+
 pub(super) fn tag_of(constraint: Result<Option<ToolConstraint>, SymphonyError>) -> Value {
     match constraint {
         Ok(Some(ToolConstraint::StructuralTag(tag))) => {
