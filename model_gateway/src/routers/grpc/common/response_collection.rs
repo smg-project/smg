@@ -230,18 +230,24 @@ async fn collect_stream_responses<S: FanoutChild>(
     prefill: Option<&Arc<dyn Worker>>,
 ) -> Result<Vec<ProtoGenerateComplete>, Response> {
     let mut all_responses = Vec::new();
+    // Whether the stream handed anything, a chunk included: `all_responses`
+    // keeps the `Complete` frames alone.
+    let mut read_any = false;
 
     while let Some(response) = stream.next_item().await {
         let gen_response = match response {
-            Ok(response) => response,
+            Ok(response) => {
+                read_any = true;
+                response
+            }
             Err(status) => {
                 let rendezvous = match side {
                     Some(side) => {
                         account_pd_side_failure(side, &status);
                         // Before anything was read from the decode stream, as the
                         // streamed path reads it before its first token: once a
-                        // response came, the sides met.
-                        if side == metrics_labels::WORKER_DECODE && all_responses.is_empty() {
+                        // response came, a chunk included, the sides met.
+                        if side == metrics_labels::WORKER_DECODE && !read_any {
                             dead_rendezvous_of(prefill, &status).await
                         } else {
                             None
@@ -325,6 +331,33 @@ mod tests {
 
     impl FanoutChild for FailingStream {
         async fn next_item(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+            self.0.take().map(Err)
+        }
+
+        fn mark_completed(&mut self) {}
+
+        fn defer_abort_until_first_item(self) -> Self {
+            self
+        }
+    }
+
+    /// A stream that yields one chunk (nothing a collected answer keeps),
+    /// then the engine's report.
+    struct ChunkThenFailing(Option<tonic::Status>, bool);
+
+    impl FanoutChild for ChunkThenFailing {
+        async fn next_item(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+            if !self.1 {
+                self.1 = true;
+                return Some(Ok(ProtoGenerateResponse::Sglang(Box::new(
+                    sglang::GenerateResponse {
+                        response: Some(sglang::generate_response::Response::Chunk(
+                            sglang::GenerateStreamChunk::default(),
+                        )),
+                        ..Default::default()
+                    },
+                ))));
+            }
             self.0.take().map(Err)
         }
 
@@ -489,6 +522,54 @@ mod tests {
                 .lines()
                 .any(|line| line.starts_with("smg_pd_rendezvous_failures_total{")),
             "nothing is probed once a response came:\n{rendered}"
+        );
+    }
+
+    /// A chunk the decode stream handed before the engine's reasonless report
+    /// means the sides met as much as a `Complete` does, though a collected
+    /// answer keeps nothing of it: the port is not probed, dead or not.
+    #[tokio::test]
+    async fn a_decode_side_failed_after_a_chunk_came_keeps_the_engines_report() {
+        let dead = {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("address").port();
+            drop(listener);
+            port
+        };
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:30000")
+                .worker_type(WorkerType::Prefill)
+                .connection_mode(ConnectionMode::Grpc)
+                .bootstrap_port(Some(dead))
+                .build(),
+        );
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let answer = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            collect_stream_responses(
+                &mut ChunkThenFailing(Some(tonic::Status::internal(ENGINE_ERROR_MESSAGE)), false),
+                "Decode",
+                Some(metrics_labels::WORKER_DECODE),
+                Some(&prefill),
+            )
+            .await
+            .err()
+            .expect("the failure becomes the answer")
+        };
+        assert_eq!(
+            answer
+                .headers()
+                .get("X-SMG-Error-Code")
+                .and_then(|code| code.to_str().ok()),
+            Some("worker_stream_failed")
+        );
+        let rendered = handle.render();
+        assert!(
+            !rendered
+                .lines()
+                .any(|line| line.starts_with("smg_pd_rendezvous_failures_total{")),
+            "nothing is probed once a chunk came:\n{rendered}"
         );
     }
 

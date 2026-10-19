@@ -199,7 +199,7 @@ pub(crate) enum StreamFailure {
     /// engine answered a status after its first chunk, or it finished the
     /// request with an error of its own (`finish_reason == "error"`, the KV
     /// handoff of a decode side that failed). `completion_tokens` is how far
-    /// the response had come; `side` says which worker's stream it was;
+    /// the response had come; `stream` says which worker's stream it was;
     /// `rendezvous` is the pair's bootstrap port when the gateway probed it
     /// behind the failure and found it dead (see [`StreamSource::explain`]).
     Upstream {
