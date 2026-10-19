@@ -1623,6 +1623,32 @@ class TestToolChoiceLlama(_TestToolChoiceBase):
         "test_tool_choice_auto_streaming",
     }
 
+    def test_conflicting_defs_required_tool_choice(self, model, api_client):
+        """Under --parser symphony the pair is served: the `llama` name reads the json table,
+        whose forced call carries each tool's own `$defs`, so the call's arguments follow the
+        called tool's definition (a string for tool1, a number for tool2), as the Qwen3 table's
+        do. On the legacy path the merged schema refuses the pair, as the base test expects."""
+        if get_parser() != "symphony":
+            super().test_conflicting_defs_required_tool_choice(model, api_client)
+            return
+        response = api_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "Test the conflicting tools"}],
+            max_tokens=100,
+            temperature=0.1,
+            tools=CONFLICTING_DEFS_TOOLS,
+            tool_choice="required",
+            stream=False,
+        )
+        calls = response.choices[0].message.tool_calls
+        assert calls, "tool_choice=required forces a call"
+        call = calls[0]
+        value = json.loads(call.function.arguments)["data"]["value"]
+        expected = {"tool1": str, "tool2": (int, float)}[call.function.name]
+        assert isinstance(value, expected), (
+            f"{call.function.name} got value {value!r}: not its own DataType definition"
+        )
+
 
 # =============================================================================
 # Tool Choice Tests - Qwen Model (qwen parser)
