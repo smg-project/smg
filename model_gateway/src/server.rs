@@ -1952,9 +1952,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // The JPEG decoder report and the TurboJPEG policy come after the
     // recorder: the report sets its gauges (`smg_mm_turbojpeg_available`,
-    // `smg_mm_webp_available`) on the recorder in force (the log lines are
-    // said once per process), and they must land in the recorder /metrics
-    // serves, not in the no-op one before it. The policy is
+    // `smg_mm_webp_available`) on every call, on the recorder in force (the
+    // log lines alone are said once per process); the gauges must land in the
+    // recorder /metrics serves, not the no-op one before it. The policy is
     // still enforced once, in every routing mode and before anything binds:
     // under `require` a host without the library stops the process here,
     // where a refusal at router creation would be turned into a warning by
