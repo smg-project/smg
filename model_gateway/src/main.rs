@@ -1167,7 +1167,14 @@ struct ServingArgs {
     )]
     tenant_header_name: String,
 
-    /// Request timeout in seconds
+    /// Request timeout in seconds.
+    ///
+    /// Bounds the read of a request's body overall (a 408 past it), and each
+    /// request to a worker, HTTP or gRPC, from its dispatch to its last
+    /// message: a request the worker has not finished within it ends with
+    /// the gateway's 504 (`call_upstream_timeout`; on a stream, the error
+    /// event that ends it) and the call to the worker is dropped, which
+    /// cancels the request on a gRPC worker.
     #[arg(long, default_value_t = 1800, help_heading = "Request Handling")]
     request_timeout_secs: u64,
 

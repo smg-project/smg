@@ -575,7 +575,8 @@ class RouterArgs:
     # False none (resolved by the Rust core).
     remove_unhealthy_workers: bool | None = None
     request_id_headers: list[str] | None = None
-    # Request timeout in seconds
+    # Request timeout in seconds: the read of the body overall, and each
+    # request to a worker, HTTP or gRPC, from its dispatch to its last message
     request_timeout_secs: int = 1800
     # Retries (disable_retries switches them off)
     retry_backoff_multiplier: float = 1.5
@@ -2117,7 +2118,11 @@ class RouterArgs:
             f"--{prefix}request-timeout-secs",
             type=int,
             default=RouterArgs.request_timeout_secs,
-            help="Request timeout in seconds",
+            help=(
+                "Request timeout in seconds: the read of the body overall, and "
+                "each request to a worker, HTTP or gRPC, from its dispatch to "
+                "its last message (504 call_upstream_timeout past it)"
+            ),
         )
         request_group.add_argument(
             f"--{prefix}shutdown-grace-period-secs",
