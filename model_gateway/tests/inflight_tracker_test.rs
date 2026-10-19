@@ -104,6 +104,20 @@ async fn test_inflight_request_appears_in_bucket() {
     let resp = response_future.await.unwrap().unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
+    // Snapshot while the response body is still held. A drain observer must
+    // retain this request even though its handler has already returned.
+    let before = inflight_snapshot(&ctx).await;
+    let repeated = inflight_snapshot(&ctx).await;
+    // The snapshot requests themselves finish between calls; the held
+    // response is the request that must appear in both observations.
+    let previous: Vec<_> = before["request_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|id| repeated["request_ids"].as_array().unwrap().contains(id))
+        .collect();
+    assert!(!previous.is_empty());
+
     // The in-flight guard rides the response BODY (streaming responses stay
     // counted while they generate), so the request deregisters when the body
     // is consumed to completion, not when the handler returns.
@@ -113,7 +127,36 @@ async fn test_inflight_request_appears_in_bucket() {
         "Request should be deregistered after the body completes"
     );
 
+    // Later requests must not keep the original cohort from draining.
+    let newer = tracker.track();
+    let after = inflight_snapshot(&ctx).await;
+    assert_eq!(before["instance_id"], after["instance_id"]);
+    assert!(after["instance_id"].as_str().is_some_and(|s| !s.is_empty()));
+    let current = after["request_ids"].as_array().unwrap();
+    assert!(!current.is_empty());
+    assert!(previous.iter().all(|id| !current.contains(id)));
+    drop(newer);
+
     ctx.shutdown().await;
+}
+
+#[expect(
+    clippy::unwrap_used,
+    reason = "test helper: malformed responses fail the test"
+)]
+async fn inflight_snapshot(ctx: &AppTestContext) -> serde_json::Value {
+    let response = ctx
+        .create_app()
+        .oneshot(
+            Request::builder()
+                .uri("/inflight")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
 }
 
 #[tokio::test]
