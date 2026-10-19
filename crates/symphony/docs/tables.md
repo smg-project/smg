@@ -320,7 +320,13 @@ What the table says beyond the others:
   `<|content_thinking|>` inside the answer or the thought opens a thought, and none of the three
   is the body's text; the table has the same rows (`content` on `text` back to `content`, on
   `thinking` to `reasoning`; `reasoning` on `thinking` to itself), so the markers are framing
-  there, dropped, and the whitespace a stay held before one is the template's. The rows are
+  there, dropped, and the whitespace a stay held before one is the template's.
+  `<|content_text|>` inside a thought has no row, although the family's parsers switch to the
+  answer there as well: the tag derivation reads every row out of the thought as a close of it,
+  and that row would end the thought the answer tag and a forced call's tag admit at the marker
+  instead of at the message's close the model writes; no recorded output holds the shape, and
+  under the tag the thought's text excludes the marker, so such a marker stays the thought's
+  text (a follow-up, with a derivation that tells a kind switch from a close). The rows are
   what an engine that starts a JSON answer's grammar after its reasoning parser needs: the tag
   above cannot tell that engine's start from the first token, so at the gate, past the model's
   own `<|content_text|>`, its optional thought and marker are open to the model once more, and a

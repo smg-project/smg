@@ -10,7 +10,13 @@
 //! said again inside a message's body is the kind, as the family's own parsers read it (the
 //! blocks are self-describing and may repeat in any order): `<|content_text|>` in the answer
 //! starts the answer's text over, `<|content_thinking|>` in the answer or in the thought opens a
-//! thought; neither is the body's text. An engine that holds a JSON answer's grammar back until
+//! thought; neither is the body's text. `<|content_text|>` inside a thought has no row, although
+//! the family's parsers switch to the answer there as well: the tag derivation reads every row
+//! out of the thought as a close of it, and that row would end the thought the answer tag and a
+//! forced call's tag admit at the marker instead of at the message's close the model writes; no
+//! recorded output holds the shape, and under the tag the thought's text excludes the marker, so
+//! such a marker stays the thought's text (a follow-up, with a derivation that tells a kind
+//! switch from a close). An engine that holds a JSON answer's grammar back until
 //! its own reasoning parser has seen the model's `<|content_text|>` lets the model write both
 //! there ([`Format::answer_grammar`]: the tag admits the thought and the marker before the schema
 //! for an engine that starts at the first token, and cannot tell the two starts apart). Recorded
@@ -43,7 +49,8 @@ pub fn inkling() -> Format {
         .transition("content", "end_message", "ended")
         .transition("ended", "message", "header")
         // The kind said again inside a body: the answer's marker starts its text over, the
-        // thought's opens a thought from either body. Framing, as from the header.
+        // thought's opens a thought from either body. Framing, as from the header. The answer's
+        // marker inside a thought has no row (the module doc says why).
         .transition("content", "text", "content")
         .transition("content", "thinking", "reasoning")
         .transition("reasoning", "thinking", "reasoning")
@@ -671,6 +678,24 @@ mod answer_tests {
         }
     }
 
+    #[test]
+    fn the_answers_marker_inside_a_thought_is_the_thoughts_text_for_now() {
+        // The family's parsers switch to the answer at `<|content_text|>` inside a thought as
+        // well; the table has no such row (the module doc: to the tag derivation a row out of
+        // the thought is a close of it, and that row would move the thought's end in the answer
+        // tag and in a forced call's tag to the marker), so the marker is the thought's text,
+        // counted as clean: the shape this pins until a derivation tells a kind switch from a
+        // close.
+        let output = "<|content_thinking|>plan<|content_text|>{\"a\":1}<|end_message|>";
+        for pieces in chunkings(output) {
+            let events = run(inkling(), &pieces);
+            assert_eq!(bytes(&events), output);
+            assert_eq!(reasoning(&events), "plan<|content_text|>{\"a\":1}");
+            assert_eq!(content(&events), "");
+            assert_eq!(malformed(&events), []);
+            assert_eq!(dropped_count(&events, "<|content_text|>"), 0);
+        }
+    }
     #[test]
     fn without_the_thought_the_kind_markers_stay_dropped() {
         // The variant for a request that keeps the reasoning in the content shows the thought's
