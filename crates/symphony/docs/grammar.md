@@ -62,7 +62,10 @@ from `[TOOL_CALLS]`, the name and `[ARGS]` to the tool's schema, with no end, as
 nothing after the object; where the named-arguments call has a close of its own and sits in a block
 (DeepSeek V3.1's `<｜tool▁call▁begin｜>NAME<｜tool▁sep｜>{…}<｜tool▁call▁end｜>`, V3's fenced call), the
 calls go between the block's ways in and its close, each the call's opener, the name and the marker,
-the tool's schema and the call's close, as the tagged syntaxes' calls do. Llama Nemotron's list takes one tag around it, `<TOOLCALL>`, the tools'
+the tool's schema and the call's close, with what the table says the template writes between two
+calls (V3's newline) before every call after the first, as the tagged syntaxes' calls do. The
+marker itself stays writable in the free text before the calls: it opens no call without the
+opener, and V3's is a code fence a thought may hold. Llama Nemotron's list takes one tag around it, `<TOOLCALL>`, the tools'
 calls as a JSON list, `</TOOLCALL>`; xLAM's bare list is the same list with no tag, alone in the
 turn. A table without calls gives `None`, and the gateway takes the JSON-schema path for it.
 

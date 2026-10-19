@@ -285,7 +285,7 @@ fn assembler(
             marker,
             json::named::After::Object,
         )),
-        Some(CallSyntax::NamedArguments(marker)) => Box::new(json::named::Assembler::new(
+        Some(CallSyntax::NamedArguments { marker, .. }) => Box::new(json::named::Assembler::new(
             index,
             id(),
             marker,

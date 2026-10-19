@@ -730,12 +730,18 @@ impl Format {
             },
             // The named-arguments calls sit in a block (DeepSeek V3.1's, V3's) or stand each from
             // its own opener (Mistral's): in a block, between the block's ways in and its close.
-            CallSyntax::NamedArguments(marker) => {
+            CallSyntax::NamedArguments {
+                marker,
+                between_calls,
+            } => {
                 let ways_in = markers.map(|markers| self.ways_into_block(markers));
                 (
                     json::named_arguments_calls(
                         self,
-                        marker,
+                        json::NamedArguments {
+                            marker,
+                            between_calls,
+                        },
                         markers,
                         ways_in.as_deref().unwrap_or_default(),
                         &named,
@@ -1223,17 +1229,20 @@ impl Format {
 
     /// What free text before a tag may not write: the table's terminals, but `kept` and those
     /// written inside one of them (a kept close `<e></t>` holds the terminal `<e>`, and free text
-    /// that excluded `<e>` could never write the close), and the call syntax's inner tags.
+    /// that excluded `<e>` could never write the close), and the call syntax's inner tags. The
+    /// named-arguments marker is not among them: it stands only after the call's opener, a
+    /// terminal the text cannot write, and in one table it is ordinary text (DeepSeek V3's fence),
+    /// which a thought may well hold.
     fn excluded_but(&self, kept: &[&str]) -> Vec<String> {
         let mut excludes: Vec<String> = self
             .terminal_texts()
             .filter(|text| !kept.iter().any(|kept| kept.contains(text)))
             .map(str::to_string)
             .collect();
-        let inner = self
-            .call_syntax()
-            .map(CallSyntax::tag_texts)
-            .unwrap_or_default();
+        let inner = match self.call_syntax() {
+            Some(CallSyntax::NamedArguments { .. }) | None => Vec::new(),
+            Some(syntax) => syntax.tag_texts(),
+        };
         excludes.extend(inner.iter().map(|tag| tag.to_string()));
         excludes
     }
@@ -2436,6 +2445,8 @@ mod tests {
                 "at_least_one": true,
             }})
         );
+        // The free text keeps the thought's own markers, and the arguments marker too: `[ARGS]`
+        // opens no call without `[TOOL_CALLS]` before it, which the text cannot write.
         let open = formats::mistral_v13()
             .grammar(&tools, true, true)
             .expect("a grammar");
@@ -2445,7 +2456,7 @@ mod tests {
                 if parts.len() == 2
                     && matches!(&parts[0], Grammar::AnyText { excludes }
                         if excludes.contains(&"[TOOL_CALLS]".to_string())
-                            && excludes.contains(&"[ARGS]".to_string())
+                            && !excludes.contains(&"[ARGS]".to_string())
                             && !excludes.contains(&"[THINK]".to_string()))
         ));
     }

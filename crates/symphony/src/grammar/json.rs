@@ -74,24 +74,35 @@ pub(super) fn named_calls(
     Some(count.triggered(vec![marker.to_string()], tags))
 }
 
+/// The named-arguments syntax's two texts, as the table declares them
+/// ([`CallSyntax::NamedArguments`](crate::format::CallSyntax::NamedArguments)).
+pub(super) struct NamedArguments<'a> {
+    /// Between the tool's name and the arguments object.
+    pub(super) marker: &'a str,
+    /// Between two calls of a block.
+    pub(super) between_calls: &'a str,
+}
+
 /// The named-arguments syntax: the call's opener, the tool's name and the marker begin a call,
 /// and the arguments the tool's schema accepts follow. Where the call has a close of its own, the
 /// close ends it, and the calls sit between the block's ways in and its close when the table has a
 /// block (DeepSeek V3.1's `<｜tool▁call▁begin｜>NAME<｜tool▁sep｜>{…}<｜tool▁call▁end｜>` inside
 /// `<｜tool▁calls▁begin｜>` … `<｜tool▁calls▁end｜>`; DeepSeek V3's fenced call in the same
-/// block), as the tagged syntaxes' calls do ([`calls::in_block`]). Without one (Mistral's
+/// block), as the tagged syntaxes' calls do ([`calls::in_block`]), with what the template writes
+/// between two calls before every call after the first (V3's newline). Without one (Mistral's
 /// `[TOOL_CALLS]NAME[ARGS]{…}`), the opener triggers a tag per tool whose `end` is nothing, since
 /// the template writes no closing marker: the object the schema accepts ends the tag, and the next
 /// opener or the end of the turn follows. That opener is the terminal of the row from the turn's
 /// own state into the arguments state; `None` for a table without one.
 pub(super) fn named_arguments_calls(
     format: &Format,
-    marker: &str,
+    syntax: NamedArguments<'_>,
     markers: Option<&CallMarkers<'_>>,
     ways_in: &[WayIn<'_>],
     tools: &[&Tool],
     count: Count<'_>,
 ) -> Option<Grammar> {
+    let marker = syntax.marker;
     let arguments = |tool: &Tool| Grammar::JsonSchema {
         schema: tool.function.parameters.clone(),
         style: None,
@@ -114,7 +125,7 @@ pub(super) fn named_arguments_calls(
             ways_in,
             calls,
             count,
-            |one_call| count.calls(one_call),
+            |one_call| separated(one_call, syntax.between_calls, count),
         ));
     }
     let (_, open, _) = format
@@ -132,6 +143,23 @@ pub(super) fn named_arguments_calls(
         })
         .collect();
     Some(count.triggered(vec![open.to_string()], tags))
+}
+
+/// The calls a block holds, as many as the count lets the model write, `between` before every
+/// call after the first: the one call alone with one owed, the calls one after another where
+/// nothing stands between them, and otherwise the first call and then `between` and a call any
+/// number of times.
+fn separated(one_call: Grammar, between: &str, count: Count<'_>) -> Grammar {
+    if count.one || between.is_empty() {
+        return count.calls(one_call);
+    }
+    Grammar::Sequence(vec![
+        one_call.clone(),
+        Grammar::Star(Box::new(Grammar::Sequence(vec![
+            Grammar::ConstString(between.to_string()),
+            one_call,
+        ]))),
+    ])
 }
 
 /// The list of the tools' calls as xLAM and Llama Nemotron write it: `[`, each call as

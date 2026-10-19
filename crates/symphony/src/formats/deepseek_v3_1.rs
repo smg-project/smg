@@ -50,7 +50,10 @@ pub fn deepseek_v3_1() -> Format {
         .transition("call", "call_open", "call")
         .transition("call", "calls_close", "content")
         .transition("calls", "calls_close", "content")
-        .calls(CallSyntax::NamedArguments(SEP))
+        .calls(CallSyntax::NamedArguments {
+            marker: SEP,
+            between_calls: "",
+        })
         .opens_turn("<｜Assistant｜>")
 }
 
@@ -715,11 +718,13 @@ mod tests {
         let first =
             payload(&[forecast()], forced(true, true, GrammarStart::FirstToken)).expect("a tag");
         assert_eq!(first["format"]["type"], "sequence");
+        // The thought's text may not write the table's terminals; the separator alone opens no
+        // call (the call's opener before it is a terminal), so it stays writable.
         assert_eq!(
             first["format"]["elements"][0],
             value!({"type": "tag", "begin": "", "content": {"type": "any_text", "excludes": [
                 "<think>", "</think>", "<｜tool▁calls▁begin｜>", "<｜tool▁calls▁end｜>",
-                "<｜tool▁call▁begin｜>", "<｜tool▁call▁end｜>", "<｜tool▁sep｜>",
+                "<｜tool▁call▁begin｜>", "<｜tool▁call▁end｜>",
             ]}, "end": "</think>"})
         );
         assert_eq!(first["format"]["elements"][1], closed["format"]);
@@ -729,7 +734,7 @@ mod tests {
             unknown["format"]["elements"][0],
             value!({"type": "any_text", "excludes": [
                 "<｜tool▁calls▁begin｜>", "<｜tool▁calls▁end｜>", "<｜tool▁call▁begin｜>",
-                "<｜tool▁call▁end｜>", "<｜tool▁sep｜>",
+                "<｜tool▁call▁end｜>",
             ]})
         );
         assert_eq!(unknown["format"]["elements"][1], closed["format"]);

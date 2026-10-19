@@ -175,12 +175,18 @@ pub enum CallSyntax {
     /// terminals that leave the state are the message's own; the object's close is the call's end,
     /// and the message's closing terminal is the region's.
     NamedJson(&'static str),
-    /// The tool's name as text, then this marker, then the arguments object alone: Mistral's
-    /// `[TOOL_CALLS]get_weather[ARGS]{"city": "Paris"}`. The terminal that enters the state is the
-    /// call's opener, which also opens the next call; the object's close is the call's end, and
-    /// the region ends at the next call's opener or the end of the turn, since the template writes
-    /// no closing marker.
-    NamedArguments(&'static str),
+    /// The tool's name as text, then `marker`, then the arguments object alone: Mistral's
+    /// `[TOOL_CALLS]get_weather[ARGS]{"city": "Paris"}`, where the terminal that enters the state
+    /// is the call's opener, which also opens the next call, the object's close is the call's end,
+    /// and the region ends at the next call's opener or the end of the turn, since the template
+    /// writes no closing marker; or DeepSeek V3.1's and V3's calls in a block, each with a close
+    /// of its own. `between_calls` is what the template writes between two calls of a block (V3's
+    /// newline; nothing for V3.1 and Mistral), wrapping the table drops and the structural tag
+    /// writes.
+    NamedArguments {
+        marker: &'static str,
+        between_calls: &'static str,
+    },
     /// The arguments object alone, named by the function the request forces
     /// (`Declared::forced`): what the engine writes under the JSON-schema constraint the gateway
     /// builds when `tool_choice` names a function, the one shape known from the request rather
@@ -227,7 +233,7 @@ impl CallSyntax {
                 TagEnd::Marker(marker) => vec![tags.parameter_open, tags.parameter_close, marker],
                 TagEnd::Angle => vec![tags.parameter_open, tags.parameter_close],
             },
-            Self::NamedJson(marker) | Self::NamedArguments(marker) => vec![*marker],
+            Self::NamedJson(marker) | Self::NamedArguments { marker, .. } => vec![*marker],
             Self::Gemma(spelling) => vec![spelling.string],
             Self::Shaped(shape) => shape.tag_texts(),
             Self::Json

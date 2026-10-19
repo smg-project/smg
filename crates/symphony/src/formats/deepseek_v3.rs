@@ -51,7 +51,10 @@ pub fn deepseek_v3() -> Format {
         .transition("call", "call_open", "call")
         .transition("call", "calls_close", "content")
         .transition("calls", "calls_close", "content")
-        .calls(CallSyntax::NamedArguments(FENCE_OPEN))
+        .calls(CallSyntax::NamedArguments {
+            marker: FENCE_OPEN,
+            between_calls: "\n",
+        })
         .opens_turn("<｜Assistant｜>")
 }
 
@@ -529,6 +532,56 @@ mod tests {
                 "at_least_one": true,
                 "stop_after_first": true,
             }})
+        );
+        // `required` with parallel calls allowed: the template's newline before every call after
+        // the first, and nothing before the first.
+        let more = deepseek_v3()
+            .grammar_for(
+                std::slice::from_ref(&tool),
+                Options {
+                    at_least_one: true,
+                    reasoning_open: false,
+                    one_call: false,
+                    start: GrammarStart::AfterReasoning,
+                },
+            )
+            .expect("a tag")
+            .payload();
+        assert_eq!(
+            more["format"]["tags"][0]["content"],
+            value!({"type": "sequence", "elements": [
+                one_call,
+                {"type": "star", "content": {"type": "sequence", "elements": [
+                    {"type": "const_string", "value": "\n"},
+                    one_call,
+                ]}},
+            ]})
+        );
+        // With the prompt's thought open and the grammar run from the first token, the thought's
+        // text may not write the table's terminals, and may still hold a fenced draft of the
+        // arguments: the fence is ordinary text, and a call opens only at the call's opener.
+        let open = deepseek_v3()
+            .grammar_for(
+                std::slice::from_ref(&tool),
+                Options {
+                    at_least_one: true,
+                    reasoning_open: true,
+                    one_call: true,
+                    start: GrammarStart::FirstToken,
+                },
+            )
+            .expect("a tag")
+            .payload();
+        assert_eq!(
+            open["format"]["elements"][0]["content"]["excludes"],
+            value!([
+                "<think>",
+                "</think>",
+                "<｜tool▁calls▁begin｜>",
+                "<｜tool▁calls▁end｜>",
+                "<｜tool▁call▁begin｜>function<｜tool▁sep｜>",
+                "```<｜tool▁call▁end｜>",
+            ])
         );
         // The call as the tag writes it, the fence's close right after the object (the template
         // puts a newline between them, which the table drops as wrapping either way), reads as

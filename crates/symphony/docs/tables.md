@@ -206,7 +206,11 @@ is the terminal that leaves the call. Beyond that:
   `<｜tool▁call▁begin｜>function<｜tool▁sep｜>`, the tool's name and the fence the template opens,
   the arguments the tool's schema accepts, then the fence's close with `<｜tool▁call▁end｜>` right
   after the object (the template puts a newline between them, which the table drops as wrapping
-  either way), between the block's ways in and its close. Not yet read live on an engine.
+  either way), between the block's ways in and its close, with the template's newline before
+  every call after the first (`CallSyntax::NamedArguments::between_calls`). The fence is ordinary
+  text, so the free text before the calls (a thought the prompt opened) may still hold a fenced
+  draft of the arguments: only the table's terminals are kept out of it. Not yet read live on an
+  engine.
 
 ## GLM 4.5 and 4.6 (`glm4`)
 

@@ -34,7 +34,10 @@ pub fn mistral_v13() -> Format {
         .transition("reasoning", "think_close", "content")
         .transition("content", "call_open", "call")
         .transition("call", "call_open", "call")
-        .calls(CallSyntax::NamedArguments(ARGS))
+        .calls(CallSyntax::NamedArguments {
+            marker: ARGS,
+            between_calls: "",
+        })
         .opens_turn("[/INST]")
 }
 
