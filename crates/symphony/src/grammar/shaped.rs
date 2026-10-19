@@ -50,7 +50,8 @@
 //! the calls sit in a block of the table's (a wrapper state with a row into the arguments state),
 //! the calls are written between the block's ways in and its close, one after another, as the
 //! tagged syntaxes write theirs ([`in_block`](super::calls::in_block)): the layout's text between
-//! and after the calls is not written there, the block's being the table's own. Arguments as an
+//! and after the calls is not written there, the block's being the table's own, and the lead, the
+//! text before a call's terminal, stands before each call inside the block. Arguments as an
 //! object that names the call have no tag yet: a layout has no places for them.
 //!
 //! [`CallSyntax::Shaped`]: crate::CallSyntax::Shaped
@@ -161,21 +162,25 @@ pub(super) fn calls(
         return None;
     }
     // In a block, the calls stand between the block's ways in and its close, as the tagged
-    // syntaxes' do; a block's calls are closed by a terminal, never by the stop.
+    // syntaxes' do, each after its lead, the text the template writes before a call's terminal;
+    // a block's calls are closed by a terminal, never by the stop.
     if let Some(markers) = markers.filter(|markers| markers.block.is_some()) {
         call.close.as_ref()?;
         let count = Count { one, ..count };
         let calls = written
             .iter()
-            .map(|call| (call.begin.clone(), call.arguments.clone(), tail.clone()))
+            .map(|call| {
+                let begin = format!("{}{}", call.lead, call.begin);
+                (begin, call.arguments.clone(), tail.clone())
+            })
             .collect();
-        let block = calls::in_block(markers, ways_in, calls, count, |one_call| {
-            count.calls(one_call)
-        });
-        return Some(match lead(&written) {
-            Some(lead) if count.at_least_one => Grammar::Sequence(vec![lead, block]),
-            _ => block,
-        });
+        return Some(calls::in_block(
+            markers,
+            ways_in,
+            calls,
+            count,
+            |one_call| count.calls(one_call),
+        ));
     }
     if in_a_row {
         let tags = written
@@ -937,6 +942,20 @@ mod tests {
         let got = payload(&single, &[lookup()], options(true, false)).expect("a tag");
         assert_eq!(got["format"]["stop_after_first"], true);
         assert_eq!(got["format"]["tags"][0]["content"]["type"], "or");
+        // A lead stands before each call inside the block, named for its tool; nothing stands
+        // before the block's tags.
+        let mut led = format.layout().cloned().expect("a layout");
+        led.call.lead = written([piece("@"), Segment::Slot(Slot::Name), piece("\n")]);
+        let got = payload(
+            &numbered_in_a_block().with_layout(led),
+            &[lookup(), ping.clone()],
+            options(true, false),
+        )
+        .expect("a tag");
+        assert_eq!(got["format"]["type"], "triggered_tags");
+        let calls = &got["format"]["tags"][0]["content"]["content"]["elements"];
+        assert_eq!(calls[0]["elements"][0]["value"], "@lookup\n<cf.lookup:");
+        assert_eq!(calls[1]["elements"][0]["value"], "@ping\n<cf.ping:");
         // A layout with a parameter does not fit JSON arguments, and gives no tag.
         let mut tagged = format.layout().cloned().expect("a layout");
         tagged.call.parameter = written([

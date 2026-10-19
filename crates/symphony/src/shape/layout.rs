@@ -56,6 +56,10 @@ pub enum Segment {
 
 /// The index as a written-out text reads it: the first call's.
 const INDEX_SAMPLE: &str = "0";
+/// A second index the check reads the header with: two digits, since the tag writes any run of
+/// digits where the index stands, and a pattern that reads one digit alone would pass the first
+/// sample and not the tag's output.
+const INDEX_SAMPLE_LONG: &str = "10";
 
 impl Written {
     /// A text with no place in it.
@@ -117,8 +121,14 @@ impl Written {
     }
 
     /// The text with `name`, `key` and `value` written in their places, and where each stands in
-    /// it, by its slot. The call's index reads `0`.
-    fn filled(&self, name: &str, key: &str, value: &str) -> (String, [Option<(usize, usize)>; 3]) {
+    /// it, by its slot; the call's index reads `index`.
+    fn filled(
+        &self,
+        name: &str,
+        key: &str,
+        value: &str,
+        index: &str,
+    ) -> (String, [Option<(usize, usize)>; 3]) {
         let mut text = String::new();
         let mut spans = [None; 3];
         for segment in &*self.0 {
@@ -128,7 +138,7 @@ impl Written {
                     continue;
                 }
                 Segment::Index => {
-                    text.push_str(INDEX_SAMPLE);
+                    text.push_str(index);
                     continue;
                 }
                 Segment::Slot(slot) => match slot {
@@ -389,6 +399,15 @@ impl Layout {
         if self.header_for(shape, terminal, &name).is_none() {
             return Err(LayoutError::Unmatched("header"));
         }
+        // The tag writes any run of digits where the index stands: the header has to read a
+        // longer index back as well, not the first call's alone.
+        if call.header.indexes() == 1
+            && self
+                .header_written(shape, terminal, &name, INDEX_SAMPLE_LONG)
+                .is_none()
+        {
+            return Err(LayoutError::Unmatched("header"));
+        }
         if let Some(tag) = tag {
             let key =
                 captured(tag, Slot::Key).map_or_else(|| "k".to_string(), |(c, m)| sample(c, m));
@@ -423,13 +442,25 @@ impl Layout {
     /// The header as written for a call to `name` after `terminal`, if the shape's header reads it
     /// back as a call to that tool, with the call's text after it as a stream reads it: the header
     /// captures exactly the name where the layout puts it, or, for a name the template writes,
-    /// `name` is that one. `None` for a name the header's class does not hold, or one longer than
-    /// the most a header holds undecided.
+    /// `name` is that one; the call's index, where the header has its place, reads `0`. `None`
+    /// for a name the header's class does not hold, or one longer than the most a header holds
+    /// undecided.
     pub(crate) fn header_for(
         &self,
         shape: &CallShape,
         terminal: &str,
         name: &str,
+    ) -> Option<String> {
+        self.header_written(shape, terminal, name, INDEX_SAMPLE)
+    }
+
+    /// [`Self::header_for`] with the call's index written as `index`.
+    fn header_written(
+        &self,
+        shape: &CallShape,
+        terminal: &str,
+        name: &str,
+        index: &str,
     ) -> Option<String> {
         let header_names = match &shape.name {
             NameSource::Header => true,
@@ -437,7 +468,7 @@ impl Layout {
             NameSource::Literal(_) | NameSource::Body => return None,
         };
         let call = &self.call;
-        let (header, spans) = call.header.filled(name, "", "");
+        let (header, spans) = call.header.filled(name, "", "", index);
         let follows = format!("{header}{}{}", call.before, self.sample_parameters(shape));
         let mut matcher = Matcher::new(
             &shape.header,
@@ -460,7 +491,7 @@ impl Layout {
         let call = &self.call;
         let value =
             captured(tag, Slot::Value).map_or_else(|| "v".to_string(), |(c, m)| sample(c, m));
-        let (written, spans) = call.parameter.filled("", key, &value);
+        let (written, spans) = call.parameter.filled("", key, &value, INDEX_SAMPLE);
         let rest = format!(
             "{written}{}{written}{}{}",
             call.between, call.after, call.trailer
@@ -485,7 +516,7 @@ impl Layout {
             Arguments::Json(_) => return format!("{{}}{}", call.trailer),
             Arguments::Envelope { .. } => ("k".to_string(), "v".to_string()),
         };
-        let (written, _) = call.parameter.filled("", &key, &value);
+        let (written, _) = call.parameter.filled("", &key, &value, INDEX_SAMPLE);
         format!(
             "{written}{}{written}{}{}",
             call.between, call.after, call.trailer
@@ -974,6 +1005,31 @@ mod tests {
         assert_eq!(
             json_layout().call.header.around_the_index("lookup"),
             (" n=\"lookup\">".to_string(), None)
+        );
+        // A header pattern that reads one digit alone passes the first call's `0` and not the
+        // longer index the tag lets the model write: the layout does not fit it.
+        let one_digit = CallShape {
+            header: Pattern(
+                [
+                    lit("f."),
+                    run(none_of(":"), 1, true, Some(Slot::Name)),
+                    lit(":"),
+                    Atom::Run {
+                        class: Class::new([('0', '9')], false),
+                        min: 1,
+                        max: Some(1),
+                        greedy: true,
+                        capture: None,
+                    },
+                    lit(">"),
+                ]
+                .into(),
+            ),
+            ..numbered()
+        };
+        assert_eq!(
+            laid.check(&table(one_digit)),
+            Err(LayoutError::Unmatched("header"))
         );
         // Without the place the header does not read back (the pattern wants the digits).
         let mut unnumbered = json_layout();
