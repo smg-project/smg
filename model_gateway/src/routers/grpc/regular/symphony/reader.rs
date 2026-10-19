@@ -728,14 +728,22 @@ mod tests {
                 "planmore",
             ),
         ] {
-            let mut reader = Reader::new(&assignment, Arc::default()).expect("a reader");
-            let mut events = reader.tail(&output).expect("read");
-            events.extend(reader.end(EngineFinish::Stop, who()).expect("ended"));
-            assert_eq!(content_of(&events), json, "{events:?}");
+            let mut events = Events::new();
+            let mut reader =
+                Reader::new(&assignment, Arc::default(), &mut events).expect("a reader");
+            let mut delta = Delta::default();
+            reader
+                .tail(output.clone(), &mut delta, &mut events)
+                .expect("read");
+            reader
+                .end(EngineFinish::Stop, who(), &mut events)
+                .expect("ended");
+            let events = events.as_slice();
+            assert_eq!(content_of(events), json, "{events:?}");
             let thoughts: String = events
                 .iter()
                 .filter_map(|event| match event {
-                    Event::Reasoning(text) => Some(text.text.as_str()),
+                    Event::Reasoning(text) => Some(&*text.text),
                     _ => None,
                 })
                 .collect();
