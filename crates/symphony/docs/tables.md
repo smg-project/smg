@@ -358,7 +358,7 @@ What the table says beyond the others:
 
 - **One state, an object, several, or a list.** As `xlam`, the output starts in the arguments
   state and the assembler decides at the first byte that is not whitespace; unlike `xlam`, a `{`
-  there is one call alone (`json::list::Assembler::object_or_list`), whose object reads as a
+  there is one call alone (`json::list`, `Framing::ObjectOrList`), whose object reads as a
   list's object does, `arguments`, `parameters` or `args` naming the arguments. After the object
   a `;` and another object is another call, the `;` and the whitespace around it the template's
   wrapping: Llama 3.1 writes its parallel calls so, `{…}; {…}`, and the engines' own readers of

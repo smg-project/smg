@@ -18,7 +18,7 @@
 //!   content too. A `[` that is followed by anything but an object or the `]` is prose as well
 //!   (`[Note: draft]`, a markdown link), and the `[` comes back as content with the rest.
 //!
-//! With [`Assembler::object_or_list`] (the `json` table), a `{` at the first byte is one call
+//! With [`Framing::ObjectOrList`] (the `json` table), a `{` at the first byte is one call
 //! alone: the object goes to a [`json::Assembler`](super::Assembler) as a list's object does, and
 //! what follows it reads as what follows a list's `]`: whitespace that ends the output is the
 //! template's wrapping, dropped; text, with the whitespace before and between its words, is
@@ -30,7 +30,7 @@
 //! the first byte did, so that an output with the marker and one without read the same; a delta
 //! that ends inside the marker is held until the next decides, and bytes that turn out not to be
 //! it are prose with everything held. The marker is read at the output's start only: later, or
-//! after prose, it is text. A list reads as before. [`Assembler::new`] (the `xlam` table) keeps a
+//! after prose, it is text. A list reads as before. [`Framing::Bare`] (the `xlam` table) keeps a
 //! `{` as prose.
 //!
 //! A region with no markers never closes by one, so [`Assembler::close`] is for a table that puts
@@ -40,10 +40,18 @@
 //! it held.
 //!
 //! Between markers (Llama Nemotron's `<TOOLCALL>[…]</TOOLCALL>`) a row of the table opens the
-//! region and its closing marker ends it, so prose has no place inside: [`Assembler::framed`]
+//! region and its closing marker ends it, so prose has no place inside: [`Framing::Framed`]
 //! reports text where the list should be, a `[` that opens no list of calls included, as
 //! `Malformed` where the bare list takes it for content. The engine picks it for a table with a
 //! row into the arguments state.
+//!
+//! The three are the one [`Framing`] the assembler takes at construction, the family's call marker
+//! inside the one that reads it, and the engine's factory maps the table's call syntax to it; the
+//! object reader and the stages around it are the same under every framing. A call written as one
+//! object between a table's markers (`CallSyntax::Json`) is the object reader itself
+//! ([`json::Assembler`](super::Assembler)), not a framing of this one: the engine reports what
+//! follows the object there, where this reader holds the whitespace after a lone object and reads
+//! a `;` or prose after it (`docs/assemblers.md`).
 
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
@@ -63,23 +71,55 @@ pub struct Assembler {
     carried: String,
     /// Objects that began, so that prose after the `[` is told from text between objects.
     objects: u32,
-    /// Whether a `{` at the first byte is one call alone ([`Self::object_or_list`]).
+    /// Whether a `{` at the first byte is one call alone ([`Framing::ObjectOrList`]).
     lone_object: bool,
     /// Whether a `[` opened a list, so that a finished object returns to the list or ends the
     /// output's calls.
     listed: bool,
-    /// Whether markers frame the list: text in place of it is malformed, not prose.
+    /// Whether markers frame the list ([`Framing::Framed`]): text in place of it is malformed,
+    /// not prose.
     framed: bool,
     /// Whether text followed the lone object or the list's `]`: from there on every byte,
     /// whitespace included, is the model's prose after its calls. Before it, whitespace is held,
     /// the template's wrapping if nothing follows.
     prose_after: bool,
-    /// The family's call marker the output may open with ([`Self::object_or_list`]), until the
+    /// The family's call marker the output may open with ([`Framing::ObjectOrList`]), until the
     /// first byte that is not whitespace has decided whether it does.
     opener: Option<&'static str>,
     /// Whether a `;` followed the lone object, so that the next object is another call: the `;`
     /// is held with the whitespace around it until the next byte decides.
     separated: bool,
+}
+
+/// What frames the calls: how the first byte that is not whitespace reads, and what text in place
+/// of a list is. The engine's factory maps the table's call syntax to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Framing {
+    /// The list alone in the output (xLAM): a `[` opens it, and anything else is prose.
+    Bare,
+    /// The list between the table's markers (Llama Nemotron): a `[` opens it, and anything else
+    /// is malformed, since prose has no place inside the markers.
+    Framed,
+    /// One object, several with `;` between them, or a list alone in the output (the `json`
+    /// table): a `{` is one call alone, a `[` opens the list, and anything else is prose.
+    /// `opener` is the family's call marker the output may open with (Llama 3.1's
+    /// `<|python_tag|>`), dropped as the template's wrapping where it does.
+    ObjectOrList { opener: Option<&'static str> },
+}
+
+impl Framing {
+    /// Whether a `{` at the first byte is one call alone, and a `;` after it separates the next.
+    fn lone_object(self) -> bool {
+        matches!(self, Self::ObjectOrList { .. })
+    }
+
+    /// The family's call marker the output may open with, where the framing names one.
+    fn opener(self) -> Option<&'static str> {
+        match self {
+            Self::ObjectOrList { opener } => opener,
+            Self::Bare | Self::Framed => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -104,41 +144,22 @@ enum Stage {
 }
 
 impl Assembler {
-    /// An assembler positioned at the output's start, the first call taking index `first` and the
-    /// ids counting from `ids`: the bare list, where anything but a list is prose.
-    pub fn new(first: u32, ids: CallIds) -> Self {
+    /// An assembler positioned at the output's start, or after the marker that opens the list's
+    /// region, the first call taking index `first` and the ids counting from `ids`; `framing`
+    /// says what frames the calls.
+    pub fn new(first: u32, ids: CallIds, framing: Framing) -> Self {
         Self {
             next_index: first,
             ids,
             stage: Stage::Deciding,
             carried: String::new(),
             objects: 0,
-            lone_object: false,
+            lone_object: framing.lone_object(),
             listed: false,
-            framed: false,
+            framed: framing == Framing::Framed,
             prose_after: false,
-            opener: None,
+            opener: framing.opener(),
             separated: false,
-        }
-    }
-
-    /// [`Self::new`], also reading a `{` at the first byte as one call alone, and another call
-    /// after each `;` that follows it; `opener` is the family's call marker the output may open
-    /// with, dropped as the template's wrapping where it does.
-    pub fn object_or_list(first: u32, ids: CallIds, opener: Option<&'static str>) -> Self {
-        Self {
-            lone_object: true,
-            opener,
-            ..Self::new(first, ids)
-        }
-    }
-
-    /// An assembler positioned after the marker that opens the list's region, the first call
-    /// taking index `first`: anything but a list is malformed.
-    pub fn framed(first: u32, ids: CallIds) -> Self {
-        Self {
-            framed: true,
-            ..Self::new(first, ids)
         }
     }
 
@@ -435,7 +456,7 @@ mod tests {
     );
 
     fn run(pieces: &[&str]) -> Vec<Event<'static>> {
-        let mut assembler = Assembler::new(0, ids());
+        let mut assembler = Assembler::new(0, ids(), Framing::Bare);
         let mut out = Events::new();
         for piece in pieces {
             assembler.feed(piece, &mut out);
@@ -588,7 +609,7 @@ mod tests {
     }
 
     fn run_alone(pieces: &[&str]) -> Vec<Event<'static>> {
-        let mut assembler = Assembler::object_or_list(0, ids(), None);
+        let mut assembler = Assembler::new(0, ids(), Framing::ObjectOrList { opener: None });
         let mut out = Events::new();
         for piece in pieces {
             assembler.feed(piece, &mut out);
@@ -722,7 +743,13 @@ mod tests {
 
     /// [`run_alone`] with Llama 3.1's call marker named.
     fn run_opened(pieces: &[&str]) -> Vec<Event<'static>> {
-        let mut assembler = Assembler::object_or_list(0, ids(), Some("<|python_tag|>"));
+        let mut assembler = Assembler::new(
+            0,
+            ids(),
+            Framing::ObjectOrList {
+                opener: Some("<|python_tag|>"),
+            },
+        );
         let mut out = Events::new();
         for piece in pieces {
             assembler.feed(piece, &mut out);
@@ -916,7 +943,7 @@ mod tests {
             "  [Note: draft] ok",
             "{\"name\": \"f\", \"arguments\": {}}",
         ] {
-            let mut assembler = Assembler::framed(0, ids());
+            let mut assembler = Assembler::new(0, ids(), Framing::Framed);
             let mut out = Events::new();
             assembler.feed(output, &mut out);
             assembler.close(&mut out);
@@ -931,7 +958,7 @@ mod tests {
             );
         }
         // The list itself reads the same between markers.
-        let mut assembler = Assembler::framed(0, ids());
+        let mut assembler = Assembler::new(0, ids(), Framing::Framed);
         let mut out = Events::new();
         assembler.feed(LIST, &mut out);
         assembler.close(&mut out);
