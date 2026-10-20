@@ -15,7 +15,7 @@
 //!
 //! Notes on what this module decides, and on what it leaves open: `docs/engine.md`.
 
-use std::{borrow::Cow, cell::OnceCell, collections::VecDeque, ops::Range, sync::Arc};
+use std::{borrow::Cow, collections::VecDeque, ops::Range, sync::Arc};
 
 use crate::{
     event::{runs_at, DropReason, Event, Events, FinishReason, MalformedReason, Text},
@@ -52,7 +52,8 @@ pub struct Engine {
     /// The request's tools in the order of their names, as positions in `declared`, for a request
     /// with more tools than a call's start searches directly: built at the first call's start
     /// (one allocation, for an output with a call) and searched per call ([`Self::declares`]).
-    names: OnceCell<Box<[usize]>>,
+    /// A plain option behind `&mut self`, so the engine stays `Sync`.
+    names: Option<Box<[usize]>>,
     scanner: Scanner,
     state: usize,
     /// The call being assembled while the engine is in an arguments state.
@@ -387,7 +388,7 @@ impl Engine {
             scanner: Scanner::new(format.terminal_texts()),
             format,
             declared,
-            names: OnceCell::new(),
+            names: None,
             state: 0,
             call: None,
             calls: 0,
@@ -1024,12 +1025,12 @@ impl Engine {
     /// Whether the request declares a function named `name`: up to
     /// [`Self::NAMES_SEARCHED_DIRECTLY`] tools, as they are; more, by the index built once per
     /// output at the first call's start. Asked only when the request declares tools at all.
-    fn declares(&self, name: &str) -> bool {
+    fn declares(&mut self, name: &str) -> bool {
         let tools = self.declared.tools();
         if tools.len() <= Self::NAMES_SEARCHED_DIRECTLY {
             return self.declared.declares(name);
         }
-        let by_name = self.names.get_or_init(|| {
+        let by_name = self.names.get_or_insert_with(|| {
             let mut positions: Vec<usize> = (0..tools.len()).collect();
             positions
                 .sort_unstable_by(|a, b| tools[*a].function.name.cmp(&tools[*b].function.name));
