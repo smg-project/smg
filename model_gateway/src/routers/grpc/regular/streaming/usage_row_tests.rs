@@ -1,9 +1,9 @@
 //! The tenant usage row of a streamed response at its end, whichever way the
 //! stream ends: read to its last token, abandoned by the client mid-stream,
-//! failed by the engine mid-stream, failed on its prefill leg before the
-//! first token. Each books the stream exactly once: the normal end with the
-//! usage block's numbers, every other end with the prompt as tokenized at
-//! dispatch and the completion tokens streamed up to the end.
+//! failed or timed out by the engine mid-stream, failed on its prefill leg
+//! before the first token. Each books the stream exactly once: the normal end
+//! with the usage block's numbers, every other end with the prompt as
+//! tokenized at dispatch and the completion tokens streamed up to the end.
 
 use std::time::Duration;
 
@@ -659,4 +659,341 @@ async fn a_two_choice_stream_on_a_cumulative_engine_books_every_token_delivered_
          second's running count included, not the first choice's five alone"
     );
     server.abort();
+}
+
+/// The completions streaming path over `result` (one unit, a batch's units,
+/// or a prefill/decode pair) for the request `body`, as a response: its
+/// coordinator task begins the request's one guard, the units count into it,
+/// and the task's end books it.
+async fn completions_response(
+    result: context::ExecutionResult,
+    dispatch: context::DispatchMetadata,
+    body: Value,
+) -> Response {
+    let request: openai_protocol::completion::CompletionRequest =
+        serde_json::from_value(body).expect("a completion request");
+    let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_COMPLETIONS);
+    Arc::new(processor(false))
+        .process_completion_streaming_response(
+            result,
+            CompletionResponseSpec::from(&request),
+            dispatch,
+            character_tokenizer(),
+            None,
+            None,
+            source,
+        )
+        .await
+}
+
+/// A streamed completions request for `prompt` (a string, or an array for a
+/// batch), its usage chunk included.
+fn completions_request(prompt: Value) -> Value {
+    serde_json::json!({
+        "model": "usage-row-test",
+        "prompt": prompt,
+        "stream": true,
+        "stream_options": {"include_usage": true},
+    })
+}
+
+#[tokio::test]
+async fn a_completions_stream_read_to_its_end_books_the_usage_block_once() {
+    let tenant = "auth:usage-row-completions-normal-end";
+    let (stream, server) = scripted_stream(
+        vec![
+            chunk(0, "Hel"),
+            chunk(0, "lo"),
+            complete_with_prompt(0, "stop", 7),
+        ],
+        "0",
+    )
+    .await;
+    let text = read_to_end(
+        completions_response(
+            context::ExecutionResult::Single { stream },
+            dispatch(tenant),
+            completions_request(serde_json::json!("test")),
+        )
+        .await,
+    )
+    .await;
+    assert!(
+        text.contains("\"completion_tokens\":5") && text.ends_with("data: [DONE]\n\n"),
+        "{text}"
+    );
+    server.abort();
+
+    let totals = booked(tenant).await;
+    assert_eq!(
+        counts(&totals),
+        (1, 7, 5),
+        "one request, the engine's prompt count, the tokens the Complete confirmed: the \
+         end's finish booked the guard, its drop had nothing left"
+    );
+    assert!(totals.request_seconds > 0.0);
+}
+
+#[tokio::test]
+async fn a_completions_stream_the_client_leaves_at_the_finish_books_what_its_unit_delivered_once() {
+    let tenant = "auth:usage-row-completions-client-gone-at-finish";
+    let (gate, held) = oneshot::channel();
+    let (stream, server) = gated_stream(
+        vec![chunk(0, "Hel"), chunk(0, "lo")],
+        held,
+        vec![complete_with_prompt(0, "stop", 7)],
+        "0",
+    )
+    .await;
+    let mut body = completions_response(
+        context::ExecutionResult::Single { stream },
+        dispatch(tenant),
+        completions_request(serde_json::json!("test")),
+    )
+    .await
+    .into_body();
+
+    // The client reads the whole text ...
+    assert!(first_frame(&mut body).await.contains("Hel"));
+    assert!(first_frame(&mut body).await.contains("lo"));
+    // ... and leaves as the engine's Complete arrives: its finish chunk cannot
+    // be sent, the unit fails before the request's one settle, and the drop
+    // books the stream.
+    drop(body);
+    let _ = gate.send(());
+
+    assert_eq!(
+        counts(&booked(tenant).await),
+        (1, u64::from(PROMPT_AT_DISPATCH), 5),
+        "one request; the prompt as dispatched (the units' aggregate never settled the \
+         guard); every token the chunks delivered"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_completions_stream_the_client_leaves_at_the_usage_chunk_books_the_engines_counts_once() {
+    let tenant = "auth:usage-row-completions-client-gone-at-usage";
+    let (stream, server) = scripted_stream(
+        vec![chunk(0, "Hel"), complete_with_prompt(0, "stop", 7)],
+        "0",
+    )
+    .await;
+    let mut body = completions_response(
+        context::ExecutionResult::Single { stream },
+        dispatch(tenant),
+        completions_request(serde_json::json!("test")),
+    )
+    .await
+    .into_body();
+
+    // The client reads up to the finish chunk and leaves before the usage
+    // chunk: the units are done, the aggregate settled the guard, and the
+    // end's finish books it whether or not the usage chunk went out.
+    while !first_frame(&mut body)
+        .await
+        .contains("\"finish_reason\":\"stop\"")
+    {}
+    drop(body);
+
+    assert_eq!(
+        counts(&booked(tenant).await),
+        (1, 7, 3),
+        "one request with the engine's counts; the finish booked once, the drop after it \
+         had nothing left"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_completions_stream_the_engine_fails_books_the_tokens_delivered_once() {
+    let tenant = "auth:usage-row-completions-engine-failed";
+    let (stream, server) = cut_stream(
+        vec![chunk(0, "Hel")],
+        tonic::Status::internal("h2 protocol error: error reading a body from connection"),
+    )
+    .await;
+    let text = read_to_end(
+        completions_response(
+            context::ExecutionResult::Single { stream },
+            dispatch(tenant),
+            completions_request(serde_json::json!("test")),
+        )
+        .await,
+    )
+    .await;
+    assert!(
+        text.contains("stream_error") && text.ends_with("data: [DONE]\n\n"),
+        "{text}"
+    );
+    server.abort();
+
+    assert_eq!(
+        counts(&booked(tenant).await),
+        (1, u64::from(PROMPT_AT_DISPATCH), 3),
+        "one request; the prompt as dispatched; the tokens delivered before the engine failed"
+    );
+}
+
+#[tokio::test]
+async fn a_completions_stream_the_engine_times_out_books_the_tokens_delivered_once() {
+    let tenant = "auth:usage-row-completions-engine-timeout";
+    let (stream, server) = cut_stream(
+        vec![chunk(0, "Hel"), chunk(0, "lo")],
+        tonic::Status::deadline_exceeded("too slow"),
+    )
+    .await;
+    let text = read_to_end(
+        completions_response(
+            context::ExecutionResult::Single { stream },
+            dispatch(tenant),
+            completions_request(serde_json::json!("test")),
+        )
+        .await,
+    )
+    .await;
+    assert!(
+        text.contains("stream_error")
+            && text.contains("too slow")
+            && text.ends_with("data: [DONE]\n\n"),
+        "{text}"
+    );
+    server.abort();
+
+    assert_eq!(
+        counts(&booked(tenant).await),
+        (1, u64::from(PROMPT_AT_DISPATCH), 5),
+        "one request; the prompt as dispatched; the tokens delivered before the deadline"
+    );
+}
+
+#[tokio::test]
+async fn a_completions_prefill_leg_that_fails_before_the_first_token_books_the_prompt_once() {
+    let tenant = "auth:usage-row-completions-prefill-failed";
+    let (prefill, prefill_server) = scripted_stream(vec![], "13").await;
+    let (decode, decode_server) = scripted_stream(
+        vec![chunk(0, "Hi"), complete_with_prompt(0, "stop", 7)],
+        "0",
+    )
+    .await;
+    let text = read_to_end(
+        completions_response(
+            context::ExecutionResult::PrefillDecode {
+                prefill,
+                decode: Box::new(decode),
+                prefill_guards: vec![None],
+                pd_timing: context::PdTiming {
+                    prefill_start: Instant::now(),
+                    decode_sent: Instant::now(),
+                    runtime: "test",
+                },
+                prefill_input_logprobs: None,
+            },
+            dispatch(tenant),
+            completions_request(serde_json::json!("test")),
+        )
+        .await,
+    )
+    .await;
+    assert!(
+        text.contains("stream_error") && text.ends_with("data: [DONE]\n\n"),
+        "{text}"
+    );
+    prefill_server.abort();
+    decode_server.abort();
+
+    assert_eq!(
+        counts(&booked(tenant).await),
+        (1, u64::from(PROMPT_AT_DISPATCH), 0),
+        "one request of the prompt as dispatched: the leg failed before the decode began"
+    );
+}
+
+#[tokio::test]
+async fn a_batched_completions_stream_read_to_its_end_books_its_units_sum_once() {
+    let tenant = "auth:usage-row-completions-batch-normal-end";
+    let (first, first_server) = scripted_stream(
+        vec![chunk(0, "Hel"), complete_with_prompt(0, "stop", 7)],
+        "0",
+    )
+    .await;
+    let (second, second_server) = scripted_stream(
+        vec![chunk(0, "lo"), complete_with_prompt(0, "stop", 7)],
+        "0",
+    )
+    .await;
+    let text = read_to_end(
+        completions_response(
+            context::ExecutionResult::Batch {
+                results: vec![
+                    context::ExecutionResult::Single { stream: first },
+                    context::ExecutionResult::Single { stream: second },
+                ],
+            },
+            dispatch(tenant),
+            completions_request(serde_json::json!(["one", "two"])),
+        )
+        .await,
+    )
+    .await;
+    assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+    first_server.abort();
+    second_server.abort();
+
+    assert_eq!(
+        counts(&booked(tenant).await),
+        (1, 14, 5),
+        "one request for the batch: the units' prompt counts summed, every unit's tokens, \
+         booked by the one finish"
+    );
+}
+
+#[tokio::test]
+async fn a_batched_completions_stream_the_client_abandons_books_what_every_unit_streamed_once() {
+    let tenant = "auth:usage-row-completions-batch-client-gone";
+    let (first, first_server) = scripted_stream(
+        vec![chunk(0, "Hel"), complete_with_prompt(0, "stop", 7)],
+        "0",
+    )
+    .await;
+    let (gate, held) = oneshot::channel();
+    let (second, second_server) = gated_stream(
+        vec![chunk(0, "lo")],
+        held,
+        vec![chunk(0, "ng"), complete_with_prompt(0, "stop", 7)],
+        "0",
+    )
+    .await;
+    let mut body = completions_response(
+        context::ExecutionResult::Batch {
+            results: vec![
+                context::ExecutionResult::Single { stream: first },
+                context::ExecutionResult::Single { stream: second },
+            ],
+        },
+        dispatch(tenant),
+        completions_request(serde_json::json!(["one", "two"])),
+    )
+    .await
+    .into_body();
+
+    // The client reads the first unit's text and finish and the second's
+    // first chunk (three frames, in whichever order the units sent them) ...
+    for _ in 0..3 {
+        first_frame(&mut body).await;
+    }
+    // ... and leaves. The second unit's next token cannot be delivered: the
+    // request fails as a whole, and its one guard books what both units
+    // counted into it.
+    drop(body);
+    let _ = gate.send(());
+
+    assert_eq!(
+        counts(&booked(tenant).await),
+        (1, u64::from(PROMPT_AT_DISPATCH), 7),
+        "one request; the prompt as dispatched; the first unit's three tokens, the second's \
+         two the client read and the two it could not be sent"
+    );
+    first_server.abort();
+    second_server.abort();
 }
