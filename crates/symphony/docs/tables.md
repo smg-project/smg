@@ -236,15 +236,16 @@ is the terminal that leaves the call. Beyond that:
   text, so the free text before the calls (a thought the prompt opened) may still hold a fenced
   draft of the arguments: only the table's terminals are kept out of it. Not yet read live on an
   engine.
-- **The tool outputs end the model's turn.** The template writes the turn opener after a user
-  message only, so after a tool result the model's turn is unopened, and the table names content
-  as the state it starts in, with `<｜tool▁outputs▁begin｜>` as the end of the turn the model wrote
-  (the unopened row): nothing of such a prompt is replayed, and the model's own `<think>` opens the
-  thought. The R1 distills' template writes `<｜tool▁calls▁end｜><｜end▁of▁sentence｜>` after the
-  second call and later only, so a turn with one call ends with neither; replayed, it would leave
-  the output in the calls block and the next turn would read as wrapper text. Bellwether's R1-line
-  sets hold content alone, so the module test pins the one-call history as that template renders
-  it.
+- **The tool outputs' opener leaves the calls block.** The template writes the turn opener after a
+  user message only, so after a tool result the prompt's replay walks the call turn, and the R1
+  distills' template writes `<｜tool▁calls▁end｜><｜end▁of▁sentence｜>` after the second call and
+  later only, so a turn with one call ends with neither: without the row the walk stayed in the
+  block and the next turn read as wrapper text. `<｜tool▁outputs▁begin｜>` is a terminal with a row
+  from the block to content, so the walk goes on past the tool outputs, and the model's own
+  `<think>`, or one the client prefilled (`continue_final_message`), opens the thought there as it
+  does after `<｜Assistant｜>`; a marker quoted inside a tool's output moves the walk, as it does
+  after an ended block. Bellwether's R1-line sets hold content alone, so the module test pins the
+  one-call history as that template renders it, and the prefilled thought.
 
 ## GLM 4.5 and 4.6 (`glm4`)
 

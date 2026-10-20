@@ -33,12 +33,12 @@ use crate::format::{CallSyntax, Emits, Format};
 /// The text between a call's name and its arguments: the fence the template opens.
 pub const FENCE_OPEN: &str = "\n```json\n";
 
-/// The DeepSeek V3 table. The template writes the turn opener after a user message only, so
-/// after a tool result the model's turn is unopened: the table names content as the state it
-/// starts in, with the tool outputs' opener as the end of the turn the model wrote, since the R1
-/// distills' template ends a turn with one call with neither `<｜tool▁calls▁end｜>` nor
-/// `<｜end▁of▁sentence｜>` (nothing of such a prompt is replayed; the model's own `<think>` opens
-/// the thought).
+/// The DeepSeek V3 table. The tool outputs' opener leaves the calls block as the block's close
+/// does: the template writes the turn opener after a user message only, so after a tool result
+/// the prompt's replay walks the call turn, and the R1 distills' template ends a turn with one
+/// call with neither `<｜tool▁calls▁end｜>` nor `<｜end▁of▁sentence｜>`; the walk goes on past the
+/// tool outputs in content, where the model's own `<think>`, or one the client prefilled, opens
+/// the thought.
 pub fn deepseek_v3() -> Format {
     Format::new("deepseek_v3")
         .terminal("think_open", "<think>")
@@ -47,6 +47,7 @@ pub fn deepseek_v3() -> Format {
         .terminal("calls_close", "<｜tool▁calls▁end｜>")
         .terminal("call_open", "<｜tool▁call▁begin｜>function<｜tool▁sep｜>")
         .terminal("call_close", "```<｜tool▁call▁end｜>")
+        .terminal("outputs_open", "<｜tool▁outputs▁begin｜>")
         .state("content", Emits::Content)
         .state("reasoning", Emits::Reasoning)
         .state("calls", Emits::Wrapper)
@@ -60,12 +61,12 @@ pub fn deepseek_v3() -> Format {
         .transition("call", "call_open", "call")
         .transition("call", "calls_close", "content")
         .transition("calls", "calls_close", "content")
+        .transition("calls", "outputs_open", "content")
         .calls(CallSyntax::NamedArguments {
             marker: FENCE_OPEN,
             between_calls: "\n",
         })
         .opens_turn("<｜Assistant｜>")
-        .unopened_turn_starts_in("content", "<｜tool▁outputs▁begin｜>")
 }
 
 #[cfg(test)]
@@ -461,9 +462,8 @@ mod tests {
         assert!(!format.reasoning_open("<｜User｜>Hi<｜Assistant｜>"));
         assert!(format.reasoning_open(THINKING));
         // After a tool result the prompt ends in `<｜tool▁outputs▁end｜>` with no new opener: the
-        // tool outputs ended the model's turn, the walk replays nothing of it, and the output
-        // starts in content, where the template puts it (`replay` still gives the text from the
-        // opener: replayed again, it says the same).
+        // replay walks the previous turn's calls block from its `<｜Assistant｜>` and leaves the
+        // output in content, where the template puts it.
         let prompt = "<｜User｜>Weather in Paris?<｜Assistant｜><｜tool▁calls▁begin｜>\
                       <｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n\
                       {\"city\": \"Paris\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>\
@@ -478,9 +478,8 @@ mod tests {
         assert_eq!(content(&events), "It is 18 degrees.");
         assert!(calls(&events).is_empty());
         // The R1 distills' template writes `<｜tool▁calls▁end｜><｜end▁of▁sentence｜>` after the
-        // second call and later only, so a turn with one call ends with neither; replayed, it
-        // would leave the output in the calls block, and the next turn would read as wrapper
-        // text. The tool outputs end it all the same, and the model's own `<think>` opens the
+        // second call and later only, so a turn with one call ends with neither; the tool
+        // outputs' opener leaves the block all the same, and the model's own `<think>` opens the
         // thought from content, as it does after `<｜Assistant｜>`.
         let one_call = "<｜User｜>Weather in Paris?<｜Assistant｜><｜tool▁calls▁begin｜>\
                         <｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n\
@@ -489,10 +488,21 @@ mod tests {
                         <｜tool▁outputs▁end｜>";
         assert!(
             !format.reasoning_open(one_call),
-            "the tool outputs ended the turn"
+            "the tool outputs left the block"
         );
         let events = run(one_call, &["<think>Warm.</think>It is 18 degrees."]);
         assert_eq!(reasoning(&events), "Warm.");
+        assert_eq!(content(&events), "It is 18 degrees.");
+        assert!(calls(&events).is_empty());
+        // A thought the client prefilled after the tool result (`continue_final_message`) is
+        // read: the walk went past the tool outputs, and `<think>` opened the thought.
+        let prefilled = format!("{one_call}<think>\nThe tool says");
+        assert!(
+            format.reasoning_open(&prefilled),
+            "the prefilled thought is open"
+        );
+        let events = run(&prefilled, &[" 18.</think>It is 18 degrees."]);
+        assert_eq!(reasoning(&events), " 18.");
         assert_eq!(content(&events), "It is 18 degrees.");
         assert!(calls(&events).is_empty());
         // A marker quoted in an earlier turn moves nothing.
@@ -593,8 +603,10 @@ mod tests {
             ]})
         );
         // With the prompt's thought open and the grammar run from the first token, the thought's
-        // text may not write the table's terminals, and may still hold a fenced draft of the
-        // arguments: the fence is ordinary text, and a call opens only at the call's opener.
+        // text may not write the table's terminals (the tool outputs' opener among them, a
+        // marker the template writes and the model does not), and may still hold a fenced draft
+        // of the arguments: the fence is ordinary text, and a call opens only at the call's
+        // opener.
         let open = deepseek_v3()
             .grammar_for(
                 std::slice::from_ref(&tool),
@@ -617,6 +629,7 @@ mod tests {
                 "<｜tool▁calls▁end｜>",
                 "<｜tool▁call▁begin｜>function<｜tool▁sep｜>",
                 "```<｜tool▁call▁end｜>",
+                "<｜tool▁outputs▁begin｜>",
             ])
         );
         // The call as the tag writes it, the fence's close right after the object (the template
