@@ -368,12 +368,17 @@ pub(crate) fn select_from(
 /// `--worker-overload-shed` an overloaded worker is never taken (the caller
 /// sheds an all-overloaded pool); `None` when the pool is not all-vetoed or
 /// has nothing routable. Under `--traffic-split` the pool is narrowed to one
-/// group first, admitted as a lifted pool is (every veto but the overload
-/// one), by the request's key where it has one and at random otherwise, so
-/// a canary takes its weight's share of a spike and not the least-loaded
-/// worker's; a pool whose groups all weigh 0 is declined rather than served
-/// from the drained build; a pool the split does not apply to (one group,
-/// or no admitted member: every worker stalled) keeps the least-loaded pick.
+/// group first, by the request's key where it has one and at random
+/// otherwise, so a canary takes its weight's share of a spike and not the
+/// least-loaded worker's: the arms admit what the fallback itself can take
+/// (a ready worker, healthy with its circuit closed; under
+/// `--worker-overload-shed` not an overloaded one), so a stalled member joins
+/// its group's arm, counts in the group's weight and is the arm's answer when
+/// every worker is stalled or the shed leaves it alone, while a group the
+/// shed empties drops out of the draw as a down group does; a pool whose
+/// groups all weigh 0 among those is declined rather than served from the
+/// drained build; a pool of one group keeps the least-loaded pick. The
+/// split's selection is counted once the arm has answered.
 fn overload_fallback(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
@@ -386,23 +391,36 @@ fn overload_fallback(
     let whole =
         || overload::fallback_if_all_vetoed(candidates, model_id, STAGE_SELECTION, shedding);
     let selected = if policies.traffic_split_enabled() {
-        let admits = |worker: &dyn Worker| worker.routing_state().eligible_ignoring_overload();
-        if traffic_split::drained(candidates, admits) {
+        // The arms admit what the fallback can take: a ready worker (healthy,
+        // circuit closed), and under the shed not an overloaded one, so a group
+        // the shed empties drops out of the draw as a down group does.
+        let takes = |worker: &dyn Worker| {
+            worker.is_healthy()
+                && worker.circuit_breaker_can_execute()
+                && !(shedding && worker.is_overloaded())
+        };
+        if traffic_split::drained(candidates, takes) {
             return None;
         }
-        match traffic_split::Split::plan(candidates, admits) {
+        match traffic_split::Split::plan(candidates, takes) {
             Some(split) => {
                 let arm = match policies.effective_sticky_key(info) {
                     Some((key, _)) => split.arm_for_key(key),
                     None => split.arm_at_random(&mut rand::rng()),
                 };
-                Metrics::record_traffic_split_selection(model_id, arm.name);
                 let members: Vec<Arc<dyn Worker>> = arm
                     .members
                     .iter()
                     .map(|&idx| Arc::clone(&candidates[idx]))
                     .collect();
-                overload::fallback_if_all_vetoed(&members, model_id, STAGE_SELECTION, shedding)?
+                let selected = overload::fallback_if_all_vetoed(
+                    &members,
+                    model_id,
+                    STAGE_SELECTION,
+                    shedding,
+                )?;
+                Metrics::record_traffic_split_selection(model_id, arm.name);
+                selected
             }
             None => whole()?,
         }
@@ -2207,6 +2225,35 @@ mod tests {
             .is_none(),
             "a pool whose groups all weigh 0 is declined, not served"
         );
+        // A stalled member still joins its group's arm: under the shed, where
+        // an overloaded worker is never taken, the arm's answer is the wedged
+        // stable worker, not a miss; and a wedged stable fleet beside an
+        // overloaded canary at 0 still serves from the stable fleet.
+        let registry = grouped("90", "10");
+        registry.set_overload_shed(true);
+        let wedged = registry.get_by_url("http://s:2").expect("registered");
+        registry.set_worker_overloaded(&wedged, false);
+        wedged.set_stall(Some(StallReason::Wedged));
+        for _ in 0..20 {
+            assert_eq!(
+                pick(&registry, &policies, PlacementInputs::default()).base_url(),
+                "http://s:2",
+                "the shed left the arm without its stalled worker"
+            );
+        }
+        let registry = grouped("90", "0");
+        for url in ["http://s:1", "http://s:2"] {
+            let worker = registry.get_by_url(url).expect("registered");
+            registry.set_worker_overloaded(&worker, false);
+            worker.set_stall(Some(StallReason::Wedged));
+        }
+        for _ in 0..20 {
+            assert_ne!(
+                pick(&registry, &policies, PlacementInputs::default()).base_url(),
+                "http://c:1",
+                "a drained canary served a pool whose stable fleet is only suspected"
+            );
+        }
     }
 
     /// A routing key pins consistent hashing to one worker; once that worker
