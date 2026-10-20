@@ -42,6 +42,14 @@ pub enum Job {
         url: String,
         update: Box<WorkerUpdateRequest>,
     },
+    /// Re-read a registered worker's labels from its engine and rebuild the
+    /// worker if they changed: the worker came into service, as a restarted
+    /// engine on the same address or one that finished loading after it was
+    /// registered on provisional information. Runs through the update
+    /// workflow.
+    RefreshWorkerLabels {
+        url: String,
+    },
     RemoveWorker {
         url: String,
         /// Per-worker revision guards keyed by registry worker id. A DP group
@@ -79,6 +87,7 @@ impl Job {
         match self {
             Job::AddWorker { .. } => "AddWorker",
             Job::UpdateWorker { .. } => "UpdateWorker",
+            Job::RefreshWorkerLabels { .. } => "RefreshWorkerLabels",
             Job::RemoveWorker { .. } => "RemoveWorker",
             Job::InitializeWorkersFromConfig { .. } => "InitializeWorkersFromConfig",
             Job::InitializeMcpServers { .. } => "InitializeMcpServers",
@@ -95,6 +104,7 @@ impl Job {
         match self {
             Job::AddWorker { config, .. } => &config.url,
             Job::UpdateWorker { url, .. } => url,
+            Job::RefreshWorkerLabels { url } => url,
             Job::RemoveWorker { url, .. } => url,
             Job::InitializeWorkersFromConfig { .. } => "startup",
             Job::InitializeMcpServers { .. } => "startup",
@@ -226,13 +236,18 @@ impl JobQueue {
     /// exactly one job per URL (#1533).
     pub async fn submit_if_idle(&self, job: Job) -> Result<bool, String> {
         let worker_url = job.worker_url().to_string();
-        if !Self::claim(&self.status_map, &worker_url, job.job_type()) {
+        let job_type = job.job_type();
+        if !Self::claim(&self.status_map, &worker_url, job_type) {
             return Ok(false);
         }
-        self.submit(job).await.map(|()| true).inspect_err(|_| {
-            // A failed submission owns no job, so its claim must not block the next one.
-            self.status_map.remove(&worker_url);
-        })
+        self.submit_inner(job, true)
+            .await
+            .map(|()| true)
+            .inspect_err(|_| {
+                // A failed submission owns no job, so its claim must not block the
+                // next one; only its own entry goes.
+                Self::record_own_status(&self.status_map, &worker_url, job_type, None);
+            })
     }
 
     /// Only an in-flight job of the same type counts: the status map is keyed
@@ -253,8 +268,61 @@ impl JobQueue {
         }
     }
 
+    /// Submit unless a job of any type is pending or processing for this URL.
+    /// For a best-effort submission that must not take an in-flight job's
+    /// status under the key: a label refresh while the worker's registration
+    /// is still processing would take that job's entry (and let the in-flight
+    /// guard admit a second registration). Returns `Ok(false)` when one is in
+    /// flight; the caller's next occasion submits again. A job of another type
+    /// submitted after the claim keeps its entry too: the pending status
+    /// written once a slot is held, the rollback of a failed submission and a
+    /// job's later status writes touch only this job's own entry
+    /// (`record_own_status`).
+    pub async fn submit_unless_in_flight(&self, job: Job) -> Result<bool, String> {
+        let worker_url = job.worker_url().to_string();
+        let job_type = job.job_type();
+        if !Self::claim_unless_in_flight(&self.status_map, &worker_url, job_type) {
+            return Ok(false);
+        }
+        self.submit_inner(job, true)
+            .await
+            .map(|()| true)
+            .inspect_err(|_| {
+                // A failed submission owns no job, so its claim must not block the
+                // next one; only its own entry goes (another job's, taken during
+                // the wait for a slot, stays with that job).
+                Self::record_own_status(&self.status_map, &worker_url, job_type, None);
+            })
+    }
+
+    /// Any in-flight job under the key blocks the claim, whatever its type.
+    fn claim_unless_in_flight(
+        status_map: &DashMap<String, JobStatus>,
+        url: &str,
+        job_type: &'static str,
+    ) -> bool {
+        match status_map.entry(url.to_string()) {
+            Entry::Occupied(e) if matches!(e.get().status.as_str(), "pending" | "processing") => {
+                false
+            }
+            entry => {
+                entry.insert(JobStatus::pending(job_type, url));
+                true
+            }
+        }
+    }
+
     /// Submit a job with detailed queue status
     pub async fn submit(&self, job: Job) -> Result<(), String> {
+        self.submit_inner(job, false).await
+    }
+
+    /// `submit`, with the pending status written over this job's own claim
+    /// alone when `claimed` ([`Self::submit_if_idle`],
+    /// [`Self::submit_unless_in_flight`]): a job of another type that took the
+    /// URL during the wait for a slot keeps its entry, where a plain submission
+    /// writes its own over whatever is there.
+    async fn submit_inner(&self, job: Job, claimed: bool) -> Result<(), String> {
         // Check if context is still alive before accepting jobs
         let Some(context) = self.context.upgrade() else {
             return Err("Job queue shutting down: AppContext dropped".to_string());
@@ -282,10 +350,7 @@ impl JobQueue {
         };
 
         // Record pending status
-        self.status_map.insert(
-            worker_url.clone(),
-            JobStatus::pending(job_type, &worker_url),
-        );
+        Self::write_pending(&self.status_map, &worker_url, job_type, claimed);
         // A tokenizer load counts as in flight for its model from here (the
         // model is pending until the job ends, whatever was recorded): with
         // the slot held, the job is handed over right after the count, so a
@@ -324,10 +389,13 @@ impl JobQueue {
         let worker_url = job.worker_url().to_string();
         let start = std::time::Instant::now();
 
-        // Update to processing
-        status_map.insert(
-            worker_url.clone(),
-            JobStatus::processing(job_type, &worker_url),
+        // Update to processing: this job's entry only (a job of another type
+        // submitted for the URL since this one was queued keeps its status).
+        Self::record_own_status(
+            &status_map,
+            &worker_url,
+            job_type,
+            Some(JobStatus::processing(job_type, &worker_url)),
         );
 
         debug!("Processing job: type={}, worker={}", job_type, worker_url);
@@ -438,6 +506,41 @@ impl JobQueue {
                 engines
                     .worker_update
                     .wait_for_completion(instance_id, url, timeout_duration)
+                    .await
+            }
+            Job::RefreshWorkerLabels { url } => {
+                let engines = context
+                    .workflow_engines
+                    .get()
+                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+
+                let mut workflow_data = create_worker_update_workflow_data(
+                    url.to_string(),
+                    WorkerUpdateRequest {
+                        priority: None,
+                        cost: None,
+                        labels: None,
+                        api_key: None,
+                        health: None,
+                    },
+                    Arc::clone(context),
+                );
+                workflow_data.refresh_discovered_labels = true;
+
+                let instance_id = engines
+                    .worker_update
+                    .start_workflow(WorkflowId::new("worker_update"), workflow_data)
+                    .await
+                    .map_err(|e| format!("Failed to start worker label refresh workflow: {e:?}"))?;
+
+                debug!(
+                    "Started worker label refresh workflow for {} (instance: {})",
+                    url, instance_id
+                );
+
+                engines
+                    .worker_update
+                    .wait_for_completion(instance_id, url, Duration::from_secs(30))
                     .await
             }
             Job::RemoveWorker {
@@ -787,21 +890,82 @@ impl JobQueue {
     ) {
         match result {
             Ok(message) => {
-                status_map.remove(worker_url);
+                Self::record_own_status(status_map, worker_url, job_type, None);
                 debug!(
                     "Completed job: type={}, worker={}, result={}",
                     job_type, worker_url, message
                 );
             }
             Err(error) => {
-                status_map.insert(
-                    worker_url.to_string(),
-                    JobStatus::failed(job_type, worker_url, error.clone()),
+                Self::record_own_status(
+                    status_map,
+                    worker_url,
+                    job_type,
+                    Some(JobStatus::failed(job_type, worker_url, error.clone())),
                 );
                 warn!(
                     "Failed job: type={}, worker={}, error={}",
                     job_type, worker_url, error
                 );
+            }
+        }
+    }
+
+    /// The pending status under `url` once a slot is held: written over
+    /// whatever is there, or, for a claimed submission (`own_only`), over this
+    /// job's own claim alone (`record_own_status`), so a job of another type
+    /// that took the URL during the wait keeps its entry and the in-flight
+    /// guard that reads it.
+    fn write_pending(
+        status_map: &DashMap<String, JobStatus>,
+        url: &str,
+        job_type: &'static str,
+        own_only: bool,
+    ) {
+        if own_only {
+            Self::record_own_status(
+                status_map,
+                url,
+                job_type,
+                Some(JobStatus::pending(job_type, url)),
+            );
+        } else {
+            status_map.insert(url.to_string(), JobStatus::pending(job_type, url));
+        }
+    }
+
+    /// Writes a job's status under its URL (`None` removes it) unless the
+    /// entry there is another job's: a job of another type submitted for the
+    /// URL after this one was queued keeps its status for its lifetime, since
+    /// the in-flight guards (the reconciler's, `submit_unless_in_flight`) read
+    /// that entry. A vacant entry is written as before.
+    fn record_own_status(
+        status_map: &DashMap<String, JobStatus>,
+        url: &str,
+        job_type: &'static str,
+        status: Option<JobStatus>,
+    ) {
+        match status_map.entry(url.to_string()) {
+            Entry::Occupied(entry) if entry.get().job_type != job_type => {
+                debug!(
+                    "Job status of type={} for worker={} left to the {} job under the key",
+                    job_type,
+                    url,
+                    entry.get().job_type
+                );
+            }
+            Entry::Occupied(mut entry) => match status {
+                Some(status) => {
+                    entry.insert(status);
+                }
+                None => {
+                    entry.remove();
+                }
+            },
+            Entry::Vacant(entry) => {
+                if let Some(status) = status {
+                    entry.insert(status);
+                }
             }
         }
     }
@@ -1042,6 +1206,122 @@ mod tests {
             JobStatus::pending("RegisterMcpServer", "http://w:8000"),
         );
         assert!(JobQueue::claim(&map, "http://w:8000", "AddWorker"));
+    }
+
+    /// A claim that yields to any in-flight job never replaces that job's
+    /// status under the URL; a terminal status under it is taken over.
+    #[test]
+    fn claim_unless_in_flight_yields_to_a_job_of_another_type() {
+        let map: DashMap<String, JobStatus> = DashMap::new();
+        map.insert(
+            "http://w:8000".to_string(),
+            JobStatus::processing("AddWorker", "http://w:8000"),
+        );
+        assert!(!JobQueue::claim_unless_in_flight(
+            &map,
+            "http://w:8000",
+            "RefreshWorkerLabels"
+        ));
+        assert_eq!(map.get("http://w:8000").unwrap().job_type, "AddWorker");
+
+        map.insert(
+            "http://w:8000".to_string(),
+            JobStatus::failed("AddWorker", "http://w:8000", "boom".to_string()),
+        );
+        assert!(JobQueue::claim_unless_in_flight(
+            &map,
+            "http://w:8000",
+            "RefreshWorkerLabels"
+        ));
+        assert_eq!(
+            map.get("http://w:8000").unwrap().job_type,
+            "RefreshWorkerLabels"
+        );
+    }
+
+    /// A job's processing and completion writes touch only its own entry: a
+    /// job of another type that took the URL after it was queued keeps its
+    /// status through the first job's processing, failure and success.
+    #[test]
+    fn a_jobs_status_writes_leave_another_jobs_entry_alone() {
+        let map: DashMap<String, JobStatus> = DashMap::new();
+        let url = "http://w:8000";
+        map.insert(url.to_string(), JobStatus::processing("RemoveWorker", url));
+        for status in [
+            Some(JobStatus::processing("RefreshWorkerLabels", url)),
+            Some(JobStatus::failed(
+                "RefreshWorkerLabels",
+                url,
+                "boom".to_string(),
+            )),
+            None,
+        ] {
+            JobQueue::record_own_status(&map, url, "RefreshWorkerLabels", status);
+            let entry = map.get(url).expect("the other job's entry stays");
+            assert_eq!(entry.job_type, "RemoveWorker");
+            assert_eq!(entry.status, "processing");
+        }
+
+        // The job's own entry takes its writes, and a vacant one is written.
+        map.insert(
+            url.to_string(),
+            JobStatus::pending("RefreshWorkerLabels", url),
+        );
+        JobQueue::record_own_status(
+            &map,
+            url,
+            "RefreshWorkerLabels",
+            Some(JobStatus::processing("RefreshWorkerLabels", url)),
+        );
+        assert_eq!(map.get(url).unwrap().status, "processing");
+        JobQueue::record_own_status(&map, url, "RefreshWorkerLabels", None);
+        assert!(map.get(url).is_none());
+        JobQueue::record_own_status(
+            &map,
+            url,
+            "RefreshWorkerLabels",
+            Some(JobStatus::failed(
+                "RefreshWorkerLabels",
+                url,
+                "boom".to_string(),
+            )),
+        );
+        assert_eq!(map.get(url).unwrap().status, "failed");
+    }
+
+    /// The pending status a claimed submission writes once its slot is held
+    /// goes over its own claim alone: a job of another type that took the URL
+    /// during the wait keeps its entry, where a plain submission's write takes
+    /// the key; a vacant entry is written either way.
+    #[test]
+    fn a_claimed_submissions_pending_write_leaves_another_jobs_entry_alone() {
+        let map: DashMap<String, JobStatus> = DashMap::new();
+        let url = "http://w:8000";
+        map.insert(url.to_string(), JobStatus::pending("AddWorker", url));
+        JobQueue::write_pending(&map, url, "RefreshWorkerLabels", true);
+        assert_eq!(map.get(url).unwrap().job_type, "AddWorker");
+        JobQueue::write_pending(&map, url, "RefreshWorkerLabels", false);
+        assert_eq!(map.get(url).unwrap().job_type, "RefreshWorkerLabels");
+        map.remove(url);
+        JobQueue::write_pending(&map, url, "RefreshWorkerLabels", true);
+        let entry = map.get(url).expect("a vacant entry is written");
+        assert_eq!(entry.job_type, "RefreshWorkerLabels");
+        assert_eq!(entry.status, "pending");
+    }
+
+    /// A claimed submission that fails releases its claim, so the caller's
+    /// next occasion submits again; the release is a write of its own entry
+    /// (`record_own_status`), so another job's entry under the URL stays.
+    #[tokio::test]
+    async fn failed_submit_unless_in_flight_releases_its_claim() {
+        let queue = JobQueue::new(JobQueueConfig::default(), Weak::new());
+        let url = "http://w:8000";
+        let job = || Job::RefreshWorkerLabels {
+            url: url.to_string(),
+        };
+        assert!(queue.submit_unless_in_flight(job()).await.is_err());
+        assert!(queue.status_map.get(url).is_none());
+        assert!(queue.submit_unless_in_flight(job()).await.is_err());
     }
 
     /// A submission that fails must not leave its claim behind, or the next

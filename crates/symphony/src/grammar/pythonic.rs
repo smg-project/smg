@@ -97,17 +97,7 @@ fn calls_joined(dialect: Dialect, tools: &[&Tool], count: Count<'_>, between: &s
             })
             .collect(),
     );
-    if count.one {
-        one_call
-    } else {
-        Grammar::Sequence(vec![
-            one_call.clone(),
-            Grammar::Star(Box::new(Grammar::Sequence(vec![
-                Grammar::ConstString(between.to_string()),
-                one_call,
-            ]))),
-        ])
-    }
+    count.calls_between(one_call, between)
 }
 
 /// One call: the name and `(`, the arguments, `)`.

@@ -26,6 +26,7 @@ use openai_protocol::common::Tool;
 use serde_json::Value;
 
 use super::{
+    repeated,
     schema::{joined, joined_nodes, keyword, shape, Definitions},
     CallMarkers, Count, Grammar, Tag,
 };
@@ -270,7 +271,7 @@ impl Ends<'_> {
         };
         Grammar::Sequence(vec![
             Grammar::ConstString("[".to_string()),
-            Grammar::Optional(Box::new(separated(item, ","))),
+            Grammar::Optional(Box::new(repeated(item, ","))),
             Grammar::ConstString("]".to_string()),
         ])
     }
@@ -306,7 +307,7 @@ impl Ends<'_> {
             Grammar::ConstString(":".to_string()),
             self.any_value(),
         ]);
-        Grammar::Optional(Box::new(separated(pair, ",")))
+        Grammar::Optional(Box::new(repeated(pair, ",")))
     }
 
     /// `texts` and the call's exits, as a text's excludes.
@@ -340,17 +341,6 @@ fn one_of(mut branches: Vec<Grammar>, none: impl FnOnce() -> Grammar) -> Grammar
         1 => branches.swap_remove(0),
         _ => Grammar::Or(branches),
     }
-}
-
-/// `item` once or more, `separator` between them.
-fn separated(item: Grammar, separator: &str) -> Grammar {
-    Grammar::Sequence(vec![
-        item.clone(),
-        Grammar::Star(Box::new(Grammar::Sequence(vec![
-            Grammar::ConstString(separator.to_string()),
-            item,
-        ]))),
-    ])
 }
 
 #[cfg(test)]

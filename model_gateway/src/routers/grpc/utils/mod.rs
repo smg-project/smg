@@ -28,6 +28,7 @@ pub(crate) use logprobs::{
     convert_proto_to_openai_logprobs,
 };
 pub use message_utils::{process_messages_with_encoding, template_tools};
+pub(crate) use message_utils::{resolve_media, MediaContext};
 pub(crate) use metrics::{error_type_for_response, error_type_from_status, route_to_endpoint};
 // `pub` (not `pub(crate)`) so the Go bindings can reuse the gateway's arming
 // predicate instead of duplicating it.
@@ -39,7 +40,7 @@ pub(crate) use parsers::{
     rendered_prompt_reasoning_in_prefill, tool_constraints_for_worker, ModelNames, Names,
     ParserResolver, WorkerDecoding,
 };
-pub(crate) use pd_bootstrap::account_pd_side_failure;
+pub(crate) use pd_bootstrap::{account_pd_side_failure, dead_rendezvous_of, DeadRendezvous};
 pub(crate) use stream_failure::{send_stream_failure, StreamFailure, StreamSource};
 
 /// One WARN per choice whose stream recovered from a rewritten decode prefix

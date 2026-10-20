@@ -386,7 +386,8 @@ fn learned(format: &Format, id: &str, template: &str, setting: &str) -> Result<L
 }
 
 /// That a table with `layout` has a tag for a forced call, a named function, one call and a JSON
-/// answer, with the prompt's thought open and not.
+/// answer, with the prompt's thought open and not, and that every one of them passes the rule the
+/// engines' structural-tag parsers hold a tag to (`Grammar::check`).
 fn every_mode_has_a_tag(format: &Format, layout: Layout) {
     let format = format.clone().with_layout(layout);
     let tools: Vec<Tool> = serde_json::from_value(layout::tools()).unwrap();
@@ -395,13 +396,22 @@ fn every_mode_has_a_tag(format: &Format, layout: Layout) {
             let options = Options {
                 at_least_one,
                 reasoning_open,
+                thought_closed: false,
                 one_call,
                 start: GrammarStart::Unknown,
             };
-            assert!(format.grammar_for(&tools, options).is_some(), "{options:?}");
+            let tag = format
+                .grammar_for(&tools, options)
+                .unwrap_or_else(|| panic!("{options:?}"));
+            tag.check()
+                .unwrap_or_else(|why| panic!("{options:?}: the engines refuse the tag: {why}"));
         }
-        let answer = format.answer_grammar(&json!({"type": "object"}), reasoning_open);
-        assert!(answer.is_some(), "{reasoning_open}");
+        let answer = format
+            .answer_grammar(&json!({"type": "object"}), reasoning_open)
+            .unwrap_or_else(|| panic!("{reasoning_open}"));
+        answer.check().unwrap_or_else(|why| {
+            panic!("thought open {reasoning_open}: the engines refuse the answer grammar: {why}")
+        });
     }
 }
 

@@ -317,6 +317,85 @@ pub(crate) async fn execute_streaming_tool_calls(
     true
 }
 
+/// The calls of a batch beyond the request's tool-call allowance: none runs.
+/// Each is closed on the wire under the type the stream announced for it,
+/// with the item the non-streamed loop renders for the same call
+/// ([`not_executed_tool_call_item`]): an `mcp_call` gets
+/// `response.mcp_call.failed` and then its `response.output_item.done`; a
+/// call in a hosted format gets its `response.output_item.done` alone (the
+/// API has no failed sub-event for those item types; the item's status says
+/// it). So no item the stream announced stays open, and each takes its place
+/// among the final response's items after the calls that ran. Returns false
+/// when the client left.
+pub(crate) async fn skip_streaming_tool_calls(
+    skipped: Vec<FunctionCallInProgress>,
+    session: &McpToolSession<'_>,
+    format_registry: &FormatRegistry,
+    tx: &SseSender,
+    state: &mut ToolLoopState,
+    sequence_number: &mut u64,
+) -> bool {
+    for call in skipped {
+        let response_format =
+            openai_bridge::lookup_tool_format(session, format_registry, &call.name);
+        let server_label = session.resolve_tool_server_label(&call.name);
+        let arguments = if call.arguments_buffer.is_empty() {
+            "{}"
+        } else {
+            &call.arguments_buffer
+        };
+        let item_id = stable_streaming_tool_item_id(&call, response_format);
+        let mut item = not_executed_tool_call_item(
+            response_format,
+            call.item_id.as_deref().unwrap_or(call.call_id.as_str()),
+            &server_label,
+            &call.name,
+            arguments,
+        );
+        if let Some(obj) = item.as_object_mut() {
+            obj.insert("id".to_string(), Value::String(item_id.clone()));
+        }
+        let output_index = call.effective_output_index();
+
+        if response_format == ResponseFormat::Passthrough {
+            let failed_payload = json!({
+                "type": McpEvent::CALL_FAILED,
+                "sequence_number": *sequence_number,
+                "output_index": output_index,
+                "item_id": item_id
+            });
+            *sequence_number += 1;
+            let failed_event = format!(
+                "event: {}\ndata: {}\n\n",
+                McpEvent::CALL_FAILED,
+                failed_payload
+            );
+            if tx.send(Ok(Bytes::from(failed_event))).await.is_err() {
+                return false;
+            }
+        }
+
+        let done_payload = json!({
+            "type": OutputItemEvent::DONE,
+            "sequence_number": *sequence_number,
+            "output_index": output_index,
+            "item": item
+        });
+        *sequence_number += 1;
+        let done_event = format!(
+            "event: {}\ndata: {}\n\n",
+            OutputItemEvent::DONE,
+            done_payload
+        );
+        if tx.send(Ok(Bytes::from(done_event))).await.is_err() {
+            return false;
+        }
+
+        state.mcp_call_items.push(item);
+    }
+    true
+}
+
 /// Transform payload to replace MCP/builtin tools with function tools.
 ///
 /// Retains existing function tools from the request, removes non-function tools
@@ -755,7 +834,14 @@ fn build_approval_response(
     Ok(response)
 }
 
-fn retained_output_items(output_array: &[Value], original_body: &ResponsesRequest) -> Vec<Value> {
+/// The upstream's output items a response keeps when the loop ends short of
+/// an answer: everything but the model's asks for server calls (the
+/// `function_call` items bound to the session's tools), which the loop
+/// renders as its own `mcp_call` items; a client function's call stays.
+pub(crate) fn retained_output_items(
+    output_array: &[Value],
+    original_body: &ResponsesRequest,
+) -> Vec<Value> {
     let user_function_names: HashSet<&str> = original_body
         .tools
         .as_deref()
@@ -911,8 +997,9 @@ pub(crate) async fn execute_tool_loop(
                 return build_incomplete_response(
                     response_json,
                     state,
-                    "max_tool_calls",
+                    TOOL_CALL_LIMIT_REASON,
                     session,
+                    format_registry,
                     original_body,
                 );
             }
@@ -1062,12 +1149,65 @@ pub(crate) async fn execute_tool_loop(
     }
 }
 
+/// The `incomplete_details.reason` of a tool loop stopped at the request's
+/// `max_tool_calls` before the model's final answer, in both modes.
+pub(crate) const TOOL_CALL_LIMIT_REASON: &str = "max_tool_calls";
+/// The error of a call the loop did not run because the request's tool-call
+/// allowance was spent before it, in both modes.
+pub(crate) const NOT_EXECUTED_AT_TOOL_CALL_LIMIT: &str =
+    "Not executed - response stopped due to limit";
+
+/// The item of a call the loop did not run because the request's tool-call
+/// allowance was spent before it, in the call's own format, in both modes:
+/// an `mcp_call` that `failed` with [`NOT_EXECUTED_AT_TOOL_CALL_LIMIT`], or,
+/// for a tool answered in a hosted format, the item type the stream announces
+/// for the call (`web_search_call`, ...) with the status `failed`. The id is
+/// derived from the call's, as an executed call's is.
+fn not_executed_tool_call_item(
+    response_format: ResponseFormat,
+    item_id_source: &str,
+    server_label: &str,
+    tool_name: &str,
+    arguments: &str,
+) -> Value {
+    if response_format == ResponseFormat::Passthrough {
+        let mut item = build_mcp_call_item(
+            tool_name,
+            arguments,
+            "",
+            server_label,
+            false,
+            Some(NOT_EXECUTED_AT_TOOL_CALL_LIMIT),
+        );
+        if let Some(obj) = item.as_object_mut() {
+            obj.insert(
+                "id".to_string(),
+                Value::String(mcp_response_item_id(item_id_source)),
+            );
+        }
+        return item;
+    }
+    let mut item = build_transformed_mcp_call_item(
+        &json!({ "error": NOT_EXECUTED_AT_TOOL_CALL_LIMIT }),
+        response_format,
+        item_id_source,
+        server_label,
+        tool_name,
+        arguments,
+    );
+    if let Some(obj) = item.as_object_mut() {
+        obj.insert("status".to_string(), Value::String("failed".to_string()));
+    }
+    item
+}
+
 /// Build an incomplete response when limits are exceeded
 fn build_incomplete_response(
     mut response: Value,
     state: ToolLoopState,
     reason: &str,
     session: &McpToolSession<'_>,
+    format_registry: &FormatRegistry,
     original_body: &ResponsesRequest,
 ) -> Result<Value, String> {
     let obj = response
@@ -1103,6 +1243,17 @@ fn build_incomplete_response(
         })
         .unwrap_or_default();
 
+    // The calls this loop ran, each already among the executed items: a turn
+    // the allowance cut in two renders them once.
+    let executed_call_ids: HashSet<&str> = state
+        .conversation_history
+        .iter()
+        .filter(|item| {
+            item.get("type").and_then(Value::as_str) == Some(ItemType::FUNCTION_CALL_OUTPUT)
+        })
+        .filter_map(|item| item.get("call_id").and_then(Value::as_str))
+        .collect();
+
     // Convert MCP function_call items in output to mcp_call format.
     if let Some(output_array) = obj.get_mut("output").and_then(|v| v.as_array_mut()) {
         // Find any function_call items and convert them to mcp_call (incomplete)
@@ -1115,24 +1266,43 @@ fn build_incomplete_response(
                     // User function calls must remain as function_call output items.
                     continue;
                 }
+                let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                if executed_call_ids.contains(call_id) {
+                    // The call ran before the allowance was spent: its item
+                    // is among the executed ones.
+                    continue;
+                }
                 let args = item
                     .get("arguments")
                     .and_then(|v| v.as_str())
                     .unwrap_or("{}");
 
-                // Mark as incomplete - not executed
+                // Not executed: the item in the call's own format, as the
+                // streamed loop closes the same call.
+                let response_format =
+                    openai_bridge::lookup_tool_format(session, format_registry, tool_name);
+                let item_id = item
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| item.get("call_id").and_then(|v| v.as_str()))
+                    .unwrap_or("");
                 let resolved_label = session.resolve_tool_server_label(tool_name);
-                let mcp_call_item = build_mcp_call_item(
+                incomplete_items.push(not_executed_tool_call_item(
+                    response_format,
+                    &non_streaming_tool_item_id_source(item_id, response_format),
+                    &resolved_label,
                     tool_name,
                     args,
-                    "", // No output - wasn't executed
-                    &resolved_label,
-                    false, // Not successful
-                    Some("Not executed - response stopped due to limit"),
-                );
-                incomplete_items.push(mcp_call_item);
+                ));
             }
         }
+
+        // The asks themselves leave: each is rendered by its call's item (the
+        // executed one, or the not-executed one in the call's own format), as
+        // the approval exit keeps only the client's own function calls.
+        let retained = retained_output_items(output_array, original_body);
+        output_array.clear();
+        output_array.extend(retained);
 
         // Add mcp_list_tools and executed mcp_call items at the beginning
         if state.total_calls > 0 || !incomplete_items.is_empty() {
@@ -1319,7 +1489,8 @@ mod tests {
 
     use super::{
         build_transformed_mcp_call_item, extract_openai_response_output_items,
-        is_internal_mcp_response_item, mcp_list_tools_bindings_to_emit, ToolLoopState,
+        is_internal_mcp_response_item, mcp_list_tools_bindings_to_emit,
+        not_executed_tool_call_item, ToolLoopState, NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
     };
     use crate::openai_bridge::ResponseFormat;
 
@@ -1329,6 +1500,43 @@ mod tests {
         schema.insert("properties".to_string(), json!({}));
 
         Tool::new(name.to_string(), "internal", schema)
+    }
+
+    /// A call left over the tool-call allowance is rendered in its own
+    /// format: an `mcp_call` that failed with the not-executed error and the
+    /// id an executed call would have had, or the hosted item type the stream
+    /// announces for the tool, `failed`, with that format's id.
+    #[test]
+    fn a_not_executed_call_item_keeps_the_format_the_stream_announced() {
+        let plain = not_executed_tool_call_item(
+            ResponseFormat::Passthrough,
+            "fc_1",
+            "mock",
+            "brave_web_search",
+            "{}",
+        );
+        assert_eq!(plain["type"], "mcp_call");
+        assert_eq!(plain["status"], "failed");
+        assert_eq!(plain["id"], "mcp_1");
+        assert_eq!(plain["server_label"], "mock");
+        assert!(
+            plain["error"]
+                .to_string()
+                .contains(NOT_EXECUTED_AT_TOOL_CALL_LIMIT),
+            "{plain}"
+        );
+
+        let hosted = not_executed_tool_call_item(
+            ResponseFormat::WebSearchCall,
+            "1",
+            "mock",
+            "brave_web_search",
+            r#"{"query":"q"}"#,
+        );
+        assert_eq!(hosted["type"], "web_search_call");
+        assert_eq!(hosted["status"], "failed");
+        assert_eq!(hosted["id"], "ws_1");
+        assert!(hosted.get("server_label").is_none());
     }
 
     #[test]

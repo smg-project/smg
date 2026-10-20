@@ -527,7 +527,7 @@ impl WorkerSelectionStage {
                 plan,
                 ctx.state.media_refs_pipeline,
             ) {
-                return Err(error::bad_request(err.code(), err.to_string()));
+                return Err(err.into_response());
             }
         }
 
@@ -598,8 +598,7 @@ impl WorkerSelectionStage {
                 // Encode workers never process references: refuse strict
                 // worker mode here rather than silently bypass the encode fleet.
                 if inputs.media_refs {
-                    let err = multimodal::MmRefsError::EncodeNotSupported;
-                    return Err(error::bad_request(err.code(), err.to_string()));
+                    return Err(multimodal::MmRefsError::EncodeNotSupported.into_response());
                 }
                 let encode_item_hashes = match encode_item_hashes(inputs.intermediate) {
                     Ok(hashes) => hashes,
@@ -1286,7 +1285,7 @@ impl WorkerSelectionStage {
                 .filter(|w| !media.media_refs || accepts_media_refs(w.as_ref()))
                 .collect();
             if capable.is_empty() {
-                return self.media_refs_shed(model_id);
+                return Self::media_refs_shed(model_id);
             }
             let capable: Vec<Arc<dyn Worker>> = capable
                 .into_iter()
@@ -1296,7 +1295,7 @@ impl WorkerSelectionStage {
                 return match media.pipeline {
                     PipelinePin::Only => Self::pipeline_worker_required(model_id),
                     PipelinePin::Never => Self::pipeline_takes_no_audio(model_id),
-                    PipelinePin::Any => self.media_refs_shed(model_id),
+                    PipelinePin::Any => Self::media_refs_shed(model_id),
                 };
             }
             match placement::failure_from(
@@ -1356,24 +1355,21 @@ impl WorkerSelectionStage {
         response
     }
 
-    /// Workers serve the model but none advertises worker-side multimodal
-    /// processing. Terminal: capability cannot change within a retry window.
-    fn media_refs_shed(&self, model_id: &str) -> Response {
-        error!(
-            function = "WorkerSelectionStage::execute",
-            mode = ?self.mode,
-            model_id = %model_id,
-            "No worker advertising worker-side multimodal processing"
-        );
-        let mut response = error::service_unavailable(
-            "no_media_ref_capable_worker",
-            format!(
-                "model {model_id} has vLLM gRPC workers but none advertises mm_processor; set \
-                 SMG_VLLM_MM_PROCESSOR on the workers or SMG_MM_PROCESSING=router on the router"
-            ),
-        );
-        mark_non_retryable(&mut response);
-        response
+    /// Workers serve the model but none of the leg's workers processes media
+    /// references. Preparation answers this verdict for the pool as
+    /// registered (`multimodal::resolve_mm_processing`); here it is the
+    /// backstop for a pool that changed in between, or a disaggregated leg
+    /// none of whose workers does. Terminal: capability cannot change within
+    /// a retry window. Its one rate-limited line is written by
+    /// [`Self::report_refusal`] at the stage's entry points, like the pool's
+    /// other refusals, not here.
+    fn media_refs_shed(model_id: &str) -> Response {
+        placement::no_media_ref_capable_worker(format!(
+            "no worker of model '{model_id}' processes media references (none advertises an \
+             mm_processor), so a request whose media is forwarded to the worker cannot be \
+             served: start the workers with worker-side media processing, or run the router \
+             with --mm-processing auto or router"
+        ))
     }
 
     /// Workers serve the model but none can take the request right now
@@ -1734,7 +1730,7 @@ impl WorkerSelectionStage {
                     .filter(|w| accepts_media_refs(w.as_ref()))
                     .collect();
                 if processing.is_empty() {
-                    return self.media_refs_shed(model_id);
+                    return Self::media_refs_shed(model_id);
                 }
                 if !processing
                     .iter()
@@ -1977,6 +1973,7 @@ impl WorkerSelectionStage {
             cache_namespace,
             hash_ring: hash_ring.clone(),
             role: WorkerRole::Prefill,
+            overload_lifted: false,
         };
         let prefill_idx = self
             .policy_registry
@@ -2118,6 +2115,7 @@ fn assign_encode_workers(
                 cache_namespace: None,
                 hash_ring: hash_ring.clone(),
                 role: WorkerRole::Single,
+                overload_lifted: false,
             };
             let worker_idx = policy.select_worker(encode_workers, &info)?;
             let worker = encode_workers[worker_idx].clone();

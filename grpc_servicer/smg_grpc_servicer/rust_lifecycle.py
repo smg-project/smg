@@ -554,12 +554,26 @@ class EngineProcess:
     re-parented and would keep the GPU. So the engine's descendants are
     tracked while it runs, and a kill, or the cleanup after it exited on its
     own, reaches every one that is still the process it was.
+
+    The descendants are recorded from a pass over ``/proc`` when the handle
+    is built (the engine's children at its spawn, before anything else runs),
+    when the engine counts as started (:func:`supervise`, once the server
+    reports it connected: its workers are spawned by then), before it is
+    signalled, and every :data:`TRACK_INTERVAL_SECS` in between. What no
+    pass recovers is a worker spawned after one and orphaned before the
+    next, by a core that exits within the interval: an orphan leaves the
+    engine's lineage the moment its parent exits.
     """
 
-    def __init__(self, process: Any):
+    def __init__(self, process: Any, *, tree: ProcessTree | None = None):
         self._process = process
         self._descendants: dict[int, str] = {}  # pid -> start time, against PID reuse
         self._tracked_at = 0.0
+        # Tracked from the spawn: the children the engine has when its handle
+        # is built are recorded before the first poll (``tree`` is the pass a
+        # group of engines shares), so a core that exits before that poll
+        # leaves none of them behind untracked.
+        self.track(tree)
 
     @property
     def pid(self) -> int | None:
@@ -571,14 +585,18 @@ class EngineProcess:
             self.track()
         return code
 
-    def track(self) -> None:
-        """Record the engine's current descendants (one pass over ``/proc``)."""
+    def track(self, tree: ProcessTree | None = None) -> None:
+        """Record the engine's current descendants, from ``tree`` (the pass
+        over ``/proc`` a group shares between its engines) or from one pass of
+        its own."""
         pid = self.pid
         if pid is None:
             return
+        if tree is None:
+            tree = ProcessTree()
         self._tracked_at = time.monotonic()
-        for child in _descendants(pid):
-            start = _start_time(child)
+        for child in tree.descendants(pid):
+            start = tree.start_time(child)
             if start is not None:
                 self._descendants[child] = start
 
@@ -622,15 +640,17 @@ class EngineProcessGroup:
 
     Every process is tracked as an :class:`EngineProcess`, so the workers an
     engine core spawns (its TP ranks) are reaped the same way when a core is
-    killed or exits on its own. ``terminate`` goes through the manager, which
-    signals the cores and force-kills what is still alive after the grace
-    period; it runs once. ``kill`` reaches the processes directly.
+    killed or exits on its own; a pass over ``/proc`` the group takes is one
+    for all of them. ``terminate`` goes through the manager, which signals
+    the cores and force-kills what is still alive after the grace period; it
+    runs once. ``kill`` reaches the processes directly.
     """
 
     def __init__(self, manager: Any, *, shutdown_timeout: float | None = None):
         self._manager = manager
         self._shutdown_timeout = shutdown_timeout
-        self._engines = [EngineProcess(process) for process in manager.processes]
+        tree = ProcessTree()
+        self._engines = [EngineProcess(process, tree=tree) for process in manager.processes]
         self._exit_code: int | None = None
         self._shut_down = False
 
@@ -655,7 +675,12 @@ class EngineProcessGroup:
             code = next((code for code in codes if code is not None), None)
             if code is not None:
                 self._exit_code = code
-        if self._exit_code is not None and None in codes:
+        if self._exit_code is not None and None in codes and not self._shut_down:
+            # The cores still alive are shut down over their descendants as of
+            # now, not as of the interval's last pass, as an explicit
+            # ``terminate`` does: a worker one of them spawned since is what
+            # the cleanup after the shutdown must reach.
+            self.track()
             self._shutdown()
         return self._exit_code
 
@@ -667,8 +692,10 @@ class EngineProcessGroup:
             self._exit_code = code
 
     def track(self) -> None:
+        """Record every core's descendants, from one pass over ``/proc``."""
+        tree = ProcessTree()
         for engine in self._engines:
-            engine.track()
+            engine.track(tree)
 
     def terminate(self) -> None:
         self.track()
@@ -862,27 +889,46 @@ def on_fault_signal(target: Any, *signals: int, what: str) -> bool:
     return True
 
 
-def _descendants(pid: int) -> list[int]:
-    """Every live descendant of ``pid``, from one pass over ``/proc`` (the
-    per-task ``children`` files are not available on every kernel)."""
-    parent_of: dict[int, int] = {}
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
+class ProcessTree:
+    """Every live process's parent and start time, from one pass over
+    ``/proc`` (the per-task ``children`` files are not available on every
+    kernel), queried for the descendants of any number of pids: a group of
+    engines takes one pass, not one per engine."""
+
+    def __init__(self) -> None:
+        self._start: dict[int, str] = {}
+        self._children: dict[int, list[int]] = {}
         try:
-            with open(f"/proc/{entry}/stat") as handle:
-                parent_of[int(entry)] = int(handle.read().rsplit(")", 1)[1].split()[1])
-        except (OSError, ValueError, IndexError):
-            continue
-    found: list[int] = []
-    pending = [pid]
-    while pending:
-        parent = pending.pop()
-        for child, child_parent in parent_of.items():
-            if child_parent == parent and child not in found:
-                found.append(child)
-                pending.append(child)
-    return found
+            entries = os.listdir("/proc")
+        except OSError:  # no procfs: nothing can be tracked, nothing is
+            entries = []
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/stat") as handle:
+                    fields = handle.read().rsplit(")", 1)[1].split()
+                parent, start = int(fields[1]), fields[19]
+            except (OSError, ValueError, IndexError):
+                continue
+            self._start[int(entry)] = start
+            self._children.setdefault(parent, []).append(int(entry))
+
+    def descendants(self, pid: int) -> list[int]:
+        """Every live descendant of ``pid`` at the pass."""
+        found: list[int] = []
+        pending = [pid]
+        while pending:
+            for child in self._children.get(pending.pop(), ()):
+                if child not in found:
+                    found.append(child)
+                    pending.append(child)
+        return found
+
+    def start_time(self, pid: int) -> str | None:
+        """``pid``'s start time at the pass; ``None`` for a pid the pass did
+        not see."""
+        return self._start.get(pid)
 
 
 def _start_time(pid: int) -> str | None:
@@ -970,6 +1016,8 @@ async def supervise(
     process alive is reported to a server that takes such reports
     (``note_engine_alive``), so the server's startup bound counts silence
     from a living engine rather than time since the last handshake message.
+    An engine that tracks its workers (``track``) gets one pass when the
+    server first reports it connected, its start and its spawning over.
 
     Signals drain: health flips to NOT_SERVING at once (the Router stops
     routing here), in-flight streams get ``drain_secs`` to finish with the
@@ -978,6 +1026,7 @@ async def supervise(
     """
     loop = asyncio.get_running_loop()
     note_engine_alive = getattr(server, "note_engine_alive", None)
+    track = getattr(engine, "track", None)
     if stop_event is None:
         stop_event = asyncio.Event()
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -988,6 +1037,11 @@ async def supervise(
         while not stop_event.is_set():
             if not announced_ready and server.engine_ready:
                 announced_ready = True
+                # The engine's start is over, and with it the spawning of its
+                # workers: one pass records them all before the servicer
+                # counts as serving, whatever the interval's passes saw.
+                if track is not None:
+                    track()
                 logger.info("Engine connected; the servicer is SERVING")
             error = server.last_error
             if error or not server.running:

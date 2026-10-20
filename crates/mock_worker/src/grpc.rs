@@ -110,6 +110,7 @@ pub async fn serve_with_listener_until(
         capture,
         stopped,
         prefill_pending: Arc::new(AtomicU64::new(0)),
+        overrides: crate::overrides::for_port(addr.map(|a| a.port()).unwrap_or(0)),
     };
     let server = async {
         // tonic drains on incoming EOF when graceful shutdown is enabled,
@@ -186,6 +187,9 @@ struct MockScheduler {
     /// Prompt tokens of the requests handed to the engine with no token yet:
     /// the prefill work in hand, as a servicer reports it on its load record.
     prefill_pending: Arc<AtomicU64>,
+    /// What the admin API made this worker report about itself (serving,
+    /// server args, model capabilities).
+    overrides: Arc<crate::overrides::WorkerOverrides>,
 }
 
 type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
@@ -324,9 +328,10 @@ impl TokenSpeedScheduler for MockScheduler {
         &self,
         _request: Request<ts::HealthCheckRequest>,
     ) -> Result<Response<ts::HealthCheckResponse>, Status> {
+        let serving = self.overrides.serving();
         Ok(Response::new(ts::HealthCheckResponse {
-            healthy: true,
-            message: "ok".to_string(),
+            healthy: serving,
+            message: if serving { "ok" } else { "not serving" }.to_string(),
         }))
     }
 
@@ -361,7 +366,7 @@ impl TokenSpeedScheduler for MockScheduler {
             bos_token_id: 1,
             weight_version: "mock".to_string(),
             default_sampling_params_json: String::new(),
-            supports_vision: false,
+            supports_vision: self.overrides.info_bool("supports_vision").unwrap_or(false),
             ..Default::default()
         }))
     }
@@ -370,21 +375,23 @@ impl TokenSpeedScheduler for MockScheduler {
         &self,
         _request: Request<ts::GetServerInfoRequest>,
     ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
-        let server_args = (!self.cfg.server_args.is_empty()).then(|| prost_types::Struct {
-            fields: self
-                .cfg
-                .server_args
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        k.clone(),
-                        prost_types::Value {
-                            kind: Some(prost_types::value::Kind::StringValue(v.clone())),
-                        },
-                    )
-                })
-                .collect(),
-        });
+        // The configured server args, with the admin API's overrides on top:
+        // what the gateway flattens into this worker's labels.
+        let mut fields: std::collections::BTreeMap<String, prost_types::Value> = self
+            .cfg
+            .server_args
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::StringValue(v.clone())),
+                    },
+                )
+            })
+            .collect();
+        fields.extend(crate::overrides::server_args(&self.overrides.info()).fields);
+        let server_args = (!fields.is_empty()).then_some(prost_types::Struct { fields });
         Ok(Response::new(ts::GetServerInfoResponse {
             server_args,
             scheduler_info: None,

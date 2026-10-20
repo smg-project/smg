@@ -39,7 +39,10 @@ use super::{
     wasm_module_registration::WasmModuleConfigRequest,
     wasm_module_removal::WasmModuleRemovalRequest,
 };
-use crate::{app_context::AppContext, worker::Worker};
+use crate::{
+    app_context::AppContext,
+    worker::{registry::WorkerId, Worker},
+};
 
 // ============================================================================
 // Shared trait for worker registration workflows
@@ -296,6 +299,21 @@ pub struct WorkerUpdateWorkflowData {
     /// Updated worker objects (transient, not serialized)
     #[serde(skip, default)]
     pub updated_workers: Option<Vec<Arc<dyn Worker>>>,
+    /// Set by a label refresh (the worker's engine came back into service or
+    /// finished loading): the labels are re-read from the engine and replace
+    /// the discovered set instead of being merged from `config`.
+    #[serde(default)]
+    pub refresh_discovered_labels: bool,
+    /// The labels the engine reports now, read by the re-discovery step for
+    /// the update step (transient).
+    #[serde(skip, default)]
+    pub fresh_engine_labels: Option<HashMap<String, String>>,
+    /// For a label refresh: each worker's registry id and revision as the
+    /// find step found it, in `workers_to_update` order, captured once before
+    /// any read so the write-back targets exactly that registration whatever
+    /// happens meanwhile (transient).
+    #[serde(skip, default)]
+    pub snapshot: Option<Vec<(WorkerId, u64)>>,
 }
 
 impl WorkflowData for WorkerUpdateWorkflowData {

@@ -511,7 +511,7 @@ mod tests {
                 ),
             ),
             tool(
-                "get_president_and_vp",
+                "get_president_and_vp_for_year",
                 schema(value!({"year": {"type": "integer"}, "position": {"type": "string"}})),
             ),
             tool(

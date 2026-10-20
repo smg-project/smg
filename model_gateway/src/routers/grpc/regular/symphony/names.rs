@@ -80,6 +80,33 @@ pub(crate) fn labels_select_nothing(names: &Names) -> bool {
     matches!(selection(names), Selection::Nothing)
 }
 
+/// Why the legacy parsers read a request Symphony was configured for, by the site that decided
+/// it: the precedence among the names and the registry ([`decision`]), or the table's missing
+/// tag ([`assign`](super::assign)). A request so read is counted once under its reason
+/// ([`telemetry::record_fallback`](super::telemetry::record_fallback)); its response's header
+/// says `legacy`, as before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fallback {
+    /// No table reads the model and no name is set for it: the registry does not know the model,
+    /// and neither its labels nor the flags name anything.
+    NoTable,
+    /// A reasoning name alone that no table answers to (`deepseek_r1`, `qwen3_thinking`), in the
+    /// labels or the flags, for a model the registry does not know: every table reads the thought
+    /// channel, so the name selects nothing, and nothing else selects a table.
+    ReasoningNameOnly,
+    /// A legacy tool-call parser's name no table answers to (`pythonic`, `mistral`): the way back
+    /// to the legacy parsers for one model (the labels) or for the models the registry does not
+    /// know (the flags).
+    LegacyToolName,
+    /// `passthrough`, as the tool-call name or alone as the reasoning name: the choice to leave a
+    /// channel as written, which no table does.
+    Passthrough,
+    /// A table reads the model and has no tag for the request's forced or required call: the older
+    /// registry's JSON schema constrains the output, which then has no markers for the table to
+    /// read, so the legacy parsers read it ([`assign`](super::assign)).
+    ForcedCallWithoutTag,
+}
+
 /// What reads a model's responses under Symphony ([`decision`]).
 pub(super) enum Decision {
     /// The response template's table, compiled when the request comes ([`Templates`]).
@@ -87,8 +114,32 @@ pub(super) enum Decision {
     /// A table, shared with every request and engine that reads with it: the registry's, or
     /// the one the names select.
     Table(Arc<Format>),
-    /// The legacy parsers.
-    Legacy,
+    /// The legacy parsers, for the reason the precedence names: never
+    /// [`Fallback::ForcedCallWithoutTag`], which the assignment decides.
+    Legacy(Fallback),
+}
+
+/// Why one source's names select the legacy parsers ([`Selection::Legacy`]): `passthrough` as
+/// the tool-call name, or alone as the reasoning name; else a tool-call name no table answers to.
+fn legacy_reason(names: &Names) -> Fallback {
+    if is_passthrough(names.tool.as_deref())
+        || (names.tool.is_none() && is_passthrough(names.reasoning.as_deref()))
+    {
+        Fallback::Passthrough
+    } else {
+        Fallback::LegacyToolName
+    }
+}
+
+/// Why nothing reads a model the registry does not know when both sources select nothing
+/// ([`Selection::Nothing`]): a reasoning name alone that no table answers to, in either, or no
+/// name at all.
+fn nothing_reason(names: &ModelNames<'_>) -> Fallback {
+    if names.labels.reasoning.is_some() || names.flags.reasoning.is_some() {
+        Fallback::ReasoningNameOnly
+    } else {
+        Fallback::NoTable
+    }
 }
 
 /// The reader of `model`'s responses under Symphony, by the one precedence among the parser names
@@ -96,15 +147,16 @@ pub(super) enum Decision {
 /// workers' labels), when they select anything; else the registry's table, for a model it knows
 /// (`symphony::formats::for_model`); else the gateway's `--tool-call-parser` and
 /// `--reasoning-parser`, for a model the registry does not know; else the legacy parsers, with
-/// their own detection. So a fleet-wide name reads the models the registry has no table for and
-/// never a family it has one for, and a worker's labels read their model whatever the registry
-/// has. A table the labels select reads a model the registry gives the same table with the model's
-/// own turn opener; another model, or one the registry does not know, replays from the table's
-/// own. The registry is asked once per path, as before the flags came apart.
+/// their own detection, the reason named ([`Fallback`]). So a fleet-wide name reads the models
+/// the registry has no table for and never a family it has one for, and a worker's labels read
+/// their model whatever the registry has. A table the labels select reads a model the registry
+/// gives the same table with the model's own turn opener; another model, or one the registry
+/// does not know, replays from the table's own. The registry is asked once per path, as before
+/// the flags came apart.
 pub(super) fn decision(names: &ModelNames<'_>, model: &str) -> Decision {
     match selection(&names.labels) {
         Selection::Template => Decision::Template,
-        Selection::Legacy => Decision::Legacy,
+        Selection::Legacy => Decision::Legacy(legacy_reason(&names.labels)),
         Selection::Table(table) => Decision::Table(match for_model_shared(model) {
             Some(format) if table_for(model) == Some(table) => format,
             _ => table.shared(),
@@ -116,33 +168,60 @@ pub(super) fn decision(names: &ModelNames<'_>, model: &str) -> Decision {
             None => match selection(names.flags) {
                 Selection::Template => Decision::Template,
                 Selection::Table(table) => Decision::Table(table.shared()),
-                Selection::Legacy | Selection::Nothing => Decision::Legacy,
+                Selection::Legacy => Decision::Legacy(legacy_reason(names.flags)),
+                Selection::Nothing => Decision::Legacy(nothing_reason(names)),
             },
         },
     }
 }
 
-/// The table that reads `model`'s responses under `parser`, if one does ([`decision`]), and whether
-/// it is the response template's, compiled for the model (an error when the model has none that
-/// compiles, which refuses the request, since the names ask for what the model cannot give): a
-/// constraint is compiled against that table, and a worker may take its whole turn's grammar.
-/// `None` under `legacy`, and when the legacy parsers read the response.
+/// What reads a model's responses under a parser ([`reading`]).
+pub(super) enum Reading {
+    /// A table, and whether it is the response template's, compiled for the model: a constraint
+    /// is compiled against it, and a worker may take its whole turn's grammar.
+    Table(Arc<Format>, bool),
+    /// The legacy parsers, by the gateway's choice: `--parser legacy`, or the request's header.
+    Legacy,
+    /// The legacy parsers under Symphony: no table reads the request, for the reason the
+    /// precedence names.
+    Fallback(Fallback),
+}
+
+/// What reads `model`'s responses under `parser`: the legacy parsers under `legacy`; else what
+/// [`decision`] gives, the response template's table compiled for the model (an error when the
+/// model has none that compiles, which refuses the request, since the names ask for what the
+/// model cannot give), another table, or the legacy parsers with the reason.
+pub(super) fn reading(
+    parser: ParserChoice,
+    names: &ModelNames<'_>,
+    model: &str,
+    templates: &Templates,
+) -> Result<Reading, SymphonyError> {
+    if parser != ParserChoice::Symphony {
+        return Ok(Reading::Legacy);
+    }
+    Ok(match decision(names, model) {
+        Decision::Template => Reading::Table(
+            templates.format(model).map_err(SymphonyError::Template)?,
+            true,
+        ),
+        Decision::Table(format) => Reading::Table(format, false),
+        Decision::Legacy(why) => Reading::Fallback(why),
+    })
+}
+
+/// The table that reads `model`'s responses under `parser`, if one does ([`reading`]), and whether
+/// it is the response template's. `None` under `legacy`, and when the legacy parsers read the
+/// response.
 pub(super) fn table_reading(
     parser: ParserChoice,
     names: &ModelNames<'_>,
     model: &str,
     templates: &Templates,
 ) -> Result<Option<(Arc<Format>, bool)>, SymphonyError> {
-    if parser != ParserChoice::Symphony {
-        return Ok(None);
-    }
-    Ok(match decision(names, model) {
-        Decision::Template => Some((
-            templates.format(model).map_err(SymphonyError::Template)?,
-            true,
-        )),
-        Decision::Table(format) => Some((format, false)),
-        Decision::Legacy => None,
+    Ok(match reading(parser, names, model, templates)? {
+        Reading::Table(format, compiled) => Some((format, compiled)),
+        Reading::Legacy | Reading::Fallback(_) => None,
     })
 }
 
@@ -316,6 +395,7 @@ pub(crate) fn reasoning_open(
         // tokenizer ships a response template today.
         Ok(Some(format)) => Some(PromptThought {
             open: format.reasoning_open(prompt),
+            closed: format.thought_closed(prompt),
             alone: format.name() == Table::Gemma4.name(),
         }),
         _ => None,
@@ -328,6 +408,9 @@ pub(crate) fn reasoning_open(
 pub(crate) struct PromptThought {
     /// The prompt leaves the model inside its thought.
     pub open: bool,
+    /// The prompt closed the thought itself and wrote what the template writes after the close
+    /// (thinking switched off), so the tag owes none of it ([`Format::thought_closed`]).
+    pub closed: bool,
     /// The replay decides alone, without the request's thinking switch: Gemma 4 prefills an open
     /// thought channel only after a tool response, so thinking enabled on a new turn says nothing
     /// about the prompt. The rule its legacy reasoning parser applied in place of the switch,
@@ -478,10 +561,21 @@ mod tests {
         );
         // The older `llama` parser's format is the json table's.
         assert_eq!(named_table(&pair(Some("llama"), None)), Some(Table::Json));
+        // The older `mistral` parser's list has a table of that name; the v13 spelling keeps its
+        // own.
+        assert_eq!(
+            named_table(&pair(Some("mistral"), None)),
+            Some(Table::Mistral)
+        );
+        assert_eq!(
+            named_table(&pair(Some("mistral_v13"), None)),
+            Some(Table::MistralV13)
+        );
         // The older DeepSeek pairings read with the tables, the thought included: the R1 line
         // behind `deepseek` + `deepseek_r1` writes V3's calls after a thought, and the V3 table
-        // reads it, whether the prompt opens the thought (the original R1's tail, below) or the
-        // model writes `<think>` itself (R1-0528).
+        // reads it, whether the prompt opens the thought (R1, R1-Zero and the distills: the
+        // original R1's tail, below) or the model writes `<think>` itself (R1-0528,
+        // R1-0528-Qwen3-8B and the bf16 mirror).
         assert_eq!(
             named_table(&pair(Some("deepseek"), Some("deepseek_r1"))),
             Some(Table::DeepSeekV3)
@@ -586,6 +680,7 @@ mod tests {
             ("deepseek", "deepseek_v3"),
             ("deepseek31", "deepseek_v3.1"),
             ("deepseek_v31", "deepseek_v3.1"),
+            ("mistral", "mistral"),
         ];
         let mut legacy: Vec<(String, &str)> = tools
             .list_parsers()
@@ -1050,7 +1145,7 @@ mod tests {
         for flags in [
             v13.clone(),
             pair(Some(TEMPLATE_PARSER), Some(TEMPLATE_PARSER)),
-            pair(Some("mistral"), None),
+            pair(Some("cohere"), None),
             pair(Some("passthrough"), None),
         ] {
             assert_eq!(
@@ -1073,7 +1168,7 @@ mod tests {
         )
         .is_err());
         assert_eq!(
-            read(&ModelNames::flagged(&pair(Some("mistral"), None)), unknown),
+            read(&ModelNames::flagged(&pair(Some("cohere"), None)), unknown),
             Ok(None)
         );
         assert_eq!(
@@ -1097,6 +1192,108 @@ mod tests {
         // it does not.
         assert_eq!(read(&ModelNames::default(), known), table("qwen3"));
         assert_eq!(read(&ModelNames::default(), unknown), Ok(None));
+    }
+
+    /// The legacy parsers read for a reason the decision names: one source's way back
+    /// (`passthrough`, or a tool-call name no table answers to, the tool-call name deciding), or
+    /// nothing anywhere for a model the registry does not know (a reasoning name alone that no
+    /// table answers to, in either source, else no name at all). A table's reading names none,
+    /// and the gateway's own choice of `legacy` is no fallback.
+    #[test]
+    fn the_legacy_parsers_read_for_a_reason_the_decision_names() {
+        let known = "Qwen/Qwen3-8B";
+        let unknown = "acme/ministral-3-14b-instruct-w4a16";
+        let why = |names: &ModelNames<'_>, model: &str| match decision(names, model) {
+            Decision::Legacy(why) => Some(why),
+            Decision::Template | Decision::Table(_) => None,
+        };
+        fn labeled<'a>(labels: Names, flags: &'a Names) -> ModelNames<'a> {
+            ModelNames { labels, flags }
+        }
+
+        // The labels' way back, for a model the registry knows as for one it does not.
+        for model in [known, unknown] {
+            assert_eq!(
+                why(&names(Some("pythonic"), None), model),
+                Some(Fallback::LegacyToolName)
+            );
+            assert_eq!(
+                why(&names(Some("pythonic"), Some("passthrough")), model),
+                Some(Fallback::LegacyToolName)
+            );
+            assert_eq!(
+                why(&names(Some("passthrough"), None), model),
+                Some(Fallback::Passthrough)
+            );
+            assert_eq!(
+                why(&names(Some("passthrough"), Some("qwen3")), model),
+                Some(Fallback::Passthrough)
+            );
+            assert_eq!(
+                why(&names(None, Some("passthrough")), model),
+                Some(Fallback::Passthrough)
+            );
+        }
+
+        // The flags' way back, for a model the registry does not know; the registry's table
+        // reads one it knows whatever they name.
+        let mistral = pair(Some("mistral"), None);
+        let passthrough = pair(None, Some("passthrough"));
+        assert_eq!(
+            why(&ModelNames::flagged(&mistral), unknown),
+            Some(Fallback::LegacyToolName)
+        );
+        assert_eq!(
+            why(&ModelNames::flagged(&passthrough), unknown),
+            Some(Fallback::Passthrough)
+        );
+        assert_eq!(why(&ModelNames::flagged(&mistral), known), None);
+        assert_eq!(why(&ModelNames::flagged(&passthrough), known), None);
+
+        // Nothing anywhere: a reasoning name alone that no table answers to, in the labels or
+        // in the flags, else no name at all; the flags' legacy name decides after labels that
+        // select nothing.
+        let r1 = pair(None, Some("deepseek_r1"));
+        assert_eq!(
+            why(&ModelNames::default(), unknown),
+            Some(Fallback::NoTable)
+        );
+        assert_eq!(
+            why(&ModelNames::flagged(&r1), unknown),
+            Some(Fallback::ReasoningNameOnly)
+        );
+        assert_eq!(
+            why(&names(None, Some("deepseek_r1")), unknown),
+            Some(Fallback::ReasoningNameOnly)
+        );
+        assert_eq!(
+            why(&labeled(r1, &mistral), unknown),
+            Some(Fallback::LegacyToolName)
+        );
+
+        // A table reads: the registry's for a model it knows, or the one a reasoning name alone
+        // answers to.
+        assert_eq!(why(&ModelNames::default(), known), None);
+        assert_eq!(why(&names(None, Some("deepseek_r1")), known), None);
+        assert_eq!(why(&names(None, Some("qwen3")), unknown), None);
+        assert!(matches!(
+            reading(
+                ParserChoice::Symphony,
+                &ModelNames::default(),
+                unknown,
+                &templates()
+            ),
+            Ok(Reading::Fallback(Fallback::NoTable))
+        ));
+        assert!(matches!(
+            reading(
+                ParserChoice::Legacy,
+                &ModelNames::default(),
+                unknown,
+                &templates()
+            ),
+            Ok(Reading::Legacy)
+        ));
     }
 
     /// What the gateway's flags select for a model the registry knows, set aside for a worker
@@ -1124,7 +1321,7 @@ mod tests {
             qwen3("the model's response template")
         );
         assert_eq!(
-            spelled(pair(Some("mistral"), None), known),
+            spelled(pair(Some("cohere"), None), known),
             qwen3("the legacy parsers")
         );
         assert_eq!(

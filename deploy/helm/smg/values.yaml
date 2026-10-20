@@ -281,9 +281,22 @@ history:
     deploy: false
 
   oracle:
-    dsn: ""                    # Oracle connect descriptor / DSN
+    # -- Connect descriptor / DSN, database user and password. They are
+    #    written into a chart-managed Secret and reach the router as the
+    #    ATP_DSN, ATP_USER and ATP_PASSWORD environment variables; none is
+    #    put in the pod's arguments. Prefer existingSecret for credentials
+    #    managed outside the chart's values.
+    dsn: ""
     user: ""
     password: ""
+    # -- Name of an existing Secret holding the credentials, instead of
+    #    dsn, user and password; it holds the three keys below
+    existingSecret: ""
+    # -- The keys within that Secret (and the chart-managed one)
+    secretKeys:
+      dsn: "oracle-dsn"
+      user: "oracle-user"
+      password: "oracle-password"
     poolMax: 10
 
 # =============================================================================

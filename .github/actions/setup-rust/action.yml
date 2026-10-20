@@ -55,10 +55,11 @@ runs:
         #   minutes, main's included.
         # A pull request's run restores the newest entry main saved under the
         # same key (the restore keys match on the prefix, so a different
-        # lockfile still restores). For the unit-tests job that entry comes
-        # from the Rust Cache Warmer workflow (rust-cache-warmer.yml), which
-        # builds the test profile under the key `unit-tests` on a schedule,
-        # since main's own unit-tests job seldom completes between merges.
+        # lockfile still restores). For the rust-lint and rust-tests jobs that
+        # entry comes from the Rust Cache Warmer workflow
+        # (rust-cache-warmer.yml), which builds every test shard and lint leg
+        # under the key `unit-tests` on a schedule, since main's own jobs
+        # seldom complete between merges.
         cache-on-failure: false
         save-if: ${{ github.ref == 'refs/heads/main' }}
 

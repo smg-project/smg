@@ -262,10 +262,12 @@ pub struct RouterConfig {
     /// Absolute worker overload protection, on by default. A worker whose load
     /// report is at or above either threshold below is left out of routing
     /// while another worker is under them; when every worker is over them the
-    /// request goes to the least-loaded one (see `worker_overload_shed` for
-    /// refusing instead). Evaluated once per ingested load report, never per
-    /// request. `false` switches both gateway thresholds off; per-worker
-    /// `overload` blocks on a WorkerSpec still apply.
+    /// request goes to the least-loaded one (in gRPC and HTTP prefill/decode
+    /// pair placement such a pool is placed by its own policy, as if none
+    /// were over them; see `worker_overload_shed` for refusing instead).
+    /// Evaluated once per ingested load report, never per request. `false`
+    /// switches both gateway thresholds off; per-worker `overload` blocks on
+    /// a WorkerSpec still apply.
     #[serde(default = "default_worker_overload_protection")]
     pub worker_overload_protection: bool,
     /// Queued (waiting) requests, summed across DP ranks, at or above which a
@@ -1243,9 +1245,12 @@ pub enum PolicyConfig {
         /// when a request's token count is unknown at routing time.
         #[serde(default = "default_least_load_mean_prefill")]
         mean_prefill_tokens: u32,
-        /// Fallback generation throughput (tokens/s) for the expected-wait term
-        /// when a backend reports no live `gen_throughput`. Set to the fleet's
-        /// per-replica generation rate; co-tunes with `kv_pressure_weight`.
+        /// Throughput (tokens/s) for prefill workers, and fallback when other
+        /// workers report no live `gen_throughput`. Set to per-replica input
+        /// tokens/s for prefill, output tokens/s otherwise; co-tunes with
+        /// `kv_pressure_weight`. The CLI shares one value across roles; use
+        /// programmatically constructed `prefill_policy` / `decode_policy` for
+        /// separate values.
         #[serde(default = "default_least_load_throughput")]
         default_throughput: f64,
         /// Per-worker waiting-queue cap: skip workers whose reported waiting

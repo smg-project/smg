@@ -57,12 +57,19 @@ What the engine decides for every format, and what it leaves open:
   when there are any (the keyed syntax refuses them first, as `Dropped { MalformedCall }`, and its
   event carries none: `tagged::refuse`). Gemma's reader does the same in its own way (`gemma::Assembler::end`): its one
   event names the value's reason, which the engine does not rename, and the bytes held at the marker
-  are the string's text, not the event's. A pythonic call the end cut ends as a tagged one does
-  (`tagged::end_cut_call`), the cut right after its `(` included, since its object closes only at
-  the call's own `)`.
+  are the string's text, not the event's. A pythonic call ends as a tagged one does
+  (`tagged::end_cut_call`) whether the stream's end or the region's marker cut it, the cut right
+  after its `(` included, since its object closes only at the call's own `)`, which every template
+  writes before the marker.
 - With the tagged syntax, a value's type comes from the request's tools (`Declared`): a
   declared string streams, every other value is written at its close. A call to a function the
-  request did not declare has every value inferred.
+  request did not declare has every value inferred, and the engine announces it, for every
+  syntax, with a `Malformed { UnknownTool }` event of no bytes right before the call's start
+  (`Engine::push_call_events`): the call goes out as the syntax read it, a reader counts the
+  failure at its offset, and a request that declares no tools is not asked. Up to sixteen tools
+  are searched by name as they are; more are indexed once per output, at the first call's start,
+  and the index is searched. A syntax that reads an undeclared first name as prose (the pythonic
+  list after content) makes no call, so there is nothing to announce.
 - Call ids are `call_` and 24 lowercase hex characters, the shape the gateway's older parsers
   mint, so a client tells no difference. The engine draws a nonce at random when it is made
   (`CallIds::fresh`: 96 random bits; not a UUIDv7, whose in-process counter steps consecutive

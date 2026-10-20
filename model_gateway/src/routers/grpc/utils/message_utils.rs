@@ -279,10 +279,10 @@ pub fn template_tools<'a>(
     }
 }
 
-/// The media context of a Messages request, resolved from the registries
-/// before the template renders, as the preparation stage resolves it:
-/// nothing is fetched or preprocessed here.
-pub(crate) struct MessagesMedia {
+/// The media context of a chat-like request (chat or Messages), resolved
+/// from the registries before the template renders, as the preparation
+/// stages resolve it: nothing is fetched or preprocessed here.
+pub(crate) struct ResolvedMedia {
     /// Where the model's template wants media parts relative to text.
     pub(crate) media_order: MediaPartOrder,
     /// The request's media and the placeholders the template writes for it,
@@ -290,13 +290,14 @@ pub(crate) struct MessagesMedia {
     pub(crate) media: Option<MediaContext>,
 }
 
-impl MessagesMedia {
+impl ResolvedMedia {
     pub(crate) fn placeholders(&self) -> Option<&PlaceholderTokens> {
         self.media.as_ref().map(|media| &media.placeholders)
     }
 }
 
-/// A request's media as the preparation stage processes it after rendering.
+/// A request's media as the preparation stages process it after rendering
+/// (`regular::stages::rendered_prompt`).
 pub(crate) struct MediaContext {
     pub(crate) plan: MediaPlan,
     pub(crate) placeholders: PlaceholderTokens,
@@ -313,19 +314,42 @@ pub(crate) fn invalid_multimodal_request(error: impl Display) -> Response {
     )
 }
 
-/// Resolve what a Messages request's media needs before the template renders:
-/// the model's media-part order and, for a request with media, the plan and
-/// the placeholder tokens (the engine's own limits applied). The refusals are
-/// the preparation stage's, so count_tokens answers a request the way
-/// `/v1/messages` would.
+/// Resolve what a Messages request's media needs before the template renders
+/// (see [`resolve_media`]). The refusals are the preparation stage's, so
+/// count_tokens answers a request the way `/v1/messages` would.
 pub(crate) async fn resolve_messages_media(
     components: &SharedComponents,
     model_id: &str,
     tokenizer: &dyn Tokenizer,
     messages: &[InputMessage],
-) -> Result<MessagesMedia, Response> {
+) -> Result<ResolvedMedia, Response> {
+    resolve_media(
+        components,
+        model_id,
+        tokenizer,
+        "resolve_messages_media",
+        || multimodal::media_plan_messages(messages),
+    )
+    .await
+}
+
+/// Resolve what a chat-like request's media needs before the template
+/// renders: the model's media-part order and, for a request with media, the
+/// plan `plan` builds from the request and the placeholder tokens (the
+/// engine's own limits applied). A renderer that writes media as template
+/// text has no plan and keeps the authored order. The chat and Messages
+/// preparation stages and count_tokens resolve through here, so the three
+/// refuse a request alike; `stage` names the caller in the log lines, as
+/// each caller's own lines named it before.
+pub(crate) async fn resolve_media(
+    components: &SharedComponents,
+    model_id: &str,
+    tokenizer: &dyn Tokenizer,
+    stage: &'static str,
+    plan: impl FnOnce() -> MediaPlan,
+) -> Result<ResolvedMedia, Response> {
     if tokenizer.renderer_capabilities().media_handling == MediaHandling::TemplateText {
-        return Ok(MessagesMedia {
+        return Ok(ResolvedMedia {
             media_order: MediaPartOrder::Authored,
             media: None,
         });
@@ -334,8 +358,8 @@ pub(crate) async fn resolve_messages_media(
         .tokenizer_registry
         .get_by_name(model_id)
         .or_else(|| components.tokenizer_registry.get_by_id(model_id));
-    // The media-part order comes from the model registry so /v1/messages
-    // renders each model consistently with /v1/chat/completions.
+    // The media-part order comes from the model registry so every path
+    // renders a model consistently.
     let media_order = match (components.multimodal.as_ref(), tokenizer_entry.as_ref()) {
         (Some(mm_components), Some(entry)) => {
             multimodal::resolve_media_part_order(
@@ -350,21 +374,21 @@ pub(crate) async fn resolve_messages_media(
         _ => MediaPartOrder::MediaFirst,
     };
 
-    let plan = multimodal::media_plan_messages(messages);
-    // Same refusals as the chat path: no images or video to a pool whose
-    // every worker is language model only, no modality to a pool whose
-    // engines take none of it (see chat/preparation.rs); the count answers
-    // them as `/v1/messages` does, before any media is fetched.
+    let plan = plan();
+    // No images or video to a pool whose every worker is language model only (the engine admits
+    // such a request and never schedules it), and no modality to a pool whose engines take none of
+    // it (the capability matrix): both are refused here, for the chat and the Messages paths alike,
+    // on the declared parts, before any byte of media is fetched, decoded or sent.
     multimodal::ensure_model_accepts_media(&components.worker_registry, model_id, &plan)?;
     if plan.is_empty() {
-        return Ok(MessagesMedia {
+        return Ok(ResolvedMedia {
             media_order,
             media: None,
         });
     }
     let Some(mm_components) = components.multimodal.as_ref() else {
         error!(
-            function = "resolve_messages_media",
+            function = stage,
             "Multimodal content detected but multimodal components not initialized"
         );
         return Err(error::bad_request(
@@ -374,7 +398,7 @@ pub(crate) async fn resolve_messages_media(
     };
     let Some(entry) = tokenizer_entry else {
         error!(
-            function = "resolve_messages_media",
+            function = stage,
             model = %model_id,
             "Tokenizer entry not found for multimodal processing"
         );
@@ -400,15 +424,15 @@ pub(crate) async fn resolve_messages_media(
     .await
     .map_err(|e| {
         error!(
-            function = "resolve_messages_media",
+            function = stage,
             model = %model_id,
             error = %e,
-            "Failed to resolve multimodal placeholder token"
+            "Failed to prepare the multimodal prompt plan"
         );
         invalid_multimodal_request(e)
     })?;
 
-    Ok(MessagesMedia {
+    Ok(ResolvedMedia {
         media_order,
         media: Some(MediaContext {
             plan,

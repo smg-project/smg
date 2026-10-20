@@ -70,7 +70,8 @@ pub(super) fn tagged(
 }
 
 /// The tag of a forced call to one of `tools`, at most one when `one_call`, with
-/// `reasoning_open` when the prompt leaves the model inside its thought ([`tagged`]).
+/// `reasoning_open` when the prompt leaves the model inside its thought and `thought_closed` when
+/// it closed the thought itself and wrote the template's text after it ([`tagged`]).
 #[expect(
     clippy::too_many_arguments,
     reason = "the table, the request's ask, where the prompt and the engine leave the model"
@@ -82,6 +83,7 @@ fn calls_tag(
     tools: &[Tool],
     one_call: bool,
     reasoning_open: bool,
+    thought_closed: bool,
     start: GrammarStart,
     continues: bool,
 ) -> Result<Option<ToolConstraint>, SymphonyError> {
@@ -90,6 +92,7 @@ fn calls_tag(
         Options {
             at_least_one: true,
             reasoning_open,
+            thought_closed,
             one_call,
             start,
         },
@@ -184,7 +187,7 @@ pub(crate) enum Asks<'a> {
 }
 
 impl<'a> Asks<'a> {
-    pub(super) fn model(self) -> &'a str {
+    pub(crate) fn model(self) -> &'a str {
         match self {
             Self::Chat(request) => &request.model,
             Self::Messages { request, .. } => &request.model,
@@ -277,7 +280,7 @@ impl<'a> Asks<'a> {
     }
 
     /// The request's `tool_choice` as a chat one, which a Messages choice converts to.
-    fn choice(self) -> Option<Cow<'a, ToolChoice>> {
+    pub(crate) fn choice(self) -> Option<Cow<'a, ToolChoice>> {
         match self {
             Self::Chat(request) => request.tool_choice.as_ref().map(Cow::Borrowed),
             Self::Messages { request, .. } => request
@@ -332,7 +335,7 @@ impl<'a> Asks<'a> {
     /// The table reads no thought from the output: a chat request that keeps the reasoning in the
     /// content (`separate_reasoning: false`), as the legacy path runs no reasoning parser then; a
     /// Messages request's thinking blocks are always its own.
-    pub(super) fn no_reasoning(self) -> bool {
+    pub(crate) fn no_reasoning(self) -> bool {
         match self {
             Self::Chat(request) => !request.separate_reasoning,
             Self::Messages { .. } => false,
@@ -359,13 +362,19 @@ pub(super) fn callable<'t>(choice: Option<&ToolChoice>, declared: &'t [Tool]) ->
 /// ([`reads`]), the request asks neither, or the table has no tag for it; the older registry then
 /// decides as before. An error refuses the request: the response template's table cannot
 /// constrain what is asked, or a chat request's `regex` or `ebnf` constraint would apply outside
-/// its format.
+/// its format. `thought_closed` says the prompt closed the thought itself and wrote the template's
+/// text after it, which the calls' tag then owes nothing of.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the table, the request's ask, where the prompt and the engines leave the model"
+)]
 pub(crate) fn constraint(
     parser: ParserChoice,
     names: &ModelNames<'_>,
     asks: Asks<'_>,
     tools: &[Tool],
     reasoning_open: bool,
+    thought_closed: bool,
     start: GrammarStart,
     templates: &Templates,
 ) -> Result<Option<ToolConstraint>, SymphonyError> {
@@ -388,6 +397,7 @@ pub(crate) fn constraint(
             tools,
             one_call,
             reasoning_open,
+            thought_closed,
             start,
             continues,
         );
@@ -412,22 +422,34 @@ pub(crate) fn constraint(
 /// `reasoning_open` when the prompt leaves the model inside its thought. The request asked for
 /// nothing, so nothing is refused: `Ok(None)` when no table reads the response ([`reads`]), the
 /// request takes no tag for its calls ([`Asks::auto_calls`]), or the table has none for them. A
-/// thought and an answer alone are not constrained today.
+/// thought and an answer alone are not constrained today. `thought_closed` as for [`constraint`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the table, the request's ask, where the prompt and the engine leave the model"
+)]
 pub(crate) fn auto_constraint(
     parser: ParserChoice,
     names: &ModelNames<'_>,
     asks: Asks<'_>,
     tools: &[Tool],
     reasoning_open: bool,
+    thought_closed: bool,
     start: GrammarStart,
     templates: &Templates,
 ) -> Result<Option<ToolConstraint>, SymphonyError> {
     let Some(format) = reads(parser, names, asks.model(), templates)? else {
         return Ok(None);
     };
-    Ok(asks
-        .auto_calls(tools)
-        .and_then(|one_call| auto_tag(&format, tools, reasoning_open, start, one_call)))
+    Ok(asks.auto_calls(tools).and_then(|one_call| {
+        auto_tag(
+            &format,
+            tools,
+            reasoning_open,
+            thought_closed,
+            start,
+            one_call,
+        )
+    }))
 }
 
 /// The tag of the calls `format` lets a model make under `auto`: no call required, one at most
@@ -436,6 +458,7 @@ pub(super) fn auto_tag(
     format: &Format,
     tools: &[Tool],
     reasoning_open: bool,
+    thought_closed: bool,
     start: GrammarStart,
     one_call: bool,
 ) -> Option<ToolConstraint> {
@@ -445,6 +468,7 @@ pub(super) fn auto_tag(
             Options {
                 at_least_one: false,
                 reasoning_open,
+                thought_closed,
                 one_call,
                 start,
             },
@@ -491,6 +515,9 @@ pub(crate) struct AutoTag {
     pub request: AutoRequest,
     /// The prompt leaves the model inside its thought.
     pub reasoning_open: bool,
+    /// The prompt closed the thought itself and wrote the template's text after it, which the tag
+    /// owes nothing of ([`Format::thought_closed`]).
+    pub thought_closed: bool,
     pub templates: Arc<Templates>,
 }
 
@@ -539,6 +566,7 @@ impl AutoTag {
             asks,
             &tools,
             self.reasoning_open,
+            self.thought_closed,
             start,
             &self.templates,
         )
@@ -572,7 +600,8 @@ impl fmt::Debug for AutoTag {
         let mut tag = f.debug_struct("AutoTag");
         tag.field("parser", &self.parser)
             .field("model", &self.model())
-            .field("reasoning_open", &self.reasoning_open);
+            .field("reasoning_open", &self.reasoning_open)
+            .field("thought_closed", &self.thought_closed);
         if let AutoRequest::Messages {
             tools, continues, ..
         } = &self.request
@@ -724,6 +753,7 @@ mod tests {
                 Asks::Chat(&answer),
                 &[],
                 true,
+                false,
                 start,
                 &templates(),
             )
@@ -758,6 +788,7 @@ mod tests {
                 Asks::Chat(&forced),
                 &tools(),
                 true,
+                false,
                 start,
                 &templates(),
             )
@@ -803,6 +834,7 @@ mod tests {
                 Asks::Chat(asked),
                 &tools(),
                 false,
+                false,
                 symphony::GrammarStart::AfterReasoning,
                 &templates(),
             )
@@ -846,6 +878,82 @@ mod tests {
         // The older path's forced call (a JSON schema) is still read by the older parsers.
         let schema = ("json_schema".to_string(), "{}".to_string());
         assert!(assign(ParserChoice::Symphony, &kimi, &named, Some(&schema), prompt).is_none());
+    }
+
+    /// A forced or required call on a table whose calls are named arguments inside a block takes
+    /// the table's tag and the table reads the answer: the request is not handed to the older
+    /// path. The older path's JSON-schema constraint still leaves the table out, as before.
+    #[test]
+    fn a_forced_call_on_the_deepseek_v3_1_table_takes_its_tag_and_the_table_reads_the_answer() {
+        let deepseek = names(Some("deepseek31"), Some("deepseek_v31"));
+        let prompt = "<｜User｜>hi<｜Assistant｜></think>";
+        let named = request(json!({
+            "model": "deepseek-ai/DeepSeek-V3.1",
+            "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+        }));
+        let required = request(json!({
+            "model": "deepseek-ai/DeepSeek-V3.1",
+            "tool_choice": "required",
+        }));
+        for (asked, one_call) in [(&named, true), (&required, false)] {
+            let Some(ToolConstraint::StructuralTag(tag)) = super::constraint(
+                ParserChoice::Symphony,
+                &deepseek,
+                Asks::Chat(asked),
+                &tools(),
+                false,
+                false,
+                symphony::GrammarStart::AfterReasoning,
+                &templates(),
+            )
+            .expect("no hf") else {
+                panic!("the table's tag, not the older registry's schema");
+            };
+            let format = serde_json::from_str::<Value>(&tag).expect("JSON");
+            let format = &format["format"];
+            assert_eq!(format["type"], "triggered_tags");
+            assert_eq!(
+                format["triggers"],
+                json!(["<｜tool▁calls▁begin｜>", "</think>"])
+            );
+            assert_eq!(format["at_least_one"], true);
+            assert_eq!(
+                format["stop_after_first"],
+                if one_call { json!(true) } else { Value::Null }
+            );
+            let call = if one_call {
+                &format["tags"][0]["content"]["elements"][0]
+            } else {
+                &format["tags"][0]["content"]["content"]["elements"][0]
+            };
+            assert_eq!(
+                call["elements"][0]["value"],
+                "<｜tool▁call▁begin｜>lookup<｜tool▁sep｜>"
+            );
+            assert_eq!(call["elements"][2]["value"], "<｜tool▁call▁end｜>");
+            assert_eq!(format["tags"][0]["end"], "<｜tool▁calls▁end｜>");
+            // The constraint is a structural tag, so the table is assigned to the response.
+            let structural = ("structural_tag".to_string(), tag);
+            let assigned = assign(
+                ParserChoice::Symphony,
+                &deepseek,
+                asked,
+                Some(&structural),
+                prompt,
+            )
+            .expect("assigned");
+            assert_eq!(assigned.format.name(), "deepseek_v3.1");
+        }
+        // The older path's forced call (a JSON schema) is still read by the older parsers.
+        let schema = ("json_schema".to_string(), "{}".to_string());
+        assert!(assign(
+            ParserChoice::Symphony,
+            &deepseek,
+            &named,
+            Some(&schema),
+            prompt
+        )
+        .is_none());
     }
 
     /// The model's workers name the start when they all carry the same label; none, a missing
@@ -974,6 +1082,7 @@ mod tests {
                 Asks::Chat(&request),
                 &[],
                 is_open(ParserChoice::Symphony, prompt) == Some(true),
+                false,
                 symphony::GrammarStart::Unknown,
                 &templates(),
             )
@@ -1069,6 +1178,7 @@ mod tests {
                 Asks::Chat(&request(extra)),
                 &[],
                 reasoning_open,
+                false,
                 symphony::GrammarStart::Unknown,
                 &templates(),
             )
@@ -1120,9 +1230,10 @@ mod tests {
         assert_eq!(kimi["format"]["type"], "tag", "{kimi}");
         assert_eq!(kimi["format"]["content"]["type"], "json_schema", "{kimi}");
         // Inkling's thought is a message of its own: the tag admits it first, closed and the
-        // next message opened, leaves the text marker optional where the engine does not say it
-        // starts at the first token (an engine that starts after its reasoning parser has
-        // consumed the model's own), then the schema and the message's close.
+        // next message opened with the text marker owed after it, or the marker alone, or
+        // neither where the engine does not say it starts at the first token (an engine that
+        // starts after its reasoning parser has consumed the model's own), then the schema and
+        // the message's close.
         let inkling = tag_of(answer(
             &ModelNames::default(),
             json!({"model": "thinkingmachines/Inkling", "response_format": {"type": "json_object"}}),
@@ -1132,24 +1243,24 @@ mod tests {
         let elements = inkling["format"]["elements"]
             .as_array()
             .expect("a sequence");
-        assert_eq!(elements.len(), 4, "{inkling}");
+        assert_eq!(elements.len(), 3, "{inkling}");
         assert_eq!(elements[0]["type"], "optional", "{inkling}");
+        let ways = &elements[0]["content"];
+        assert_eq!(ways["type"], "or", "{inkling}");
+        let opener = json!({"type": "const_string", "value": "<|content_text|>"});
         assert_eq!(
-            elements[0]["content"]["begin"], "<|content_thinking|>",
+            ways["elements"][0]["elements"][0]["begin"], "<|content_thinking|>",
             "{inkling}"
         );
+        assert_eq!(ways["elements"][0]["elements"][1], opener, "{inkling}");
+        assert_eq!(ways["elements"][1], opener, "{inkling}");
         assert_eq!(
             elements[1],
-            json!({"type": "optional", "content": {"type": "const_string", "value": "<|content_text|>"}}),
-            "{inkling}"
-        );
-        assert_eq!(
-            elements[2],
             json!({"type": "json_schema", "json_schema": {"type": "object"}}),
             "{inkling}"
         );
         assert_eq!(
-            elements[3],
+            elements[2],
             json!({"type": "const_string", "value": "<|end_message|>"}),
             "{inkling}"
         );
@@ -1228,6 +1339,7 @@ mod tests {
             Asks::Chat(&auto),
             &tools(),
             false,
+            false,
             symphony::GrammarStart::Unknown,
             &templates(),
         )
@@ -1254,6 +1366,7 @@ mod tests {
             Asks::Chat(&auto),
             &[],
             false,
+            false,
             symphony::GrammarStart::Unknown,
             &templates()
         )
@@ -1265,6 +1378,7 @@ mod tests {
             Asks::Chat(&auto),
             &tools(),
             false,
+            false,
             symphony::GrammarStart::Unknown,
             &templates()
         )
@@ -1275,6 +1389,7 @@ mod tests {
             &ModelNames::default(),
             Asks::Chat(&request(json!({"tool_choice": "none"}))),
             &tools(),
+            false,
             false,
             symphony::GrammarStart::Unknown,
             &templates()
@@ -1299,6 +1414,7 @@ mod tests {
                     &ModelNames::default(),
                     Asks::Chat(&request(own.clone())),
                     &tools(),
+                    false,
                     false,
                     symphony::GrammarStart::Unknown,
                     &templates()
@@ -1326,6 +1442,7 @@ mod tests {
                 },
                 &tools,
                 false,
+                false,
                 symphony::GrammarStart::Unknown,
                 &templates()
             )
@@ -1340,6 +1457,7 @@ mod tests {
                 continues: true
             },
             &tools,
+            false,
             false,
             symphony::GrammarStart::Unknown,
             &templates()
@@ -1358,6 +1476,7 @@ mod tests {
                 continues: false
             },
             &tools,
+            false,
             false,
             symphony::GrammarStart::Unknown,
             &templates()
@@ -1382,6 +1501,7 @@ mod tests {
                 &hf,
                 Asks::Chat(&request(extra)),
                 &tools(),
+                false,
                 false,
                 symphony::GrammarStart::Unknown,
                 templates,
@@ -1429,6 +1549,7 @@ mod tests {
                 &plain,
                 Asks::Chat(&request(json!({"response_format": {"type": "json_object"}}))),
                 &tools(),
+                false,
                 false,
                 symphony::GrammarStart::Unknown,
                 &templates(),
@@ -1508,6 +1629,7 @@ mod tests {
                 },
                 &tools(),
                 false,
+                false,
                 symphony::GrammarStart::Unknown,
                 &templates(),
             )
@@ -1556,6 +1678,7 @@ mod tests {
             },
             &tools(),
             false,
+            false,
             symphony::GrammarStart::Unknown,
             &unrendered,
         )
@@ -1584,6 +1707,7 @@ mod tests {
             flags: Names::default(),
             request: AutoRequest::Chat(Arc::new(request(json!({"tools": tools()})))),
             reasoning_open: true,
+            thought_closed: false,
             templates: Arc::clone(&templates),
         };
         // What one decision gives (the tag's text, whether it is the whole turn's, whether the
@@ -1713,6 +1837,7 @@ mod tests {
                 flags: Names::default(),
                 request: AutoRequest::Chat(Arc::new(request(json!({})))),
                 reasoning_open: true,
+                thought_closed: false,
                 templates: Arc::clone(&templates),
             },
         )
@@ -1745,6 +1870,7 @@ mod tests {
                 flags: Names::default(),
                 request: AutoRequest::Chat(Arc::new(chat.clone())),
                 reasoning_open: true,
+                thought_closed: false,
                 templates: Arc::clone(&templates),
             },
             AutoTag {
@@ -1757,6 +1883,7 @@ mod tests {
                     continues: false,
                 },
                 reasoning_open: true,
+                thought_closed: false,
                 templates: Arc::clone(&templates),
             },
         ];
@@ -1769,6 +1896,7 @@ mod tests {
                         Asks::Chat(&chat),
                         &chat.callable_tools(),
                         true,
+                        false,
                         start,
                         &templates,
                     ),
@@ -1781,6 +1909,7 @@ mod tests {
                         },
                         &tools(),
                         true,
+                        false,
                         start,
                         &templates,
                     ),
@@ -1815,6 +1944,7 @@ mod tests {
             flags: Names::default(),
             request: AutoRequest::Chat(Arc::new(request(json!({})))),
             reasoning_open: true,
+            thought_closed: false,
             templates,
         };
         for start in [Unknown, AfterReasoning, FirstToken] {

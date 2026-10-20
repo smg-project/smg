@@ -789,11 +789,10 @@ impl ZmqEngineClient {
                         .as_deref()
                         .unwrap_or("no reason reported")
                 );
-                return Err(match output.finish_status {
-                    Some(400) => tonic::Status::invalid_argument(message),
-                    Some(503) => tonic::Status::unavailable(message),
-                    _ => tonic::Status::internal(message),
-                });
+                return Err(crate::sglang::scheduler_abort_status(
+                    output.finish_status,
+                    message,
+                ));
             }
             let embedding = output.embedding.unwrap_or_default();
             return Ok(sglang_proto::EmbedResponse {

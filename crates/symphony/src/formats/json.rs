@@ -1,14 +1,16 @@
 //! JSON calls alone in the turn: the whole output is one call object, `{"name": …, "parameters":
-//! {…}}` (`arguments` reads the same), or several with `;` between them, or a list of them, or
-//! content; Llama 3.1's format, whose template renders a call as the bare object and whose
-//! models write the call behind the template's call token, `<|python_tag|>{"name": …,
-//! "parameters": {…}}`, and their parallel calls as `<|python_tag|>{…}; {…}`. The marker is read
-//! at the output's start and dropped, so an output with it and one without read the same. The
-//! format the gateway's older `json` parser reads for a model that names it, and its older
-//! `llama` parser's (Llama 3.2 writes the same). The recorded groups that write it (Nemotron
-//! Ultra CPT, UltraLong, Safety Guard, the 70B Reward Principle) record the template's bare
-//! object; the marker and the `;` form stand on the unit tests, which hold a model's output
-//! verbatim.
+//! {…}}` (`arguments` reads the same), or several with `;` or whitespace between them, or a list
+//! of them, or content; Llama 3.1's format, whose template renders a call as the bare object and
+//! whose models write the call behind the template's call token, `<|python_tag|>{"name": …,
+//! "parameters": {…}}`, and their parallel calls as `<|python_tag|>{…}; {…}`; Llama 3.2 Instruct
+//! writes its parallel calls as consecutive objects with a blank line between them, `{…}\n\n{…}`,
+//! and the engines' own readers of the family read every object of either sequence. The marker
+//! is read at the output's start and dropped, so an output with it and one without read the
+//! same. The format the gateway's older `json` parser reads for a model that names it, and its
+//! older `llama` parser's (Llama 3.2 writes the same). The recorded groups that write it (Nemotron
+//! Ultra CPT, UltraLong, Safety Guard, the 70B Reward Principle, Llama 3.2 1B/3B Instruct and
+//! 11B/90B Vision Instruct) record the template's bare object; the marker and the `;` form stand
+//! on the unit tests, which hold a model's output verbatim.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 use crate::format::{CallSyntax, Emits, Format};
@@ -319,6 +321,148 @@ mod tests {
                 1,
                 "{tail:?}: {events:?}"
             );
+        }
+    }
+
+    /// Two parallel calls of different tools as a served Llama 3.2 Instruct checkpoint writes
+    /// them, verbatim: consecutive objects, each on its own lines, a blank line between them,
+    /// no call token, no `;` and no list.
+    const OBJECTS_ON_BLANK_LINES: &str = concat!(
+        "{\n",
+        "    \"name\": \"triangle_properties_get\",\n",
+        "    \"parameters\": {\n",
+        "        \"side1\": 5,\n",
+        "        \"side2\": 7,\n",
+        "        \"side3\": 9,\n",
+        "        \"get_area\": true,\n",
+        "        \"get_perimeter\": true,\n",
+        "        \"get_angles\": true\n",
+        "    }\n",
+        "}\n",
+        "\n",
+        "{\n",
+        "    \"name\": \"circle_properties_get\",\n",
+        "    \"parameters\": {\n",
+        "        \"radius\": 3,\n",
+        "        \"get_area\": true,\n",
+        "        \"get_circumference\": true\n",
+        "    }\n",
+        "}",
+    );
+
+    /// Four, verbatim from the same checkpoint, with one newline between the objects.
+    const OBJECTS_ON_NEWLINES: &str = concat!(
+        "{\n",
+        "    \"name\": \"get_scientist_for_discovery\",\n",
+        "    \"parameters\": {\n",
+        "        \"discovery\": \"Relativity Theory\"\n",
+        "    }\n",
+        "}\n",
+        "{\n",
+        "    \"name\": \"flight_book\",\n",
+        "    \"parameters\": {\n",
+        "        \"departure_location\": \"Los Angeles\",\n",
+        "        \"destination_location\": \"New York\",\n",
+        "        \"date\": \"2022-12-25\",\n",
+        "        \"time\": \"10:00 AM\",\n",
+        "        \"direct_flight\": true\n",
+        "    }\n",
+        "}\n",
+        "{\n",
+        "    \"name\": \"game_stats_fetch_player_statistics\",\n",
+        "    \"parameters\": {\n",
+        "        \"game\": \"Call of Duty\",\n",
+        "        \"username\": \"gamer123\",\n",
+        "        \"platform\": \"PlayStation\"\n",
+        "    }\n",
+        "}\n",
+        "{\n",
+        "    \"name\": \"event_finder_find_upcoming\",\n",
+        "    \"parameters\": {\n",
+        "        \"location\": \"San Francisco, CA\",\n",
+        "        \"genre\": \"rock\",\n",
+        "        \"days_ahead\": 14\n",
+        "    }\n",
+        "}",
+    );
+
+    #[test]
+    fn consecutive_objects_on_blank_lines_or_newlines_are_the_familys_parallel_calls() {
+        // Every object of the sequence is a call, in order, with its own arguments as written;
+        // nothing is content, the whitespace between the objects is the template's wrapping, and
+        // the finish counts them: the engines' own readers of the family read every object.
+        let events = whole_and_per_byte(OBJECTS_ON_BLANK_LINES);
+        assert_eq!(
+            calls(&events),
+            [
+                (
+                    "triangle_properties_get".to_string(),
+                    concat!(
+                        "{\n        \"side1\": 5,\n        \"side2\": 7,\n        \"side3\": 9,\n",
+                        "        \"get_area\": true,\n        \"get_perimeter\": true,\n",
+                        "        \"get_angles\": true\n    }"
+                    )
+                    .to_string()
+                ),
+                (
+                    "circle_properties_get".to_string(),
+                    concat!(
+                        "{\n        \"radius\": 3,\n        \"get_area\": true,\n",
+                        "        \"get_circumference\": true\n    }"
+                    )
+                    .to_string()
+                ),
+            ]
+        );
+        assert_eq!(content(&events), "");
+        assert_eq!(
+            dropped(&events),
+            [(DropReason::Wrapper, "\n\n".to_string())]
+        );
+        assert!(malformed(&events).is_empty(), "{events:?}");
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish {
+                reason: FinishReason::Stop,
+                tool_calls: 2,
+                ..
+            })
+        ));
+        let events = whole_and_per_byte(OBJECTS_ON_NEWLINES);
+        let names: Vec<String> = calls(&events).into_iter().map(|(name, _)| name).collect();
+        assert_eq!(
+            names,
+            [
+                "get_scientist_for_discovery",
+                "flight_book",
+                "game_stats_fetch_player_statistics",
+                "event_finder_find_upcoming",
+            ]
+        );
+        assert_eq!(content(&events), "");
+        assert_eq!(
+            dropped(&events),
+            [(DropReason::Wrapper, "\n\n\n".to_string())]
+        );
+        assert!(malformed(&events).is_empty(), "{events:?}");
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish {
+                reason: FinishReason::Stop,
+                tool_calls: 4,
+                ..
+            })
+        ));
+        // At every two-way cut as well, the sequence cut between and inside the objects.
+        for output in [OBJECTS_ON_BLANK_LINES, OBJECTS_ON_NEWLINES] {
+            let whole = run(&[output]);
+            for cut in 1..output.len() {
+                let events = run(&[&output[..cut], &output[cut..]]);
+                assert_eq!(bytes(&events), output, "cut at {cut}");
+                assert_eq!(calls(&events), calls(&whole), "cut at {cut}");
+                assert_eq!(content(&events), "", "cut at {cut}");
+                assert_eq!(events.last(), whole.last(), "cut at {cut}");
+            }
         }
     }
 

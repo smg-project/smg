@@ -20,7 +20,6 @@
 
 use crate::{
     format::{CallSyntax, Emits, Format},
-    shape::{Layout, Message},
     tagged::{Placement, Spelling},
 };
 
@@ -41,15 +40,7 @@ pub fn seed_oss() -> Format {
         .transition("calls", "call_open", "calls")
         .calls(CallSyntax::Tagged(Spelling::Python, Placement::Direct))
         .opens_turn("<seed:bos>assistant")
-        .with_layout(Layout {
-            thought: Some(Message {
-                before: "".into(),
-                after: "\n".into(),
-                stops: false,
-                close: Some("</seed:think>".into()),
-            }),
-            ..Layout::default()
-        })
+        .with_layout(super::thought_layout("</seed:think>", "\n"))
 }
 
 #[cfg(test)]

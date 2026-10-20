@@ -6,7 +6,7 @@ use openai_protocol::{
     common::{ToolChoice, ToolChoiceValue},
     messages::CreateMessageRequest,
 };
-use tracing::{debug, error};
+use tracing::error;
 
 use crate::{
     routers::{
@@ -14,8 +14,13 @@ use crate::{
         grpc::{
             common::stages::PipelineStage,
             context::{PreparationOutput, RequestContext},
-            multimodal,
-            regular::symphony,
+            regular::{
+                stages::{
+                    reading,
+                    rendered_prompt::{prepare_rendered_prompt, RenderedPrompt},
+                },
+                symphony,
+            },
             spec::MessagesResponseSpec,
             utils::{self, message_utils},
         },
@@ -115,132 +120,23 @@ impl MessagePreparationStage {
             }
         };
 
-        // Step 3: Tokenize the prompt the way its renderer said to
-        let encoding = match utils::encode_prompt_blocking(
-            tokenizer.clone(),
+        // Steps 3 and 4: the prompt tokenized the way its renderer said to,
+        // the media anchors checked, the media processed or kept as
+        // references (shared with the chat stage).
+        let RenderedPrompt {
+            token_ids,
+            multimodal_intermediate,
+            multimodal_refs,
+        } = prepare_rendered_prompt(
+            ctx,
+            &tokenizer,
             &processed_messages.text,
             prompt_encoding,
+            media.media,
+            self.wire_pools,
+            "MessagePreparationStage::execute",
         )
-        .await
-        {
-            Ok(encoding) => encoding,
-            Err(e) => {
-                error!(function = "MessagePreparationStage::execute", error = %e, "Tokenization failed");
-                return Err(error::internal_error(
-                    "tokenization_failed",
-                    format!("Tokenization failed: {e}"),
-                ));
-            }
-        };
-
-        let mut token_ids = encoding.token_ids().to_vec();
-
-        if let Some(media) = media.media.as_ref() {
-            multimodal::validate_rendered_media_anchors(
-                &media.plan,
-                &media.placeholders,
-                &*tokenizer,
-                &token_ids,
-            )
-            .map_err(|error| {
-                error!(
-                    function = "MessagePreparationStage::execute",
-                    %error,
-                    "Rendered multimodal anchors do not match request media"
-                );
-                error::bad_request("multimodal_prompt_contract_mismatch", error.to_string())
-            })?;
-        }
-
-        // Step 4: Full multimodal processing (fetch + preprocess + expand tokens + hash),
-        // or keep the media references for a worker that processes them itself.
-        let mut multimodal_intermediate = None;
-        let mut multimodal_refs = None;
-        if let Some(message_utils::MediaContext {
-            plan: media_plan,
-            placeholders,
-            components: mm_components,
-            tokenizer_id,
-            tokenizer_source,
-        }) = media.media
-        {
-            let processing = multimodal::resolve_mm_processing(
-                &mm_components,
-                &ctx.components.worker_registry,
-                model_id,
-                &media_plan,
-                &placeholders,
-            )
-            .map_err(|e| error::bad_request(e.code(), e.to_string()))?;
-            if processing == multimodal::MmProcessing::Worker {
-                debug!(
-                    function = "MessagePreparationStage::execute",
-                    media_items = media_plan.parts().len(),
-                    "Forwarding media references for worker-side processing"
-                );
-                // Which of the workers that process references may take the
-                // plan (see `resolve_mm_processing` and `PipelinePin`).
-                ctx.state.media_refs_pipeline =
-                    multimodal::media_refs_pipeline_pin(&media_plan, &placeholders);
-                multimodal_refs = Some(media_plan);
-            } else {
-                // The dtype every worker the selection can pick reads image
-                // pixels in, when they agree (and the one-pass write is not
-                // switched off, `SMG_MM_ONE_PASS_WIRE=0`): the preprocessor
-                // then writes it directly; otherwise `None`, and the write
-                // happens at assembly. Resolved over the pools of this
-                // pipeline's mode, the pools the pixels can reach, as the
-                // selection draws them.
-                let image_wire_dtype = multimodal::mm_shared_image_wire_dtype_over(
-                    &ctx.components.worker_registry,
-                    model_id,
-                    self.wire_pools,
-                );
-                // The frames decode under the destination engine's own
-                // transparency rule, resolved over the same pools as the dtype.
-                let transparency = multimodal::engine_transparency_policy(
-                    &ctx.components.worker_registry,
-                    model_id,
-                    self.wire_pools,
-                );
-                // The engine's per-item bound, the smallest its workers
-                // advertise: an item above it would never be scheduled.
-                let encoder_budget =
-                    multimodal::engine_encoder_budget(&ctx.components.worker_registry, model_id);
-                match multimodal::process_multimodal_plan(
-                    media_plan,
-                    model_id,
-                    &*tokenizer,
-                    token_ids,
-                    &mm_components,
-                    &tokenizer_id,
-                    &tokenizer_source,
-                    image_wire_dtype,
-                    transparency,
-                    encoder_budget,
-                )
-                .await
-                {
-                    Ok(output) => {
-                        debug!(
-                            function = "MessagePreparationStage::execute",
-                            expanded_tokens = output.expanded_token_ids.len(),
-                            "Multimodal processing complete"
-                        );
-                        token_ids = output.expanded_token_ids;
-                        multimodal_intermediate = Some(output.intermediate);
-                    }
-                    Err(e) => {
-                        error!(
-                            function = "MessagePreparationStage::execute",
-                            error = %multimodal::processing_failed_message(&e),
-                            "Multimodal processing failed"
-                        );
-                        return Err(multimodal::processing_failed_response(&e));
-                    }
-                }
-            }
-        }
+        .await?;
 
         // Step 4: Build tool constraints if tools present. When Symphony reads
         // the message, its table gives a forced call its tag (see
@@ -249,86 +145,30 @@ impl MessagePreparationStage {
         // parser with a reasoning prefix gets its tag wrapped so a forced call
         // follows the reasoning instead of preempting it. The table's refusal
         // waits for request building, which decides on the selected worker
-        // (`regular::symphony::worker_constraint`).
-        let names = ctx.components.parser_resolver.names(&request.model);
-        // The thinking switch's answer, or the table's replay of the rendered
-        // prompt where a table reads the message: a turn the prompt leaves
-        // unopened starts inside the thought whatever the switch says, and the
-        // tag must read it as the engine will (`regular::symphony::reasoning_open`).
-        let reasoning = utils::messages_reasoning_starts_in_prefill(
-            request,
-            processed_messages.continued_final_message,
-            tokenizer.as_ref(),
-        ) || symphony::reasoning_open(
-            parser,
-            &names,
-            &request.model,
-            &ctx.components.templates,
-            &processed_messages.text,
-        )
-        .is_some_and(|thought| thought.open);
-        let workers = ctx
-            .components
-            .worker_registry
-            .get_by_model(&ctx.input.model_id);
-        let symphony_constraint = symphony::constraint(
-            parser,
-            &names,
+        // (`regular::symphony::worker_constraint`). All of it, and whether the
+        // decoder keeps the special tokens the reader needs, is decided as for
+        // a chat request (`reading::prepare`), over the tools the template
+        // renders.
+        let reading::Prepared {
+            constraint: tool_call_constraint,
+            json_schema: json_schema_constraint,
+            keeps_special_tokens: preserve_reasoning_special_tokens,
+        } = reading::prepare(
+            ctx,
             symphony::Asks::Messages {
                 request,
                 continues: request.continues_final_assistant(),
             },
             &filtered_tools,
-            reasoning,
-            symphony::grammar_start_of(&workers),
-            &ctx.components.templates,
-        );
-        let tool_call_constraint = match (symphony_constraint, chat_tool_choice.as_ref()) {
-            (Ok(None), Some(tool_choice)) if !filtered_tools.is_empty() => Ok(ctx
-                .components
-                .tool_parser_factory
-                .registry()
-                .generate_tool_constraint(
-                    ctx.components.parser_resolver.legacy_tool(&names),
-                    &filtered_tools,
-                    tool_choice,
-                    reasoning,
-                )
-                .map_err(|e| {
-                    error!(function = "MessagePreparationStage::execute", error = %e, "Invalid tool configuration");
-                    error::bad_request(
-                        "invalid_tool_configuration",
-                        format!("Invalid tool configuration: {e}"),
-                    )
-                })?),
-            (prepared, _) => prepared,
-        };
-
-        let json_schema_constraint =
-            matches!(&tool_call_constraint, Ok(Some(c)) if c.is_json_schema());
-        // A Symphony table whose markers the decoder would drop as special tokens needs them
-        // kept: without them the table reads neither the thought nor the calls. Where a table
-        // reads the message its markers alone decide, and no legacy reasoning parser is built to
-        // be asked; under a JSON-schema constraint no table reads (request building makes no
-        // assignment: `regular::symphony::assign_messages`), so the legacy parsers answer for
-        // themselves, as they do where no table reads at all.
-        let preserve_reasoning_special_tokens = match symphony::keeps_special_tokens(
-            parser,
-            &names,
-            &request.model,
-            &ctx.components.templates,
-            &tokenizer,
-        ) {
-            Some(kept) if !json_schema_constraint => kept,
-            _ => utils::reasoning_parser_requires_special_tokens(
-                &ctx.components.reasoning_parser_factory,
-                ctx.components
-                    .parser_resolver
-                    .reasoning_parser(&request.model)
-                    .as_deref(),
-                &request.model,
+            &processed_messages.text,
+            utils::messages_reasoning_starts_in_prefill(
+                request,
+                processed_messages.continued_final_message,
+                tokenizer.as_ref(),
             ),
-        };
+            &tokenizer,
+            "MessagePreparationStage::execute",
+        )?;
 
         // Derive skip_special_tokens from parser and constraint type:
         // - typed reasoning parsers need their control tokens preserved
@@ -336,19 +176,14 @@ impl MessagePreparationStage {
         // - structural_tag or no constraint (auto): parser needs trigger tokens
         let skip_special_tokens = if preserve_reasoning_special_tokens {
             false
+        } else if json_schema_constraint {
+            true
         } else {
-            match &tool_call_constraint {
-                Ok(Some(c)) if c.is_json_schema() => true,
-                _ if !filtered_tools.is_empty()
-                    && !matches!(
-                        chat_tool_choice,
-                        Some(ToolChoice::Value(ToolChoiceValue::None))
-                    ) =>
-                {
-                    false
-                }
-                _ => true,
-            }
+            filtered_tools.is_empty()
+                || matches!(
+                    chat_tool_choice,
+                    Some(ToolChoice::Value(ToolChoiceValue::None))
+                )
         };
 
         // Step 5: the stop sequence decoder, over the stop sequences the spec

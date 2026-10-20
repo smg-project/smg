@@ -1534,6 +1534,7 @@ fn every_layout_here_fits_its_table() {
 
 /// The tags of `format` for the probe's tools: a forced call, a named function (one call, at
 /// least one), one call at most, and a JSON answer; with `reasoning_open` as the prompt leaves it.
+/// Each passes the rule the engines' structural-tag parsers hold a tag to (`Grammar::check`).
 #[expect(
     clippy::expect_used,
     reason = "a table with no tag for a mode fails the test that asks for it"
@@ -1543,18 +1544,23 @@ fn modes(format: &Format, reasoning_open: bool) -> [Grammar; 4] {
     let options = |at_least_one, one_call| Options {
         at_least_one,
         reasoning_open,
+        thought_closed: false,
         one_call,
         start: GrammarStart::Unknown,
     };
     let tag = |options| format.grammar_for(&tools, options).expect("a tag");
-    [
+    let grammars = [
         tag(options(true, false)),
         tag(options(true, true)),
         tag(options(false, true)),
         format
             .answer_grammar(&json!({"type": "object"}), reasoning_open)
             .expect("an answer tag"),
-    ]
+    ];
+    for grammar in &grammars {
+        grammar.check().expect("a tag the engines take");
+    }
+    grammars
 }
 
 #[test]

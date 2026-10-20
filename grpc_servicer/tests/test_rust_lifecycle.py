@@ -258,6 +258,135 @@ def test_one_cores_exit_ends_the_group_and_the_cleanup_reaps_every_worker(tmp_pa
         _wait_dead(worker, "orphaned worker")
 
 
+# ── tracked from the spawn: a worker orphaned before the next pass ─────────────
+
+
+def test_the_workers_an_engine_has_at_its_spawn_are_tracked_before_any_poll(tmp_path, monkeypatch):
+    """The handle's construction is the first pass: a core that exits before
+    the supervisor's first poll, right after it spawned its workers, still has
+    them cleaned up. With the interval's passes off, that pass is the only one
+    that can have seen the worker."""
+    monkeypatch.setattr(rust_lifecycle, "TRACK_INTERVAL_SECS", 3600.0)
+    pid_file, go = tmp_path / "worker.pid", tmp_path / "go"
+    launcher = subprocess.Popen(
+        ["bash", "-c", f"sleep 300 & echo $! > {pid_file}; {_exit_when(go, 3)}"]
+    )
+    worker_pid = _worker_pid(pid_file, launcher)
+
+    engine = rust_lifecycle.EngineProcess(_PopenAsSpawned(launcher))
+
+    assert worker_pid in engine._descendants
+    go.touch()
+    assert engine.wait(timeout=_PATIENCE_SECS) == 3  # no poll before the exit
+    assert _alive(worker_pid)
+    rust_lifecycle.terminate_engine(engine)
+    _wait_dead(worker_pid, "orphaned worker")
+
+
+def _spawns_on(spawn, pid_file) -> str:
+    """The head of a launcher's command: it spawns its worker once the test
+    creates ``spawn``, so a worker can appear after a pass."""
+    return f"until [ -e {spawn} ]; do sleep 0.02; done; sleep 300 & echo $! > {pid_file}"
+
+
+class _ServerOf:
+    """The Rust server as ``supervise`` sees it: running without an error,
+    connected to its engine when the test says so."""
+
+    def __init__(self):
+        self.engine_ready = False
+        self.last_error = None
+        self.running = True
+        self.events: list[str] = []
+
+    def set_serving(self, serving: bool) -> None:
+        self.events.append(f"serving:{serving}")
+
+    def stop(self, timeout: float) -> None:
+        self.events.append("stop")
+
+
+def test_the_engines_connection_takes_a_pass_before_the_servicer_serves(tmp_path, monkeypatch):
+    """A worker spawned during the engine's start, after its handle was built,
+    is recorded when the server reports the engine connected (its start is
+    over, its workers exist): a core that exits right after still has the
+    worker cleaned up at the end of the supervision, with the interval's
+    passes off."""
+    monkeypatch.setattr(rust_lifecycle, "TRACK_INTERVAL_SECS", 3600.0)
+    pid_file, go, spawn = tmp_path / "worker.pid", tmp_path / "go", tmp_path / "spawn"
+    launcher = subprocess.Popen(
+        ["bash", "-c", f"{_spawns_on(spawn, pid_file)}; {_exit_when(go, 3)}"]
+    )
+    engine = rust_lifecycle.EngineProcess(_PopenAsSpawned(launcher))
+    server = _ServerOf()
+
+    async def run() -> tuple[int, int]:
+        supervision = asyncio.create_task(
+            rust_lifecycle.supervise(
+                server,
+                engine,
+                drain_secs=0.0,
+                stop_timeout=0.1,
+                stop_event=asyncio.Event(),
+                poll_secs=0.01,
+            )
+        )
+        await asyncio.sleep(0.05)  # the supervisor's first polls, with no worker to see
+        spawn.touch()
+        worker_pid = await asyncio.to_thread(_worker_pid, pid_file, launcher)
+        assert worker_pid not in engine._descendants
+        server.engine_ready = True
+        deadline = time.monotonic() + _PATIENCE_SECS
+        while worker_pid not in engine._descendants:
+            assert time.monotonic() < deadline, "the connection took no pass"
+            await asyncio.sleep(0.01)
+        go.touch()
+        return worker_pid, await supervision
+
+    worker_pid, code = asyncio.run(run())
+
+    assert code == 1  # the engine exited
+    assert server.events == ["serving:False", "stop"]
+    _wait_dead(worker_pid, "orphaned worker")
+
+
+def test_a_cores_exit_takes_a_pass_before_the_other_cores_are_shut_down(tmp_path, monkeypatch):
+    """The exit that ends the group shuts the other cores down over their
+    descendants as of then, as an explicit terminate does: a worker a sibling
+    spawned after the last pass is reached by the cleanup, with the interval's
+    passes off."""
+    monkeypatch.setattr(rust_lifecycle, "TRACK_INTERVAL_SECS", 3600.0)
+    pid_files = [tmp_path / "a.pid", tmp_path / "b.pid"]
+    go, spawn = tmp_path / "go", tmp_path / "spawn"
+    launchers = [
+        subprocess.Popen(
+            ["bash", "-c", f"sleep 300 & echo $! > {pid_files[0]}; {_exit_when(go, 3)}"]
+        ),
+        subprocess.Popen(["bash", "-c", f"{_spawns_on(spawn, pid_files[1])}; wait"]),
+    ]
+    first_worker = _worker_pid(pid_files[0], launchers[0])
+    manager = _ManagerOf(launchers)
+    engines = rust_lifecycle.EngineProcessGroup(manager)
+    assert engines.poll() is None
+    spawn.touch()
+    late_worker = _worker_pid(pid_files[1], launchers[1])
+    assert first_worker in engines._engines[0]._descendants  # the pass at construction
+    assert late_worker not in engines._engines[1]._descendants
+
+    go.touch()
+    deadline = time.monotonic() + _PATIENCE_SECS
+    while engines.poll() is None:
+        assert time.monotonic() < deadline, "the first core never exited"
+        time.sleep(0.05)
+
+    assert manager.shutdowns == [None]
+    assert late_worker in engines._engines[1]._descendants  # the pass before the shutdown
+    assert engines.wait(timeout=_PATIENCE_SECS) == 3
+    rust_lifecycle.terminate_engine(engines)
+    for worker in (first_worker, late_worker):
+        _wait_dead(worker, "orphaned worker")
+
+
 class _FakeRank:
     """A ``multiprocessing``-shaped scheduler process this process started."""
 

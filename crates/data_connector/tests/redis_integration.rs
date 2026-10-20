@@ -14,9 +14,9 @@ use std::{
 
 use chrono::{TimeDelta, Utc};
 use data_connector::{
-    create_storage, ConditionalStore, ConversationItemId, HistoryBackend, ListParams,
-    NewConversation, NewConversationItem, RedisConfig, ResponseId, ResponseStorage, SchemaConfig,
-    SortOrder, StorageBundle, StorageFactoryConfig, StoredResponse,
+    create_storage, AddedAtSequence, ConditionalStore, ConversationItemId, HistoryBackend,
+    ListParams, NewConversation, NewConversationItem, RedisConfig, ResponseId, ResponseStorage,
+    SchemaConfig, SortOrder, StorageBundle, StorageFactoryConfig, StoredResponse,
 };
 use redis::aio::MultiplexedConnection;
 use serde_json::json;
@@ -225,6 +225,82 @@ async fn a_second_link_of_an_item_moves_it_and_the_item_lists_once() {
         .await
         .expect("is linked"));
     assert_eq!(list(SortOrder::Asc).await, std::slice::from_ref(&ids[1]));
+}
+
+/// A conversation longer than a listing's limit: under `Desc` the listing is
+/// the newest items, newest first (the window a request replays, put back in
+/// stored order by its loader); under `Asc` the oldest, oldest first (the
+/// public listing's default page). The same limit, the two ends of the
+/// conversation.
+#[tokio::test]
+#[ignore = "requires a live Redis server; set DATA_CONNECTOR_TEST_REDIS_URL and run with -- --ignored"]
+async fn a_conversation_longer_than_the_listing_lists_its_newest_items_under_desc_and_its_oldest_under_asc(
+) {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let bundle = redis_bundle(&url)
+        .await
+        .expect("failed to initialize Redis storage");
+    let conversation = bundle
+        .conversation_storage
+        .create_conversation(NewConversation {
+            id: None,
+            metadata: None,
+            tenant: None,
+        })
+        .await
+        .expect("create conversation");
+    let items = bundle.conversation_item_storage;
+
+    // 150 items, their ids unique to this run (the server keeps the keys of earlier runs), linked
+    // in order and each stamped later than the one before, as the conversations API does.
+    let nonce = &conversation.id.0;
+    let mut stamps = AddedAtSequence::new();
+    let mut ids = Vec::new();
+    for n in 1..=150 {
+        let id = ConversationItemId::from(format!("msg_{n}_{nonce}").as_str());
+        items
+            .create_item(NewConversationItem {
+                id: Some(id.clone()),
+                response_id: None,
+                item_type: "message".to_string(),
+                role: Some("user".to_string()),
+                content: json!([]),
+                status: Some("completed".to_string()),
+                tenant: None,
+            })
+            .await
+            .expect("create item");
+        items
+            .link_item(&conversation.id, &id, stamps.next_added_at())
+            .await
+            .expect("link item");
+        ids.push(id);
+    }
+
+    let list = |order: SortOrder| {
+        let items = items.clone();
+        let conversation_id = conversation.id.clone();
+        let params = ListParams {
+            limit: 101,
+            order,
+            after: None,
+        };
+        async move {
+            items
+                .list_items(&conversation_id, params)
+                .await
+                .expect("list items")
+                .into_iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let newest_first: Vec<ConversationItemId> = ids[49..].iter().rev().cloned().collect();
+    assert_eq!(list(SortOrder::Desc).await, newest_first);
+    assert_eq!(list(SortOrder::Asc).await, ids[..101].to_vec());
 }
 
 #[tokio::test]

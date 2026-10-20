@@ -6,10 +6,21 @@
 //! phase it died in. Those failures count under
 //! `smg_pd_rendezvous_failures_total{leg, phase}`, next to the registration
 //! probe's, so a dead rendezvous port shows as a rate at the gateway and not
-//! only as late client errors.
+//! only as late client errors. An engine whose wire carries no reason
+//! retires the side with a bare report; for a decode side, the gateway then
+//! asks the question itself, with the registration probe, of the port that
+//! side had to reach (see [`dead_rendezvous_of`]).
 
-use super::stream_failure::UpstreamClass;
-use crate::observability::metrics::Metrics;
+use std::{fmt, sync::Arc};
+
+use super::stream_failure::{is_the_engines_own_report, UpstreamClass};
+use crate::{
+    observability::metrics::{metrics_labels, Metrics},
+    worker::{
+        bootstrap_probe::{probe_partners_bootstrap_port, DeadBootstrapPort, REQUEST_PHASE},
+        Worker,
+    },
+};
 
 /// Words an engine puts on a side that never met its partner: the bootstrap
 /// (its server, its room, the wait in the bootstrapping state) and the
@@ -71,12 +82,173 @@ pub(crate) fn account_pd_side_failure(side: &'static str, status: &tonic::Status
     }
 }
 
+/// A dead rendezvous port behind a decode side's failure: the prefill side's
+/// bootstrap port, as the request path found it (see [`dead_rendezvous_of`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeadRendezvous(pub(crate) DeadBootstrapPort);
+
+impl fmt::Display for DeadRendezvous {
+    /// The words a client reads after the engine's report. The port's
+    /// address is for the gateway's own line, not for the client.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the prefill side's bootstrap port did not accept a connection ({}), so the sides \
+             could not rendezvous",
+            self.0.error
+        )
+    }
+}
+
+/// The rendezvous failure behind a decode side its engine failed without a
+/// reason. The engine's own report (see [`is_the_engines_own_report`]) names
+/// no phase: its wire carries none. When it ends the decode side of a
+/// disaggregated request, the port that side's engine had to reach, the
+/// prefill side's bootstrap port, is probed as it was at registration (the
+/// same port decision, connection and bound). A port that does not accept
+/// the connection is the failure the engine could not name: counted under
+/// the rendezvous family's `request` phase on the prefill side, whose port it
+/// is, and handed back for the line and the message. `None` for a status
+/// that carries the engine's words (classed by [`RendezvousPhase`] instead),
+/// a prefill side that hands its partners no port, or a port that accepted.
+pub(crate) async fn dead_rendezvous_of(
+    prefill: Option<&Arc<dyn Worker>>,
+    status: &tonic::Status,
+) -> Option<DeadRendezvous> {
+    if !is_the_engines_own_report(status) {
+        return None;
+    }
+    match probe_partners_bootstrap_port(prefill?.as_ref()).await? {
+        Ok(()) => None,
+        Err(dead) => {
+            Metrics::record_pd_rendezvous_failure(metrics_labels::WORKER_PREFILL, REQUEST_PHASE);
+            Some(DeadRendezvous(dead))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::net::TcpListener;
+
     use metrics_exporter_prometheus::PrometheusBuilder;
+    use openai_protocol::worker::{RuntimeType, WorkerType};
 
     use super::*;
-    use crate::observability::metrics::metrics_labels;
+    use crate::{routers::grpc::proto_wrapper::ENGINE_ERROR_MESSAGE, worker::BasicWorkerBuilder};
+
+    /// A loopback port nothing listens on.
+    fn closed_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("address").port();
+        drop(listener);
+        port
+    }
+
+    /// A prefill side on the loopback host whose partners are handed `port`.
+    fn prefill_on(port: u16) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:30000")
+                .worker_type(WorkerType::Prefill)
+                .runtime_type(RuntimeType::Sglang)
+                .bootstrap_port(Some(port))
+                .build(),
+        )
+    }
+
+    /// The rendered rendezvous series.
+    fn rendezvous_series(rendered: &str) -> Vec<&str> {
+        rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_pd_rendezvous_failures_total{"))
+            .collect()
+    }
+
+    /// The engine's own report behind a prefill side whose bootstrap port
+    /// nothing listens on is the dead rendezvous: counted under the request
+    /// phase on the prefill side, worded for the client without the address.
+    #[tokio::test]
+    async fn the_engines_own_report_behind_a_dead_bootstrap_port_is_a_rendezvous_failure() {
+        let port = closed_port();
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let dead = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            dead_rendezvous_of(
+                Some(&prefill_on(port)),
+                &tonic::Status::internal(ENGINE_ERROR_MESSAGE),
+            )
+            .await
+        }
+        .expect("the dead port is the rendezvous failure");
+        assert_eq!((dead.0.host.as_str(), dead.0.port), ("127.0.0.1", port));
+        let words = dead.to_string();
+        assert!(
+            words.starts_with("the prefill side's bootstrap port did not accept a connection (")
+                && words.ends_with("), so the sides could not rendezvous"),
+            "{words}"
+        );
+        assert!(
+            !words.contains("127.0.0.1"),
+            "the address stays out of the client's words: {words}"
+        );
+        let rendered = handle.render();
+        let counted = rendezvous_series(&rendered);
+        assert_eq!(counted.len(), 1, "{rendered}");
+        assert!(
+            counted[0].contains(r#"leg="prefill""#)
+                && counted[0].contains(r#"phase="request""#)
+                && counted[0].ends_with(" 1"),
+            "{rendered}"
+        );
+    }
+
+    /// Nothing is probed or counted without both a report that carries no
+    /// reason and a dead port: a status with the engine's words (classed by
+    /// phase above), a port that accepts, no prefill side, or a prefill side
+    /// no partner is handed a port for.
+    #[tokio::test]
+    async fn nothing_is_probed_without_a_reasonless_report_and_a_dead_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let live = listener.local_addr().expect("address").port();
+        let side_channel: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:30000")
+                .worker_type(WorkerType::Prefill)
+                .runtime_type(RuntimeType::Vllm)
+                .kv_connector("NixlConnector")
+                .build(),
+        );
+        let report = tonic::Status::internal(ENGINE_ERROR_MESSAGE);
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let verdicts = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            [
+                dead_rendezvous_of(Some(&prefill_on(live)), &report).await,
+                dead_rendezvous_of(
+                    Some(&prefill_on(closed_port())),
+                    &tonic::Status::internal(
+                        "Decode handshake failed for request rank=0 req.rid='r2' \
+                         req.bootstrap_room=42",
+                    ),
+                )
+                .await,
+                dead_rendezvous_of(
+                    Some(&prefill_on(closed_port())),
+                    &tonic::Status::unavailable("connection reset"),
+                )
+                .await,
+                dead_rendezvous_of(None, &report).await,
+                dead_rendezvous_of(Some(&side_channel), &report).await,
+            ]
+        };
+        assert!(verdicts.iter().all(Option::is_none), "{verdicts:?}");
+        assert!(
+            rendezvous_series(&handle.render()).is_empty(),
+            "{}",
+            handle.render()
+        );
+    }
 
     /// The texts a disaggregated engine's scheduler and transfer layer write
     /// for a side they retire, as their sources spell them, and the phase

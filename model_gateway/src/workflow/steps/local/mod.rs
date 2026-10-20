@@ -8,6 +8,7 @@ mod drain_workers;
 mod ensure_harmony_encoding;
 mod find_worker_to_update;
 mod find_workers_to_remove;
+mod rediscover_labels;
 mod remove_from_policy_registry;
 mod remove_from_worker_registry;
 mod submit_tokenizer_job;
@@ -27,6 +28,7 @@ pub use ensure_harmony_encoding::EnsureHarmonyEncodingStep;
 pub use find_worker_to_update::FindWorkerToUpdateStep;
 pub use find_workers_to_remove::{FindWorkersToRemoveStep, WorkerRemovalRequest};
 use openai_protocol::worker::WorkerUpdateRequest;
+pub use rediscover_labels::RediscoverLabelsStep;
 pub use remove_from_policy_registry::RemoveFromPolicyRegistryStep;
 pub use remove_from_worker_registry::RemoveFromWorkerRegistryStep;
 pub use submit_tokenizer_job::SubmitTokenizerJobStep;
@@ -184,6 +186,21 @@ pub fn create_worker_update_workflow() -> WorkflowDefinition<WorkerUpdateWorkflo
         )
         .add_step(
             StepDefinition::new(
+                "rediscover_labels",
+                "Re-read the worker's labels from its engine (label refresh only)",
+                Arc::new(RediscoverLabelsStep),
+            )
+            .with_timeout(Duration::from_secs(10))
+            // An engine that just came back may still be warming up: one more
+            // try before the refresh is left to the next transition.
+            .with_retry(RetryPolicy {
+                max_attempts: 2,
+                backoff: BackoffStrategy::Fixed(Duration::from_secs(3)),
+            })
+            .depends_on(&["find_worker_to_update"]),
+        )
+        .add_step(
+            StepDefinition::new(
                 "update_worker_properties",
                 "Update worker properties",
                 Arc::new(UpdateWorkerPropertiesStep),
@@ -193,7 +210,7 @@ pub fn create_worker_update_workflow() -> WorkflowDefinition<WorkerUpdateWorkflo
                 max_attempts: 1,
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
             })
-            .depends_on(&["find_worker_to_update"]),
+            .depends_on(&["rediscover_labels"]),
         )
         .add_step(
             StepDefinition::new(
@@ -241,6 +258,9 @@ pub fn create_worker_update_workflow_data(
         app_context: Some(app_context),
         workers_to_update: None,
         updated_workers: None,
+        refresh_discovered_labels: false,
+        fresh_engine_labels: None,
+        snapshot: None,
     }
 }
 

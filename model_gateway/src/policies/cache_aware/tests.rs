@@ -48,7 +48,7 @@ fn overlap_affinity_group(
 }
 use crate::{
     observability::metrics::CACHE_AWARE_MATCH_RATIO_BUCKETS,
-    worker::{BasicWorkerBuilder, WorkerBlocks, WorkerType},
+    worker::{runtime::StallReason, BasicWorkerBuilder, WorkerBlocks, WorkerType},
 };
 
 fn no_health_check() -> HealthCheckConfig {
@@ -163,6 +163,51 @@ fn overloaded_worker_is_vetoed_by_the_fused_gather() {
         worker.set_overloaded(false);
     }
     assert!(policy.select_worker(&workers, &info).is_some());
+}
+
+/// A caller that judged the overload veto unable to steer lifts it (every
+/// worker of a disaggregated pool over the thresholds): the policy then
+/// places as if none were over them, prefix affinity included. The liveness
+/// veto is not lifted.
+#[test]
+fn a_lifted_overload_veto_keeps_the_prefix_owner() {
+    let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+        eviction_interval_secs: 0,
+        ..Default::default()
+    });
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    policy.init_workers(&workers);
+
+    let info = SelectWorkerInfo {
+        request_text: Some("a stable prefix that pins one worker"),
+        ..Default::default()
+    };
+    let owner = policy.select_worker(&workers, &info).unwrap();
+    for worker in &workers {
+        worker.set_overloaded(true);
+    }
+    assert_eq!(
+        policy.select_worker(&workers, &info),
+        None,
+        "the veto applies"
+    );
+    let lifted = SelectWorkerInfo {
+        overload_lifted: true,
+        ..info.clone()
+    };
+    for _ in 0..4 {
+        assert_eq!(
+            policy.select_worker(&workers, &lifted),
+            Some(owner),
+            "with the veto lifted the owner keeps its prefix"
+        );
+    }
+    workers[owner].set_stall(Some(StallReason::Wedged));
+    assert_ne!(
+        policy.select_worker(&workers, &lifted),
+        Some(owner),
+        "a stalled owner is not lifted back"
+    );
 }
 
 #[test]
@@ -886,6 +931,38 @@ fn string_tree_unique_hit_keeps_affinity_and_credits_expected_wait() {
     };
     assert_eq!(policy.select_worker(&workers, &hit), Some(0));
     assert_only_final_worker_credited(&policy, &workers, 0, 1024);
+}
+
+/// A prefill cache miss favors less queued input regardless of output rate.
+#[test]
+fn prefill_miss_ignores_generation_rate() {
+    for generated in [0.0, 0.5, 10_000.0] {
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let workers: Vec<Arc<dyn Worker>> = ["http://p1:8000", "http://p2:8000"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .worker_type(WorkerType::Prefill)
+                        .health_config(no_health_check())
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect();
+        policy.init_workers(&workers);
+        let feed = TestFeed::attached_to(&policy.load_scorer);
+        feed.publish(&HashMap::from([
+            (
+                workers[0].url().to_string(),
+                expected_wait_load(2_000, 0.0, generated),
+            ),
+            (
+                workers[1].url().to_string(),
+                expected_wait_load(4_000, 0.0, 2_000.0),
+            ),
+        ]));
+        assert_eq!(route_text(&policy, &workers, "new prefill prompt"), Some(0));
+    }
 }
 
 #[test]

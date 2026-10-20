@@ -7,7 +7,7 @@ use std::{fmt::Debug, sync::Arc};
 
 use crate::{
     config::CacheIndexKind,
-    worker::{load_state::LoadReceiver, HashRing, Worker},
+    worker::{load_state::LoadReceiver, runtime::RoutingState, HashRing, Worker},
 };
 
 mod bucket;
@@ -273,12 +273,23 @@ impl Default for BucketConfig {
 /// [`Worker::is_available`] folds the absolute overload veto into the health +
 /// circuit-breaker test it already performed, under the same guards and with
 /// the same short-circuit order — the veto is one more test on a word already
-/// in hand, never a second walk.
-pub(crate) fn get_healthy_worker_indices(workers: &[Arc<dyn Worker>]) -> Vec<usize> {
+/// in hand, never a second walk. A selection whose caller lifted that veto
+/// ([`SelectWorkerInfo::overload_lifted`]) tests every other veto instead
+/// ([`RoutingState::eligible_ignoring_overload`]).
+pub(crate) fn get_healthy_worker_indices(
+    workers: &[Arc<dyn Worker>],
+    info: &SelectWorkerInfo,
+) -> Vec<usize> {
     workers
         .iter()
         .enumerate()
-        .filter(|(_, w)| w.is_available())
+        .filter(|(_, w)| {
+            if info.overload_lifted {
+                w.routing_state().eligible_ignoring_overload()
+            } else {
+                w.is_available()
+            }
+        })
         .map(|(idx, _)| idx)
         .collect()
 }
@@ -351,6 +362,27 @@ pub struct SelectWorkerInfo<'a> {
     /// Which PD role this selection is for (default `Single`); namespaces
     /// header-based sticky routing so prefill and decode stick independently.
     pub role: WorkerRole,
+    /// Every worker of the pool this selection is over is vetoed by the
+    /// absolute overload thresholds, so that veto cannot steer it: the
+    /// policy takes a worker over them as it takes one under them (health,
+    /// the circuit breaker and the liveness veto still apply). Set by
+    /// disaggregated pair placement for such a pool (see
+    /// `placement::select_pair`); a single-worker placement keeps the
+    /// least-loaded steering default for it.
+    pub overload_lifted: bool,
+}
+
+impl SelectWorkerInfo<'_> {
+    /// Whether a worker in routing `state` is a candidate for this
+    /// selection: [`RoutingState::eligible`], or every veto but the overload
+    /// one when the caller lifted that veto ([`Self::overload_lifted`]).
+    pub(crate) fn admits(&self, state: RoutingState) -> bool {
+        if self.overload_lifted {
+            state.eligible_ignoring_overload()
+        } else {
+            state.eligible()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -358,7 +390,7 @@ mod tests {
     use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, WorkerType};
+    use crate::worker::{runtime::StallReason, BasicWorkerBuilder, WorkerType};
 
     fn no_health_check() -> HealthCheckConfig {
         HealthCheckConfig {
@@ -394,12 +426,12 @@ mod tests {
         ];
 
         // All healthy initially
-        let indices = get_healthy_worker_indices(&workers);
+        let indices = get_healthy_worker_indices(&workers, &SelectWorkerInfo::default());
         assert_eq!(indices, vec![0, 1, 2]);
 
         // Mark one unhealthy
         workers[1].set_status(WorkerStatus::NotReady);
-        let indices = get_healthy_worker_indices(&workers);
+        let indices = get_healthy_worker_indices(&workers, &SelectWorkerInfo::default());
         assert_eq!(indices, vec![0, 2]);
     }
 
@@ -426,7 +458,7 @@ mod tests {
             );
             worker.set_status(status);
             let workers = vec![worker];
-            let indices = get_healthy_worker_indices(&workers);
+            let indices = get_healthy_worker_indices(&workers, &SelectWorkerInfo::default());
             assert_eq!(
                 indices == vec![0],
                 expected_included,
@@ -456,17 +488,40 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(get_healthy_worker_indices(&workers), vec![0, 1, 2]);
+        assert_eq!(
+            get_healthy_worker_indices(&workers, &SelectWorkerInfo::default()),
+            vec![0, 1, 2]
+        );
 
         // A busy worker is still eligible: load alone is not the veto.
         let _guard = crate::worker::WorkerLoadGuard::new(Arc::clone(&workers[1]), None);
-        assert_eq!(get_healthy_worker_indices(&workers), vec![0, 1, 2]);
+        assert_eq!(
+            get_healthy_worker_indices(&workers, &SelectWorkerInfo::default()),
+            vec![0, 1, 2]
+        );
 
         workers[1].set_overloaded(true);
-        assert_eq!(get_healthy_worker_indices(&workers), vec![0, 2]);
+        assert_eq!(
+            get_healthy_worker_indices(&workers, &SelectWorkerInfo::default()),
+            vec![0, 2]
+        );
+
+        // A caller that lifted the veto (every worker of its pool over the
+        // thresholds) gets the worker back; the liveness veto still applies.
+        let lifted = SelectWorkerInfo {
+            overload_lifted: true,
+            ..Default::default()
+        };
+        assert_eq!(get_healthy_worker_indices(&workers, &lifted), vec![0, 1, 2]);
+        workers[1].set_stall(Some(StallReason::Wedged));
+        assert_eq!(get_healthy_worker_indices(&workers, &lifted), vec![0, 2]);
+        workers[1].set_stall(None);
 
         workers[1].set_overloaded(false);
-        assert_eq!(get_healthy_worker_indices(&workers), vec![0, 1, 2]);
+        assert_eq!(
+            get_healthy_worker_indices(&workers, &SelectWorkerInfo::default()),
+            vec![0, 1, 2]
+        );
     }
 
     #[test]

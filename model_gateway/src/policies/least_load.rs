@@ -18,7 +18,7 @@ use crate::{
     worker::{
         expected_wait::ExpectedWait,
         load_state::{LoadReceiver, LoadSnapshot},
-        Worker,
+        Worker, WorkerType,
     },
 };
 
@@ -119,7 +119,7 @@ impl SincePollDispatch {
 /// - running requests are estimated
 ///   at `running_reqs · p̄`: a poll releases dispatch credit but does not mean
 ///   the request finished. This is a fallback estimate, not remaining prefill;
-/// - zero/absent throughput (backend reports no generation rate): falls back to
+/// - prefill workers, or zero/absent generation throughput: fall back to
 ///   the configured `default_throughput`, so the work term stays in seconds and
 ///   the KV barrier stays relevant;
 /// - a worker with no fresh snapshot while peers report: its live in-flight is
@@ -140,8 +140,9 @@ impl SincePollDispatch {
 ///   barrier. Raise it to steer harder away from near-full KV; lower it to
 ///   weight raw drain time more.
 /// - `default_throughput` (default `2000` tok/s) — drain rate used when a
-///   backend reports no live `gen_throughput`. Set it to the fleet's measured
-///   per-replica generation rate; it co-tunes with `kv_pressure_weight`.
+///   backend reports no live `gen_throughput`, and always for prefill workers.
+///   Set it to per-replica input tokens/s for prefill, output tokens/s otherwise;
+///   it co-tunes with `kv_pressure_weight`.
 /// - `mean_prefill_tokens` (p̄, default `1024`) — per-request token estimate for
 ///   the in-flight term when the request's token count is unknown at routing
 ///   (the HTTP path; ignored when tokens are known, i.e. gRPC).
@@ -171,7 +172,7 @@ pub struct LeastLoadPolicy {
     /// request's token count is unknown at routing time.
     mean_prefill_tokens: u32,
     /// Fallback throughput (tokens/s) for the `/throughput` term when a backend
-    /// reports no live `gen_throughput`.
+    /// reports no live `gen_throughput`; always used as input tokens/s for prefill.
     default_throughput: f64,
     /// Per-worker waiting-queue cap; `0` disables the veto.
     max_waiting_requests: u32,
@@ -339,7 +340,7 @@ impl LeastLoadPolicy {
                         * f64::from(self.mean_prefill_tokens);
                 ExpectedWait::new(
                     queued_tokens,
-                    self.drain_rate(load),
+                    self.drain_rate(worker, load),
                     load.effective_kv_pressure(),
                     self.kv_pressure_weight,
                 )
@@ -369,15 +370,19 @@ impl LeastLoadPolicy {
         snapshot.and_then(|snapshot| snapshot.get(url))
     }
 
-    /// The drain rate a reporting worker's wait is priced at: its live
-    /// generation rate, else the configured default.
-    fn drain_rate(&self, load: &WorkerLoadResponse) -> f64 {
-        let live = load.total_gen_throughput();
-        if live > 0.0 {
-            live
-        } else {
-            self.default_throughput
+    /// Generation throughput is a usable drain rate only for decode and regular
+    /// workers. Prefill consumes input tokens, which the output rate cannot price.
+    fn live_drain_rate(worker: &Arc<dyn Worker>, load: &WorkerLoadResponse) -> Option<f64> {
+        if worker.worker_type() == &WorkerType::Prefill {
+            return None;
         }
+        let live = load.total_gen_throughput();
+        (live > 0.0).then_some(live)
+    }
+
+    /// Prefill uses configured input capacity; other roles prefer live output rate.
+    fn drain_rate(&self, worker: &Arc<dyn Worker>, load: &WorkerLoadResponse) -> f64 {
+        Self::live_drain_rate(worker, load).unwrap_or(self.default_throughput)
     }
 
     /// The scoring inputs for one pass over `candidates`: the nominal drain
@@ -398,9 +403,10 @@ impl LeastLoadPolicy {
     ) -> ScoreInputs<'a> {
         let (tp_sum, tp_count) = candidates
             .iter()
-            .filter_map(|&i| Self::fresh_load(snapshot, workers[i].url()))
-            .map(|l| l.total_gen_throughput())
-            .filter(|t| *t > 0.0)
+            .filter_map(|&i| {
+                Self::fresh_load(snapshot, workers[i].url())
+                    .and_then(|load| Self::live_drain_rate(&workers[i], load))
+            })
             .fold((0.0, 0u32), |(s, n), t| (s + t, n + 1));
         let nominal_throughput = if tp_count > 0 {
             tp_sum / tp_count as f64
@@ -582,7 +588,7 @@ impl LeastLoadPolicy {
                     "running_estimated_tokens": load.map(|load| self.running_estimated_tokens(load)),
                     "kv_pressure": load.map(WorkerLoadResponse::effective_kv_pressure),
                     "resident_token_usage": load.map(WorkerLoadResponse::effective_token_usage),
-                    "drain_rate": load.map(|load| self.drain_rate(load)),
+                    "drain_rate": load.map(|load| self.drain_rate(&workers[idx], load)),
                     "since_poll_tokens": inflight.get(url).map_or(0, |dispatch| dispatch.tokens),
                     "unaccounted_requests": load.map(|load| {
                         let since_poll = inflight.get(url).map_or(0, |dispatch| dispatch.requests);
@@ -636,7 +642,7 @@ impl LeastLoadPolicy {
 
 impl LoadBalancingPolicy for LeastLoadPolicy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
-        let healthy = get_healthy_worker_indices(workers);
+        let healthy = get_healthy_worker_indices(workers, info);
         if healthy.is_empty() {
             return None;
         }
@@ -749,6 +755,66 @@ mod tests {
                 .health_config(no_health_check())
                 .build(),
         )
+    }
+
+    /// Prefill scores and missing-peer estimates must not track output-token rates.
+    #[test]
+    fn prefill_ignores_generation_rate() {
+        let policy = LeastLoadPolicy::with_params(0.15, 1024, 4_000.0, 0);
+        let feed = TestFeed::attached_to(&policy);
+        let workers: Vec<Arc<dyn Worker>> = ["http://prefill:1", "http://missing:2"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .worker_type(WorkerType::Prefill)
+                        .health_config(no_health_check())
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect();
+        workers[1].increment_load();
+        let inflight = HashMap::new();
+        for generated in [0.0, 0.5, 10_000.0] {
+            feed.publish(&HashMap::from([(
+                workers[0].url().to_string(),
+                make_load(10_000, 0.0, generated),
+            )]));
+            let snapshot = policy.snapshot().unwrap();
+            let inputs = policy.score_inputs(&workers, &[0, 1], Some(&snapshot), &inflight);
+            assert_eq!(inputs.nominal_throughput, 4_000.0);
+            assert_eq!(policy.score(&workers[0], &inputs), 2.5);
+            assert_eq!(policy.score(&workers[1], &inputs), 2.5 + 1024.0 / 4_000.0);
+        }
+    }
+
+    /// Decode and regular workers retain live generation rates and zero-rate fallback.
+    #[test]
+    fn generation_rate_still_prices_decode_and_regular() {
+        let policy = LeastLoadPolicy::new();
+        let feed = TestFeed::attached_to(&policy);
+        let inflight = HashMap::new();
+        for role in [WorkerType::Decode, WorkerType::Regular] {
+            let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
+                BasicWorkerBuilder::new("http://worker:1")
+                    .worker_type(role)
+                    .build(),
+            )];
+            for generated in [0.0, 0.5, 10_000.0] {
+                let load = make_load(10_000, 0.0, generated);
+                let expected = if generated > 0.0 {
+                    generated
+                } else {
+                    DEFAULT_THROUGHPUT
+                };
+                assert_eq!(policy.drain_rate(&workers[0], &load), expected);
+                feed.publish(&HashMap::from([(workers[0].url().to_string(), load)]));
+                let snapshot = policy.snapshot().unwrap();
+                let inputs = policy.score_inputs(&workers, &[0], Some(&snapshot), &inflight);
+                assert_eq!(inputs.nominal_throughput, expected);
+                assert_eq!(policy.score(&workers[0], &inputs), 10_000.0 / expected);
+            }
+        }
     }
 
     #[test]
