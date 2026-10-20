@@ -13,6 +13,13 @@
 //!   events, and nothing says so to the client;
 //! - `dropped`: bytes the table treats as the template's wrapping (`Event::Dropped`): correct,
 //!   expected on every output, not counted here;
+//! - `empty`: an output with no text, no reasoning and no call: only bytes the table drops
+//!   (whitespace before any text, the template's markers and separators) or no bytes at all.
+//!   The reader delivers the dropped whitespace of such an output as one content event before
+//!   the finish, the whole answer as the engine's own server streams it (`Reader::end`); the
+//!   output is counted as its own outcome either way, and written like a malformed output, with
+//!   the engine's finish, the dropped bytes by class and the bytes delivered, so a model that
+//!   answers with whitespace under a forced length, or a stream that ended with nothing, is seen;
 //! - `forgiven`: a repair that keeps the answer's shape. Of those, the calls after the first
 //!   dropped under `parallel_tool_calls: false` are counted (`suppressed_calls`); the refined
 //!   finish, the empty arguments of a call without an `arguments` member and the chunking rule's
@@ -47,12 +54,13 @@ use std::{
 
 use metrics::{Key, Label, Level, Metadata};
 use parking_lot::Mutex;
-use symphony::{formats::Table, DropReason, Event, MalformedReason};
+use symphony::{formats::Table, DropReason, Event, FinishReason, MalformedReason};
 use tracing::warn;
 
 use super::names::Fallback;
 
-/// Outputs read to their end, by `table` and `outcome` (`clean`, `malformed`, `failed`).
+/// Outputs read to their end, by `table` and `outcome` (`clean`, `malformed`, `failed`,
+/// `empty`).
 pub(crate) const OUTPUTS: &str = "smg_symphony_outputs_total";
 /// Malformed runs, by `table` and `reason`.
 pub(crate) const MALFORMED: &str = "smg_symphony_malformed_total";
@@ -114,7 +122,7 @@ const REASONS: [&str; 29] = [
 /// The place of `other` in [`REASONS`]: a reason the match below does not know.
 const OTHER_REASON: usize = REASONS.len() - 1;
 /// The `outcome` labels, in the order of [`Series::outputs`].
-const OUTCOMES: [&str; 3] = ["clean", "malformed", "failed"];
+const OUTCOMES: [&str; 4] = ["clean", "malformed", "failed", "empty"];
 /// The `reason` labels of [`FALLBACK`], in the order of [`fallback_index`]: the four decisions
 /// that leave a model to the legacy parsers, and the table that has no tag for a forced call.
 const FALLBACK_REASONS: [&str; 5] = [
@@ -127,6 +135,7 @@ const FALLBACK_REASONS: [&str; 5] = [
 const CLEAN: usize = 0;
 const MALFORMED_OUTCOME: usize = 1;
 const FAILED: usize = 2;
+const EMPTY: usize = 3;
 
 /// The `table` label of the format named `name`: the registry table's own name, the response
 /// template's, or `other`. Static, so a record allocates nothing for it.
@@ -181,6 +190,17 @@ fn reason_index(why: MalformedReason) -> usize {
 /// The `reason` label of a malformed run.
 pub(crate) fn reason_label(why: MalformedReason) -> &'static str {
     REASONS[reason_index(why)]
+}
+
+/// The engine's finish as the line spells it, the public API's words.
+fn finish_label(reason: &FinishReason) -> &'static str {
+    match reason {
+        FinishReason::Stop => "stop",
+        FinishReason::Length => "length",
+        FinishReason::ToolCalls => "tool_calls",
+        FinishReason::Abort => "abort",
+        FinishReason::Other(_) => "other",
+    }
 }
 
 /// The place of a fallback's `reason` label in [`FALLBACK_REASONS`].
@@ -241,6 +261,20 @@ pub(crate) struct Tally {
     announced: bool,
     suppressed_calls: u32,
     tool_calls: u32,
+    /// The bytes the client was shown: content, reasoning, malformed text kept as content, and
+    /// the source of the call events.
+    shown: u64,
+    /// The calls the output began, suppressed or not.
+    calls_begun: u32,
+    /// The bytes dropped as whitespace, and as anything else the table drops.
+    dropped_space: u64,
+    dropped_wrapping: u64,
+    /// The engine tokens of the dropped bytes, where the events carried their counts.
+    dropped_tokens: u32,
+    /// The engine's finish, as the `Finish` event says it.
+    finish: &'static str,
+    /// The dropped whitespace the reader delivered as content at the end of an empty output.
+    delivered: u64,
 }
 
 impl Tally {
@@ -249,7 +283,14 @@ impl Tally {
     pub(crate) fn see(&mut self, event: &Event, first_call_only: bool) {
         let announced = std::mem::take(&mut self.announced);
         match event {
+            Event::Content(text) | Event::Reasoning(text) => {
+                self.shown += text.text.len() as u64;
+            }
+            Event::ToolCallArguments { source, .. } | Event::ToolCallEnd { source, .. } => {
+                self.shown += source.text.len() as u64;
+            }
             Event::Malformed { text, why } => {
+                self.shown += text.text.len() as u64;
                 self.reasons
                     .get_or_insert_with(|| Box::new([0; REASONS.len()]))[reason_index(*why)] += 1;
                 self.malformed_bytes += text.text.len() as u64;
@@ -279,11 +320,27 @@ impl Tally {
                     }
                 }
             }
-            Event::ToolCallStart { index, .. } if first_call_only && *index > 0 => {
-                self.suppressed_calls += 1;
+            Event::Dropped { text, why } => {
+                match why {
+                    DropReason::Whitespace => self.dropped_space += text.text.len() as u64,
+                    _ => self.dropped_wrapping += text.text.len() as u64,
+                }
+                self.dropped_tokens += text.tokens.unwrap_or(0);
             }
-            Event::Finish { tool_calls, .. } => self.tool_calls = *tool_calls,
-            _ => {}
+            Event::ToolCallStart { index, source, .. } => {
+                self.calls_begun += 1;
+                self.shown += source.text.len() as u64;
+                if first_call_only && *index > 0 {
+                    self.suppressed_calls += 1;
+                }
+            }
+            Event::Finish {
+                reason, tool_calls, ..
+            } => {
+                self.tool_calls = *tool_calls;
+                self.finish = finish_label(reason);
+            }
+            Event::ReasoningStart | Event::ReasoningEnd => {}
         }
         self.at += bytes_of(event);
     }
@@ -293,6 +350,18 @@ impl Tally {
     /// after it.
     pub(crate) fn grew(&mut self, bytes: usize) {
         self.at += bytes;
+        self.shown += bytes as u64;
+    }
+
+    /// Whether the output showed nothing: no text, no call begun, and no malformed run (whose
+    /// text is content); only dropped bytes, or none at all.
+    pub(super) fn is_empty(&self) -> bool {
+        self.shown == 0 && self.calls_begun == 0 && self.malformed() == 0
+    }
+
+    /// `bytes` of the dropped whitespace went out as content at the end of an empty output.
+    pub(super) fn delivered(&mut self, bytes: usize) {
+        self.delivered += bytes as u64;
     }
 
     /// The first malformed run, for the reader's tests.
@@ -326,17 +395,43 @@ impl Tally {
     }
 
     /// Records the output under `table`, read to its end: the counters, and the line when the
-    /// output has a malformed run and the table's bucket allows one. Suppressed calls are counted
-    /// and not written: the request asked for them to be dropped.
+    /// output has a malformed run, or showed nothing ([`Self::is_empty`]), and the table's bucket
+    /// allows one. Suppressed calls are counted and not written: the request asked for them to be
+    /// dropped.
     pub(crate) fn report(&self, table: &'static str, who: Who<'_>) {
         let series = series(table);
         let malformed = self.malformed();
+        let empty = self.is_empty();
         let outcome = if malformed > 0 {
             MALFORMED_OUTCOME
+        } else if empty {
+            EMPTY
         } else {
             CLEAN
         };
         increment(&series.outputs[outcome], 1);
+        if empty {
+            let Some(suppressed_lines) = series.sampler.allow() else {
+                return;
+            };
+            warn!(
+                target: "smg::symphony",
+                request_id = who.request_id,
+                choice = who.choice,
+                model = who.model,
+                table,
+                outcome = OUTCOMES[EMPTY],
+                finish = self.finish,
+                bytes = self.at,
+                whitespace_bytes = self.dropped_space,
+                wrapper_bytes = self.dropped_wrapping,
+                dropped_tokens = self.dropped_tokens,
+                delivered_bytes = self.delivered,
+                suppressed_lines,
+                "Symphony read an output with no text, reasoning or call: whitespace and framing alone, or nothing"
+            );
+            return;
+        }
         if malformed == 0 && self.suppressed_calls == 0 {
             return;
         }
@@ -418,7 +513,7 @@ fn observe(key: &Key, value: f64) {
 /// The keys of one table's series, built once, and the bucket for its lines.
 struct Series {
     /// [`OUTPUTS`] by outcome, in the order of [`OUTCOMES`].
-    outputs: [Key; 3],
+    outputs: [Key; 4],
     /// [`MALFORMED`] by reason, in the order of [`REASONS`].
     malformed: [Key; REASONS.len()],
     malformed_bytes: Key,
@@ -1140,6 +1235,121 @@ mod tests {
             );
         });
         assert!(!logs_contain("req-dropped"));
+    }
+
+    fn dropped(text: &str, tokens: u32, why: DropReason) -> Event<'static> {
+        Event::Dropped {
+            text: Text::new(text.to_owned(), tokens),
+            why,
+        }
+    }
+
+    fn finished(reason: FinishReason) -> Event<'static> {
+        Event::Finish {
+            reason,
+            tool_calls: 0,
+            reasoning_tokens: 0,
+        }
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn an_output_of_dropped_bytes_alone_is_empty_and_writes_one_line() {
+        let scrape = rendered(|| {
+            let mut tally = Tally::default();
+            tally.see(&dropped("</think>", 1, DropReason::Wrapper), false);
+            tally.see(&dropped("\n\n\n", 3, DropReason::Whitespace), false);
+            tally.see(&finished(FinishReason::Length), false);
+            tally.report(
+                "qwen3",
+                Who {
+                    request_id: "req-empty",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+        });
+        let outputs = line_with(&scrape, OUTPUTS, &["table=\"qwen3\"", "outcome=\"empty\""])
+            .expect("the outputs counter");
+        assert!(outputs.ends_with(" 1"), "{outputs}");
+        assert!(
+            line_with(&scrape, OUTPUTS, &["table=\"qwen3\"", "outcome=\"clean\""])
+                .is_none_or(|line| line.ends_with(" 0"))
+        );
+        assert!(!scrape.contains(MALFORMED), "{scrape}");
+        assert!(logs_contain(
+            "Symphony read an output with no text, reasoning or call: whitespace and framing alone, or nothing"
+        ));
+        assert!(logs_contain("req-empty"));
+        assert!(logs_contain("delivered_bytes=0"));
+        assert!(logs_contain("finish=\"length\""));
+        assert!(logs_contain("bytes=11"));
+        assert!(logs_contain("whitespace_bytes=3"));
+        assert!(logs_contain("wrapper_bytes=8"));
+        assert!(logs_contain("dropped_tokens=4"));
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn an_output_of_no_bytes_is_empty_with_the_engines_finish() {
+        let scrape = rendered(|| {
+            let mut tally = Tally::default();
+            tally.see(&finished(FinishReason::Stop), false);
+            tally.report(
+                "qwen3",
+                Who {
+                    request_id: "req-nothing",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+        });
+        let outputs = line_with(&scrape, OUTPUTS, &["table=\"qwen3\"", "outcome=\"empty\""])
+            .expect("the outputs counter");
+        assert!(outputs.ends_with(" 1"), "{outputs}");
+        assert!(logs_contain("req-nothing"));
+        assert!(logs_contain("finish=\"stop\""));
+        assert!(logs_contain("bytes=0"));
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn whitespace_before_text_or_a_call_is_not_an_empty_output() {
+        let scrape = rendered(|| {
+            let mut text = Tally::default();
+            text.see(&dropped("\n", 1, DropReason::Whitespace), false);
+            text.see(&Event::Content(Text::new("Hi", 1)), false);
+            text.see(&finished(FinishReason::Stop), false);
+            text.report(
+                "qwen3",
+                Who {
+                    request_id: "req-text",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+            let mut call = Tally::default();
+            call.see(&dropped("\n", 1, DropReason::Whitespace), false);
+            call.see(&call_start(0, "<tool_call>"), false);
+            call.see(&finish(1), false);
+            call.report(
+                "qwen3",
+                Who {
+                    request_id: "req-call",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+        });
+        let outputs = line_with(&scrape, OUTPUTS, &["table=\"qwen3\"", "outcome=\"clean\""])
+            .expect("the outputs counter");
+        assert!(outputs.ends_with(" 2"), "{outputs}");
+        assert!(
+            line_with(&scrape, OUTPUTS, &["table=\"qwen3\"", "outcome=\"empty\""])
+                .is_none_or(|line| line.ends_with(" 0"))
+        );
+        assert!(!logs_contain("req-text"));
+        assert!(!logs_contain("req-call"));
     }
 
     #[test]

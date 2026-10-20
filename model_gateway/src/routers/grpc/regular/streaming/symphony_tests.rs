@@ -1017,3 +1017,86 @@ async fn a_malformed_region_in_a_stream_is_counted_and_written_once() {
     assert!(logs_contain("table=\"qwen3\""));
     assert!(logs_contain("choice=0"));
 }
+
+/// An output of whitespace alone: the table holds it as the lead of the content and drops it
+/// when nothing follows; the reader delivers it as one content delta before the finish chunk,
+/// so the stream carries the answer the engine's own server would stream. The output is
+/// recorded as `empty`, with the engine's finish and the bytes delivered, once.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_stream_of_whitespace_alone_carries_it_as_one_delta_and_is_recorded_empty() {
+    let spec = assigned(
+        chat_spec(false),
+        qwen3(CallSyntax::Json),
+        "<|im_start|>assistant\n",
+    );
+    let mut responses: Vec<proto::GenerateResponse> = std::iter::repeat_n("\n", 24)
+        .map(|piece| chunk(0, piece))
+        .collect();
+    responses.push(complete(0, "length"));
+    let ((result, events), scrape) = scraped(stream_events(responses, false, spec)).await;
+    result.expect("the stream ends well");
+    // The opening chunk, one content delta of the whole answer, the finish chunk: the opening
+    // chunk's empty content is the public API's shape, not a delta.
+    let chunks: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["choices"][0].is_object())
+        .collect();
+    assert_eq!(chunks.len(), 3, "{events:#?}");
+    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+    assert_eq!(
+        chunks[1]["choices"][0]["delta"]["content"],
+        "\n".repeat(24),
+        "{events:#?}"
+    );
+    assert!(chunks[1]["choices"][0]["finish_reason"].is_null());
+    assert_eq!(chunks[2]["choices"][0]["finish_reason"], "length");
+    assert_eq!(chat_text(&events, 0, "content"), "\n".repeat(24));
+    assert_eq!(chat_text(&events, 0, "reasoning_content"), "");
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"qwen3\"", "outcome=\"empty\""],
+    )
+    .expect("the outputs counter");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    assert!(logs_contain(
+        "Symphony read an output with no text, reasoning or call: whitespace and framing alone, or nothing"
+    ));
+    assert!(logs_contain("finish=\"length\""));
+    assert!(logs_contain("whitespace_bytes=24"));
+    assert!(logs_contain("delivered_bytes=24"));
+}
+
+/// A choice whose first engine output is its `Complete`: the opening chunk, the finish chunk,
+/// and the output recorded as `empty` with the finish the engine gave.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_stream_of_no_tokens_is_recorded_empty_too() {
+    let spec = assigned(
+        chat_spec(false),
+        qwen3(CallSyntax::Json),
+        "<|im_start|>assistant\n",
+    );
+    let ((result, events), scrape) =
+        scraped(stream_events(vec![complete(0, "stop")], false, spec)).await;
+    result.expect("the stream ends well");
+    let chunks: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["choices"][0].is_object())
+        .collect();
+    assert_eq!(chunks.len(), 2, "{events:#?}");
+    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+    assert_eq!(chunks[1]["choices"][0]["finish_reason"], "stop");
+    assert_eq!(chat_text(&events, 0, "content"), "");
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"qwen3\"", "outcome=\"empty\""],
+    )
+    .expect("the outputs counter");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    assert!(logs_contain("finish=\"stop\""));
+    assert!(logs_contain("bytes=0"));
+    assert!(logs_contain("delivered_bytes=0"));
+}

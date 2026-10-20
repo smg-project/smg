@@ -6,7 +6,8 @@ use std::sync::Arc;
 use llm_tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
 use openai_protocol::common::Tool;
 use symphony::{
-    Declared, Engine, EngineFinish, Event, Events, Format, Input, Parser as _, TokenSpan,
+    Declared, DropReason, Engine, EngineFinish, Event, Events, Format, Input, Parser as _, Text,
+    TokenSpan,
 };
 use tracing::debug;
 
@@ -172,6 +173,12 @@ pub(crate) struct Reader {
     ended: bool,
     /// Drop the events of every call after the first.
     first_call_only: bool,
+    /// Whether the output showed the client anything yet: text, reasoning or a call.
+    shown: bool,
+    /// The whitespace the table dropped before the output showed anything: the template's
+    /// spacing when text follows it, the model's whole answer when nothing does, which then goes
+    /// out as one content event before the `Finish` ([`Self::end`]).
+    unshown: String,
 }
 
 impl Reader {
@@ -193,6 +200,8 @@ impl Reader {
             read: 0,
             ended: false,
             first_call_only: false,
+            shown: false,
+            unshown: String::new(),
         };
         // The prompt's events carry no text of the prompt (a thought it opens or closes), so they
         // move from the replay's own buffer into the caller's, whatever delta that one borrows.
@@ -300,8 +309,13 @@ impl Reader {
     }
 
     /// Ends the output with the engine's finish, once: the events, the last of them the
-    /// `Finish`, go into `out`; nothing when the output already ended. The output is recorded
-    /// here, under `who`: its counters, and the line when it was not clean ([`Tally::report`]).
+    /// `Finish`, go into `out`; nothing when the output already ended. An output that showed
+    /// nothing (no text, no reasoning, no call) and dropped whitespace delivers that whitespace
+    /// as one content event right before the `Finish`: it is the whole answer, as the engine's
+    /// own server streams it, not the template's spacing around text that never came. The
+    /// markers and separators dropped with it stay dropped: they are the template's. The output
+    /// is recorded here, under `who`: its counters, and the line when it was not clean
+    /// ([`Tally::report`]); such an output counts as `empty` whether or not whitespace went out.
     pub(crate) fn end(
         &mut self,
         finish: EngineFinish,
@@ -313,6 +327,19 @@ impl Reader {
         }
         self.ended = true;
         self.feed(Input::End { finish }, out)?;
+        if self.tally.is_empty() && !self.unshown.is_empty() {
+            let delivered = std::mem::take(&mut self.unshown);
+            self.tally.delivered(delivered.len());
+            let content = Event::Content(Text::uncounted(delivered));
+            // The `Finish` stays the last event: it makes way for the content and follows it.
+            match out.as_mut_slice().last_mut() {
+                Some(last) if matches!(last, Event::Finish { .. }) => {
+                    let finish = std::mem::replace(last, content);
+                    out.push(finish);
+                }
+                _ => out.push(content),
+            }
+        }
         self.tally.report(self.table, who);
         Ok(())
     }
@@ -345,6 +372,32 @@ impl Reader {
         for event in fresh.iter() {
             self.tally.see(event, self.first_call_only);
         }
+        // Until the output shows something, the whitespace it drops is kept for the end
+        // ([`Self::end`]); the first text, reasoning or call makes it the template's for good.
+        if !self.shown {
+            for event in fresh.iter() {
+                match event {
+                    Event::Dropped {
+                        text,
+                        why: DropReason::Whitespace,
+                    } => self.unshown.push_str(&text.text),
+                    Event::Content(_)
+                    | Event::Reasoning(_)
+                    | Event::Malformed { .. }
+                    | Event::ToolCallStart { .. }
+                    | Event::ToolCallArguments { .. }
+                    | Event::ToolCallEnd { .. } => {
+                        self.shown = true;
+                        self.unshown = String::new();
+                        break;
+                    }
+                    Event::Dropped { .. }
+                    | Event::ReasoningStart
+                    | Event::ReasoningEnd
+                    | Event::Finish { .. } => {}
+                }
+            }
+        }
         if self.first_call_only {
             symphony::event::first_call_only(fresh);
         }
@@ -356,6 +409,134 @@ impl Reader {
 mod tests {
     use super::*;
     use crate::routers::grpc::regular::symphony::testing::{assign, constraint, *};
+
+    /// A reader over `format` after `prompt`, fed `pieces` one by one, ended with `finish`.
+    fn read_pieces(
+        format: Format,
+        prompt: &str,
+        pieces: &[&str],
+        finish: EngineFinish,
+    ) -> Vec<Event<'static>> {
+        let assignment = Assignment {
+            format: Arc::new(format),
+            prompt: prompt.to_string(),
+        };
+        // A step's events borrow its delta, as a stream's do: each piece is a step of its own,
+        // its events taken owned before the next.
+        let mut all: Vec<Event<'static>> = Vec::new();
+        let mut events = Events::new();
+        let mut reader = Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
+        all.extend(events.into_owned().drain());
+        for piece in pieces {
+            let mut delta = Delta::default();
+            let mut events = Events::new();
+            reader
+                .tail((*piece).to_string(), &mut delta, &mut events)
+                .expect("read");
+            all.extend(events.into_owned().drain());
+        }
+        let mut events = Events::new();
+        reader.end(finish, who(), &mut events).expect("ended");
+        all.extend(events.into_owned().drain());
+        all
+    }
+
+    fn newlines(count: usize) -> Vec<&'static str> {
+        vec!["\n"; count]
+    }
+
+    /// The content events and whether the last event is the `Finish`.
+    fn content_events(events: &[Event<'_>]) -> (Vec<String>, bool) {
+        let contents = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Content(text) => Some(text.text.to_string()),
+                _ => None,
+            })
+            .collect();
+        let finish_last = matches!(events.last(), Some(Event::Finish { .. }));
+        (contents, finish_last)
+    }
+
+    #[test]
+    fn an_output_of_whitespace_alone_goes_out_as_one_content_event_before_the_finish() {
+        use symphony::{
+            formats::{minimax_m3, qwen3},
+            tagged::{Placement, Spelling},
+            CallSyntax,
+        };
+        // The recorded case: the thought closed at once, then nothing but newlines to the
+        // forced length. The marker is the template's and stays dropped; the newlines are the
+        // answer and go out as one content event, with the `Finish` still last.
+        let pieces: Vec<&str> = std::iter::once("</mm:think>")
+            .chain(newlines(300))
+            .collect();
+        let events = read_pieces(minimax_m3(), "]~b]ai\n", &pieces, EngineFinish::Length);
+        let (contents, finish_last) = content_events(&events);
+        assert_eq!(contents, vec!["\n".repeat(300)], "{events:?}");
+        assert!(finish_last, "{events:?}");
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, Event::Reasoning(_))));
+        // The same over a table with tagged calls, whose template opens the thought in the
+        // prompt: the output closes it at once, then nothing but newlines.
+        let tagged = qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine));
+        let pieces: Vec<&str> = std::iter::once("</think>").chain(newlines(300)).collect();
+        let events = read_pieces(
+            tagged,
+            "<|im_start|>assistant\n<think>\n",
+            &pieces,
+            EngineFinish::Length,
+        );
+        let (contents, finish_last) = content_events(&events);
+        assert_eq!(contents, vec!["\n".repeat(300)], "{events:?}");
+        assert!(finish_last, "{events:?}");
+        // Whitespace alone from the first byte, under a stop.
+        let events = read_pieces(minimax_m3(), "]~b]ai\n", &newlines(3), EngineFinish::Stop);
+        assert_eq!(content_events(&events).0, vec!["\n\n\n"]);
+    }
+
+    #[test]
+    fn whitespace_before_text_or_a_call_is_the_templates_and_goes_out_once_at_most() {
+        use symphony::formats::minimax_m3;
+        // Text after the lead: the table releases the lead as content before it; the reader
+        // delivers nothing of its own.
+        let pieces = ["</mm:think>", "\n", "\n", "Hello"];
+        let events = read_pieces(minimax_m3(), "]~b]ai\n", &pieces, EngineFinish::Stop);
+        assert_eq!(content_of(&events), "\n\nHello");
+        assert_eq!(content_events(&events).0.len(), 1, "{events:?}");
+        // A call after the lead: the lead is the template's spacing and no content goes out.
+        let pieces = [
+            "</mm:think>\n]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"lookup\">",
+            "]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+        ];
+        let events = read_pieces(minimax_m3(), "]~b]ai\n", &pieces, EngineFinish::Stop);
+        assert_eq!(content_of(&events), "");
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, Event::ToolCallStart { .. })));
+        // The template's separator alone is the template's: nothing goes out, and the output
+        // is still empty.
+        let events = read_pieces(
+            minimax_m3(),
+            "]~b]ai\n",
+            &["]<]minimax[>["; 5],
+            EngineFinish::Length,
+        );
+        assert_eq!(content_of(&events), "");
+        // Whitespace inside a thought is reasoning as it arrives, so nothing is held for the end.
+        let pieces: Vec<&str> = std::iter::once("<mm:think>").chain(newlines(4)).collect();
+        let events = read_pieces(minimax_m3(), "]~b]ai\n", &pieces, EngineFinish::Length);
+        assert_eq!(content_of(&events), "");
+        let reasoning: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Reasoning(text) => Some(&*text.text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning, "\n\n\n\n");
+    }
 
     #[test]
     fn a_request_without_tools_is_read_by_every_table_and_its_calls_are_content() {
