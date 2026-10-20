@@ -388,13 +388,7 @@ impl ZmqEngineClient {
             .structured_outputs
             .get()
             .copied()
-            .unwrap_or_else(|| {
-                default_structured_outputs_support(match &self.backend {
-                    ZmqBackend::Vllm(_) => ZmqDialect::Vllm,
-                    ZmqBackend::TokenSpeed(_) => ZmqDialect::TokenSpeed,
-                    ZmqBackend::Sglang(_) => ZmqDialect::Sglang,
-                })
-            })
+            .unwrap_or_else(|| default_structured_outputs_support(self.dialect()))
     }
 
     /// Bound every generate request this connection opens from here on by
