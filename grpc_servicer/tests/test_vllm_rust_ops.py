@@ -161,12 +161,24 @@ def test_parallel_children_keep_arrival_and_cancel_together(ops):
     assert not (ops.requests or ops.parents or ops.children or ops.arrivals)
 
 
-def test_incompatible_api_fails_at_startup(ops, monkeypatch):
+@pytest.mark.parametrize(
+    "module_name,owner,method",
+    [
+        ("metrics.stats", "IterationStats", "update_from_output"),
+        ("metrics.loggers", None, "StatLoggerManager"),
+        ("metrics.loggers", "StatLoggerManager", "log_engine_initialized"),
+        ("metrics.loggers", "StatLoggerManager", "record"),
+        ("metrics.stats", "LoRARequestStates", "update_scheduler_stats"),
+        ("metrics.stats", "LoRARequestStates", "request_finished"),
+        ("engine.parallel_sampling", "ParentRequest", "observe_finished_request"),
+    ],
+)
+def test_incompatible_api_fails_at_startup(ops, monkeypatch, module_name, owner, method):
     """Reject native signature drift before setting up multiprocess metrics."""
-    stats = sys.modules["vllm.v1.metrics.stats"]
+    module = sys.modules[f"vllm.v1.{module_name}"]
     prometheus = sys.modules["vllm.v1.metrics.prometheus"]
     prometheus.setup_multiprocess_prometheus.reset_mock()
-    monkeypatch.setattr(stats.IterationStats, "update_from_output", lambda self: None)
+    monkeypatch.setattr(getattr(module, owner) if owner else module, method, lambda: None)
     with pytest.raises(RuntimeError, match="incompatible with this vLLM"):
         RustOps(ops.config, 0, log_stats=True)
     prometheus.setup_multiprocess_prometheus.assert_not_called()

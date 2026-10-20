@@ -87,7 +87,8 @@ class RustOps:
         try:
             from vllm.v1.engine.core_client import MPClient
             from vllm.v1.engine.parallel_sampling import ParentRequest
-            from vllm.v1.metrics.stats import IterationStats
+            from vllm.v1.metrics.loggers import StatLoggerManager
+            from vllm.v1.metrics.stats import IterationStats, LoRARequestStates
 
             inspect.signature(MPClient._apply_ready_response).bind(None, b"")
             inspect.signature(IterationStats.update_from_output).bind(*([None] * 7))
@@ -100,6 +101,18 @@ class RustOps:
                 req_stats=None,
                 num_cached_tokens=0,
             )
+            inspect.signature(StatLoggerManager).bind(None, engine_idxs=[0])
+            inspect.signature(StatLoggerManager.log_engine_initialized).bind(None)
+            inspect.signature(StatLoggerManager.record).bind(
+                None,
+                scheduler_stats=None,
+                iteration_stats=None,
+                mm_cache_stats=None,
+                engine_idx=0,
+            )
+            inspect.signature(LoRARequestStates.update_scheduler_stats).bind(None, None)
+            inspect.signature(LoRARequestStates.request_finished).bind(None, "probe", None)
+            inspect.signature(ParentRequest.observe_finished_request).bind(None, None, 0)
             ParentRequest(
                 NS(request_id="probe", external_req_id="probe", params=NS(n=2, output_kind=0))
             )
