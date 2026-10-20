@@ -16,7 +16,7 @@ import httpx
 import openai
 import pytest
 import smg_client
-from infra.constants import get_parser
+from infra.constants import get_parser, get_runtime
 from infra.streams import collect_streamed_chat
 
 logger = logging.getLogger(__name__)
@@ -106,7 +106,7 @@ PYTHONIC_MESSAGES = [
 # =============================================================================
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct")
 @pytest.mark.gateway(
@@ -115,13 +115,19 @@ PYTHONIC_MESSAGES = [
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestOpenAIServerFunctionCalling:
-    """Tests for OpenAI-compatible function calling with the llama tool parser."""
+    """Tests for OpenAI-compatible function calling with the llama tool parser.
 
-    def test_function_calling_format(self, model, api_client):
+    On the mock engine each test states the model's answer first, in the
+    llama parser's syntax (``mock_answers`` does nothing on a real engine);
+    the ``n=2`` cases skip there, the mock answering one choice per request.
+    """
+
+    def test_function_calling_format(self, model, api_client, mock_answers):
         """Test: Whether the function call format returned by the AI is correct.
 
         When returning a tool call, message.content should be None, and tool_calls should be a list.
         """
+        mock_answers.enqueue('{"name": "add", "parameters": {"a": 3, "b": 5}}')
 
         tools = [
             {
@@ -170,12 +176,15 @@ class TestOpenAIServerFunctionCalling:
         function_name = tool_calls[0].function.name
         assert function_name == "add", "Function name should be 'add'"
 
-    def test_function_calling_streaming_simple(self, model, api_client):
+    def test_function_calling_streaming_simple(self, model, api_client, mock_answers):
         """Test: Whether the function name can be correctly recognized in streaming mode.
 
         - Expect a function call to be found, and the function name to be correct.
         - Verify that streaming mode returns at least multiple chunks.
         """
+        mock_answers.enqueue(
+            '{"name": "get_current_weather", "parameters": {"city": "Paris", "unit": "celsius"}}'
+        )
 
         tools = [
             {
@@ -236,13 +245,14 @@ class TestOpenAIServerFunctionCalling:
             "Final response of function calling should have finish_reason 'tool_calls'"
         )
 
-    def test_function_calling_streaming_args_parsing(self, model, api_client):
+    def test_function_calling_streaming_args_parsing(self, model, api_client, mock_answers):
         """Test: Whether the function call arguments returned in streaming mode can be correctly
         concatenated into valid JSON.
 
         - The user request requires multiple parameters.
         - AI may return the arguments in chunks that need to be concatenated.
         """
+        mock_answers.enqueue('{"name": "add", "parameters": {"a": 5, "b": 7}}')
 
         tools = [
             {
@@ -362,11 +372,14 @@ class TestOpenAIServerFunctionCalling:
         assert str(args_obj["int_a"]) == "5", "Parameter int_a should be 5"
         assert str(args_obj["int_b"]) == "7", "Parameter int_b should be 7"
 
-    def test_function_call_required(self, model, api_client):
+    def test_function_call_required(self, model, api_client, mock_answers):
         """Test: Whether tool_choice: "required" works as expected.
 
         - When tool_choice == "required", the model should return one or more tool_calls.
         """
+        # Under a required choice the gateway constrains the engine to a JSON
+        # array of calls and reads it as one.
+        mock_answers.enqueue('[{"name": "get_weather", "parameters": {"city": "Paris"}}]')
         tools = [
             {
                 "type": "function",
@@ -451,11 +464,14 @@ class TestOpenAIServerFunctionCalling:
                 f"Parameter int_b should be an integer, got: {type(args_obj['int_b'])}"
             )
 
-    def test_function_call_specific(self, model, api_client):
+    def test_function_call_specific(self, model, api_client, mock_answers):
         """Test: Whether tool_choice: ToolChoice works as expected.
 
         - When tool_choice is a specific ToolChoice, the model should return one or more tool_calls.
         """
+        # Under a named choice the gateway constrains the engine to that
+        # function's parameters object and names the call itself.
+        mock_answers.enqueue('{"city": "Paris"}')
         tools = [
             {
                 "type": "function",
@@ -519,6 +535,7 @@ class TestOpenAIServerFunctionCalling:
         assert function_name == "get_weather", "Function name should be 'get_weather'"
         assert "city" in args_obj, "Function arguments should have 'city'"
 
+    @pytest.mark.skipif(get_runtime() == "mock", reason="the mock answers one choice per request")
     def test_streaming_multiple_choices_finish_reason(self, model, api_client):
         """Test: Verify that each choice gets its own finish_reason chunk in streaming mode with n > 1.
 
@@ -590,12 +607,13 @@ class TestOpenAIServerFunctionCalling:
                 f"Expected finish_reason 'tool_calls' for index {index}, got {reasons[-1]}"
             )
 
-    def test_function_calling_streaming_no_tool_call(self, model, api_client):
+    def test_function_calling_streaming_no_tool_call(self, model, api_client, mock_answers):
         """Test: Whether the finish_reason is stop in streaming mode when no tool call is given.
 
         - Expect no function call to be found.
         - Verify that finish_reason is stop
         """
+        mock_answers.enqueue("I am an assistant; ask me about the weather.")
 
         tools = [
             {
@@ -653,6 +671,7 @@ class TestOpenAIServerFunctionCalling:
             "Final response of no function calling should have finish_reason 'stop'"
         )
 
+    @pytest.mark.skipif(get_runtime() == "mock", reason="the mock answers one choice per request")
     def test_streaming_multiple_choices_without_tools(self, model, api_client):
         """Test: Verify that each choice gets its own finish_reason chunk without tool calls.
 

@@ -27,11 +27,12 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex, OnceLock, PoisonError,
+        Arc, Mutex, OnceLock, PoisonError,
     },
     time::Duration,
 };
 
+use llm_tokenizer::traits::Tokenizer;
 use serde_json::{json, Value};
 
 use crate::config::Config;
@@ -282,6 +283,34 @@ impl Answer {
         })
     }
 
+    /// Give an answer that has text but no ids the ids of its text, encoded
+    /// with `tokenizer` (a token wire delivers ids): the whole text as one
+    /// encode, so the pieces a test wrote are not forced to be tokens. An
+    /// answer with ids, or without text, is returned as it is.
+    pub fn encoded_with(mut self, tokenizer: &dyn Tokenizer) -> Result<Self, String> {
+        if !self.output_ids.is_empty() {
+            return Ok(self);
+        }
+        let Some(pieces) = &self.output_text else {
+            return Ok(self);
+        };
+        let text = pieces.concat();
+        let encoding = tokenizer
+            .encode(&text, false)
+            .map_err(|e| format!("encoding the scripted text: {e}"))?;
+        self.output_ids = encoding.token_ids().to_vec();
+        // Per-token logprobs were given per piece; they align with the ids
+        // only when the pieces were tokens, which the encode does not promise.
+        if self
+            .logprobs
+            .as_ref()
+            .is_some_and(|logprobs| logprobs.len() != self.output_ids.len())
+        {
+            self.logprobs = None;
+        }
+        Ok(self)
+    }
+
     /// The prompt tokens to report for a prompt of `prompt_len` ids.
     pub fn prompt_tokens(&self, prompt_len: usize) -> u32 {
         self.prompt_tokens
@@ -530,6 +559,38 @@ pub fn register(worker: &str) {
     store().workers.insert(worker.to_string());
 }
 
+static TOKENIZER: OnceLock<Result<Arc<dyn Tokenizer>, String>> = OnceLock::new();
+
+/// The tokenizer the worker's `--tokenizer` names, loaded on first use: what
+/// a token wire encodes a scripted `output_text` with when the answer has
+/// no ids. The gateway tokenizes prompts with the same files, so the ids
+/// the mock sends back decode to the text the test wrote.
+pub fn tokenizer(cfg: &Config) -> Result<Arc<dyn Tokenizer>, String> {
+    TOKENIZER
+        .get_or_init(|| {
+            llm_tokenizer::factory::create_tokenizer(&cfg.tokenizer_path)
+                .map_err(|e| format!("tokenizer {}: {e}", cfg.tokenizer_path))
+        })
+        .clone()
+}
+
+/// [`take`], with a text-only answer encoded for a token wire: the answer
+/// with its ids, or `None` with the reason logged when the worker has no
+/// tokenizer to encode it with (the request then runs as a miss would).
+pub fn take_ids(cfg: &Config, worker: &str, prompt_ids: &[u32]) -> Option<Answer> {
+    let answer = take(worker, prompt_ids)?;
+    if !answer.output_ids.is_empty() || answer.output_text.is_none() {
+        return Some(answer);
+    }
+    match tokenizer(cfg).and_then(|tokenizer| answer.encoded_with(tokenizer.as_ref())) {
+        Ok(answer) => Some(answer),
+        Err(e) => {
+            tracing::error!("{worker}: a scripted text cannot go on this wire: {e}");
+            None
+        }
+    }
+}
+
 /// Load a `--script` file: one answer per line, each with a `key` or its
 /// `input_ids`. A file is loaded once per process; loading it again is a
 /// no-op that reports its answers. Returns how many answers the file holds.
@@ -776,6 +837,42 @@ mod tests {
         store.clear(worker);
         assert_eq!(store.status(worker)["queued"], 0);
         assert!(store.take(worker, &script_key(&[9])).is_none(), "cleared");
+    }
+
+    #[test]
+    fn a_text_only_answer_takes_its_ids_from_the_tokenizer() {
+        use llm_tokenizer::{traits::Encoder, MockTokenizer};
+        let tokenizer = MockTokenizer::new();
+        let expected: Vec<u32> = tokenizer
+            .encode("hello world", false)
+            .expect("the mock tokenizer encodes")
+            .token_ids()
+            .to_vec();
+        assert!(!expected.is_empty());
+
+        let text_only = parse(r#"{"output_text": "hello world", "logprobs": [-0.5]}"#)
+            .expect("answer")
+            .answer;
+        let encoded = text_only.encoded_with(&tokenizer).expect("encoded");
+        assert_eq!(encoded.output_ids, expected);
+        assert_eq!(encoded.text(), "hello world", "the text stays");
+        if expected.len() != 1 {
+            assert!(
+                encoded.logprobs.is_none(),
+                "logprobs that no longer align are dropped"
+            );
+        }
+
+        let with_ids = parse(r#"{"output_ids": [4, 5], "output_text": "hello world"}"#)
+            .expect("answer")
+            .answer;
+        let kept = with_ids.clone().encoded_with(&tokenizer).expect("kept");
+        assert_eq!(kept, with_ids, "an answer with ids is not re-encoded");
+        let ids_only = parse(r#"{"output_ids": [4, 5]}"#).expect("answer").answer;
+        assert_eq!(
+            ids_only.clone().encoded_with(&tokenizer).expect("kept"),
+            ids_only
+        );
     }
 
     #[test]

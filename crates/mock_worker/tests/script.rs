@@ -260,6 +260,46 @@ async fn grpc_cuts_frames_by_chunk_tokens_and_pauses_between_them() {
     );
 }
 
+#[tokio::test]
+async fn grpc_encodes_a_scripted_text_with_the_workers_tokenizer() {
+    // A word-level tokenizer in a directory, as a model directory holds one.
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        dir.path().join("tokenizer.json"),
+        r#"{"version":"1.0","model":{"type":"WordLevel","vocab":{"[UNK]":0,"the":1,"answer":2,"is":3,"42":4},"unk_token":"[UNK]"},"pre_tokenizer":{"type":"Whitespace"}}"#,
+    )
+    .expect("write the tokenizer");
+    let cfg = Config {
+        tokenizer_path: dir.path().display().to_string(),
+        ..config(None)
+    };
+    let (client, worker) = start_grpc(cfg).await;
+    let state = script::enqueue(
+        &worker,
+        vec![script::Answer::parse(
+            &json!({"output_text": "the answer is 42", "finish_reason": "stop"}),
+        )
+        .expect("a text answer")],
+    )
+    .expect("a started worker");
+    assert_eq!(state["queued"], 1);
+
+    let frames = generate(&client, grpc_request("t", &[7, 7], true, false)).await;
+    let ids: Vec<u32> = frames
+        .iter()
+        .filter_map(|f| match &f.response {
+            Some(GenResp::Chunk(chunk)) => Some(chunk.token_ids.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(ids, vec![1, 2, 3, 4], "the text's ids, one chunk each");
+    assert!(matches!(
+        frames.last().and_then(|f| f.response.as_ref()),
+        Some(GenResp::Complete(c)) if c.output_ids == vec![1, 2, 3, 4] && c.completion_tokens == 4
+    ));
+}
+
 // ── the admin API ───────────────────────────────────────────────────────────
 
 #[tokio::test]

@@ -30,6 +30,9 @@ class Runtime(StrEnum):
     TRTLLM = "trtllm"
     MLX = "mlx"
     TOKENSPEED = "tokenspeed"
+    # The scripted mock worker (`crates/mock_worker`): no model, the test
+    # states the answer before it sends the request. CPU only.
+    MOCK = "mock"
     OPENAI = "openai"
     XAI = "xai"
     GEMINI = "gemini"
@@ -39,7 +42,7 @@ class Runtime(StrEnum):
 # Convenience sets
 LOCAL_MODES = frozenset({ConnectionMode.HTTP, ConnectionMode.GRPC, ConnectionMode.ZMQ})
 LOCAL_RUNTIMES = frozenset(
-    {Runtime.SGLANG, Runtime.VLLM, Runtime.TRTLLM, Runtime.MLX, Runtime.TOKENSPEED}
+    {Runtime.SGLANG, Runtime.VLLM, Runtime.TRTLLM, Runtime.MLX, Runtime.TOKENSPEED, Runtime.MOCK}
 )
 CLOUD_RUNTIMES = frozenset({Runtime.OPENAI, Runtime.XAI, Runtime.GEMINI, Runtime.ANTHROPIC})
 
@@ -414,6 +417,7 @@ RUNTIME_LABELS = {
     "trtllm": "TensorRT-LLM",
     "mlx": "MLX",
     "tokenspeed": "TokenSpeed",
+    "mock": "Mock",
 }
 
 ENV_SHOW_ROUTER_LOGS = "SHOW_ROUTER_LOGS"

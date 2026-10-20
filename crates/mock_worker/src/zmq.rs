@@ -180,7 +180,7 @@ pub async fn serve_until(
                 let in_flight = InFlight::enter();
                 // A scripted answer, ahead of either engine mode: the rank's
                 // queue or the prompt's key decides ([`crate::script`]).
-                if let Some(answer) = script::take(&name, &prompt) {
+                if let Some(answer) = script::take_ids(&cfg, &name, &prompt) {
                     let want_logprobs = request
                         .sampling_params
                         .as_ref()
