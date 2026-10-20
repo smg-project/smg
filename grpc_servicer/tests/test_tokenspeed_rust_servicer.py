@@ -1015,6 +1015,8 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
     monkeypatch.setenv("SMG_TOKENSPEED_SERVICER_DRAIN_SECS", "1.5")
     monkeypatch.setenv("SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS", "42")
     monkeypatch.setenv("SMG_TOKENSPEED_SERVICER_STARTUP_CEILING_SECS", "0")
+    monkeypatch.setenv("SMG_TOKENSPEED_SERVICER_SILENCE_TIMEOUT_SECS", "900")
+    monkeypatch.setenv("SMG_TOKENSPEED_SERVICER_PREFILL_TOKENS_PER_SEC", "1000")
 
     assert asyncio.run(rust.serve_rust(FakeServerArgs(port=50123))) == 0
 
@@ -1026,6 +1028,8 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
     assert server["tokenizer_dir"] == str(tmp_path)
     assert server["engine_startup_timeout_secs"] == 42.0
     assert server["engine_startup_ceiling_secs"] == 0.0  # 0 lifts the ceiling
+    assert server["engine_silence_timeout_secs"] == 900.0
+    assert server["engine_prefill_tokens_per_sec"] == 1000
     assert server["model_path"] == "org/m"
     headless = recorded["headless"]
     assert headless.zmq_msgpack is True and headless.skip_tokenizer_init is True
@@ -1136,9 +1140,13 @@ def test_serve_rust_defaults_both_startup_bounds(monkeypatch, tmp_path):
     defaults for the silence bound and the ceiling."""
     monkeypatch.delenv(rust.STARTUP_TIMEOUT_SECS_ENV, raising=False)
     monkeypatch.delenv(rust.STARTUP_CEILING_SECS_ENV, raising=False)
+    monkeypatch.delenv(rust.SILENCE_TIMEOUT_SECS_ENV, raising=False)
+    monkeypatch.delenv(rust.PREFILL_TOKENS_PER_SEC_ENV, raising=False)
     created = _run_serve_rust(monkeypatch, tmp_path)
     assert created["engine_startup_timeout_secs"] == rust.DEFAULT_STARTUP_TIMEOUT_SECS
     assert created["engine_startup_ceiling_secs"] == rust.DEFAULT_STARTUP_CEILING_SECS
+    assert created["engine_silence_timeout_secs"] == rust.DEFAULT_SILENCE_TIMEOUT_SECS
+    assert created["engine_prefill_tokens_per_sec"] == rust.DEFAULT_PREFILL_TOKENS_PER_SEC
 
 
 def test_serve_rust_constructs_the_server_with_keywords_the_binding_takes(monkeypatch, tmp_path):

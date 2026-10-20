@@ -321,7 +321,19 @@ own messages count too, so a healthy start that takes longer, a large
 checkpoint streaming in for an hour, still completes, while an engine that
 exits fails fast regardless), `SMG_VLLM_SERVICER_STARTUP_CEILING_SECS`
 (default 14400: the most a start may take however alive the engine is; 0
-lifts the ceiling), `SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS`
+lifts the ceiling), `SMG_VLLM_SERVICER_SILENCE_TIMEOUT_SECS` (default 300: how
+long the connected engine may hold requests in flight, in total since its last
+output, with nothing pending prefill, before the servicer treats it as dead,
+fails them and closes the link for the launcher to restart the pair; a hard
+engine death sends nothing over the wire, so silence is the only sign of it),
+`SMG_VLLM_SERVICER_PREFILL_TOKENS_PER_SEC` (default 2000: the prompt tokens
+pending prefill, those of the in-flight requests the engine has produced
+nothing for yet, extend that bound by the time they take at this rate, 500 s
+per million tokens; a wire that says nothing until a prompt's first token is
+silent through a whole prefill, and a batch of long prompts prefills for
+longer than any fixed bound; a low rate is a bound on how slowly a healthy
+engine may prefill, not an estimate of how fast it does; 0 allows nothing),
+`SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS`
 (default 1, for the one runtime `server.rs` builds for the vLLM, SGLang and
 TokenSpeed Rust servicers alike: one runtime worker carries about 100k output
 tokens/s on one connection with its lock uncontended; raise it to 2-4 when one
@@ -648,7 +660,13 @@ not by rank, so each prefill shape warms one rank and the log says so),
 `SMG_TOKENSPEED_SERVICER_STARTUP_CEILING_SECS` (default 14400; the two startup
 bounds as for vLLM above: the launcher reports the scheduler process alive each
 time it polls it, so a slow but living start completes, under the ceiling, and
-0 lifts the ceiling), `SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS`
+0 lifts the ceiling), `SMG_TOKENSPEED_SERVICER_SILENCE_TIMEOUT_SECS` (default
+300) and `SMG_TOKENSPEED_SERVICER_PREFILL_TOKENS_PER_SEC` (default 2000; the
+connected scheduler's silence bound and its prefill allowance as for vLLM
+above: this wire carries token batches only, so a batch of long prompts is
+silent for as long as its prefill takes, and the allowance, 500 s per million
+pending prompt tokens at the default rate, is what keeps that from reading as
+a dead scheduler), `SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS`
 (default 1, for the one runtime `server.rs` builds for the vLLM, SGLang and
 TokenSpeed Rust servicers alike: one runtime worker carries about 100k output
 tokens/s on one connection with its lock uncontended; raise it to 2-4 when one
@@ -857,7 +875,11 @@ prefill shape warms one rank and the log says so),
 `SMG_SGLANG_SERVICER_STARTUP_CEILING_SECS` (default 14400; the two startup
 bounds as for vLLM above: the launcher reports the scheduler process alive each
 time it polls it, so a slow but living start completes, under the ceiling, and
-0 lifts the ceiling), `SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS`.
+0 lifts the ceiling), `SMG_SGLANG_SERVICER_SILENCE_TIMEOUT_SECS` (default 300)
+and `SMG_SGLANG_SERVICER_PREFILL_TOKENS_PER_SEC` (default 2000; the connected
+scheduler's silence bound and its prefill allowance as for TokenSpeed above:
+this wire too carries token batches only), `SMG_ZMQ_SOCKET_DIR`,
+`SMG_SERVICER_WORKER_THREADS`.
 
 #### Headless over ZMQ (no SGLang change)
 

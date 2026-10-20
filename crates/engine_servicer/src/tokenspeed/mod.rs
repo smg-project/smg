@@ -295,6 +295,7 @@ impl TokenSpeedServicerServer {
         );
         let connect_state = Arc::clone(&state);
         let kv_relay = state.kv_relay.clone();
+        let silence = config.servicer.silence_bounds();
         let ServicerConfig {
             bind_address,
             ipc_base_url,
@@ -303,6 +304,7 @@ impl TokenSpeedServicerServer {
             tokenizer_dir,
             engine_startup_timeout,
             engine_startup_ceiling,
+            ..
         } = config.servicer;
         let thread = ServerThread::start(
             "smg-tokenspeed-servicer",
@@ -325,6 +327,7 @@ impl TokenSpeedServicerServer {
                     engine_count,
                     engine_startup_timeout,
                     engine_startup_ceiling,
+                    silence,
                     tokenizer_dir,
                     last_error,
                 ));

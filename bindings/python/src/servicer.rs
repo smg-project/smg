@@ -24,8 +24,9 @@ use engine_servicer::{
     BoxFuture, MediaError, MediaFeatures, MediaProcessor, MediaRequest, ProcessedMedia,
     ServicerConfig, ServicerError, SglangModelInfo, SglangServicerConfig, SglangServicerServer,
     TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer, VllmModelInfo,
-    VllmServicerConfig, VllmServicerServer, ALL_MODALITIES, DEFAULT_ENGINE_STARTUP_CEILING,
-    DEFAULT_ENGINE_STARTUP_TIMEOUT, PIXEL_MODALITIES,
+    VllmServicerConfig, VllmServicerServer, ALL_MODALITIES, DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC,
+    DEFAULT_ENGINE_SILENCE_TIMEOUT, DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT,
+    PIXEL_MODALITIES,
 };
 use llm_multimodal::{jpeg_turbo::TurboJpegPolicy, Modality};
 use prost::Message;
@@ -84,6 +85,33 @@ fn startup_ceiling(secs: Option<f64>) -> PyResult<Option<Duration>> {
         .map_err(|error| {
             PyValueError::new_err(format!("engine_startup_ceiling_secs {secs}: {error}"))
         })
+}
+
+/// The engine-silence bound from the launcher's seconds; `None` is the crate
+/// default.
+fn silence_timeout(secs: Option<f64>) -> PyResult<Duration> {
+    match secs {
+        None => Ok(DEFAULT_ENGINE_SILENCE_TIMEOUT),
+        Some(secs) if secs > 0.0 => Duration::try_from_secs_f64(secs).map_err(|error| {
+            PyValueError::new_err(format!("engine_silence_timeout_secs {secs}: {error}"))
+        }),
+        Some(secs) => Err(PyValueError::new_err(format!(
+            "engine_silence_timeout_secs must be positive, got {secs}"
+        ))),
+    }
+}
+
+/// The prefill rate the engine-silence bound allows, in tokens per second;
+/// `None` is the crate default, `0` allows nothing.
+fn prefill_tokens_per_sec(rate: Option<i64>) -> PyResult<u64> {
+    match rate {
+        None => Ok(DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC),
+        Some(rate) => u64::try_from(rate).map_err(|_| {
+            PyValueError::new_err(format!(
+                "engine_prefill_tokens_per_sec must be 0 or more, got {rate}"
+            ))
+        }),
+    }
 }
 
 /// Install the Rust tracing subscriber for a process that only hosts a
@@ -660,6 +688,8 @@ impl PyVllmGrpcServer {
         smg_media_processor = None,
         engine_startup_timeout_secs = None,
         engine_startup_ceiling_secs = None,
+        engine_silence_timeout_secs = None,
+        engine_prefill_tokens_per_sec = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -709,6 +739,8 @@ impl PyVllmGrpcServer {
         smg_media_processor: Option<Bound<'_, PyDict>>,
         engine_startup_timeout_secs: Option<f64>,
         engine_startup_ceiling_secs: Option<f64>,
+        engine_silence_timeout_secs: Option<f64>,
+        engine_prefill_tokens_per_sec: Option<i64>,
     ) -> PyResult<Self> {
         if media_processor.is_some() && smg_media_processor.is_some() {
             return Err(PyValueError::new_err(
@@ -770,6 +802,8 @@ impl PyVllmGrpcServer {
             tokenizer_dir,
             engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
             engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
+            engine_silence_timeout: silence_timeout(engine_silence_timeout_secs)?,
+            engine_prefill_tokens_per_sec: prefill_tokens_per_sec(engine_prefill_tokens_per_sec)?,
         };
         let mut config = VllmServicerConfig {
             servicer,
@@ -940,6 +974,8 @@ impl PyTokenSpeedGrpcServer {
         kv_events_topic = String::new(),
         engine_startup_timeout_secs = None,
         engine_startup_ceiling_secs = None,
+        engine_silence_timeout_secs = None,
+        engine_prefill_tokens_per_sec = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -979,6 +1015,8 @@ impl PyTokenSpeedGrpcServer {
         kv_events_topic: String,
         engine_startup_timeout_secs: Option<f64>,
         engine_startup_ceiling_secs: Option<f64>,
+        engine_silence_timeout_secs: Option<f64>,
+        engine_prefill_tokens_per_sec: Option<i64>,
     ) -> PyResult<Self> {
         let model = TokenSpeedModelInfo {
             served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
@@ -1018,6 +1056,8 @@ impl PyTokenSpeedGrpcServer {
             tokenizer_dir,
             engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
             engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
+            engine_silence_timeout: silence_timeout(engine_silence_timeout_secs)?,
+            engine_prefill_tokens_per_sec: prefill_tokens_per_sec(engine_prefill_tokens_per_sec)?,
         };
         let config = TokenSpeedServicerConfig { servicer, model };
         let inner = py
@@ -1140,6 +1180,8 @@ impl PySglangGrpcServer {
         kv_events_topic = String::new(),
         engine_startup_timeout_secs = None,
         engine_startup_ceiling_secs = None,
+        engine_silence_timeout_secs = None,
+        engine_prefill_tokens_per_sec = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -1177,6 +1219,8 @@ impl PySglangGrpcServer {
         kv_events_topic: String,
         engine_startup_timeout_secs: Option<f64>,
         engine_startup_ceiling_secs: Option<f64>,
+        engine_silence_timeout_secs: Option<f64>,
+        engine_prefill_tokens_per_sec: Option<i64>,
     ) -> PyResult<Self> {
         let model = SglangModelInfo {
             served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
@@ -1214,6 +1258,8 @@ impl PySglangGrpcServer {
             tokenizer_dir,
             engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
             engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
+            engine_silence_timeout: silence_timeout(engine_silence_timeout_secs)?,
+            engine_prefill_tokens_per_sec: prefill_tokens_per_sec(engine_prefill_tokens_per_sec)?,
         };
         let config = SglangServicerConfig { servicer, model };
         let inner = py

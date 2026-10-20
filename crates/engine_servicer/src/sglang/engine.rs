@@ -10,12 +10,18 @@ use openai_protocol::worker::RuntimeType;
 use tracing::{error, info};
 
 use super::State;
-use crate::{record_error, SharedError};
+use crate::{record_error, servicer_config::SilenceBounds, SharedError};
 
 /// The handshake's silence bound (`startup_timeout`) counts from the latest
 /// sign of life: a handshake message, or the lifecycle owner's report that
 /// the scheduler process is alive (`State::engine::liveness`); the ceiling
-/// bounds the whole start regardless.
+/// bounds the whole start regardless. Once connected, the scheduler's silence
+/// is bounded by `silence` (with the prefill allowance for the prompt it
+/// holds), applied before the first request reaches it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the link's inputs: endpoints, engine count, the startup and silence bounds and the error slot"
+)]
 pub(super) async fn connect_engine(
     state: Arc<State>,
     ipc_base_url: String,
@@ -23,6 +29,7 @@ pub(super) async fn connect_engine(
     engine_count: usize,
     startup_timeout: Duration,
     startup_ceiling: Option<Duration>,
+    silence: SilenceBounds,
     last_error: SharedError,
 ) {
     // The scheduler stops at EOS itself; the ids only inform the adapter.
@@ -51,9 +58,12 @@ pub(super) async fn connect_engine(
             if super::truncates_long_prompts(&state.model) {
                 client.note_engine_truncates_long_prompts();
             }
+            silence.apply(&client);
             info!(
                 handshake = %handshake_address,
                 engines = engine_count,
+                silence_window = ?silence.window,
+                prefill_tokens_per_sec = silence.prefill_tokens_per_sec,
                 "SGLang scheduler connected"
             );
             let _ = state.engine.client.set(client);

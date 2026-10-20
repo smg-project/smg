@@ -675,6 +675,8 @@ def test_read_launcher_knobs_reads_every_knob_once_with_its_default(tmp_path):
         drain_secs_env="X_DRAIN",
         startup_timeout_secs_env="X_START",
         startup_ceiling_secs_env="X_CEIL",
+        silence_timeout_secs_env="X_SILENCE",
+        prefill_tokens_per_sec_env="X_PREFILL",
     )
     socket_dir = {"SMG_ZMQ_SOCKET_DIR": str(tmp_path / "sockets")}
     knobs = rust_lifecycle.read_launcher_knobs(**names, environ=socket_dir)
@@ -683,16 +685,28 @@ def test_read_launcher_knobs_reads_every_knob_once_with_its_default(tmp_path):
         drain_secs=rust_lifecycle.DEFAULT_DRAIN_SECS,
         startup_timeout_secs=rust_lifecycle.DEFAULT_STARTUP_TIMEOUT_SECS,
         startup_ceiling_secs=rust_lifecycle.DEFAULT_STARTUP_CEILING_SECS,
+        silence_timeout_secs=rust_lifecycle.DEFAULT_SILENCE_TIMEOUT_SECS,
+        prefill_tokens_per_sec=rust_lifecycle.DEFAULT_PREFILL_TOKENS_PER_SEC,
         socket_dir=str(tmp_path / "sockets"),
     )
     assert os.path.isdir(tmp_path / "sockets")
     knobs = rust_lifecycle.read_launcher_knobs(
         **names,
         socket_dir=str(tmp_path / "given"),
-        environ={"X_HS": "24321", "X_DRAIN": "0", "X_START": "42", "X_CEIL": "0", **socket_dir},
+        environ={
+            "X_HS": "24321",
+            "X_DRAIN": "0",
+            "X_START": "42",
+            "X_CEIL": "0",
+            "X_SILENCE": "900",
+            "X_PREFILL": "1000",
+            **socket_dir,
+        },
     )
     assert (knobs.handshake_port, knobs.drain_secs) == (24321, 0.0)
     assert (knobs.startup_timeout_secs, knobs.startup_ceiling_secs) == (42.0, 0.0)
+    assert (knobs.silence_timeout_secs, knobs.prefill_tokens_per_sec) == (900.0, 1000)
+    assert isinstance(knobs.prefill_tokens_per_sec, int)
     assert knobs.socket_dir == str(tmp_path / "given") and os.path.isdir(knobs.socket_dir)
     for name, value, text in [
         ("X_HS", "70000", "must be between 1 and 65535"),
@@ -702,6 +716,9 @@ def test_read_launcher_knobs_reads_every_knob_once_with_its_default(tmp_path):
         ("X_START", "abc", "is not a number"),
         ("X_START", "-1", "must be greater than 0"),
         ("X_CEIL", "-1", "must be at least 0"),
+        ("X_SILENCE", "0", "must be greater than 0"),
+        ("X_SILENCE", "abc", "is not a number"),
+        ("X_PREFILL", "-1", "must be at least 0"),
     ]:
         with pytest.raises(rust_lifecycle.ServicerConfigError, match=f"{name}='{value}' {text}"):
             rust_lifecycle.read_launcher_knobs(**names, environ={name: value, **socket_dir})

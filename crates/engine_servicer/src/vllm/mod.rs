@@ -378,6 +378,7 @@ impl VllmServicerServer {
         let connect_state = Arc::clone(&state);
         let stats_state = Arc::clone(&state);
         let kv_relay = state.kv_relay.clone();
+        let silence = config.servicer.silence_bounds();
         let ServicerConfig {
             bind_address,
             ipc_base_url,
@@ -386,6 +387,7 @@ impl VllmServicerServer {
             tokenizer_dir,
             engine_startup_timeout,
             engine_startup_ceiling,
+            ..
         } = config.servicer;
         let thread = ServerThread::start(
             "smg-vllm-servicer",
@@ -410,6 +412,7 @@ impl VllmServicerServer {
                     engine_count,
                     engine_startup_timeout,
                     engine_startup_ceiling,
+                    silence,
                     tokenizer_dir,
                     last_error,
                 ));

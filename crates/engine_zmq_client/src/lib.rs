@@ -40,7 +40,8 @@ pub mod mock_engine;
 // else stays reachable through its own module path.
 pub use connector::{
     Client, EngineCoreClient, EngineCoreStream, RequestStream, SglangClient, SglangStream,
-    TokenSpeedClient, TokenSpeedStream,
+    TokenSpeedClient, TokenSpeedStream, ENGINE_PREFILL_TOKENS_PER_SEC,
+    ENGINE_SILENCE_DEATH_TIMEOUT,
 };
 pub use error::{Error, Result};
 pub use startup::{EngineLiveness, StartupBudget};

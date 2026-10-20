@@ -46,6 +46,8 @@ from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
 # this launcher's own documented values.
 from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     DEFAULT_DRAIN_SECS,
+    DEFAULT_PREFILL_TOKENS_PER_SEC,
+    DEFAULT_SILENCE_TIMEOUT_SECS,
     DEFAULT_STARTUP_CEILING_SECS,
     DEFAULT_STARTUP_TIMEOUT_SECS,
     IMPLS,
@@ -78,6 +80,8 @@ HANDSHAKE_PORT_ENV = "SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT"
 DRAIN_SECS_ENV = "SMG_TOKENSPEED_SERVICER_DRAIN_SECS"
 STARTUP_TIMEOUT_SECS_ENV = "SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS"
 STARTUP_CEILING_SECS_ENV = "SMG_TOKENSPEED_SERVICER_STARTUP_CEILING_SECS"
+SILENCE_TIMEOUT_SECS_ENV = "SMG_TOKENSPEED_SERVICER_SILENCE_TIMEOUT_SECS"
+PREFILL_TOKENS_PER_SEC_ENV = "SMG_TOKENSPEED_SERVICER_PREFILL_TOKENS_PER_SEC"
 # Set to 0/false/no/off to keep TokenSpeed's KV event publisher off when the
 # launcher was given no --kv-events-config (see `default_kv_events_config`).
 KV_EVENTS_ENV = "SMG_TOKENSPEED_SERVICER_KV_EVENTS"
@@ -523,6 +527,8 @@ class TokenSpeedLauncher(RustLauncher):
     drain_secs_env = DRAIN_SECS_ENV
     startup_timeout_secs_env = STARTUP_TIMEOUT_SECS_ENV
     startup_ceiling_secs_env = STARTUP_CEILING_SECS_ENV
+    silence_timeout_secs_env = SILENCE_TIMEOUT_SECS_ENV
+    prefill_tokens_per_sec_env = PREFILL_TOKENS_PER_SEC_ENV
     kv_events_env = KV_EVENTS_ENV
     without_tokenizer = "string stops will be refused"
     warmup_env = WARMUP_ENV

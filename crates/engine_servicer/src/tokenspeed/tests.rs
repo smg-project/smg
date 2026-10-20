@@ -1695,3 +1695,56 @@ async fn a_prompt_the_window_cannot_hold_is_refused_before_the_scheduler() {
     assert_eq!(accepted.input_ids, vec![1, 2, 3]);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
+
+/// The configured engine-silence bound and prefill allowance reach the
+/// scheduler's link: with a 300 ms window and one token per second allowed
+/// for the prompt pending prefill (three tokens: three seconds), a scheduler
+/// that reads a request and never answers is given up on at the window plus
+/// the allowance, well under the crate's five-minute default, and the stream
+/// ends with the engine's death.
+#[tokio::test]
+async fn the_configured_silence_bound_and_prefill_allowance_reach_the_scheduler_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let window = Duration::from_millis(300);
+    let allowance = Duration::from_secs(3);
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_silence_timeout = window;
+    config.servicer.engine_prefill_tokens_per_sec = 1;
+    let server = TokenSpeedServicerServer::start(config).unwrap();
+    let engine = connect_to_frontend(
+        &handshake,
+        EngineId::from_engine_index(0),
+        default_ready_response(),
+    )
+    .await
+    .expect("mock scheduler handshake");
+    wait_until(|| server.engine_ready()).await;
+    let mut client = TokenSpeedSchedulerClient::new(grpc_channel(server.address()).await);
+    let (mut engine_in, _engine_out) = engine.split();
+    let started = Instant::now();
+    let mut stream = client
+        .generate(generate_request("r-silent", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    assert_eq!(recv_add(&mut engine_in).await.input_ids, vec![1, 2, 3]);
+    let status = stream
+        .message()
+        .bounded()
+        .await
+        .expect_err("a scheduler silent past the window and the allowance is dead");
+    assert!(
+        status
+            .message()
+            .contains("engine core reported fatal failure"),
+        "{}",
+        status.message()
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= window + allowance && elapsed < Duration::from_secs(15),
+        "given up on at the window plus the prompt's allowance, not before or much after: {elapsed:?}"
+    );
+    server.stop(Duration::from_secs(5)).unwrap();
+}

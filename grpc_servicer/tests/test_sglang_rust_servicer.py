@@ -845,15 +845,23 @@ def test_serve_rust_hands_the_server_both_startup_bounds(monkeypatch, tmp_path):
     ceiling."""
     monkeypatch.delenv(rust.STARTUP_TIMEOUT_SECS_ENV, raising=False)
     monkeypatch.delenv(rust.STARTUP_CEILING_SECS_ENV, raising=False)
+    monkeypatch.delenv(rust.SILENCE_TIMEOUT_SECS_ENV, raising=False)
+    monkeypatch.delenv(rust.PREFILL_TOKENS_PER_SEC_ENV, raising=False)
     created = _run_serve_rust(monkeypatch, tmp_path)
     assert created["engine_startup_timeout_secs"] == rust.DEFAULT_STARTUP_TIMEOUT_SECS
     assert created["engine_startup_ceiling_secs"] == rust.DEFAULT_STARTUP_CEILING_SECS
+    assert created["engine_silence_timeout_secs"] == rust.DEFAULT_SILENCE_TIMEOUT_SECS
+    assert created["engine_prefill_tokens_per_sec"] == rust.DEFAULT_PREFILL_TOKENS_PER_SEC
 
     monkeypatch.setenv(rust.STARTUP_TIMEOUT_SECS_ENV, "42")
     monkeypatch.setenv(rust.STARTUP_CEILING_SECS_ENV, "0")
+    monkeypatch.setenv(rust.SILENCE_TIMEOUT_SECS_ENV, "900")
+    monkeypatch.setenv(rust.PREFILL_TOKENS_PER_SEC_ENV, "0")
     created = _run_serve_rust(monkeypatch, tmp_path)
     assert created["engine_startup_timeout_secs"] == 42.0
     assert created["engine_startup_ceiling_secs"] == 0.0
+    assert created["engine_silence_timeout_secs"] == 900.0
+    assert created["engine_prefill_tokens_per_sec"] == 0
 
 
 def test_serve_rust_constructs_the_server_with_keywords_the_binding_takes(monkeypatch, tmp_path):

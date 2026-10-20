@@ -76,6 +76,19 @@ DEFAULT_STARTUP_TIMEOUT_SECS = 1800.0
 # over half an hour to load on a cold start; four hours leaves room for the
 # storage path. 0 lifts the ceiling.
 DEFAULT_STARTUP_CEILING_SECS = 4 * 3600.0
+# Bound on the connected engine's silence: how long it may hold requests in
+# flight, in total since its last output, with nothing pending prefill, before
+# the Rust server treats it as dead and fails them (the crate's default). The
+# prompt tokens pending prefill extend it at ``DEFAULT_PREFILL_TOKENS_PER_SEC``:
+# a wire that says nothing until a prompt's first token is silent through a
+# whole prefill, and a batch of long prompts prefills for longer than any fixed
+# bound.
+DEFAULT_SILENCE_TIMEOUT_SECS = 300.0
+# The prefill rate the silence bound allows the engine, in tokens per second: a
+# bound on how slowly a healthy engine may prefill (500 s per million pending
+# prompt tokens on top of the window; the crate's default), not an estimate of
+# how fast it does. 0 allows nothing.
+DEFAULT_PREFILL_TOKENS_PER_SEC = 2000
 _POLL_SECS = 0.5
 # Grace a scheduler process this process started gets between SIGTERM and
 # SIGKILL at shutdown, and how long the kill is waited for.
@@ -241,6 +254,8 @@ class LauncherKnobs:
     drain_secs: float
     startup_timeout_secs: float
     startup_ceiling_secs: float
+    silence_timeout_secs: float
+    prefill_tokens_per_sec: int
     socket_dir: str
 
 
@@ -250,16 +265,20 @@ def read_launcher_knobs(
     drain_secs_env: str,
     startup_timeout_secs_env: str,
     startup_ceiling_secs_env: str,
+    silence_timeout_secs_env: str,
+    prefill_tokens_per_sec_env: str,
     socket_dir: str | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> LauncherKnobs:
     """Every knob of a Rust-servicer launcher at once, each failure a
     :class:`ServicerConfigError` naming its variable: the handshake port (1 to
     65535, or a free one), the drain on a signal (0 s or more), the startup
-    silence bound (above 0 s), the startup ceiling (0 lifts it), the IPC socket
-    directory (``socket_dir``, else ``$SMG_ZMQ_SOCKET_DIR``, else the
-    default; created). Nothing is read later: a bad value is refused before
-    the gRPC port is bound and before the engine starts."""
+    silence bound (above 0 s), the startup ceiling (0 lifts it), the connected
+    engine's silence bound (above 0 s) and the prefill rate it allows (0 or
+    more tokens per second; 0 allows nothing), the IPC socket directory
+    (``socket_dir``, else ``$SMG_ZMQ_SOCKET_DIR``, else the default; created).
+    Nothing is read later: a bad value is refused before the gRPC port is
+    bound and before the engine starts."""
     return LauncherKnobs(
         handshake_port=env_port(handshake_port_env, environ=environ),
         drain_secs=env_float(drain_secs_env, DEFAULT_DRAIN_SECS, environ=environ, minimum=0.0),
@@ -271,6 +290,17 @@ def read_launcher_knobs(
         ),
         startup_ceiling_secs=env_float(
             startup_ceiling_secs_env, DEFAULT_STARTUP_CEILING_SECS, environ=environ, minimum=0.0
+        ),
+        silence_timeout_secs=env_float(
+            silence_timeout_secs_env, DEFAULT_SILENCE_TIMEOUT_SECS, environ=environ, positive=True
+        ),
+        prefill_tokens_per_sec=int(
+            env_float(
+                prefill_tokens_per_sec_env,
+                DEFAULT_PREFILL_TOKENS_PER_SEC,
+                environ=environ,
+                minimum=0.0,
+            )
         ),
         socket_dir=prepare_socket_dir(
             default_socket_dir(environ) if socket_dir is None else socket_dir
@@ -1235,6 +1265,8 @@ class RustLauncher:
     drain_secs_env: str
     startup_timeout_secs_env: str
     startup_ceiling_secs_env: str
+    silence_timeout_secs_env: str
+    prefill_tokens_per_sec_env: str
     kv_events_env: str
     # What the servicer loses without a local tokenizer directory, for the warning.
     without_tokenizer: str
@@ -1329,9 +1361,10 @@ class RustLauncher:
     def announce(
         self, server: Any, knobs: LauncherKnobs, handshake_port: int, engine_count: int
     ) -> None:
-        """The two lines an operator reads at the start: where the server
-        listens and what dials its handshake, and the startup bounds with the
-        variables that set them."""
+        """The three lines an operator reads at the start: where the server
+        listens and what dials its handshake, the startup bounds with the
+        variables that set them, and the connected engine's silence bound with
+        its prefill allowance."""
         logger.info(
             "Rust %s servicer listening on %s (%s handshake tcp://127.0.0.1:%d, %d %s(s))",
             self.engine,
@@ -1351,6 +1384,15 @@ class RustLauncher:
             self.startup_ceiling_secs_env,
             self.started,
         )
+        logger.info(
+            "%s silence bound once connected: %.0fs without an output while requests are in "
+            "flight (%s), plus the prompt pending prefill at %d tokens/s (%s)",
+            self.started.capitalize(),
+            knobs.silence_timeout_secs,
+            self.silence_timeout_secs_env,
+            knobs.prefill_tokens_per_sec,
+            self.prefill_tokens_per_sec_env,
+        )
 
     async def serve(self, args: Any) -> int:
         """Serve this process's gRPC contract from Rust. Returns the process
@@ -1362,6 +1404,8 @@ class RustLauncher:
             drain_secs_env=self.drain_secs_env,
             startup_timeout_secs_env=self.startup_timeout_secs_env,
             startup_ceiling_secs_env=self.startup_ceiling_secs_env,
+            silence_timeout_secs_env=self.silence_timeout_secs_env,
+            prefill_tokens_per_sec_env=self.prefill_tokens_per_sec_env,
             socket_dir=default_socket_dir(),
         )
         warmup_setting = read_warmup_setting(self.warmup_env)
@@ -1388,6 +1432,8 @@ class RustLauncher:
             tokenizer_dir=tokenizer_dir,
             engine_startup_timeout_secs=knobs.startup_timeout_secs,
             engine_startup_ceiling_secs=knobs.startup_ceiling_secs,
+            engine_silence_timeout_secs=knobs.silence_timeout_secs,
+            engine_prefill_tokens_per_sec=knobs.prefill_tokens_per_sec,
             **self.server_extras(args, tokenizer_dir),
             **facts,
         )

@@ -2,7 +2,8 @@
 
 What every servicer starts with, whichever engine it serves (the listener, the
 engines' IPC base and handshake endpoints, the engine count, the tokenizer
-directory and the two start-up bounds), is one block in the Rust crate; each
+directory, the two start-up bounds and the engine-silence bound), is one block
+in the Rust crate; each
 class adds the model facts its engine advertises. These tests pin the three
 constructors to that block: the same parameter names and defaults, the same
 refusal with the same message for a bad value, before anything is bound or
@@ -27,6 +28,8 @@ SHARED_DEFAULTS = {
     "tokenizer_dir": None,
     "engine_startup_timeout_secs": None,
     "engine_startup_ceiling_secs": None,
+    "engine_silence_timeout_secs": None,
+    "engine_prefill_tokens_per_sec": None,
 }
 # A call that passes the servicer's block and a model path only. The bad values
 # below are refused before anything is bound or dialled, so the endpoints need
@@ -59,6 +62,16 @@ REFUSED = [
         "engine_startup_ceiling_secs",
         -1.0,
         "engine_startup_ceiling_secs must be positive, or 0 for no ceiling, got -1",
+    ),
+    (
+        "engine_silence_timeout_secs",
+        0.0,
+        "engine_silence_timeout_secs must be positive, got 0",
+    ),
+    (
+        "engine_prefill_tokens_per_sec",
+        -1,
+        "engine_prefill_tokens_per_sec must be 0 or more, got -1",
     ),
 ]
 

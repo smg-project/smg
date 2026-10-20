@@ -1725,6 +1725,8 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
     assert kwargs["tokenizer_dir"] == str(tmp_path)
     assert kwargs["engine_startup_timeout_secs"] == rust_lifecycle.DEFAULT_STARTUP_TIMEOUT_SECS
     assert kwargs["engine_startup_ceiling_secs"] == rust_lifecycle.DEFAULT_STARTUP_CEILING_SECS
+    assert kwargs["engine_silence_timeout_secs"] == rust_lifecycle.DEFAULT_SILENCE_TIMEOUT_SECS
+    assert kwargs["engine_prefill_tokens_per_sec"] == rust_lifecycle.DEFAULT_PREFILL_TOKENS_PER_SEC
     assert kwargs["served_model_name"] == "served-a"
     assert kwargs["eos_token_ids"] == [151645, 151643, 7]
     assert kwargs["kv_connector"] == ""

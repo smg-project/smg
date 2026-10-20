@@ -1131,6 +1131,28 @@ impl ZmqEngineClient {
         }
     }
 
+    /// Bound how long the engine may hold requests in flight, in total since
+    /// its last output, with nothing pending prefill, before it is treated as
+    /// dead (the ZMQ client's `set_silence_death_timeout`).
+    pub fn set_silence_death_timeout(&self, timeout: Duration) {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.set_silence_death_timeout(timeout),
+            ZmqBackend::TokenSpeed(client) => client.set_silence_death_timeout(timeout),
+            ZmqBackend::Sglang(client) => client.set_silence_death_timeout(timeout),
+        }
+    }
+
+    /// The prefill rate the silence bound allows the engine for the prompt
+    /// tokens pending prefill; zero allows nothing (the ZMQ client's
+    /// `set_prefill_tokens_per_sec`).
+    pub fn set_prefill_tokens_per_sec(&self, tokens_per_sec: u64) {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.set_prefill_tokens_per_sec(tokens_per_sec),
+            ZmqBackend::TokenSpeed(client) => client.set_prefill_tokens_per_sec(tokens_per_sec),
+            ZmqBackend::Sglang(client) => client.set_prefill_tokens_per_sec(tokens_per_sec),
+        }
+    }
+
     /// Per-rank load from the piggybacked scheduler stats (SMG's DP routing
     /// signal), in the same shape as the gRPC `GetLoads` response. A rank that
     /// has not reported yet has no entry.

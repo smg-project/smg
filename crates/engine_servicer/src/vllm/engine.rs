@@ -11,7 +11,7 @@ use openai_protocol::worker::RuntimeType;
 use tracing::{error, info, warn};
 
 use super::State;
-use crate::{record_error, SharedError};
+use crate::{record_error, servicer_config::SilenceBounds, SharedError};
 
 /// Load the tokenizer and connect the engine, in the background of a server
 /// that is already listening. Failures gate health and surface as the last
@@ -20,10 +20,12 @@ use crate::{record_error, SharedError};
 /// The handshake's silence bound (`startup_timeout`) counts from the latest
 /// sign of life: a handshake message, or the lifecycle owner's report that
 /// the engine process is alive (`State::engine::liveness`); the ceiling
-/// bounds the whole start regardless.
+/// bounds the whole start regardless. Once connected, the engine's silence is
+/// bounded by `silence` (with the prefill allowance for the prompt it holds),
+/// applied before the first request reaches it.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the link's inputs: endpoints, engine count, the two startup bounds, the tokenizer and the error slot"
+    reason = "the link's inputs: endpoints, engine count, the startup and silence bounds, the tokenizer and the error slot"
 )]
 pub(super) async fn connect_engine(
     state: Arc<State>,
@@ -32,6 +34,7 @@ pub(super) async fn connect_engine(
     engine_count: usize,
     startup_timeout: Duration,
     startup_ceiling: Option<Duration>,
+    silence: SilenceBounds,
     tokenizer_dir: Option<String>,
     last_error: SharedError,
 ) {
@@ -87,9 +90,12 @@ pub(super) async fn connect_engine(
             if state.model.log_stats == Some(true) {
                 client.note_reports_steps();
             }
+            silence.apply(&client);
             info!(
                 handshake = %handshake_address,
                 engines = engine_count,
+                silence_window = ?silence.window,
+                prefill_tokens_per_sec = silence.prefill_tokens_per_sec,
                 "vLLM engine connected"
             );
             let _ = state.engine.client.set(client);

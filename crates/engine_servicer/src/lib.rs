@@ -77,3 +77,24 @@ pub const DEFAULT_ENGINE_STARTUP_TIMEOUT: Duration = Duration::from_secs(30 * 60
 /// cold start; four hours leaves room for the storage path, with the knob
 /// above it for anything slower.
 pub const DEFAULT_ENGINE_STARTUP_CEILING: Duration = Duration::from_secs(4 * 60 * 60);
+
+/// How long a connected engine may hold requests in flight, in total since its
+/// last output, with nothing pending prefill, before the servicer treats it as
+/// dead, fails the requests and closes the link (the engine's client then
+/// reports it dead and the lifecycle owner restarts the pair). A hard engine
+/// death sends nothing over the wire, so silence is the only sign of it; the
+/// prompt tokens pending prefill extend the bound at
+/// [`DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC`], so a batch of long prompts on a
+/// wire that says nothing until a prompt's first token is not read as a dead
+/// engine. The engine client's own default
+/// ([`engine_zmq_client::ENGINE_SILENCE_DEATH_TIMEOUT`]).
+pub const DEFAULT_ENGINE_SILENCE_TIMEOUT: Duration =
+    engine_zmq_client::ENGINE_SILENCE_DEATH_TIMEOUT;
+
+/// The prefill rate the engine-silence bound allows the engine for the prompt
+/// tokens pending prefill: a bound on how slowly a healthy engine may prefill
+/// (500 s per million pending prompt tokens on top of the window), not an
+/// estimate of how fast it does. The engine client's own default
+/// ([`engine_zmq_client::ENGINE_PREFILL_TOKENS_PER_SEC`]).
+pub const DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC: u64 =
+    engine_zmq_client::ENGINE_PREFILL_TOKENS_PER_SEC;

@@ -314,6 +314,7 @@ impl SglangServicerServer {
         );
         let connect_state = Arc::clone(&state);
         let kv_relay = state.kv_relay.clone();
+        let silence = config.servicer.silence_bounds();
         let ServicerConfig {
             bind_address,
             ipc_base_url,
@@ -344,6 +345,7 @@ impl SglangServicerServer {
                     engine_count,
                     engine_startup_timeout,
                     engine_startup_ceiling,
+                    silence,
                     last_error,
                 ));
                 info!(address = %listener.local_addr().map(|a| a.to_string()).unwrap_or_default(), "SGLang gRPC servicer listening");
