@@ -126,7 +126,9 @@ pub enum MalformedReason {
     /// the event carries no bytes and stands where the arguments stopped being JSON; the call's
     /// fragments carry every byte the model wrote.
     InvalidArguments,
-    /// A tool call named a function the request did not declare.
+    /// A tool call named a function the request did not declare. The engine's own event, for
+    /// every syntax: it stands right before the call's start and carries no bytes, the call goes
+    /// out as the syntax read it, and a request that declares no tools is not asked.
     UnknownTool,
     /// Text where the call's syntax has only tags: between a tag and the next, outside a value.
     TextBetweenTags,

@@ -63,7 +63,13 @@ What the engine decides for every format, and what it leaves open:
   writes before the marker.
 - With the tagged syntax, a value's type comes from the request's tools (`Declared`): a
   declared string streams, every other value is written at its close. A call to a function the
-  request did not declare has every value inferred.
+  request did not declare has every value inferred, and the engine announces it, for every
+  syntax, with a `Malformed { UnknownTool }` event of no bytes right before the call's start
+  (`Engine::push_call_events`): the call goes out as the syntax read it, a reader counts the
+  failure at its offset, and a request that declares no tools is not asked. Up to sixteen tools
+  are searched by name as they are; more are indexed once per output, at the first call's start,
+  and the index is searched. A syntax that reads an undeclared first name as prose (the pythonic
+  list after content) makes no call, so there is nothing to announce.
 - Call ids are `call_` and 24 lowercase hex characters, the shape the gateway's older parsers
   mint, so a client tells no difference. The engine draws a nonce at random when it is made
   (`CallIds::fresh`: 96 random bits; not a UUIDv7, whose in-process counter steps consecutive

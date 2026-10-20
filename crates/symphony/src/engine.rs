@@ -15,7 +15,7 @@
 //!
 //! Notes on what this module decides, and on what it leaves open: `docs/engine.md`.
 
-use std::{borrow::Cow, collections::VecDeque, ops::Range, sync::Arc};
+use std::{borrow::Cow, cell::OnceCell, collections::VecDeque, ops::Range, sync::Arc};
 
 use crate::{
     event::{runs_at, DropReason, Event, Events, FinishReason, MalformedReason, Text},
@@ -46,8 +46,13 @@ enum Closed {
 pub struct Engine {
     /// The table, shared with every engine that runs it.
     format: Arc<Format>,
-    /// The request's tools, which type a tagged call's values.
+    /// The request's tools, which type a tagged call's values and say which functions a call may
+    /// name.
     declared: Declared,
+    /// The request's tools in the order of their names, as positions in `declared`, for a request
+    /// with more tools than a call's start searches directly: built at the first call's start
+    /// (one allocation, for an output with a call) and searched per call ([`Self::declares`]).
+    names: OnceCell<Box<[usize]>>,
     scanner: Scanner,
     state: usize,
     /// The call being assembled while the engine is in an arguments state.
@@ -382,6 +387,7 @@ impl Engine {
             scanner: Scanner::new(format.terminal_texts()),
             format,
             declared,
+            names: OnceCell::new(),
             state: 0,
             call: None,
             calls: 0,
@@ -1009,15 +1015,51 @@ impl Engine {
         taken
     }
 
+    /// Tools up to this many are searched by name at each call's start as they are; more are
+    /// indexed once per output at the first call's start and the index is searched. Measured on
+    /// the crate's bench subjects (two tools, two calls), the direct search is free, and the one
+    /// allocation an index costs moved the allocator's consolidation into the read.
+    const NAMES_SEARCHED_DIRECTLY: usize = 16;
+
+    /// Whether the request declares a function named `name`: up to
+    /// [`Self::NAMES_SEARCHED_DIRECTLY`] tools, as they are; more, by the index built once per
+    /// output at the first call's start. Asked only when the request declares tools at all.
+    fn declares(&self, name: &str) -> bool {
+        let tools = self.declared.tools();
+        if tools.len() <= Self::NAMES_SEARCHED_DIRECTLY {
+            return self.declared.declares(name);
+        }
+        let by_name = self.names.get_or_init(|| {
+            let mut positions: Vec<usize> = (0..tools.len()).collect();
+            positions
+                .sort_unstable_by(|a, b| tools[*a].function.name.cmp(&tools[*b].function.name));
+            positions.into_boxed_slice()
+        });
+        by_name
+            .binary_search_by(|at| tools[*at].function.name.as_str().cmp(name))
+            .is_ok()
+    }
+
     /// Pushes a call's events with their tokens counted, and counts each call that starts: the
     /// index the next call takes, and `Finish::tool_calls`. A syntax that writes several calls in
-    /// one region starts each of them here. An event's bytes are counted as carried out of the
-    /// region, with the ignored terminals that arrived among them placed where they arrived.
+    /// one region starts each of them here. A call that names a function the request did not
+    /// declare is announced first, by a `Malformed { UnknownTool }` event of no bytes right before
+    /// its start, so a reader counts it at its offset; the call goes out as the syntax read it, and
+    /// a request that declares no tools is not asked. An event's bytes are counted as carried out
+    /// of the region, with the ignored terminals that arrived among them placed where they
+    /// arrived.
     fn push_call_events<'d>(&mut self, events: Vec<Event<'d>>, out: &mut Events<'d>) {
         for event in events {
-            if let Event::ToolCallStart { id, .. } = &event {
+            if let Event::ToolCallStart { id, name, .. } = &event {
                 self.calls += 1;
                 self.given_ids.push(id.clone());
+                if !self.declared.tools().is_empty() && !self.declares(name) {
+                    let unknown = Event::Malformed {
+                        text: self.tokens.text(""),
+                        why: MalformedReason::UnknownTool,
+                    };
+                    self.push_carried_out(unknown, out);
+                }
             }
             self.push_carried_out(event, out);
         }
@@ -1259,10 +1301,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        formats::{glm, inkling, qwen3, xlam},
+        formats::{glm, inkling, llama4, mistral, qwen3, xlam},
         input::TokenSpan,
         tagged::{Placement, Spelling},
-        testing::bytes,
+        testing::{arguments_of, bytes},
     };
 
     fn declared() -> Declared {
@@ -1329,6 +1371,239 @@ mod tests {
             engine.feed(input, &mut out).expect("in order");
         }
         out.into_owned().drain()
+    }
+
+    /// The events of `output` after `prompt` on `format`, with `declared` the request's tools,
+    /// ended by a stop.
+    fn read_with(
+        format: &Arc<Format>,
+        declared: Declared,
+        prompt: &str,
+        pieces: &[&str],
+    ) -> Vec<Event<'static>> {
+        let mut engine = Engine::with_call_ids(Arc::clone(format), declared, ids());
+        let mut out = Events::new();
+        engine
+            .feed(
+                Input::Prompt {
+                    token_ids: &[],
+                    text: prompt,
+                },
+                &mut out,
+            )
+            .expect("the prompt");
+        for piece in pieces {
+            engine
+                .feed(
+                    Input::Delta {
+                        token_ids: &[],
+                        text: piece,
+                        spans: &[],
+                    },
+                    &mut out,
+                )
+                .expect("a delta");
+        }
+        engine
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("the end");
+        out.into_owned().drain()
+    }
+
+    /// Where the `UnknownTool` events stand among `events`.
+    fn unknown_tool_at(events: &[Event]) -> Vec<usize> {
+        events
+            .iter()
+            .enumerate()
+            .filter_map(|(at, event)| {
+                matches!(
+                    event,
+                    Event::Malformed {
+                        why: MalformedReason::UnknownTool,
+                        ..
+                    }
+                )
+                .then_some(at)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_call_to_a_function_the_request_did_not_declare_is_announced_before_its_start_on_every_syntax(
+    ) {
+        // Four syntaxes: keyed tags, JSON between tags, the turn's Python list and the JSON list.
+        // A declared name: no event. An undeclared or a misspelled one: one `UnknownTool` event of
+        // no bytes right before the call's start, the call itself as the syntax read it, at every
+        // cut of the output. A request without tools is not asked.
+        type Written = fn(&str) -> String;
+        let cases: [(&str, Format, &str, Written); 4] = [
+            ("glm", glm(), "<|assistant|><think>", |name| {
+                format!(
+                    "</think>Sure.<tool_call>{name}<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
+                )
+            }),
+            (
+                "qwen3",
+                qwen3(CallSyntax::Json),
+                "<|im_start|>assistant\n",
+                |name| {
+                    format!(
+                        "<tool_call>\n{{\"name\": \"{name}\", \"arguments\": {{\"city\": \"Paris\"}}}}\n</tool_call>"
+                    )
+                },
+            ),
+            (
+                "llama4",
+                llama4(),
+                "<|header_start|>assistant<|header_end|>\n\n",
+                |name| format!("[{name}(city=\"Paris\")]"),
+            ),
+            ("mistral", mistral(), "[/INST]", |name| {
+                format!(
+                    "[TOOL_CALLS] [{{\"name\": \"{name}\", \"arguments\": {{\"city\": \"Paris\"}}, \"id\": \"call00000\"}}]"
+                )
+            }),
+        ];
+        for (table, format, prompt, written) in cases {
+            let format = Arc::new(format);
+            let declared_arguments = {
+                let events = read_with(&format, declared(), prompt, &[&written("get_weather")]);
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, Event::Malformed { .. })),
+                    "{table}: a declared name: {events:?}"
+                );
+                arguments_of(&events, 0)
+            };
+            for name in ["fetch_weather", "get_wether"] {
+                let output = written(name);
+                let characters: Vec<&str> = output
+                    .char_indices()
+                    .map(|(at, character)| &output[at..at + character.len_utf8()])
+                    .collect();
+                let mut plans: Vec<Vec<&str>> = vec![vec![&output], characters];
+                plans.extend(
+                    (1..output.len())
+                        .filter(|cut| output.is_char_boundary(*cut))
+                        .map(|cut| vec![&output[..cut], &output[cut..]]),
+                );
+                for pieces in plans {
+                    let events = read_with(&format, declared(), prompt, &pieces);
+                    let place = || format!("{table} {name} in {} pieces: {events:?}", pieces.len());
+                    assert_eq!(bytes(&events), output, "{}", place());
+                    let unknown = unknown_tool_at(&events);
+                    let start = events
+                        .iter()
+                        .position(|event| {
+                            matches!(event, Event::ToolCallStart { name: called, .. } if called == name)
+                        })
+                        .unwrap_or_else(|| panic!("{}", place()));
+                    assert_eq!(unknown, [start - 1], "{}", place());
+                    assert!(
+                        matches!(&events[start - 1], Event::Malformed { text, .. } if text.text.is_empty()),
+                        "{}",
+                        place()
+                    );
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| matches!(event, Event::Malformed { .. }))
+                            .count(),
+                        1,
+                        "{}",
+                        place()
+                    );
+                    assert_eq!(arguments_of(&events, 0), declared_arguments, "{}", place());
+                    assert!(
+                        matches!(events.last(), Some(Event::Finish { tool_calls: 1, .. })),
+                        "{}",
+                        place()
+                    );
+                }
+            }
+            let events = read_with(
+                &format,
+                Declared::of(&[]),
+                prompt,
+                &[&written("fetch_weather")],
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::Malformed { .. })),
+                "{table}: no tools declared, nothing to announce: {events:?}"
+            );
+            assert!(matches!(
+                events.last(),
+                Some(Event::Finish { tool_calls: 1, .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn a_request_with_many_tools_has_them_indexed_once_and_every_name_found_by_the_index() {
+        // More tools than a call's start searches directly, declared in reverse order of their
+        // names: the index built at the first call finds each declared name, and a name between
+        // two declared ones, or past the last, is announced.
+        let count = Engine::NAMES_SEARCHED_DIRECTLY + 4;
+        let tools: Vec<Tool> = (0..count)
+            .rev()
+            .map(|k| Tool {
+                tool_type: "function".to_string(),
+                function: Function {
+                    name: format!("tool_{k:02}"),
+                    description: None,
+                    parameters: value!({"type": "object", "properties": {"city": {"type": "string"}}}),
+                    strict: None,
+                    extra: Default::default(),
+                },
+            })
+            .collect();
+        let format = Arc::new(glm());
+        let prompt = "<|assistant|><think>";
+        let written = |name: &str| {
+            format!(
+                "</think>Sure.<tool_call>{name}<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
+            )
+        };
+        for k in 0..count {
+            let name = format!("tool_{k:02}");
+            let events = read_with(&format, Declared::of(&tools), prompt, &[&written(&name)]);
+            assert!(unknown_tool_at(&events).is_empty(), "{name}: {events:?}");
+            assert!(matches!(
+                events.last(),
+                Some(Event::Finish { tool_calls: 1, .. })
+            ));
+        }
+        for name in ["tool_1", "tool_015", "tool_99", "tool", "tool_000"] {
+            let events = read_with(&format, Declared::of(&tools), prompt, &[&written(name)]);
+            let start = events
+                .iter()
+                .position(|event| matches!(event, Event::ToolCallStart { .. }))
+                .unwrap_or_else(|| panic!("{name:?}: the call starts: {events:?}"));
+            assert_eq!(
+                unknown_tool_at(&events),
+                [start - 1],
+                "{name:?}: {events:?}"
+            );
+        }
+        // Two calls in one output share the index: built once, both names found.
+        let output = format!(
+            "{}<tool_call>tool_19<arg_key>city</arg_key><arg_value>Rome</arg_value></tool_call>",
+            written("tool_03")
+        );
+        let events = read_with(&format, Declared::of(&tools), prompt, &[&output]);
+        assert!(unknown_tool_at(&events).is_empty(), "{events:?}");
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 2, .. })
+        ));
     }
 
     /// Each call's arguments as the client joins them, and the bytes of each call's end.
