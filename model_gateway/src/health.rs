@@ -96,9 +96,9 @@ pub struct ReadinessSnapshot {
     /// Total number of registered workers (reported in the ready response
     /// body).
     pub total_workers: usize,
-    /// Models whose multimodal requests worker-side media placement
-    /// (`--mm-processing worker`) cannot serve: a worker of the model reports
-    /// a vision encoder and no worker of it processes media references
+    /// Models whose requests that forward media references worker-side media
+    /// placement (`--mm-processing worker`) cannot serve: a worker of the model
+    /// reports a vision encoder and no worker of it processes media references
     /// (`multimodal::models_without_media_processing`, over every registered
     /// worker: the capability is configuration, not health). Every such
     /// request is refused `no_media_ref_capable_worker`; the ready body names
@@ -230,8 +230,9 @@ impl ProbeState {
 
         // Under worker-side media placement, a model whose workers report a
         // vision encoder and none of which processes media references refuses
-        // every multimodal request (`no_media_ref_capable_worker`): the ready
-        // body names it, and the change is said once, here, not per probe.
+        // every request that forwards media references
+        // (`no_media_ref_capable_worker`): the ready body names it, and the
+        // change is said once, here, not per probe.
         // Readiness itself is not held on it: the router still serves the
         // model's text requests and every other model, and a failed probe
         // would take the whole pod out of rotation for all of them.
@@ -249,9 +250,10 @@ impl ProbeState {
                     warn!(
                         models = ?media_unserved,
                         "no worker processes media references for a model whose workers report \
-                         a vision encoder: under --mm-processing worker its multimodal requests \
-                         are refused (no_media_ref_capable_worker) and /readiness names the model \
-                         under models_without_media_processing until such a worker registers"
+                         a vision encoder: under --mm-processing worker its requests that \
+                         forward media references are refused (no_media_ref_capable_worker) and \
+                         /readiness names the model under models_without_media_processing until \
+                         such a worker registers"
                     );
                 }
             }
