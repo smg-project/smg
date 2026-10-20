@@ -62,6 +62,47 @@ impl ParserChoice {
     }
 }
 
+/// What the gateway does about an output a Symphony table did not read whole (a malformed
+/// run folded into the content, a call dropped under `parallel_tool_calls: false`; see
+/// `routers::grpc::regular::symphony::telemetry`). The counters are recorded under every
+/// policy; the policy decides the log line and the per-request report
+/// (`X-SMG-Parse-Report`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ParseFailures {
+    /// The line, and the report on every output that is not clean (a request's
+    /// `X-SMG-Parse-Report: off` leaves it out; `on` adds it to a clean output too).
+    Surface,
+    /// The line, and the report when the request asks for it (`X-SMG-Parse-Report: on` or
+    /// `detail`).
+    #[default]
+    Log,
+    /// Neither: the counters alone; the header is ignored.
+    Silent,
+}
+
+impl ParseFailures {
+    /// The policy `name` spells, `surface`, `log` or `silent` in any case; `None` for any other
+    /// text.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "surface" => Some(Self::Surface),
+            "log" => Some(Self::Log),
+            "silent" => Some(Self::Silent),
+            _ => None,
+        }
+    }
+
+    /// The name the flag spells this policy as.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Surface => "surface",
+            Self::Log => "log",
+            Self::Silent => "silent",
+        }
+    }
+}
+
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
@@ -534,6 +575,12 @@ pub struct RouterConfig {
     /// registry knows. A request's `X-SMG-Parser` header overrides it for that request.
     #[serde(default)]
     pub parser: ParserChoice,
+    /// What the gateway does about an output a Symphony table did not read whole: the log
+    /// line and the per-request report (`log`, the default: the line, and the report when
+    /// the request asks; `surface`: the report on every such output; `silent`: the counters
+    /// alone). See [`ParseFailures`].
+    #[serde(default)]
+    pub parse_failures: ParseFailures,
     #[serde(default = "default_history_backend")]
     pub history_backend: HistoryBackend,
     /// Required when history_backend = "oracle"
@@ -1951,6 +1998,7 @@ impl Default for RouterConfig {
             chat_template: None,
             disable_tokenizer_autoload: false,
             parser: ParserChoice::default(),
+            parse_failures: ParseFailures::default(),
             model_aliases: HashMap::new(),
             history_backend: default_history_backend(),
             oracle: None,
@@ -2051,6 +2099,27 @@ impl RouterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_failures_spells_its_three_policies_and_defaults_to_log() {
+        assert_eq!(ParseFailures::default(), ParseFailures::Log);
+        for (name, policy) in [
+            ("surface", ParseFailures::Surface),
+            ("log", ParseFailures::Log),
+            ("silent", ParseFailures::Silent),
+            (" Silent ", ParseFailures::Silent),
+        ] {
+            assert_eq!(ParseFailures::parse(name), Some(policy), "{name}");
+            assert_eq!(policy.name(), name.trim().to_ascii_lowercase());
+        }
+        assert_eq!(ParseFailures::parse("loud"), None);
+        let json: ParseFailures = serde_json::from_str("\"surface\"").expect("deserializes");
+        assert_eq!(json, ParseFailures::Surface);
+        assert_eq!(
+            serde_json::to_string(&ParseFailures::Silent).expect("serializes"),
+            "\"silent\""
+        );
+    }
 
     #[test]
     fn test_router_config_default() {

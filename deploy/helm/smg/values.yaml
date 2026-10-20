@@ -219,6 +219,9 @@ router:
     configPath: ""
   reasoningParser: ""
   toolCallParser: ""
+  # What the gateway does about an output a Symphony table did not read whole: "log" (the
+  # default when empty), "surface" or "silent" (--parse-failures)
+  parseFailures: ""
 
 # =============================================================================
 # HuggingFace Configuration

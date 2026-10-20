@@ -219,6 +219,7 @@ mod tests {
             .await
             .unwrap();
         let components = Arc::new(SharedComponents {
+            parse_failures: crate::config::ParseFailures::Log,
             templates: Arc::new(Templates::new(tokenizer_registry.clone())),
             tokenizer_registry,
             worker_registry: Arc::new(WorkerRegistry::new()),
@@ -372,6 +373,7 @@ mod tests {
             .await
             .unwrap();
         let components = Arc::new(SharedComponents {
+            parse_failures: crate::config::ParseFailures::Log,
             templates: Arc::new(Templates::new(tokenizer_registry.clone())),
             tokenizer_registry,
             worker_registry: Arc::new(WorkerRegistry::new()),

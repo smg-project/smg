@@ -184,6 +184,24 @@ seeds, read from the fixture tree at fuzz time. `fuzz/README.md` says how a targ
 it checks, where its seeds come from and how a crash is minimized and filed; the nightly workflow
 runs every target for a bounded time.
 
+### What the gateway says about an output it did not read whole
+
+Every output a table reads is counted at its end (`smg_symphony_outputs_total{table, outcome}`,
+`clean`, `malformed` or `failed`), every malformed run by reason
+(`smg_symphony_malformed_total{table, reason}`), the malformed bytes of an output
+(`smg_symphony_malformed_bytes{table}`) and the calls after the first dropped under
+`parallel_tool_calls: false` (`smg_symphony_calls_suppressed_total{table}`). An output that is
+not clean writes one sampled `warn` line (target `smg::symphony`: the request id, choice, model,
+table, the first run's reason, offset and a 120-byte excerpt), and a client can ask for the facts
+with the request header `X-SMG-Parse-Report: on | off | detail`: the response then carries one
+`smg.parse` object next to `usage` (the parser and table that read it, `outcome`, the malformed
+runs with their choice, reason, offset, length and excerpt, the suppressed calls; `detail` adds
+the dropped wrapping) at the top level of a chat completion, on the finish chunk of a streamed
+choice, and on the `message` and `message_delta` of the Messages API. The gateway's
+`--parse-failures` policy sets what a client can get: `log` (the default) writes the line and
+reports on request, `surface` reports every output that is not clean as well, `silent` keeps
+the counters alone and ignores the header.
+
 ## Models
 
 Symphony's target is every checkpoint group bellwether has a manifest for; a group is the
