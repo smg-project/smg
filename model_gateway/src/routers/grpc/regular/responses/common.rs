@@ -677,6 +677,60 @@ mod history_tests {
         ));
     }
 
+    /// A client's own tool result with no call before it, sent with a
+    /// `previous_response_id`, is not the loader's to drop: it stays after the
+    /// chain's items in the loaded input, and the contract profile refuses it
+    /// as the public API does. (The loader judges the chain's items alone.)
+    #[tokio::test]
+    async fn a_clients_own_result_after_a_chain_keeps_its_refusal() {
+        use openai_protocol::responses::StringOrContentParts;
+        use serde_json::json;
+
+        let stores = Stores::with_conversation().await;
+        stores
+            .store_turn(
+                "resp_1",
+                &ResponsesRequest {
+                    model: "deepseek-flash".to_string(),
+                    input: ResponseInput::Text("Start.".to_string()),
+                    ..Default::default()
+                },
+                json!([{
+                    "type": "function_call", "id": "fc_1", "call_id": "call_1",
+                    "name": "calc", "arguments": "{}", "status": "completed"
+                }]),
+            )
+            .await;
+        let turn_2 = ResponsesRequest {
+            model: "deepseek-flash".to_string(),
+            input: ResponseInput::Items(vec![ResponseInputOutputItem::FunctionCallOutput {
+                id: None,
+                call_id: "call_unknown".to_string(),
+                output: StringOrContentParts::String("ok".to_string()),
+                status: None,
+            }]),
+            previous_response_id: Some("resp_1".to_string()),
+            ..Default::default()
+        };
+
+        let loaded = load_history(stores.history(), &turn_2, None)
+            .await
+            .expect("the chain loads");
+
+        let ResponseInput::Items(items) = &loaded.input else {
+            panic!("the loaded input is an item list");
+        };
+        let shapes = shape(items);
+        assert_eq!(
+            shapes.last().map(String::as_str),
+            Some("function_call_output:call_unknown"),
+            "{shapes:?}"
+        );
+        let refused = conversions::responses_to_chat(&loaded)
+            .expect_err("a result no call before it issued is a malformed history");
+        assert!(refused.contains("call_unknown"), "{refused}");
+    }
+
     /// A stored turn keeps its `item_reference`s as the client sent them, so
     /// the call a stored result answers may sit behind a reference: the
     /// loader resolves the references first and judges the results after,
