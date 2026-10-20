@@ -263,8 +263,10 @@ pub(crate) async fn prepare_placeholder_tokens(
 }
 
 /// Resolve the media-part ordering for a model from the same registry that owns
-/// its placeholder/prompt logic. Falls back to vLLM-compatible media-first when
-/// the model matches no spec.
+/// its placeholder/prompt logic: where media goes relative to text when the
+/// template takes one string per message (a template that takes parts places
+/// them itself, in the request's order). Falls back to the engine's media-first
+/// placement when the model matches no spec.
 pub(crate) async fn resolve_media_part_order(
     model_id: &str,
     tokenizer: &dyn TokenizerTrait,

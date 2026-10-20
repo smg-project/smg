@@ -524,10 +524,15 @@ fn process_content_format_with_order(
 /// public preprocessing bindings do not have model metadata, so their legacy
 /// `None` path continues to omit media parts.
 ///
-/// Media parts are emitted before text by default, matching vLLM's
-/// `interleave_mm_strings=false` behavior and preserving existing VQA behavior.
-/// TML/Inkling opts into authored order because part order is protocol-visible
-/// in its canonical renderer.
+/// Where a message's media goes relative to its text is the template's
+/// business when the template takes parts (`OpenAI` format): it walks them
+/// and writes each anchor where its part sits, so the parts reach it in the
+/// request's order, as the engine's own server hands them to such a
+/// template. A template that takes one string per message cannot place them
+/// itself; there the media is written before the text by default (the
+/// engine's own server's placement for such a template) and a renderer
+/// whose string form is positional opts into the request's order
+/// (`MediaPartOrder::Authored`).
 fn transform_content_field(
     content_value: &mut Value,
     content_format: ChatTemplateContentFormat,
@@ -540,9 +545,9 @@ fn transform_content_field(
 
     match content_format {
         ChatTemplateContentFormat::String => {
-            // Replace media parts with placeholders. The default branch builds
-            // separate media/text buckets for vLLM-compatible front placement;
-            // the TML branch appends each rendered part as it is encountered.
+            // Replace media parts with placeholders. The default order builds
+            // separate media/text buckets for the front placement; the
+            // authored order appends each rendered part as it is encountered.
             let mut media_parts: Vec<String> = Vec::new();
             let mut text_parts: Vec<String> = Vec::new();
             let mut authored_parts: Vec<String> = Vec::new();
@@ -593,7 +598,11 @@ fn transform_content_field(
             }
         }
         ChatTemplateContentFormat::OpenAI => {
-            // Replace media URLs with simple type placeholders
+            // Replace media URLs with simple type placeholders. The parts keep
+            // the request's order whatever `media_order` says: the template
+            // walks them and writes each anchor where its part sits (a text
+            // part before an image renders before it), which is how the
+            // engine's own server hands them to such a template.
             let processed_parts: Vec<Value> = content_array
                 .iter()
                 .map(|part| {
@@ -609,25 +618,7 @@ fn transform_content_field(
                 })
                 .collect();
 
-            // The default branch places media before the remaining parts,
-            // matching vLLM front placement. `partition` is stable, so relative
-            // order within media and within text is kept. TML skips partitioning.
-            let ordered_parts = match media_order {
-                MediaPartOrder::Authored => processed_parts,
-                MediaPartOrder::MediaFirst => {
-                    let (mut media, rest): (Vec<Value>, Vec<Value>) =
-                        processed_parts.into_iter().partition(|p| {
-                            matches!(
-                                p.get("type").and_then(|t| t.as_str()),
-                                Some("image") | Some("video") | Some("audio")
-                            )
-                        });
-                    media.extend(rest);
-                    media
-                }
-            };
-
-            *content_value = Value::Array(ordered_parts);
+            *content_value = Value::Array(processed_parts);
         }
     }
 
@@ -1387,9 +1378,9 @@ mod tests {
         assert_eq!(
             openai[0]["content"],
             json!([
+                {"type": "text", "text": "Describe and transcribe"},
                 {"type": "image"},
-                {"type": "audio"},
-                {"type": "text", "text": "Describe and transcribe"}
+                {"type": "audio"}
             ])
         );
     }
@@ -1424,8 +1415,8 @@ mod tests {
         assert_eq!(
             openai[0]["content"],
             json!([
-                {"type": "audio"},
-                {"type": "text", "text": "Transcribe this"}
+                {"type": "text", "text": "Transcribe this"},
+                {"type": "audio"}
             ])
         );
     }
@@ -1475,18 +1466,13 @@ mod tests {
         assert_eq!(result.len(), 1);
         let transformed_message = &result[0];
 
-        // Media URLs replaced with simple type placeholders, and the image is
-        // hoisted before the text (vLLM front placement; image-after-question
-        // degrades VQA accuracy).
+        // Media URLs replaced with simple type placeholders; the parts stay
+        // where the request put them (the template writes the anchor there).
         let content_array = transformed_message["content"].as_array().unwrap();
         assert_eq!(content_array.len(), 2);
-
-        // Image part comes first now.
-        assert_eq!(content_array[0], json!({"type": "image"}));
-
-        // Text part follows, unchanged.
-        assert_eq!(content_array[1]["type"], "text");
-        assert_eq!(content_array[1]["text"], "Describe this image:");
+        assert_eq!(content_array[0]["type"], "text");
+        assert_eq!(content_array[0]["text"], "Describe this image:");
+        assert_eq!(content_array[1], json!({"type": "image"}));
     }
 
     #[test]
@@ -1628,14 +1614,16 @@ mod tests {
 
         let content_array = result_openai[1]["content"].as_array().unwrap();
         assert_eq!(content_array.len(), 2);
-        // Image hoisted before text.
-        assert_eq!(content_array[0], json!({"type": "image"}));
-        assert_eq!(content_array[1]["type"], "text");
+        // The request's order: the text, then the image.
+        assert_eq!(content_array[0]["type"], "text");
+        assert_eq!(content_array[1], json!({"type": "image"}));
     }
 
     #[test]
-    fn test_media_hoisted_before_text_openai() {
-        // Real MMBench shape: [question text, image] must render image-first.
+    fn parts_reach_a_parts_template_in_the_requests_order_whatever_the_media_order() {
+        // A template that takes parts places them itself: a text part before
+        // the image stays before it, under the media-first default too (the
+        // engine's own server hands such a template the parts as given).
         let messages = vec![ChatMessage::User {
             ext: Default::default(),
             content: MessageContent::Parts(vec![
@@ -1656,8 +1644,8 @@ mod tests {
         let result =
             process_content_format(&messages, ChatTemplateContentFormat::OpenAI, None).unwrap();
         let arr = result[0]["content"].as_array().unwrap();
-        assert_eq!(arr[0], json!({"type": "image"}));
-        assert_eq!(arr[1]["type"], "text");
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[1], json!({"type": "image"}));
     }
 
     #[test]
@@ -1692,7 +1680,9 @@ mod tests {
 
     #[test]
     fn test_media_first_stable_and_multi() {
-        // Multiple media + text keep relative order within each group, media first.
+        // String template: every media part first, each group in its own
+        // order, joined by newlines as the engine's own server joins them;
+        // parts template: the request's order, text and media interleaved.
         let messages = vec![ChatMessage::User {
             ext: Default::default(),
             content: MessageContent::Parts(vec![
@@ -1720,13 +1710,112 @@ mod tests {
             name: None,
         }];
 
+        let tokens = placeholders(&[(Modality::Image, "<image>")]);
+        let result =
+            process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
+                .unwrap();
+        assert_eq!(result[0]["content"], "<image>\n<image>\na\nb");
+
         let result =
             process_content_format(&messages, ChatTemplateContentFormat::OpenAI, None).unwrap();
-        let arr = result[0]["content"].as_array().unwrap();
-        assert_eq!(arr[0], json!({"type": "image"}));
-        assert_eq!(arr[1], json!({"type": "image"}));
-        assert_eq!(arr[2]["text"], "a");
-        assert_eq!(arr[3]["text"], "b");
+        assert_eq!(
+            result[0]["content"],
+            json!([
+                {"type": "text", "text": "a"},
+                {"type": "image"},
+                {"type": "text", "text": "b"},
+                {"type": "image"}
+            ])
+        );
+    }
+
+    /// A chat template that walks a message's parts (the shape of the
+    /// vision families' templates: one anchor written where each image part
+    /// sits, the text where it sits).
+    const PARTS_TEMPLATE: &str = r"
+{%- for m in messages -%}
+<|turn|>{{ m.role }}<|body|>
+{%- if m.content is string -%}{{ m.content }}
+{%- else -%}{%- for part in m.content -%}
+{%- if part.type == 'image' -%}<|image|>{%- elif part.type == 'text' -%}{{ part.text }}{%- endif -%}
+{%- endfor -%}{%- endif -%}<|end|>
+{%- endfor -%}
+{%- if add_generation_prompt -%}<|turn|>assistant<|body|>{%- endif -%}";
+
+    /// A user message of `parts` (`"<img>"` for an image, any other string
+    /// for a text part) rendered through `PARTS_TEMPLATE` under the
+    /// media-first default, as the pipeline renders a chat request.
+    fn render_parts(parts: &[&str]) -> String {
+        let content: Vec<Value> = parts
+            .iter()
+            .map(|part| match *part {
+                "<img>" => {
+                    json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}})
+                }
+                text => json!({"type": "text", "text": text}),
+            })
+            .collect();
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": content}]
+        }))
+        .unwrap();
+        let mut tokenizer =
+            llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
+                .unwrap();
+        tokenizer
+            .set_chat_template(PARTS_TEMPLATE.to_string())
+            .unwrap();
+        assert_eq!(
+            tokenizer.chat_template_content_format(),
+            ChatTemplateContentFormat::OpenAI
+        );
+        process_chat_messages_with_placeholders(
+            &request,
+            &tokenizer,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap()
+        .0
+        .text
+    }
+
+    /// The rendered prompt follows the request's content-part order on a
+    /// template that walks the parts: text then image, image then text,
+    /// images interleaved with text, images then text, and text alone; each
+    /// equal, byte for byte, to what the template itself renders for the
+    /// parts in that order.
+    #[test]
+    fn a_parts_template_renders_the_parts_where_the_request_put_them() {
+        let turn =
+            |body: &str| format!("<|turn|>user<|body|>{body}<|end|><|turn|>assistant<|body|>");
+        assert_eq!(
+            render_parts(&["What is in this picture?", "<img>"]),
+            turn("What is in this picture?<|image|>")
+        );
+        assert_eq!(
+            render_parts(&["<img>", "What is in this picture?"]),
+            turn("<|image|>What is in this picture?")
+        );
+        assert_eq!(
+            render_parts(&[
+                "Figure 1: ",
+                "<img>",
+                " Figure 2: ",
+                "<img>",
+                " Which figure shows a cat?"
+            ]),
+            turn("Figure 1: <|image|> Figure 2: <|image|> Which figure shows a cat?")
+        );
+        assert_eq!(
+            render_parts(&["<img>", "<img>", "Which picture is brighter?"]),
+            turn("<|image|><|image|>Which picture is brighter?")
+        );
+        assert_eq!(
+            render_parts(&["No picture here.", " Just text."]),
+            turn("No picture here. Just text.")
+        );
     }
 
     #[test]
