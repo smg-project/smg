@@ -780,6 +780,8 @@ class TestParseRouterArgs:
                 "250",
                 "--zmq-startup-timeout-secs",
                 "900",
+                "--balance-prefix-margin-tokens",
+                "4096",
             ]
         )
         assert router_args.worker_overload_shed is True
@@ -802,6 +804,7 @@ class TestParseRouterArgs:
         assert router_args.worker_warmup_divert_every == 4
         assert router_args.selection_policy == "cache-aware-default"
         assert router_args.selection_accounting_ttl_ms == 250
+        assert router_args.balance_prefix_margin_tokens == 4096
 
         defaults = parse_router_args([])
         assert defaults.worker_overload_shed is False
@@ -817,6 +820,7 @@ class TestParseRouterArgs:
         assert defaults.worker_warmup_divert_every == 8
         assert defaults.selection_policy == "cache-aware-default"
         assert defaults.selection_accounting_ttl_ms == 0
+        assert defaults.balance_prefix_margin_tokens == 0
 
     def test_parse_tenancy_flags(self):
         """The tenancy flags of the Rust CLI reach RouterArgs: tenant header

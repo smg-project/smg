@@ -57,8 +57,13 @@
     ------------------------
     cache_threshold:         Min prefix match ratio for highest-match routing (0.0-1.0)
     balance_abs_threshold:   Absolute margin of the spill gate (requests above the fleet mean); capped at
-                             the in-flight count's natural swing at the pool's mean, never under four
-                             unless the configured value itself is lower (0: the relative part alone)
+                             the larger of the in-flight count's natural swing at the pool's mean and
+                             the held prefix's price, never under four unless the configured value
+                             itself is lower (0: the relative part alone)
+    balance_prefix_margin_tokens: Price of a held prefix in the absolute margin: a holder's margin is at
+                             least its held tokens over this many tokens per request, up to the
+                             configured absolute threshold (0, the default: the held prefix does not
+                             count; decode picks are never priced)
     balance_rel_threshold:   Relative margin of the spill gate (multiple of the fleet mean)
     eviction_interval_secs:  Interval between LRU eviction / TTL sweep cycles
     max_tree_size:           Max total size (chars/tokens) of each model's approximate tree,
@@ -95,9 +100,10 @@ use super::{
         self, CandidateInputs, OptimisticAccounting, Pick, RequestInputs, WorkerSelectionPolicy,
     },
     normalize_model_key,
+    prefix_hash::CHARS_PER_TOKEN,
     utils::PeriodicTask,
     CacheAwareConfig, CacheNamespace, LeastLoadPolicy, LoadBalancingPolicy, SelectWorkerInfo,
-    TEXT_MARKER_LEN,
+    WorkerRole, TEXT_MARKER_LEN,
 };
 use crate::{
     config::CacheIndexKind,
@@ -150,6 +156,26 @@ const POOL_TABLES_KEPT: usize = 8;
 /// configured value lowers the margin below it (see
 /// [`CacheAwarePolicy::absolute_margin`]).
 const MIN_ABSOLUTE_MARGIN: f64 = 4.0;
+
+/// What a decision's prefix lengths count: the token tree and the event
+/// index count tokens, the string tree characters. The spill gate prices a
+/// held prefix in tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefixUnit {
+    Tokens,
+    Chars,
+}
+
+impl PrefixUnit {
+    /// `units` of this kind in tokens: characters at [`CHARS_PER_TOKEN`] a
+    /// token, as the prefix-hash policy hashes untokenized text.
+    fn tokens(self, units: f64) -> f64 {
+        match self {
+            Self::Tokens => units,
+            Self::Chars => units / CHARS_PER_TOKEN as f64,
+        }
+    }
+}
 
 /// Cache-aware routing policy
 ///
@@ -1469,7 +1495,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
     }
 
     /// The count-pressure gate moves a request off a holder loaded well past
-    /// the pool's mean (`candidate_requires_spill`), so the holder of a
+    /// the pool's mean (`candidate_requires_spill`; with a prefix price set,
+    /// the deeper the prefix it holds, the further past), so the holder of a
     /// request's prefix keeps it until then.
     fn balances_load_against_affinity(&self) -> bool {
         true
@@ -1855,61 +1882,91 @@ impl CacheAwarePolicy {
     /// The count-pressure gate's comparison alone, with no trace record: a
     /// worker holding more than `balance_rel_threshold` times the mean load
     /// AND the absolute margin ([`Self::absolute_margin`]) above it is over
-    /// the gate. The affinity path records its decision through
-    /// [`Self::candidate_requires_spill`]; the warm-up slice checks its
-    /// candidates here, so a thin-overlap miss writes no gate entries for
-    /// workers it did not pick.
-    fn over_count_pressure_gate(&self, load: f64, avg_load: f64) -> bool {
+    /// the gate. `held_tokens` is the request's prefix the worker already
+    /// holds (0 for a worker that is not a holder). The affinity path
+    /// records its decision through [`Self::candidate_requires_spill`]; the
+    /// warm-up slice checks its candidates here, so a thin-overlap miss
+    /// writes no gate entries for workers it did not pick.
+    fn over_count_pressure_gate(&self, load: f64, avg_load: f64, held_tokens: f64) -> bool {
         load > avg_load * f64::from(self.config.balance_rel_threshold)
-            && load > avg_load + self.absolute_margin(avg_load)
+            && load > avg_load + self.absolute_margin(avg_load, held_tokens)
     }
 
-    /// The gate's absolute margin at `avg_load`: `balance_abs_threshold`
-    /// requests above the mean, capped at the in-flight count's natural
-    /// swing at this mean (two standard deviations of a Poisson count,
-    /// `2 * sqrt(avg_load)`, rounded up to whole requests) and never under
-    /// [`MIN_ABSOLUTE_MARGIN`] unless the configured value is lower still
-    /// (0 leaves the relative margin to decide alone). A fixed absolute margin sized for a large
-    /// pool cannot clear in a pool whose per-worker in-flight count stays
-    /// below it (two workers at 32 in flight: the busier one would need 80
-    /// at a margin of 64), so cache affinity there was never balanced at
-    /// all, whatever the skew. Sized to the swing, the margin still tells
-    /// steady-state variance from pressure at every mean: a worker two
-    /// standard deviations above the fleet is not noise (a mean of 16: eight
-    /// requests; a mean of 4: four), the configured value caps it, and the
-    /// floor keeps a handful of requests on an otherwise idle fleet from
-    /// counting as pressure. The margin is not tied to the relative one, so
-    /// a tight relative threshold (1.1) does not turn one idle worker in a
-    /// loaded fleet into a spill of every busy holder.
-    fn absolute_margin(&self, avg_load: f64) -> f64 {
+    /// The gate's absolute margin at `avg_load` for a worker holding
+    /// `held_tokens` of the request's prefix: `balance_abs_threshold`
+    /// requests above the mean, capped at the larger of the in-flight
+    /// count's natural swing at this mean (two standard deviations of a
+    /// Poisson count, `2 * sqrt(avg_load)`, rounded up to whole requests)
+    /// and the held prefix's price ([`Self::held_prefix_margin`]), and never
+    /// under [`MIN_ABSOLUTE_MARGIN`] unless the configured value is lower
+    /// still (0 leaves the relative margin to decide alone). A fixed
+    /// absolute margin sized for a large pool cannot clear in a pool whose
+    /// per-worker in-flight count stays below it (two workers at 32 in
+    /// flight: the busier one would need 80 at a margin of 64), so cache
+    /// affinity there was never balanced at all, whatever the skew. Sized to
+    /// the swing, the margin still tells steady-state variance from pressure
+    /// at every mean: a worker two standard deviations above the fleet is
+    /// not noise (a mean of 16: eight requests; a mean of 4: four), the
+    /// configured value caps it, and the floor keeps a handful of requests
+    /// on an otherwise idle fleet from counting as pressure. A spill gives
+    /// the held prefix up, and the spill target prefills it again (a long
+    /// conversation's follow-up holds nearly all of its context): with a
+    /// price set, the holder keeps the request until its excess load is
+    /// worth that recompute, so a deep prefix stays put up to the configured
+    /// margin and a shallow one balances as the swing allows. The price
+    /// counts the holder's whole match, even when the spill target holds
+    /// part of it. The margin is not tied
+    /// to the relative one, so a tight relative threshold (1.1) does not
+    /// turn one idle worker in a loaded fleet into a spill of every busy
+    /// holder.
+    fn absolute_margin(&self, avg_load: f64, held_tokens: f64) -> f64 {
         let configured = self.config.balance_abs_threshold as f64;
         let swing = (2.0 * avg_load.sqrt()).ceil();
-        configured.min(swing.max(MIN_ABSOLUTE_MARGIN))
+        configured.min(
+            swing
+                .max(MIN_ABSOLUTE_MARGIN)
+                .max(self.held_prefix_margin(held_tokens)),
+        )
+    }
+
+    /// A held prefix in requests' worth of prefill: `held_tokens` over
+    /// `balance_prefix_margin_tokens`, rounded up. 0 when the price is 0 (the
+    /// default), which leaves the margin to the swing alone.
+    fn held_prefix_margin(&self, held_tokens: f64) -> f64 {
+        let price = self.config.balance_prefix_margin_tokens;
+        if price == 0 || held_tokens <= 0.0 {
+            return 0.0;
+        }
+        (held_tokens / f64::from(price)).ceil()
     }
 
     /// Per-request count-pressure predicate: over
     /// `balance_rel_threshold` times the healthy-fleet mean load AND the
-    /// absolute margin above it, the request spills to the expected-wait
-    /// worker instead. Affinity paths insert for the spill target, so a
-    /// prefix whose home saturates gains an additional tenant — hot prefixes
-    /// replicate instead of queueing behind one engine. Both margins must
-    /// clear so the gate neither fires on steady-state variance (relative
-    /// alone would, at low means) nor stays blind to a deep queue (absolute
-    /// alone would, at high means).
+    /// absolute margin above it (which weighs the `held_tokens` of the
+    /// request's prefix the worker holds), the request spills to the
+    /// expected-wait worker instead. Affinity paths insert for the spill
+    /// target, so a prefix whose home saturates gains an additional tenant —
+    /// hot prefixes replicate instead of queueing behind one engine. Both
+    /// margins must clear so the gate neither fires on steady-state variance
+    /// (relative alone would, at low means) nor stays blind to a deep queue
+    /// (absolute alone would, at high means).
     fn candidate_requires_spill(
         &self,
         workers: &[Arc<dyn Worker>],
         selected: usize,
         avg_load: f64,
+        held_tokens: f64,
     ) -> bool {
         let load = workers[selected].load() as f64;
-        let spill = self.over_count_pressure_gate(load, avg_load);
+        let spill = self.over_count_pressure_gate(load, avg_load, held_tokens);
         if cache_trace::enabled() {
             cache_trace::gate(serde_json::json!({
                 "worker": workers[selected].url(), "load": load, "average_load": avg_load,
                 "relative_threshold": self.config.balance_rel_threshold,
                 "absolute_threshold": self.config.balance_abs_threshold,
-                "absolute_margin": self.absolute_margin(avg_load), "spill": spill,
+                "held_tokens": held_tokens,
+                "prefix_margin_tokens": self.config.balance_prefix_margin_tokens,
+                "absolute_margin": self.absolute_margin(avg_load, held_tokens), "spill": spill,
             }));
         }
         spill
@@ -1971,7 +2028,7 @@ impl CacheAwarePolicy {
             ) {
                 continue;
             }
-            if self.over_count_pressure_gate(workers[idx].load() as f64, avg_load) {
+            if self.over_count_pressure_gate(workers[idx].load() as f64, avg_load, 0.0) {
                 continue;
             }
             match pick {
@@ -2117,25 +2174,43 @@ impl CacheAwarePolicy {
         self.select_expected_wait(workers, &[idx], info)
     }
 
-    /// Resolve an affinity score group to one final worker. Safe affinity
-    /// candidates retain priority; only when every tied holder trips the
-    /// pressure gate do we scan the healthy fleet for non-gated spill targets.
-    /// The expected-wait selector both chooses and credits the result under one
-    /// lock, so no provisional holder is ever accounted.
+    /// Resolve an affinity score group to one final worker. Each affinity
+    /// candidate comes with the tokens of the request's prefix it holds,
+    /// which its pressure gate weighs, except on a decode pick: a decode
+    /// worker prefills nothing again, so it keeps the swing's margin. Safe
+    /// affinity candidates retain
+    /// priority; only when every tied holder trips the pressure gate do we
+    /// scan the healthy fleet for non-gated spill targets. The expected-wait
+    /// selector both chooses and credits the result under one lock, so no
+    /// provisional holder is ever accounted.
     fn select_final_from_affinity(
         &self,
         workers: &[Arc<dyn Worker>],
-        affinity_candidates: &[usize],
+        affinity_candidates: &[(usize, f64)],
         healthy_indices: &[usize],
         avg_load: f64,
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
+        let priced =
+            self.config.balance_prefix_margin_tokens > 0 && info.role != WorkerRole::Decode;
         let safe_affinity: Vec<usize> = affinity_candidates
             .iter()
-            .copied()
-            .filter(|&idx| !self.candidate_requires_spill(workers, idx, avg_load))
+            .filter(|&&(idx, held_tokens)| {
+                let held_tokens = if priced { held_tokens } else { 0.0 };
+                !self.candidate_requires_spill(workers, idx, avg_load, held_tokens)
+            })
+            .map(|&(idx, _)| idx)
             .collect();
         if !safe_affinity.is_empty() {
+            // Kept only by the held prefix: the swing-sized margin alone
+            // would have spilled every safe holder.
+            if priced
+                && safe_affinity.iter().all(|&idx| {
+                    self.over_count_pressure_gate(workers[idx].load() as f64, avg_load, 0.0)
+                })
+            {
+                Metrics::record_cache_aware_prefix_margin_held();
+            }
             return self.select_expected_wait(workers, &safe_affinity, info);
         }
 
@@ -2146,10 +2221,11 @@ impl CacheAwarePolicy {
         if affinity_candidates.is_empty() {
             return self.select_expected_wait(workers, healthy_indices, info);
         }
+        // A spill target gives no prefix up: its gate is the swing's.
         let spill_candidates: Vec<usize> = healthy_indices
             .iter()
             .copied()
-            .filter(|&idx| !self.candidate_requires_spill(workers, idx, avg_load))
+            .filter(|&idx| !self.candidate_requires_spill(workers, idx, avg_load, 0.0))
             .collect();
         let candidates = if spill_candidates.is_empty() {
             healthy_indices
@@ -2175,12 +2251,17 @@ impl CacheAwarePolicy {
     ///   selector; the policy owns the load trade-off, so the count-pressure
     ///   gate does not apply. If the waiting-queue veto drops it, the fleet
     ///   fallback runs.
+    ///
+    /// `unit` is what the request's lengths count (tokens, or the string
+    /// tree's characters); the gate prices each holder's prefix in tokens.
+    #[expect(clippy::too_many_arguments, reason = "hot-path plumbing, not state")]
     fn resolve_selection(
         &self,
         workers: &[Arc<dyn Worker>],
         healthy_indices: &[usize],
         candidates: &[OverlapCandidate],
         request: &RequestInputs<'_>,
+        unit: PrefixUnit,
         avg_load: f64,
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
@@ -2271,7 +2352,16 @@ impl CacheAwarePolicy {
                 self.select_final_from_affinity(workers, &[], healthy_indices, avg_load, info)
             }
             Pick::Group(rows) => {
-                let group: Vec<usize> = rows.iter().map(|&row| inputs[row].idx).collect();
+                // Each holder with the prefix it holds, in tokens.
+                let group: Vec<(usize, f64)> = rows
+                    .iter()
+                    .map(|&row| {
+                        let candidate = &inputs[row];
+                        let held_units =
+                            candidate.device_blocks.max(0.0) * request.block_size as f64;
+                        (candidate.idx, unit.tokens(held_units))
+                    })
+                    .collect();
                 self.select_final_from_affinity(workers, &group, healthy_indices, avg_load, info)
             }
             Pick::Final(row) => {
@@ -2337,6 +2427,7 @@ impl CacheAwarePolicy {
     /// Every matched tenant serves the same prefix, so raw overlap cannot
     /// discriminate; waiting-prefill decay can split affinity score bands,
     /// then LeastLoad resolves only the selected equal-score group.
+    #[expect(clippy::too_many_arguments, reason = "hot-path plumbing, not state")]
     fn select_matched_candidate(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -2344,6 +2435,7 @@ impl CacheAwarePolicy {
         matched_tenants: &[TenantId],
         matched_units: usize,
         request: &RequestInputs<'_>,
+        unit: PrefixUnit,
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
         let avg_load = request.avg_load;
@@ -2395,6 +2487,7 @@ impl CacheAwarePolicy {
             healthy_indices,
             &candidates,
             request,
+            unit,
             avg_load,
             info,
         )
@@ -2519,6 +2612,7 @@ impl CacheAwarePolicy {
             healthy_indices,
             &candidates,
             &request,
+            PrefixUnit::Tokens,
             avg_load,
             info,
         )?;
@@ -3001,9 +3095,14 @@ impl CacheAwarePolicy {
             if holder_candidates.is_empty() {
                 continue;
             }
+            // A holder of this boundary holds `boundary` tokens of the prompt.
+            let holders: Vec<(usize, f64)> = holder_candidates
+                .iter()
+                .map(|&idx| (idx, boundary as f64))
+                .collect();
             let selected = self.select_final_from_affinity(
                 workers,
-                &holder_candidates,
+                &holders,
                 healthy_indices,
                 avg_load,
                 info,
@@ -3218,10 +3317,19 @@ impl CacheAwarePolicy {
                     &result.matched_tenants,
                     matched,
                     &request,
+                    PrefixUnit::Tokens,
                     info,
                 )
             } else {
-                self.resolve_selection(workers, healthy_indices, &[], &request, avg_load, info)
+                self.resolve_selection(
+                    workers,
+                    healthy_indices,
+                    &[],
+                    &request,
+                    PrefixUnit::Tokens,
+                    avg_load,
+                    info,
+                )
             };
             selected_idx.map(|idx| workers[idx].url())
         });
@@ -3290,10 +3398,19 @@ impl CacheAwarePolicy {
                     &result.matched_tenants,
                     matched,
                     &request,
+                    PrefixUnit::Chars,
                     info,
                 )
             } else {
-                self.resolve_selection(workers, healthy_indices, &[], &request, avg_load, info)
+                self.resolve_selection(
+                    workers,
+                    healthy_indices,
+                    &[],
+                    &request,
+                    PrefixUnit::Chars,
+                    avg_load,
+                    info,
+                )
             };
             selected_idx.map(|idx| workers[idx].url())
         });

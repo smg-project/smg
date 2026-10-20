@@ -825,6 +825,11 @@ pub(crate) fn init_metrics() {
          first_healthy_fallback)"
     );
     describe_counter!(
+        "smg_cache_aware_prefix_margin_held_total",
+        "Cache-aware affinity picks the spill gate's swing-sized margin alone would have spilled, \
+         kept on their holder by the price of the prefix it holds (--balance-prefix-margin-tokens)"
+    );
+    describe_counter!(
         "smg_policy_inflight_reconciled_total",
         "Policy bookings released at the per-poll in-flight reconciliation because their \
          completion never arrived, by policy"
@@ -2187,6 +2192,13 @@ impl Metrics {
             "branch" => branch
         )
         .increment(1);
+    }
+
+    /// Record a cache-aware affinity pick that the spill gate's swing-sized
+    /// margin alone would have spilled, kept on its holder by the held
+    /// prefix's price
+    pub fn record_cache_aware_prefix_margin_held() {
+        counter!("smg_cache_aware_prefix_margin_held_total").increment(1);
     }
 
     /// Record bookings a policy released at the in-flight reconciliation

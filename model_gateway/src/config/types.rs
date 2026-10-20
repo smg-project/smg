@@ -1186,11 +1186,11 @@ pub enum PolicyConfig {
         cache_threshold: f32,
         /// Spill gate, absolute part: the selected worker spills to
         /// least-loaded when its load exceeds the healthy-fleet mean by this
-        /// many requests AND by `balance_rel_threshold`; capped at the
-        /// in-flight count's natural swing at the pool's current mean (two
-        /// standard deviations, never under four requests unless this value
-        /// is lower), so a small pool
-        /// can spill at all.
+        /// many requests AND by `balance_rel_threshold`; capped at the larger
+        /// of the in-flight count's natural swing at the pool's current mean
+        /// (two standard deviations, never under four requests unless this
+        /// value is lower) and the held prefix's price
+        /// (`balance_prefix_margin_tokens`), so a small pool can spill at all.
         #[serde(alias = "spill_abs_threshold")]
         balance_abs_threshold: usize,
         /// Spill gate, relative part (multiple of the healthy-fleet mean;
@@ -1198,6 +1198,16 @@ pub enum PolicyConfig {
         /// `balance_abs_threshold`.
         #[serde(alias = "spill_rel_threshold")]
         balance_rel_threshold: f32,
+        /// Spill gate, price of a held prefix (tokens per request; `0`, the
+        /// default, leaves held prefixes unpriced): a holder's absolute
+        /// margin is at least the tokens of the request's prefix it holds
+        /// over this price, rounded up, up to `balance_abs_threshold`, so a
+        /// deep prefix is not given up, and prefilled again elsewhere, to
+        /// balance a small skew. Suits prefill pools serving long multi-turn
+        /// sessions (e.g. 1024, the mean prefill LeastLoad prices a queued
+        /// request at); decode picks are never priced.
+        #[serde(default)]
+        balance_prefix_margin_tokens: u32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
         #[serde(default = "default_block_size")]
@@ -2671,6 +2681,7 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_prefix_margin_tokens: 0,
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -2702,6 +2713,7 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_prefix_margin_tokens: 0,
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
@@ -2734,6 +2746,7 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_prefix_margin_tokens: 0,
         };
 
         match cache_aware {
@@ -2777,6 +2790,46 @@ mod tests {
                 assert_eq!(overlap_decay, 0.0);
                 assert_eq!(selection_temperature, 0.0);
             }
+            _ => panic!("Expected CacheAware"),
+        }
+    }
+
+    #[test]
+    fn test_cache_aware_prefix_margin_defaults_to_unpriced_and_round_trips() {
+        // Config files written before the key existed leave held prefixes
+        // unpriced, as before; a set value survives a round trip.
+        let json = r#"{
+            "type": "cache_aware",
+            "cache_threshold": 0.5,
+            "balance_abs_threshold": 32,
+            "balance_rel_threshold": 1.1,
+            "eviction_interval_secs": 60,
+            "max_tree_size": 1000
+        }"#;
+        match serde_json::from_str(json).unwrap() {
+            PolicyConfig::CacheAware {
+                balance_prefix_margin_tokens,
+                ..
+            } => assert_eq!(balance_prefix_margin_tokens, 0),
+            _ => panic!("Expected CacheAware"),
+        }
+
+        let json = r#"{
+            "type": "cache_aware",
+            "cache_threshold": 0.5,
+            "balance_abs_threshold": 32,
+            "balance_rel_threshold": 1.1,
+            "balance_prefix_margin_tokens": 1024,
+            "eviction_interval_secs": 60,
+            "max_tree_size": 1000
+        }"#;
+        let policy: PolicyConfig = serde_json::from_str(json).unwrap();
+        let serialized = serde_json::to_string(&policy).unwrap();
+        match serde_json::from_str(&serialized).unwrap() {
+            PolicyConfig::CacheAware {
+                balance_prefix_margin_tokens,
+                ..
+            } => assert_eq!(balance_prefix_margin_tokens, 1024),
             _ => panic!("Expected CacheAware"),
         }
     }
@@ -3454,6 +3507,7 @@ discovery:
                 cache_boundaries: Vec::new(),
                 selection_policy: None,
                 selection_accounting_ttl_ms: 0,
+                balance_prefix_margin_tokens: 0,
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_metric: Default::default(),
@@ -3494,6 +3548,7 @@ discovery:
                 cache_boundaries: Vec::new(),
                 selection_policy: None,
                 selection_accounting_ttl_ms: 0,
+                balance_prefix_margin_tokens: 0,
             }),
             decode_policy: None,
         };
@@ -3560,6 +3615,7 @@ discovery:
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_prefix_margin_tokens: 0,
         };
 
         match pd.get_prefill_policy(&main_policy) {

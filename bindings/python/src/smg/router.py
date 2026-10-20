@@ -300,15 +300,23 @@ class Router:
         balance_abs_threshold: Spill gate, absolute part: a matched worker is skipped
             for the least-loaded one when its load exceeds the healthy-fleet mean by
             this many requests AND by balance_rel_threshold; the margin is capped at
-            the in-flight count's natural swing at the pool's current mean (two
-            standard deviations, never under four requests unless this value is
-            lower), so a small pool can spill at all; with the bucket policy the
+            the larger of the in-flight count's natural swing at the pool's current
+            mean (two standard deviations, never under four requests unless this
+            value is lower) and the held prefix's price (balance_prefix_margin_tokens),
+            so a small pool can spill at all; with the bucket policy the
             pair keeps its own rule (balancing when (max_load - min_load) exceeds
             this value and max_load exceeds min_load times the relative
             threshold). Default: 64
         balance_rel_threshold: Spill gate, relative part: the multiple of the
             healthy-fleet mean a matched worker's load must exceed, together with
             the absolute part. Default: 1.5
+        balance_prefix_margin_tokens: Spill gate, price of a held prefix in tokens
+            per request: a matched worker's absolute margin is at least the tokens
+            of the request's prefix it holds over this value, rounded up, up to
+            balance_abs_threshold, so a priced deep prefix keeps its holder through
+            a skew that moves a shallow one (decode picks are never priced). Suits
+            prefill pools serving long multi-turn sessions, e.g. 1024. Default: 0
+            (unpriced)
         eviction_interval_secs: Interval in seconds between cache eviction operations
             in cache-aware routing. Default: 60
         overlap_decay: Cache-aware anti-hotspot decay: each candidate's overlap score

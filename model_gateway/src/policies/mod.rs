@@ -171,16 +171,28 @@ pub struct CacheAwareConfig {
     /// mean by this many requests AND by `balance_rel_threshold`. Requiring
     /// both keeps the gate quiet on steady-state variance at low means
     /// (absolute) without going blind to a deep queue at high means
-    /// (relative). The margin is capped at the in-flight count's natural
-    /// swing at the pool's current mean (two standard deviations, never
-    /// under four requests unless this value is lower), so a pool whose
-    /// per-worker in-flight count
-    /// stays below this value can still spill.
+    /// (relative). The margin is capped at the larger of the in-flight
+    /// count's natural swing at the pool's current mean (two standard
+    /// deviations, never under four requests unless this value is lower) and
+    /// the held prefix's price (`balance_prefix_margin_tokens`), so a pool
+    /// whose per-worker in-flight count stays below this value can still
+    /// spill.
     pub balance_abs_threshold: usize,
     /// Relative load margin (multiple of the healthy-fleet mean) for the
     /// per-request candidate gate; fires only together with
     /// `balance_abs_threshold`.
     pub balance_rel_threshold: f32,
+    /// Price of a held prefix in the candidate gate's absolute margin, in
+    /// tokens per request: a holder's margin is at least the tokens of the
+    /// request's prefix it holds over this, rounded up, up to
+    /// `balance_abs_threshold`. A spill gives the held prefix up and the
+    /// spill target prefills it again, so a deep prefix (a long
+    /// conversation's follow-up) keeps its holder through a skew that would
+    /// move a shallow one. `0` (the default) leaves the margin to the swing
+    /// alone. Suits prefill pools serving long multi-turn sessions (e.g.
+    /// 1024, the mean prefill LeastLoad prices a queued request at); decode
+    /// picks are never priced, as a decode worker prefills nothing again.
+    pub balance_prefix_margin_tokens: u32,
     pub eviction_interval_secs: u64,
     pub max_tree_size: usize,
     /// Backend KV cache block size (tokens per block) for event-driven routing.
@@ -242,6 +254,7 @@ impl Default for CacheAwareConfig {
             cache_threshold: 0.5,
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.1,
+            balance_prefix_margin_tokens: 0,
             eviction_interval_secs: 30,
             max_tree_size: 10000,
             block_size: 16,

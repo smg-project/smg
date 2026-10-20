@@ -1245,6 +1245,7 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_prefix_margin_tokens: 0,
         });
         let builder = AppContextBuilder::new()
             .with_client(&config, 5)
@@ -1290,6 +1291,7 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_prefix_margin_tokens: 0,
         }));
     }
 
@@ -1315,6 +1317,7 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_prefix_margin_tokens: 0,
         };
 
         let mut config = config_with_policy(PolicyConfig::Random);

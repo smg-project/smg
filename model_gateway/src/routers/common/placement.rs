@@ -1235,7 +1235,7 @@ mod tests {
     use crate::{
         config::types::{PdPairingMode, PolicyConfig},
         observability::logging::test_support::test_subscriber,
-        policies::{CacheAwarePolicy, ConsistentHashingPolicy, RoundRobinPolicy},
+        policies::{CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy, RoundRobinPolicy},
         worker::{runtime::StallReason, BasicWorkerBuilder, ModelCard, PdWire, WorkerType},
     };
 
@@ -2003,6 +2003,7 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_prefix_margin_tokens: 0,
         }
     }
 
@@ -2840,5 +2841,55 @@ mod tests {
         let pair = pair_from(&registry, &policies).expect("steered to the overloaded pair");
         assert_eq!(pair.prefill.url(), "grpc://p:1");
         assert_eq!(pair.decode.url(), "grpc://d:1");
+    }
+
+    /// A long conversation's next turn, its ~99,000-token context held by
+    /// its prefill worker, at 25 requests in flight there against 7 on the
+    /// other prefill worker, under the launcher's spill thresholds (64
+    /// requests and 1.5 times the mean): the cache-aware prefill policy
+    /// keeps the turn with its cache. Priced at 0, the swing-sized margin (8
+    /// at a mean of 16) moves it to the other prefill worker, which prefills
+    /// the whole context again.
+    #[test]
+    fn a_cache_aware_prefill_pool_keeps_a_long_session_at_a_small_skew() {
+        for (price, stays) in [(1_024, true), (0, false)] {
+            let registry = pd_registry(&[
+                ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+                ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+                ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ]);
+            let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            let config = CacheAwareConfig {
+                balance_abs_threshold: 64,
+                balance_rel_threshold: 1.5,
+                balance_prefix_margin_tokens: price,
+                eviction_interval_secs: 0,
+                ..Default::default()
+            };
+            policies.set_prefill_policy(Arc::new(CacheAwarePolicy::with_config(config.clone())));
+            policies.set_decode_policy(Arc::new(CacheAwarePolicy::with_config(config)));
+            let first_turn: Vec<u32> = (0..99_000).collect();
+            let next_turn: Vec<u32> = (0..100_000).collect();
+            let home = place_prompt(&registry, &policies, &first_turn).prefill;
+            let other_url = if home.url() == "grpc://p:1" {
+                "grpc://p:2"
+            } else {
+                "grpc://p:1"
+            };
+            let other = registry.get_by_url(other_url).expect("registered");
+            for _ in 0..25 {
+                home.increment_load();
+            }
+            for _ in 0..7 {
+                other.increment_load();
+            }
+            let pair = place_prompt(&registry, &policies, &next_turn);
+            assert_eq!(
+                pair.prefill.url() == home.url(),
+                stays,
+                "price {price}: the turn went to {}",
+                pair.prefill.url()
+            );
+        }
     }
 }
