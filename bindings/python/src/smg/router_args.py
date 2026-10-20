@@ -652,6 +652,9 @@ class RouterArgs:
     worker_wedge_secs: int = 3
     # DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped)
     zmq_engine_count: int | None = None
+    # Seconds any one stage of a ZMQ engine's startup handshake may stay silent;
+    # it alone covers the engine's init between its HELLO and its READY
+    zmq_startup_timeout_secs: int = 3600
 
     @staticmethod
     def add_cli_args(
@@ -2398,6 +2401,20 @@ class RouterArgs:
                 "DP engines per startup ZMQ worker: each ipc:// worker becomes a "
                 "grouped worker whose handshake awaits this many engines on one "
                 "socket set (vLLM and TokenSpeed; default: 1)"
+            ),
+        )
+        backend_group.add_argument(
+            f"--{prefix}zmq-startup-timeout-secs",
+            type=int,
+            default=RouterArgs.zmq_startup_timeout_secs,
+            help=(
+                "Seconds any one stage of a ZMQ engine's startup handshake (its HELLO, "
+                "its READY, its input registration) may stay silent before the router "
+                "gives the handshake up and binds again. The router did not launch the "
+                "engine and sees nothing from it beside the wire, so this alone must "
+                "cover the engine's whole init between its HELLO and its READY; an "
+                "engine says HELLO once and READY once, so a bound shorter than its "
+                "init strands it (default: 3600)"
             ),
         )
         backend_group.add_argument(

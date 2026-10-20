@@ -38,7 +38,7 @@ smg serve --backend sglang --model-path /path/to/model --port 8080 --dp-size 4
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--backend` | `sglang` | Backend to use: `sglang`, `vllm`, or `trtllm` |
-| `--connection-mode` | `grpc` | Connection mode: `grpc`, `http`, or `zmq`. trtllm only supports grpc; tokenspeed only zmq; `zmq` (a same-host direct engine connection) is available for vllm, tokenspeed, and sglang |
+| `--connection-mode` | `grpc` | Connection mode: `grpc`, `http`, or `zmq`. trtllm only supports grpc; tokenspeed only zmq; `zmq` (a same-host direct engine connection) is available for vllm, tokenspeed, and sglang. Over `zmq` the router waits for the engine's startup handshake, whose READY comes only once the engine has loaded its model: the router's `--zmq-startup-timeout-secs` (`--router-zmq-startup-timeout-secs` here; default 3600) bounds how long any one stage of it may stay silent, and must cover the engine's whole init |
 | `--host` | `127.0.0.1` | Host for the router |
 | `--port` | `8080` | Port for the router |
 | `--dp-size` | `1` | Data parallel size (number of worker replicas) |

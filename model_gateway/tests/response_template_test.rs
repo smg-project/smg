@@ -626,9 +626,9 @@ async fn always_constrains_the_calls_a_request_allows_under_auto() {
     assert_eq!(requested.last_constraint(), None);
 
     // On a registry table too. A JSON response_format is the request's own constraint, which
-    // the auto tag never displaces: the answer's constraint is sent instead, the JSON where the
-    // calls' block would be (its shape on this template, whose prompt leaves the thought open:
-    // `a_registry_tables_json_answer_follows_the_thought_the_prompt_leaves_open`).
+    // the auto tag never displaces: the answer's constraint is sent instead; on a worker that
+    // names no grammar start that is the engine's own schema, whatever the prompt
+    // (`a_registry_tables_json_answer_follows_the_thought_the_prompt_leaves_open`).
     let registry = serve(Setup {
         constrained_decoding: Some(ConstrainedDecoding::Always),
         tool_parser: Some("qwen"),
@@ -645,22 +645,23 @@ async fn always_constrains_the_calls_a_request_allows_under_auto() {
         json!({"tools": tools(), "response_format": {"type": "json_object"}}),
     )
     .await;
-    let (kind, tag) = registry.last_constraint().expect("the answer's constraint");
-    assert_eq!(kind, "structural_tag");
-    assert_eq!(block_of(&tag), "json_schema", "{tag}");
+    let (kind, schema) = registry.last_constraint().expect("the answer's constraint");
+    assert_eq!(kind, "json_schema");
+    let schema: Value = serde_json::from_str(&schema).expect("the schema as JSON");
+    assert_eq!(schema, json!({"type": "object"}));
 }
 
 /// A registry table's JSON `response_format` under `always` follows the prompt as the table and
 /// the engine read it (`regular::symphony::reasoning_open`), not the thinking switch alone. The
 /// Qwen 3.5 chat template's generation prompt ends in `<think>\n`, so the model writes its thought
-/// first and the answer after its close: the engine receives the table's answer tag, the
-/// thought's free text (closing itself) and then the JSON, where the bare schema from the first
-/// token would force the JSON inside the thought, which the table reads as reasoning, and the
-/// client would get no content. The engine's own schema constraint stays wherever the tag would
-/// be the schema alone: a request with thinking off, whose prompt closes the thought
-/// (`<think>\n\n</think>\n\n`), and an engine that starts the grammar after its reasoning parser
-/// has seen the close; one that runs it from the first token gets the closed thought, then the
-/// schema.
+/// first and the answer after its close. The engine's own schema constraint is sent wherever the
+/// tag would be the schema alone: an engine that does not say where it starts the grammar (free
+/// text before the schema would constrain nothing: the model may write a fence and prose around
+/// its JSON, with the end of the turn masked until a whole JSON follows), one that starts it
+/// after its reasoning parser has seen the close, and a request with thinking off, whose prompt
+/// closes the thought (`<think>\n\n</think>\n\n`); an engine that runs the grammar from the first
+/// token gets the closed thought, then the schema, so the JSON is not forced inside the thought,
+/// which the table reads as reasoning.
 #[tokio::test]
 async fn a_registry_tables_json_answer_follows_the_thought_the_prompt_leaves_open() {
     let answer = json!({"tools": tools(), "response_format": {"type": "json_object"}});
@@ -671,19 +672,18 @@ async fn a_registry_tables_json_answer_follows_the_thought_the_prompt_leaves_ope
         labels,
         ..Setup::default()
     };
-    // The template's default leaves the thought open: the thought's free text, then the JSON,
-    // for an engine that does not say where it starts the grammar.
+    // The template's default leaves the thought open: for an engine that does not say where it
+    // starts the grammar, the schema alone, the engine's own constraint.
     let prompt = rendered(&answer);
     assert!(prompt.ends_with(THINKING), "{prompt:?}");
     let gateway = serve(registry(Vec::new())).await;
     chat(&gateway, answer.clone()).await;
     let sent = gateway.last_constraint();
-    assert_eq!(shape_of(sent.clone()), "the free text then the block");
-    let (_, tag) = sent.expect("the answer's tag");
-    assert_eq!(block_of(&tag), "json_schema", "{tag}");
-    let tag: Value = serde_json::from_str(&tag).expect("the tag as JSON");
-    let block = &tag["format"]["elements"][1];
-    assert_eq!(block["json_schema"], json!({"type": "object"}), "{tag}");
+    assert_eq!(shape_of(sent.clone()), "not a tag");
+    let (kind, schema) = sent.expect("the schema constraint");
+    assert_eq!(kind, "json_schema");
+    let schema: Value = serde_json::from_str(&schema).expect("the schema as JSON");
+    assert_eq!(schema, json!({"type": "object"}));
     // Thinking off closes the thought in the prompt: the tag would be the schema alone, and the
     // engine's own constraint is sent, as before.
     let off = HashMap::from([("enable_thinking".to_string(), json!(false))]);

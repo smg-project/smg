@@ -9,19 +9,17 @@
 //! writes the thought or not. Everything the markers do not frame is the message's text. A kind
 //! said again inside a message's body is the kind, as the family's own parsers read it (the
 //! blocks are self-describing and may repeat in any order): `<|content_text|>` in the answer
-//! starts the answer's text over, `<|content_thinking|>` in the answer or in the thought opens a
-//! thought; neither is the body's text. `<|content_text|>` inside a thought has no row, although
-//! the family's parsers switch to the answer there as well: the tag derivation reads every row
-//! out of the thought as a close of it, and that row would end the thought the answer tag and a
-//! forced call's tag admit at the marker instead of at the message's close the model writes; no
-//! recorded output holds the shape, and under the tag the thought's text excludes the marker, so
-//! such a marker stays the thought's text (a follow-up, with a derivation that tells a kind
-//! switch from a close). An engine that holds a JSON answer's grammar back until
-//! its own reasoning parser has seen the model's `<|content_text|>` lets the model write both
-//! there ([`Format::answer_grammar`]: the tag admits the thought and the marker before the schema
-//! for an engine that starts at the first token, and cannot tell the two starts apart). Recorded
-//! as `inkling` (thinkingmachines/Inkling); Inkling-Small and Inkling-NVFP4 ship the same template
-//! byte for byte and read with it.
+//! starts the answer's text over and in the thought starts the answer, `<|content_thinking|>` in
+//! the answer or in the thought opens a thought; none is the body's text, and none closes the
+//! message, which `<|end_message|>` closes wherever its kind was said again: the tag derivation
+//! tells a kind said again from a close (`Format::is_kind_switch`), so the answer tag and a
+//! forced call's tag end the thought at the message's close the model writes, and the thought's
+//! text under them still writes no kind marker. An engine that holds a JSON answer's grammar back
+//! until its own reasoning parser has seen the model's `<|content_text|>` lets the model write
+//! both there ([`Format::answer_grammar`]: the tag admits the thought and the marker before the
+//! schema for an engine that starts at the first token, and cannot tell the two starts apart).
+//! Recorded as `inkling` (thinkingmachines/Inkling); Inkling-Small and Inkling-NVFP4 ship the
+//! same template byte for byte and read with it.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
@@ -48,12 +46,14 @@ pub fn inkling() -> Format {
         .transition("reasoning", "end_message", "ended")
         .transition("content", "end_message", "ended")
         .transition("ended", "message", "header")
-        // The kind said again inside a body: the answer's marker starts its text over, the
-        // thought's opens a thought from either body. Framing, as from the header. The answer's
-        // marker inside a thought has no row (the module doc says why).
+        // The kind said again inside a body: the answer's marker starts its text over or, in the
+        // thought, starts the answer; the thought's opens a thought from either body. Framing, as
+        // from the header; the message closes where it did (the tag derivation reads these rows
+        // as no close: `Format::is_kind_switch`).
         .transition("content", "text", "content")
         .transition("content", "thinking", "reasoning")
         .transition("reasoning", "thinking", "reasoning")
+        .transition("reasoning", "text", "content")
         .calls(CallSyntax::NamedJson(INVOKE_JSON))
         .opens_turn("<|message_model|>")
 }
@@ -517,6 +517,15 @@ mod answer_tests {
         ]
     }
 
+    /// `output` in two pieces, cut at every character boundary.
+    fn cuts(output: &str) -> Vec<Vec<String>> {
+        output
+            .char_indices()
+            .skip(1)
+            .map(|(at, _)| vec![output[..at].to_string(), output[at..].to_string()])
+            .collect()
+    }
+
     fn run(format: Format, pieces: &[String]) -> Vec<Event<'static>> {
         let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
         drive(
@@ -644,8 +653,8 @@ mod answer_tests {
     fn a_kind_said_again_after_text_moves_the_body_as_the_familys_parsers_do() {
         // The kind markers move between the bodies wherever they stand, as the family's own
         // parsers read them: a thought opened inside the answer's text, a thought's opener
-        // inside a thought; neither is the body's text. The message's opener inside a body has
-        // no row and stays out of place, counted as before.
+        // inside a thought, the answer's marker inside a thought; none is the body's text. The
+        // message's opener inside a body has no row and stays out of place, counted as before.
         let output = "<|content_text|>Hi <|content_thinking|>more<|end_message|><|message_model|>\
                       <|content_text|>there<|end_message|>";
         for pieces in chunkings(output) {
@@ -665,6 +674,15 @@ mod answer_tests {
             assert_eq!(malformed(&events), []);
             assert_eq!(dropped_count(&events, "<|content_thinking|>"), 2);
         }
+        let output = "<|content_thinking|>plan<|content_text|>{\"a\":1}<|end_message|>";
+        for pieces in chunkings(output) {
+            let events = run(inkling(), &pieces);
+            assert_eq!(bytes(&events), output);
+            assert_eq!(reasoning(&events), "plan");
+            assert_eq!(content(&events), "{\"a\":1}");
+            assert_eq!(malformed(&events), []);
+            assert_eq!(dropped_count(&events, "<|content_text|>"), 1);
+        }
         let output = "<|content_text|>Hi <|message_model|>there<|end_message|>";
         for pieces in chunkings(output) {
             let events = run(inkling(), &pieces);
@@ -679,48 +697,100 @@ mod answer_tests {
     }
 
     #[test]
-    fn the_answers_marker_inside_a_thought_is_the_thoughts_text_for_now() {
-        // The family's parsers switch to the answer at `<|content_text|>` inside a thought as
-        // well; the table has no such row (the module doc: to the tag derivation a row out of
-        // the thought is a close of it, and that row would move the thought's end in the answer
-        // tag and in a forced call's tag to the marker), so the marker is the thought's text,
-        // counted as clean: the shape this pins until a derivation tells a kind switch from a
-        // close.
-        let output = "<|content_thinking|>plan<|content_text|>{\"a\":1}<|end_message|>";
-        for pieces in chunkings(output) {
-            let events = run(inkling(), &pieces);
-            assert_eq!(bytes(&events), output);
-            assert_eq!(reasoning(&events), "plan<|content_text|>{\"a\":1}");
-            assert_eq!(content(&events), "");
-            assert_eq!(malformed(&events), []);
-            assert_eq!(dropped_count(&events, "<|content_text|>"), 0);
+    fn the_answers_marker_inside_a_thought_starts_the_answer_as_the_familys_parsers_read_it() {
+        // The family's parsers switch to the answer at `<|content_text|>` wherever it stands, the
+        // thought included: the marker is framing, dropped, the text before it is the thought's,
+        // the text after it the answer's, the message closes where it did, and nothing is
+        // malformed; whole, one character at a time, and cut in two at every character, with the
+        // table and with its no-tools variant. Before the row, such an answer was the thought's
+        // text, with empty content and no malformed run.
+        for (thought, json) in [("plan", "{\"a\":1}"), (TRIAGE_THOUGHT, TRIAGE_JSON)] {
+            let output =
+                format!("<|content_thinking|>{thought}<|content_text|>{json}<|end_message|>");
+            for format in [inkling(), inkling().without_calls()] {
+                for pieces in chunkings(&output).into_iter().chain(cuts(&output)) {
+                    let events = run(format.clone(), &pieces);
+                    assert_eq!(bytes(&events), output, "{pieces:?}");
+                    assert_eq!(reasoning(&events), thought, "{pieces:?}");
+                    assert_eq!(content(&events), json, "{pieces:?}");
+                    assert_eq!(malformed(&events), [], "{pieces:?}: {events:?}");
+                    assert_eq!(dropped_count(&events, "<|content_text|>"), 1, "{pieces:?}");
+                    assert_eq!(dropped_count(&events, "<|content_thinking|>"), 1);
+                    assert_eq!(dropped_count(&events, "<|end_message|>"), 1);
+                    assert!(matches!(
+                        events.last(),
+                        Some(Event::Finish { tool_calls: 0, .. })
+                    ));
+                }
+            }
         }
     }
+
+    #[test]
+    fn the_kinds_may_repeat_in_any_order_inside_one_message() {
+        // Thought, answer, thought, answer, each kind said where it starts, in one message: the
+        // thoughts are one reasoning in two spans, the answers one content, every marker is
+        // framing, the message's close ends it, and nothing is malformed; whole and one
+        // character at a time, with the table and with its no-tools variant.
+        let output = "<|content_thinking|>one<|content_text|>two<|content_thinking|>three\
+                      <|content_text|>four<|end_message|>";
+        for format in [inkling(), inkling().without_calls()] {
+            for pieces in chunkings(output) {
+                let events = run(format.clone(), &pieces);
+                assert_eq!(bytes(&events), output);
+                assert_eq!(reasoning(&events), "onethree");
+                assert_eq!(content(&events), "twofour");
+                assert_eq!(malformed(&events), [], "{events:?}");
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, Event::ReasoningStart))
+                        .count(),
+                    2,
+                    "{events:?}"
+                );
+                assert_eq!(dropped_count(&events, "<|content_thinking|>"), 2);
+                assert_eq!(dropped_count(&events, "<|content_text|>"), 2);
+                assert!(matches!(
+                    events.last(),
+                    Some(Event::Finish { tool_calls: 0, .. })
+                ));
+            }
+        }
+    }
+
     #[test]
     fn without_the_thought_the_kind_markers_stay_dropped() {
         // The variant for a request that keeps the reasoning in the content shows the thought's
         // text as content and none of the four markers, with and without tools: the kind markers
         // frame the messages as much as a call, and their rows between the bodies change nothing
         // of that.
-        let output = recorded_with_a_second_thought(
+        let recorded = recorded_with_a_second_thought(
             FIRST_THOUGHT,
             SECOND_THOUGHT,
             true,
             SECOND_THOUGHT_JSON,
         );
-        for format in [
-            inkling().without_reasoning(),
-            inkling().without_calls().without_reasoning(),
+        let answer_in_the_thought =
+            "<|content_thinking|>plan<|content_text|>{\"a\":1}<|end_message|>";
+        for (output, text) in [
+            (
+                recorded.as_str(),
+                format!("{FIRST_THOUGHT}{SECOND_THOUGHT}{SECOND_THOUGHT_JSON}"),
+            ),
+            (answer_in_the_thought, "plan{\"a\":1}".to_string()),
         ] {
-            for pieces in chunkings(&output) {
-                let events = run(format.clone(), &pieces);
-                assert_eq!(bytes(&events), output);
-                assert_eq!(reasoning(&events), "");
-                assert_eq!(
-                    content(&events),
-                    format!("{FIRST_THOUGHT}{SECOND_THOUGHT}{SECOND_THOUGHT_JSON}")
-                );
-                assert_eq!(malformed(&events), [], "{events:?}");
+            for format in [
+                inkling().without_reasoning(),
+                inkling().without_calls().without_reasoning(),
+            ] {
+                for pieces in chunkings(output) {
+                    let events = run(format.clone(), &pieces);
+                    assert_eq!(bytes(&events), output);
+                    assert_eq!(reasoning(&events), "");
+                    assert_eq!(content(&events), text);
+                    assert_eq!(malformed(&events), [], "{events:?}");
+                }
             }
         }
     }

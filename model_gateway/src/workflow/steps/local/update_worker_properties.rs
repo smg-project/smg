@@ -289,6 +289,10 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 .overload_defaults(OverloadThresholds::from_gateway_config(
                     &app_context.router_config,
                 ))
+                // The ZMQ handshake bound is the router config's, set at registration;
+                // the rebuilt worker keeps the live value rather than the builder's
+                // default, so the bound an operator set stays in force across an update.
+                .zmq_startup_timeout(worker.metadata().zmq_startup_timeout)
                 .status(next_status);
             if let Some(config) = circuit_breaker_config {
                 builder = builder.circuit_breaker_config(config);
@@ -1720,6 +1724,7 @@ mod tests {
                 .runtime_type(RuntimeType::Vllm)
                 .zmq_handshake_address(handshake.clone())
                 .zmq_engine_group(2)
+                .zmq_startup_timeout(Duration::from_secs(7200))
                 .health_config(HealthCheckConfig::default())
                 .overload(OverloadUpdate {
                     waiting_requests: Some(8),
@@ -1758,6 +1763,13 @@ mod tests {
         assert_eq!(
             new.metadata().spec.labels.get("tier"),
             Some(&"gold".to_string())
+        );
+        // The handshake bound an operator set survives the rebuild: the live value,
+        // not the builder's default.
+        assert_eq!(
+            new.metadata().zmq_startup_timeout,
+            Duration::from_secs(7200),
+            "the ZMQ startup bound survives the update"
         );
         assert_eq!(
             new.metadata().spec.zmq_handshake_address.as_deref(),

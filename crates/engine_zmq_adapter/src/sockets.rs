@@ -2,15 +2,11 @@
 //! SMG binds, the `tcp://` handshake the engine dials, and the owner-only
 //! socket directory they live in.
 
-use std::{path::Path, time::Duration};
+use std::path::Path;
 
 /// Loopback host for the same-host ZMQ transport (TCP handshake and local
 /// binds). Shared with the worker-side socket derivation.
 pub(crate) const ZMQ_LOOPBACK_HOST: &str = "127.0.0.1";
-
-/// Time to wait for a ZMQ engine to complete the startup handshake. Generous:
-/// the engine loads the model and profiles KV cache between INIT and READY.
-pub(crate) const ZMQ_CONNECT_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Derive a deterministic TCP handshake port from the ipc data-plane path.
 ///

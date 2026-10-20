@@ -187,6 +187,17 @@ pub struct RouterConfig {
     #[serde(default)]
     pub worker_startup_delay_secs: u64,
     pub worker_startup_check_interval_secs: u64,
+    /// Seconds any one stage of a ZMQ engine's startup handshake (its HELLO,
+    /// its READY, its registration on the input socket) may stay silent
+    /// before the gateway gives the handshake up and binds again. The gateway
+    /// did not launch the engine and sees no sign of life from it beside the
+    /// wire, so this bound alone must cover the engine's init between its
+    /// HELLO and its READY: a large model's weights, KV-cache profiling and
+    /// graph capture take minutes to the better part of an hour. An engine
+    /// says HELLO once and READY once, so a bound shorter than its init
+    /// strands it; `worker_startup_timeout_secs` bounds registration, not this.
+    #[serde(default = "default_zmq_startup_timeout_secs")]
+    pub zmq_startup_timeout_secs: u64,
     /// Control-plane job queue: max pending jobs. Size to fleet scale so a
     /// discovery reconcile pass can enqueue every worker without blocking.
     #[serde(default = "default_job_queue_capacity")]
@@ -764,6 +775,14 @@ fn default_worker_overload_token_usage() -> Option<f64> {
 
 fn default_worker_stall_secs() -> u64 {
     2
+}
+
+/// The default per-stage silence bound of a ZMQ engine's startup handshake:
+/// an hour, since it alone covers the engine's init between HELLO and READY.
+pub const DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS: u64 = 3600;
+
+fn default_zmq_startup_timeout_secs() -> u64 {
+    DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS
 }
 
 fn default_worker_wedge_secs() -> u64 {
@@ -1804,6 +1823,7 @@ impl Default for RouterConfig {
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
             worker_startup_delay_secs: 0,
             worker_startup_check_interval_secs: 30,
+            zmq_startup_timeout_secs: default_zmq_startup_timeout_secs(),
             job_queue_capacity: default_job_queue_capacity(),
             job_queue_concurrency: default_job_queue_concurrency(),
             load_monitor_interval_secs: 10,
@@ -1999,6 +2019,7 @@ mod tests {
         assert_eq!(config.request_timeout_secs, 1800);
         assert_eq!(config.upstream_pool_idle_timeout_secs, 3);
         assert_eq!(config.worker_startup_timeout_secs, 1800);
+        assert_eq!(config.zmq_startup_timeout_secs, 3600);
         assert_eq!(config.worker_startup_check_interval_secs, 30);
         assert_eq!(config.load_monitor_interval_secs, 10);
         assert!(config.discovery.is_none());

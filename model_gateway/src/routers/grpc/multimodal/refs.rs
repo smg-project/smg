@@ -197,9 +197,9 @@ impl std::fmt::Display for MmRefsError {
                 f,
                 "model '{model}' has {workers} registered worker(s) and none processes media \
                  references (no worker advertises an mm_processor), so under --mm-processing \
-                 worker its multimodal requests cannot be served: start the workers with \
-                 worker-side media processing, or run the router with --mm-processing auto or \
-                 router"
+                 worker its requests that forward media references cannot be served: start the \
+                 workers with worker-side media processing, or run the router with \
+                 --mm-processing auto or router"
             ),
         }
     }
@@ -314,16 +314,16 @@ pub(crate) fn registration_lacks_media_processing<'a>(
     vision_worker_without_media_processing(worker) && !pool_has_encode_worker(pool)
 }
 
-/// The models among `workers` whose multimodal requests worker-side placement
-/// cannot serve: a model with a worker that reports a vision encoder and no
-/// worker that processes media references, judged over every registered
-/// worker (healthy or not: the capability is configuration). What `/readiness`
-/// names in its ready body, sorted for a stable line and body. Empty under any
-/// other placement: `auto` processes such a model's media on the router,
-/// `router` always does. A model with an encode worker is never named: on the
-/// encode-prefill-decode pipeline references are refused whatever its workers
-/// advertise ([`pool_has_encode_worker`]), so a capable worker would change
-/// nothing for it.
+/// The models among `workers` whose requests that forward media references
+/// worker-side placement cannot serve: a model with a worker that reports a
+/// vision encoder and no worker that processes media references, judged over
+/// every registered worker (healthy or not: the capability is configuration).
+/// What `/readiness` names in its ready body, sorted for a stable line and
+/// body. Empty under any other placement: `auto` processes such a model's media
+/// on the router, `router` always does. A model with an encode worker is never
+/// named: on the encode-prefill-decode pipeline references are refused whatever
+/// its workers advertise ([`pool_has_encode_worker`]), so a capable worker
+/// would change nothing for it.
 pub(crate) fn models_without_media_processing(
     processing: MmProcessingMode,
     workers: &[Arc<dyn Worker>],

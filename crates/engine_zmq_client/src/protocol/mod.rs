@@ -27,7 +27,7 @@ pub mod vllm;
 pub struct EngineLoad {
     /// Requests currently in model-execution batches.
     pub num_running: u64,
-    /// Requests waiting in the scheduler queue.
+    /// Total waiting requests, including deferred requests.
     pub num_waiting: u64,
     /// KV-cache usage ratio (`1.0` == 100%).
     pub kv_cache_usage: f64,

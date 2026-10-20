@@ -35,7 +35,7 @@ use crate::{
         translate_embed_request_sglang, translate_request_sglang, SglangGenerateStream,
         SglangProfileStart,
     },
-    sockets::{ensure_ipc_socket_dir, zmq_socket_addresses, Handshake, ZMQ_CONNECT_TIMEOUT},
+    sockets::{ensure_ipc_socket_dir, zmq_socket_addresses, Handshake},
     stream::ZmqGenerateStream,
     tokenspeed::{
         fan_out_tokenspeed_requests, translate_request_tokenspeed_for, GridTensors,
@@ -116,14 +116,19 @@ pub(crate) struct ZmqConnectionMeta {
 /// by the worker's background handshake driver. `model_id` is
 /// the config-resolved served model (EngineCore reports none). `engine_count`
 /// is the number of DP engines that will dial this worker's sockets (1 for an
-/// ungrouped worker). Errors are plain reasons; the worker layer wraps them in
-/// its own error type.
+/// ungrouped worker). `startup` is the longest any one stage of the handshake
+/// (an engine's HELLO, its READY, its registration on the input socket) may
+/// stay silent: the gateway did not launch the engine and sees no sign of
+/// life from it beside the wire, so this bound alone must cover the engine's
+/// init between its HELLO and its READY. Errors are plain reasons; the worker
+/// layer wraps them in its own error type.
 pub async fn connect_for_worker(
     base_url: &str,
     model_id: String,
     runtime: RuntimeType,
     handshake_override: Option<&str>,
     engine_count: usize,
+    startup: Duration,
 ) -> Result<ZmqEngineClient, String> {
     // The engine can't stop at EOS on its own (it has no tokenizer or model
     // config); resolve the EOS ids from the local model dir so every request
@@ -149,7 +154,7 @@ pub async fn connect_for_worker(
         Handshake::registered(handshake_override),
         engine_count,
         eos,
-        ZMQ_CONNECT_TIMEOUT,
+        startup,
     )
     .await
 }
@@ -159,9 +164,10 @@ pub async fn connect_for_worker(
 /// the handshake. For a frontend that already knows the model's EOS ids from
 /// the engine's own config (the Rust gRPC servicer) and has no model dir to
 /// read them from. `startup` bounds the handshake: the gateway's connector
-/// passes [`ZMQ_CONNECT_TIMEOUT`]; a servicer that launches its own engine
-/// passes a [`StartupBudget`] shaped by what that engine's start may take
-/// and by the signs of life it sees from the engine process. `handshake` is
+/// passes its configured per-stage bound as a plain [`Duration`]; a servicer
+/// that launches its own engine passes a [`StartupBudget`] shaped by what
+/// that engine's start may take and by the signs of life it sees from the
+/// engine process. `handshake` is
 /// the endpoint the engine dials: a registered worker's is tcp-only
 /// ([`Handshake::registered`]); a servicer's own link may bind an `ipc://`
 /// socket ([`Handshake::TcpOrIpc`]).
@@ -1127,7 +1133,9 @@ mod tests {
     use std::{path::Path, sync::Arc, time::Duration};
 
     use engine_zmq_client::{
-        mock_engine::{connect_to_frontend, default_ready_response, EngineInbound, MockEngine},
+        mock_engine::{
+            connect_to_frontend, default_ready_response, hello, EngineInbound, MockEngine,
+        },
         protocol::vllm::request::UtilityCall,
         EngineId,
     };
@@ -1136,7 +1144,7 @@ mod tests {
     use tonic::Code;
 
     use super::*;
-    use crate::{eos::EosTokenIds, sockets::ZMQ_CONNECT_TIMEOUT};
+    use crate::eos::EosTokenIds;
 
     /// A connected client over a throwaway ipc endpoint. The mock engine is
     /// dropped on return: these tests only inspect request-side EOS state.
@@ -1186,6 +1194,62 @@ mod tests {
         assert_eq!(client.effective_eos(), &resolved);
     }
 
+    /// The gateway's connect path across a retry: the first handshake greets
+    /// the engine and gives up its READY wait while the engine is still
+    /// loading (the startup bound is shorter than the engine's init); the
+    /// retry binds the same addresses again, and the engine's one READY and
+    /// one registration reach it. The retry takes the engine as its own: an
+    /// engine says HELLO once, so a wait for another would strand it.
+    #[tokio::test]
+    async fn a_retried_connect_takes_the_engine_the_first_handshake_greeted() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_url = format!("ipc://{}", dir.path().join("w").display());
+        let handshake = format!("ipc://{}", dir.path().join("hs.sock").display());
+
+        let (gave_up, engine) = tokio::join!(
+            connect_with_eos(
+                &base_url,
+                "m".to_string(),
+                RuntimeType::Vllm,
+                Handshake::TcpOrIpc(&handshake),
+                1,
+                EosTokenIds::default(),
+                Duration::from_secs(1),
+            ),
+            hello(&handshake, EngineId::from_engine_index(0)),
+        );
+        let Err(reason) = gave_up else {
+            panic!("the first connect must give up its READY wait");
+        };
+        assert!(reason.contains("waiting for READY"), "{reason}");
+        let engine = engine.expect("HELLO/INIT with the first connect");
+        // The dropped listeners' socket files go on their own tasks; the
+        // gateway retries a health probe later.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (client, engine) = tokio::join!(
+            connect_with_eos(
+                &base_url,
+                "m".to_string(),
+                RuntimeType::Vllm,
+                Handshake::TcpOrIpc(&handshake),
+                1,
+                EosTokenIds::default(),
+                Duration::from_secs(10),
+            ),
+            async {
+                engine
+                    .redial(&handshake)
+                    .await?
+                    .ready(default_ready_response())
+                    .await
+            },
+        );
+        let client = client.expect("the retry connects the engine");
+        engine.expect("mock engine connected");
+        assert_eq!(client.dialect(), ZmqDialect::Vllm);
+    }
+
     /// The dialect is resolved before the handshake, so a runtime with no ZMQ
     /// adapter fails immediately instead of blocking for the connect timeout
     /// (this test would hang on the generous timeout otherwise).
@@ -1201,7 +1265,7 @@ mod tests {
             "m".to_string(),
             EosTokenIds::default(),
             RuntimeType::Trtllm,
-            ZMQ_CONNECT_TIMEOUT,
+            Duration::from_secs(600),
         )
         .await
         else {

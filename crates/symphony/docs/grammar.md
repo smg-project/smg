@@ -103,8 +103,18 @@ nothing after the call.
 `Format::answer_grammar` is the tag for an answer that is JSON a schema accepts, the
 `response_format` of a request, from the same table: the rows into the state the answer is written
 in, the schema, and the answer's close with the end of the turn. Where the output starts in
-content, as in ChatML's tables, it is the schema alone, after the prefix when the prompt left the
-model inside its thought. A table may bound the runs of whitespace the answer's JSON holds between
+content, as in ChatML's tables, it is the schema alone, and it takes no free-text prefix when the
+prompt left the model inside its thought: the prefix leads a forced call because the call's markers
+are excluded from it, so the marker the model writes can only open the tag, but an answer has no
+marker, nothing in free text says where the schema begins, and the model would write a fence or a
+note around its JSON with the end of the turn masked, once its text has left the schema, until a
+whole JSON follows. So the schema stands alone where the engine runs a reasoning parser and applies
+the grammar after the model's own close, and where the engine does not say where it starts, the
+engine's own constraint applied where the engine starts; where it says it starts at the first
+token, the thought as a tag closed by its own marker leads the schema, so the model thinks before
+it answers and free text cannot run on after the close; where one of the engines a request may
+run on starts at the first token and another does not (`GrammarStart::Either`), no one tag fits
+both and the answer keeps the prefix, loosely, as a forced call does. A table may bound the runs of whitespace the answer's JSON holds between
 its tokens (`Format::bounds_answer_whitespace`, written as xgrammar's `max_whitespace_cnt` on the
 answer's schema node; an xgrammar before 0.2.7 ignores the key): a model held to its answer's JSON
 after a long thought, by an engine that starts the grammar at the first token, may drift into tabs
@@ -126,7 +136,12 @@ prompt (one engine) or only when the request asks for reasoning (another), and t
 So at the gate, past the model's own opener, the tag's thought and the way in are open to the
 model once more, and a model held to a JSON it had not planned writes one of them again about two
 times in three; the table reads the kind said again inside a body as the kind, as the family's own
-parsers do, and the answer is the bare JSON either way (the `inkling` notes in `tables.md`).
+parsers do, and the answer is the bare JSON either way (the `inkling` notes in `tables.md`). A kind
+said again inside a body is no close of the thought to the derivation (`Format::is_kind_switch`: a
+row from one body into another on the marker that opens that body from the turn's own state, in a
+table whose turn starts in the frame between its messages), so the thought's message keeps its
+close in the tag; a thought that closes into the text after it, in a table whose turn starts in
+that text (MiniMax M3's), keeps that close.
 Before this, the tag wrote the way in as its `begin`, and an engine that had consumed the model's
 own opener forced it again: the answer reached the client as `<|content_text|>{...}`; and the
 way in was optional after the thought too, which admitted a message without a kind.

@@ -140,8 +140,11 @@ pub(crate) fn grammar_start_from(start: WorkerGrammarStart) -> GrammarStart {
 /// Where the model's `workers` start a grammar, before one is selected: the start every one of
 /// them names in its `constrained_decoding_start` label, a prefill or encode worker left out
 /// since it generates no token a grammar constrains (the roles that do are allow-listed, so a
-/// role added later is left out until it is named); unknown when none says or they differ, and
-/// the tag takes the prefix that fits either kind of engine.
+/// role added later is left out until it is named); `Either` when one that starts at the first
+/// token stands beside one that does not, since no one tag fits both (the answer keeps the
+/// prefix a forced call takes: [`Format::answer_grammar_for`]); unknown when none says, and
+/// when workers that start after their reasoning parser stand beside ones that do not say,
+/// since the unknown start's tags fit both (a forced call's prefix, an answer's schema alone).
 pub(crate) fn grammar_start_of(workers: &[Arc<dyn Worker>]) -> GrammarStart {
     let mut starts = workers
         .iter()
@@ -164,9 +167,14 @@ pub(crate) fn grammar_start_of(workers: &[Arc<dyn Worker>]) -> GrammarStart {
     let Some(first) = starts.next() else {
         return GrammarStart::Unknown;
     };
-    if starts.all(|start| start == first) {
+    let starts: Vec<_> = std::iter::once(first).chain(starts).collect();
+    if starts.iter().all(|start| *start == first) {
         grammar_start_from(first)
+    } else if starts.contains(&WorkerGrammarStart::FirstToken) {
+        // An engine that starts at the first token beside one that does not: no one tag fits both.
+        GrammarStart::Either
     } else {
+        // After the reasoning parser beside not saying: the unknown start's tags fit both.
         GrammarStart::Unknown
     }
 }
@@ -737,8 +745,9 @@ mod tests {
     /// Where the model's workers start the grammar shapes what precedes a table's answer or its
     /// calls when the prompt leaves the thought open: nothing after the reasoning parser's gate
     /// (a JSON answer then needs no tag; the request's own schema goes to the engine as it is),
-    /// the thought closed first from the first token, and the free-text prefix when the workers
-    /// do not say.
+    /// the thought closed first from the first token, the schema alone (the request's own, no
+    /// tag) when the workers do not say, and the free-text prefix when they name different
+    /// starts.
     #[test]
     fn the_workers_grammar_start_shapes_what_precedes_a_tables_answer_and_calls() {
         let deepseek = names(Some("deepseek_v4"), Some("deepseek_v4"));
@@ -767,9 +776,28 @@ mod tests {
                 }
             })
         };
-        let unknown = tag_of(symphony::GrammarStart::Unknown).expect("a tag with the prefix");
-        assert_eq!(unknown["format"]["elements"][0]["type"], "any_text");
-        assert_eq!(unknown["format"]["elements"][1]["type"], "json_schema");
+        // Where the workers do not say, the answer takes no prefix either: free text before a
+        // schema constrains nothing, so the schema stands alone and goes to the engine as the
+        // request's own, as it does after the gate.
+        assert_eq!(
+            tag_of(symphony::GrammarStart::Unknown),
+            None,
+            "the schema stands alone where the workers do not say"
+        );
+        // Where a worker that starts at the first token stands beside one that does not, the
+        // request may land on an engine of either kind, and no one tag fits both: the answer
+        // keeps the prefix a forced call takes, the free text closing the thought, loosely, as
+        // before.
+        let either = tag_of(symphony::GrammarStart::Either).expect("a tag");
+        assert_eq!(either["format"]["type"], "sequence", "{either}");
+        assert_eq!(
+            either["format"]["elements"][0]["type"], "any_text",
+            "{either}"
+        );
+        assert_eq!(
+            either["format"]["elements"][1]["type"], "json_schema",
+            "{either}"
+        );
         assert_eq!(
             tag_of(symphony::GrammarStart::AfterReasoning),
             None,
@@ -956,8 +984,10 @@ mod tests {
         .is_none());
     }
 
-    /// The model's workers name the start when they all carry the same label; none, a missing
-    /// label or a disagreement leaves it unknown. A worker's own label maps one to one.
+    /// The model's workers name the start when they all carry the same label; none or a missing
+    /// label leaves it unknown, as does a pool of workers that start after their reasoning parser
+    /// beside ones that do not say, and a first-token worker beside another kind names either
+    /// kind. A worker's own label maps one to one.
     #[test]
     fn the_models_workers_name_the_grammar_start_when_they_agree() {
         let worker = |start: Option<&str>| -> Arc<dyn Worker> {
@@ -986,11 +1016,25 @@ mod tests {
         );
         assert_eq!(
             grammar_start_of(&[worker(Some("after_reasoning")), worker(Some("first_token"))]),
-            symphony::GrammarStart::Unknown
+            symphony::GrammarStart::Either
         );
+        // After the reasoning parser beside not saying: the unknown start's tags fit both (a
+        // forced call's prefix, an answer's schema alone), so the pool needs no prefix.
         assert_eq!(
             grammar_start_of(&[worker(Some("after_reasoning")), worker(None)]),
             symphony::GrammarStart::Unknown
+        );
+        assert_eq!(
+            grammar_start_of(&[worker(Some("first_token")), worker(None)]),
+            symphony::GrammarStart::Either
+        );
+        assert_eq!(
+            grammar_start_of(&[
+                worker(Some("after_reasoning")),
+                worker(None),
+                worker(Some("first_token"))
+            ]),
+            symphony::GrammarStart::Either
         );
         // A prefill worker generates no token a grammar constrains: its label does not count.
         let prefill = |start: Option<&str>| -> Arc<dyn Worker> {
@@ -1050,9 +1094,11 @@ mod tests {
     /// A prompt the template leaves without a turn opener (a system message rendered in place
     /// after the user turn) starts the model inside its thought on the DeepSeek V4 table, and the
     /// grammar built for the request reads it as the engine does, whatever the thinking switch
-    /// said: the answer tag of a JSON `response_format` takes the thought first, as it does on a
-    /// prompt that opened the thought. A prompt that opened and closed the thought (thinking off)
-    /// leaves the model in the content, and the legacy choice asks the table nothing.
+    /// said: the answer tag of a JSON `response_format` takes the closed thought first where the
+    /// engine starts the grammar at the first token, and is the engine's own schema where it does
+    /// not say or starts after its reasoning parser's gate, as on a prompt that opened the
+    /// thought. A prompt that opened and closed the thought (thinking off) leaves the model in
+    /// the content, and the legacy choice asks the table nothing.
     #[test]
     fn a_turn_the_prompt_leaves_unopened_is_inside_the_thought_for_the_grammar_too() {
         let model = "deepseek-ai/DeepSeek-V4-Flash";
@@ -1070,12 +1116,14 @@ mod tests {
         assert_eq!(is_open(ParserChoice::Symphony, thinking), Some(true));
         assert_eq!(is_open(ParserChoice::Symphony, closed), Some(false));
         assert_eq!(is_open(ParserChoice::Legacy, unopened), None);
-        // The JSON answer's tag on the unopened prompt is the thinking prompt's, thought first;
-        // with the thought closed the schema alone is the engine's own constraint, and no tag.
+        // The JSON answer's tag on the unopened prompt is the thinking prompt's: the closed
+        // thought first where the engine starts at the first token, and otherwise the schema
+        // alone, the engine's own constraint and no tag; with the thought closed the schema alone
+        // on every start.
         let request = request(json!({
             "model": model, "response_format": {"type": "json_object"}
         }));
-        let answer = |prompt| {
+        let answer = |prompt, start| {
             super::constraint(
                 ParserChoice::Symphony,
                 &names(None, None),
@@ -1083,12 +1131,28 @@ mod tests {
                 &[],
                 is_open(ParserChoice::Symphony, prompt) == Some(true),
                 false,
-                symphony::GrammarStart::Unknown,
+                start,
                 &templates(),
             )
         };
-        assert_eq!(tag_of(answer(unopened)), tag_of(answer(thinking)));
-        assert!(matches!(answer(closed), Ok(None)));
+        let first = tag_of(answer(unopened, symphony::GrammarStart::FirstToken));
+        assert_eq!(
+            first,
+            tag_of(answer(thinking, symphony::GrammarStart::FirstToken))
+        );
+        assert_eq!(first["format"]["elements"][0]["end"], "</think>", "{first}");
+        for start in [
+            symphony::GrammarStart::Unknown,
+            symphony::GrammarStart::AfterReasoning,
+        ] {
+            assert!(matches!(answer(unopened, start), Ok(None)), "{start:?}");
+            assert!(matches!(answer(thinking, start), Ok(None)), "{start:?}");
+            assert!(matches!(answer(closed, start), Ok(None)), "{start:?}");
+        }
+        assert!(matches!(
+            answer(closed, symphony::GrammarStart::FirstToken),
+            Ok(None)
+        ));
     }
 
     #[test]
@@ -1270,16 +1334,12 @@ mod tests {
         assert!(answer(&ModelNames::default(), content_first.clone(), false)
             .expect("read")
             .is_none());
-        // With the prompt inside the thought, the schema follows the prefix a forced call takes,
-        // free text that closes the thought, so the JSON is not written inside it.
-        let led = tag_of(answer(&ModelNames::default(), content_first, true));
-        assert_eq!(led["format"]["type"], "sequence", "{led}");
-        assert_eq!(led["format"]["elements"][0]["type"], "any_text", "{led}");
-        assert_eq!(
-            led["format"]["elements"][1],
-            json!({"type": "json_schema", "json_schema": {"type": "object"}}),
-            "{led}"
-        );
+        // With the prompt inside the thought and the engine silent on where it starts the
+        // grammar, the schema stands alone as well: a free-text prefix would let the answer run
+        // on unconstrained, and the engine's own constraint applies where the engine starts.
+        assert!(answer(&ModelNames::default(), content_first, true)
+            .expect("read")
+            .is_none());
         // A table that admits a thought before its answer (MiniMax M3's) keeps that tag with the
         // thought closed: the thought the model may write first, then the schema.
         let thought_first = tag_of(answer(

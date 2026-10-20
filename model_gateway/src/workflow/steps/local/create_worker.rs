@@ -284,6 +284,9 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                     .resilience(resolved_resilience.clone())
                     .health_config(health_config.clone())
                     .health_endpoint(health_endpoint)
+                    .zmq_startup_timeout(Duration::from_secs(
+                        app_context.router_config.zmq_startup_timeout_secs,
+                    ))
                     .overload_defaults(overload_defaults)
                     .labels(labels_for_rank(&labels, dp, &config.labels))
                     // The engine's report in this rank's space, sized by the
@@ -331,13 +334,15 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
 
         // A registration that worker-side media placement cannot use is said
         // once, here, with the worker's address: an engine with a vision
-        // encoder that does not process media references never receives an
-        // image under `--mm-processing worker`. The line says what follows
-        // for the model, read from its pool (the registered workers and the
-        // ones registering with it): with a capable worker beside this one
-        // the media is served (selection picks that worker); without one the
-        // model's multimodal requests are refused (`no_media_ref_capable_worker`)
-        // and `/readiness` names the model until such a worker registers.
+        // encoder that does not process media references never receives a
+        // media reference under `--mm-processing worker` (a request with
+        // per-item hints it still serves, through the router's pipeline). The
+        // line says what follows for the model, read from its pool (the
+        // registered workers and the ones registering with it): with a capable
+        // worker beside this one the references are served (selection picks
+        // that worker); without one the model's requests that forward media
+        // references are refused (`no_media_ref_capable_worker`) and
+        // `/readiness` names the model until such a worker registers.
         // The registration itself is not refused. A model on the
         // encode-prefill-decode pipeline (an encode worker among its
         // registered workers or these) is not warned about: references never
@@ -355,17 +360,17 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                     continue;
                 }
                 let consequence = if pool_processes_media_refs(pool()) {
-                    "other workers of the model process media references and serve them"
+                    "other workers of the model process them"
                 } else {
-                    "the model's multimodal requests are refused until a worker of it \
-                     processes media references"
+                    "the model's requests that forward media references are refused until a \
+                     worker of it processes them"
                 };
                 warn!(
                     url = %worker.url(),
                     model = %worker.model_id(),
                     "worker reports a vision encoder but no worker-side media processor (no \
-                     mm_processor label): under --mm-processing worker it receives no \
-                     multimodal request; {consequence}"
+                     mm_processor label): under --mm-processing worker it receives no media \
+                     references; {consequence}"
                 );
             }
         }

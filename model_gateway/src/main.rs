@@ -37,7 +37,7 @@ use smg::{
         PdPairingMode, PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric, RedisConfig,
         RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig,
         TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig, TurboJpegPolicy,
-        DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
+        DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     },
     mesh_discovery::MeshDiscoveryConfig,
     observability::metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
@@ -418,6 +418,17 @@ struct RoutingArgs {
     /// worker whose handshake awaits this many engines on one socket set.
     #[arg(long, value_parser = parse_positive_usize, help_heading = "Worker Configuration")]
     zmq_engine_count: Option<usize>,
+
+    /// Seconds any one stage of a ZMQ engine's startup handshake (its HELLO,
+    /// its READY, its input registration) may stay silent before the router
+    /// gives the handshake up and binds again. The router did not launch the
+    /// engine and sees nothing from it beside the wire, so this alone must
+    /// cover the engine's whole init between its HELLO and its READY (weights,
+    /// KV-cache profiling, graph capture). An engine says HELLO once and READY
+    /// once: a bound shorter than its init strands it, so err on the generous
+    /// side. --worker-startup-timeout-secs bounds registration, not this.
+    #[arg(long, default_value_t = DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS, help_heading = "Worker Configuration")]
+    zmq_startup_timeout_secs: u64,
 
     /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext) on all
     /// engine-directed connections — request dispatch and health/probe traffic
@@ -3129,6 +3140,7 @@ impl CliArgs {
             .connection_mode(connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
             .zmq_engine_count(self.routing.zmq_engine_count)
+            .zmq_startup_timeout_secs(self.routing.zmq_startup_timeout_secs)
             .host(&self.routing.host)
             .port(self.routing.port)
             .health_check_port(self.routing.health_check_port)

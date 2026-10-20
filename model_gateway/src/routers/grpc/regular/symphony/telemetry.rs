@@ -76,18 +76,43 @@ const OTHER_TABLE: &str = "other";
 /// The `table` label of a request no table reads ([`FALLBACK`]).
 const NO_TABLE: &str = "none";
 
-/// The `reason` labels, in the order of [`Tally::reasons`]: the three reasons that say what the
-/// model got wrong, the table's own marker where no row leads (an answer's opener written again
-/// inside the answer: a frame the table did not read, kept as content), and `other` for the
-/// crate's syntax-level reasons (text where the call's syntax has none, a tag out of place, a key
-/// without a value, ...), each spelled by the crate's sentence on the sampled line.
-const REASONS: [&str; 5] = [
+/// The `reason` labels, in the order of [`Tally::reasons`]: every reason the crate names
+/// (`MalformedReason`, in its order, each under the crate's own spelling of it), so a dashboard
+/// tells a stray tag from a call written in the wrong syntax without the sampled line, and
+/// `other` for a reason this build does not know (the crate's enum is non-exhaustive).
+const REASONS: [&str; 29] = [
     "unterminated_region",
     "invalid_arguments",
     "unknown_tool",
+    "text_between_tags",
+    "tag_out_of_place",
+    "tag_cut_short",
+    "tag_tail",
+    "empty_name",
+    "call_without_name",
+    "call_without_function_tag",
+    "second_function_tag",
+    "closed_before_the_name",
+    "text_where_the_name_should_be",
+    "text_between_calls",
+    "text_where_an_argument_should_begin",
+    "text_in_place_of_the_list",
+    "text_after_the_arguments",
+    "text_after_the_list",
+    "name_without_arguments",
+    "name_without_a_call",
+    "key_written_twice",
+    "key_without_a_value",
+    "key_cut_short",
+    "value_cut_short",
+    "empty_key",
+    "block_without_a_complete_call",
+    "no_forced_function",
     "marker_out_of_place",
     "other",
 ];
+/// The place of `other` in [`REASONS`]: a reason the match below does not know.
+const OTHER_REASON: usize = REASONS.len() - 1;
 /// The `outcome` labels, in the order of [`Series::outputs`].
 const OUTCOMES: [&str; 3] = ["clean", "malformed", "failed"];
 /// The `reason` labels of [`FALLBACK`], in the order of [`fallback_index`]: the four decisions
@@ -117,14 +142,39 @@ pub(crate) fn table_label(name: &str) -> &'static str {
         })
 }
 
-/// The `reason` label of a malformed run, and its place in [`REASONS`].
+/// The `reason` label of a malformed run, and its place in [`REASONS`]. The arms follow the
+/// crate's enum; a variant this build does not know lands on `other`.
 fn reason_index(why: MalformedReason) -> usize {
     match why {
         MalformedReason::UnterminatedRegion => 0,
         MalformedReason::InvalidArguments => 1,
         MalformedReason::UnknownTool => 2,
-        MalformedReason::MarkerOutOfPlace => 3,
-        _ => 4,
+        MalformedReason::TextBetweenTags => 3,
+        MalformedReason::TagOutOfPlace => 4,
+        MalformedReason::TagCutShort => 5,
+        MalformedReason::TagTail => 6,
+        MalformedReason::EmptyName => 7,
+        MalformedReason::CallWithoutName => 8,
+        MalformedReason::CallWithoutFunctionTag => 9,
+        MalformedReason::SecondFunctionTag => 10,
+        MalformedReason::ClosedBeforeTheName => 11,
+        MalformedReason::TextWhereTheNameShouldBe => 12,
+        MalformedReason::TextBetweenCalls => 13,
+        MalformedReason::TextWhereAnArgumentShouldBegin => 14,
+        MalformedReason::TextInPlaceOfTheList => 15,
+        MalformedReason::TextAfterTheArguments => 16,
+        MalformedReason::TextAfterTheList => 17,
+        MalformedReason::NameWithoutArguments => 18,
+        MalformedReason::NameWithoutACall => 19,
+        MalformedReason::KeyWrittenTwice => 20,
+        MalformedReason::KeyWithoutAValue => 21,
+        MalformedReason::KeyCutShort => 22,
+        MalformedReason::ValueCutShort => 23,
+        MalformedReason::EmptyKey => 24,
+        MalformedReason::BlockWithoutACompleteCall => 25,
+        MalformedReason::NoForcedFunction => 26,
+        MalformedReason::MarkerOutOfPlace => 27,
+        _ => OTHER_REASON,
     }
 }
 
@@ -182,8 +232,9 @@ pub(crate) struct FirstRun {
 pub(crate) struct Tally {
     /// The bytes of the events seen so far: where the next event's bytes start.
     at: usize,
-    /// Malformed runs by reason, in the order of [`REASONS`].
-    reasons: [u32; 5],
+    /// Malformed runs by reason, in the order of [`REASONS`]; allocated by the first run, so a
+    /// clean output carries no counters and the tally stays small.
+    reasons: Option<Box<[u32; REASONS.len()]>>,
     malformed_bytes: u64,
     first: Option<FirstRun>,
     /// The event before the next is the first run's: refused bytes that follow it are its size.
@@ -199,7 +250,8 @@ impl Tally {
         let announced = std::mem::take(&mut self.announced);
         match event {
             Event::Malformed { text, why } => {
-                self.reasons[reason_index(*why)] += 1;
+                self.reasons
+                    .get_or_insert_with(|| Box::new([0; REASONS.len()]))[reason_index(*why)] += 1;
                 self.malformed_bytes += text.text.len() as u64;
                 if self.first.is_none() {
                     self.first = Some(FirstRun {
@@ -249,15 +301,20 @@ impl Tally {
         self.first.as_ref()
     }
 
-    /// Malformed runs seen.
-    fn malformed(&self) -> u32 {
-        self.reasons.iter().sum()
+    /// Malformed runs by reason, in the order of [`REASONS`]: none for a clean output.
+    fn reasons(&self) -> &[u32] {
+        self.reasons.as_deref().map_or(&[], |reasons| &reasons[..])
     }
 
-    /// The distinct reason labels seen, in a fixed order, joined with a comma.
+    /// Malformed runs seen.
+    fn malformed(&self) -> u32 {
+        self.reasons().iter().sum()
+    }
+
+    /// The distinct reason labels seen, in the order of [`REASONS`], joined with a comma.
     fn reasons_seen(&self) -> String {
         let mut seen = String::new();
-        for (count, label) in self.reasons.iter().zip(REASONS) {
+        for (count, label) in self.reasons().iter().zip(REASONS) {
             if *count > 0 {
                 if !seen.is_empty() {
                     seen.push(',');
@@ -283,7 +340,7 @@ impl Tally {
         if malformed == 0 && self.suppressed_calls == 0 {
             return;
         }
-        for (count, key) in self.reasons.iter().zip(&series.malformed) {
+        for (count, key) in self.reasons().iter().zip(&series.malformed) {
             if *count > 0 {
                 increment(key, u64::from(*count));
             }
@@ -363,7 +420,7 @@ struct Series {
     /// [`OUTPUTS`] by outcome, in the order of [`OUTCOMES`].
     outputs: [Key; 3],
     /// [`MALFORMED`] by reason, in the order of [`REASONS`].
-    malformed: [Key; 5],
+    malformed: [Key; REASONS.len()],
     malformed_bytes: Key,
     calls_suppressed: Key,
     /// [`FALLBACK`] by reason, in the order of [`FALLBACK_REASONS`]: the series of the table
@@ -549,7 +606,7 @@ mod tests {
         );
         assert_eq!(
             tally.reasons_seen(),
-            "unterminated_region,invalid_arguments,other"
+            "unterminated_region,invalid_arguments,call_without_name"
         );
         assert_eq!(tally.suppressed_calls, 0);
     }
@@ -578,7 +635,7 @@ mod tests {
         assert_eq!(
             tally.first,
             Some(FirstRun {
-                reason: "other",
+                reason: "tag_cut_short",
                 why: "a tag that another tag or the call's end cut short",
                 at: 2,
                 bytes: 18,
@@ -673,7 +730,7 @@ mod tests {
         assert_eq!(
             tally.first,
             Some(FirstRun {
-                reason: "other",
+                reason: "tag_out_of_place",
                 why: "a tag where the call's syntax has none",
                 at: "</think>At once:<tool_call>f".len(),
                 bytes: "</arg_key>".len(),
@@ -683,26 +740,75 @@ mod tests {
     }
 
     #[test]
-    fn the_first_run_of_another_reason_carries_its_sentence() {
+    fn the_first_run_of_a_syntax_reason_carries_its_own_label_and_sentence() {
         let mut tally = Tally::default();
         tally.see(
             &malformed("<|end|>", MalformedReason::NameWithoutACall),
             false,
         );
         let first = tally.first.as_ref().expect("a first run");
-        assert_eq!(first.reason, "other");
+        assert_eq!(first.reason, "name_without_a_call");
         assert_eq!(first.why, "a name without a call");
         assert_eq!(first.at, 0);
     }
 
     #[test]
+    fn every_reason_the_crate_names_has_a_label_of_its_own_spelled_as_the_crate_spells_it() {
+        // The crate's own list of its reasons (`MalformedReason::ALL`, written with the enum by
+        // one macro list) drives this: the label is the crate's serde spelling of the reason, so a
+        // line, a trace and the counter agree on the name; no two reasons share a label, none
+        // lands on `other`, and a reason added to the crate fails this test until it has a label.
+        let mut labels = std::collections::HashSet::new();
+        for (index, why) in MalformedReason::ALL.iter().copied().enumerate() {
+            let label = reason_label(why);
+            let spelled = serde_json::to_value(why).expect("a reason serializes");
+            assert_eq!(Some(label), spelled.as_str(), "{why:?}");
+            assert_eq!(reason_index(why), index, "{why:?}");
+            assert_ne!(label, "other", "{why:?}");
+            assert!(labels.insert(label), "{why:?} shares its label");
+        }
+        assert_eq!(labels.len() + 1, REASONS.len());
+        assert_eq!(REASONS[OTHER_REASON], "other");
+    }
+
+    #[test]
+    fn a_clean_tally_allocates_no_counters_and_a_botched_one_counts_each_reason_by_name() {
+        let mut tally = Tally::default();
+        tally.see(&Event::Content(Text::uncounted("Hi")), false);
+        tally.see(&finish(0), false);
+        assert!(tally.reasons.is_none());
+        assert_eq!(tally.malformed(), 0);
+        assert_eq!(tally.reasons_seen(), "");
+        let mut tally = Tally::default();
+        for event in [
+            malformed("", MalformedReason::TextWhereTheNameShouldBe),
+            malformed("", MalformedReason::TagOutOfPlace),
+            malformed("", MalformedReason::TextBetweenTags),
+            malformed("", MalformedReason::TagOutOfPlace),
+            malformed("", MalformedReason::CallWithoutName),
+            finish(0),
+        ] {
+            tally.see(&event, false);
+        }
+        assert_eq!(tally.malformed(), 5);
+        assert_eq!(
+            tally.reasons_seen(),
+            "text_between_tags,tag_out_of_place,call_without_name,text_where_the_name_should_be"
+        );
+        let reasons = tally.reasons();
+        assert_eq!(reasons[reason_index(MalformedReason::TagOutOfPlace)], 2);
+        assert_eq!(reasons[reason_index(MalformedReason::TextBetweenTags)], 1);
+    }
+
+    #[test]
     fn a_kind_said_again_inside_an_answer_counts_the_output_as_clean() {
         // Through the table whose messages say their kind after their opener, as a request
-        // without tools reads it: a JSON answer whose text marker the model wrote twice, and one
+        // without tools reads it: a JSON answer whose text marker the model wrote twice, one
         // with a second thought opened inside the answer's message, as an engine that starts the
-        // grammar after its own reasoning parser lets the model write them. The markers are
-        // framing, the second thought is reasoning, the JSON is the content, and the tally sees
-        // no malformed run: the output counts as clean, under no reason.
+        // grammar after its own reasoning parser lets the model write them, and one whose text
+        // marker the model wrote inside its thought. The markers are framing, the thoughts are
+        // reasoning, the JSON is the content, and the tally sees no malformed run: the output
+        // counts as clean, under no reason.
         use symphony::{formats::Table, Declared, Engine, EngineFinish, Events, Input, Parser};
         let json = "{\"city\": \"Oslo\"}";
         for output in [
@@ -715,6 +821,7 @@ mod tests {
                  <|content_thinking|>more<|end_message|><|message_model|><|content_text|>{json}\
                  <|end_message|>"
             ),
+            format!("<|content_thinking|>plan<|content_text|>{json}<|end_message|>"),
         ] {
             let mut engine =
                 Engine::new(Table::Inkling.format().without_calls(), Declared::default());

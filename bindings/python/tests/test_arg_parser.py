@@ -775,9 +775,12 @@ class TestParseRouterArgs:
                 "cache-aware-default",
                 "--selection-accounting-ttl-ms",
                 "250",
+                "--zmq-startup-timeout-secs",
+                "900",
             ]
         )
         assert router_args.worker_overload_shed is True
+        assert router_args.zmq_startup_timeout_secs == 900
         # Deprecated: chain is the only value, read in any case as the Rust CLI
         # reads it; the removed positional index and any other spelling are
         # refused by the parser.
@@ -800,6 +803,7 @@ class TestParseRouterArgs:
         defaults = parse_router_args([])
         assert defaults.worker_overload_shed is False
         assert defaults.kv_index is None
+        assert defaults.zmq_startup_timeout_secs == 3600
         assert defaults.worker_stall_secs == 2
         assert defaults.worker_wedge_secs == 3
         assert defaults.worker_stale_secs == 15
