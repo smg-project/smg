@@ -106,6 +106,7 @@ pub async fn serve_with_listener_until(
     // One simulated engine per listener (i.e. per virtual worker), registered
     // in the process fleet under `http:<port>` for the oracle and admin API.
     let name = format!("http:{port}");
+    script::register(&name);
     let engine = cfg
         .realistic
         .then(|| Engine::spawn_named(cfg.engine.clone(), name.clone(), true));
@@ -211,8 +212,13 @@ async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Respon
         .and_then(Value::as_bool)
         .unwrap_or(false);
     // The prompt as this wire knows it: synthetic ids, one per whitespace
-    // word, the realistic engine's prompt and the script's key alike.
-    let prompt_ids = synth_token_ids(&extract_prompt_text(&parsed));
+    // word, the realistic engine's prompt and the script's key alike. The
+    // canned path does without them until something is scripted.
+    let prompt_ids = if script::active() || state.engine.is_some() {
+        synth_token_ids(&extract_prompt_text(&parsed))
+    } else {
+        Vec::new()
+    };
 
     // A scripted answer, ahead of either engine mode: the worker's queue or
     // the prompt's key decides ([`crate::script`]).
@@ -332,11 +338,12 @@ fn stream_chat(
 // ── Scripted responses ──────────────────────────────────────────────────────
 
 /// Whether the request asked for logprobs: chat's `logprobs: true`, a
-/// completion's `logprobs: <n>`.
+/// completion's `logprobs: <n>` (`0` included: the sampled token's logprob
+/// with no alternatives, as the engines read it).
 fn wants_logprobs(endpoint: Endpoint, request: &Value) -> bool {
     match (endpoint, request.get("logprobs")) {
         (Endpoint::Chat, Some(value)) => value.as_bool().unwrap_or(false),
-        (Endpoint::Completions, Some(value)) => value.as_u64().is_some_and(|n| n > 0),
+        (Endpoint::Completions, Some(value)) => value.as_u64().is_some(),
         (_, None) => false,
     }
 }
@@ -376,9 +383,10 @@ fn scripted_logprobs(endpoint: Endpoint, pieces: &[String], logprobs: &[f32]) ->
 
 /// The scripted answer in the endpoint's shape: one JSON body after the
 /// answer's pauses, or an SSE stream of one frame per cut of the text, the
-/// finish frame and `[DONE]`, with the pause before every frame but the
-/// first. The finish carries `matched_stop` when the answer names one, and
-/// the usage when the request asked for it in its stream.
+/// finish frame, the usage chunk when the request asked for it in its
+/// stream (a chunk of its own with no choices, as the engines send it) and
+/// `[DONE]`, with the pause before every frame but the first. The finish
+/// carries `matched_stop` when the answer names one.
 async fn scripted_response(
     endpoint: Endpoint,
     cfg: &Config,
@@ -456,7 +464,8 @@ async fn scripted_response(
     Json(body).into_response()
 }
 
-/// The frames of a scripted stream: the text frames, the finish frame, `[DONE]`.
+/// The frames of a scripted stream: the text frames, the finish frame, the
+/// usage chunk when asked for, `[DONE]`.
 fn scripted_frames(
     endpoint: Endpoint,
     model: String,
@@ -492,6 +501,14 @@ fn scripted_frames(
             return None;
         }
         if st.finished {
+            // The usage rides in a chunk of its own after the finish frame,
+            // with no choices, as the engines send it.
+            if let Some(usage) = st.usage.take() {
+                let mut chunk = scripted_chunk(st.endpoint, &st.model, Value::Null);
+                chunk["choices"] = json!([]);
+                chunk["usage"] = usage;
+                return Some((Ok(Event::default().data(chunk.to_string())), st));
+            }
             st.ended = true;
             return Some((Ok(Event::default().data("[DONE]")), st));
         }
@@ -508,10 +525,7 @@ fn scripted_frames(
             if let Some(stop) = &st.answer.matched_stop {
                 choice["matched_stop"] = stop.to_json();
             }
-            let mut frame = scripted_chunk(st.endpoint, &st.model, choice);
-            if let Some(usage) = &st.usage {
-                frame["usage"] = usage.clone();
-            }
+            let frame = scripted_chunk(st.endpoint, &st.model, choice);
             return Some((Ok(Event::default().data(frame.to_string())), st));
         };
         if st.started && !st.answer.delay.is_zero() {

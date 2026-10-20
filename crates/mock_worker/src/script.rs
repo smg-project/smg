@@ -25,7 +25,10 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock, PoisonError},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, OnceLock, PoisonError,
+    },
     time::Duration,
 };
 
@@ -386,12 +389,20 @@ struct Store {
     misses: HashMap<String, u64>,
     /// Whether anything was ever scripted: misses are counted from then on.
     active: bool,
-    /// The script files loaded so far, each once.
-    loaded: HashSet<PathBuf>,
+    /// The script files loaded so far, each once, with their answer counts.
+    loaded: HashMap<PathBuf, usize>,
+    /// The workers that started in this process, by name: what the admin
+    /// routes accept besides [`ALL`].
+    workers: HashSet<String>,
 }
 
 impl Store {
+    /// Load a script file once: a file loaded before is not read again, its
+    /// count is reported.
     fn load(&mut self, path: &Path) -> Result<usize, String> {
+        if let Some(count) = self.loaded.get(path) {
+            return Ok(*count);
+        }
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut answers = Vec::new();
         for (n, line) in text.lines().enumerate() {
@@ -411,21 +422,28 @@ impl Store {
             })?;
             answers.push((key, scripted.answer));
         }
-        self.active = true;
+        self.activate();
         let count = answers.len();
-        if self.loaded.insert(path.to_path_buf()) {
-            self.keyed.extend(answers);
-        }
+        self.loaded.insert(path.to_path_buf(), count);
+        self.keyed.extend(answers);
         Ok(count)
     }
 
-    fn take(&mut self, worker: &str, prompt_ids: &[u32]) -> Option<Answer> {
+    /// Something is scripted from now on: requests look in the store, and a
+    /// request that finds nothing counts as a miss.
+    fn activate(&mut self) {
+        self.active = true;
+        ACTIVE.store(true, Ordering::Release);
+    }
+
+    /// The answer for `worker`'s next request whose prompt has `key`.
+    fn take(&mut self, worker: &str, key: &str) -> Option<Answer> {
         let queued = self
             .queues
             .get_mut(worker)
             .and_then(VecDeque::pop_front)
             .or_else(|| self.queues.get_mut(ALL).and_then(VecDeque::pop_front));
-        let answer = queued.or_else(|| self.keyed.get(&script_key(prompt_ids)).cloned());
+        let answer = queued.or_else(|| self.keyed.get(key).cloned());
         let counter = if answer.is_some() {
             &mut self.hits
         } else if self.active {
@@ -437,8 +455,13 @@ impl Store {
         answer
     }
 
+    /// Whether `worker` names a worker of the process, or every worker.
+    fn knows(&self, worker: &str) -> bool {
+        worker == ALL || self.workers.contains(worker)
+    }
+
     fn enqueue(&mut self, worker: &str, answers: Vec<Scripted>) {
-        self.active = true;
+        self.activate();
         for scripted in answers {
             match scripted.key {
                 Some(key) => {
@@ -482,6 +505,9 @@ impl Store {
 }
 
 static STORE: OnceLock<Mutex<Store>> = OnceLock::new();
+/// Whether anything was ever scripted in the process, readable without the
+/// lock: until then a request's path does not touch the store at all.
+static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// The process-wide store every worker and the admin API share.
 fn store() -> std::sync::MutexGuard<'static, Store> {
@@ -489,6 +515,19 @@ fn store() -> std::sync::MutexGuard<'static, Store> {
         .get_or_init(|| Mutex::new(Store::default()))
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Whether anything was ever scripted in the process (a file loaded or an
+/// answer enqueued). A wire with work of its own to do only for a script
+/// (the HTTP worker's prompt ids in canned mode) skips it while this is false.
+pub fn active() -> bool {
+    ACTIVE.load(Ordering::Acquire)
+}
+
+/// A worker that started, by name (`grpc:<port>`, `http:<port>`,
+/// `zmq:<index>`): the admin routes accept it from then on.
+pub fn register(worker: &str) {
+    store().workers.insert(worker.to_string());
 }
 
 /// Load a `--script` file: one answer per line, each with a `key` or its
@@ -510,31 +549,46 @@ pub fn ensure_loaded(cfg: &Config) -> Result<(), String> {
 
 /// The answer for `worker`'s next request with `prompt_ids`, if one is
 /// scripted: its queue, then the shared queue, then the prompt's key. A miss
-/// is counted once anything was ever scripted in the process.
+/// is counted once anything was ever scripted in the process; until then
+/// nothing is computed and the store is not locked.
 pub fn take(worker: &str, prompt_ids: &[u32]) -> Option<Answer> {
-    store().take(worker, prompt_ids)
+    if !active() {
+        return None;
+    }
+    let key = script_key(prompt_ids);
+    store().take(worker, &key)
 }
 
 /// Enqueue `answers` for `worker` ([`ALL`] for every worker), the keyed ones
-/// under their key instead; answers the worker's state.
-pub fn enqueue(worker: &str, answers: Vec<Scripted>) -> Value {
+/// under their key instead; answers the worker's state, or `None` for a
+/// name no worker of the process has.
+pub fn enqueue(worker: &str, answers: Vec<Scripted>) -> Option<Value> {
     let mut store = store();
+    if !store.knows(worker) {
+        return None;
+    }
     store.enqueue(worker, answers);
-    store.status(worker)
+    Some(store.status(worker))
 }
 
 /// The worker's queue length, hits and misses, and the keyed answers of the
-/// process; [`ALL`] reports the shared queue and the totals.
-pub fn status(worker: &str) -> Value {
-    store().status(worker)
+/// process; [`ALL`] reports the shared queue and the totals. `None` for a
+/// name no worker of the process has.
+pub fn status(worker: &str) -> Option<Value> {
+    let store = store();
+    store.knows(worker).then(|| store.status(worker))
 }
 
 /// Drop the worker's queued answers ([`ALL`]: every queue); the keyed
-/// answers and the counters stay. Answers the worker's state.
-pub fn clear(worker: &str) -> Value {
+/// answers and the counters stay. Answers the worker's state, or `None` for
+/// a name no worker of the process has.
+pub fn clear(worker: &str) -> Option<Value> {
     let mut store = store();
+    if !store.knows(worker) {
+        return None;
+    }
     store.clear(worker);
-    store.status(worker)
+    Some(store.status(worker))
 }
 
 #[cfg(test)]
@@ -662,12 +716,24 @@ mod tests {
     fn a_store_serves_queues_before_keys_and_counts_misses_once_active() {
         let mut store = Store::default();
         let worker = "grpc:19000";
-        assert!(store.take(worker, &[1, 2, 3]).is_none(), "nothing scripted");
+        assert!(
+            store.take(worker, &script_key(&[1, 2, 3])).is_none(),
+            "nothing scripted"
+        );
         assert_eq!(
             store.status(worker)["misses"],
             0,
             "no script yet: no miss counted"
         );
+
+        assert!(
+            !store.knows(worker) && store.knows(ALL),
+            "the workers register their names"
+        );
+
+        store.workers.insert(worker.to_string());
+
+        assert!(store.knows(worker));
 
         let keyed = parse(r#"{"input_ids": [1, 2, 3], "output_ids": [7]}"#).expect("keyed");
         let first = parse(r#"{"output_ids": [1]}"#).expect("queued");
@@ -678,24 +744,24 @@ mod tests {
         store.enqueue(ALL, vec![shared]);
 
         let ids = |answer: Option<Answer>| answer.map(|a| a.output_ids);
-        assert_eq!(ids(store.take(worker, &[9])), Some(vec![1]));
-        assert_eq!(ids(store.take(worker, &[9])), Some(vec![2]));
+        assert_eq!(ids(store.take(worker, &script_key(&[9]))), Some(vec![1]));
+        assert_eq!(ids(store.take(worker, &script_key(&[9]))), Some(vec![2]));
         assert_eq!(
-            ids(store.take(worker, &[9])),
+            ids(store.take(worker, &script_key(&[9]))),
             Some(vec![3]),
             "the shared queue"
         );
         assert_eq!(
-            ids(store.take(worker, &[1, 2, 3])),
+            ids(store.take(worker, &script_key(&[1, 2, 3]))),
             Some(vec![7]),
             "the key"
         );
         assert_eq!(
-            ids(store.take(worker, &[1, 2, 3])),
+            ids(store.take(worker, &script_key(&[1, 2, 3]))),
             Some(vec![7]),
             "a key stays"
         );
-        assert!(store.take(worker, &[9]).is_none());
+        assert!(store.take(worker, &script_key(&[9])).is_none());
         let state = store.status(worker);
         assert_eq!(
             (state["hits"].as_u64(), state["misses"].as_u64()),
@@ -709,7 +775,7 @@ mod tests {
         );
         store.clear(worker);
         assert_eq!(store.status(worker)["queued"], 0);
-        assert!(store.take(worker, &[9]).is_none(), "cleared");
+        assert!(store.take(worker, &script_key(&[9])).is_none(), "cleared");
     }
 
     #[test]
@@ -723,19 +789,22 @@ mod tests {
         )
         .expect("write");
         assert_eq!(store.load(&path).expect("loads"), 2);
+        std::fs::remove_file(&path).expect("remove the script: a second load does not read it");
         assert_eq!(
             store.load(&path).expect("loads again"),
             2,
             "a second load is a no-op"
         );
         assert_eq!(store.keyed.len(), 2);
-        let answer = store.take("http:9000", &[5, 6]).expect("the keyed answer");
+        let answer = store
+            .take("http:9000", &script_key(&[5, 6]))
+            .expect("the keyed answer");
         assert_eq!(
             (answer.output_ids, answer.finish_reason),
             (vec![8, 9], "length".to_string())
         );
         assert_eq!(
-            store.take("zmq:0", &[4]).map(|a| a.text()),
+            store.take("zmq:0", &script_key(&[4])).map(|a| a.text()),
             Some("four".to_string())
         );
 

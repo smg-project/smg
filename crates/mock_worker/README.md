@@ -289,9 +289,9 @@ gRPC, ZMQ), ahead of either engine mode. Two sources feed one store:
   (`all`: whichever worker gets the request). An answer with a `key` or
   `input_ids` is filed under its prompt for every worker instead.
   `GET /admin/script/{worker}` reads `queued`, `hits`, `misses` and the
-  `keyed` count; `DELETE` drops the queue. This is the form a test wants: it
-  states the model's answer right before it sends the request, no tokenizer
-  prediction needed.
+  `keyed` count; `DELETE` drops the queue; a name no worker of the process
+  has is a 404. This is the form a test wants: it states the model's answer
+  right before it sends the request, no tokenizer prediction needed.
 
 For a request a worker looks in this order: its own queue, the shared queue,
 the keyed answers under its prompt's key. Nothing found is a miss, counted
@@ -305,9 +305,9 @@ the `Complete` (`output_ids`, `finish_reason`, `matched_stop`,
 pushes one `EngineCoreOutputs` batch per frame, the prompt's prefill stats
 on the first, the finish reason and `stop_reason` on the last; an HTTP worker
 answers `/v1/chat/completions`, `/v1/completions` and `/generate` with the
-`output_text` pieces (one SSE frame per `chunk_tokens` pieces, then the
-finish frame with `matched_stop` and, under `stream_options.include_usage`,
-the usage; or one JSON body) and keys its prompt on its synthetic ids, one
+`output_text` pieces (one SSE frame per `chunk_tokens` pieces, the finish
+frame with `matched_stop`, under `stream_options.include_usage` a usage
+chunk of its own, then `[DONE]`; or one JSON body) and keys its prompt on its synthetic ids, one
 per whitespace word of the prompt text (`http::synth_token_ids`). An answer
 without `output_ids` has no frames on the token wires (the `Complete` alone
 is sent); one without `output_text` has none on the HTTP wire.

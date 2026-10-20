@@ -21,7 +21,8 @@
 //!   them: what the worker's next requests get, in order (`all`: whichever
 //!   worker gets the request), or, with a `key` or `input_ids`, what every
 //!   worker answers to that prompt; `GET` reads the queue length and the hit
-//!   and miss counts, `DELETE` drops the queue ([`crate::script`]).
+//!   and miss counts, `DELETE` drops the queue ([`crate::script`]); a name no
+//!   worker of the process has is a 404, as on the fault routes.
 //!
 //! Worker names are `grpc:<port>` / `http:<port>` / `zmq:<index>`; `all`
 //! addresses every worker.
@@ -146,18 +147,27 @@ async fn script_enqueue(Path(worker): Path<String>, Json(body): Json<Value>) -> 
             }
         }
     }
-    Json(script::enqueue(&worker, answers)).into_response()
+    script_state(script::enqueue(&worker, answers))
 }
 
 /// The worker's queued answers, hits and misses, and the keyed answers of
 /// the process.
-async fn script_status(Path(worker): Path<String>) -> Json<Value> {
-    Json(script::status(&worker))
+async fn script_status(Path(worker): Path<String>) -> Response {
+    script_state(script::status(&worker))
 }
 
 /// Drop the worker's queued answers (`all`: every queue); keyed answers stay.
-async fn script_clear(Path(worker): Path<String>) -> Json<Value> {
-    Json(script::clear(&worker))
+async fn script_clear(Path(worker): Path<String>) -> Response {
+    script_state(script::clear(&worker))
+}
+
+/// A script route's answer: the state, or 404 for a name no worker of the
+/// process has (the fault routes' answer to the same mistake).
+fn script_state(state: Option<Value>) -> Response {
+    match state {
+        Some(state) => Json(state).into_response(),
+        None => (StatusCode::NOT_FOUND, "unknown worker").into_response(),
+    }
 }
 
 /// Serve the admin API on `port` until the process exits.

@@ -225,7 +225,7 @@ async fn grpc_answers_a_prompt_the_script_misses_as_before_and_counts_the_miss()
         Some(GenResp::Complete(c)) if c.finish_reason == "stop" && c.output_ids == vec![100, 101, 102]
     ));
     generate(&client, grpc_request("h", &[4, 4], false, false)).await;
-    let state = script::status(&worker);
+    let state = script::status(&worker).expect("a started worker");
     assert_eq!(
         (state["hits"].as_u64(), state["misses"].as_u64()),
         (Some(1), Some(1))
@@ -370,10 +370,21 @@ async fn the_admin_api_enqueues_answers_in_order_reads_the_counts_and_clears() {
     let why = bad.text().await.expect("text");
     assert!(why.starts_with("answer 1: "), "{why}");
     assert_eq!(
-        script::status(&worker)["queued"],
+        script::status(&worker).expect("a started worker")["queued"],
         0,
         "a refused batch enqueues nothing"
     );
+
+    // A name no worker of the process has is refused, as on the fault routes.
+    for (method, name) in [("GET", "grpc:1"), ("POST", "grpc1"), ("DELETE", "http:2")] {
+        let request = match method {
+            "GET" => http.get(url(name)),
+            "POST" => http.post(url(name)).json(&json!({"output_ids": [1]})),
+            _ => http.delete(url(name)),
+        };
+        let response = request.send().await.expect(method);
+        assert_eq!(response.status(), 404, "{method} {name}");
+    }
 }
 
 // ── HTTP ────────────────────────────────────────────────────────────────────
@@ -449,9 +460,8 @@ async fn http_delivers_the_scripted_text_as_frames_and_as_one_body() {
     let chunk = |choice: Value| json!({"id": "chatcmpl-mock", "object": "chat.completion.chunk", "created": 0, "model": MODEL, "choices": [choice]});
     let logprob = |token: &str, value: f64| json!({"content": [{"token": token, "logprob": value, "bytes": null, "top_logprobs": []}]});
     let usage = json!({"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5, "prompt_tokens_details": {"cached_tokens": 1}});
-    let mut finish =
+    let finish =
         chunk(json!({"index": 0, "delta": {}, "finish_reason": "stop", "matched_stop": "\n"}));
-    finish["usage"] = usage.clone();
     let expected = [
         chunk(
             json!({"index": 0, "delta": {"role": "assistant", "content": "Hello"}, "finish_reason": null, "logprobs": logprob("Hello", -0.5)}),
@@ -461,12 +471,18 @@ async fn http_delivers_the_scripted_text_as_frames_and_as_one_body() {
         ),
         finish,
     ];
-    assert_eq!(frames.len(), 4, "{frames:?}");
+    assert_eq!(frames.len(), 5, "{frames:?}");
     for (frame, expected) in frames.iter().zip(&expected) {
         let frame: Value = serde_json::from_str(frame).expect("a JSON frame");
         assert_eq!(&frame, expected);
     }
-    assert_eq!(frames[3], "[DONE]");
+    let usage_chunk: Value = serde_json::from_str(&frames[3]).expect("a JSON frame");
+    assert_eq!(
+        usage_chunk,
+        json!({"id": "chatcmpl-mock", "object": "chat.completion.chunk", "created": 0, "model": MODEL, "choices": [], "usage": usage}),
+        "the usage rides in a chunk of its own after the finish frame"
+    );
+    assert_eq!(frames[4], "[DONE]");
 
     let whole: Value = http
         .post(format!("{base}/v1/chat/completions"))
@@ -527,7 +543,7 @@ async fn http_delivers_the_scripted_text_as_frames_and_as_one_body() {
         .await
         .expect("body json");
     assert_eq!(canned["choices"][0]["message"]["content"], "mock");
-    let state = script::status(&worker);
+    let state = script::status(&worker).expect("a started worker");
     assert_eq!(
         (state["hits"].as_u64(), state["misses"].as_u64()),
         (Some(3), Some(1))
@@ -640,7 +656,7 @@ async fn zmq_pushes_the_scripted_tokens_with_their_stats_finish_and_stop() {
         .collect();
     assert_eq!(tokens, vec![100, 101, 102]);
     assert!(canned.iter().all(|o| o.new_logprobs.is_none()));
-    let state = script::status(&format!("zmq:{rank}"));
+    let state = script::status(&format!("zmq:{rank}")).expect("a started rank");
     assert_eq!(
         (state["hits"].as_u64(), state["misses"].as_u64()),
         (Some(1), Some(1))

@@ -61,6 +61,7 @@ pub async fn serve_until(
     // The rank's name in the process (`zmq:<index>`): what the admin API and
     // the script store address it by.
     let name = format!("zmq:{engine_index}");
+    script::register(&name);
     let mut ready = default_ready_response();
     ready.data_parallel_rank = engine_index;
     ready.instance_id = format!("mock-zmq-{engine_index}");
