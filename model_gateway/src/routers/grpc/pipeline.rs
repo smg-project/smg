@@ -4678,7 +4678,7 @@ mod request_release_tests {
     /// the decode side wedged after its first token. The decode engine receives
     /// the abort at once and both sides end with their load released.
     #[tokio::test]
-    async fn a_client_that_leaves_a_stalled_harmony_responses_pd_stream_aborts_the_decode_leg_at_once(
+    async fn a_client_that_leaves_a_stalled_harmony_responses_pd_stream_aborts_the_decode_side_at_once(
     ) {
         let prefill_port = spawn_stub(GatedScheduler::default()).await;
         let decode_scheduler = GatedScheduler {
@@ -4727,11 +4727,11 @@ mod request_release_tests {
     }
 
     /// Harmony Responses over the gRPC PD path, the client leaving while the
-    /// prefill leg wedged after its first token: the prefill drain is cut by
-    /// the client's leaving, both legs drop unmarked (the prefill engine
-    /// receives the abort at once) and both legs' load returns with the body.
+    /// prefill side wedged after its first token: the prefill drain is cut by
+    /// the client's leaving, both sides drop unmarked (the prefill engine
+    /// receives the abort at once) and both sides' load returns with the body.
     #[tokio::test]
-    async fn a_client_that_leaves_a_stalled_harmony_responses_pd_stream_during_the_prefill_aborts_both_legs_at_once(
+    async fn a_client_that_leaves_a_stalled_harmony_responses_pd_stream_during_the_prefill_aborts_both_sides_at_once(
     ) {
         let prefill_scheduler = GatedScheduler {
             hold_after_first: true,
@@ -4768,13 +4768,13 @@ mod request_release_tests {
         drop(response);
 
         let deadline = Instant::now() + Duration::from_secs(2);
-        // Both legs drop unmarked: each engine receives the abort.
+        // Both sides drop unmarked: each engine receives the abort.
         wait_for_abort(&prefill_scheduler, deadline).await;
         wait_for_abort(&decode_scheduler, deadline).await;
         while prefill.load() != 0 || decode.load() != 0 {
             assert!(
                 Instant::now() < deadline,
-                "the legs' load stayed at {} and {} after the body was dropped during the prefill",
+                "the sides' load stayed at {} and {} after the body was dropped during the prefill",
                 prefill.load(),
                 decode.load()
             );
