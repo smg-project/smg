@@ -1102,8 +1102,9 @@ async fn spec_decode_counts_reach_the_complete() {
 }
 
 /// The grammar backend on every structured request is the engine's
-/// configured one (`auto` settles on xgrammar as vLLM's frontend does), not
-/// a per-constraint guess: the engine pins one backend at first use.
+/// configured one (`auto` settles on xgrammar, the backend structural tags
+/// compile on), not a per-constraint guess: the engine pins one backend at
+/// first use.
 #[tokio::test]
 async fn structured_output_backend_follows_the_launcher_config() {
     use vllm::sampling_params::Constraint;
@@ -1134,11 +1135,13 @@ async fn structured_output_backend_follows_the_launcher_config() {
         h.server.stop(Duration::from_secs(5)).expect("clean stop");
     }
 
-    // `auto` resolves per constraint as vLLM's frontend does: a Lark grammar
-    // goes to xgrammar unchanged (vLLM 0.30 parses Lark there), a schema with
-    // a feature xgrammar lacks goes to guidance, and a choice is lowered to
-    // the grammar xgrammar compiles. The streams stay open so no abort
-    // interleaves with the engine's inbound requests.
+    // `auto` is xgrammar for every constraint: a Lark grammar goes there
+    // unchanged (vLLM 0.30 parses Lark there), a schema with a feature
+    // xgrammar lacks goes there too (sent to guidance, as vLLM's own frontend
+    // would, it pins a fresh engine on guidance and fails every structural
+    // tag after it), and a choice is lowered to the grammar xgrammar
+    // compiles. The streams stay open so no abort interleaves with the
+    // engine's inbound requests.
     let mut h = harness(model_info(), None).await;
     let lark = "start: \"yes\" | \"no\"";
     let mut streams = Vec::new();
@@ -1152,7 +1155,7 @@ async fn structured_output_backend_follows_the_launcher_config() {
         (
             "so3",
             Constraint::JsonSchema(r#"{"type":"integer","multipleOf":3}"#.to_string()),
-            StructuredOutputBackend::Guidance,
+            StructuredOutputBackend::Xgrammar,
             StructuredOutputConstraint::Json(
                 serde_json::json!({"type": "integer", "multipleOf": 3}),
             ),

@@ -103,8 +103,8 @@ pub(crate) struct ZmqConnectionMeta {
     /// than on the client so every clone shares the one adoption.
     tokenizer_eos: OnceLock<EosTokenIds>,
     /// The engine's structured-output backend config, set once by the caller
-    /// that knows it (the servicer); unset keeps the translation's
-    /// per-constraint default.
+    /// that knows it (the servicer); unset is the engine's `auto`
+    /// ([`StructuredOutputsBackendConfig::default`]).
     structured_outputs_backend: OnceLock<StructuredOutputsBackendConfig>,
     /// The engine's supported tasks (`get_supported_tasks`), fetched on first
     /// use and kept for the connection, as vLLM's frontend keeps them.
@@ -326,6 +326,8 @@ impl ZmqEngineClient {
     /// keeps a single backend per process, chosen by the first request that
     /// needs one, so the caller resolves it once from the engine's
     /// `--structured-outputs-config` and every request carries the same one.
+    /// A connection nobody configures (the gateway's own worker link) runs
+    /// the engine's `auto`: xgrammar on every request.
     pub fn set_structured_outputs_backend(&self, config: StructuredOutputsBackendConfig) {
         let _ = self.meta.structured_outputs_backend.set(config);
     }
@@ -528,7 +530,12 @@ impl ZmqEngineClient {
         } else {
             TranslatedMedia::default()
         };
-        let structured_backend = self.meta.structured_outputs_backend.get().copied();
+        let structured_backend = self
+            .meta
+            .structured_outputs_backend
+            .get()
+            .copied()
+            .unwrap_or_default();
         // On the request's own `n`: every sub below carries `n = 1`.
         if let Some(sp) = req.sampling_params.as_ref() {
             refuse_greedy_choices(sp).map_err(tonic::Status::invalid_argument)?;
@@ -1237,6 +1244,129 @@ mod tests {
         let client = client.expect("the retry connects the engine");
         engine.expect("mock engine connected");
         assert_eq!(client.dialect(), ZmqDialect::Vllm);
+    }
+
+    /// The gateway's own connection (nothing configures the backend, as
+    /// behind `--worker-urls ipc://...`) against an engine that keeps the
+    /// backend of its first structured request for its life: whichever
+    /// constraint comes first, every later one carries the backend the engine
+    /// settled on, and that backend is the one a structural tag compiles on,
+    /// so the kind of the first request never decides whether a forced tool
+    /// call compiles later.
+    #[tokio::test]
+    async fn the_first_structured_request_never_strands_a_later_one() {
+        use engine_zmq_client::protocol::vllm::structured_outputs::{
+            StructuredOutputBackend, StructuredOutputConstraint,
+        };
+        use vllm::sampling_params::Constraint;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base_url = format!("ipc://{}", dir.path().join("w").display());
+        let handshake = format!("ipc://{}", dir.path().join("hs.sock").display());
+        let (client, engine) = tokio::join!(
+            connect_with_eos(
+                &base_url,
+                "m".to_string(),
+                RuntimeType::Vllm,
+                Handshake::TcpOrIpc(&handshake),
+                1,
+                EosTokenIds::default(),
+                Duration::from_secs(10),
+            ),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                default_ready_response()
+            ),
+        );
+        let client = client.expect("adapter connect");
+        let mut engine = engine.expect("mock engine");
+
+        // The engine's rule: the first structured request creates its one
+        // backend; a later request stamped for another would fail at grammar
+        // build (or, for a tag, compile on a backend that has no such format).
+        let mut engine_backend: Option<StructuredOutputBackend> = None;
+        // Held open: dropping a stream aborts its request on the same socket.
+        let mut streams = Vec::new();
+        for (id, constraint) in [
+            (
+                "json-answer-first",
+                Constraint::JsonSchema(
+                    r#"{"type":"object","properties":{"city":{"type":"string"}}}"#.to_string(),
+                ),
+            ),
+            (
+                "forced-call",
+                Constraint::StructuralTag(
+                    r#"{"format":{"type":"triggered_tags","triggers":["<tool_call>"],"tags":[]}}"#
+                        .to_string(),
+                ),
+            ),
+            ("json-object", Constraint::JsonObject(true)),
+            ("regex", Constraint::Regex("[0-9]+".to_string())),
+            ("grammar", Constraint::Grammar("root ::= \"a\"".to_string())),
+            (
+                "choice",
+                Constraint::Choice(vllm::ChoiceConstraint {
+                    choices: vec!["yes".to_string(), "no".to_string()],
+                }),
+            ),
+            (
+                "schema-xgrammar-lacks",
+                Constraint::JsonSchema(r#"{"type":"integer","multipleOf":3}"#.to_string()),
+            ),
+        ] {
+            let request = vllm::GenerateRequest {
+                request_id: id.to_string(),
+                input: Some(vllm::generate_request::Input::Tokenized(
+                    vllm::TokenizedInput {
+                        original_text: String::new(),
+                        input_ids: vec![1, 2, 3],
+                    },
+                )),
+                sampling_params: Some(vllm::SamplingParams {
+                    max_tokens: Some(8),
+                    constraint: Some(constraint),
+                    ..Default::default()
+                }),
+                stream: true,
+                ..Default::default()
+            };
+            streams.push(
+                client
+                    .generate_vllm_streams(request)
+                    .await
+                    .expect("generate"),
+            );
+            let EngineInbound::Add(engine_request) = engine.recv().await.expect("inbound") else {
+                panic!("{id}: expected an add request");
+            };
+            let structured = engine_request
+                .sampling_params
+                .and_then(|sp| sp.structured_outputs)
+                .expect("structured outputs");
+            let settled = *engine_backend.get_or_insert(structured.backend);
+            assert_eq!(
+                structured.backend, settled,
+                "{id}: stamped for a backend the engine does not run"
+            );
+            if id == "choice" {
+                // xgrammar compiles no choice: it goes as the grammar vLLM's
+                // frontend substitutes.
+                assert!(
+                    matches!(
+                        structured.constraint,
+                        StructuredOutputConstraint::Grammar(_)
+                    ),
+                    "{id}: {:?}",
+                    structured.constraint
+                );
+            }
+        }
+        // The backend the engine settled on is the one the triggered-tags
+        // format compiles on.
+        assert_eq!(engine_backend, Some(StructuredOutputBackend::Xgrammar));
+        drop(streams);
     }
 
     /// The dialect is resolved before the handshake, so a runtime with no ZMQ
