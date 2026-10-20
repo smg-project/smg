@@ -240,6 +240,19 @@ if resolve_servicer_impl(args) == "rust":
     raise SystemExit(await serve_rust(args))
 ```
 
+##### Metrics
+
+The SMG plugin adds an optional HTTP `/metrics` listener on `--host` for Rust gRPC:
+
+```bash
+vllm serve <model> --grpc --servicer-impl rust --metrics-port 9090
+```
+
+The listener binds `--host` (`0.0.0.0` when unset); choose a port different from gRPC. It reuses vLLM's
+native statistics and multiprocess registry. `--disable-log-stats` disables request
+statistics. Metrics add Python callbacks; timings reflect Rust frontend processing.
+Profiler routes are not exposed, and collection failures return HTTP 503.
+
 ##### Supported vLLM releases
 
 The switch binds `serve_grpc` in the launcher module of the installed release

@@ -520,9 +520,30 @@ class VllmLauncher(RustLauncher):
     without_tokenizer = "string stops will be refused"
 
     def __init__(self) -> None:
+        """Keep configuration and optional metrics scoped to this launcher lifetime."""
         self.vllm_config: Any = None
         self.media: Any = None
         self.encoder_budget: int = 0
+        self.ops: Any = None
+
+    async def serve(self, args: argparse.Namespace) -> int:
+        """Close metrics even when configuration, binding or engine startup fails."""
+        try:
+            return await super().serve(args)
+        finally:
+            if self.ops is not None:
+                await self.ops.close()
+
+    async def server_started(self, server: Any) -> None:
+        """Attach metrics before any engine process can emit outputs."""
+        if self.ops is not None:
+            await self.ops.start(server)
+
+    async def before_stop(self) -> None:
+        """Stop metrics callbacks before joining the Rust runtime."""
+        if self.ops is not None:
+            await self.ops.close()
+            self.ops = None
 
     def prepare(self, args: argparse.Namespace) -> None:
         configure_logging()
@@ -531,6 +552,7 @@ class VllmLauncher(RustLauncher):
         return default_kv_events_config(args)
 
     def facts(self, args: argparse.Namespace) -> dict[str, Any]:
+        """Resolve engine capabilities and prepare metrics before spawning workers."""
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.usage.usage_lib import UsageContext
 
@@ -538,6 +560,18 @@ class VllmLauncher(RustLauncher):
         self.vllm_config = engine_args.create_engine_config(
             usage_context=UsageContext.OPENAI_API_SERVER
         )
+        ops_port = getattr(args, "metrics_port", None)
+        if ops_port is not None:
+            from smg_grpc_servicer.vllm.rust_ops import RustOps
+
+            if not 1 <= ops_port <= 65535 or ops_port == args.port:
+                raise ValueError("--metrics-port must be 1..65535 and differ from --port")
+            self.ops = RustOps(
+                self.vllm_config,
+                ops_port,
+                log_stats=not engine_args.disable_log_stats,
+                host=args.host or "0.0.0.0",
+            )
         # The engine cores are started with `log_stats=not disable_log_stats`
         # (`launch_engine_cores`); the servicer is told the same.
         disable_log_stats = getattr(engine_args, "disable_log_stats", None)
@@ -588,6 +622,8 @@ class VllmLauncher(RustLauncher):
             else "off",
             settings.source if (smg_media is not None or self.media is not None) else "-",
         )
+        if self.ops is not None and self.media is not None and self.media._renderer is not None:
+            self.ops.mm_cache_stats = self.media._renderer.stat_mm_cache
         return {"media_processor": self.media, "smg_media_processor": smg_media}
 
     def launch(

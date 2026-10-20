@@ -99,6 +99,14 @@ pub struct VllmGenerateStream {
 }
 
 impl VllmGenerateStream {
+    /// Engine terminal held behind its last token chunk, for frontend metrics.
+    pub fn pending_finish_reason(&self) -> Option<&str> {
+        match self.pending.as_ref()?.response.as_ref()? {
+            vllm::generate_response::Response::Complete(complete) => Some(&complete.finish_reason),
+            vllm::generate_response::Response::Chunk(_) => None,
+        }
+    }
+
     pub(crate) fn new(
         inner: EngineCoreStream,
         index: u32,
@@ -853,7 +861,7 @@ pub(crate) fn translate_sampling(
 /// vLLM's `_verify_greedy_sampling`: greedy decoding (temperature below its
 /// sampling epsilon) cannot yield distinct choices. Checked on the request's
 /// own `n`, before the fan-out hands each choice `n = 1`.
-pub(crate) fn refuse_greedy_choices(sp: &vllm::SamplingParams) -> Result<(), String> {
+pub fn refuse_greedy_choices(sp: &vllm::SamplingParams) -> Result<(), String> {
     if sp.temperature.is_some_and(|temperature| temperature < 1e-5) && sp.n > 1 {
         return Err(format!(
             "n must be 1 when using greedy sampling, got {}.",

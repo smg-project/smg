@@ -1052,6 +1052,41 @@ def test_a_block_with_a_held_port_is_passed_over_for_another(monkeypatch):
         rust_lifecycle.free_kv_events_endpoint(ranks=2)
 
 
+@pytest.mark.parametrize("fail_close", [False, True])
+def test_supervise_closes_metrics_before_server_even_when_close_fails(monkeypatch, fail_close):
+    """A failing HTTP cleanup must not leave the Rust server or engine running."""
+    events = []
+    monkeypatch.setattr(rust_lifecycle, "mark_not_serving", lambda server: events.append("drain"))
+    monkeypatch.setattr(rust_lifecycle, "terminate_engine", lambda engine: events.append("engine"))
+
+    async def stop(server, timeout):
+        """Record the point where the runtime would be joined."""
+        events.append("server")
+
+    async def close():
+        """Exercise both successful and failing metrics shutdown."""
+        events.append("metrics")
+        if fail_close:
+            raise RuntimeError("metrics close failed")
+
+    monkeypatch.setattr(rust_lifecycle, "stop_server", stop)
+
+    async def exercise():
+        """Start with shutdown requested so no fake engine polling is needed."""
+        event = asyncio.Event()
+        event.set()
+        return await rust_lifecycle.supervise(
+            object(), object(), drain_secs=0, stop_event=event, before_stop=close
+        )
+
+    if fail_close:
+        with pytest.raises(RuntimeError, match="metrics close failed"):
+            asyncio.run(exercise())
+    else:
+        assert asyncio.run(exercise()) == 0
+    assert events == ["drain", "metrics", "server", "engine"]
+
+
 def test_the_kv_events_default_announcement_is_one_line_for_both_implementations(caplog):
     """What the operator reads once the default applied, under either servicer
     implementation: the engine's name, what is on, and the two ways to decide

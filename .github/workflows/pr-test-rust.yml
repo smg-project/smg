@@ -259,7 +259,7 @@ jobs:
           # zmq or vllm still skip here (-rs lists them): the zmq ones import
           # engine servicers that need torch, and the vllm cases run on the
           # vLLM e2e lane.
-          pip install ./crates/grpc_client/python msgspec pydantic numpy pyzmq
+          pip install ./crates/grpc_client/python msgspec pydantic numpy pyzmq aiohttp prometheus-client
           pytest -q grpc_servicer/tests -rs
 
       - name: Run CI tooling unit tests

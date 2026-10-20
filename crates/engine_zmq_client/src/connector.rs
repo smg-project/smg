@@ -42,7 +42,9 @@ use crate::{
         sglang::SglangProtocol, tokenspeed::TokenSpeedProtocol, vllm::VllmProtocol, EngineBatch,
         EngineLoad, EngineOutput, EngineProtocol, UtilityReply, WaveEvent,
     },
-    transport::{run_output_loop, send_message, ConnectedEngine, ConnectedTransport, EngineId},
+    transport::{
+        run_observed_output_loop, send_message, ConnectedEngine, ConnectedTransport, EngineId,
+    },
 };
 
 /// The vLLM EngineCore connector (the original engine surface).
@@ -380,6 +382,7 @@ struct InputQueueLimit {
 }
 
 struct ClientInner<P: EngineProtocol> {
+    observer: crate::observer::ObserverSlot,
     /// Frames for the shared input ROUTER socket, in submission order. The
     /// input writer ([`run_input_writer`]) owns the socket and writes them one
     /// at a time, so a caller that stopped waiting never cancels a write.
@@ -882,6 +885,7 @@ impl<P: EngineProtocol> ClientInner<P> {
 
     /// Send an Abort for one request id to its engine.
     async fn abort(&self, engine_id: &EngineId, request_id: &str) -> Result<()> {
+        crate::observer::observe(&self.observer, "abort", request_id.as_bytes());
         let payload = P::encode_abort(request_id)?;
         self.send_to_engine(engine_id, P::abort_frame(), payload, Vec::new())
             .await
@@ -891,6 +895,7 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// accept it: the frame goes out in order behind whatever the engine has
     /// not read yet, and the input writer reports a write that failed.
     fn queue_abort(&self, engine_id: &EngineId, request_id: &str) -> Result<()> {
+        crate::observer::observe(&self.observer, "abort", request_id.as_bytes());
         let payload = P::encode_abort(request_id)?;
         self.queue_frame(engine_id, P::abort_frame(), payload, Vec::new(), None, None)
     }
@@ -926,6 +931,7 @@ impl<P: EngineProtocol> Client<P> {
         let (abort_tx, abort_rx) = mpsc::unbounded_channel();
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(ClientInner {
+            observer: Default::default(),
             input_tx,
             send_timeout: Mutex::new(ENGINE_SEND_TIMEOUT),
             input_death_timeout: Mutex::new(ENGINE_INPUT_DEATH_TIMEOUT),
@@ -961,7 +967,11 @@ impl<P: EngineProtocol> Client<P> {
             clippy::disallowed_methods,
             reason = "background tasks are aborted on client drop"
         )]
-        let output_task = tokio::spawn(run_output_loop::<P>(output_socket, out_tx));
+        let output_task = tokio::spawn(run_observed_output_loop::<P>(
+            output_socket,
+            out_tx,
+            inner.observer.clone(),
+        ));
         #[expect(
             clippy::disallowed_methods,
             reason = "background tasks are aborted on client drop"
@@ -977,6 +987,11 @@ impl<P: EngineProtocol> Client<P> {
     /// The engines connected on this transport.
     pub fn engines(&self) -> &[ConnectedEngine] {
         &self.inner.engines
+    }
+
+    /// Install before admitting requests; used by the vLLM metrics bridge.
+    pub fn set_wire_observer(&self, observer: crate::observer::WireObserver) {
+        let _ = self.inner.observer.set(observer);
     }
 
     /// Whether the connection is still live. Becomes false once the dispatcher
@@ -1146,6 +1161,7 @@ impl<P: EngineProtocol> Client<P> {
             }
         };
         aux_frames.extend(extra_aux_frames);
+        crate::observer::observe(&self.inner.observer, "add", &payload);
         if let Err(error) = self
             .inner
             .send_add_to_engine(&guard.engine_id, payload, aux_frames)
@@ -1172,6 +1188,7 @@ impl<P: EngineProtocol> Client<P> {
 
         let (engine_id, request_id) = guard.complete();
         Ok(RequestStream {
+            observer: self.inner.observer.clone(),
             request_id,
             engine_id,
             receiver,
@@ -1572,6 +1589,7 @@ impl<P: EngineProtocol> SubmitGuard<'_, P> {
     /// Give the entry and the slot back; `abort` when the engine may hold or
     /// later read the add frame.
     fn take_back(&mut self, abort: bool) {
+        crate::observer::observe(&self.inner.observer, "abort", self.request_id.as_bytes());
         self.armed = false;
         self.inner.registry.lock().remove_all([&self.request_id]);
         self.inner.release_one(&self.engine_id, &self.request_id);
@@ -1602,6 +1620,7 @@ impl<P: EngineProtocol> Drop for SubmitGuard<'_, P> {
 /// Stream of outputs for one submitted request. Dropping it before the terminal
 /// output aborts the request on the engine.
 pub struct RequestStream<P: EngineProtocol> {
+    observer: crate::observer::ObserverSlot,
     request_id: String,
     engine_id: EngineId,
     receiver: OutputReceiver<P::Output>,
@@ -1636,12 +1655,14 @@ impl<P: EngineProtocol> Stream for RequestStream<P> {
         }
         match self.receiver.poll_recv(cx) {
             Poll::Ready(Some(Ok(output))) => {
+                crate::observer::observe(&self.observer, "consume", self.request_id.as_bytes());
                 if output.finished() {
                     self.finished = true;
                 }
                 Poll::Ready(Some(Ok(output)))
             }
             Poll::Ready(Some(Err(error))) => {
+                crate::observer::observe(&self.observer, "abort", self.request_id.as_bytes());
                 self.finished = true;
                 Poll::Ready(Some(Err(error)))
             }
@@ -1651,6 +1672,7 @@ impl<P: EngineProtocol> Stream for RequestStream<P> {
             // indistinguishable from a completed generation, and a truncated
             // response must not look complete to the caller.
             Poll::Ready(None) => {
+                crate::observer::observe(&self.observer, "abort", self.request_id.as_bytes());
                 self.finished = true;
                 Poll::Ready(Some(Err(Error::RequestStreamClosed {
                     request_id: self.request_id.clone(),
@@ -1688,8 +1710,9 @@ mod tests {
             handshake::EngineCoreReadyResponse,
             vllm::{
                 output::{
-                    DpControlMessage, DpControlOutput, EngineCoreFinishReason, EngineCoreOutput,
-                    EngineCoreOutputs, RequestBatchOutputs,
+                    decode_engine_core_outputs, DpControlMessage, DpControlOutput,
+                    EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs,
+                    RequestBatchOutputs,
                 },
                 request::{EngineCoreRequest, UtilityCall},
                 stats::SchedulerStats,
@@ -1832,6 +1855,11 @@ mod tests {
     #[tokio::test]
     async fn submit_streams_tokens_until_finish() {
         let (client, mut engine, _ns) = connect().await;
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let events = observed.clone();
+        client.set_wire_observer(Arc::new(move |kind, bytes| {
+            events.lock().push((kind.to_string(), bytes.to_vec()));
+        }));
 
         let request = EngineCoreRequest {
             request_id: "req-1".to_string(),
@@ -1845,6 +1873,7 @@ mod tests {
         assert_eq!(frames[0].as_ref(), b"\x00");
         let received: EngineCoreRequest = decode_msgpack(frames[1].as_ref()).unwrap();
         assert_eq!(received.request_id, "req-1");
+        assert_eq!(observed.lock()[0], ("add".to_string(), frames[1].to_vec()));
 
         engine
             .send_output(batch(
@@ -1878,6 +1907,18 @@ mod tests {
         assert!(second.finished());
         // Terminal output ends the stream.
         assert!(stream.next().await.is_none());
+        let events = observed.lock();
+        assert_eq!(
+            events.iter().filter(|(kind, _)| kind == "consume").count(),
+            2
+        );
+        let outputs: Vec<_> = events.iter().filter(|(kind, _)| kind == "output").collect();
+        assert_eq!(outputs.len(), 2);
+        let last = decode_engine_core_outputs(&[Bytes::copy_from_slice(&outputs[1].1)]).unwrap();
+        let EngineCoreOutputs::RequestBatch(last) = last else {
+            panic!("request batch")
+        };
+        assert_eq!(last.outputs[0].new_token_ids, vec![11]);
     }
 
     /// The silence the servicer reports for a frozen engine: nothing while

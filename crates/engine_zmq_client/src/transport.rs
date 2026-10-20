@@ -119,6 +119,8 @@ pub struct ConnectedEngine {
     pub engine_id: EngineId,
     /// Post-init configuration received on the input socket registration.
     pub ready_response: EngineCoreReadyResponse,
+    /// Original handshake metadata for consumers of engine-specific extensions.
+    pub ready_payload: Bytes,
 }
 
 /// The connected shared transport plus all registered engines after a
@@ -400,20 +402,22 @@ async fn wait_for_input_registrations(
         }
         let ready_response: EngineCoreReadyResponse = decode_msgpack(payload)?;
         debug!(?engine_id, "received input registration from engine");
-        ready_responses.insert(engine_id, ready_response);
+        ready_responses.insert(engine_id, (ready_response, payload.clone()));
     }
 
     expected_engines
         .into_iter()
         .map(|engine_id| {
-            let ready_response = ready_responses.remove(&engine_id).ok_or_else(|| {
-                unexpected_handshake(format!(
-                    "missing ready response for engine id {engine_id:?}"
-                ))
-            })?;
+            let (ready_response, ready_payload) =
+                ready_responses.remove(&engine_id).ok_or_else(|| {
+                    unexpected_handshake(format!(
+                        "missing ready response for engine id {engine_id:?}"
+                    ))
+                })?;
             Ok(ConnectedEngine {
                 engine_id,
                 ready_response,
+                ready_payload,
             })
         })
         .collect()
@@ -468,8 +472,17 @@ pub async fn send_message(
 /// `ENGINE_CORE_DEAD` sentinel, a transport error, or when the receiver is
 /// dropped. Decode errors are forwarded but do not stop the loop.
 pub async fn run_output_loop<P: EngineProtocol>(
+    output_socket: PullSocket,
+    tx: mpsc::Sender<Result<EngineBatch<P::Output>>>,
+) {
+    run_observed_output_loop::<P>(output_socket, tx, Default::default()).await;
+}
+
+/// Deliver metadata to the optional observer before dispatching decoded outputs.
+pub(crate) async fn run_observed_output_loop<P: EngineProtocol>(
     mut output_socket: PullSocket,
     tx: mpsc::Sender<Result<EngineBatch<P::Output>>>,
+    observer: crate::observer::ObserverSlot,
 ) {
     loop {
         let message = match output_socket.recv().await {
@@ -492,6 +505,7 @@ pub async fn run_output_loop<P: EngineProtocol>(
             return;
         }
 
+        crate::observer::observe(&observer, "output", frame);
         let decoded = match P::decode_batch(&frames) {
             Ok(decoded) => Ok(decoded),
             Err(error) => {

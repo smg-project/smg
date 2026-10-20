@@ -539,8 +539,16 @@ async fn non_streaming_yields_only_the_complete() {
 /// the engine-side request.
 #[tokio::test]
 async fn string_stops_are_matched_by_the_servicer() {
+    let events = Arc::new(Mutex::new(Vec::new()));
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
     let mut h = harness(model_info(), Some(tokenizer)).await;
+    let observed = events.clone();
+    h.server.set_wire_observer(Arc::new(move |kind, bytes| {
+        observed
+            .lock()
+            .unwrap()
+            .push((kind.to_owned(), bytes.to_vec()));
+    }));
     // "Hello world" is two mock tokens (1, 2), so it stays a string stop.
     let mut stream = h
         .client
@@ -589,6 +597,23 @@ async fn string_stops_are_matched_by_the_servicer() {
     // The engine is still generating from its point of view: it gets the
     // abort for the choice the servicer ended.
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["r3".to_string()]);
+    let events = events.lock().unwrap();
+    let kinds: Vec<_> = events.iter().map(|(kind, _)| kind.as_str()).collect();
+    assert_eq!(kinds.iter().filter(|kind| **kind == "consume").count(), 2);
+    assert_eq!(kinds.iter().filter(|kind| **kind == "processed").count(), 1);
+    let finished = events
+        .iter()
+        .position(|(kind, _)| kind == "finish")
+        .unwrap();
+    let aborted = events.iter().position(|(kind, _)| kind == "abort").unwrap();
+    assert!(
+        finished < aborted,
+        "record stop before the engine abort discards state"
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&events[finished].1).unwrap(),
+        serde_json::json!(["r3", 0, "stop", true])
+    );
 }
 
 /// A stop string that is one token (`world` is mock token 2) also reaches
@@ -3398,6 +3423,11 @@ async fn a_cancelled_decode_side_still_notifies_the_engine() {
 #[tokio::test]
 async fn greedy_sampling_with_several_choices_is_refused_before_the_fan_out() {
     let mut h = harness(model_info(), None).await;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observed = events.clone();
+    h.server.set_wire_observer(Arc::new(move |event, _| {
+        observed.lock().unwrap().push(event.to_owned());
+    }));
     let mut request = generate_request("g2", false, Vec::new());
     if let Some(params) = request.sampling_params.as_mut() {
         params.n = 2;
@@ -3409,6 +3439,7 @@ async fn greedy_sampling_with_several_choices_is_refused_before_the_fan_out() {
         status.message(),
         "n must be 1 when using greedy sampling, got 2."
     );
+    assert!(!events.lock().unwrap().iter().any(|event| event == "parent"));
     assert_engine_idle(&mut h.engine_in).await;
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
@@ -3793,4 +3824,32 @@ async fn a_shutdown_after_the_engines_completion_ends_the_stream_cleanly() {
         "a clean end after the completion, not a status"
     );
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Cancelling a partially submitted fan-out releases bookkeeping for unsent children too.
+#[tokio::test]
+async fn cancelled_submission_forgets_parent_metrics() {
+    let h = harness(model_info(), None).await;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observed = events.clone();
+    h.server.set_wire_observer(Arc::new(move |event, _| {
+        observed.lock().unwrap().push(event.to_owned());
+    }));
+    let mut request = generate_request("cancel-metrics", true, Vec::new());
+    request.sampling_params.as_mut().unwrap().n = 256;
+    // Fan-out yields on the engine input writer before all choices are submitted.
+    {
+        let submission = generate::generate(&h.server.state, request, None);
+        tokio::pin!(submission);
+        assert!(futures::poll!(&mut submission).is_pending());
+        assert!(events.lock().unwrap().iter().any(|event| event == "parent"));
+    }
+    let events = events.lock().unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| *event == "forget_parent")
+            .count(),
+        1
+    );
 }

@@ -1218,6 +1218,31 @@ def test_serve_rust_starts_the_engine_cores_from_this_process(monkeypatch, tmp_p
     assert recorded["configs"][0][0] is args and recorded["configs"][1][0].headless is True
 
 
+def test_compiled_metrics_observer_binding(tmp_path):
+    """The installed extension accepts the observer before the engine handshake."""
+    import threading
+
+    logged = threading.Event()
+    servicer = pytest.importorskip("smg.servicer")
+    server = servicer.VllmGrpcServer(
+        bind_address="127.0.0.1:0",
+        ipc_base_url=f"ipc://{tmp_path}/wire",
+        handshake_address=f"ipc://{tmp_path}/handshake",
+        model_path="test-model",
+        engine_startup_timeout_secs=2.0,
+    )
+    try:
+        server.set_metrics_observer(lambda event, payload, timestamp: logged.set())
+        server.log_metrics()
+        assert logged.wait(2)
+        with pytest.raises(ValueError, match="already installed"):
+            server.set_metrics_observer(lambda *args: None)
+        assert not server.engine_ready
+    finally:
+        server.stop()
+    assert not server.running
+
+
 def test_serve_rust_fakes_leave_the_installed_package_untouched():
     """The fakes `_install_fake_servicer` installs (the helper every `serve_rust`
     test here goes through) go under a fake ``smg`` package, so the installed
@@ -1546,12 +1571,31 @@ def test_kv_event_publishing_is_on_by_default_under_the_rust_servicer(monkeypatc
     assert args.kv_events_config is applied
 
 
-def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, tmp_path):
+@pytest.mark.parametrize("ops_port", [None, 9090])
+@pytest.mark.parametrize("disable_stats", [False, True])
+def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(
+    monkeypatch, tmp_path, ops_port, disable_stats
+):
     """The upstream hook hands `serve_rust` its parsed namespace: the Rust
     server binds the launcher's host/port, the engine cores are launched
     from that same namespace (plus the handshake), and both are supervised.
     argv is never consulted, so the `vllm serve <model> --grpc` form works."""
     recorded: dict = {}
+    ops_events = []
+
+    class FakeOps:
+        def __init__(self, config, port, *, log_stats, host):
+            assert host == "0.0.0.0"
+            assert port == ops_port and log_stats is not disable_stats
+            ops_events.append("descriptors")
+
+        async def start(self, server):
+            ops_events.append("http")
+
+        async def close(self):
+            ops_events.append("closed")
+
+    _install(monkeypatch, "smg_grpc_servicer.vllm.rust_ops", RustOps=FakeOps)
 
     class AsyncEngineArgs:
         @staticmethod
@@ -1559,7 +1603,7 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
             recorded["engine_args_from"] = args
             return SimpleNamespace(
                 create_engine_config=lambda usage_context: _config(),
-                disable_log_stats=False,
+                disable_log_stats=disable_stats,
             )
 
     _stub_frontend_args(monkeypatch)
@@ -1570,6 +1614,8 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
     launched: list[argparse.Namespace] = []
 
     def fake_launch(ns):
+        if ops_port is not None:
+            assert ops_events == ["descriptors", "http"]
         launched.append(ns)
         return FakeEngine()
 
@@ -1587,9 +1633,16 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
     monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
 
     args = argparse.Namespace(
-        model_tag="org/m", model="org/m", grpc=True, host=None, port=50051, max_model_len=4096
+        model_tag="org/m",
+        model="org/m",
+        grpc=True,
+        host=None,
+        port=50051,
+        max_model_len=4096,
+        metrics_port=ops_port,
     )
     assert asyncio.run(rust.serve_rust(args)) == 0
+    assert ops_events == (["descriptors", "http", "closed"] if ops_port is not None else [])
 
     server, engine, drain_secs = recorded["supervised"]
     assert isinstance(server, FakeServer) and isinstance(engine, FakeEngine)
@@ -1626,7 +1679,7 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
     assert kwargs["eos_token_ids"] == [151645, 151643, 7]
     assert kwargs["kv_connector"] == ""
     # The engine cores run with their statistics on: the servicer is told.
-    assert kwargs["log_stats"] is True
+    assert kwargs["log_stats"] is not disable_stats
 
     (ns,) = launched
     assert ns.model == "org/m" and ns.model_tag is None and ns.grpc is False
@@ -1782,6 +1835,64 @@ def test_require_python_media_mode_is_the_servicers_refusal_as_a_configuration_e
     )
     # A launcher namespace without the flags (no plugin loaded) reads the environment.
     assert rust.require_python_media_mode(argparse.Namespace(model="org/m"), environ={}) == "off"
+
+
+def test_metrics_port_argument_is_scoped_and_preserves_upstream():
+    """Only gRPC parsers gain the opt-in port; upstream definitions keep their defaults."""
+    from smg_grpc_servicer.vllm.plugin import add_metrics_argument
+
+    plain = argparse.ArgumentParser()
+    add_metrics_argument(plain)
+    assert "--metrics-port" not in plain._option_string_actions
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--grpc", action="store_true")
+    add_metrics_argument(parser)
+    add_metrics_argument(parser)
+    assert parser.parse_args([]).metrics_port is None
+    assert parser.parse_args(["--metrics-port", "9090"]).metrics_port == 9090
+    upstream = argparse.ArgumentParser()
+    upstream.add_argument("--grpc", action="store_true")
+    upstream.add_argument("--metrics-port", type=int, default=9191)
+    add_metrics_argument(upstream)
+    assert upstream.parse_args([]).metrics_port == 9191
+
+
+@pytest.mark.parametrize(
+    "arguments, valid",
+    [
+        (["--grpc", "--servicer-impl", "rust", "--metrics-port", "9090"], True),
+        (["--grpc", "--servicer-impl", "python", "--metrics-port", "9090"], False),
+        (["--grpc", "--servicer-impl", "rust", "--metrics-port", "0"], False),
+        (["--grpc", "--servicer-impl", "rust", "--metrics-port", "65536"], False),
+        (["--grpc", "--servicer-impl", "rust", "--metrics-port", "50051"], False),
+    ],
+)
+@pytest.mark.parametrize("upstream", [False, True])
+def test_metrics_port_plugin_validates_before_engine_start(monkeypatch, arguments, valid, upstream):
+    """The actual parse wrapper refuses unusable ports and Python-mode metrics requests."""
+    from smg_grpc_servicer.vllm import plugin
+
+    class Parser(argparse.ArgumentParser):
+        pass
+
+    _install(monkeypatch, "vllm.utils.argparse_utils", FlexibleArgumentParser=Parser)
+    monkeypatch.setattr(plugin, "install_launcher_switch", lambda: None)
+    monkeypatch.setattr(plugin, "check_servicer_impl", lambda parser, args: args.servicer_impl)
+    monkeypatch.setattr(plugin, "handoff_mm_flags", lambda *args: None)
+    monkeypatch.setattr(plugin, "handoff_capture_cap", lambda *args: None)
+    monkeypatch.setenv(rust.SERVICER_IMPL_ENV, "python")
+    plugin.register()
+    parser = Parser()
+    parser.add_argument("--grpc", action="store_true")
+    parser.add_argument("--port", type=int, default=50051)
+    if upstream:
+        parser.add_argument("--metrics-port", type=int)
+    if valid or (upstream and "python" in arguments):
+        assert parser.parse_args(arguments).metrics_port == 9090
+    else:
+        with pytest.raises(SystemExit) as error:
+            parser.parse_args(arguments)
+        assert error.value.code == 2
 
 
 def test_the_switch_refuses_a_host_with_no_free_publisher_port_as_the_rust_path_does(

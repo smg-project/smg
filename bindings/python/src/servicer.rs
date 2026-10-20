@@ -5,13 +5,14 @@
 //! engines bind the same way as their protocols land. Rust owns the
 //! listener, the engine link, and the request path; Python launches the
 //! headless engine, starts and stops the server, and announces draining. The
-//! one request-time crossing is worker-side media processing, when the
+//! worker-side media crossing runs when the
 //! Python processor is chosen: a request's `media_refs` go to a Python object
 //! that runs the engine's own processors (the Python servicer's, with vLLM's
 //! input processor behind them), and what it produces comes back as bytes
 //! the engine reads directly. The other choice, smg's own pipeline
 //! ([`SmgMediaProcessor`]), never crosses: it is the Router's media pipeline
 //! run in this process.
+//! Optional metrics events cross into Python to reuse vLLM statistics and collectors.
 
 use std::{
     collections::HashMap,
@@ -608,10 +609,58 @@ fn native_media_options(
 #[pyclass(name = "VllmGrpcServer")]
 pub struct PyVllmGrpcServer {
     inner: VllmServicerServer,
+    metrics: Mutex<Option<Arc<crate::metrics_observer::MetricsObserver>>>,
 }
 
 #[pymethods]
 impl PyVllmGrpcServer {
+    /// Deliver statistics on a bounded worker so inference never waits for Python.
+    fn set_metrics_observer(&self, observer: Py<PyAny>) -> PyResult<()> {
+        let mut slot = self
+            .metrics
+            .lock()
+            .map_err(|_| to_py_err(ServicerError::Poisoned))?;
+        if slot.is_some() {
+            return Err(PyValueError::new_err(
+                "metrics observer is already installed",
+            ));
+        }
+        let worker = Arc::new(
+            crate::metrics_observer::MetricsObserver::new(move |events| {
+                Python::attach(|py| {
+                    for (event, payload, timestamp) in events {
+                        if let Err(error) =
+                            observer.call1(py, (event, PyBytes::new(py, payload), timestamp))
+                        {
+                            error.write_unraisable(py, None);
+                        }
+                    }
+                });
+            })
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
+        );
+        let producer = worker.clone();
+        self.inner
+            .set_wire_observer(Arc::new(move |event, payload| {
+                producer.observe(event, payload);
+            }));
+        *slot = Some(worker);
+        Ok(())
+    }
+
+    /// Queue periodic native logging without running plugins on Python's event loop.
+    fn log_metrics(&self) -> PyResult<()> {
+        if let Some(metrics) = self
+            .metrics
+            .lock()
+            .map_err(|_| to_py_err(ServicerError::Poisoned))?
+            .as_ref()
+        {
+            metrics.observe("log", b"");
+        }
+        Ok(())
+    }
+
     #[new]
     #[pyo3(signature = (
         bind_address,
@@ -822,7 +871,10 @@ impl PyVllmGrpcServer {
             }));
             VllmServicerServer::start_with_tokenizer(config, tokenizer).map_err(to_py_err)
         })?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            metrics: Mutex::new(None),
+        })
     }
 
     /// The bound `ip:port`.
@@ -873,7 +925,25 @@ impl PyVllmGrpcServer {
             ));
         }
         let timeout = Duration::from_secs_f64(timeout_secs);
-        py.detach(|| self.inner.stop(timeout)).map_err(to_py_err)
+        py.detach(|| {
+            let start = std::time::Instant::now();
+            let metrics = self
+                .metrics
+                .lock()
+                .map_err(|_| ServicerError::Poisoned)?
+                .clone();
+            if let Some(metrics) = &metrics {
+                metrics.signal_stop();
+            }
+            let result = self.inner.stop(timeout);
+            if let Some(metrics) = metrics {
+                if !metrics.close(timeout.saturating_sub(start.elapsed())) {
+                    return Err(ServicerError::StopTimeout);
+                }
+            }
+            result
+        })
+        .map_err(to_py_err)
     }
 }
 

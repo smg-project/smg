@@ -77,6 +77,9 @@ pub(super) async fn connect_engine(
     .await
     {
         Ok(client) => {
+            if let Some(observer) = state.observer.get() {
+                client.set_wire_observer(observer.clone());
+            }
             client.adopt_tokenizer_eos(state.tokenizer());
             client.set_structured_outputs_backend(structured_outputs_backend_from_config(
                 &state.model.structured_outputs_backend,
