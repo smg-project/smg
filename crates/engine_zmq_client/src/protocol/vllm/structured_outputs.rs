@@ -159,7 +159,7 @@ pub fn choice_as_grammar(choices: &[String]) -> String {
 }
 
 /// Whether a nested schema value (an object, or an array of objects) fails
-/// `check`, the recursion both feature checks share.
+/// `check`, the recursion of [`has_xgrammar_unsupported_json_features`].
 fn any_nested(obj: &serde_json::Map<String, Value>, check: fn(&Value) -> bool) -> bool {
     obj.values().any(|value| match value {
         Value::Object(_) => check(value),

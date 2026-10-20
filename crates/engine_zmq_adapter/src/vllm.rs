@@ -917,7 +917,9 @@ pub(crate) fn validate_sampling(sp: &vllm::SamplingParams, max_tokens: u32) -> R
 /// xgrammar's converter drops those keywords and the engine answers off the
 /// schema with a 200. The same refusal here for every config that resolves to
 /// xgrammar, `auto` included; a backend that enforces such a schema itself
-/// takes it as is.
+/// takes it as is. The constraint is one `JsonSchema` whatever built it: a
+/// `response_format` schema, or the tool parameters of a forced tool call on
+/// a parser without structural tags; the message names both.
 pub(crate) fn refuse_schema_xgrammar_cannot_enforce(
     sp: &vllm::SamplingParams,
     structured_backend: StructuredOutputsBackendConfig,
@@ -930,7 +932,8 @@ pub(crate) fn refuse_schema_xgrammar_cannot_enforce(
     };
     if has_xgrammar_unsupported_json_features(&serde_json::Value::String(schema.clone())) {
         return Err(
-            "The provided JSON schema contains features not supported by xgrammar, the \
+            "The JSON schema constraint (a response_format schema, or the tool parameters of a \
+             forced tool call) contains features not supported by xgrammar, the \
              structured-output backend this engine runs (multipleOf; uniqueItems or contains; \
              an unsupported string format; minLength/maxLength beside pattern or format; \
              propertyNames or patternProperties beside other property keywords)"
@@ -1798,7 +1801,10 @@ mod tests {
     /// is xgrammar, `auto` included, as vLLM's frontend refuses it under
     /// `backend=xgrammar`: xgrammar would compile it with the keyword dropped
     /// and the engine would answer off the schema. A pinned guidance enforces
-    /// such a schema and takes it as is.
+    /// such a schema and takes it as is. The tool parameters of a forced tool
+    /// call reach this translation as the same `JsonSchema` constraint (a
+    /// parser without structural tags builds one from the tools), so a tool
+    /// whose parameters use such a keyword is refused the same way.
     #[test]
     fn a_schema_xgrammar_cannot_enforce_is_refused_wherever_xgrammar_is_the_backend() {
         use engine_zmq_client::protocol::vllm::structured_outputs::StructuredOutputConstraint;
@@ -1828,6 +1834,14 @@ mod tests {
                 "{config:?}: {refused}"
             );
         }
+        // The parameters of a forced tool call, as a tool-call parser without
+        // structural tags sends them: an array parameter with `uniqueItems`.
+        let tool_parameters = r#"{"type":"object","properties":{"tags":{"type":"array","items":{"type":"string"},"uniqueItems":true}},"required":["tags"]}"#;
+        let refused = translate(schema(tool_parameters), Auto).expect_err("refused");
+        assert!(
+            refused.contains("tool parameters of a forced tool call"),
+            "{refused}"
+        );
         let params = translate(
             schema(multiple_of),
             Pinned(StructuredOutputBackend::Guidance),
