@@ -216,11 +216,12 @@ def register() -> None:
         # Python servicer after the model loaded, and the refusal is the only
         # line such a launch prints.
         impl = check_servicer_impl(self, parsed)
-        if getattr(self, "_smg_metrics_port", False) and parsed.metrics_port is not None:
-            if impl != "rust":
+        metrics_port = getattr(parsed, "metrics_port", None)
+        if metrics_port is not None:
+            if impl != "rust" and getattr(self, "_smg_metrics_port", False):
                 self.error("--metrics-port requires --grpc --servicer-impl rust")
-            if not 1 <= parsed.metrics_port <= 65535 or parsed.metrics_port == getattr(
-                parsed, "port", None
+            if impl == "rust" and (
+                not 1 <= metrics_port <= 65535 or metrics_port == getattr(parsed, "port", None)
             ):
                 self.error("--metrics-port must be 1..65535 and differ from --port")
         # Upstream's launcher builds the Python servicer without its

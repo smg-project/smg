@@ -1867,7 +1867,8 @@ def test_metrics_port_argument_is_scoped_and_preserves_upstream():
         (["--grpc", "--servicer-impl", "rust", "--metrics-port", "50051"], False),
     ],
 )
-def test_metrics_port_plugin_validates_before_engine_start(monkeypatch, arguments, valid):
+@pytest.mark.parametrize("upstream", [False, True])
+def test_metrics_port_plugin_validates_before_engine_start(monkeypatch, arguments, valid, upstream):
     """The actual parse wrapper refuses unusable ports and Python-mode metrics requests."""
     from smg_grpc_servicer.vllm import plugin
 
@@ -1884,7 +1885,9 @@ def test_metrics_port_plugin_validates_before_engine_start(monkeypatch, argument
     parser = Parser()
     parser.add_argument("--grpc", action="store_true")
     parser.add_argument("--port", type=int, default=50051)
-    if valid:
+    if upstream:
+        parser.add_argument("--metrics-port", type=int)
+    if valid or (upstream and "python" in arguments):
         assert parser.parse_args(arguments).metrics_port == 9090
     else:
         with pytest.raises(SystemExit) as error:
