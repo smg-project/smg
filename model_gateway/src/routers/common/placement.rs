@@ -416,11 +416,10 @@ fn overload_fallback(
                     Some((key, _)) => split.arm_for_key(key),
                     None => split.arm_at_random(&mut rand::rng()),
                 };
-                // The arm's group whole, not the admitted members alone: the
-                // fallback's own all-vetoed check and readiness and shed filters
-                // run over the group as they do over a pool, so a group with a
-                // worker that is down but not vetoed keeps its unavailable
-                // answer; the other groups stay out, a drained one among them.
+                // The arm's group whole: the pool is all vetoed (checked above),
+                // so the group is too, and the fallback's readiness and shed
+                // filters pick inside it as they would over the pool; the other
+                // groups stay out, a drained one among them.
                 let members: Vec<Arc<dyn Worker>> = candidates
                     .iter()
                     .filter(|worker| traffic_split::group_of(worker.as_ref()) == arm.name)
