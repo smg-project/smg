@@ -6,7 +6,7 @@ import os
 from unittest.mock import patch
 
 import pytest
-from infra.constants import LOCAL_RUNTIMES, RUNTIME_LABELS, ConnectionMode, Runtime
+from infra.constants import DEFAULT_HOST, LOCAL_RUNTIMES, RUNTIME_LABELS, ConnectionMode, Runtime
 from infra.worker import Worker
 
 MODEL = "meta-llama/Llama-3.2-1B-Instruct"
@@ -32,6 +32,7 @@ def test_the_grpc_and_http_commands_bind_the_worker_port_and_an_admin_port(mode)
     with patch.dict(os.environ, {"MOCK_WORKER_BIN": "/opt/bin/mock-worker"}):
         cmd = worker._build_cmd()
     assert cmd[0] == "/opt/bin/mock-worker"
+    assert _flag(cmd, "--host") == DEFAULT_HOST, "the lane's loopback, as the engines get it"
     port_flag = "--grpc-base-port" if mode == ConnectionMode.GRPC else "--http-base-port"
     count_flag = "--grpc-count" if mode == ConnectionMode.GRPC else "--http-count"
     assert _flag(cmd, port_flag) == "31001"
@@ -51,6 +52,9 @@ def test_the_zmq_command_dials_the_handshake_the_gateway_derives():
     cmd = worker._build_cmd()
     assert cmd[0] == "mock-worker", "the binary on the PATH when MOCK_WORKER_BIN is unset"
     assert _flag(cmd, "--zmq-count") == "1"
+    # The gateway binds the derived handshake on the IPv4 loopback whatever
+    # the lane's host is.
+    assert _flag(cmd, "--zmq-handshake").startswith("tcp://127.0.0.1:")
     assert (
         _flag(cmd, "--zmq-handshake") == f"tcp://127.0.0.1:{_zmq_handshake_port(worker.base_url)}"
     )
@@ -61,6 +65,10 @@ def test_an_admin_port_given_to_the_worker_is_kept():
     worker = _worker(ConnectionMode.GRPC, admin_port=31999)
     cmd = worker._build_cmd()
     assert _flag(cmd, "--admin-port") == "31999"
+    assert not worker._admin_port_auto, "a caller's port is the caller's to release"
+    picked = _worker(ConnectionMode.GRPC)
+    picked._build_cmd()
+    assert picked._admin_port_auto, "a port the harness picked is released at stop"
 
 
 def test_an_engine_without_an_admin_api_has_no_admin_url():

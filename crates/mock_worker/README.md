@@ -309,8 +309,12 @@ answers `/v1/chat/completions`, `/v1/completions` and `/generate` with the
 frame with `matched_stop`, under `stream_options.include_usage` a usage
 chunk of its own, then `[DONE]`; or one JSON body) and keys its prompt on its synthetic ids, one
 per whitespace word of the prompt text (`http::synth_token_ids`). An answer
-without `output_ids` has no frames on the token wires (the `Complete` alone
-is sent); one without `output_text` has none on the HTTP wire.
+without `output_ids` is encoded on the token wires with the worker's
+`--tokenizer`, which must then name local tokenizer files (a directory with
+`tokenizer.json`, or the file): the mock never fetches a tokenizer, and an
+answer it cannot encode (no such files, or per-piece `logprobs` that do not
+align with the encoded ids) fails the request with the reason instead of a
+canned answer; one without `output_text` has no frames on the HTTP wire.
 
 ```bash
 cargo run --release -p mock-worker -- \

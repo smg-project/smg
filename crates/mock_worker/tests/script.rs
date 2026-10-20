@@ -300,6 +300,37 @@ async fn grpc_encodes_a_scripted_text_with_the_workers_tokenizer() {
     ));
 }
 
+#[tokio::test]
+async fn grpc_fails_a_text_answer_it_cannot_encode_instead_of_answering_canned() {
+    let cfg = Config {
+        tokenizer_path: "/nonexistent/tokenizer-dir".to_string(),
+        ..config(None)
+    };
+    let (client, worker) = start_grpc(cfg).await;
+    script::enqueue(
+        &worker,
+        vec![
+            script::Answer::parse(&json!({"output_text": "no tokenizer here"}))
+                .expect("a text answer"),
+        ],
+    )
+    .expect("a started worker");
+    let error = match client
+        .generate(grpc_request("e", &[7, 7], false, false))
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("the call must fail before any frame"),
+    };
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+    assert!(error.message().contains("tokenizer"), "{error}");
+    let state = script::status(&worker).expect("a started worker");
+    assert_eq!(
+        state["queued"], 0,
+        "the answer was taken, and the failure says so"
+    );
+}
+
 // ── the admin API ───────────────────────────────────────────────────────────
 
 #[tokio::test]

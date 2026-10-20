@@ -236,7 +236,9 @@ impl TokenSpeedScheduler for MockScheduler {
             .as_ref()
             .map(|tokenized| tokenized.input_ids.as_slice())
             .unwrap_or(&[]);
-        if let Some(answer) = script::take_ids(&self.cfg, &self.name, prompt_ids) {
+        let scripted = script::take_ids(&self.cfg, &self.name, prompt_ids)
+            .map_err(Status::failed_precondition)?;
+        if let Some(answer) = scripted {
             let prompt_tokens = answer.prompt_tokens(prompt_ids.len());
             let stream = scripted_stream(
                 answer,

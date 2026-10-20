@@ -94,6 +94,8 @@ class Worker:
     # Mock engine only: the port of the mock worker's admin API, where a test
     # states the answers the worker's next requests get.
     admin_port: int | None = None
+    # Whether the harness picked ``admin_port`` (and releases it at stop).
+    _admin_port_auto: bool = field(default=False, repr=False)
     process: subprocess.Popen | None = field(default=None, repr=False)
     # Where the engine's output lands when it is not shown on the terminal.
     log_path: str | None = field(default=None, repr=False)
@@ -298,6 +300,10 @@ class Worker:
         if self.dist_init_port is not None:
             release_port(self.dist_init_port)
             self.dist_init_port = None
+        if self._admin_port_auto and self.admin_port is not None:
+            release_port(self.admin_port)
+            self.admin_port = None
+            self._admin_port_auto = False
         for port in self._moriio_ports:
             release_port(port)
 
@@ -549,8 +555,11 @@ class Worker:
         """
         if self.admin_port is None:
             self.admin_port = get_open_port()
+            self._admin_port_auto = True
         cmd = [
             os.environ.get("MOCK_WORKER_BIN", "mock-worker"),
+            "--host",
+            DEFAULT_HOST,
             "--model",
             model_path,
             "--tokenizer",
@@ -564,10 +573,12 @@ class Worker:
             cmd += ["--grpc-base-port", str(self.port), "--grpc-count", "1"]
         elif self.mode == ConnectionMode.ZMQ:
             # The gateway binds the handshake it derives from the worker's
-            # ipc:// URL; the rank dials it, as an engine does.
+            # ipc:// URL on the IPv4 loopback whatever the lane's host is
+            # (the ZMQ adapter's fixed loopback); the rank dials it, as an
+            # engine does.
             from smg.serve import _zmq_handshake_port
 
-            handshake = f"tcp://{DEFAULT_HOST}:{_zmq_handshake_port(self.base_url)}"
+            handshake = f"tcp://127.0.0.1:{_zmq_handshake_port(self.base_url)}"
             cmd += ["--zmq-handshake", handshake, "--zmq-count", "1"]
         else:
             cmd += ["--http-base-port", str(self.port), "--http-count", "1"]

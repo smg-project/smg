@@ -299,14 +299,17 @@ impl Answer {
             .encode(&text, false)
             .map_err(|e| format!("encoding the scripted text: {e}"))?;
         self.output_ids = encoding.token_ids().to_vec();
-        // Per-token logprobs were given per piece; they align with the ids
-        // only when the pieces were tokens, which the encode does not promise.
-        if self
-            .logprobs
-            .as_ref()
-            .is_some_and(|logprobs| logprobs.len() != self.output_ids.len())
-        {
-            self.logprobs = None;
+        // Per-piece logprobs align with the ids only when the pieces were
+        // tokens, which the encode does not promise: an answer that wants
+        // logprobs on a token wire gives ids.
+        if let Some(logprobs) = &self.logprobs {
+            if logprobs.len() != self.output_ids.len() {
+                return Err(format!(
+                    "{} logprobs for {} encoded ids: give output_ids with logprobs on a token wire",
+                    logprobs.len(),
+                    self.output_ids.len()
+                ));
+            }
         }
         Ok(self)
     }
@@ -559,36 +562,56 @@ pub fn register(worker: &str) {
     store().workers.insert(worker.to_string());
 }
 
-static TOKENIZER: OnceLock<Result<Arc<dyn Tokenizer>, String>> = OnceLock::new();
+type LoadedTokenizer = Result<Arc<dyn Tokenizer>, String>;
+static TOKENIZERS: OnceLock<Mutex<HashMap<String, LoadedTokenizer>>> = OnceLock::new();
 
-/// The tokenizer the worker's `--tokenizer` names, loaded on first use: what
-/// a token wire encodes a scripted `output_text` with when the answer has
-/// no ids. The gateway tokenizes prompts with the same files, so the ids
-/// the mock sends back decode to the text the test wrote.
-pub fn tokenizer(cfg: &Config) -> Result<Arc<dyn Tokenizer>, String> {
-    TOKENIZER
-        .get_or_init(|| {
-            llm_tokenizer::factory::create_tokenizer(&cfg.tokenizer_path)
+/// The tokenizer the worker's `--tokenizer` names, loaded on first use and
+/// kept per path: what a token wire encodes a scripted `output_text` with
+/// when the answer has no ids. The gateway tokenizes prompts with the same
+/// files, so the ids the mock sends back decode to the text the test wrote.
+pub fn tokenizer(cfg: &Config) -> LoadedTokenizer {
+    let mut loaded = TOKENIZERS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    loaded
+        .entry(cfg.tokenizer_path.clone())
+        .or_insert_with(|| {
+            // Local files only: the mock encodes with the files the gateway
+            // was pointed at, and never fetches a tokenizer from a hub (the
+            // hub loader blocks on a runtime of its own, which a worker's
+            // request path must not do).
+            let path = Path::new(&cfg.tokenizer_path);
+            if !path.exists() {
+                return Err(format!(
+                    "tokenizer {}: not a local file or directory",
+                    cfg.tokenizer_path
+                ));
+            }
+            llm_tokenizer::factory::create_tokenizer_from_file(&cfg.tokenizer_path)
                 .map_err(|e| format!("tokenizer {}: {e}", cfg.tokenizer_path))
         })
         .clone()
 }
 
 /// [`take`], with a text-only answer encoded for a token wire: the answer
-/// with its ids, or `None` with the reason logged when the worker has no
-/// tokenizer to encode it with (the request then runs as a miss would).
-pub fn take_ids(cfg: &Config, worker: &str, prompt_ids: &[u32]) -> Option<Answer> {
-    let answer = take(worker, prompt_ids)?;
+/// with its ids. An answer that cannot be encoded (no tokenizer to load, or
+/// logprobs that do not align) is an `Err` the wire fails the request with,
+/// so a test learns the reason instead of reading a canned answer.
+pub fn take_ids(cfg: &Config, worker: &str, prompt_ids: &[u32]) -> Result<Option<Answer>, String> {
+    let Some(answer) = take(worker, prompt_ids) else {
+        return Ok(None);
+    };
     if !answer.output_ids.is_empty() || answer.output_text.is_none() {
-        return Some(answer);
+        return Ok(Some(answer));
     }
-    match tokenizer(cfg).and_then(|tokenizer| answer.encoded_with(tokenizer.as_ref())) {
-        Ok(answer) => Some(answer),
-        Err(e) => {
+    tokenizer(cfg)
+        .and_then(|tokenizer| answer.encoded_with(tokenizer.as_ref()))
+        .map(Some)
+        .map_err(|e| {
             tracing::error!("{worker}: a scripted text cannot go on this wire: {e}");
-            None
-        }
-    }
+            format!("the scripted answer cannot go on this wire: {e}")
+        })
 }
 
 /// Load a `--script` file: one answer per line, each with a `key` or its
@@ -850,17 +873,20 @@ mod tests {
             .to_vec();
         assert!(!expected.is_empty());
 
-        let text_only = parse(r#"{"output_text": "hello world", "logprobs": [-0.5]}"#)
+        let text_only = parse(r#"{"output_text": "hello world"}"#)
             .expect("answer")
             .answer;
         let encoded = text_only.encoded_with(&tokenizer).expect("encoded");
         assert_eq!(encoded.output_ids, expected);
         assert_eq!(encoded.text(), "hello world", "the text stays");
         if expected.len() != 1 {
-            assert!(
-                encoded.logprobs.is_none(),
-                "logprobs that no longer align are dropped"
-            );
+            let with_logprob = parse(r#"{"output_text": "hello world", "logprobs": [-0.5]}"#)
+                .expect("answer")
+                .answer;
+            let refused = with_logprob
+                .encoded_with(&tokenizer)
+                .expect_err("per-piece logprobs that do not align with the ids are refused");
+            assert!(refused.contains("give output_ids"), "{refused}");
         }
 
         let with_ids = parse(r#"{"output_ids": [4, 5], "output_text": "hello world"}"#)

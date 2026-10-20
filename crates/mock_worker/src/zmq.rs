@@ -180,7 +180,20 @@ pub async fn serve_until(
                 let in_flight = InFlight::enter();
                 // A scripted answer, ahead of either engine mode: the rank's
                 // queue or the prompt's key decides ([`crate::script`]).
-                if let Some(answer) = script::take_ids(&cfg, &name, &prompt) {
+                let scripted = match script::take_ids(&cfg, &name, &prompt) {
+                    Ok(scripted) => scripted,
+                    Err(_) => {
+                        // The reason is in the log; the request ends as one
+                        // an engine failed, which the gateway reports.
+                        let _ = out_tx.send(terminal_batch(
+                            engine_index,
+                            request_id,
+                            EngineCoreFinishReason::Error,
+                        ));
+                        continue;
+                    }
+                };
+                if let Some(answer) = scripted {
                     let want_logprobs = request
                         .sampling_params
                         .as_ref()
