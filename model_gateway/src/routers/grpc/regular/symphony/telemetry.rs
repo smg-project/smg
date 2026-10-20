@@ -10,7 +10,11 @@
 //!   row leads, kept as content text (`Event::Malformed`), by its reason; the bytes reach the
 //!   client as content, or, where the syntax's block is never prose, are dropped behind an event of
 //!   no bytes (`Dropped { MalformedCall }`) and sized here as that event's; nothing is lost in the
-//!   events, and nothing says so to the client;
+//!   events, and nothing says so to the client. An output whose only answer is such a dropped
+//!   block (no content, no call: a call written as Python where the name goes) is the one case
+//!   where the reader releases the dropped bytes as content before the finish (`Reader::end`),
+//!   so a client never reads an empty answer where the model wrote one; the output still counts
+//!   as `malformed`, and its line says how many bytes went out;
 //! - `dropped`: bytes the table treats as the template's wrapping (`Event::Dropped`): correct,
 //!   expected on every output, not counted here;
 //! - `empty`: an output with no text, no reasoning and no call: only bytes the table drops
@@ -275,8 +279,10 @@ pub(crate) struct Tally {
     dropped_tokens: u32,
     /// The engine's finish, as the `Finish` event says it.
     finish: &'static str,
-    /// The dropped whitespace the reader released as content at the end of an empty output;
-    /// whether it reaches the client is the surface's rule (the chat stream carries it).
+    /// The bytes the reader released as content at the end of the output: the dropped whitespace
+    /// of an empty output, whether it reaches the client being the surface's rule (the chat
+    /// stream carries it), or the refused call blocks of an output that answered with nothing
+    /// else, which every surface carries.
     released: u64,
 }
 
@@ -356,13 +362,19 @@ impl Tally {
         self.shown += bytes as u64;
     }
 
+    /// Where the next event's bytes start in the output: the bytes of the events seen so far.
+    pub(super) fn at(&self) -> usize {
+        self.at
+    }
+
     /// Whether the output showed nothing: no text, no call begun, and no malformed run (whose
     /// text is content); only dropped bytes, or none at all.
     pub(super) fn is_empty(&self) -> bool {
         self.shown == 0 && self.calls_begun == 0 && self.malformed() == 0
     }
 
-    /// `bytes` of the dropped whitespace were released as content at the end of an empty output.
+    /// `bytes` the table dropped were released as content at the end of the output: whitespace
+    /// of an empty output, or the refused call blocks of one that answered with nothing else.
     pub(super) fn released(&mut self, bytes: usize) {
         self.released += bytes as u64;
     }
@@ -477,6 +489,7 @@ impl Tally {
             reasons = %self.reasons_seen(),
             tool_calls = self.tool_calls,
             suppressed_calls = self.suppressed_calls,
+            released_bytes = self.released,
             suppressed_lines,
             "Symphony did not read the whole output as content, reasoning and calls"
         );

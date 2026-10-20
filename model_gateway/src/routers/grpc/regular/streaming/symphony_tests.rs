@@ -15,7 +15,7 @@ use openai_protocol::{
 use serde_json::{json, Value};
 use smg_grpc_client::{tokenspeed_proto::GenerateComplete, vllm_engine::proto};
 use symphony::{
-    formats::{deepseek_v4, plain, qwen3},
+    formats::{deepseek_v4, glm, plain, qwen3},
     CallSyntax, Format,
 };
 
@@ -343,6 +343,11 @@ async fn without_an_assignment_the_older_parsers_read_the_stream() {
 /// A whole `output` read by the non-streaming driver with the Qwen3 table, one logprob per
 /// character token: the choice and its reasoning token count.
 async fn fold(output: &str) -> (ChatChoice, u32) {
+    fold_with(output, qwen3(CallSyntax::Json), "<|im_start|>assistant\n").await
+}
+
+/// [`fold`] over `format` after `prompt`.
+async fn fold_with(output: &str, format: Format, prompt: &str) -> (ChatChoice, u32) {
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
     let output_ids: Vec<u32> = output.chars().map(u32::from).collect();
     let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
@@ -357,11 +362,7 @@ async fn fold(output: &str) -> (ChatChoice, u32) {
     });
     let mut decoder =
         StopSequenceDecoder::new(tokenizer.clone(), StopSequenceConfig::default(), false);
-    let spec = assigned(
-        chat_spec(true),
-        qwen3(CallSyntax::Json),
-        "<|im_start|>assistant\n",
-    );
+    let spec = assigned(chat_spec(true), format, prompt);
     let processor = ResponseProcessor::new(
         ToolParserFactory::new(),
         ReasoningParserFactory::new(),
@@ -422,6 +423,22 @@ async fn symphony_folds_a_whole_output_into_the_message() {
         "Hello ",
         "the content's tokens alone keep their logprobs"
     );
+}
+
+#[tokio::test]
+async fn a_refused_block_released_as_the_answer_keeps_its_tokens_logprobs() {
+    // The whole answer after the thought is a call written as Python inside the call tag: the
+    // reader releases the refused bytes as the content, and their tokens keep their logprobs,
+    // placed where the output wrote them, not where the released event stands.
+    let output = "plan</think><tool_call>get_stock_info(company=\"Apple\")</tool_call>";
+    let (choice, reasoning_tokens) = fold_with(output, glm(), "<|assistant|><think>").await;
+    let released = "get_stock_info(company=\"Apple\")</tool_call>";
+    assert_eq!(choice.message.content.as_deref(), Some(released));
+    assert_eq!(choice.message.reasoning_content.as_deref(), Some("plan"));
+    assert!(choice.message.tool_calls.is_none());
+    assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
+    assert_eq!(reasoning_tokens, 4);
+    assert_eq!(kept_logprob_tokens(&choice), released);
 }
 
 #[tokio::test]
@@ -1099,4 +1116,66 @@ async fn a_stream_of_no_tokens_is_recorded_empty_too() {
     assert!(logs_contain("finish=\"stop\""));
     assert!(logs_contain("bytes=0"));
     assert!(logs_contain("released_bytes=0"));
+}
+
+/// An output whose only answer is a call written as Python inside the block's markers, after
+/// a thought: the table refuses the block, so the stream would end with the reasoning deltas and
+/// a finish chunk alone. The reader releases the refused bytes as one content delta before the
+/// finish chunk, which stays last; no call delta is made of them; the output is counted as
+/// malformed under the reason, and its line says how many bytes went out.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_stream_whose_only_answer_is_a_python_call_in_the_tag_carries_it_as_content_before_the_finish(
+) {
+    let spec = assigned(chat_spec(true), glm(), "<|assistant|><think>");
+    let output = "plan</think><tool_call>get_stock_info(company=\"Apple\")</tool_call>";
+    let released = "get_stock_info(company=\"Apple\")</tool_call>";
+    let ((result, events), scrape) = scraped(stream_events(
+        vec![
+            chunk(0, &output[..12]),
+            chunk(0, &output[12..40]),
+            chunk(0, &output[40..]),
+            complete(0, "stop"),
+        ],
+        true,
+        spec,
+    ))
+    .await;
+    result.expect("the stream ends well");
+    assert_eq!(chat_text(&events, 0, "reasoning_content"), "plan");
+    assert_eq!(chat_text(&events, 0, "content"), released);
+    assert!(tool_call_deltas(&events).is_empty(), "{events:#?}");
+    let chunks: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["choices"][0].is_object())
+        .collect();
+    let content_at = chunks
+        .iter()
+        .position(|chunk| chunk["choices"][0]["delta"]["content"].is_string())
+        .expect("a content delta");
+    let finish_at = chunks
+        .iter()
+        .position(|chunk| chunk["choices"][0]["finish_reason"].is_string())
+        .expect("a finish chunk");
+    assert!(content_at < finish_at, "{events:#?}");
+    assert_eq!(finish_at, chunks.len() - 1, "{events:#?}");
+    assert_eq!(chunks[finish_at]["choices"][0]["finish_reason"], "stop");
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"glm\"", "outcome=\"malformed\""],
+    )
+    .expect("the outputs counter");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    let reason = series_line(
+        &scrape,
+        "smg_symphony_malformed_total",
+        &["table=\"glm\"", "reason=\"text_where_the_name_should_be\""],
+    )
+    .expect("the reason counter");
+    assert!(reason.ends_with(" 1"), "{reason}");
+    assert!(logs_contain(
+        "Symphony did not read the whole output as content, reasoning and calls"
+    ));
+    assert!(logs_contain(&format!("released_bytes={}", released.len())));
 }

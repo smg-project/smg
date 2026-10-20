@@ -6,8 +6,8 @@ use std::sync::Arc;
 use llm_tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
 use openai_protocol::common::Tool;
 use symphony::{
-    Declared, DropReason, Engine, EngineFinish, Event, Events, Format, Input, Parser as _, Text,
-    TokenSpan,
+    adapt::chat, Declared, DropReason, Engine, EngineFinish, Event, Events, Format, Input,
+    Parser as _, Text, TokenSpan,
 };
 use tracing::debug;
 
@@ -179,6 +179,22 @@ pub(crate) struct Reader {
     /// spacing when text follows it, the model's whole answer when nothing does, which is then
     /// released as one content event before the `Finish` ([`Self::end`]).
     unshown: String,
+    /// Whether the output answered yet: content, or a call that started. A thought alone is not
+    /// an answer.
+    answered: bool,
+    /// The bytes of the call blocks the table refused before the output answered
+    /// (`Dropped { MalformedCall }`: a block that names no call, Python or prose where the name
+    /// goes): debris beside the content or the call that follows, which stays dropped as the
+    /// table says; the model's whole answer when nothing else comes, which is then released as
+    /// one content event before the `Finish` ([`Self::end`]).
+    refused: String,
+    /// Where the held bytes sit in the output, as byte ranges, in order: the whitespace's and
+    /// the refused blocks'. The event that releases them stands past the output's last byte, so
+    /// these say which tokens the released content was ([`Self::content_spans`]).
+    unshown_spans: Vec<(usize, usize)>,
+    refused_spans: Vec<(usize, usize)>,
+    /// The ranges of the bytes released at the end, once released.
+    released_spans: Vec<(usize, usize)>,
 }
 
 impl Reader {
@@ -202,6 +218,11 @@ impl Reader {
             first_call_only: false,
             shown: false,
             unshown: String::new(),
+            answered: false,
+            refused: String::new(),
+            unshown_spans: Vec::new(),
+            refused_spans: Vec::new(),
+            released_spans: Vec::new(),
         };
         // The prompt's events carry no text of the prompt (a thought it opens or closes), so they
         // move from the replay's own buffer into the caller's, whatever delta that one borrows.
@@ -315,10 +336,15 @@ impl Reader {
     /// spacing around text that never came. The chat stream carries it as the engine's own server
     /// streams it; a whole response's adapter applies its own rule for whitespace-only content
     /// (the chat message, the Messages blocks and the Responses items leave it out). The markers
-    /// and separators dropped with it stay dropped: they are the template's. The output is
-    /// recorded here, under `who`: its counters, and the line when it was not clean
-    /// ([`Tally::report`]); such an output counts as `empty` whether or not whitespace was
-    /// released.
+    /// and separators dropped with it stay dropped: they are the template's. An output that
+    /// answered with nothing but call blocks the table refused (a call written as Python where
+    /// the name goes, which the keyed syntax never reads as content) releases their bytes the
+    /// same way: the model's answer, as its own server shows it, where the table's rule keeps
+    /// debris out of an answer that has content or a call; the marker that led into a block is
+    /// the table's row and stays dropped. The output is recorded here, under `who`: its
+    /// counters, and the line when it was not clean ([`Tally::report`]); an output of whitespace
+    /// alone counts as `empty`, one of refused blocks as `malformed`, whether or not bytes were
+    /// released, and the line says how many were.
     pub(crate) fn end(
         &mut self,
         finish: EngineFinish,
@@ -332,19 +358,39 @@ impl Reader {
         self.feed(Input::End { finish }, out)?;
         if self.tally.is_empty() && !self.unshown.is_empty() {
             let released = std::mem::take(&mut self.unshown);
+            self.released_spans = std::mem::take(&mut self.unshown_spans);
             self.tally.released(released.len());
-            let content = Event::Content(Text::uncounted(released));
-            // The `Finish` stays the last event: it makes way for the content and follows it.
-            match out.as_mut_slice().last_mut() {
-                Some(last) if matches!(last, Event::Finish { .. }) => {
-                    let finish = std::mem::replace(last, content);
-                    out.push(finish);
-                }
-                _ => out.push(content),
-            }
+            release_before_the_finish(released, out);
+        } else if !self.answered && !self.refused.is_empty() {
+            let released = std::mem::take(&mut self.refused);
+            self.released_spans = std::mem::take(&mut self.refused_spans);
+            self.tally.released(released.len());
+            release_before_the_finish(released, out);
         }
         self.tally.report(self.table, who);
         Ok(())
+    }
+
+    /// The byte ranges of the output that reached the client as content: the crate's content
+    /// spans of `events`, which count every event's bytes in order, and the ranges of the bytes
+    /// released at the end ([`Self::end`]), whose event stands past the output's last byte and
+    /// is left out. In order, not overlapping; what the logprobs filter of the whole response
+    /// reads next to [`Self::token_ends`].
+    pub(crate) fn content_spans(&self, events: &[Event<'_>]) -> Vec<(usize, usize)> {
+        let mut spans = chat::content_spans(events);
+        if !self.released_spans.is_empty() {
+            spans.retain(|&(start, _)| start < self.read);
+            spans.extend_from_slice(&self.released_spans);
+            spans.sort_unstable();
+        }
+        spans
+    }
+
+    /// The ranges of the output's bytes released as content at its end: none until the output
+    /// ended, or when it answered with something else.
+    #[cfg(test)]
+    pub(crate) fn released_spans(&self) -> &[(usize, usize)] {
+        &self.released_spans
     }
 
     /// Whether the output ended.
@@ -372,18 +418,66 @@ impl Reader {
             self.tally.grew(telemetry::bytes_of(grown) - last);
         }
         let fresh = &mut out.as_mut_slice()[before..];
+        // Where the step's first event starts in the output: the held runs below are placed by it.
+        let start = self.tally.at();
         for event in fresh.iter() {
             self.tally.see(event, self.first_call_only);
+        }
+        // Until the output answers, the bytes of the call blocks the table refuses are kept for
+        // the end ([`Self::end`]); the first content or call makes them debris for good.
+        if !self.answered {
+            let mut at = start;
+            for event in fresh.iter() {
+                let bytes = telemetry::bytes_of(event);
+                match event {
+                    Event::Dropped {
+                        text,
+                        why: DropReason::MalformedCall,
+                    } => {
+                        self.refused.push_str(&text.text);
+                        hold_span(&mut self.refused_spans, at, bytes);
+                    }
+                    Event::Content(text) | Event::Malformed { text, .. }
+                        if !text.text.is_empty() =>
+                    {
+                        self.answered = true;
+                        self.refused = String::new();
+                        self.refused_spans = Vec::new();
+                        break;
+                    }
+                    Event::ToolCallStart { .. } => {
+                        self.answered = true;
+                        self.refused = String::new();
+                        self.refused_spans = Vec::new();
+                        break;
+                    }
+                    Event::Content(_)
+                    | Event::Malformed { .. }
+                    | Event::Dropped { .. }
+                    | Event::Reasoning(_)
+                    | Event::ReasoningStart
+                    | Event::ReasoningEnd
+                    | Event::ToolCallArguments { .. }
+                    | Event::ToolCallEnd { .. }
+                    | Event::Finish { .. } => {}
+                }
+                at += bytes;
+            }
         }
         // Until the output shows something, the whitespace it drops is kept for the end
         // ([`Self::end`]); the first text, reasoning or call makes it the template's for good.
         if !self.shown {
+            let mut at = start;
             for event in fresh.iter() {
+                let bytes = telemetry::bytes_of(event);
                 match event {
                     Event::Dropped {
                         text,
                         why: DropReason::Whitespace,
-                    } => self.unshown.push_str(&text.text),
+                    } => {
+                        self.unshown.push_str(&text.text);
+                        hold_span(&mut self.unshown_spans, at, bytes);
+                    }
                     Event::Content(_)
                     | Event::Reasoning(_)
                     | Event::Malformed { .. }
@@ -392,6 +486,7 @@ impl Reader {
                     | Event::ToolCallEnd { .. } => {
                         self.shown = true;
                         self.unshown = String::new();
+                        self.unshown_spans = Vec::new();
                         break;
                     }
                     Event::Dropped { .. }
@@ -399,12 +494,35 @@ impl Reader {
                     | Event::ReasoningEnd
                     | Event::Finish { .. } => {}
                 }
+                at += bytes;
             }
         }
         if self.first_call_only {
             symphony::event::first_call_only(fresh);
         }
         Ok(())
+    }
+}
+
+/// `bytes` more held at `at` in the output: they join the last range when they follow it, else
+/// they start one.
+fn hold_span(spans: &mut Vec<(usize, usize)>, at: usize, bytes: usize) {
+    match spans.last_mut() {
+        Some((_, end)) if *end == at => *end = at + bytes,
+        _ => spans.push((at, at + bytes)),
+    }
+}
+
+/// `released` goes into `out` as one content event right before the `Finish`, which stays the
+/// last event: it makes way for the content and follows it.
+fn release_before_the_finish(released: String, out: &mut Events<'_>) {
+    let content = Event::Content(Text::uncounted(released));
+    match out.as_mut_slice().last_mut() {
+        Some(last) if matches!(last, Event::Finish { .. }) => {
+            let finish = std::mem::replace(last, content);
+            out.push(finish);
+        }
+        _ => out.push(content),
     }
 }
 
@@ -563,6 +681,182 @@ mod tests {
             })
             .collect();
         assert_eq!(reasoning, "\n\n\n\n");
+    }
+
+    /// The generation prompt's tail of a table whose template opens the thought: the turn
+    /// opened, and its thought.
+    const GLM_PROMPT: &str = "<|assistant|><think>";
+
+    /// An output that answers with nothing but a call written as Python inside the block's
+    /// markers, after its thought (the recorded shape): the table refuses the block, never
+    /// content, so the client would read an empty answer under a finish. The reader releases the
+    /// refused bytes as one content event before the `Finish`: the block's text and the marker
+    /// that ended it, as the table refused them; the thought stays reasoning; the whole chat
+    /// message carries the same content. The same when the stream's end cuts the block. The
+    /// output counts as malformed under its reasons, with the bytes released on its line.
+    #[test]
+    fn an_answer_of_a_refused_call_block_alone_goes_out_as_its_bytes_before_the_finish() {
+        use symphony::{adapt::chat::message, formats::glm};
+        let scrape = rendered(|| {
+            let pieces = [
+                "plan</think>",
+                "<tool_call>",
+                "get_stock_info(company=",
+                "\"Apple\")",
+                "</tool_call>",
+            ];
+            let events = read_pieces(glm(), GLM_PROMPT, &pieces, EngineFinish::Stop);
+            let (contents, finish_last) = content_events(&events);
+            assert_eq!(
+                contents,
+                vec!["get_stock_info(company=\"Apple\")</tool_call>"],
+                "{events:?}"
+            );
+            assert!(finish_last, "{events:?}");
+            assert!(events
+                .iter()
+                .all(|event| !matches!(event, Event::ToolCallStart { .. })));
+            let choice = message(0, &events);
+            assert_eq!(
+                choice.message.content.as_deref(),
+                Some("get_stock_info(company=\"Apple\")</tool_call>")
+            );
+            assert!(choice.message.tool_calls.is_none());
+            assert_eq!(choice.message.reasoning_content.as_deref(), Some("plan"));
+            assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
+            // The stream's end cuts the second of two such blocks: everything the table refused
+            // goes out, the `Finish` still last.
+            let pieces = [
+                "</think><tool_call>searchHotels(location=\"San Diego\")",
+                "<tool_call>searchHotels(location=\"San",
+                " Diego\")",
+            ];
+            let events = read_pieces(glm(), GLM_PROMPT, &pieces, EngineFinish::Length);
+            let (contents, finish_last) = content_events(&events);
+            assert_eq!(
+                contents,
+                vec!["searchHotels(location=\"San Diego\")<tool_call>searchHotels(location=\"San Diego\")"],
+                "{events:?}"
+            );
+            assert!(finish_last, "{events:?}");
+        });
+        let outputs = line_with(
+            &scrape,
+            "smg_symphony_outputs_total",
+            &["table=\"glm\"", "outcome=\"malformed\""],
+        )
+        .expect("the outputs counter");
+        assert!(outputs.ends_with(" 2"), "{outputs}");
+        let reason = line_with(
+            &scrape,
+            "smg_symphony_malformed_total",
+            &["table=\"glm\"", "reason=\"text_where_the_name_should_be\""],
+        )
+        .expect("the reason counter");
+        assert!(reason.ends_with(" 2"), "{reason}");
+        assert!(
+            line_with(
+                &scrape,
+                "smg_symphony_outputs_total",
+                &["table=\"glm\"", "outcome=\"empty\""]
+            )
+            .is_none(),
+            "{scrape}"
+        );
+    }
+
+    /// The released bytes have their places in the output, not the event's: the content spans
+    /// a logprobs filter reads are the refused block's ranges, in order, and the released event
+    /// past the output's end is left out; an output that answered has no released range and the
+    /// crate's spans alone.
+    #[test]
+    fn the_released_bytes_are_placed_where_the_output_wrote_them() {
+        use symphony::formats::glm;
+        let assignment = Assignment {
+            format: Arc::new(glm()),
+            prompt: GLM_PROMPT.to_string(),
+        };
+        let mut events = Events::new();
+        let mut reader = Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
+        let output = "plan</think><tool_call>get_stock_info(company=\"Apple\")</tool_call>";
+        let events = read_tail(&mut reader, output);
+        let block = "plan</think><tool_call>".len();
+        assert_eq!(reader.released_spans(), [(block, output.len())]);
+        assert_eq!(
+            reader.content_spans(&events),
+            [(block, output.len())],
+            "{events:?}"
+        );
+        // The second of two blocks cut by the stream's end: one range over both, the marker
+        // between them included, as the table refused them.
+        let mut events = Events::new();
+        let mut reader = Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
+        let output = concat!(
+            "</think><tool_call>searchHotels(location=\"San Diego\")",
+            "<tool_call>searchHotels(location=\"San Diego\")"
+        );
+        let events = read_tail(&mut reader, output);
+        let block = "</think><tool_call>".len();
+        assert_eq!(reader.content_spans(&events), [(block, output.len())]);
+        // An answered output: nothing released, the crate's spans.
+        let mut events = Events::new();
+        let mut reader = Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
+        let output = "</think>Let me look:<tool_call>Read(file_path=\"x\")</tool_call>";
+        let events = read_tail(&mut reader, output);
+        assert!(reader.released_spans().is_empty());
+        assert_eq!(
+            reader.content_spans(&events),
+            [("</think>".len(), "</think>Let me look:".len())]
+        );
+    }
+
+    /// A refused block beside content or a call is debris, as the table says: nothing of it
+    /// goes out, whether the content comes before the block or after it, or a well-formed call
+    /// follows it; and a thought alone does not make the block the answer.
+    #[test]
+    fn a_refused_block_beside_content_or_a_call_stays_dropped() {
+        use symphony::formats::glm;
+        let events = read_pieces(
+            glm(),
+            GLM_PROMPT,
+            &["</think>Let me look:<tool_call>Read(file_path=\"x\")</tool_call>"],
+            EngineFinish::Stop,
+        );
+        assert_eq!(
+            content_events(&events).0,
+            vec!["Let me look:"],
+            "{events:?}"
+        );
+        // What was held is let go when the answer comes after the block.
+        let events = read_pieces(
+            glm(),
+            GLM_PROMPT,
+            &[
+                "</think><tool_call>Read(file_path=\"x\")</tool_call>",
+                "Sorry, no tool for that.",
+            ],
+            EngineFinish::Stop,
+        );
+        assert_eq!(
+            content_events(&events).0,
+            vec!["Sorry, no tool for that."],
+            "{events:?}"
+        );
+        // A well-formed call after a block of prose: the call, and no content at all.
+        let events = read_pieces(
+            glm(),
+            GLM_PROMPT,
+            &["</think><tool_call>modify text with tool call<tool_call>lookup<arg_key>q</arg_key><arg_value>1</arg_value></tool_call>"],
+            EngineFinish::Stop,
+        );
+        assert_eq!(content_of(&events), "", "{events:?}");
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, Event::ToolCallStart { name, .. } if name == "lookup")));
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 1, .. })
+        ));
     }
 
     #[test]
