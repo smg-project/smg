@@ -6,8 +6,9 @@
 //! constraint whose output the table never reads, so the forced call comes back as raw text. The
 //! gaps known today are listed with their cause and checked both ways: a listed gap that closes
 //! fails the test until its entry goes, so the list stays what is true. Every tag written passes
-//! the rule the engines' structural-tag parsers hold it to (`Grammar::check`), so a table's tag is
-//! refused here and not by the engine at the first forced call.
+//! the rule the engines' structural-tag parsers hold it to (`Grammar::check`), as does every tag a
+//! table writes for `tool_choice: auto` and every answer grammar, so a tag the engines would refuse
+//! fails here and not at the first request.
 
 use openai_protocol::common::{Function, Tool};
 use serde_json::json;
@@ -65,13 +66,17 @@ fn tools() -> Vec<Tool> {
 /// Every configuration: the request's ask, the tools the gateway passes for it (a named function
 /// narrows the list to that one tool, `ToolChoice::narrow_tools`: the one with parameters or the
 /// one without; `required` passes both), and where the prompt and the engine leave the model.
+/// The forced asks owe a tag (`at_least_one`); `auto` is listed for the rule alone, since a table
+/// may write no tag for it.
 fn configurations() -> Vec<(String, Options, std::ops::Range<usize>)> {
     let mut all = Vec::new();
-    for (ask, one_call, passed) in [
-        ("a named function with parameters", true, 0..1),
-        ("a named function without parameters", true, 1..2),
-        ("required", false, 0..2),
-        ("required with parallel calls off", true, 0..2),
+    for (ask, at_least_one, one_call, passed) in [
+        ("a named function with parameters", true, true, 0..1),
+        ("a named function without parameters", true, true, 1..2),
+        ("required", true, false, 0..2),
+        ("required with parallel calls off", true, true, 0..2),
+        ("auto", false, false, 0..2),
+        ("auto with parallel calls off", false, true, 0..2),
     ] {
         for (thought, reasoning_open) in [("thought closed", false), ("thought open", true)] {
             for start in [
@@ -82,7 +87,7 @@ fn configurations() -> Vec<(String, Options, std::ops::Range<usize>)> {
                 all.push((
                     format!("{ask}, {thought}, start {start:?}"),
                     Options {
-                        at_least_one: true,
+                        at_least_one,
                         reasoning_open,
                         one_call,
                         start,
@@ -125,6 +130,18 @@ fn every_table_that_reads_calls_writes_a_forced_tag_in_every_configuration() {
                 None => false,
             };
             let tag = format.grammar_for(&tools[passed], options);
+            if !options.at_least_one {
+                // `auto`: a table may write no tag; one it writes passes the engines' rule.
+                if let Some(tag) = tag {
+                    tag.check().unwrap_or_else(|why| {
+                        panic!(
+                            "{} ({configuration}): the engines refuse the tag: {why}",
+                            table.name()
+                        )
+                    });
+                }
+                continue;
+            }
             if expected {
                 assert!(
                     tag.is_none(),
@@ -151,6 +168,41 @@ fn every_table_that_reads_calls_writes_a_forced_tag_in_every_configuration() {
         }
     }
     assert!(checked > 0, "no table reads calls");
+}
+
+#[test]
+fn every_answer_grammar_a_table_writes_passes_the_engines_rule() {
+    // An answer held to a JSON schema (`response_format`), with the prompt's thought closed or
+    // open and the engine's grammar started where it does not say, after its reasoning parser or
+    // at the first token: a table may write none; one it writes passes the engines' rule.
+    let schema = json!({
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+    });
+    let mut checked = 0;
+    for table in Table::ALL {
+        let format = table.format();
+        for reasoning_open in [false, true] {
+            for start in [
+                GrammarStart::Unknown,
+                GrammarStart::AfterReasoning,
+                GrammarStart::FirstToken,
+            ] {
+                if let Some(grammar) = format.answer_grammar_for(&schema, reasoning_open, start) {
+                    grammar.check().unwrap_or_else(|why| {
+                        panic!(
+                            "{} (thought open {reasoning_open}, start {start:?}): the engines \
+                             refuse the answer grammar: {why}",
+                            table.name()
+                        )
+                    });
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 0, "no table writes an answer grammar");
 }
 
 #[test]
