@@ -203,6 +203,11 @@ pub mod metrics_labels {
     pub const SNAPSHOT_ERROR_UNREADABLE: &str = "unreadable";
     pub const SNAPSHOT_ERROR_INVALID: &str = "invalid";
 
+    // Discovered workers a provider left out of an otherwise good snapshot:
+    // their record could not be used, or two claimed one address
+    pub const DISCOVERY_SKIP_INVALID: &str = "invalid";
+    pub const DISCOVERY_SKIP_CONFLICT: &str = "conflict";
+
     // Rate limit results
     pub const RATE_LIMIT_ALLOWED: &str = "allowed";
     pub const RATE_LIMIT_REJECTED: &str = "rejected";

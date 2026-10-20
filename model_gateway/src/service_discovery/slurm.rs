@@ -12,9 +12,18 @@
 //! 3. `scontrol --json show nodes <name,...>` once, for every node named.
 //!
 //! A node's worker listens on the configured port at the node's `NodeAddr`,
-//! which Slurm defaults to `NodeHostname` and that to the node's name. A
-//! command that fails, times out or answers something unusable rejects the
-//! whole poll, and the last good one stays.
+//! which Slurm defaults to `NodeHostname` and that to the node's name. Every
+//! selected job's nodes run one server each on that port, so worker jobs
+//! should run `--exclusive` (or on nodes of their own): Slurm otherwise shares
+//! a node between jobs.
+//!
+//! A command that fails or times out, or an answer that does not parse,
+//! rejects the whole poll, and the last good one stays. A job that cannot be
+//! placed is left out alone: one whose hostlist does not expand, with a node
+//! `scontrol` does not know or without a usable address, or running with no
+//! start time. So is an address two placements claim, since which job's
+//! server holds the port is unknown. What a poll leaves out is counted on
+//! `smg_discovery_skipped_total` and logged when it first appears.
 //!
 //! `squeue`'s answer is filtered again here, by cluster, state, name, user,
 //! account and partition: under `--json`, Slurm 23.11 ignores every one of
@@ -35,7 +44,7 @@
 //! so its workers are new instances at the same addresses.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     net::Ipv6Addr,
     path::{Path, PathBuf},
     process::Stdio,
@@ -47,7 +56,7 @@ use async_trait::async_trait;
 use openai_protocol::worker::WorkerType;
 use serde::Deserialize;
 use tokio::{process::Command, task, time};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{
     provider::{DiscoveredWorker, DiscoveryKind},
@@ -57,7 +66,7 @@ use super::{
 use crate::{
     app_context::AppContext,
     config::{ConfigError, ConfigResult, RoutingMode, SlurmDiscoveryConfig},
-    observability::metrics::metrics_labels,
+    observability::metrics::{metrics_labels, Metrics},
     worker::{endpoint::Endpoint, EndpointKey},
 };
 
@@ -249,12 +258,43 @@ fn invalid(reason: impl Into<String>) -> SlurmError {
     }
 }
 
+/// What a poll found: the workers to publish, and what it left out.
+#[derive(Debug, Default)]
+struct PollOutcome {
+    workers: Vec<DiscoveredWorker>,
+    skipped: Vec<Skip>,
+}
+
+/// A job, or an address, a poll left out of an answer it otherwise applied.
+#[derive(Debug, Clone, PartialEq)]
+struct Skip {
+    /// The `reason` of `smg_discovery_skipped_total`.
+    reason: &'static str,
+    message: String,
+}
+
+impl Skip {
+    fn job(job: &Job, why: impl std::fmt::Display) -> Self {
+        Self {
+            reason: metrics_labels::DISCOVERY_SKIP_INVALID,
+            message: format!("job {} ({}): {why}", job.id, job.name),
+        }
+    }
+}
+
 /// One poll: a worker on every node of every selected job, or why there is
 /// no answer.
+///
+/// An answer that cannot be read rejects the poll: a command that fails or
+/// times out, or one whose output does not parse. A job that cannot be placed
+/// is left out alone, and the rest of the poll stands: one whose hostlist does
+/// not expand, with a node `scontrol` does not know or that has no usable
+/// address, or running with no start time. So is an address two placements
+/// claim: only one server can listen there, and which one is unknown.
 async fn poll(
     client: &dyn SlurmClient,
     config: &SlurmProviderConfig,
-) -> Result<Vec<DiscoveredWorker>, SlurmError> {
+) -> Result<PollOutcome, SlurmError> {
     let answer = client.running_jobs(config).await?;
     let user = match (&config.user, &answer.requested_by) {
         (Some(user), _) | (None, Some(user)) => user.as_str(),
@@ -272,6 +312,7 @@ async fn poll(
         )
     })?;
 
+    let mut skipped = Vec::new();
     let mut placements = Vec::new();
     for job in answer.jobs {
         let Some(&worker_type) = config.roles.get(&job.name) else {
@@ -281,15 +322,26 @@ async fn poll(
             continue;
         }
         // Part of the instance's identity, so only a placed job needs one.
-        let start_time = job
-            .start_time
-            .ok_or_else(|| invalid(format!("running job {} has no start time", job.id)))?;
-        let nodes = client.expand_hostlist(&job.nodes).await?;
+        let Some(start_time) = job.start_time else {
+            skipped.push(Skip::job(&job, "running with no start time"));
+            continue;
+        };
+        let nodes = match client.expand_hostlist(&job.nodes).await {
+            Ok(nodes) => nodes,
+            Err(SlurmError::Invalid { reason }) => {
+                skipped.push(Skip::job(&job, reason));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         placements.push((job, start_time, worker_type, nodes));
     }
     // Asking `scontrol` about no node at all would list every node.
     if placements.is_empty() {
-        return Ok(Vec::new());
+        return Ok(PollOutcome {
+            workers: Vec::new(),
+            skipped,
+        });
     }
 
     let names: BTreeSet<&String> = placements
@@ -304,30 +356,29 @@ async fn poll(
         .map(|node| (node.name.clone(), node))
         .collect();
 
-    let mut workers = Vec::new();
-    let mut claimed: HashMap<EndpointKey, String> = HashMap::new();
-    for (job, start_time, worker_type, node_names) in &placements {
+    let mut placed = Vec::new();
+    'jobs: for (job, start_time, worker_type, node_names) in &placements {
+        let mut workers = Vec::new();
         for node_name in node_names {
-            let node = nodes.get(node_name).ok_or_else(|| {
-                invalid(format!(
-                    "node {node_name} of job {} is missing from scontrol's answer",
-                    job.id
-                ))
-            })?;
-            let endpoint = node_endpoint(node, config.port)?;
-            let discovery_id = format!(
-                "{}/{}/{}/{}/{}/{worker_type}",
-                job.cluster, job.id, start_time, job.restart_count, node.name
-            );
-            if let Some(other) = claimed.insert(endpoint.key(), discovery_id.clone()) {
-                return Err(invalid(format!(
-                    "{other} and {discovery_id} both place a worker at {}; a node runs one \
-                     server on the configured port",
-                    endpoint.redacted()
-                )));
-            }
+            let Some(node) = nodes.get(node_name) else {
+                skipped.push(Skip::job(
+                    job,
+                    format!("node {node_name} is missing from scontrol's answer"),
+                ));
+                continue 'jobs;
+            };
+            let endpoint = match node_endpoint(node, config.port) {
+                Ok(endpoint) => endpoint,
+                Err(why) => {
+                    skipped.push(Skip::job(job, why));
+                    continue 'jobs;
+                }
+            };
             workers.push(DiscoveredWorker {
-                discovery_id,
+                discovery_id: format!(
+                    "{}/{}/{}/{}/{}/{worker_type}",
+                    job.cluster, job.id, start_time, job.restart_count, node.name
+                ),
                 endpoint,
                 worker_type: *worker_type,
                 bootstrap_port: config
@@ -340,27 +391,58 @@ async fn poll(
                 compat_labels: BTreeMap::new(),
             });
         }
+        placed.extend(workers);
     }
-    Ok(workers)
+
+    // Two placements at one address: Slurm shares a node between jobs unless
+    // they run `--exclusive`, but only one server can listen on the port.
+    let mut claims: HashMap<EndpointKey, Vec<String>> = HashMap::new();
+    for worker in &placed {
+        claims
+            .entry(worker.endpoint.key())
+            .or_default()
+            .push(worker.discovery_id.clone());
+    }
+    let mut conflicts: Vec<Skip> = Vec::new();
+    for worker in &placed {
+        let ids = &claims[&worker.endpoint.key()];
+        if ids.len() > 1 && ids[0] == worker.discovery_id {
+            conflicts.push(Skip {
+                reason: metrics_labels::DISCOVERY_SKIP_CONFLICT,
+                message: format!(
+                    "{} all place a worker at {}, where one server listens on the configured \
+                     port; run worker jobs with --exclusive",
+                    ids.join(", "),
+                    worker.endpoint.redacted()
+                ),
+            });
+        }
+    }
+    skipped.extend(conflicts);
+    let workers = placed
+        .into_iter()
+        .filter(|worker| claims[&worker.endpoint.key()].len() == 1)
+        .collect();
+    Ok(PollOutcome { workers, skipped })
 }
 
 /// The worker endpoint on `node`: its `NodeAddr`, else its `NodeHostname`,
 /// on `port`. Never its name alone, which need not resolve.
-fn node_endpoint(node: &Node, port: u16) -> Result<Endpoint, SlurmError> {
+fn node_endpoint(node: &Node, port: u16) -> Result<Endpoint, String> {
     let host = [&node.address, &node.hostname]
         .into_iter()
         .find(|host| !host.is_empty())
-        .ok_or_else(|| invalid(format!("node {} has no address", node.name)))?;
+        .ok_or_else(|| format!("node {} has no address", node.name))?;
     let authority = if host.parse::<Ipv6Addr>().is_ok() {
         format!("[{host}]:{port}")
     } else {
         format!("{host}:{port}")
     };
     Endpoint::parse(&authority).map_err(|error| {
-        invalid(format!(
+        format!(
             "node {} has an address no worker can be reached at ({host}): {error}",
             node.name
-        ))
+        )
     })
 }
 
@@ -743,6 +825,8 @@ struct SlurmDiscovery {
     app_context: Arc<AppContext>,
     client: Box<dyn SlurmClient>,
     last_good: LastGood,
+    /// What the last poll left out, so a skip that lasts is logged once.
+    skipped: HashSet<String>,
 }
 
 impl SlurmDiscovery {
@@ -756,6 +840,7 @@ impl SlurmDiscovery {
             app_context,
             client,
             last_good: LastGood::new(DiscoveryKind::Slurm, "Slurm".to_string(), "job list"),
+            skipped: HashSet::new(),
         }
     }
 
@@ -773,11 +858,26 @@ impl SlurmDiscovery {
     }
 
     /// Poll into the last good snapshot. A poll that fails is reported and
-    /// leaves the snapshot in place.
+    /// leaves the snapshot in place; what one leaves out is counted on every
+    /// poll and logged when it first appears.
     async fn repoll(&mut self) {
         let read = poll(self.client.as_ref(), &self.config)
             .await
-            .map(DesiredState::from_workers);
+            .map(|outcome| {
+                let mut skipped = HashSet::new();
+                for skip in outcome.skipped {
+                    Metrics::record_discovery_skip(
+                        DiscoveryKind::Slurm.metric_label(),
+                        skip.reason,
+                    );
+                    if !self.skipped.contains(&skip.message) {
+                        warn!("Slurm discovery left out {}", skip.message);
+                    }
+                    skipped.insert(skip.message);
+                }
+                self.skipped = skipped;
+                DesiredState::from_workers(outcome.workers)
+            });
         self.last_good.update(read);
     }
 }
@@ -946,6 +1046,8 @@ mod tests {
         hostlists: HashMap<String, Vec<String>>,
         nodes: Vec<Node>,
         node_lookups: Mutex<Vec<Vec<String>>>,
+        /// `scontrol show hostnames` failing as a command, not answering badly.
+        expansion_fails: bool,
     }
 
     impl FakeSlurm {
@@ -969,6 +1071,7 @@ mod tests {
                 hostlists,
                 nodes,
                 node_lookups: Mutex::new(Vec::new()),
+                expansion_fails: false,
             }
         }
 
@@ -984,6 +1087,12 @@ mod tests {
         }
 
         async fn expand_hostlist(&self, hostlist: &str) -> Result<Vec<String>, SlurmError> {
+            if self.expansion_fails {
+                return Err(SlurmError::Command {
+                    command: format!("scontrol show hostnames {hostlist}"),
+                    reason: "timed out after 30s".to_string(),
+                });
+            }
             self.hostlists
                 .get(hostlist)
                 .cloned()
@@ -1001,10 +1110,21 @@ mod tests {
         }
     }
 
+    fn urls_of(outcome: &PollOutcome) -> Vec<String> {
+        let mut urls: Vec<String> = outcome
+            .workers
+            .iter()
+            .map(|worker| worker.endpoint.render())
+            .collect();
+        urls.sort();
+        urls
+    }
+
     async fn urls(slurm: &FakeSlurm, config: &SlurmProviderConfig) -> Vec<String> {
         let mut urls: Vec<String> = poll(slurm, config)
             .await
             .unwrap()
+            .workers
             .iter()
             .map(|worker| worker.endpoint.render())
             .collect();
@@ -1063,11 +1183,16 @@ mod tests {
             ["10.0.1.1:8000", "10.0.1.2:8000"]
         );
 
+        // A selected one is left out alone.
         slurm.job_mut(1).start_time = None;
-        let error = poll(&slurm, &config(&["smg-worker"])).await.unwrap_err();
-        assert!(
-            error.to_string().contains("job 1 has no start time"),
-            "{error}"
+        let outcome = poll(&slurm, &config(&["smg-worker"])).await.unwrap();
+        assert_eq!(urls_of(&outcome), ["10.0.1.2:8000"]);
+        assert_eq!(
+            outcome.skipped,
+            [Skip {
+                reason: metrics_labels::DISCOVERY_SKIP_INVALID,
+                message: "job 1 (smg-worker): running with no start time".to_string(),
+            }]
         );
     }
 
@@ -1108,6 +1233,7 @@ mod tests {
         let mut workers: Vec<(String, WorkerType, Option<u16>)> = poll(&slurm, &config)
             .await
             .unwrap()
+            .workers
             .into_iter()
             .map(|w| (w.endpoint.render(), w.worker_type, w.bootstrap_port))
             .collect();
@@ -1160,6 +1286,7 @@ mod tests {
         let mut found: Vec<(String, String)> = poll(&slurm, &config(&["smg-worker"]))
             .await
             .unwrap()
+            .workers
             .into_iter()
             .map(|worker| (worker.endpoint.render(), worker.discovery_id))
             .collect();
@@ -1190,11 +1317,11 @@ mod tests {
     async fn a_requeue_is_a_new_instance_at_the_same_address() {
         let mut slurm = FakeSlurm::recorded();
         let config = config(&["smg-decode"]);
-        let before = poll(&slurm, &config).await.unwrap();
+        let before = poll(&slurm, &config).await.unwrap().workers;
         let job = slurm.job_mut(4);
         job.restart_count += 1;
         job.start_time = job.start_time.map(|start| start + 60);
-        let after = poll(&slurm, &config).await.unwrap();
+        let after = poll(&slurm, &config).await.unwrap().workers;
 
         assert_eq!(before.len(), 1);
         assert_eq!(after.len(), 1);
@@ -1207,28 +1334,51 @@ mod tests {
         );
     }
 
+    /// A job with a node `scontrol` does not know is left out whole; the rest
+    /// of the poll stands.
     #[tokio::test]
-    async fn a_node_scontrol_does_not_know_rejects_the_poll() {
+    async fn a_job_on_a_node_scontrol_does_not_know_is_left_out() {
         let mut slurm = FakeSlurm::recorded();
         slurm.nodes.retain(|node| node.name != "n2");
-        let error = poll(&slurm, &config(&["smg-worker"])).await.unwrap_err();
-        assert!(matches!(error, SlurmError::Invalid { .. }), "{error}");
-        assert!(error.to_string().contains("node n2 of job 2"), "{error}");
+        let outcome = poll(&slurm, &config(&["smg-worker"])).await.unwrap();
+        assert_eq!(urls_of(&outcome), ["10.0.1.1:8000"]);
+        assert_eq!(
+            outcome.skipped,
+            [Skip {
+                reason: metrics_labels::DISCOVERY_SKIP_INVALID,
+                message: "job 2 (smg-worker): node n2 is missing from scontrol's answer"
+                    .to_string(),
+            }]
+        );
     }
 
-    /// Two jobs on one node would put two servers on one port, which the
-    /// deployment contract rules out: the poll is rejected, not half applied.
+    /// Slurm shares a node between jobs unless they run `--exclusive`, but
+    /// only one server can listen on the port, and which one is unknown: the
+    /// address is left out for every job claiming it, and every other
+    /// placement stands, a job's other nodes included.
     #[tokio::test]
-    async fn two_jobs_on_one_node_reject_the_poll() {
+    async fn two_jobs_on_one_node_leave_that_address_out() {
         let mut slurm = FakeSlurm::recorded();
-        slurm.job_mut(2).nodes = "n1".to_string();
-        let error = poll(&slurm, &config(&["smg-worker"])).await.unwrap_err();
+        // Job 2 shares job 1's node, and has a node of its own too.
+        slurm.job_mut(2).nodes = "n1,n2".to_string();
+        slurm
+            .hostlists
+            .insert("n1,n2".to_string(), vec!["n1".into(), "n2".into()]);
+        let mut config = config(&["smg-worker", "smg-decode"]);
+        config
+            .roles
+            .insert("smg-decode".to_string(), WorkerType::Regular);
+
+        let outcome = poll(&slurm, &config).await.unwrap();
+        assert_eq!(urls_of(&outcome), ["10.0.1.2:8000", "10.0.1.4:8000"]);
+        assert_eq!(outcome.skipped.len(), 1, "{:?}", outcome.skipped);
+        let skip = &outcome.skipped[0];
+        assert_eq!(skip.reason, metrics_labels::DISCOVERY_SKIP_CONFLICT);
         assert!(
-            error
-                .to_string()
-                .contains("both place a worker at 10.0.1.1:8000"),
-            "{error}"
+            skip.message.contains("place a worker at 10.0.1.1:8000"),
+            "{skip:?}"
         );
+        assert!(skip.message.contains("smgtest/1/") && skip.message.contains("smgtest/2/"));
     }
 
     /// With no job to place, `scontrol` is not asked about nodes at all: asked
@@ -1239,6 +1389,7 @@ mod tests {
         assert!(poll(&slurm, &config(&["no-such-job"]))
             .await
             .unwrap()
+            .workers
             .is_empty());
         assert!(slurm.node_lookups.lock().unwrap().is_empty());
     }
@@ -1294,11 +1445,22 @@ mod tests {
         assert_eq!(urls(&slurm, &named).await.len(), 2);
     }
 
+    /// A hostlist `scontrol` cannot expand leaves its job out; `scontrol`
+    /// failing as a command leaves the answer unread, and rejects the poll.
     #[tokio::test]
-    async fn a_failed_expansion_fails_the_poll() {
+    async fn an_expansion_that_fails_leaves_its_job_out_and_a_failed_command_the_poll() {
         let mut slurm = FakeSlurm::recorded();
         slurm.hostlists.remove("n1");
-        assert!(poll(&slurm, &config(&["smg-worker"])).await.is_err());
+        let outcome = poll(&slurm, &config(&["smg-worker"])).await.unwrap();
+        assert_eq!(urls_of(&outcome), ["10.0.1.2:8000"]);
+        assert_eq!(outcome.skipped.len(), 1);
+        assert!(outcome.skipped[0]
+            .message
+            .starts_with("job 1 (smg-worker): "));
+
+        slurm.expansion_fails = true;
+        let error = poll(&slurm, &config(&["smg-worker"])).await.unwrap_err();
+        assert!(matches!(error, SlurmError::Command { .. }), "{error}");
     }
 
     #[test]
@@ -1392,7 +1554,10 @@ if [ "$1" = show ]; then echo slurmnode; else cat {}; fi"#,
         );
         let slurm = cli(squeue, scontrol);
 
-        let workers = poll(&slurm, &config(&["smg-decode"])).await.unwrap();
+        let workers = poll(&slurm, &config(&["smg-decode"]))
+            .await
+            .unwrap()
+            .workers;
         assert_eq!(workers.len(), 1);
         assert_eq!(workers[0].endpoint.render(), "127.0.0.1:8000");
         assert_eq!(

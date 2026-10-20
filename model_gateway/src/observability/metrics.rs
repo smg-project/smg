@@ -933,6 +933,10 @@ pub(crate) fn init_metrics() {
         "smg_discovery_snapshot_errors_total",
         "Discovery source observations rejected, by source and reason"
     );
+    describe_counter!(
+        "smg_discovery_skipped_total",
+        "Discovered workers left out of an otherwise good snapshot, by source and reason"
+    );
 
     // Layer 5: MCP metrics
     describe_counter!(
@@ -2667,6 +2671,17 @@ impl Metrics {
             "source" => source
         )
         .set(count as f64);
+    }
+
+    /// Record a discovered worker a provider left out of a snapshot it
+    /// otherwise applied
+    pub fn record_discovery_skip(source: &'static str, reason: &'static str) {
+        counter!(
+            "smg_discovery_skipped_total",
+            "source" => source,
+            "reason" => reason
+        )
+        .increment(1);
     }
 
     /// Record a discovery source observation that was rejected; the provider
