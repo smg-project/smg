@@ -95,6 +95,13 @@ pub(crate) async fn try_http_reachable(
 /// Perform a single gRPC health check with a specific runtime type.
 ///
 /// Also used by `DetectBackendStep` for runtime identification.
+///
+/// The answer counts, not only the RPC: an engine that reports itself not
+/// healthy (a servicer that bound its port while its engine still loads the
+/// model answers so, as does one that is draining) is not reachable yet, as
+/// an HTTP engine whose health route answers an error status is not. The
+/// startup detection keeps polling until the engine can serve, instead of
+/// admitting a worker whose every request would fail until then.
 pub(crate) async fn do_grpc_health_check(
     grpc_url: &str,
     timeout_secs: u64,
@@ -107,12 +114,26 @@ pub(crate) async fn do_grpc_health_check(
         .map_err(|e| format!("gRPC connection failed: {e}"))?;
 
     let health_future = client.health_check();
-    tokio::time::timeout(Duration::from_secs(timeout_secs), health_future)
+    let response = tokio::time::timeout(Duration::from_secs(timeout_secs), health_future)
         .await
         .map_err(|_| "gRPC health check timeout".to_string())?
         .map_err(|e| format!("gRPC health check failed: {e}"))?;
+    if !response.healthy {
+        return Err(not_healthy_error(&response.message));
+    }
 
     Ok(())
+}
+
+/// The error for a health answer that says the engine is not healthy, with
+/// the engine's own reason when it gives one.
+fn not_healthy_error(message: &str) -> String {
+    let message = message.trim();
+    if message.is_empty() {
+        "gRPC health check reports the engine not healthy".to_string()
+    } else {
+        format!("gRPC health check reports the engine not healthy: {message}")
+    }
 }
 
 /// Dial the endpoint once to decide whether it is worth probing per-runtime.
@@ -217,6 +238,8 @@ mod tests {
             Arc,
         },
     };
+
+    use tokio::net::TcpListener;
 
     use super::*;
 
@@ -334,5 +357,76 @@ mod tests {
                 "error names {runtime}, so a per-runtime probe ran: {err}"
             );
         }
+    }
+
+    /// A mock gRPC engine on an ephemeral loopback port, answering its health
+    /// check as its overrides say (healthy until told otherwise).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test helper: the mock engine's serve task runs for the test process's lifetime"
+    )]
+    async fn mock_grpc_engine() -> (String, Arc<mock_worker::overrides::WorkerOverrides>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = Arc::new(mock_worker::config::Config {
+            http_count: 0,
+            grpc_base_port: port,
+            grpc_count: 1,
+            model_id: "probe-model".to_string(),
+            tokenizer_path: "probe-model".to_string(),
+            ..mock_worker::config::Config::default()
+        });
+        tokio::spawn(mock_worker::grpc::serve_with_listener(config, listener));
+        (
+            format!("grpc://127.0.0.1:{port}"),
+            mock_worker::overrides::for_port(port),
+        )
+    }
+
+    /// An engine that answers its health check but reports itself not healthy
+    /// (its model still loading, say) is not reachable yet: the probe fails
+    /// with the engine's reason, for the runtime it speaks and in the
+    /// fan-out, and passes once the engine reports healthy.
+    #[tokio::test]
+    async fn an_engine_that_reports_not_healthy_is_not_reachable_yet() {
+        let (url, engine) = mock_grpc_engine().await;
+        engine.set_serving(false);
+
+        let err = do_grpc_health_check(&url, 5, "tokenspeed")
+            .await
+            .expect_err("an engine reporting not healthy must not pass the probe");
+        assert_eq!(
+            err,
+            "gRPC health check reports the engine not healthy: not serving"
+        );
+        let err = try_grpc_reachable(&url, 5)
+            .await
+            .expect_err("the fan-out must not count a not-healthy answer as reachable");
+        assert!(
+            err.contains(
+                "tokenspeed=gRPC health check reports the engine not healthy: not serving"
+            ),
+            "the fan-out error does not carry the engine's reason: {err}"
+        );
+
+        engine.set_serving(true);
+        do_grpc_health_check(&url, 5, "tokenspeed")
+            .await
+            .expect("a healthy engine passes the probe");
+        try_grpc_reachable(&url, 5)
+            .await
+            .expect("a healthy engine is reachable");
+    }
+
+    #[test]
+    fn the_not_healthy_error_carries_the_engines_reason_when_it_gives_one() {
+        assert_eq!(
+            not_healthy_error("Engine is starting"),
+            "gRPC health check reports the engine not healthy: Engine is starting"
+        );
+        assert_eq!(
+            not_healthy_error("  "),
+            "gRPC health check reports the engine not healthy"
+        );
     }
 }
