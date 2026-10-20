@@ -752,9 +752,10 @@ fn sweep_full(
     }
     match worker.stall_reason() {
         Some(StallReason::Unreachable) => return,
-        // (A probing worker with its probe in flight reads as wedged to
-        // routing, but it is the rules below that judge the probe.)
-        Some(StallReason::Wedged) if drain_state != WedgeDrain::Probing => {
+        // (A probing worker with its probe in flight reads as vetoed to
+        // routing alone, `Worker::probe_in_flight`; the rules below judge
+        // the probe.)
+        Some(StallReason::Wedged) => {
             // A wedged veto ends with its connection or with its pile. The
             // connection failed and the worker has been silent since: the
             // streams that were to show progress are gone, so the veto is
@@ -791,6 +792,24 @@ fn sweep_full(
             worker,
             Some(StallReason::Unreachable),
             "load records stopped",
+        );
+        return;
+    }
+    // A probe in flight that has shown no progress for the wedge bound: the
+    // engine is still stuck, so the worker is wedged again and back in the
+    // drain, to be held once the probe is over (the pile rule below needs
+    // growth or a pile of four, which one probe never shows). Off at a zero
+    // threshold.
+    if drain_state == WedgeDrain::Probing
+        && drain.enabled()
+        && load > 0
+        && !wedge.is_zero()
+        && worker.token_progress_age() >= wedge_bound(worker, wedge)
+    {
+        set(
+            worker,
+            Some(StallReason::Wedged),
+            "the probe made no progress",
         );
         return;
     }
@@ -3156,20 +3175,32 @@ mod tests {
         assert_eq!(w.wedge_drain(), WedgeDrain::Probing);
         assert!(w.stall_reason().is_none(), "routable for a probe");
         assert!(!w.routing_state().stalled);
-        // 11. One probe at a time: with one in flight the worker is vetoed.
+        // 11. One probe at a time: with one in flight the worker is vetoed,
+        //     for routing alone: the rules judge the probe.
         tracked_pile(&w, 1);
-        assert_eq!(
-            w.stall_reason(),
-            Some(StallReason::Wedged),
-            "the probe is in flight"
-        );
+        assert!(w.probe_in_flight(), "the probe is in flight");
+        assert!(w.stall_reason().is_none(), "no veto of the rules' yet");
+        assert!(w.routing_state().stalled);
         assert!(!w.routing_state().eligible());
         assert!(!w.is_healthy_and_eligible());
-        // 12. The probe makes no progress: back to draining, and held again
-        //     once the probe is over.
+        // 12. The probe makes no progress: a sweep within the wedge bound
+        //     leaves it probing, the first sweep past the bound wedges the
+        //     worker again (the production order: the sweep interval is
+        //     shorter than the bound), back to draining, and held again once
+        //     the probe is over.
+        sweep_full(
+            &w,
+            DEFAULT_STALL,
+            Duration::from_millis(200),
+            DEFAULT_STALE,
+            DRAIN,
+        );
+        assert_eq!(w.wedge_drain(), WedgeDrain::Probing, "within the bound");
+        assert!(w.stall_reason().is_none());
         thread::sleep(Duration::from_millis(5));
         sweep_drain(&w, DRAIN);
         assert_eq!(w.wedge_drain(), WedgeDrain::Draining, "the probe wedged");
+        assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
         end_pile(&w, 1);
         sweep_drain(&w, DRAIN);
         assert_eq!(w.wedge_drain(), WedgeDrain::Held);
@@ -3179,7 +3210,7 @@ mod tests {
         assert_eq!(w.wedge_drain(), WedgeDrain::Probing);
         // 13. The next probe completes: re-admitted for good.
         tracked_pile(&w, 1);
-        assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
+        assert!(w.probe_in_flight());
         on_completion(&w);
         assert_eq!(w.wedge_drain(), WedgeDrain::Off);
         assert!(w.stall_reason().is_none(), "a completed probe re-admits");
@@ -3221,11 +3252,8 @@ mod tests {
             "a quiet probe is not a wedge"
         );
         end_pile(&w, 1);
-        assert_eq!(
-            w.stall_reason(),
-            Some(StallReason::Wedged),
-            "the probe slot is spent"
-        );
+        assert!(w.probe_in_flight(), "the probe slot is spent");
+        assert!(w.stall_reason().is_none(), "the rules have not judged it");
         sweep_full(&w, DEFAULT_STALL, long, DEFAULT_STALE, DRAIN);
         assert_eq!(
             w.wedge_drain(),

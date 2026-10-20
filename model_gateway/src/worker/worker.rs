@@ -539,7 +539,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// which route on health alone and never consult the circuit breaker;
     /// `BasicWorker` overrides it to read both under a single runtime guard.
     fn is_healthy_and_eligible(&self) -> bool {
-        self.is_healthy() && !self.is_overloaded() && self.stall_reason().is_none()
+        self.is_healthy() && !self.is_overloaded() && !self.vetoed_for_routing()
     }
 
     /// Whether the absolute overload guard currently vetoes this worker.
@@ -596,6 +596,20 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// interval.
     fn probe_taken(&self) -> bool {
         false
+    }
+
+    /// Whether the worker's one probe out of the wedge drain is in flight
+    /// (see [`super::liveness`]): a veto for routing, not one of the
+    /// liveness rules' ([`Self::stall_reason`]), which judge the probe.
+    fn probe_in_flight(&self) -> bool {
+        false
+    }
+
+    /// Whether routing leaves the worker out: the liveness veto
+    /// ([`Self::stall_reason`]) or a probe in flight
+    /// ([`Self::probe_in_flight`]).
+    fn vetoed_for_routing(&self) -> bool {
+        self.stall_reason().is_some() || self.probe_in_flight()
     }
 
     /// The gateway clock (`liveness::now_ms`) at which the drain's hold is
@@ -836,7 +850,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
             load: self.load(),
             processed: self.processed_requests(),
             overloaded: self.is_overloaded(),
-            stalled: self.stall_reason().is_some(),
+            stalled: self.vetoed_for_routing(),
         }
     }
 
@@ -1951,6 +1965,10 @@ impl Worker for BasicWorker {
         self.runtime.load().probe_taken()
     }
 
+    fn probe_in_flight(&self) -> bool {
+        self.runtime.load().probe_in_flight()
+    }
+
     fn wedge_drain_until_ms(&self) -> u64 {
         self.runtime.load().wedge_drain_until_ms()
     }
@@ -2123,7 +2141,10 @@ impl Worker for BasicWorker {
 
     fn is_healthy_and_eligible(&self) -> bool {
         let rt = self.runtime.load();
-        rt.status() == WorkerStatus::Ready && !rt.is_overloaded() && rt.stall_reason().is_none()
+        rt.status() == WorkerStatus::Ready
+            && !rt.is_overloaded()
+            && rt.stall_reason().is_none()
+            && !rt.probe_in_flight()
     }
 
     fn completion_sink(&self) -> Option<Arc<dyn RequestCompletionSink>> {
@@ -2151,7 +2172,7 @@ impl Worker for BasicWorker {
             load: rt.load(),
             processed: rt.processed_requests(),
             overloaded: rt.is_overloaded(),
-            stalled: rt.stall_reason().is_some(),
+            stalled: rt.stall_reason().is_some() || rt.probe_in_flight(),
         }
     }
 

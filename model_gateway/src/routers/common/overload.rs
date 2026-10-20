@@ -95,7 +95,7 @@ pub fn all_vetoed(candidates: &[Arc<dyn Worker>]) -> bool {
     !candidates.is_empty()
         && candidates
             .iter()
-            .all(|w| w.is_overloaded() || w.stall_reason().is_some())
+            .all(|w| w.is_overloaded() || w.vetoed_for_routing())
 }
 
 /// Whether `worker` is kept out of selection by the overload thresholds
@@ -136,7 +136,7 @@ pub fn fallback_if_all_vetoed(
             least_loaded_uniform(
                 candidates
                     .iter()
-                    .filter(|w| ready(w) && w.stall_reason().is_none()),
+                    .filter(|w| ready(w) && !w.vetoed_for_routing()),
                 &mut rng,
             )
         })

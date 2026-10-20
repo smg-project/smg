@@ -110,7 +110,8 @@ pub struct RoutingState {
     pub processed: usize,
     /// Absolute overload veto, set by the load monitor at ingestion time.
     pub overloaded: bool,
-    /// Liveness veto: unreachable or wedged (see [`super::liveness`]).
+    /// Liveness veto: unreachable or wedged, or the one probe of a worker
+    /// leaving the wedge drain in flight (see [`super::liveness`]).
     pub stalled: bool,
 }
 
@@ -609,16 +610,19 @@ impl WorkerRuntime {
         self.transport_failed.load(Ordering::Relaxed)
     }
 
-    /// The veto, or, for a worker probing its way out of the wedge drain, a
-    /// veto from the dispatch of its one probe on: a probing worker takes
-    /// one tracked request per hold.
+    /// The veto the liveness rules set. A probe in flight is no veto of
+    /// theirs ([`Self::probe_in_flight`]): the sweep and the load report
+    /// judge a probing worker by what its probe shows.
     pub fn stall_reason(&self) -> Option<StallReason> {
-        match StallReason::from_u8(self.stall.load(Ordering::Acquire)) {
-            Some(reason) => Some(reason),
-            None => (self.wedge_drain() == WedgeDrain::Probing
-                && (self.probe_taken() || self.tracked_load() > 0))
-                .then_some(StallReason::Wedged),
-        }
+        StallReason::from_u8(self.stall.load(Ordering::Acquire))
+    }
+
+    /// Whether a worker probing its way out of the wedge drain has its one
+    /// probe in flight: routing reads it as vetoed from the probe's dispatch
+    /// on (a probing worker takes one tracked request per hold) until the
+    /// drain moves it on.
+    pub fn probe_in_flight(&self) -> bool {
+        self.wedge_drain() == WedgeDrain::Probing && (self.probe_taken() || self.tracked_load() > 0)
     }
 
     pub fn probe_taken(&self) -> bool {

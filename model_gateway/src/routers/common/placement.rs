@@ -845,7 +845,7 @@ fn relaxed_pair(
         best
     };
     let overloaded_first = (!shedding)
-        .then(|| search(&|w| eligible(w) && w.stall_reason().is_none()))
+        .then(|| search(&|w| eligible(w) && !w.vetoed_for_routing()))
         .flatten();
     let ((prefill, decode), branch) = match overloaded_first {
         Some(pair) => (pair, BRANCH_ALL_OVERLOADED_FALLBACK),
