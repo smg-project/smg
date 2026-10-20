@@ -53,6 +53,7 @@ use wfaas::LoggingSubscriber;
 
 pub mod connection_limit;
 pub mod connection_timeouts;
+pub mod posture;
 
 use crate::{
     app_context::AppContext,
@@ -1025,7 +1026,7 @@ pub struct ServerConfig {
     /// command line, the environment or a file), for the start-up record;
     /// a caller that did not track them leaves the default, which logs
     /// nothing.
-    pub secret_sources: crate::posture::SecretSources,
+    pub secret_sources: posture::SecretSources,
 }
 
 /// Apply the request-admission layer to a protected route group.
@@ -2178,7 +2179,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // Name what this start leaves open, once, before the listener opens:
     // an unauthenticated gateway is a decision, not an omission.
-    crate::posture::log_open_posture(
+    posture::log_open_posture(
         &serving_auth_config,
         &admin_auth_config,
         control_plane_auth_state.is_some(),
@@ -2187,7 +2188,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         admin_addr,
     );
     // And where a keyed start's secrets came from, sources alone.
-    crate::posture::log_secret_sources(&config.secret_sources);
+    posture::log_secret_sources(&config.secret_sources);
 
     let GatewayApps {
         data: app,
