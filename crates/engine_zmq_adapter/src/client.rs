@@ -39,7 +39,9 @@ use crate::{
     },
     sockets::{ensure_ipc_socket_dir, zmq_socket_addresses, Handshake},
     stream::{RequestDeadline, ZmqGenerateStream},
-    structured_outputs::{refuse_unenforceable_constraint, StructuredOutputsSupport},
+    structured_outputs::{
+        refuse_unenforceable_constraint, StructuredOutputsBackendConfig, StructuredOutputsSupport,
+    },
     tokenspeed::{
         constraint_ref as tokenspeed_constraint_ref, fan_out_tokenspeed_requests,
         translate_request_tokenspeed_for, GridTensors, TokenSpeedGenerateStream,
@@ -54,6 +56,20 @@ use crate::{
 /// How long the one-time `get_supported_tasks` utility call may take; the
 /// engine answers it between scheduler steps.
 const SUPPORTED_TASKS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What a connection nobody configured enforces of a structured request, by
+/// dialect: the wire that stamps a backend on each structured request ran
+/// the engine's `auto` (xgrammar, every kind) before this support existed
+/// and keeps it, refusing what it refused; the wires that stamp none judged
+/// nothing ahead of their engine and keep that too, so a gateway's direct
+/// link to an engine on another backend refuses nothing the engine would
+/// enforce. The servicer that launched the engine sets the real support.
+pub(crate) fn default_structured_outputs_support(dialect: ZmqDialect) -> StructuredOutputsSupport {
+    match dialect {
+        ZmqDialect::Vllm => StructuredOutputsSupport::default(),
+        ZmqDialect::TokenSpeed | ZmqDialect::Sglang => StructuredOutputsBackendConfig::Other.into(),
+    }
+}
 
 /// The connector params a refused request must still release: NIXL's
 /// `do_remote_prefill` marks a PD decode side whose prefill side holds blocks
@@ -357,21 +373,28 @@ impl ZmqEngineClient {
     /// ([`refuse_unenforceable_constraint`]); the wire that stamps a backend
     /// on each structured request stamps this one, since such an engine keeps
     /// the backend of its first structured request for its life. A connection
-    /// nobody configures (the gateway's own worker link) runs the engine's
-    /// `auto`: xgrammar on every request, every kind taken. The first call
-    /// wins.
+    /// nobody configures (the gateway's own worker link) keeps what its wire
+    /// ran before this support existed
+    /// ([`default_structured_outputs_support`]). The first call wins.
     pub fn set_structured_outputs_support(&self, support: StructuredOutputsSupport) {
         let _ = self.meta.structured_outputs.set(support);
     }
 
     /// What the engine enforces of a structured request
-    /// ([`Self::set_structured_outputs_support`]); the default until set.
+    /// ([`Self::set_structured_outputs_support`]); until set, the wire's own
+    /// default ([`default_structured_outputs_support`]).
     fn structured_outputs_support(&self) -> StructuredOutputsSupport {
         self.meta
             .structured_outputs
             .get()
             .copied()
-            .unwrap_or_default()
+            .unwrap_or_else(|| {
+                default_structured_outputs_support(match &self.backend {
+                    ZmqBackend::Vllm(_) => ZmqDialect::Vllm,
+                    ZmqBackend::TokenSpeed(_) => ZmqDialect::TokenSpeed,
+                    ZmqBackend::Sglang(_) => ZmqDialect::Sglang,
+                })
+            })
     }
 
     /// Bound every generate request this connection opens from here on by

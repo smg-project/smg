@@ -147,9 +147,11 @@ impl ConstraintKinds {
 /// What the engine enforces: its grammar backend and the constraint kinds
 /// that backend compiles, as the servicer that launched the engine read them
 /// off its configuration and set them on the connection
-/// (`ZmqEngineClient::set_structured_outputs_support`). The default is a
-/// connection nobody configured (the gateway's own worker link): the engine's
-/// `auto`, every kind.
+/// (`ZmqEngineClient::set_structured_outputs_support`). `Default` is the
+/// engine's `auto` with every kind, what the wire that stamps a backend on
+/// each structured request ran before this support existed; a connection
+/// nobody configured gets its own wire's default
+/// (`client::default_structured_outputs_support`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StructuredOutputsSupport {
     pub backend: StructuredOutputsBackendConfig,
@@ -516,6 +518,33 @@ mod tests {
                     "{backend:?}: {constraint:?}"
                 );
             }
+        }
+    }
+
+    /// A connection nobody configured keeps what its wire ran before: the
+    /// stamping wire the engine's `auto`, the others no judgement at all.
+    #[test]
+    fn an_unconfigured_connection_keeps_its_wires_old_behaviour() {
+        use crate::{client::default_structured_outputs_support, ZmqDialect};
+        assert_eq!(
+            default_structured_outputs_support(ZmqDialect::Vllm),
+            StructuredOutputsSupport::default()
+        );
+        for dialect in [ZmqDialect::Sglang, ZmqDialect::TokenSpeed] {
+            let support = default_structured_outputs_support(dialect);
+            assert_eq!(
+                support,
+                StructuredOutputsSupport::from(Other),
+                "{dialect:?}"
+            );
+            assert_eq!(
+                refuse_unenforceable_constraint(
+                    Some(ConstraintRef::JsonSchema(MULTIPLE_OF)),
+                    support
+                ),
+                Ok(()),
+                "{dialect:?}"
+            );
         }
     }
 

@@ -137,13 +137,13 @@ def tokenspeed_grammar_backend(server_args: Any) -> str:
     checkpoints it defaults otherwise to ``xgrammar`` once it has read the
     checkpoint, so an unset flag reads as the resolved default when the engine
     has read it, and as "" (unknown: say nothing, the servicer then judges
-    nothing ahead of the engine) when it has not; "" too when the server
+    nothing ahead of the engine) when it has not, or when its own post-init
+    has not run yet (the raw argument is then None); "" too when the server
     arguments have no such field."""
     backend = getattr(server_args, "grammar_backend", _UNKNOWN)
-    if backend is _UNKNOWN:
+    if backend is _UNKNOWN or backend is None:
         return ""
-    # Before the engine's own post-init the raw argument is None: its default.
-    backend = str(backend or GRAMMAR_BACKEND_NONE)
+    backend = str(backend)
     if backend == GRAMMAR_BACKEND_NONE and getattr(server_args, "_grammar_backend_unset", False):
         beam_checkpoint = getattr(server_args, "_beam_checkpoint", None)
         if beam_checkpoint is None:

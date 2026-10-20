@@ -161,8 +161,9 @@ def test_tokenspeed_grammar_backend_is_the_flag_or_the_resolved_checkpoint_defau
         )
         == ""
     )
-    # Before the engine's post-init the raw argument is None: its default.
-    assert cd.tokenspeed_grammar_backend(SimpleNamespace(grammar_backend=None)) == "none"
+    # Not given and the engine's own post-init not run yet (the raw argument
+    # is None): unknown as well, say nothing.
+    assert cd.tokenspeed_grammar_backend(SimpleNamespace(grammar_backend=None)) == ""
     # No such field at all: say nothing.
     assert cd.tokenspeed_grammar_backend(SimpleNamespace(model="org/model")) == ""
 
