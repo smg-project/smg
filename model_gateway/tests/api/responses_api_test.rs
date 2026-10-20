@@ -3723,3 +3723,219 @@ async fn a_streamed_turn_of_parallel_calls_runs_them_in_one_round_trip_as_unstre
     );
     mcp.stop().await;
 }
+
+/// A streamed call runs once it is whole: named, and its arguments concluded
+/// by `response.function_call_arguments.done` or by the call's
+/// `response.output_item.done`, the arguments either carries being the ones
+/// it runs with (`{}` for a call concluded with none). A turn the upstream
+/// ends `failed` or `incomplete` before then, or with an `error` event, ends
+/// the client's stream on that event, the stream's one terminal: no call
+/// runs, no event follows it. A body that ends before then is the answer as
+/// it stands.
+#[tokio::test]
+async fn a_streamed_call_runs_once_whole_and_a_turn_ended_before_that_ends_the_stream() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+
+    use axum::response::IntoResponse;
+    let response = |status: &str, output: serde_json::Value| {
+        serde_json::json!({
+            "id": "resp_stub", "object": "response", "created_at": 1_700_000_000,
+            "model": "mock-model", "status": status, "output": output
+        })
+    };
+    // A turn's SSE body: `response.created`, `response.in_progress`, then
+    // `events`, numbered in order.
+    let turn = |events: Vec<serde_json::Value>| -> String {
+        [
+            serde_json::json!({"type": "response.created", "response": response("in_progress", serde_json::json!([]))}),
+            serde_json::json!({"type": "response.in_progress", "response": response("in_progress", serde_json::json!([]))}),
+        ]
+        .into_iter()
+        .chain(events)
+        .enumerate()
+        .map(|(sequence_number, mut event)| {
+            event["sequence_number"] = sequence_number.into();
+            format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap_or_default())
+        })
+        .collect()
+    };
+    let call = |arguments: &str, status: &str| {
+        serde_json::json!({
+            "id": "fc_stub", "type": "function_call", "call_id": "call_stub",
+            "name": "brave_web_search", "arguments": arguments, "status": status
+        })
+    };
+    let arguments = "{\"query\":\"smg\"}";
+    let added = serde_json::json!({"type": "response.output_item.added", "output_index": 0, "item": call("", "in_progress")});
+    let partial = serde_json::json!({"type": "response.function_call_arguments.delta", "output_index": 0, "item_id": "fc_stub", "delta": "{\"query\":\"sm"});
+    let arguments_done = serde_json::json!({"type": "response.function_call_arguments.done", "output_index": 0, "item_id": "fc_stub", "arguments": arguments});
+    let item_done = serde_json::json!({"type": "response.output_item.done", "output_index": 0, "item": call(arguments, "completed")});
+    let mut failed_response = response("failed", serde_json::json!([]));
+    failed_response["error"] =
+        serde_json::json!({"code": "server_error", "message": "the model failed"});
+    let failed = serde_json::json!({"type": "response.failed", "response": failed_response});
+    let mut incomplete_response = response("incomplete", serde_json::json!([]));
+    incomplete_response["incomplete_details"] = serde_json::json!({"reason": "max_output_tokens"});
+    let incomplete =
+        serde_json::json!({"type": "response.incomplete", "response": incomplete_response});
+    let error = serde_json::json!({"type": "error", "code": "server_error", "message": "the upstream failed", "param": null});
+    // Every later turn answers.
+    let message = serde_json::json!({
+        "id": "msg_stub", "type": "message", "role": "assistant", "status": "completed",
+        "content": [{"type": "output_text", "text": "answered", "annotations": []}]
+    });
+    let answer = turn(vec![
+        serde_json::json!({"type": "response.output_item.added", "output_index": 0, "item": message}),
+        serde_json::json!({"type": "response.output_item.done", "output_index": 0, "item": message}),
+        serde_json::json!({"type": "response.completed", "response": response("completed", serde_json::json!([message]))}),
+    ]);
+
+    let turns = Arc::new(AtomicUsize::new(0));
+    let first: Arc<Mutex<Option<String>>> = Arc::default();
+    let (counter, next) = (Arc::clone(&turns), Arc::clone(&first));
+    let (upstream, server) = stub_upstream(axum::routing::post(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+        let body = next
+            .lock()
+            .expect("the first turn")
+            .take()
+            .unwrap_or_else(|| answer.clone());
+        async move { ([(CONTENT_TYPE, "text/event-stream")], body).into_response() }
+    }))
+    .await;
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let (router, _ctx, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
+
+    let mut no_arguments_done = arguments_done.clone();
+    no_arguments_done["arguments"] = "".into();
+    let cases = [
+        ("no call, incomplete", vec![incomplete.clone()]),
+        ("no call, error", vec![error.clone()]),
+        ("added, failed", vec![added.clone(), failed.clone()]),
+        (
+            "added, partial arguments, failed",
+            vec![added.clone(), partial.clone(), failed],
+        ),
+        (
+            "added, partial arguments, incomplete",
+            vec![added.clone(), partial.clone(), incomplete],
+        ),
+        (
+            "added, partial arguments, body ends",
+            vec![added.clone(), partial],
+        ),
+        (
+            "added, arguments done, body ends",
+            vec![added.clone(), arguments_done.clone()],
+        ),
+        (
+            "added, item done, body ends",
+            vec![added.clone(), item_done.clone()],
+        ),
+        (
+            "added, no arguments done, body ends",
+            vec![added.clone(), no_arguments_done],
+        ),
+        ("added, error", vec![added.clone(), error.clone()]),
+        (
+            "whole call, error",
+            vec![
+                added.clone(),
+                arguments_done.clone(),
+                item_done.clone(),
+                error.clone(),
+            ],
+        ),
+        (
+            "added, error, the call's rest",
+            vec![added, error, arguments_done, item_done],
+        ),
+    ];
+    let mut got = Vec::new();
+    for (case, events) in cases {
+        *first.lock().expect("the first turn") = Some(turn(events));
+        let (turns_before, calls_before) = (turns.load(Ordering::SeqCst), mcp.call_count());
+        let body = stream_body(router.as_ref(), streaming_mcp_request(&mcp.url(), None)).await;
+        let events = frame_events(&body);
+        let kind =
+            |event: &serde_json::Value| event["type"].as_str().unwrap_or_default().to_string();
+        // The calls the client sees closed: status and the arguments they ran with.
+        let closed: Vec<(String, String)> = events
+            .iter()
+            .filter(|event| {
+                event["type"] == "response.output_item.done" && event["item"]["type"] == "mcp_call"
+            })
+            .map(|event| {
+                let field =
+                    |name: &str| event["item"][name].as_str().unwrap_or_default().to_string();
+                (field("status"), field("arguments"))
+            })
+            .collect();
+        let terminals: Vec<String> = events
+            .iter()
+            .map(kind)
+            .filter(|kind| {
+                matches!(
+                    kind.as_str(),
+                    "response.completed" | "response.incomplete" | "response.failed" | "error"
+                )
+            })
+            .collect();
+        got.push((
+            case,
+            turns.load(Ordering::SeqCst) - turns_before,
+            mcp.call_count() - calls_before,
+            closed,
+            terminals,
+            events.last().map(kind),
+        ));
+    }
+
+    let ended_on = |case, terminal: &str| {
+        (
+            case,
+            1,
+            0,
+            vec![],
+            vec![terminal.to_string()],
+            Some(terminal.to_string()),
+        )
+    };
+    let ran_once = |case, arguments: &str| {
+        (
+            case,
+            2,
+            1,
+            vec![("completed".to_string(), arguments.to_string())],
+            vec!["response.completed".to_string()],
+            Some("response.completed".to_string()),
+        )
+    };
+    assert_eq!(
+        got,
+        [
+            ended_on("no call, incomplete", "response.incomplete"),
+            ended_on("no call, error", "error"),
+            ended_on("added, failed", "response.failed"),
+            ended_on("added, partial arguments, failed", "response.failed"),
+            ended_on(
+                "added, partial arguments, incomplete",
+                "response.incomplete"
+            ),
+            ended_on("added, partial arguments, body ends", "response.completed"),
+            ran_once("added, arguments done, body ends", arguments),
+            ran_once("added, item done, body ends", arguments),
+            ran_once("added, no arguments done, body ends", "{}"),
+            ended_on("added, error", "error"),
+            ended_on("whole call, error", "error"),
+            ended_on("added, error, the call's rest", "error"),
+        ],
+        "(case, upstream turns, MCP calls, the calls closed on the wire with the arguments they \
+         ran with, the terminal events, the last event)"
+    );
+    server.abort();
+    mcp.stop().await;
+}

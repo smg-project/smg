@@ -838,6 +838,8 @@ pub(super) fn handle_streaming_with_tool_interception(
         let auth_header =
             provider.extract_auth_header(headers_opt.as_ref(), worker_api_key.as_ref());
 
+        // `end` is `None` when the upstream ended the client's stream with a
+        // terminal of its own, already forwarded.
         let (handler, end) = loop {
             // Make streaming request
             let mut request_builder = client_clone.post(&url_clone).json(&current_payload);
@@ -877,6 +879,7 @@ pub(super) fn handle_streaming_with_tool_interception(
             }
             let mut chunk_processor = ChunkProcessor::new();
             let mut tool_calls_detected = false;
+            let mut terminal_forwarded = false;
             let mut seen_in_progress = false;
 
             while let Some(chunk_result) = upstream_stream.next().await {
@@ -992,18 +995,45 @@ pub(super) fn handle_streaming_with_tool_interception(
                                     // dispatched call to finish.
                                 }
                                 StreamAction::ExecuteTools => {
-                                    // The upstream ended its turn holding calls. A
-                                    // turn of parallel calls streams them one after
-                                    // another, so only now is every call of the turn
-                                    // read; the terminal itself is not forwarded (the
-                                    // loop ends the client's stream with its own).
+                                    // The upstream ended its turn holding calls, each
+                                    // of them whole. A turn of parallel calls streams
+                                    // them one after another, so only now is every
+                                    // call of the turn read; the terminal itself is not
+                                    // forwarded (the loop ends the client's stream with
+                                    // its own).
                                     tool_calls_detected = true;
                                     break; // Exit stream processing to execute the turn's calls
+                                }
+                                StreamAction::ForwardTerminal => {
+                                    // The upstream ended its turn `incomplete` or
+                                    // `failed` without a whole batch of calls, or sent
+                                    // an error: its event ends the client's stream. No
+                                    // call runs, nothing more of the upstream is read,
+                                    // and the loop sends no terminal of its own.
+                                    if !forward_streaming_event(
+                                        SseEventData {
+                                            raw_block: &raw_block,
+                                            event_name,
+                                            data: data.as_ref(),
+                                            pre_parsed: None,
+                                        },
+                                        &mut handler,
+                                        &tx,
+                                        &mut sse_encoder,
+                                        &streaming_ctx,
+                                        &mut sequence_number,
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
+                                    terminal_forwarded = true;
+                                    break;
                                 }
                             }
                         }
 
-                        if tool_calls_detected {
+                        if tool_calls_detected || terminal_forwarded {
                             break;
                         }
                     }
@@ -1027,11 +1057,16 @@ pub(super) fn handle_streaming_with_tool_interception(
                 preserved_response_id = Some(id);
             }
 
+            if terminal_forwarded {
+                break (handler, None);
+            }
+
             // The model answered without asking for a tool: the loop's end. A
-            // body that closed before its terminal event ends the turn too,
-            // and the calls it completed run all the same.
-            if !tool_calls_detected && !handler.has_complete_calls() {
-                break (handler, ToolLoopEnd::Answered);
+            // body that closed before its terminal event ends the turn too:
+            // its calls run all the same when each of them is whole, and
+            // otherwise none does.
+            if !tool_calls_detected && !handler.has_runnable_calls() {
+                break (handler, Some(ToolLoopEnd::Answered));
             }
 
             // Execute tools
@@ -1093,7 +1128,7 @@ pub(super) fn handle_streaming_with_tool_interception(
                 {
                     return;
                 }
-                break (handler, ToolLoopEnd::ToolCallLimit);
+                break (handler, Some(ToolLoopEnd::ToolCallLimit));
             }
 
             // Build resume payload
@@ -1123,19 +1158,23 @@ pub(super) fn handle_streaming_with_tool_interception(
         };
 
         // The loop's end, answered or stopped at the tool-call allowance: the
-        // terminal event, the record, the sentinel.
-        if !send_final_response_event(
-            &handler,
-            &tx,
-            &mut sse_encoder,
-            &mut sequence_number,
-            &state,
-            &streaming_ctx,
-            end,
-        )
-        .await
-        {
-            return;
+        // terminal event, the record, the sentinel. A stream the upstream
+        // ended with its own terminal has it already: the record and the
+        // sentinel alone.
+        if let Some(end) = end {
+            if !send_final_response_event(
+                &handler,
+                &tx,
+                &mut sse_encoder,
+                &mut sequence_number,
+                &state,
+                &streaming_ctx,
+                end,
+            )
+            .await
+            {
+                return;
+            }
         }
 
         let final_response_json = if should_store {
@@ -1158,7 +1197,7 @@ pub(super) fn handle_streaming_with_tool_interception(
                 &original_request,
                 previous_response_id.as_deref(),
             );
-            if end == ToolLoopEnd::ToolCallLimit {
+            if end == Some(ToolLoopEnd::ToolCallLimit) {
                 end_at_tool_call_limit(&mut response_json, &original_request);
             }
 
@@ -1344,8 +1383,9 @@ mod tests {
     /// handler answers `ExecuteTools` and runs the calls it holds then; a call
     /// read after that point is never run, never in the history, never on the
     /// wire. So the loop leaves at the terminal and no sooner, with every call
-    /// of the turn in the batch, in order, whether a call completes with its
-    /// arguments events or with its `output_item.done` alone.
+    /// of the turn in the batch, in order, each with its own arguments,
+    /// whether a call completes with its arguments events or with its
+    /// `output_item.done` alone.
     #[test]
     fn a_turn_of_parallel_calls_is_read_to_its_terminal_before_its_calls_run() {
         let call_events = |index: usize, id: &str, with_arguments_events: bool| {
@@ -1419,19 +1459,20 @@ mod tests {
                     break;
                 }
             }
-            let batch: Vec<String> = handler
+            let batch: Vec<(String, String)> = handler
                 .take_pending_calls()
                 .into_iter()
-                .map(|call| call.call_id)
+                .map(|call| (call.call_id, call.arguments_buffer))
                 .collect();
             got.push((shape, left_at, batch));
         }
 
+        let call = |id: &str| (format!("call_{id}"), format!("{{\"query\":\"{id}\"}}"));
         let read_to_the_terminal = |shape| {
             (
                 shape,
                 Some("response.completed".to_string()),
-                vec!["call_a".to_string(), "call_b".to_string()],
+                vec![call("a"), call("b")],
             )
         };
         assert_eq!(
@@ -1440,7 +1481,8 @@ mod tests {
                 read_to_the_terminal("output_item.done alone"),
                 read_to_the_terminal("arguments events"),
             ],
-            "(shape, the event the loop leaves the upstream turn at, the calls it runs)"
+            "(shape, the event the loop leaves the upstream turn at, the calls it runs with \
+             their arguments)"
         );
     }
 

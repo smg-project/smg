@@ -1871,6 +1871,7 @@ mod tests {
             output_index: 0,
             last_obfuscation: None,
             assigned_output_index: Some(0),
+            arguments_concluded: true,
         };
 
         let tool_call_item = json!({
@@ -1929,6 +1930,7 @@ mod tests {
             output_index: 0,
             last_obfuscation: None,
             assigned_output_index: Some(0),
+            arguments_concluded: true,
         };
 
         let tool_call_item = json!({
@@ -1986,6 +1988,7 @@ mod tests {
             output_index: 0,
             last_obfuscation: None,
             assigned_output_index: Some(0),
+            arguments_concluded: true,
         };
 
         let tool_call_item = json!({
@@ -2055,6 +2058,7 @@ mod tests {
             output_index: 0,
             last_obfuscation: None,
             assigned_output_index: Some(0),
+            arguments_concluded: true,
         };
 
         let tool_call_item = json!({
