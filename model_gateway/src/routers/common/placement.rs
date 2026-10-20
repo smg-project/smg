@@ -370,7 +370,8 @@ pub(crate) fn select_from(
 /// has nothing routable. Under `--traffic-split` the pool is narrowed to one
 /// group first, by the request's key where it has one and at random
 /// otherwise, so a canary takes its weight's share of a spike and not the
-/// least-loaded worker's: the arms admit what the fallback itself can take
+/// least-loaded worker's; the pool is judged whole first, as without the
+/// split, so the split chooses where, not whether: the arms admit what the fallback itself can take
 /// (a ready worker, healthy with its circuit closed; under
 /// `--worker-overload-shed` not an overloaded one), so a stalled member joins
 /// its group's arm, counts in the group's weight and is the arm's answer when
@@ -391,6 +392,13 @@ fn overload_fallback(
     let whole =
         || overload::fallback_if_all_vetoed(candidates, model_id, STAGE_SELECTION, shedding);
     let selected = if policies.traffic_split_enabled() {
+        // The pool is judged whole first, as it is without the split: a pool
+        // with a worker that is down but not vetoed keeps its unavailable
+        // answer whichever arm the draw would take. The split then only
+        // chooses where, over arms that are all vetoed by construction.
+        if !overload::all_vetoed(candidates) {
+            return None;
+        }
         // The arms admit what the fallback can take: a ready worker (healthy,
         // circuit closed), and under the shed not an overloaded one, so a group
         // the shed empties drops out of the draw as a down group does.
