@@ -1248,7 +1248,9 @@ pub enum PolicyConfig {
         /// Throughput (tokens/s) for prefill workers, and fallback when other
         /// workers report no live `gen_throughput`. Set to per-replica input
         /// tokens/s for prefill, output tokens/s otherwise; co-tunes with
-        /// `kv_pressure_weight`.
+        /// `kv_pressure_weight`. The CLI shares one value across roles; use
+        /// programmatically constructed `prefill_policy` / `decode_policy` for
+        /// separate values.
         #[serde(default = "default_least_load_throughput")]
         default_throughput: f64,
         /// Per-worker waiting-queue cap: skip workers whose reported waiting

@@ -632,7 +632,9 @@ struct RoutingArgs {
     least_load_kv_pressure_weight: f64,
 
     /// Input throughput (tokens/s) for least_load prefill workers; fallback
-    /// output throughput for other workers when no live rate is reported
+    /// output throughput for other workers when no live rate is reported.
+    /// Shared across roles; separate prefill/decode values require constructing
+    /// RouterConfig programmatically in Rust.
     #[arg(long, default_value_t = 2000.0, help_heading = "Routing Policy")]
     least_load_default_throughput: f64,
 
