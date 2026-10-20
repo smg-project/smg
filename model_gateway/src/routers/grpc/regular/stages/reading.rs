@@ -1,16 +1,20 @@
-//! What the chat and Messages request-building stages decide alike once the
-//! worker is selected: whether the rendered prompt leaves the model inside its
-//! thought, what constrains the output on that worker, and which table reads
-//! the response (Symphony's assignment, see `regular::symphony`). The two
-//! stages spell what their request asks ([`Asks`]) and decide through these
-//! functions; each keeps what differs between the APIs, the tokenizer-driven
-//! reasoning switch and the request the `auto` tag derives for.
+//! What the chat and Messages stages decide alike about how the response is
+//! read (see `regular::symphony`): in preparation, the constraint the request
+//! asks for before its worker is known and whether the decoder keeps the
+//! special tokens the reader needs ([`prepare`]); in request building, whether
+//! the rendered prompt leaves the model inside its thought
+//! ([`reasoning_decision`]), what constrains the output on the selected worker
+//! and which table reads the response ([`decide`]). The two stages spell what
+//! their request asks ([`Asks`]) and decide through these functions; each
+//! keeps what differs between the APIs, the tokenizer-driven reasoning switch
+//! and the request the `auto` tag derives for.
 
 use std::sync::Arc;
 
 use axum::response::Response;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::common::Tool;
+use tracing::error;
 
 use crate::{
     config::ParserChoice,
@@ -24,6 +28,138 @@ use crate::{
         },
     },
 };
+
+/// What preparation found for the response.
+pub(crate) struct Prepared {
+    /// The constraint for what the request asks, before its worker is known:
+    /// the table's tag for a forced call or a JSON answer, else the older
+    /// registry's; or why the table cannot constrain the request, which
+    /// request building answers on the selected worker
+    /// (`regular::symphony::worker_constraint`).
+    pub constraint: PreparedConstraint,
+    /// The constraint is a JSON schema: the older path's forced call, under
+    /// which no table reads.
+    pub json_schema: bool,
+    /// The decoder keeps the special tokens the reader of the response needs:
+    /// a table's markers, or a legacy reasoning parser's.
+    pub keeps_special_tokens: bool,
+}
+
+/// The constraint preparation finds for what the request asks, and whether
+/// the decoder keeps the special tokens the reader needs. When Symphony reads
+/// the response, its table gives a forced call, or a JSON `response_format`,
+/// its tag, so the output comes back in the syntax the table parses
+/// (`regular::symphony::constraint`, which decides with the predicate the
+/// reader is assigned by); the older registry decides for every other request
+/// (`generate_tool_constraint`, over `tools`, the ones the request's choice
+/// lets the model call, and the legacy tool parser's name). On a thinking
+/// prompt a parser with a reasoning prefix gets its tag wrapped so a forced
+/// call follows the reasoning instead of preempting it: `switch` is the API's
+/// tokenizer-driven answer, and where a table reads the response its replay
+/// of the rendered prompt decides beside it (a turn the prompt leaves
+/// unopened starts inside the thought whatever the switch says:
+/// `regular::symphony::reasoning_open`), so the tag reads the prompt as the
+/// engine will. The table's refusal waits for request building, which decides
+/// on the selected worker; the registry's refuses the request here (a 400,
+/// logged under `stage`). A table whose markers the decoder would drop as
+/// special tokens needs them kept whatever the request asks of the channels:
+/// without them the table reads neither the thought nor the calls
+/// (`regular::symphony::keeps_special_tokens`); under a JSON-schema constraint
+/// no table reads (request building makes no assignment), so the legacy
+/// parsers answer for themselves, as they do where no table reads at all: a
+/// reasoning parser that needs its control tokens, for a request that
+/// separates the reasoning.
+pub(crate) fn prepare(
+    ctx: &RequestContext,
+    asks: Asks<'_>,
+    tools: &[Tool],
+    processed_text: &str,
+    switch: bool,
+    tokenizer: &Arc<dyn Tokenizer>,
+    stage: &'static str,
+) -> Result<Prepared, Response> {
+    let model = asks.model();
+    let parser = ctx.state.parser.unwrap_or_default();
+    let names = ctx.components.parser_resolver.names(model);
+    // The tag takes the start the model's workers name, when they agree; the
+    // selected worker's own start decides the `auto` tag at request building.
+    let workers = ctx
+        .components
+        .worker_registry
+        .get_by_model(&ctx.input.model_id);
+    let replay = (!switch)
+        .then(|| {
+            symphony::reasoning_open(
+                parser,
+                &names,
+                model,
+                &ctx.components.templates,
+                processed_text,
+            )
+        })
+        .flatten();
+    let reasoning = switch || replay.is_some_and(|thought| thought.open);
+    // The prompt closed the thought itself and wrote the template's text
+    // after it (thinking switched off): the calls' tag owes none of it.
+    let thought_closed = replay.is_some_and(|thought| thought.closed);
+    let from_the_table = symphony::constraint(
+        parser,
+        &names,
+        asks,
+        tools,
+        reasoning,
+        thought_closed,
+        symphony::grammar_start_of(&workers),
+        &ctx.components.templates,
+    );
+    let choice = asks.choice();
+    let constraint = match (from_the_table, choice.as_deref()) {
+        (Ok(None), Some(tool_choice)) if !tools.is_empty() => Ok(ctx
+            .components
+            .tool_parser_factory
+            .registry()
+            .generate_tool_constraint(
+                ctx.components.parser_resolver.legacy_tool(&names),
+                tools,
+                tool_choice,
+                reasoning,
+            )
+            .map_err(|e| {
+                error!(function = stage, error = %e, "Invalid tool configuration");
+                error::bad_request(
+                    "invalid_tool_configuration",
+                    format!("Invalid tool configuration: {e}"),
+                )
+            })?),
+        (prepared, _) => prepared,
+    };
+    let json_schema = matches!(&constraint, Ok(Some(c)) if c.is_json_schema());
+    let keeps_special_tokens = match symphony::keeps_special_tokens(
+        parser,
+        &names,
+        model,
+        &ctx.components.templates,
+        tokenizer,
+    ) {
+        Some(kept) if !json_schema => kept,
+        _ => {
+            !asks.no_reasoning()
+                && utils::reasoning_parser_requires_special_tokens(
+                    &ctx.components.reasoning_parser_factory,
+                    ctx.components
+                        .parser_resolver
+                        .reasoning_parser(model)
+                        .as_deref(),
+                    model,
+                )
+        }
+    };
+    Ok(Prepared {
+        constraint,
+        json_schema,
+        keeps_special_tokens,
+    })
+}
 
 /// Whether the rendered prompt leaves the model inside its thought, as the
 /// request's grammar, the plan's reasoning state and the response spec all

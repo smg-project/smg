@@ -147,15 +147,16 @@ pub enum CallSyntax {
     /// an arguments state entered at the output's start, and the assembler decides at the first
     /// byte that is not whitespace.
     JsonList,
-    /// One JSON call object, or several with `;` between them, or a list of them, alone in the
-    /// turn, after the family's call marker where the model writes one, or content: Llama 3.1's
-    /// format, which the gateway's older `json` parser reads. The table's one state is an
-    /// arguments state entered at the output's start, and the assembler decides at the first byte
-    /// that is not whitespace: `{` is one call, and another after each `;`, `[` a list, anything
-    /// else content. The marker is the one the family's model writes before its first call,
-    /// when the table names one (`<|python_tag|>`, the token Llama 3.1's template reserves for a
-    /// call): read at the output's start only and dropped as the template's wrapping, so that an
-    /// output with it and one without read the same.
+    /// One JSON call object, or several with `;` or whitespace between them, or a list of them,
+    /// alone in the turn, after the family's call marker where the model writes one, or content:
+    /// Llama 3.1's format, which the gateway's older `json` parser reads. The table's one state is
+    /// an arguments state entered at the output's start, and the assembler decides at the first
+    /// byte that is not whitespace: `{` is one call, and every further object after it, behind a
+    /// `;` or behind whitespace alone, another; `[` a list, anything else content. The marker is
+    /// the one the family's model writes before its first call, when the table names one
+    /// (`<|python_tag|>`, the token Llama 3.1's template reserves for a call): read at the output's
+    /// start only and dropped as the template's wrapping, so that an output with it and one without
+    /// read the same.
     JsonAlone(Option<&'static str>),
     /// An XML tree of arguments: `<invoke name="…">`, then one element per argument, `<key>` to
     /// `</key>`, nested for an object and with `<item>` elements for a list, typed by the request's
@@ -774,9 +775,10 @@ impl Format {
     /// the bytes stay in the content as the model wrote them. The rows stay, so a call inside or
     /// after the thought reads as before, from wherever a start row, an anchor or the prompt's
     /// replay puts the turn. A call's markers are the terminals on the rows into or out of an
-    /// arguments state or a calls wrapper; a table whose thought is framed by them alone
-    /// (Inkling's) shows none, and neither does the variant [`Self::without_calls`] made of it,
-    /// whose message framing stays dropped ([`Self::message_framing`]). A state's own text rows
+    /// arguments state or a calls wrapper, and the message frame's are the terminals with a row
+    /// into or out of the frame ([`Self::message_framing`]): a table whose thought is framed by
+    /// them alone (Inkling's, whose kind markers also move between the bodies) shows none, and
+    /// neither does the variant [`Self::without_calls`] made of it. A state's own text rows
     /// stay with it: a trimmed stay is still trimmed, a framing state's text still dropped; and a
     /// tag the end cut short is still dropped, as the legacy parsers drop it on both their paths.
     /// A table without a thought changes only in what it shows; the thought-first mark and the
@@ -786,8 +788,13 @@ impl Format {
     #[must_use]
     pub fn without_reasoning(mut self) -> Self {
         let calls = self.terminals_of_calls();
+        let framing = self.message_framing();
         for (index, terminal) in self.terminals.iter_mut().enumerate() {
-            if !terminal.ignored && !calls.contains(&index) && !terminal.frames_messages {
+            if !terminal.ignored
+                && !calls.contains(&index)
+                && !framing.contains(&index)
+                && !terminal.frames_messages
+            {
                 terminal.shown = true;
             }
         }

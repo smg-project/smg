@@ -393,6 +393,10 @@ pub(crate) fn init_metrics() {
         symphony_telemetry::CALLS_SUPPRESSED,
         "Tool calls after the first that a Symphony table read and the gateway dropped under parallel_tool_calls: false, by table"
     );
+    describe_counter!(
+        symphony_telemetry::FALLBACK,
+        "Requests Symphony was configured for (the --parser flag or the request's X-SMG-Parser header) that the legacy parsers read instead of a table, by reason (no_table: the registry has no table for the model and nothing names one; reasoning_name_only: a reasoning parser name alone that no table answers to; legacy_tool_name: a legacy tool-call parser name no table answers to; passthrough; forced_call_without_tag: the table has no structural tag for the request's forced or required call, so the older registry's JSON schema constrains the output) and table (the table that had no tag; none where no table reads the model)"
+    );
     describe_counter!("smg_tokenizer_cache_lookups_total", "Tokenizer cache lookups by layer and result; L1 includes inputs without cacheable boundaries and excludes L0 hits");
     describe_counter!(
         "smg_tokenizer_cache_evictions_total",
@@ -549,7 +553,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_pd_rendezvous_failures_total",
-        "PD rendezvous failures by leg (the worker type of the leg that failed) and phase: a bootstrap port that refused the registration probe (probe), and the failures the engines report on the gRPC path when the legs never met (bootstrap) or the KV handoff after they met failed (transfer)"
+        "PD rendezvous failures by side (the worker type of the side whose rendezvous failed) and phase: a bootstrap port that refused the registration probe (probe) or the same probe run when a decode side's engine failed a request without a reason (request, on the prefill side whose port it is), and the failures the engines report on the gRPC path when the sides never met (bootstrap) or the KV handoff after they met failed (transfer)"
     );
     describe_counter!(
         "smg_pd_kv_transfer_failures_total",
@@ -1953,8 +1957,10 @@ impl Metrics {
     }
 
     /// Record a PD rendezvous failure by `side` (the worker type of the side
-    /// that failed) and `phase` (`probe` at registration; `bootstrap` or
-    /// `transfer` as the engine reported it). Its own family: the injection
+    /// whose rendezvous failed) and `phase` (`probe` at registration and
+    /// `request` on the request path, the prefill side's port probed by the
+    /// gateway; `bootstrap` or `transfer` as the engine reported it). Its
+    /// own family: the injection
     /// failures above keep their unlabelled series, so a bare selector on
     /// it still reads them alone.
     pub fn record_pd_rendezvous_failure(side: &'static str, phase: &'static str) {

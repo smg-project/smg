@@ -9,7 +9,6 @@ use openai_protocol::{
 use tracing::error;
 
 use crate::{
-    config::ParserChoice,
     routers::{
         error,
         grpc::{
@@ -17,7 +16,10 @@ use crate::{
             context::{PreparationOutput, RequestContext},
             multimodal,
             regular::{
-                stages::rendered_prompt::{prepare_rendered_prompt, RenderedPrompt},
+                stages::{
+                    reading,
+                    rendered_prompt::{prepare_rendered_prompt, RenderedPrompt},
+                },
                 symphony,
             },
             utils, ProcessedMessages,
@@ -161,107 +163,28 @@ pub(crate) async fn prepare_chat_like(
         // the choice lets the model call, dynamic tools declared on messages
         // included (see `ChatCompletionRequest::callable_tools`).
         let constraint_tools = request.callable_tools();
-        // When Symphony reads the response, its table gives a forced call, or a
-        // JSON response_format, its tag, so the output comes back in the syntax
-        // the table parses (see `regular::symphony`, which decides both with one
-        // predicate); the older registry decides for every other request. Only
-        // the chat stage chooses a parser: transcription, which shares this
-        // preparation, keeps the legacy parsers. The table's refusal waits for
-        // request building, which decides on the selected worker: one whose
-        // engine takes the whole turn's grammar may serve what the table's
-        // tags cannot (`regular::symphony::worker_constraint`).
-        let parser: ParserChoice = ctx.state.parser.unwrap_or_default();
-        let names = ctx.components.parser_resolver.names(&request.model);
-        // The tag takes the start the model's workers name, when they agree; the selected
-        // worker's own start decides the `auto` tag at request building.
-        let workers = ctx
-            .components
-            .worker_registry
-            .get_by_model(&ctx.input.model_id);
-        // The thinking switch's answer, or the table's replay of the rendered
-        // prompt where a table reads the response: a turn the prompt leaves
-        // unopened starts inside the thought whatever the switch says, and the
-        // tag must read it as the engine will (`regular::symphony::reasoning_open`).
-        let switch = utils::chat_reasoning_starts_in_rendered_prefill(
-            request,
-            processed_messages.continued_final_message,
-            tokenizer.as_ref(),
-        );
-        let replay = (!switch)
-            .then(|| {
-                symphony::reasoning_open(
-                    parser,
-                    &names,
-                    &request.model,
-                    &ctx.components.templates,
-                    &processed_messages.text,
-                )
-            })
-            .flatten();
-        let reasoning = switch || replay.is_some_and(|thought| thought.open);
-        // The prompt closed the thought itself and wrote the template's text
-        // after it (thinking switched off): the calls' tag owes none of it.
-        let thought_closed = replay.is_some_and(|thought| thought.closed);
-        let symphony_constraint = symphony::constraint(
-            parser,
-            &names,
+        // All of it, and whether the decoder keeps the special tokens the
+        // reader needs, is decided as for a Messages request
+        // (`reading::prepare`). Only the chat stage chooses a parser:
+        // transcription, which shares this preparation, keeps the legacy
+        // parsers.
+        let reading::Prepared {
+            constraint: tool_call_constraint,
+            json_schema: json_schema_constraint,
+            keeps_special_tokens: preserve_reasoning_special_tokens,
+        } = reading::prepare(
+            ctx,
             symphony::Asks::Chat(request),
             &constraint_tools,
-            reasoning,
-            thought_closed,
-            symphony::grammar_start_of(&workers),
-            &ctx.components.templates,
-        );
-        let tool_call_constraint = match (symphony_constraint, request.tool_choice.as_ref()) {
-            (Ok(None), Some(tool_choice)) if !constraint_tools.is_empty() => Ok(ctx
-                .components
-                .tool_parser_factory
-                .registry()
-                .generate_tool_constraint(
-                    ctx.components.parser_resolver.legacy_tool(&names),
-                    &constraint_tools,
-                    tool_choice,
-                    reasoning,
-                )
-                .map_err(|e| {
-                    error!(function = "ChatPreparationStage::execute", error = %e, "Invalid tool configuration");
-                    error::bad_request(
-                        "invalid_tool_configuration",
-                        format!("Invalid tool configuration: {e}"),
-                    )
-                })?),
-            (prepared, _) => prepared,
-        };
-
-        let json_schema_constraint = tool_call_constraint
-            .as_ref()
-            .is_ok_and(|constraint| constraint.as_ref().is_some_and(|c| c.is_json_schema()));
-        // A Symphony table whose markers the decoder would drop as special tokens needs them
-        // kept whatever the request asks of the channels: without them the table reads neither
-        // the thought nor the calls. Where a table reads the response its markers alone decide,
-        // and no legacy reasoning parser is built to be asked; under a JSON-schema constraint no
-        // table reads (request building makes no assignment: `regular::symphony::assign`), so
-        // the legacy parsers answer for themselves, as they do where no table reads at all.
-        let preserve_reasoning_special_tokens = match symphony::keeps_special_tokens(
-            parser,
-            &names,
-            &request.model,
-            &ctx.components.templates,
+            &processed_messages.text,
+            utils::chat_reasoning_starts_in_rendered_prefill(
+                request,
+                processed_messages.continued_final_message,
+                tokenizer.as_ref(),
+            ),
             &tokenizer,
-        ) {
-            Some(kept) if !json_schema_constraint => kept,
-            _ => {
-                request.separate_reasoning
-                    && utils::reasoning_parser_requires_special_tokens(
-                        &ctx.components.reasoning_parser_factory,
-                        ctx.components
-                            .parser_resolver
-                            .reasoning_parser(&request.model)
-                            .as_deref(),
-                        &request.model,
-                    )
-            }
-        };
+            "ChatPreparationStage::execute",
+        )?;
 
         let skip_special_tokens = skips_special_tokens(
             request,

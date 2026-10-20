@@ -14,8 +14,12 @@
 //! The spelling is the gateway's older `deepseek` parser's; DeepSeek V3.1 drops the type and the
 //! fence ([`deepseek_v3_1`]). V3's template writes no thought; the table reads one between
 //! `<think>` and `</think>` all the same, since the checkpoints that share the call spelling and
-//! write a thought (DeepSeek R1-0528, which the gateway's older pairing `deepseek` + `deepseek_r1`
-//! served) read with it under the `deepseek` alias, and a thought must never land in the content.
+//! write a thought read with it: the DeepSeek R1 line (R1, R1-Zero, the bf16 mirror, the six
+//! distills, R1-0528 and R1-0528-Qwen3-8B, by id, and the gateway's older pairing `deepseek` +
+//! `deepseek_r1` under the `deepseek` alias), whose templates render V3's block from the history
+//! and either open the thought in the prompt (`<think>` after the assistant header: R1, R1-Zero,
+//! the distills) or leave the model to open it (R1-0528, R1-0528-Qwen3-8B, the bf16 mirror); a
+//! thought must never land in the content.
 //! Recorded as `deepseek-v3-0324`, whose parse sets hold content alone: the template takes a
 //! call's arguments as a string, so the recorder, whose corpus holds them as an object, refused
 //! every call case; the calls stand on the turns the template renders, held in the tests below.
@@ -29,7 +33,19 @@ use crate::format::{CallSyntax, Emits, Format};
 /// The text between a call's name and its arguments: the fence the template opens.
 pub const FENCE_OPEN: &str = "\n```json\n";
 
-/// The DeepSeek V3 table.
+/// The DeepSeek V3 table. The tool outputs are a state of their own, entered from the calls block
+/// or from content on `<｜tool▁outputs▁begin｜>`, or from content or the thought on
+/// `<｜tool▁output▁begin｜>` (R1's, R1-Zero's, the bf16 mirror's and the distills' templates write
+/// the outer opener, like `<｜Assistant｜>`, for the conversation's first tool turn only, so a later
+/// turn's text is walked in content, where a quoted `<think>` opens the thought), and left for
+/// content on `<｜tool▁outputs▁end｜>`, with no other row: the
+/// template writes the turn opener after a user message only, so after a
+/// tool result the prompt's replay walks the call turn, and the R1 distills' template ends a turn
+/// with one call with neither `<｜tool▁calls▁end｜>` nor `<｜end▁of▁sentence｜>`, so the opener is
+/// what leaves the block there; nothing quoted inside a tool's output moves the walk; and the
+/// close starts the answer with nothing begun, so whitespace alone ahead of its thought or call
+/// is held, and the model's own `<think>`, or one the client prefilled, opens the thought from
+/// content as it does after `<｜Assistant｜>`.
 pub fn deepseek_v3() -> Format {
     Format::new("deepseek_v3")
         .terminal("think_open", "<think>")
@@ -38,10 +54,14 @@ pub fn deepseek_v3() -> Format {
         .terminal("calls_close", "<｜tool▁calls▁end｜>")
         .terminal("call_open", "<｜tool▁call▁begin｜>function<｜tool▁sep｜>")
         .terminal("call_close", "```<｜tool▁call▁end｜>")
+        .terminal("outputs_open", "<｜tool▁outputs▁begin｜>")
+        .terminal("output_open", "<｜tool▁output▁begin｜>")
+        .terminal("outputs_close", "<｜tool▁outputs▁end｜>")
         .state("content", Emits::Content)
         .state("reasoning", Emits::Reasoning)
         .state("calls", Emits::Wrapper)
         .state("call", Emits::Arguments)
+        .state("outputs", Emits::Content)
         .transition("content", "think_open", "reasoning")
         .transition("reasoning", "think_close", "content")
         .transition("content", "calls_open", "calls")
@@ -51,6 +71,11 @@ pub fn deepseek_v3() -> Format {
         .transition("call", "call_open", "call")
         .transition("call", "calls_close", "content")
         .transition("calls", "calls_close", "content")
+        .transition("calls", "outputs_open", "outputs")
+        .transition("content", "outputs_open", "outputs")
+        .transition("content", "output_open", "outputs")
+        .transition("reasoning", "output_open", "outputs")
+        .transition("outputs", "outputs_close", "content")
         .calls(CallSyntax::NamedArguments {
             marker: FENCE_OPEN,
             between_calls: "\n",
@@ -75,8 +100,10 @@ mod tests {
 
     /// The generation prompt's tail: the turn's opener and nothing more.
     const PROMPT: &str = "<｜Assistant｜>";
-    /// The tail of a checkpoint whose template opens the thought in the prompt (the original R1
-    /// and its distills). R1-0528 ends its prompt at the opener and writes `<think>` itself.
+    /// The tail of a checkpoint whose template opens the thought in the prompt: DeepSeek R1's,
+    /// R1-Zero's and the R1 distills' write `<think>` and a newline after the assistant header.
+    /// R1-0528's, R1-0528-Qwen3-8B's and the bf16 mirror's end at the header, and the model writes
+    /// `<think>` itself.
     const THINKING: &str = "<｜Assistant｜><think>\n";
 
     fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
@@ -201,8 +228,9 @@ mod tests {
     /// The turns the template renders for the shapes a tool-calling conversation takes: one call,
     /// three calls in one block (a newline before each call after the first), a call after
     /// content, a call with no arguments, nested and non-ASCII values, and content alone; then a
-    /// call and content after a thought the prompt opens (the original R1 and its distills), and
-    /// after a thought the model opens itself, the prompt ending at the opener (R1-0528).
+    /// call and content after a thought the prompt opens (R1, R1-Zero and the distills, whose
+    /// template writes `<think>` and a newline after the header), and after a thought the model
+    /// opens itself, the prompt ending at the header (R1-0528, R1-0528-Qwen3-8B and the bf16 mirror).
     const RENDERED_TURNS: &[RenderedTurn] = &[
         RenderedTurn {
             tail: PROMPT,
@@ -459,7 +487,103 @@ mod tests {
             format.replay(prompt),
             &prompt[prompt.find("<｜Assistant｜>").expect("the opener")..]
         );
+        assert!(!format.reasoning_open(prompt));
         let events = run(prompt, &["It is 18 degrees."]);
+        assert_eq!(content(&events), "It is 18 degrees.");
+        assert!(calls(&events).is_empty());
+        // The R1 distills' template writes `<｜tool▁calls▁end｜><｜end▁of▁sentence｜>` after the
+        // second call and later only, so a turn with one call ends with neither; the tool
+        // outputs' opener leaves the block all the same, and the model's own `<think>` opens the
+        // thought from content, as it does after `<｜Assistant｜>`.
+        let one_call = "<｜User｜>Weather in Paris?<｜Assistant｜><｜tool▁calls▁begin｜>\
+                        <｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n\
+                        {\"city\": \"Paris\"}\n```<｜tool▁call▁end｜><｜tool▁outputs▁begin｜>\
+                        <｜tool▁output▁begin｜>{\"temperature\": 18}<｜tool▁output▁end｜>\
+                        <｜tool▁outputs▁end｜>";
+        assert!(
+            !format.reasoning_open(one_call),
+            "the tool outputs left the block"
+        );
+        let events = run(one_call, &["<think>Warm.</think>It is 18 degrees."]);
+        assert_eq!(reasoning(&events), "Warm.");
+        assert_eq!(content(&events), "It is 18 degrees.");
+        assert!(calls(&events).is_empty());
+        // The tool outputs are a state of their own, left for content on their close: the
+        // answer starts with nothing begun, and whitespace alone ahead of its thought is held,
+        // not shown as content.
+        let events = run(one_call, &["\n<think>Warm.</think>It is 18 degrees."]);
+        assert_eq!(reasoning(&events), "Warm.");
+        assert_eq!(
+            content(&events),
+            "It is 18 degrees.",
+            "no whitespace-only content"
+        );
+        let events = run(prompt, &["\n\n<think>Warm.</think>It is 18 degrees."]);
+        assert_eq!(reasoning(&events), "Warm.");
+        assert_eq!(
+            content(&events),
+            "It is 18 degrees.",
+            "the lead is held after an ended block too"
+        );
+        // Nothing quoted inside a tool's output moves the walk: a literal `<think>` or a calls
+        // opener in the result's text stays there, and the answer after it is content.
+        let quoted = "<｜User｜>Weather in Paris?<｜Assistant｜><｜tool▁calls▁begin｜>\
+                      <｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n\
+                      {\"city\": \"Paris\"}\n```<｜tool▁call▁end｜><｜tool▁outputs▁begin｜>\
+                      <｜tool▁output▁begin｜>{\"note\": \"<think> and <｜tool▁calls▁begin｜> \
+                      are text here\"}<｜tool▁output▁end｜><｜tool▁outputs▁end｜>";
+        assert!(
+            !format.reasoning_open(quoted),
+            "a quoted marker moves nothing"
+        );
+        let events = run(quoted, &["It is 18 degrees."]);
+        assert_eq!(content(&events), "It is 18 degrees.");
+        assert_eq!(reasoning(&events), "");
+        assert!(calls(&events).is_empty());
+        // R1's, R1-Zero's, the bf16 mirror's and the distills' templates write `<｜Assistant｜>`
+        // and `<｜tool▁outputs▁begin｜>` for the conversation's first tool turn only (R1-0528's
+        // reset them every tool turn), so a later turn's call and results are walked from that
+        // first opener, in content: the inner `<｜tool▁output▁begin｜>` takes the walk into the
+        // outputs there, and the close leaves them with nothing begun.
+        let later = "<｜User｜>u1<｜Assistant｜><｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function\
+                     <｜tool▁sep｜>f\n```json\n{}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>\
+                     <｜end▁of▁sentence｜><｜tool▁outputs▁begin｜><｜tool▁output▁begin｜>r1\
+                     <｜tool▁output▁end｜><｜tool▁outputs▁end｜>answer1<｜end▁of▁sentence｜>\
+                     <｜User｜>u2\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>g\n```json\n{}\n```\
+                     <｜tool▁call▁end｜><｜tool▁calls▁end｜><｜end▁of▁sentence｜><｜tool▁output▁begin｜>\
+                     {\"note\": \"<think>\"}<｜tool▁output▁end｜><｜tool▁outputs▁end｜>";
+        assert!(
+            !format.reasoning_open(later),
+            "a later turn's result moves nothing"
+        );
+        let events = run(later, &["\n<think>Warm.</think>It is 18 degrees."]);
+        assert_eq!(reasoning(&events), "Warm.");
+        assert_eq!(
+            content(&events),
+            "It is 18 degrees.",
+            "nothing begun after a later result"
+        );
+        assert!(calls(&events).is_empty());
+        // An unbalanced `<think>` quoted in the text walked in content before the inner opener
+        // (a user's question, a call's arguments) opens the thought; the inner opener takes the
+        // walk from the thought into the outputs as it does from content.
+        let quoted_later = later.replace("<｜User｜>u2", "<｜User｜>What does the <think> tag do?");
+        assert!(
+            !format.reasoning_open(&quoted_later),
+            "the inner opener leaves the thought"
+        );
+        let events = run(&quoted_later, &["<think>Warm.</think>It is 18 degrees."]);
+        assert_eq!(reasoning(&events), "Warm.");
+        assert_eq!(content(&events), "It is 18 degrees.");
+        // A thought the client prefilled after the tool result (`continue_final_message`) is
+        // read: the walk went past the tool outputs, and `<think>` opened the thought.
+        let prefilled = format!("{one_call}<think>\nThe tool says");
+        assert!(
+            format.reasoning_open(&prefilled),
+            "the prefilled thought is open"
+        );
+        let events = run(&prefilled, &[" 18.</think>It is 18 degrees."]);
+        assert_eq!(reasoning(&events), " 18.");
         assert_eq!(content(&events), "It is 18 degrees.");
         assert!(calls(&events).is_empty());
         // A marker quoted in an earlier turn moves nothing.
@@ -560,8 +684,10 @@ mod tests {
             ]})
         );
         // With the prompt's thought open and the grammar run from the first token, the thought's
-        // text may not write the table's terminals, and may still hold a fenced draft of the
-        // arguments: the fence is ordinary text, and a call opens only at the call's opener.
+        // text may not write the table's terminals (the tool outputs' opener among them, a
+        // marker the template writes and the model does not), and may still hold a fenced draft
+        // of the arguments: the fence is ordinary text, and a call opens only at the call's
+        // opener.
         let open = deepseek_v3()
             .grammar_for(
                 std::slice::from_ref(&tool),
@@ -584,6 +710,9 @@ mod tests {
                 "<｜tool▁calls▁end｜>",
                 "<｜tool▁call▁begin｜>function<｜tool▁sep｜>",
                 "```<｜tool▁call▁end｜>",
+                "<｜tool▁outputs▁begin｜>",
+                "<｜tool▁output▁begin｜>",
+                "<｜tool▁outputs▁end｜>",
             ])
         );
         // The call as the tag writes it, the fence's close right after the object (the template

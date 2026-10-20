@@ -477,7 +477,7 @@ mod tests {
             ),
             ("</mm:think><tool_call>\n<invoke name=\"alert\"><name>Par</tool_call>", ""),
             (
-                "</mm:think><tool_call>\n<invoke name=\"alert\"><name>Par<invoke name=\"g\">\
+                "</mm:think><tool_call>\n<invoke name=\"alert\"><name>Par<invoke name=\"alert\">\
                  </invoke>\n</tool_call>",
                 "",
             ),

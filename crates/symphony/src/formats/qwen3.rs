@@ -1189,13 +1189,39 @@ mod tests {
                 ),
             ),
         ];
+        // Both functions declared: the engine announces a call to an undeclared one, and the
+        // subject here is the block's shape.
+        let two_tools = || {
+            use openai_protocol::common::{Function, Tool};
+            use serde_json::json as value;
+            let tool = |name: &str, parameters: serde_json::Value| Tool {
+                tool_type: "function".to_string(),
+                function: Function {
+                    name: name.to_string(),
+                    description: None,
+                    parameters,
+                    strict: None,
+                    extra: Default::default(),
+                },
+            };
+            Declared::of(&[
+                tool(
+                    "get_weather",
+                    value!({"type": "object", "properties": {"city": {"type": "string"}}}),
+                ),
+                tool(
+                    "lookup",
+                    value!({"type": "object", "properties": {"id": {"type": "integer"}}}),
+                ),
+            ])
+        };
         for (placement, output) in shapes {
             let per_char: Vec<String> = output.chars().map(String::from).collect();
             let per_char: Vec<&str> = per_char.iter().map(String::as_str).collect();
             for pieces in [vec![output], per_char] {
                 let mut parser = engine(
                     qwen3(CallSyntax::Tagged(Spelling::Json, placement)),
-                    declared(),
+                    two_tools(),
                 );
                 let mut out = Events::new();
                 for piece in &pieces {

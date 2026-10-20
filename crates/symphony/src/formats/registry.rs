@@ -462,6 +462,18 @@ mod tests {
         ] {
             assert_eq!(table_for(mimo), Some(Table::Qwen3TaggedDirect), "{mimo}");
         }
+        // The R1 line writes V3's call spelling from its history and a thought the V3 table reads.
+        for r1 in [
+            "deepseek-ai/DeepSeek-R1",
+            "deepseek-ai/DeepSeek-R1-Zero",
+            "arcee-ai/DeepSeek-R1-bf16",
+            "deepseek-ai/DeepSeek-R1-0528",
+            "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
+            "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
+            "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
+        ] {
+            assert_eq!(table_for(r1), Some(Table::DeepSeekV3), "{r1}");
+        }
     }
 
     #[test]

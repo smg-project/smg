@@ -149,7 +149,8 @@ Three tiers, two of them at run time:
 - **Malformed**: bytes of a region the parser gave up on, returned whole, each with a
   `MalformedReason` from a closed set: the stream ended inside a region (`UnterminatedRegion`),
   arguments that did not parse (`InvalidArguments`), a call to a function the request did not
-  declare (`UnknownTool`), and the syntax-level shapes a model gets wrong: text between a call's
+  declare (`UnknownTool`: the engine's own event of no bytes before the call's start, for every
+  syntax, the call delivered as read), and the syntax-level shapes a model gets wrong: text between a call's
   tags, a tag out of place or cut short, a call or a tag without a name, a key written twice or
   without a value, text where a call or an argument should begin, text after the arguments or
   after the list, a block that closed without a complete call, and the rest the enum lists with a

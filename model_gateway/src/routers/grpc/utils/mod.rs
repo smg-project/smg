@@ -40,7 +40,7 @@ pub(crate) use parsers::{
     rendered_prompt_reasoning_in_prefill, tool_constraints_for_worker, ModelNames, Names,
     ParserResolver, WorkerDecoding,
 };
-pub(crate) use pd_bootstrap::account_pd_side_failure;
+pub(crate) use pd_bootstrap::{account_pd_side_failure, dead_rendezvous_of, DeadRendezvous};
 pub(crate) use stream_failure::{send_stream_failure, StreamFailure, StreamSource};
 
 /// One WARN per choice whose stream recovered from a rewritten decode prefix

@@ -2816,4 +2816,76 @@ mod pd_tests {
             }
         }
     }
+
+    /// One gateway under `--parser symphony` with no parser names: the model the registry does
+    /// not know is read by the legacy parsers, its answer says so, and the request is counted
+    /// once, under `no_table` and no table; a second request counts a second; the model the
+    /// registry knows is read by its table and counts nothing. The count is the pipeline's one
+    /// per request, where request building decides the reader.
+    #[tokio::test]
+    async fn a_request_the_legacy_parsers_read_under_symphony_is_counted_once_through_the_pipeline()
+    {
+        let ctx =
+            grpc_ctx_with_parsers(routing_mode(Mode::Regular), ParserChoice::Symphony, None).await;
+        register_tokenizer_for(
+            &ctx,
+            KNOWN_MODEL,
+            CHAT_TEMPLATE,
+            (TABLE_OUTPUT, TABLE_OUTPUT_ID),
+        )
+        .await;
+        register_tokenizer_for(
+            &ctx,
+            UNKNOWN_MODEL,
+            V13_CHAT_TEMPLATE,
+            (V13_OUTPUT, V13_OUTPUT_ID),
+        )
+        .await;
+        for (model, output_id) in [
+            (KNOWN_MODEL, TABLE_OUTPUT_ID),
+            (UNKNOWN_MODEL, V13_OUTPUT_ID),
+        ] {
+            let port = spawn_engine(vec![output_id]).await;
+            register_worker(
+                &ctx,
+                &format!("grpc://127.0.0.1:{port}"),
+                WorkerType::Regular,
+                ModelCard::new(model),
+            );
+        }
+        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("router");
+        // A recorder of this test's own: the runtime is single-threaded, so it sees every
+        // record of the requests below.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let guard = metrics::set_default_local_recorder(&recorder);
+        let fallback_lines = |scrape: &str| -> Vec<String> {
+            scrape
+                .lines()
+                .filter(|line| line.starts_with("smg_symphony_fallback_total"))
+                .map(str::to_string)
+                .collect()
+        };
+        for count in [" 1", " 2"] {
+            let (status, parser, answer) = chat(&router, UNKNOWN_MODEL, &HeaderMap::new()).await;
+            assert_eq!(status, StatusCode::OK, "{answer}");
+            assert_eq!(parser.as_deref(), Some("legacy"), "{answer}");
+            let lines = fallback_lines(&handle.render());
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(
+                lines[0].contains("reason=\"no_table\"")
+                    && lines[0].contains("table=\"none\"")
+                    && lines[0].ends_with(count),
+                "{}",
+                lines[0]
+            );
+        }
+        let (status, parser, answer) = chat(&router, KNOWN_MODEL, &HeaderMap::new()).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(parser.as_deref(), Some("symphony"), "{answer}");
+        let lines = fallback_lines(&handle.render());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].ends_with(" 2"), "{}", lines[0]);
+        drop(guard);
+    }
 }

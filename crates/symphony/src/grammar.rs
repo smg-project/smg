@@ -522,7 +522,8 @@ pub struct Options {
 /// prompt opens no thought, the start is read by the answer tag of a table whose thought is a
 /// message of its own alone, and only where it names the first token
 /// ([`Format::answer_grammar`]): an engine that starts after its parser may gate on it whatever
-/// the prompt or only when the request asks for reasoning, which the start does not say.
+/// the prompt or only when the request asks for reasoning, which the start does not say, so the
+/// tag fits both and the table reads what the model writes at the gate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GrammarStart {
     /// The engine does not say where it starts.
@@ -846,8 +847,9 @@ impl Format {
     /// [`Self::grammar`]; a thought the model may write first leads the answer as it leads a call.
     /// Where the thought is a message of its own before an answer that is another (Inkling's) and
     /// the prompt opens no thought, the tag admits the thought first, closed and the next message
-    /// opened, and leaves the way into the answer optional unless the engine starts the grammar at
-    /// the first token ([`Self::thought_message`]).
+    /// opened, with the way into the answer owed after it, and leaves the way in optional without
+    /// the thought unless the engine starts the grammar at the first token
+    /// ([`Self::thought_message`]).
     pub fn answer_grammar(&self, schema: &Value, reasoning_open: bool) -> Option<Grammar> {
         self.answer_grammar_for(schema, reasoning_open, GrammarStart::Unknown)
     }
@@ -939,24 +941,33 @@ impl Format {
         // writes it. On a prompt that opens no thought the start says which only when it names
         // the first token: an engine that says it starts after its parser may gate on that parser
         // whatever the prompt or only when the request asks for reasoning, and the tag fits
-        // both, the way in optional. The thought comes first either way, so an engine that starts
-        // before it does not force the answer into the model's first message.
+        // both, the way in optional without the thought. After the thought, closed and the next
+        // message opened, the way in is owed whatever the engine: the message needs its kind,
+        // and nothing has consumed it, at the gate included, where the tag's thought is open to
+        // the model once more past its own marker (the table reads the kind said again there as
+        // the kind). The thought comes first either way, so an engine that starts before it does
+        // not force the answer into the model's first message.
         if !reasoning_open {
             if let Some(thought) = self.thought_message() {
-                let thought = if self.writes_thought_first() {
-                    thought
+                let opener = (!begin.is_empty()).then(|| Grammar::ConstString(begin));
+                let mut parts = Vec::new();
+                if self.writes_thought_first() {
+                    parts.push(thought);
+                    parts.extend(opener);
                 } else {
-                    Grammar::Optional(Box::new(thought))
-                };
-                let mut parts = vec![thought];
-                if !begin.is_empty() {
-                    let opener = Grammar::ConstString(begin);
-                    parts.push(match start {
-                        GrammarStart::FirstToken => opener,
-                        GrammarStart::AfterReasoning | GrammarStart::Unknown => {
-                            Grammar::Optional(Box::new(opener))
+                    match (opener, start) {
+                        (Some(opener), GrammarStart::FirstToken) => {
+                            parts.push(Grammar::Optional(Box::new(thought)));
+                            parts.push(opener);
                         }
-                    });
+                        (Some(opener), GrammarStart::AfterReasoning | GrammarStart::Unknown) => {
+                            parts.push(Grammar::Optional(Box::new(Grammar::Or(vec![
+                                Grammar::Sequence(vec![thought, opener.clone()]),
+                                opener,
+                            ]))));
+                        }
+                        (None, _) => parts.push(Grammar::Optional(Box::new(thought))),
+                    }
                 }
                 parts.push(answer);
                 if !end.is_empty() {
@@ -3073,8 +3084,9 @@ mod tests {
     fn inklings_answer_is_a_text_message() {
         // The output starts after the message's opener, where the text marker makes the message
         // the answer, and the message's close ends it. The thought is a message of its own, so
-        // the tag admits it first, closed and the next message opened, and leaves the text marker
-        // to the engine: one that starts the grammar after its reasoning parser has consumed the
+        // the tag admits it first, closed and the next message opened, with the text marker owed
+        // after it (the message needs its kind), and leaves the marker to the engine without the
+        // thought: one that starts the grammar after its reasoning parser has consumed the
         // model's own marker (the parser hands over there, not at the thought's close, which ends
         // every message), one that starts before the thought writes it. The generation prompt
         // opens no thought; a thought a prompt left open reaches a text message only through the
@@ -3089,11 +3101,14 @@ mod tests {
             ]},
             "end": "<|end_message|><|message_model|>",
         });
+        let opener = value!({"type": "const_string", "value": "<|content_text|>"});
         assert_eq!(
             answer(&formats::inkling(), false),
             Some(value!({"format": {"type": "sequence", "elements": [
-                {"type": "optional", "content": thought},
-                {"type": "optional", "content": {"type": "const_string", "value": "<|content_text|>"}},
+                {"type": "optional", "content": {"type": "or", "elements": [
+                    {"type": "sequence", "elements": [thought, opener]},
+                    opener,
+                ]}},
                 {"type": "json_schema", "json_schema": answer_schema()},
                 {"type": "const_string", "value": "<|end_message|>"},
             ]}}))
@@ -3104,9 +3119,10 @@ mod tests {
     #[test]
     fn inklings_answer_writes_the_text_marker_outright_only_from_the_first_token() {
         // Where the engine says it starts the grammar at the first token, the model writes the
-        // marker under the grammar, so the tag owes it; after a reasoning parser's gate, or where
-        // the engine does not say, the model's own marker may have been consumed before the
-        // grammar started, and the tag fits both.
+        // marker under the grammar, so the tag owes it with or without the thought; after a
+        // reasoning parser's gate, or where the engine does not say, the model's own marker may
+        // have been consumed before the grammar started, and the tag fits both: the marker owed
+        // after the thought, optional on its own.
         let answer_for = |start| {
             formats::inkling()
                 .answer_grammar_for(&answer_schema(), false, start)
@@ -3122,21 +3138,24 @@ mod tests {
             elements(&unknown).expect("a sequence"),
         );
         assert_eq!(first.len(), 4);
+        assert_eq!(unknown.len(), 3);
+        let opener = value!({"type": "const_string", "value": "<|content_text|>"});
         assert_eq!(
-            first[0], unknown[0],
+            first[0]["type"], "optional",
             "the thought the model may write first"
         );
+        assert_eq!(first[1], opener, "owed outright from the first token");
         assert_eq!(
-            first[1],
-            value!({"type": "const_string", "value": "<|content_text|>"})
-        );
-        assert_eq!(
-            unknown[1],
-            value!({"type": "optional", "content": first[1]})
+            unknown[0],
+            value!({"type": "optional", "content": {"type": "or", "elements": [
+                {"type": "sequence", "elements": [first[0]["content"].clone(), opener.clone()]},
+                opener,
+            ]}}),
+            "owed after the thought, the engine's to have consumed without it"
         );
         assert_eq!(
             first[2..],
-            unknown[2..],
+            unknown[1..],
             "the schema and the message's close"
         );
     }
@@ -4064,8 +4083,9 @@ mod tests {
         // opener `<a>`: the layout's text after a thought follows the close, and its text before
         // an answer comes right before `<a>`, not before the first row. With the thought not
         // open, the thought is a message of its own (it closes into the framing between the
-        // messages, and `<n>` leads back): the tag admits it first, closed and followed by `<n>`,
-        // and the way into the answer, the layout's text and `<a>`, is left optional.
+        // messages, and `<n>` leads back): the tag admits it first, closed and followed by `<n>`
+        // and then the way into the answer, the layout's text and `<a>`, which is owed after the
+        // thought and optional on its own.
         let format = Format::new("two markers")
             .terminal("think_open", "<t>")
             .terminal("think_close", "</t>")
@@ -4100,14 +4120,16 @@ mod tests {
         );
         let closed = answer(&format, false).expect("an answer tag");
         assert_eq!(closed["format"]["type"], "sequence");
-        assert_eq!(
-            closed["format"]["elements"][0]["content"]["end"],
-            value!("</t>\n<n>")
-        );
-        assert_eq!(
-            closed["format"]["elements"][1],
-            value!({"type": "optional", "content": {"type": "const_string", "value": " <a>"}})
-        );
+        let first = &closed["format"]["elements"][0];
+        assert_eq!(first["type"], "optional");
+        let ways = first["content"]["elements"]
+            .as_array()
+            .expect("the two ways in");
+        assert_eq!(ways[0]["elements"][0]["end"], value!("</t>\n<n>"));
+        let opener = value!({"type": "const_string", "value": " <a>"});
+        assert_eq!(ways[0]["elements"][1], opener, "owed after the thought");
+        assert_eq!(ways[1], opener, "optional on its own");
+        assert_eq!(closed["format"]["elements"][1]["type"], "json_schema");
     }
 
     /// A thought the template closes two ways, `<u>` or `<e></t>`, the row on `<u>` first in the

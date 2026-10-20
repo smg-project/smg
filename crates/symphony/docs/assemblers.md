@@ -122,14 +122,15 @@ from the engine's `CallIds`. What frames the calls is one value, `Framing`, give
 and mapped from the table's call syntax by the engine's factory: `Bare` (xLAM) is the list alone in
 the output, where anything but a list is prose; `Framed` (Llama Nemotron) is the list between
 markers, where text in place of it is malformed; `ObjectOrList` (the `json` table) also reads a
-`{` at the first byte as one call alone and another call after each `;` that follows it, and
-carries the family's call marker the output may open with (Llama 3.1's `<|python_tag|>`), dropped
-as the template's wrapping where it does. The stages (deciding at the first byte that is not
-whitespace, inside the marker, between objects, inside one, after the `]` or the lone object) and
-what they say of the bytes around the objects (the brackets, the commas, the `;` and the wrapping
-whitespace `Dropped`; text between objects `Malformed`, one run per event, a run ending at
-whitespace, a comma, a brace or the `]`; text after the list or the lone object `Malformed` with
-its whitespace, one event per piece once text follows) are the same under every framing.
+`{` at the first byte as one call alone and every further object after it, behind a `;` or behind
+whitespace alone, as another call, and carries the family's call marker the output may open with
+(Llama 3.1's `<|python_tag|>`), dropped as the template's wrapping where it does. The stages
+(deciding at the first byte that is not whitespace, inside the marker, between objects, inside one,
+after the `]` or the lone object) and what they say of the bytes around the objects (the brackets,
+the commas, the `;` and the wrapping whitespace `Dropped`; text between objects `Malformed`, one run
+per event, a run ending at whitespace, a comma, a brace or the `]`; text after the list or the lone
+object `Malformed` with its whitespace, one event per piece once text follows) are the same under
+every framing.
 
 The JSON family so reads as one object reader with the framings around it, each stated once:
 none, where a table's markers frame one object (`CallSyntax::Json`, the JSON assembler itself); a
@@ -137,11 +138,11 @@ header (`json::named`, whose `After` says what the JSON after the marker is); a 
 whose `Framing` says what is around the objects). The lone object between markers is not a framing
 of the list reader: the engine, not the reader, reports what follows the object there
 (`Engine::wrapping`, per piece), where the list reader holds the whitespace after a lone object
-across pieces and reads a `;` or prose after it; folding it in would change those events, or put a
-branch on the busiest JSON path for no reader fewer. The forced call (`json::forced`) reads through
-the value reader (`json::arguments`), which ends where the value is whole and holds the strings a
-caller types, not at an object's brace: a different reader by design, named by the request rather
-than framed.
+across pieces and reads a `;`, another object or prose after it; folding it in would change those
+events, or put a branch on the busiest JSON path for no reader fewer. The forced call
+(`json::forced`) reads through the value reader (`json::arguments`), which ends where the value is
+whole and holds the strings a caller types, not at an object's brace: a different reader by design,
+named by the request rather than framed.
 
 ## The Qwen tagged assembler (`tagged::assembler`)
 

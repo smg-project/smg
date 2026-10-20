@@ -28,7 +28,10 @@
 //! model, when the registry's table sets the flags' choice aside ([`set_aside_by_the_registry`]).
 //! Every request read with `legacy` keeps the older parsers. The response names
 //! the parser that read it in `x-smg-parser`, legacy when the choice was Symphony but no table
-//! took the request, so a client comparing the two can tell which one read each answer. What a
+//! took the request, so a client comparing the two can tell which one read each answer, and the
+//! gateway counts such a request once by the reason (`smg_symphony_fallback_total`,
+//! [`telemetry`]), so an operator can tell how often, and why, before and after the default
+//! changes. What a
 //! request asks of the channels takes a variant of the table rather than another reader: where the
 //! legacy path would run no tool parser (`tool_choice: none`; no tools declared, for a provider
 //! that reads calls only with them), the table without its calls; with

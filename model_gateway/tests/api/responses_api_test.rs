@@ -2887,21 +2887,25 @@ fn sse_frames(body: &str) -> Vec<&str> {
     body.split("\n\n").filter(|f| !f.is_empty()).collect()
 }
 
-/// The `sequence_number` of a frame's data event.
-fn frame_sequence_number(frame: &str) -> Option<u64> {
-    let data = frame.lines().find_map(|l| l.strip_prefix("data: "))?;
-    serde_json::from_str::<serde_json::Value>(data).ok()?["sequence_number"].as_u64()
+/// A streaming request through the tool loop, its response not stored.
+fn streaming_mcp_request(mcp_url: &str, max_tool_calls: Option<u32>) -> ResponsesRequest {
+    mcp_request(mcp_url, max_tool_calls, true, false)
 }
 
-/// A streaming request that routes through the tool loop: one MCP tool at
-/// `mcp_url`, the mock server's `brave_web_search` behind it.
-fn streaming_mcp_request(mcp_url: &str, max_tool_calls: Option<u32>) -> ResponsesRequest {
+/// A request that routes through the tool loop: one MCP tool at `mcp_url`,
+/// the mock server's `brave_web_search` behind it.
+fn mcp_request(
+    mcp_url: &str,
+    max_tool_calls: Option<u32>,
+    stream: bool,
+    store: bool,
+) -> ResponsesRequest {
     ResponsesRequest {
         input: ResponseInput::Text("search for something".to_string()),
         model: "mock-model".to_string(),
         max_tool_calls,
-        store: Some(false),
-        stream: Some(true),
+        store: Some(store),
+        stream: Some(stream),
         tools: Some(vec![ResponseTool::Mcp(McpTool {
             server_url: Some(mcp_url.to_string()),
             authorization: None,
@@ -2950,20 +2954,36 @@ async fn stub_upstream(
     (format!("http://{addr}"), server)
 }
 
-/// The SSE body of one function-call turn: the model asks for
-/// `brave_web_search`, as an upstream of the Responses API streams it. An
-/// upstream that answers every turn with it asks again after the call's
-/// output comes back, so with `max_tool_calls` 1 the second turn's call is
-/// one over the limit.
-fn function_call_turn() -> String {
+/// The `function_call` item of turn `turn`: the model asks for
+/// `brave_web_search`; the ids carry the turn's number.
+fn function_call_turn_item(turn: usize) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("fc_stub_{turn}"), "type": "function_call",
+        "call_id": format!("call_stub_{turn}"), "name": "brave_web_search",
+        "arguments": "{\"query\":\"smg\"}", "status": "completed"
+    })
+}
+
+/// The response object of function-call turn `turn`, as an upstream of the
+/// Responses API answers it unstreamed. An upstream that answers every turn
+/// with it asks again after the call's output comes back, so with
+/// `max_tool_calls` 1 the second turn's call is one over the limit.
+fn function_call_turn_response(turn: usize) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("resp_stub_{turn}"), "object": "response", "created_at": 1_700_000_000,
+        "model": "mock-model", "status": "completed", "output": [function_call_turn_item(turn)]
+    })
+}
+
+/// The SSE body of function-call turn `turn`, as an upstream of the
+/// Responses API streams it.
+fn function_call_turn_events(turn: usize) -> String {
     let response = serde_json::json!({
-        "id": "resp_stub", "object": "response", "created_at": 1_700_000_000,
+        "id": format!("resp_stub_{turn}"), "object": "response", "created_at": 1_700_000_000,
         "model": "mock-model", "status": "in_progress", "output": []
     });
-    let call = serde_json::json!({
-        "id": "fc_stub", "type": "function_call", "call_id": "call_stub",
-        "name": "brave_web_search", "arguments": "{\"query\":\"smg\"}", "status": "completed"
-    });
+    let call = function_call_turn_item(turn);
+    let item_id = format!("fc_stub_{turn}");
     let events = [
         (
             "response.created",
@@ -2979,11 +2999,11 @@ fn function_call_turn() -> String {
         ),
         (
             "response.function_call_arguments.delta",
-            serde_json::json!({"type": "response.function_call_arguments.delta", "sequence_number": 3, "output_index": 0, "item_id": "fc_stub", "delta": "{\"query\":\"smg\"}"}),
+            serde_json::json!({"type": "response.function_call_arguments.delta", "sequence_number": 3, "output_index": 0, "item_id": item_id, "delta": "{\"query\":\"smg\"}"}),
         ),
         (
             "response.function_call_arguments.done",
-            serde_json::json!({"type": "response.function_call_arguments.done", "sequence_number": 4, "output_index": 0, "item_id": "fc_stub", "arguments": "{\"query\":\"smg\"}"}),
+            serde_json::json!({"type": "response.function_call_arguments.done", "sequence_number": 4, "output_index": 0, "item_id": item_id, "arguments": "{\"query\":\"smg\"}"}),
         ),
         (
             "response.output_item.done",
@@ -2991,10 +3011,7 @@ fn function_call_turn() -> String {
         ),
         (
             "response.completed",
-            serde_json::json!({"type": "response.completed", "sequence_number": 6, "response": {
-                "id": "resp_stub", "object": "response", "created_at": 1_700_000_000,
-                "model": "mock-model", "status": "completed", "output": [call]
-            }}),
+            serde_json::json!({"type": "response.completed", "sequence_number": 6, "response": function_call_turn_response(turn)}),
         ),
     ];
     events
@@ -3003,21 +3020,125 @@ fn function_call_turn() -> String {
         .collect()
 }
 
+/// An upstream that asks for the tool on every turn, streamed or not: the
+/// turn's SSE body for a streaming request, its response object otherwise,
+/// the turns numbered in order.
+fn always_calling_upstream() -> axum::routing::MethodRouter {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use axum::response::IntoResponse;
+    let turns = Arc::new(AtomicUsize::new(0));
+    axum::routing::post(move |body: String| {
+        let turns = Arc::clone(&turns);
+        async move {
+            let turn = turns.fetch_add(1, Ordering::SeqCst) + 1;
+            let streaming = serde_json::from_str::<serde_json::Value>(&body)
+                .is_ok_and(|request| request["stream"] == true);
+            if streaming {
+                (
+                    [(CONTENT_TYPE, "text/event-stream")],
+                    function_call_turn_events(turn),
+                )
+                    .into_response()
+            } else {
+                axum::Json(function_call_turn_response(turn)).into_response()
+            }
+        }
+    })
+}
+
+/// An upstream that asks for two calls in one turn, unstreamed: the two
+/// `function_call` items in one response object.
+fn two_call_turn_upstream() -> axum::routing::MethodRouter {
+    axum::routing::post(|| async {
+        axum::Json(serde_json::json!({
+            "id": "resp_stub_two", "object": "response", "created_at": 1_700_000_000,
+            "model": "mock-model", "status": "completed",
+            "output": [
+                {"id": "fc_stub_a", "type": "function_call", "call_id": "call_stub_a",
+                 "name": "brave_web_search", "arguments": "{\"query\":\"smg a\"}", "status": "completed"},
+                {"id": "fc_stub_b", "type": "function_call", "call_id": "call_stub_b",
+                 "name": "brave_web_search", "arguments": "{\"query\":\"smg b\"}", "status": "completed"}
+            ]
+        }))
+    })
+}
+
+/// The frames' data as JSON, in order; the sentinel is no JSON and is left
+/// out.
+fn frame_events(body: &str) -> Vec<serde_json::Value> {
+    sse_frames(body)
+        .iter()
+        .filter_map(|frame| frame.lines().find_map(|line| line.strip_prefix("data: ")))
+        .filter_map(|data| serde_json::from_str(data).ok())
+        .collect()
+}
+
+/// What a response's items say: type, status and name, in order.
+fn item_shapes(response: &serde_json::Value) -> Vec<(String, String, String)> {
+    let field =
+        |item: &serde_json::Value, name: &str| item[name].as_str().unwrap_or_default().to_string();
+    response["output"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|item| {
+            (
+                field(item, "type"),
+                field(item, "status"),
+                field(item, "name"),
+            )
+        })
+        .collect()
+}
+
+/// The items' errors, in order.
+fn item_errors(response: &serde_json::Value) -> Vec<serde_json::Value> {
+    response["output"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|item| item["error"].clone())
+        .collect()
+}
+
 /// The router of an OpenAI-mode gateway over `upstream`, with the mock MCP
-/// server in its MCP configuration.
-#[expect(
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
+/// server in its MCP configuration, and the context it was built from (its
+/// storage, for the records a request leaves).
 async fn external_router_with_mcp(
     upstream: &str,
     mcp: &MockMCPServer,
     startup_timeout_secs: u64,
-) -> (Box<dyn smg::routers::RouterTrait>, tempfile::TempDir) {
+) -> (
+    Box<dyn smg::routers::RouterTrait>,
+    std::sync::Arc<smg::app_context::AppContext>,
+    tempfile::TempDir,
+) {
     let mcp_yaml = format!(
         "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
         mcp.url()
     );
+    external_router_with_mcp_yaml(upstream, &mcp_yaml, startup_timeout_secs).await
+}
+
+/// The router of an OpenAI-mode gateway over `upstream`, with `mcp_yaml` as
+/// its MCP configuration, and the context it was built from.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+async fn external_router_with_mcp_yaml(
+    upstream: &str,
+    mcp_yaml: &str,
+    startup_timeout_secs: u64,
+) -> (
+    Box<dyn smg::routers::RouterTrait>,
+    std::sync::Arc<smg::app_context::AppContext>,
+    tempfile::TempDir,
+) {
     let dir = tempfile::tempdir().expect("tmpdir");
     let cfg_path = dir.path().join("mcp.yaml");
     std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
@@ -3027,8 +3148,17 @@ async fn external_router_with_mcp(
         .build_unchecked();
     let cfg_path = cfg_path.to_str().expect("a utf-8 path");
     let ctx = crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path).await;
+    // A running gateway's registration job populates the format registry as
+    // it connects each configured server; the test context connects them
+    // itself, so the registry is populated here the same way.
+    let mcp_config = smg_mcp::McpConfig::from_file(cfg_path)
+        .await
+        .expect("the mcp config");
+    for server in &mcp_config.servers {
+        ctx.mcp_format_registry.populate_from_server_config(server);
+    }
     let router = RouterFactory::create_router(&ctx).await.expect("router");
-    (router, dir)
+    (router, ctx, dir)
 }
 
 /// The body of a streaming request through `router`, as the client reads it.
@@ -3069,7 +3199,7 @@ async fn a_failed_upstream_status_ends_the_stream_with_the_typed_error_event() {
         )
     }))
     .await;
-    let (router, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
+    let (router, _ctx, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
 
     let body = stream_body(router.as_ref(), streaming_mcp_request(&mcp.url(), None)).await;
 
@@ -3083,45 +3213,345 @@ async fn a_failed_upstream_status_ends_the_stream_with_the_typed_error_event() {
 }
 
 /// The tool-call limit reached mid-stream (an upstream that asks for the
-/// tool on every turn, a limit of one): the events of the calls the model
-/// asked for, then the one typed error event at the stream's next sequence
-/// number, and nothing after it (no sentinel).
+/// tool on every turn, a limit of one, the response stored): the stream
+/// ends the way the non-streamed loop ends the same stop. The call that fit
+/// ran; the one over the limit is closed as not executed
+/// (`response.mcp_call.failed`, then its `response.output_item.done`, so no
+/// item the stream announced stays open); then `response.completed`, the
+/// response `completed` with `incomplete_details.reason` `max_tool_calls`
+/// and both calls among its items; no error event, no `response.failed`;
+/// and the record says what the terminal said.
 #[tokio::test]
-async fn the_tool_call_limit_ends_the_stream_with_the_typed_error_event_and_nothing_after() {
+async fn the_tool_call_limit_ends_the_stream_as_the_non_streamed_loop_ends_its_response() {
     let mut mcp = MockMCPServer::start().await.expect("start mcp");
-    let (upstream, server) = stub_upstream(axum::routing::post(|| async {
-        ([(CONTENT_TYPE, "text/event-stream")], function_call_turn())
-    }))
+    let (upstream, server) = stub_upstream(always_calling_upstream()).await;
+    let (router, ctx, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
+
+    let body = stream_body(
+        router.as_ref(),
+        mcp_request(&mcp.url(), Some(1), true, true),
+    )
     .await;
-    let (router, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
 
-    let body = stream_body(router.as_ref(), streaming_mcp_request(&mcp.url(), Some(1))).await;
-
-    let frames = sse_frames(&body);
-    let last = frames.last().expect("a frame");
-    let before: Vec<&str> = frames[..frames.len() - 1].to_vec();
-    assert!(
-        before
-            .iter()
-            .any(|f| f.starts_with("event: response.output_item.added\n")),
-        "the call's events precede the error: {body}"
-    );
-    let next = before
+    assert!(!body.contains("event: error\n"), "{body}");
+    let events = frame_events(&body);
+    let types: Vec<&str> = events
         .iter()
-        .filter_map(|f| frame_sequence_number(f))
-        .max()
-        .map_or(0, |n| n + 1);
-    assert_eq!(
-        *last,
-        format!(
-            "data: {{\"type\":\"error\",\"code\":\"max_tool_calls_exceeded\",\"message\":\
-             \"Reached the max_tool_calls limit (1) before executing the remaining tool \
-             calls.\",\"param\":null,\"sequence_number\":{next}}}"
-        ),
+        .map(|event| event["type"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        !types
+            .iter()
+            .any(|kind| matches!(*kind, "error" | "response.failed")),
         "{body}"
     );
-    assert!(!body.contains("event: error\n"), "{body}");
-    assert!(!body.contains("data: [DONE]"), "{body}");
+    let failed_at = types
+        .iter()
+        .position(|kind| *kind == "response.mcp_call.failed")
+        .expect("the skipped call's failed event");
+    assert_eq!(
+        &types[failed_at..],
+        [
+            "response.mcp_call.failed",
+            "response.output_item.done",
+            "response.completed"
+        ],
+        "the skipped call is closed, then the terminal, then nothing but the sentinel: {body}"
+    );
+    assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+    assert!(
+        events.windows(2).all(|pair| {
+            pair[0]["sequence_number"].as_u64() < pair[1]["sequence_number"].as_u64()
+        }),
+        "{body}"
+    );
+    let announced: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["type"] == "response.output_item.added")
+        .map(|event| &event["output_index"])
+        .collect();
+    let closed: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["type"] == "response.output_item.done")
+        .map(|event| &event["output_index"])
+        .collect();
+    assert_eq!(announced, closed, "every item announced is closed: {body}");
+
+    let skipped = &events[failed_at + 1]["item"];
+    assert_eq!(skipped["type"], "mcp_call", "{skipped}");
+    assert_eq!(skipped["status"], "failed", "{skipped}");
+    assert!(
+        skipped["error"]
+            .to_string()
+            .contains("Not executed - response stopped due to limit"),
+        "{skipped}"
+    );
+    assert_eq!(skipped["id"], events[failed_at]["item_id"], "{body}");
+
+    let response = &events[failed_at + 2]["response"];
+    assert_eq!(response["status"], "completed", "{response}");
+    assert_eq!(
+        response["incomplete_details"],
+        serde_json::json!({ "reason": "max_tool_calls" }),
+        "{response}"
+    );
+    assert!(response["error"].is_null(), "{response}");
+    let shape = |kind: &str, status: &str, name: &str| {
+        (kind.to_string(), status.to_string(), name.to_string())
+    };
+    assert_eq!(
+        item_shapes(response),
+        vec![
+            shape("mcp_list_tools", "", ""),
+            shape("mcp_call", "completed", "brave_web_search"),
+            shape("mcp_call", "failed", "brave_web_search"),
+        ],
+        "{response}"
+    );
+
+    let stored = ctx
+        .response_storage
+        .get_response(&smg_data_connector::ResponseId::from(
+            response["id"].as_str().expect("an id"),
+        ))
+        .await
+        .expect("storage")
+        .expect("the record is stored")
+        .raw_response;
+    assert_eq!(stored["status"], response["status"], "{stored}");
+    assert_eq!(
+        stored["incomplete_details"], response["incomplete_details"],
+        "{stored}"
+    );
+    assert_eq!(item_shapes(&stored), item_shapes(response), "{stored}");
+    assert_eq!(item_errors(&stored), item_errors(response), "{stored}");
+    server.abort();
+    mcp.stop().await;
+}
+
+/// The same stop, streamed and not (the same upstream, the same limit, both
+/// stored): the terminal's response and the non-streamed response say the
+/// same thing (status, `incomplete_details`, the items in order with their
+/// statuses and errors), and so do their records.
+#[tokio::test]
+async fn a_streamed_and_a_non_streamed_tool_call_limit_leave_the_same_record() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let (upstream, server) = stub_upstream(always_calling_upstream()).await;
+    let (router, ctx, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
+
+    let body = stream_body(
+        router.as_ref(),
+        mcp_request(&mcp.url(), Some(1), true, true),
+    )
+    .await;
+    let streamed = frame_events(&body)
+        .last()
+        .map(|terminal| terminal["response"].clone())
+        .expect("a terminal");
+
+    let request = mcp_request(&mcp.url(), Some(1), false, true);
+    let plain = router
+        .route_responses(None, &test_tenant_meta(), request.clone(), &request.model)
+        .await;
+    assert_eq!(plain.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(plain.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let plain: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+    let stored = |response: &serde_json::Value| {
+        let id = response["id"].as_str().expect("an id").to_string();
+        let storage = ctx.response_storage.clone();
+        async move {
+            storage
+                .get_response(&smg_data_connector::ResponseId::from(id.as_str()))
+                .await
+                .expect("storage")
+                .expect("the record is stored")
+                .raw_response
+        }
+    };
+    let (streamed_record, plain_record) = (stored(&streamed).await, stored(&plain).await);
+
+    for (streamed, plain) in [(&streamed, &plain), (&streamed_record, &plain_record)] {
+        assert_eq!(streamed["status"], "completed", "{streamed}");
+        assert_eq!(streamed["status"], plain["status"], "{streamed}\n{plain}");
+        assert_eq!(
+            streamed["incomplete_details"], plain["incomplete_details"],
+            "{streamed}\n{plain}"
+        );
+        assert_eq!(
+            item_shapes(streamed),
+            item_shapes(plain),
+            "{streamed}\n{plain}"
+        );
+        assert_eq!(
+            item_errors(streamed),
+            item_errors(plain),
+            "{streamed}\n{plain}"
+        );
+    }
+    server.abort();
+    mcp.stop().await;
+}
+
+/// The same stop for a tool answered in a hosted format (the request's
+/// `web_search_preview` tool, routed to the mock server's `brave_web_search`
+/// by its `builtin_type`): the stream announces the call as a
+/// `web_search_call`, so the call over the limit closes as one too: its
+/// `response.output_item.done` carries a `web_search_call` with the status
+/// `failed`, no `mcp_call` event names its index, and every item announced
+/// is closed under the type it was announced with; the terminal's items and
+/// the record say the same.
+#[tokio::test]
+async fn a_hosted_format_call_over_the_limit_closes_as_the_item_the_stream_announced() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let (upstream, server) = stub_upstream(always_calling_upstream()).await;
+    let mcp_yaml = format!(
+        "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n    \
+         builtin_type: web_search_preview\n    builtin_tool_name: brave_web_search\n",
+        mcp.url()
+    );
+    let (router, ctx, _dir) = external_router_with_mcp_yaml(&upstream, &mcp_yaml, 5).await;
+    let request = ResponsesRequest {
+        tools: Some(vec![ResponseTool::WebSearchPreview(
+            WebSearchPreviewTool::default(),
+        )]),
+        ..mcp_request(&mcp.url(), Some(1), true, true)
+    };
+
+    let body = stream_body(router.as_ref(), request).await;
+
+    let events = frame_events(&body);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event["type"].as_str(), Some("error" | "response.failed"))),
+        "{body}"
+    );
+    assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+    let items_by_type = |kind: &str| -> Vec<(u64, String)> {
+        events
+            .iter()
+            .filter(|event| event["type"] == kind)
+            .map(|event| {
+                (
+                    event["output_index"].as_u64().unwrap_or_default(),
+                    event["item"]["type"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+            .collect()
+    };
+    let announced = items_by_type("response.output_item.added");
+    let closed = items_by_type("response.output_item.done");
+    assert_eq!(
+        announced, closed,
+        "every item is closed under the type it was announced with: {body}"
+    );
+    assert!(
+        announced.iter().any(|(_, kind)| kind == "web_search_call"),
+        "{body}"
+    );
+
+    let skipped = events
+        .iter()
+        .rev()
+        .find(|event| event["type"] == "response.output_item.done")
+        .expect("the last item closed");
+    assert_eq!(skipped["item"]["type"], "web_search_call", "{skipped}");
+    assert_eq!(skipped["item"]["status"], "failed", "{skipped}");
+    let skipped_index = &skipped["output_index"];
+    assert!(
+        !events.iter().any(|event| {
+            event["type"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("response.mcp_call."))
+                && &event["output_index"] == skipped_index
+        }),
+        "no mcp_call sub-event closes the hosted item: {body}"
+    );
+
+    let response = &events.last().expect("the terminal")["response"];
+    assert_eq!(response["status"], "completed", "{response}");
+    assert_eq!(
+        response["incomplete_details"],
+        serde_json::json!({ "reason": "max_tool_calls" }),
+        "{response}"
+    );
+    let shape = |kind: &str, status: &str| (kind.to_string(), status.to_string(), String::new());
+    assert_eq!(
+        item_shapes(response),
+        vec![
+            shape("web_search_call", "completed"),
+            shape("web_search_call", "failed"),
+        ],
+        "{response}"
+    );
+    let stored = ctx
+        .response_storage
+        .get_response(&smg_data_connector::ResponseId::from(
+            response["id"].as_str().expect("an id"),
+        ))
+        .await
+        .expect("storage")
+        .expect("the record is stored")
+        .raw_response;
+    assert_eq!(item_shapes(&stored), item_shapes(response), "{stored}");
+    server.abort();
+    mcp.stop().await;
+}
+
+/// An unstreamed turn of two calls over an allowance of one: the first call
+/// runs, the second is the stop. Each call is rendered once, under its own
+/// id: the one that ran `completed`, the other not executed.
+#[tokio::test]
+async fn an_unstreamed_turn_the_allowance_cuts_renders_each_call_once() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let (upstream, server) = stub_upstream(two_call_turn_upstream()).await;
+    let (router, _ctx, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
+
+    let request = mcp_request(&mcp.url(), Some(1), false, false);
+    let response = router
+        .route_responses(None, &test_tenant_meta(), request.clone(), &request.model)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let response: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+    assert_eq!(
+        response["incomplete_details"],
+        serde_json::json!({ "reason": "max_tool_calls" }),
+        "{response}"
+    );
+    let shape = |kind: &str, status: &str, name: &str| {
+        (kind.to_string(), status.to_string(), name.to_string())
+    };
+    assert_eq!(
+        item_shapes(&response),
+        vec![
+            shape("mcp_list_tools", "", ""),
+            shape("mcp_call", "completed", "brave_web_search"),
+            shape("mcp_call", "failed", "brave_web_search"),
+        ],
+        "{response}"
+    );
+    let ids: Vec<&str> = response["output"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["id"].as_str())
+        .collect();
+    let unique: std::collections::HashSet<&str> = ids.iter().copied().collect();
+    assert_eq!(
+        ids.len(),
+        unique.len(),
+        "every item under its own id: {response}"
+    );
     server.abort();
     mcp.stop().await;
 }
@@ -3135,7 +3565,7 @@ async fn an_unreachable_upstream_ends_the_stream_with_the_typed_error_event() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         format!("http://{}", listener.local_addr().expect("addr"))
     };
-    let (router, _dir) = external_router_with_mcp(&closed, &mcp, 1).await;
+    let (router, _ctx, _dir) = external_router_with_mcp(&closed, &mcp, 1).await;
 
     let body = stream_body(router.as_ref(), streaming_mcp_request(&mcp.url(), None)).await;
 

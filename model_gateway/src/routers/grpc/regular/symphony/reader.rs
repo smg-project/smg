@@ -12,7 +12,7 @@ use tracing::debug;
 
 use super::{
     constraint::Asks,
-    names::reads,
+    names::{reading, Fallback, Reading},
     telemetry::{self, Tally, Who},
     template::Templates,
     SymphonyError,
@@ -28,22 +28,11 @@ pub(crate) struct Assignment {
     pub prompt: String,
 }
 
-/// The assignment of `format` to a response, with the part of `prompt` the engine replays. Not
-/// made when the constraint is a JSON schema: the older path's forced call, whose output has no
-/// markers for a table to read, which the older registry writes where the table has no tag.
-pub(super) fn assignment(
-    format: Option<Arc<Format>>,
-    model: &str,
-    constraint: Option<&(String, String)>,
-    prompt: &str,
-) -> Option<Assignment> {
-    let format = format?;
-    if constraint.is_some_and(|(kind, _)| kind == "json_schema") {
-        return None;
-    }
+/// The assignment of `format` to a response, with the part of `prompt` the engine replays.
+pub(super) fn assignment(format: Arc<Format>, model: &str, prompt: &str) -> Assignment {
     debug!(model, table = format.name(), "Symphony reads the response");
     let prompt = format.replay(prompt).to_string();
-    Some(Assignment { format, prompt })
+    Assignment { format, prompt }
 }
 
 /// The table as the request's asks make it: without its calls when the legacy path would run no
@@ -66,11 +55,16 @@ pub(super) fn asked(format: Arc<Format>, no_calls: bool, no_reasoning: bool) -> 
     Arc::new(format)
 }
 
-/// Symphony's assignment to a request, if a table reads the response ([`reads`]) and the
-/// constraint is not a JSON schema ([`assignment`]): the table without its calls where the legacy
-/// path would run no tool parser, without its thought where it would run no reasoning parser
-/// ([`Asks::no_calls`], [`Asks::no_reasoning`], [`asked`]). A call the conversation established
-/// without a tool inventory comes back as a call under either parser.
+/// Symphony's assignment to a request, if a table reads the response ([`reading`]) and the
+/// constraint is not a JSON schema: the older path's forced call, whose output has no markers for
+/// a table to read, which the older registry writes where the table has no tag. The table goes
+/// without its calls where the legacy path would run no tool parser, without its thought where it
+/// would run no reasoning parser ([`Asks::no_calls`], [`Asks::no_reasoning`], [`asked`]). A call
+/// the conversation established without a tool inventory comes back as a call under either
+/// parser. `None` where the legacy parsers read the response, which the response's header then
+/// says; a request Symphony was configured for is counted once here, by the reason
+/// ([`telemetry::record_fallback`]): request building asks once per request, and nothing else
+/// decides the reader.
 pub(crate) fn assign(
     parser: ParserChoice,
     names: &ModelNames<'_>,
@@ -79,9 +73,23 @@ pub(crate) fn assign(
     prompt: &str,
     templates: &Templates,
 ) -> Result<Option<Assignment>, SymphonyError> {
-    let format = reads(parser, names, asks.model(), templates)?;
-    let format = format.map(|format| asked(format, asks.no_calls(), asks.no_reasoning()));
-    Ok(assignment(format, asks.model(), constraint, prompt))
+    let format = match reading(parser, names, asks.model(), templates)? {
+        Reading::Table(format, _) => format,
+        Reading::Legacy => return Ok(None),
+        Reading::Fallback(why) => {
+            telemetry::record_fallback(why, None);
+            return Ok(None);
+        }
+    };
+    if constraint.is_some_and(|(kind, _)| kind == "json_schema") {
+        telemetry::record_fallback(
+            Fallback::ForcedCallWithoutTag,
+            Some(telemetry::table_label(format.name())),
+        );
+        return Ok(None);
+    }
+    let format = asked(format, asks.no_calls(), asks.no_reasoning());
+    Ok(Some(assignment(format, asks.model(), prompt)))
 }
 
 /// The engine's finish reason as Symphony takes it.
@@ -703,6 +711,65 @@ mod tests {
     }
 
     #[test]
+    fn a_reader_gives_a_json_answer_bare_when_the_model_said_its_kind_again() {
+        // The table whose messages say their kind after their opener, as a request without tools
+        // reads it, over the two outputs an engine that starts a JSON answer's grammar after its
+        // own reasoning parser lets the model write: the text marker twice, or a second thought
+        // opened inside the answer's message. The client sees the bare JSON as content, the
+        // thoughts as reasoning, and the reader reads no malformed run.
+        let assignment = Assignment {
+            format: Arc::new(symphony::formats::inkling().without_calls()),
+            prompt: "<|message_model|>".to_string(),
+        };
+        let json = "{\"city\": \"Oslo\", \"country\": \"Norway\"}";
+        let thought = "<|content_thinking|>plan<|end_message|><|message_model|><|content_text|>";
+        for (output, reasoning) in [
+            (
+                format!("{thought}<|content_text|>{json}<|end_message|>"),
+                "plan",
+            ),
+            (
+                format!(
+                    "{thought}<|content_thinking|>more<|end_message|><|message_model|>\
+                     <|content_text|>{json}<|end_message|>"
+                ),
+                "planmore",
+            ),
+        ] {
+            let mut events = Events::new();
+            let mut reader =
+                Reader::new(&assignment, Arc::default(), &mut events).expect("a reader");
+            let mut delta = Delta::default();
+            reader
+                .tail(output.clone(), &mut delta, &mut events)
+                .expect("read");
+            reader
+                .end(EngineFinish::Stop, who(), &mut events)
+                .expect("ended");
+            let events = events.as_slice();
+            assert_eq!(content_of(events), json, "{events:?}");
+            let thoughts: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Reasoning(text) => Some(&*text.text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(thoughts, reasoning, "{events:?}");
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::Malformed { .. })),
+                "{events:?}"
+            );
+            let Some(Event::Finish { tool_calls, .. }) = events.last() else {
+                panic!("a finish");
+            };
+            assert_eq!(*tool_calls, 0);
+        }
+    }
+
+    #[test]
     fn a_reader_ends_once() {
         let assignment = Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
@@ -951,5 +1018,126 @@ mod tests {
             panic!("a finish");
         };
         assert_eq!(*reasoning_tokens, 0);
+    }
+
+    /// A request Symphony was configured for that the legacy parsers read is counted once, under
+    /// the reason the seam names and the table that had no tag for it, or `none`; a table's
+    /// assignment, and the gateway's own choice of the legacy parsers, count nothing.
+    #[test]
+    fn a_request_the_legacy_parsers_read_under_symphony_is_counted_once_by_reason() {
+        let unknown = request(json!({"model": "acme/ministral-3-14b-instruct-w4a16"}));
+        let known = request(json!({}));
+        let counted = |names: &ModelNames<'_>,
+                       request: &ChatCompletionRequest,
+                       constraint: Option<&(String, String)>| {
+            let scrape = rendered(|| {
+                assert!(
+                    assign(ParserChoice::Symphony, names, request, constraint, PROMPT).is_none()
+                );
+            });
+            let lines: Vec<&str> = scrape
+                .lines()
+                .filter(|line| line.starts_with(telemetry::FALLBACK))
+                .collect();
+            assert_eq!(lines.len(), 1, "{scrape}");
+            assert!(lines[0].ends_with(" 1"), "{}", lines[0]);
+            lines[0].to_string()
+        };
+        let labelled = |line: &str, reason: &str, table: &str| {
+            assert!(line.contains(&format!("reason=\"{reason}\"")), "{line}");
+            assert!(line.contains(&format!("table=\"{table}\"")), "{line}");
+        };
+        labelled(
+            &counted(&ModelNames::default(), &unknown, None),
+            "no_table",
+            "none",
+        );
+        labelled(
+            &counted(&names(None, Some("deepseek_r1")), &unknown, None),
+            "reasoning_name_only",
+            "none",
+        );
+        labelled(
+            &counted(&names(Some("pythonic"), Some("deepseek_r1")), &known, None),
+            "legacy_tool_name",
+            "none",
+        );
+        labelled(
+            &counted(&names(None, Some("passthrough")), &known, None),
+            "passthrough",
+            "none",
+        );
+
+        // The shape a table without a tag for a forced call hands over: the seam's constraint is
+        // nothing, the older registry writes its JSON schema for the named tool, request building
+        // passes it here, and the table that reads the model is the one counted.
+        let forced = request(json!({
+            "tools": serde_json::to_value(tools()).expect("tools"),
+            "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+        }));
+        let schema = tool_parser::ParserFactory::new()
+            .registry()
+            .generate_tool_constraint(
+                None,
+                &tools(),
+                forced.tool_choice.as_ref().expect("a choice"),
+                false,
+            )
+            .expect("a constraint")
+            .expect("the older registry's schema")
+            .to_tuple();
+        assert_eq!(schema.0, "json_schema");
+        labelled(
+            &counted(&ModelNames::default(), &forced, Some(&schema)),
+            "forced_call_without_tag",
+            "qwen3",
+        );
+        // A message the same way.
+        let message = message_request(json!({}));
+        let scrape = rendered(|| {
+            let assigned = super::assign(
+                ParserChoice::Symphony,
+                &ModelNames::default(),
+                Asks::Messages {
+                    request: &message,
+                    continues: false,
+                },
+                Some(&schema),
+                PROMPT,
+                &templates(),
+            )
+            .expect("no hf");
+            assert!(assigned.is_none());
+        });
+        labelled(
+            line_with(&scrape, telemetry::FALLBACK, &[]).expect("counted"),
+            "forced_call_without_tag",
+            "qwen3",
+        );
+
+        // Nothing counted where a table reads, under a structural tag too, nor under `legacy`.
+        let tag = ("structural_tag".to_string(), "{}".to_string());
+        let scrape = rendered(|| {
+            let default = ModelNames::default();
+            assert!(assign(ParserChoice::Symphony, &default, &known, None, PROMPT).is_some());
+            assert!(assign(
+                ParserChoice::Symphony,
+                &default,
+                &forced,
+                Some(&tag),
+                PROMPT
+            )
+            .is_some());
+            assert!(assign(ParserChoice::Legacy, &default, &unknown, None, PROMPT).is_none());
+            assert!(assign(
+                ParserChoice::Legacy,
+                &default,
+                &known,
+                Some(&schema),
+                PROMPT
+            )
+            .is_none());
+        });
+        assert!(!scrape.contains(telemetry::FALLBACK), "{scrape}");
     }
 }

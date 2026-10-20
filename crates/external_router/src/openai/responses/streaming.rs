@@ -54,8 +54,9 @@ use crate::{
         context::{RequestContext, StreamingEventContext, StreamingRequest},
         mcp::{
             build_resume_payload, execute_streaming_tool_calls, inject_mcp_metadata_streaming,
-            mcp_list_tools_bindings_to_emit, prepare_mcp_tools_as_functions,
-            send_mcp_list_tools_events, StreamAction, StreamingToolHandler, ToolLoopState,
+            mcp_list_tools_bindings_to_emit, prepare_mcp_tools_as_functions, retained_output_items,
+            send_mcp_list_tools_events, skip_streaming_tool_calls, StreamAction,
+            StreamingToolHandler, ToolLoopState, TOOL_CALL_LIMIT_REASON,
         },
     },
     persistence_utils::persist_conversation_items,
@@ -237,11 +238,6 @@ const UPSTREAM_REQUEST_FAILED: &str = "upstream_request_failed";
 /// The error code of a stream whose upstream body ended with an error before
 /// its natural end, as the gateway's own routers code the same failure.
 const STREAM_ERROR: &str = "stream_error";
-/// The error code of a tool loop stopped at its tool-call limit: the code
-/// and the wording the gateway's own pipelines give the same stop. They end
-/// it with the `response.failed` terminal (and store the failed record);
-/// this loop still ends it with the error event, the frame it always had.
-const MAX_TOOL_CALLS_EXCEEDED: &str = "max_tool_calls_exceeded";
 /// The error code of a failure in the gateway's own processing.
 const INTERNAL_ERROR: &str = "internal_error";
 
@@ -514,7 +510,43 @@ async fn maybe_inject_tool_in_progress(
     send_sse_event(tx, enc, event_type, &event).await
 }
 
-/// Send final response.completed event to client
+/// How the tool loop ended: with the model's answer, or at the request's
+/// tool-call allowance before one. Both are a normal end of the run
+/// (`response.completed`, the response `completed`, the record stored); the
+/// second carries the note the non-streamed loop leaves on the same stop,
+/// `incomplete_details.reason` `max_tool_calls`, so a streamed and a
+/// non-streamed request stopped the same way leave the same record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ToolLoopEnd {
+    Answered,
+    ToolCallLimit,
+}
+
+/// What the non-streamed loop does to a response it ended at the request's
+/// `max_tool_calls`: the model's asks for server calls leave the items (each
+/// is rendered by the item that says it was not executed), and
+/// `incomplete_details` names the reason, the status left `completed` (the
+/// calls that ran are answered; the ones that did not are not a failure of
+/// the run).
+fn end_at_tool_call_limit(response: &mut Value, original_request: &ResponsesRequest) {
+    let Some(obj) = response.as_object_mut() else {
+        return;
+    };
+    if let Some(output) = obj.get_mut("output").and_then(Value::as_array_mut) {
+        let retained = retained_output_items(output, original_request);
+        output.clear();
+        output.extend(retained);
+    }
+    obj.insert(
+        "incomplete_details".to_string(),
+        json!({ "reason": TOOL_CALL_LIMIT_REASON }),
+    );
+}
+
+/// Send the `response.completed` event that ends the tool loop's stream:
+/// the final response built from the handler's snapshot, the loop's items
+/// in place, the client's view of the tools, the request's metadata, and
+/// the note of a loop stopped at its tool-call allowance.
 /// Returns false if client disconnected
 pub(super) async fn send_final_response_event(
     handler: &StreamingToolHandler,
@@ -523,6 +555,7 @@ pub(super) async fn send_final_response_event(
     sequence_number: &mut u64,
     state: &ToolLoopState,
     ctx: &StreamingEventContext<'_>,
+    end: ToolLoopEnd,
 ) -> bool {
     let mut final_response = match handler.snapshot_final_response() {
         Some(resp) => resp,
@@ -542,7 +575,11 @@ pub(super) async fn send_final_response_event(
         inject_mcp_metadata_streaming(&mut final_response, state, session);
     }
 
-    restore_original_tools(&mut final_response, ctx.original_request, None);
+    // With the session, the wire hides what the record hides: the internal
+    // servers' items and the calls to their tools. The asks for the session's
+    // exposed tools that a limit stop leaves beside their not-executed items
+    // are dropped by `end_at_tool_call_limit` below.
+    restore_original_tools(&mut final_response, ctx.original_request, ctx.session);
     patch_response_with_request_metadata(
         &mut final_response,
         ctx.original_request,
@@ -551,6 +588,9 @@ pub(super) async fn send_final_response_event(
 
     if let Some(obj) = final_response.as_object_mut() {
         obj.insert("status".to_string(), Value::String("completed".to_string()));
+    }
+    if end == ToolLoopEnd::ToolCallLimit {
+        end_at_tool_call_limit(&mut final_response, ctx.original_request);
     }
 
     let completed_payload = json!({
@@ -798,7 +838,7 @@ pub(super) fn handle_streaming_with_tool_interception(
         let auth_header =
             provider.extract_auth_header(headers_opt.as_ref(), worker_api_key.as_ref());
 
-        loop {
+        let (handler, end) = loop {
             // Make streaming request
             let mut request_builder = client_clone.post(&url_clone).json(&current_payload);
             request_builder = provider.apply_headers(request_builder, auth_header.as_ref());
@@ -1004,67 +1044,13 @@ pub(super) fn handle_streaming_with_tool_interception(
                 preserved_response_id = Some(id);
             }
 
-            // If no tool calls, we're done - stream is complete
+            // The model answered without asking for a tool: the loop's end.
             if !tool_calls_detected {
-                if !send_final_response_event(
-                    &handler,
-                    &tx,
-                    &mut sse_encoder,
-                    &mut sequence_number,
-                    &state,
-                    &streaming_ctx,
-                )
-                .await
-                {
-                    return;
-                }
-
-                let final_response_json = if should_store {
-                    handler.accumulator.into_final_response()
-                } else {
-                    None
-                };
-
-                if let Some(mut response_json) = final_response_json {
-                    if let Some(ref id) = preserved_response_id {
-                        if let Some(obj) = response_json.as_object_mut() {
-                            obj.insert("id".to_string(), Value::String(id.clone()));
-                        }
-                    }
-                    inject_mcp_metadata_streaming(&mut response_json, &state, &session);
-
-                    restore_original_tools(&mut response_json, &original_request, Some(&session));
-                    patch_response_with_request_metadata(
-                        &mut response_json,
-                        &original_request,
-                        previous_response_id.as_deref(),
-                    );
-
-                    // Always persist conversation items and response (even without conversation)
-                    if let Err(err) = persist_conversation_items(
-                        storage.conversation.clone(),
-                        storage.conversation_item.clone(),
-                        storage.response.clone(),
-                        &response_json,
-                        &original_request,
-                        storage.tenant.as_deref(),
-                        storage.request_context.clone(),
-                    )
-                    .await
-                    {
-                        warn!(
-                            "Failed to persist conversation items (stream + MCP): {}",
-                            err
-                        );
-                    }
-                }
-
-                let _ = tx.send(Ok(Bytes::from_static(SSE_DONE.as_bytes()))).await;
-                return;
+                break (handler, ToolLoopEnd::Answered);
             }
 
             // Execute tools
-            let pending_calls = handler.take_pending_calls();
+            let mut pending_calls = handler.take_pending_calls();
 
             // Check iteration limit
             state.iteration += 1;
@@ -1078,24 +1064,11 @@ pub(super) fn handle_streaming_with_tool_interception(
                 None => DEFAULT_MAX_ITERATIONS,
             };
 
-            if state.total_calls > effective_limit {
-                warn!(
-                    "Reached tool call limit during streaming: {}",
-                    effective_limit
-                );
-                let message = format!(
-                    "Reached the max_tool_calls limit ({effective_limit}) before executing the remaining tool calls."
-                );
-                send_error_event(
-                    &tx,
-                    &mut sse_encoder,
-                    &mut sequence_number,
-                    MAX_TOOL_CALLS_EXCEEDED,
-                    &message,
-                )
-                .await;
-                return;
-            }
+            // The calls that fit the request's remaining allowance run, as
+            // the non-streamed loop runs them; the rest of the batch is the
+            // stop, the loop's end before an answer.
+            let over_limit = state.total_calls.saturating_sub(effective_limit);
+            let skipped = pending_calls.split_off(pending_calls.len().saturating_sub(over_limit));
 
             // Execute all pending tool calls. Pass the caller-declared tools so
             // hosted-tool overrides (e.g. image_generation size/quality) are
@@ -1115,6 +1088,27 @@ pub(super) fn handle_streaming_with_tool_interception(
             .await
             {
                 return;
+            }
+
+            if !skipped.is_empty() {
+                warn!(
+                    effective_limit,
+                    skipped = skipped.len(),
+                    "Reached the tool call limit during streaming: the remaining calls are not executed"
+                );
+                if !skip_streaming_tool_calls(
+                    skipped,
+                    &session,
+                    &format_registry,
+                    &tx,
+                    &mut state,
+                    &mut sequence_number,
+                )
+                .await
+                {
+                    return;
+                }
+                break (handler, ToolLoopEnd::ToolCallLimit);
             }
 
             // Build resume payload
@@ -1141,7 +1135,68 @@ pub(super) fn handle_streaming_with_tool_interception(
                     return;
                 }
             }
+        };
+
+        // The loop's end, answered or stopped at the tool-call allowance: the
+        // terminal event, the record, the sentinel.
+        if !send_final_response_event(
+            &handler,
+            &tx,
+            &mut sse_encoder,
+            &mut sequence_number,
+            &state,
+            &streaming_ctx,
+            end,
+        )
+        .await
+        {
+            return;
         }
+
+        let final_response_json = if should_store {
+            handler.accumulator.into_final_response()
+        } else {
+            None
+        };
+
+        if let Some(mut response_json) = final_response_json {
+            if let Some(ref id) = preserved_response_id {
+                if let Some(obj) = response_json.as_object_mut() {
+                    obj.insert("id".to_string(), Value::String(id.clone()));
+                }
+            }
+            inject_mcp_metadata_streaming(&mut response_json, &state, &session);
+
+            restore_original_tools(&mut response_json, &original_request, Some(&session));
+            patch_response_with_request_metadata(
+                &mut response_json,
+                &original_request,
+                previous_response_id.as_deref(),
+            );
+            if end == ToolLoopEnd::ToolCallLimit {
+                end_at_tool_call_limit(&mut response_json, &original_request);
+            }
+
+            // Always persist conversation items and response (even without conversation)
+            if let Err(err) = persist_conversation_items(
+                storage.conversation.clone(),
+                storage.conversation_item.clone(),
+                storage.response.clone(),
+                &response_json,
+                &original_request,
+                storage.tenant.as_deref(),
+                storage.request_context.clone(),
+            )
+            .await
+            {
+                warn!(
+                    "Failed to persist conversation items (stream + MCP): {}",
+                    err
+                );
+            }
+        }
+
+        let _ = tx.send(Ok(Bytes::from_static(SSE_DONE.as_bytes()))).await;
     });
 
     let body_stream = ReceiverStream::new(rx);
@@ -1220,7 +1275,83 @@ pub async fn handle_streaming_response(ctx: RequestContext) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use openai_protocol::responses::ResponseInput;
+
     use super::*;
+
+    /// The terminal of a loop stopped at the request's tool-call allowance
+    /// is the terminal of an answered loop, `response.completed` with the
+    /// response `completed` at the stream's own sequence number, plus the
+    /// note the non-streamed loop leaves on the same stop,
+    /// `incomplete_details.reason` `max_tool_calls`; nothing else differs
+    /// between the two frames.
+    #[tokio::test]
+    async fn the_tool_call_limit_terminal_is_the_completed_terminal_with_the_non_streamed_note() {
+        let request = ResponsesRequest {
+            model: "m".to_string(),
+            input: ResponseInput::Text("hi".to_string()),
+            ..Default::default()
+        };
+        let ctx = StreamingEventContext {
+            original_request: &request,
+            previous_response_id: None,
+            session: None,
+            mcp_format_registry: None,
+        };
+        let state = ToolLoopState::new(Vec::new());
+        let mut handler = StreamingToolHandler::with_starting_index(0);
+        handler.accumulator.ingest_block(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\
+             \"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1,\
+             \"model\":\"m\",\"status\":\"in_progress\",\"output\":[]}}",
+        );
+
+        let mut frames = Vec::new();
+        for end in [ToolLoopEnd::Answered, ToolLoopEnd::ToolCallLimit] {
+            let (tx, mut rx) = sse_channel();
+            let mut enc = SseEncoder::new();
+            let mut sequence_number = 7;
+            assert!(
+                send_final_response_event(
+                    &handler,
+                    &tx,
+                    &mut enc,
+                    &mut sequence_number,
+                    &state,
+                    &ctx,
+                    end,
+                )
+                .await
+            );
+            drop(tx);
+            assert_eq!(sequence_number, 8, "{end:?}");
+            let frame = rx.recv().await.expect("the terminal").expect("a frame");
+            assert!(rx.recv().await.is_none(), "one frame, {end:?}");
+            frames.push(String::from_utf8(frame.to_vec()).expect("utf-8"));
+        }
+
+        let data = |frame: &str| -> Value {
+            let data = frame
+                .strip_prefix("event: response.completed\ndata: ")
+                .expect("the completed event");
+            serde_json::from_str(data.trim_end()).expect("json")
+        };
+        let answered = data(&frames[0]);
+        let mut limited = data(&frames[1]);
+        assert_eq!(limited["type"], "response.completed");
+        assert_eq!(limited["sequence_number"], 7);
+        assert_eq!(limited["response"]["status"], "completed");
+        assert_eq!(
+            limited["response"]["incomplete_details"],
+            json!({ "reason": "max_tool_calls" })
+        );
+        assert!(answered["response"].get("incomplete_details").is_none());
+        limited["response"]
+            .as_object_mut()
+            .expect("an object")
+            .remove("incomplete_details");
+        assert_eq!(answered, limited, "the note is the only difference");
+    }
 
     /// The error event that ends a failed stream is the frame every router
     /// writes for one, at the stream's own sequence number, which it
