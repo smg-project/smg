@@ -418,7 +418,11 @@ impl PolicyRegistry {
         follow: Option<&str>,
     ) -> Option<(usize, Option<&'w str>)> {
         if self.traffic_split && Self::traffic_split_applies(policy.name(), info) {
-            if let Some(split) = Split::plan(workers) {
+            // The split admits what the selection admits (every veto but the
+            // overload one where the caller lifted it), so a pool placed with
+            // the veto lifted is split, followed and drained as any other.
+            let admits = |worker: &dyn Worker| info.admits(worker.routing_state());
+            if let Some(split) = Split::plan(workers, admits) {
                 // The group an earlier side was split into is followed;
                 // otherwise the same key the sticky override would pin by
                 // keeps a session in one group, and a keyless request draws
@@ -444,7 +448,7 @@ impl PolicyRegistry {
             // group also when it is the only one left open (the others
             // unavailable or at capacity), and the caller reports the miss
             // rather than use the drained build.
-            if traffic_split::drained(workers) {
+            if traffic_split::drained(workers, admits) {
                 return None;
             }
         }

@@ -304,7 +304,8 @@ pub(crate) fn select_from(
             .cloned()
             .collect::<Vec<_>>();
         if untried.is_empty()
-            || (policies.traffic_split_enabled() && traffic_split::drained(&untried))
+            || (policies.traffic_split_enabled()
+                && traffic_split::drained(&untried, |worker| worker.is_available()))
         {
             available
         } else {
@@ -2692,6 +2693,91 @@ mod tests {
             place_prompt(&registry, &policies, &next_turn).prefill.url(),
             home.url()
         );
+    }
+
+    /// Two traffic groups on both pools under `--traffic-split`, every worker
+    /// over the overload thresholds: the veto is lifted on both pools, and the
+    /// split still holds. The pair never spans two groups (the decode follows
+    /// the prefill's), and a canary at weight 0 takes nothing, lifted or not.
+    #[test]
+    fn a_pool_placed_with_the_veto_lifted_is_still_split_and_its_pair_shares_a_group() {
+        let grouped = |canary_weight: &str| {
+            let registry = WorkerRegistry::new();
+            for (url, worker_type, group, weight) in [
+                ("grpc://ps:1", WorkerType::Prefill, "stable", "90"),
+                ("grpc://ps:2", WorkerType::Prefill, "stable", "90"),
+                ("grpc://pc:1", WorkerType::Prefill, "canary", canary_weight),
+                ("grpc://ds:1", WorkerType::Decode, "stable", "90"),
+                ("grpc://ds:2", WorkerType::Decode, "stable", "90"),
+                ("grpc://dc:1", WorkerType::Decode, "canary", canary_weight),
+            ] {
+                registry
+                    .register(Arc::new(
+                        BasicWorkerBuilder::new(url)
+                            .model(ModelCard::new(MODEL))
+                            .worker_type(worker_type)
+                            .connection_mode(ConnectionMode::Grpc)
+                            .runtime_type(RuntimeType::Vllm)
+                            .label("traffic_group", group)
+                            .label("traffic_weight", weight)
+                            .health_config(HealthCheckConfig {
+                                disable_health_check: true,
+                                ..Default::default()
+                            })
+                            .build(),
+                    ))
+                    .expect("worker registers");
+            }
+            for worker in registry.get_all() {
+                registry.set_worker_overloaded(&worker, true);
+            }
+            registry
+        };
+        let policies = cohort_policies().with_traffic_split(true);
+        let registry = grouped("10");
+        let pairs = pairs_of(&registry, &policies);
+        let mut canary = 0;
+        for _ in 0..100 {
+            let pair = select_pair(
+                &registry,
+                &policies,
+                MODEL,
+                &pairs,
+                None,
+                true,
+                None,
+                PlacementInputs::default(),
+            )
+            .expect("a pair");
+            let prefill = traffic_split::group_of(pair.prefill.as_ref());
+            assert_eq!(
+                prefill,
+                traffic_split::group_of(pair.decode.as_ref()),
+                "a lifted pair spans two groups"
+            );
+            if prefill == "canary" {
+                canary += 1;
+            }
+        }
+        assert!(canary <= 40, "the canary took {canary} of 100 at weight 10");
+        // The canary drained: nothing lands on it, lifted or not.
+        let registry = grouped("0");
+        let pairs = pairs_of(&registry, &policies);
+        for _ in 0..50 {
+            let pair = select_pair(
+                &registry,
+                &policies,
+                MODEL,
+                &pairs,
+                None,
+                true,
+                None,
+                PlacementInputs::default(),
+            )
+            .expect("a pair");
+            assert_eq!(traffic_split::group_of(pair.prefill.as_ref()), "stable");
+            assert_eq!(traffic_split::group_of(pair.decode.as_ref()), "stable");
+        }
     }
 
     /// One prefill worker over the thresholds beside one under them, as the

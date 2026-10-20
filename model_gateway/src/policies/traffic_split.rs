@@ -150,16 +150,23 @@ pub struct Split<'a> {
 
 impl<'a> Split<'a> {
     /// The split over `workers`, or `None` when it does not apply: fewer
-    /// than two groups have an available member, or every group weighs 0.
-    /// Unavailable workers join no arm, so a group whose workers are all
-    /// down drops out of the draw instead of taking requests it cannot serve.
+    /// than two groups have a member the selection admits, or every group
+    /// weighs 0. `admits` is the selection's own test of a worker
+    /// (availability; every veto but the overload one where the caller
+    /// lifted that veto, `SelectWorkerInfo::admits`), so a pool placed with
+    /// the veto lifted is split as an unlifted one is; workers it does not
+    /// admit join no arm, so a group whose workers are all down drops out of
+    /// the draw instead of taking requests it cannot serve.
     ///
     /// The single-group case, the usual one, allocates nothing: the arms are
     /// only built once a second group name is seen.
-    pub fn plan(workers: &'a [Arc<dyn Worker>]) -> Option<Self> {
+    pub fn plan(
+        workers: &'a [Arc<dyn Worker>],
+        admits: impl Fn(&dyn Worker) -> bool,
+    ) -> Option<Self> {
         let mut first: Option<&str> = None;
         let mut mixed = false;
-        for worker in workers.iter().filter(|worker| worker.is_available()) {
+        for worker in workers.iter().filter(|worker| admits(worker.as_ref())) {
             let name = group_of(worker.as_ref());
             match first {
                 None => first = Some(name),
@@ -176,7 +183,7 @@ impl<'a> Split<'a> {
 
         let mut arms: Vec<Arm<'a>> = Vec::new();
         for (idx, worker) in workers.iter().enumerate() {
-            if !worker.is_available() {
+            if !admits(worker.as_ref()) {
                 continue;
             }
             let labels = &worker.metadata().spec.labels;
@@ -267,21 +274,22 @@ impl<'a> Split<'a> {
     }
 }
 
-/// Whether every group among the available workers of `workers` weighs 0,
-/// so nothing in the slice may take a request: the case [`Split::plan`]
-/// declines to split (one group, or every group drained) in which the policy
-/// must not run over the slice either. A group weighs what [`Arm::weight`]
-/// says: the highest explicit weight among its available members, else 0
-/// for a named group and [`DEFAULT_WEIGHT`] for the default one (a default
-/// member without a label lifts nothing while another carries a weight). An
-/// empty or all-unavailable slice is not drained (the policy answers those).
+/// Whether every group among the workers of `workers` the selection admits
+/// (`admits`, as for [`Split::plan`]) weighs 0, so nothing in the slice may
+/// take a request: the case [`Split::plan`] declines to split (one group, or
+/// every group drained) in which the policy must not run over the slice
+/// either. A group weighs what [`Arm::weight`] says: the highest explicit
+/// weight among its admitted members, else 0 for a named group and
+/// [`DEFAULT_WEIGHT`] for the default one (a default member without a label
+/// lifts nothing while another carries a weight). An empty slice, or one
+/// with no admitted worker, is not drained (the policy answers those).
 /// Returns at the first positive weight, so a weighted slice costs one
 /// worker's labels; an unlabelled one is read whole, as [`Split::plan`]
 /// reads it.
-pub fn drained(workers: &[Arc<dyn Worker>]) -> bool {
+pub fn drained(workers: &[Arc<dyn Worker>], admits: impl Fn(&dyn Worker) -> bool) -> bool {
     let mut any = false;
     let (mut default_weighted, mut default_unweighted) = (false, false);
-    for worker in workers.iter().filter(|worker| worker.is_available()) {
+    for worker in workers.iter().filter(|worker| admits(worker.as_ref())) {
         any = true;
         let default = group_of(worker.as_ref()) == DEFAULT_GROUP;
         match worker
@@ -319,6 +327,11 @@ mod tests {
 
     /// A worker in `group` (none = unlabelled) carrying `weight` (none =
     /// no weight label); `up` false makes it unavailable.
+    /// The selection's admission in these tests: availability.
+    fn available(worker: &dyn Worker) -> bool {
+        worker.is_available()
+    }
+
     fn worker(url: &str, group: Option<&str>, weight: Option<&str>, up: bool) -> Arc<dyn Worker> {
         let mut labels = HashMap::new();
         if let Some(group) = group {
@@ -441,13 +454,13 @@ mod tests {
             worker("http://a", None, None, true),
             worker("http://b", None, None, true),
         ];
-        assert!(Split::plan(&unlabelled).is_none());
+        assert!(Split::plan(&unlabelled, available).is_none());
         let one_named = vec![
             worker("http://a", Some("stable"), Some("90"), true),
             worker("http://b", Some("stable"), Some("90"), true),
         ];
-        assert!(Split::plan(&one_named).is_none());
-        assert!(Split::plan(&[]).is_none());
+        assert!(Split::plan(&one_named, available).is_none());
+        assert!(Split::plan(&[], available).is_none());
     }
 
     #[test]
@@ -458,7 +471,7 @@ mod tests {
             worker("http://s2", Some("stable"), Some("90"), true),
             worker("http://d1", None, None, true),
         ];
-        let split = Split::plan(&workers).unwrap();
+        let split = Split::plan(&workers, available).unwrap();
         assert_eq!(names(&split), vec!["canary", "default", "stable"]);
         let arms = split.arms();
         assert_eq!((arms[0].weight(), arms[0].members.clone()), (10, vec![1]));
@@ -485,7 +498,7 @@ mod tests {
             worker("http://c3", Some("canary"), None, true),
             worker("http://d1", None, None, true),
         ];
-        let split = Split::plan(&workers).unwrap();
+        let split = Split::plan(&workers, available).unwrap();
         assert_eq!(names(&split), vec!["canary", DEFAULT_GROUP]);
         assert_eq!(split.arms()[0].weight(), 20);
         assert_eq!(split.arms()[1].weight(), DEFAULT_WEIGHT);
@@ -503,7 +516,7 @@ mod tests {
             worker("http://c1", Some("canary"), Some("5"), false),
             worker("http://c2", Some("canary"), None, true),
         ];
-        let split = Split::plan(&workers).unwrap();
+        let split = Split::plan(&workers, available).unwrap();
         assert_eq!(names(&split), vec!["canary", "stable"]);
         assert_eq!(split.arms()[0].weight(), 0);
         assert_eq!(split.total(), 90);
@@ -520,7 +533,7 @@ mod tests {
             worker("http://c1", Some("canary"), Some("5"), true),
             worker("http://c2", Some("canary"), None, true),
         ];
-        let split = Split::plan(&workers).unwrap();
+        let split = Split::plan(&workers, available).unwrap();
         assert_eq!(split.arms()[0].weight(), 5);
         assert_eq!(split.arm_named("canary").map(|arm| arm.weight()), Some(5));
     }
@@ -533,13 +546,13 @@ mod tests {
             worker("http://c1", Some("canary"), Some("10"), false),
         ];
         // Only the stable arm has an available member: one group, no split.
-        assert!(Split::plan(&workers).is_none());
+        assert!(Split::plan(&workers, available).is_none());
         let workers = vec![
             worker("http://s1", Some("stable"), Some("90"), true),
             worker("http://s2", Some("stable"), Some("90"), false),
             worker("http://c1", Some("canary"), Some("10"), true),
         ];
-        let split = Split::plan(&workers).unwrap();
+        let split = Split::plan(&workers, available).unwrap();
         assert_eq!(split.arms()[1].members, vec![0]);
     }
 
@@ -549,7 +562,7 @@ mod tests {
             worker("http://s1", Some("stable"), Some("90"), true),
             worker("http://c1", Some("canary"), Some("0"), true),
         ];
-        let split = Split::plan(&workers).unwrap();
+        let split = Split::plan(&workers, available).unwrap();
         let mut rng = StdRng::seed_from_u64(7);
         for _ in 0..1_000 {
             assert_eq!(split.arm_at_random(&mut rng).name, "stable");
@@ -561,7 +574,7 @@ mod tests {
             worker("http://s1", Some("stable"), Some("0"), true),
             worker("http://c1", Some("canary"), Some("0"), true),
         ];
-        assert!(Split::plan(&drained).is_none());
+        assert!(Split::plan(&drained, available).is_none());
     }
 
     #[test]
@@ -570,7 +583,7 @@ mod tests {
             worker("http://s1", Some("stable"), Some("90"), true),
             worker("http://c1", Some("canary"), Some("10"), true),
         ];
-        let split = Split::plan(&workers).unwrap();
+        let split = Split::plan(&workers, available).unwrap();
         assert_eq!(split.arm_at(0).name, "canary");
         assert_eq!(split.arm_at(9).name, "canary");
         assert_eq!(split.arm_at(10).name, "stable");
@@ -583,7 +596,7 @@ mod tests {
             worker("http://s1", Some("stable"), Some("70"), true),
             worker("http://c1", Some("canary"), Some("30"), true),
         ];
-        let split = Split::plan(&workers).unwrap();
+        let split = Split::plan(&workers, available).unwrap();
         for key in ["conv", "user-42", "session/9f"] {
             let first = split.arm_for_key(key).name;
             for _ in 0..10 {
@@ -605,7 +618,7 @@ mod tests {
                 worker("http://s1", Some("stable"), Some("90"), true),
                 worker("http://c1", Some("canary"), Some(weight), true),
             ];
-            let split = Split::plan(&workers).unwrap();
+            let split = Split::plan(&workers, available).unwrap();
             keys.iter()
                 .enumerate()
                 .filter(|(_, key)| split.arm_for_key(key).name == "canary")
@@ -653,7 +666,7 @@ mod tests {
             worker("http://s2", Some("stable"), Some("90"), true),
             worker("http://c1", Some("canary"), Some("10"), true),
         ];
-        let split = Split::plan(&workers).unwrap();
+        let split = Split::plan(&workers, available).unwrap();
         let draws = 20_000;
         let counts = draw_counts(&split, draws, 0x5eed_0001);
         let chi2 = chi_square(&counts, &[("stable", 0.9), ("canary", 0.1)], draws);
@@ -669,7 +682,7 @@ mod tests {
             worker("http://b", Some("b"), Some("50"), true),
             worker("http://d", None, None, true),
         ];
-        let split = Split::plan(&workers).unwrap();
+        let split = Split::plan(&workers, available).unwrap();
         let draws = 20_000;
         let counts = draw_counts(&split, draws, 0x5eed_0002);
         let chi2 = chi_square(
@@ -688,7 +701,7 @@ mod tests {
             worker("http://s1", Some("stable"), Some("80"), true),
             worker("http://c1", Some("canary"), Some("20"), true),
         ];
-        let split = Split::plan(&workers).unwrap();
+        let split = Split::plan(&workers, available).unwrap();
         let draws = 20_000;
         let counts = draw_counts(&split, draws, 0x5eed_0003);
         let chi2 = chi_square(&counts, &[("stable", 0.9), ("canary", 0.1)], draws);
