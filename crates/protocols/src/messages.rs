@@ -1296,6 +1296,10 @@ pub enum ToolUseCaller {
 pub enum StopReason {
     /// The model reached a natural stopping point
     EndTurn,
+    /// The gateway's parser gave up on a region of the output and the request asked for
+    /// strictness (`X-SMG-Parse-Strict: on`); the bytes are in the content, the facts under
+    /// `smg.parse`.
+    ParseFailure,
     /// We exceeded the requested max_tokens
     MaxTokens,
     /// One of the custom stop_sequences was generated

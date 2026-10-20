@@ -30,7 +30,8 @@ use crate::routers::{
         context::{DispatchMetadata, ExecutionResult},
         proto_wrapper::ProtoGenerateComplete,
         regular::symphony::{
-            engine_finish, finished, telemetry::Who, Assignment, Delta, Reader, SymphonyError,
+            engine_finish, finished, telemetry, telemetry::Who, Assignment, Delta, Reader,
+            SymphonyError,
         },
         spec::{ChatResponseSpec, CompletionResponseSpec, MessagesResponseSpec},
         utils,
@@ -275,6 +276,16 @@ impl ResponseProcessor {
         let reasoning_tokens =
             finished(events.as_slice()).map_or(0, |finished| finished.reasoning_tokens);
         let mut choice = adapt::chat::message(index as u32, &events);
+        // Strictness: an output the table gave up on a run of finishes with `parse_failure`
+        // rather than as an ordinary stop; its bytes stay in the content. A truncation
+        // (`length`) and every other engine finish stay what they are: a call cut by the token
+        // limit is a truncation first, and a client's truncation guard must still see it.
+        if original_request.parse_strict
+            && reader.has_malformed()
+            && matches!(choice.finish_reason.as_deref(), Some("stop" | "tool_calls"))
+        {
+            choice.finish_reason = Some(telemetry::PARSE_FAILURE.to_string());
+        }
         choice.matched_stop = matched_stop_value(stop_decoder, complete);
         // The content's tokens alone keep their logprobs, as on the older path: none when
         // the message has no content (whitespace alone, which `adapt::chat::message` leaves
@@ -364,13 +375,25 @@ impl ResponseProcessor {
         }
         let stop_sequence = matched_stop_string(stop_decoder, complete);
         let stop_reason = match output.stop_reason {
+            // Strictness: a natural end of turn (or a call) the table gave up on a run of is a
+            // parse failure; a truncation stays a truncation. A stop sequence that ended it stays
+            // in `stop_sequence` beside the failure, as chat keeps `matched_stop`.
+            Some(messages::StopReason::EndTurn | messages::StopReason::ToolUse)
+                if request.parse_strict && reader.has_malformed() =>
+            {
+                Some(messages::StopReason::ParseFailure)
+            }
             Some(messages::StopReason::EndTurn) if stop_sequence.is_some() => {
                 Some(messages::StopReason::StopSequence)
             }
             stop_reason => stop_reason,
         };
-        let stop_sequence = stop_sequence
-            .filter(|_| matches!(stop_reason, Some(messages::StopReason::StopSequence)));
+        let stop_sequence = stop_sequence.filter(|_| {
+            matches!(
+                stop_reason,
+                Some(messages::StopReason::StopSequence | messages::StopReason::ParseFailure)
+            )
+        });
         let thinking_requested = request.thinking_requested;
         let reasoning_tokens =
             finished(events.as_slice()).map_or(0, |finished| finished.reasoning_tokens);

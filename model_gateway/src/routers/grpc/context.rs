@@ -244,6 +244,11 @@ pub(crate) struct ProcessingState {
     /// `regular::symphony::telemetry::Report`); the response spec carries it to the drivers.
     pub parse_report: Report,
 
+    /// Whether the request asked for strictness (`X-SMG-Parse-Strict: on` under a policy that
+    /// is not `silent`): an output the table gave up on a run of finishes with `parse_failure` in
+    /// place of a natural stop; a truncation keeps its reason.
+    pub parse_strict: bool,
+
     /// Owned here rather than inside `PreparationOutput` so EPD's `EncodeStage`
     /// can borrow it for the with-pixels encode serialization before request
     /// building `take()`s it for the prefill serialization.

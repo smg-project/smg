@@ -3295,7 +3295,14 @@ impl<'a> ChatStream<'a> {
 
         let complete_usage = self.prompt_tokens.len() as u32 >= self.spec.expected_choices;
         for (position, (index, finish_reason)) in self.finish_reasons.iter().enumerate() {
-            let final_finish_reason = if self.has_tool_calls.get(index).copied().unwrap_or(false)
+            let final_finish_reason = if self.spec.parse_strict
+                && finish_reason == "stop"
+                && self.readers.get(index).is_some_and(Reader::has_malformed)
+            {
+                // Strictness: a natural stop (a call included) the table gave up on a run of
+                // finishes with `parse_failure`; a truncation stays `length`.
+                telemetry::PARSE_FAILURE.to_string()
+            } else if self.has_tool_calls.get(index).copied().unwrap_or(false)
                 && finish_reason == "stop"
             {
                 "tool_calls".to_string()
@@ -4358,6 +4365,18 @@ impl<'a> MessagesStream<'a> {
         // Symphony's stop reason is the `Finish` event's; a stop sequence the decoder or the
         // engine matched is reported as such, as the message says.
         let stop_reason = match self.symphony_stop.take() {
+            // Strictness: a natural end of turn (or a call) the table gave up on a run of is a
+            // parse failure; a truncation stays a truncation. A stop sequence that ended it stays
+            // in `stop_sequence` beside the failure, as chat keeps `matched_stop`.
+            Some(messages::StopReason::EndTurn | messages::StopReason::ToolUse)
+                if self.spec.parse_strict
+                    && self
+                        .symphony
+                        .as_ref()
+                        .is_some_and(|(reader, _)| reader.has_malformed()) =>
+            {
+                Some(messages::StopReason::ParseFailure)
+            }
             Some(messages::StopReason::EndTurn)
                 if self.matched_stop.as_ref().is_some_and(Value::is_string) =>
             {
@@ -4367,7 +4386,10 @@ impl<'a> MessagesStream<'a> {
             None => stop_reason,
         };
 
-        let stop_sequence = if matches!(stop_reason, Some(messages::StopReason::StopSequence)) {
+        let stop_sequence = if matches!(
+            stop_reason,
+            Some(messages::StopReason::StopSequence | messages::StopReason::ParseFailure)
+        ) {
             self.matched_stop
                 .as_ref()
                 .and_then(|v| v.as_str().map(String::from))
