@@ -1127,8 +1127,9 @@ async fn spec_decode_counts_reach_the_complete() {
 }
 
 /// The grammar backend on every structured request is the engine's
-/// configured one (`auto` settles on xgrammar as vLLM's frontend does), not
-/// a per-constraint guess: the engine pins one backend at first use.
+/// configured one (`auto` settles on xgrammar, the backend structural tags
+/// compile on), not a per-constraint guess: the engine pins one backend at
+/// first use.
 #[tokio::test]
 async fn structured_output_backend_follows_the_launcher_config() {
     use vllm::sampling_params::Constraint;
@@ -1159,10 +1160,10 @@ async fn structured_output_backend_follows_the_launcher_config() {
         h.server.stop(Duration::from_secs(5)).expect("clean stop");
     }
 
-    // `auto` resolves per constraint as vLLM's frontend does: a Lark grammar
-    // goes to xgrammar unchanged (vLLM 0.30 parses Lark there), a schema with
-    // a feature xgrammar lacks goes to guidance, and a choice is lowered to
-    // the grammar xgrammar compiles. The streams stay open so no abort
+    // `auto` is xgrammar for every constraint: a Lark grammar goes there
+    // unchanged (vLLM 0.30 parses Lark there) and a choice is lowered to the
+    // grammar xgrammar compiles; a schema with a feature xgrammar lacks is
+    // refused before the engine (below). The streams stay open so no abort
     // interleaves with the engine's inbound requests.
     let mut h = harness(model_info(), None).await;
     let lark = "start: \"yes\" | \"no\"";
@@ -1173,14 +1174,6 @@ async fn structured_output_backend_follows_the_launcher_config() {
             Constraint::Grammar(lark.to_string()),
             StructuredOutputBackend::Xgrammar,
             StructuredOutputConstraint::Grammar(lark.to_string()),
-        ),
-        (
-            "so3",
-            Constraint::JsonSchema(r#"{"type":"integer","multipleOf":3}"#.to_string()),
-            StructuredOutputBackend::Guidance,
-            StructuredOutputConstraint::Json(
-                serde_json::json!({"type": "integer", "multipleOf": 3}),
-            ),
         ),
         (
             "so4",
@@ -1208,6 +1201,57 @@ async fn structured_output_backend_follows_the_launcher_config() {
         assert_eq!(structured.backend, expected_backend, "{id}");
         assert_eq!(structured.constraint, expected_constraint, "{id}");
     }
+    // A schema with a feature xgrammar lacks is refused under `auto` before it
+    // reaches the engine, as vLLM's frontend refuses it under
+    // `backend=xgrammar`: xgrammar would compile it with the keyword dropped
+    // and the engine would answer off the schema.
+    let mut request = generate_request("so3", true, Vec::new());
+    request.sampling_params.as_mut().unwrap().constraint = Some(Constraint::JsonSchema(
+        r#"{"type":"integer","multipleOf":3}"#.to_string(),
+    ));
+    let status = h.client.generate(request).await.expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status.message().contains("`multipleOf` at its root"),
+        "{}",
+        status.message()
+    );
+    // The same keyword inside a forced call's structural tag (a parser with
+    // structural tags embeds each tool's parameters as a `json_schema`
+    // element) is refused under `auto` the same way, before the engine.
+    let mut request = generate_request("so5", true, Vec::new());
+    request.sampling_params.as_mut().unwrap().constraint = Some(Constraint::StructuralTag(
+        serde_json::json!({"format": {"type": "triggered_tags", "triggers": ["<tool_call>"],
+            "tags": [{"begin": "<tool_call>{\"name\": \"t\", \"arguments\": ",
+                      "content": {"type": "json_schema", "json_schema": {"type": "object",
+                          "properties": {"tags": {"type": "array", "items": {"type": "string"},
+                                                  "uniqueItems": true}}}},
+                      "end": "}</tool_call>"}],
+            "at_least_one": true}})
+        .to_string(),
+    ));
+    let status = h.client.generate(request).await.expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status.message().contains(
+            "`uniqueItems` at `/format/tags/0/content/json_schema/properties/tags` (inside the \
+             tag that begins `<tool_call>{\"name\": \"t\", \"arguments\": `)"
+        ),
+        "{}",
+        status.message()
+    );
+    // Nothing refused reached the engine: its next request is the next one
+    // served.
+    let mut request = generate_request("so6", true, Vec::new());
+    request.sampling_params.as_mut().unwrap().constraint = Some(Constraint::JsonObject(true));
+    streams.push(
+        h.client
+            .generate(request)
+            .await
+            .expect("generate")
+            .into_inner(),
+    );
+    assert_eq!(recv_add(&mut h.engine_in).await.request_id, "so6");
     drop(streams);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

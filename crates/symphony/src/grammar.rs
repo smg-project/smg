@@ -1915,9 +1915,12 @@ mod tests {
         let tools = weather_tools();
         for (format, excludes) in [
             (
+                // The opener spelled with the template's blank line is a terminal of the table,
+                // so it is listed with the rest; it excludes nothing the bare opener does not.
                 formats::deepseek_v4_1(),
                 value!([
                     "<｜DSML｜ calls>",
+                    "\n\n<｜DSML｜ calls>",
                     "</｜DSML｜ calls>",
                     "<｜DSML｜ invoke name=\"",
                     "</｜DSML｜ invoke>",
@@ -2295,6 +2298,7 @@ mod tests {
             .terminal("think_open", "<think>")
             .terminal("think_close", "</think>")
             .terminal("calls_open", "<｜DSML｜ calls>")
+            .terminal("separated_calls_open", "\n\n<｜DSML｜ calls>")
             .terminal("calls_close", "</｜DSML｜ calls>")
             .terminal("invoke_open", "<｜DSML｜ invoke name=\"")
             .terminal("invoke_close", AttributedTags::DSML.invoke_close)
@@ -2306,6 +2310,8 @@ mod tests {
             .transition("reasoning", "calls_open", "calls")
             .transition("reasoning", "think_close", "content")
             .transition("content", "calls_open", "calls")
+            .transition("reasoning", "separated_calls_open", "calls")
+            .transition("content", "separated_calls_open", "calls")
             .transition("calls", "invoke_open", "invoke")
             .transition("invoke", "calls_close", "content")
             .transition("invoke", "invoke_close", "calls")

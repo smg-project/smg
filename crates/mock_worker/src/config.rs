@@ -90,6 +90,10 @@ pub struct ReplayConfig {
     /// `--capture PATH`: append every gRPC `Generate` request to `PATH`,
     /// one JSON object per line.
     pub capture: Option<PathBuf>,
+    /// `--script PATH`: a JSONL of scripted answers keyed by the prompt's
+    /// token ids, served on every wire ahead of the engine
+    /// ([`crate::script`]).
+    pub script: Option<PathBuf>,
 }
 
 /// Timing flags collected while parsing; resolved into one [`TimingModel`]
@@ -223,6 +227,7 @@ impl Config {
                 }
                 "--output-tokens" => cfg.output_tokens = parse(value(&mut args, &flag)?, &flag)?,
                 "--capture" => cfg.replay.capture = Some(value(&mut args, &flag)?.into()),
+                "--script" => cfg.replay.script = Some(value(&mut args, &flag)?.into()),
                 "--engine" => {
                     cfg.realistic = match value(&mut args, &flag)?.as_str() {
                         "realistic" => true,
@@ -405,6 +410,8 @@ fn usage() -> String {
        --gen-ms <ms>            canned per-request latency (default 0)\n\
        --output-tokens <n>      output tokens per request when unspecified (default 8)\n\
        --capture <path>         append each gRPC Generate request to <path> as a JSON line\n\
+       --script <path>          scripted answers (JSONL keyed by the prompt's token ids), served on\n\
+                                every wire ahead of the engine; the admin API enqueues more\n\
      \n\
      Realistic engine simulator (vLLM pass loop over a block-level KV pool; opt-in):\n\
        --engine <canned|realistic>  engine mode (default canned)\n\
@@ -509,6 +516,17 @@ mod tests {
             cfg.replay.capture,
             Some(PathBuf::from("/tmp/generate.jsonl"))
         );
+    }
+
+    #[test]
+    fn script_flag_sets_the_script_path() {
+        let grpc = ["--grpc-base-port", "19000", "--grpc-count", "1"];
+        let cfg = parse(&grpc).expect("gRPC flags parse");
+        assert_eq!(cfg.replay.script, None, "no script by default");
+
+        let cfg = parse(&[&grpc[..], &["--script", "/tmp/answers.jsonl"]].concat())
+            .expect("--script parses");
+        assert_eq!(cfg.replay.script, Some(PathBuf::from("/tmp/answers.jsonl")));
     }
 
     #[test]

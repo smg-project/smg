@@ -68,6 +68,38 @@ def test_request_decodes_from_the_frontend_prefix_with_list_ids():
     assert req.require_reasoning is False and req.routed_dp_rank is None
 
 
+def test_request_decodes_from_the_sampling_prefix_the_frontend_sends():
+    """SMG sends the sampling params through ``custom_params`` (the API
+    parameters); the scheduler's own fields after them, and whatever a
+    release inserts before those, take their defaults, so one encoding serves
+    the releases whose field order differs there."""
+    request = _positional_request()
+    fields = list(SamplingParams.__struct_fields__)
+    request[8] = request[8][: fields.index("custom_params") + 1]
+    frames = [wire.REQ_TYPE_ADD, msgspec.msgpack.encode(request)]
+    (req,) = wire.decode_request_frames(frames)
+    params = req.sampling_params
+    assert (params.max_new_tokens, params.top_k, params.n) == (8, 1, 1)
+    assert params.is_normalized is False and params.stop_strs is None
+
+
+def test_the_ready_response_declares_the_request_structs_field_order():
+    """The field order SMG checks the prefixes it encodes against: the
+    installed release's own declaration, which pins where the prefixes end."""
+    layouts = wire.request_layouts()
+    assert layouts["SamplingParams"][:4] == [
+        "max_new_tokens",
+        "stop",
+        "stop_token_ids",
+        "stop_regex",
+    ]
+    assert layouts["SamplingParams"].index("custom_params") == 25
+    assert layouts["TokenizedGenerateReqInput"][:2] == ["rid", "http_worker_ipc"]
+    assert layouts["TokenizedGenerateReqInput"].index("lora_id") == 21
+    assert layouts["TokenizedGenerateReqInput"].index("require_reasoning") == 32
+    assert layouts["TokenizedEmbeddingReqInput"].index("dimensions") == 11
+
+
 def test_abort_frame_fans_out_one_abort_per_rid():
     aborts = wire.decode_request_frames([wire.REQ_TYPE_ABORT, msgspec.msgpack.encode(["a", "b"])])
     assert [a.rid for a in aborts] == ["a", "b"]

@@ -61,6 +61,7 @@ tikv-jemallocator = { version = "0.6", default-features = false, features = ["ba
 tikv-jemalloc-ctl = { version = "0.6", default-features = false }
 http = "1.4.2"
 lru = "0.18.0"
+memchr = "2"
 num-traits = "0.2"
 parking_lot = "0.12.5"
 rand = "0.10.1"
@@ -80,7 +81,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 webpki-roots = "1.0"
 multer = "3"
-str0m = { version = "0.23", default-features = false, features = ["openssl"] }
+str0m = { version = "0.24", default-features = false, features = ["openssl"] }
 scopeguard = "1.2"
 bitflags = "2.13.0"
 schemars = "1.2"

@@ -45,7 +45,7 @@ COMMON_POLICY_CHOICES = [
 PREFILL_POLICY_CHOICES = [*COMMON_POLICY_CHOICES, "bucket"]
 ENCODE_POLICY_CHOICES = ["random", "round_robin", "consistent_hashing"]
 # Worker discovery providers --discovery-provider accepts.
-DISCOVERY_PROVIDER_CHOICES = ["kubernetes", "file"]
+DISCOVERY_PROVIDER_CHOICES = ["kubernetes", "file", "slurm"]
 
 
 def _parse_kv_index(value: str) -> str:
@@ -343,8 +343,9 @@ class RouterArgs:
     disable_retries: bool = False
     # Disable automatic tokenizer loading at startup and worker registration
     disable_tokenizer_autoload: bool = False
-    # File discovery (discovery_provider="file"): how often the JSON manifest is
-    # reread besides on every change (None = 30s), and the manifest's path.
+    # The selected provider's periodic pass (None = 30s): Kubernetes and file
+    # discovery apply a change as it happens and retry on it, Slurm discovery
+    # polls on it; and the file provider's manifest path.
     discovery_check_interval_secs: int | None = None
     discovery_file: str | None = None
     # The worker discovery provider. service_discovery=True is the legacy
@@ -586,6 +587,19 @@ class RouterArgs:
     service_discovery_port: int = 80
     # Grace period in seconds to wait for in-flight requests during shutdown
     shutdown_grace_period_secs: int = 180
+    # Slurm discovery (discovery_provider="slurm"): the account whose jobs are
+    # discovered, the encode and prefill bootstrap port, the job names whose
+    # nodes are each worker type, the partition, the port of every node's
+    # server, and the user (None = the one the router runs as)
+    slurm_account: str | None = None
+    slurm_bootstrap_port: int | None = None
+    slurm_decode_job_name: list[str] = dataclasses.field(default_factory=list)
+    slurm_encode_job_name: list[str] = dataclasses.field(default_factory=list)
+    slurm_job_name: list[str] = dataclasses.field(default_factory=list)
+    slurm_partition: str | None = None
+    slurm_port: int | None = None
+    slurm_prefill_job_name: list[str] = dataclasses.field(default_factory=list)
+    slurm_user: str | None = None
     # Seconds of upstream silence after which an open SSE stream carries a
     # keep-alive frame; 0 sends none
     sse_keepalive_secs: int = 15
@@ -626,7 +640,8 @@ class RouterArgs:
     # thresholds off (--disable-worker-overload-protection)
     worker_overload_protection: bool = True
     # Refuse with a 503 when every worker a request could use is overloaded,
-    # instead of routing it to the least-loaded one
+    # instead of routing it to the least-loaded one (or, for a cache-aware
+    # prefill pool of a prefill/decode pair, by its policy)
     worker_overload_shed: bool = False
     # Absolute per-worker overload thresholds (token usage, waiting requests), as
     # the Rust CLI defaults them; None switches one signal off
@@ -690,6 +705,9 @@ class RouterArgs:
         )
         file_discovery_group = parser.add_argument_group(
             "Service Discovery (File)", "Workers listed in a JSON manifest"
+        )
+        slurm_discovery_group = parser.add_argument_group(
+            "Service Discovery (Slurm)", "Workers on the nodes of running Slurm jobs"
         )
         logging_group = parser.add_argument_group("Logging", "Log output configuration")
         prometheus_group = parser.add_argument_group(
@@ -1042,7 +1060,10 @@ class RouterArgs:
                 " overloaded and left out of routing while another worker is"
                 " under the thresholds; when every worker is over them the"
                 " request goes to the least-loaded one (see"
-                " --worker-overload-shed). The signal is the queued (waiting)"
+                " --worker-overload-shed). Unless --worker-overload-shed is"
+                " set, a cache-aware prefill pool of a prefill/decode pair is"
+                " not steered by the thresholds: its spill gate balances it."
+                " The signal is the queued (waiting)"
                 " request count, summed across DP ranks. Must be >= 1: the"
                 " comparison is inclusive, so 0 would veto every worker"
                 " unconditionally. Defaults to 8."
@@ -1094,8 +1115,9 @@ class RouterArgs:
             help=(
                 "Refuse a request with a 503 (worker_overload_protection_shed,"
                 " Retry-After the load poll interval) when every worker it could"
-                " use is overloaded, instead of routing it to the least-loaded one;"
-                " also sheds a worker that crossed a threshold between selection"
+                " use is overloaded, instead of routing it to the least-loaded one"
+                " (or, for a cache-aware prefill pool, by its policy); also sheds"
+                " a worker that crossed a threshold between selection"
                 " and dispatch. Off by default."
             ),
         )
@@ -1766,9 +1788,63 @@ class RouterArgs:
             type=int,
             default=None,
             help=(
-                "Seconds between periodic rereads of the --discovery-file manifest,"
-                " which is also reread as soon as it changes (default: 30)"
+                "Seconds between periodic discovery passes. Kubernetes and file"
+                " discovery apply a change as it happens and use the pass to retry"
+                " and to catch what went unreported; Slurm discovery polls at this"
+                " interval (default: 30)"
             ),
+        )
+        for role, workers in [
+            ("", "regular"),
+            ("encode-", "encode"),
+            ("prefill-", "prefill"),
+            ("decode-", "decode"),
+        ]:
+            slurm_discovery_group.add_argument(
+                f"--{prefix}slurm-{role}job-name",
+                type=str,
+                action="append",
+                default=None,
+                help=(
+                    f"Slurm job name whose nodes are {workers} workers, for"
+                    " --discovery-provider slurm. Can be specified multiple times"
+                ),
+            )
+        slurm_discovery_group.add_argument(
+            f"--{prefix}slurm-port",
+            type=int,
+            default=None,
+            help=(
+                "Port of the inference server on every node of a discovered job"
+                " (required with --discovery-provider slurm)"
+            ),
+        )
+        slurm_discovery_group.add_argument(
+            f"--{prefix}slurm-bootstrap-port",
+            type=int,
+            default=None,
+            help="Bootstrap port of the Slurm-discovered encode and prefill workers",
+        )
+        slurm_discovery_group.add_argument(
+            f"--{prefix}slurm-user",
+            type=str,
+            default=None,
+            help=(
+                "Discover this Slurm user's jobs, by name or uid"
+                " (default: the user the router runs as)"
+            ),
+        )
+        slurm_discovery_group.add_argument(
+            f"--{prefix}slurm-account",
+            type=str,
+            default=None,
+            help="Discover only jobs charged to this Slurm account",
+        )
+        slurm_discovery_group.add_argument(
+            f"--{prefix}slurm-partition",
+            type=str,
+            default=None,
+            help="Discover only jobs in this Slurm partition",
         )
         k8s_group.add_argument(
             f"--{prefix}selector",

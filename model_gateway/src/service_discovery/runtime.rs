@@ -8,6 +8,7 @@ use tokio::task;
 use super::{
     file::{self, FileProviderConfig},
     kubernetes::{self, ModelIdSource, ServiceDiscoveryConfig},
+    slurm::{self, SlurmProviderConfig},
 };
 use crate::{
     app_context::AppContext,
@@ -26,6 +27,7 @@ use crate::{
 pub enum RuntimeDiscoveryConfig {
     Kubernetes(ServiceDiscoveryConfig),
     File(FileProviderConfig),
+    Slurm(SlurmProviderConfig),
 }
 
 impl RuntimeDiscoveryConfig {
@@ -46,6 +48,9 @@ impl RuntimeDiscoveryConfig {
                 Duration::from_secs(file.check_interval_secs),
                 mode,
             )?)),
+            DiscoveryConfig::Slurm(slurm) => {
+                Ok(Self::Slurm(SlurmProviderConfig::new(slurm, mode)?))
+            }
         }
     }
 }
@@ -96,6 +101,9 @@ pub async fn start_service_discovery(
             Ok(kubernetes::start_kubernetes_discovery(config, app_context).await?)
         }
         RuntimeDiscoveryConfig::File(config) => Ok(file::start_file_discovery(config, app_context)),
+        RuntimeDiscoveryConfig::Slurm(config) => {
+            Ok(slurm::start_slurm_discovery(config, app_context))
+        }
     }
 }
 
@@ -192,6 +200,28 @@ mod tests {
         };
         assert_eq!(runtime.path, std::path::Path::new("/run/smg/workers.json"));
         assert_eq!(runtime.check_interval, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn slurm_settings_reach_the_runtime() {
+        let config = DiscoveryConfig::Slurm(crate::config::SlurmDiscoveryConfig {
+            job_names: vec!["smg-worker".to_string()],
+            encode_job_names: vec![],
+            prefill_job_names: vec![],
+            decode_job_names: vec![],
+            port: 8000,
+            bootstrap_port: None,
+            user: None,
+            account: None,
+            partition: None,
+            check_interval_secs: 10,
+        });
+        let Ok(RuntimeDiscoveryConfig::Slurm(runtime)) =
+            RuntimeDiscoveryConfig::from_config(&config, &regular())
+        else {
+            panic!("expected Slurm runtime discovery");
+        };
+        assert_eq!(runtime.check_interval, Duration::from_secs(10));
     }
 
     #[test]

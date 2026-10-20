@@ -2830,14 +2830,33 @@ impl<'a> ChatStream<'a> {
         // Symphony ends the choice's output here: the decoder's last
         // text, then the engine's finish. The finish chunk is Phase 4's,
         // with the matched stop; the `Finish` event gives it the calls
-        // made, and the usage the reasoning tokens.
-        if let Some(reader) = self.readers.get_mut(&index) {
+        // made, and the usage the reasoning tokens. A choice whose first
+        // engine output is its Complete has no reader yet: it gets one
+        // for its end, so an output of no tokens is recorded as every
+        // output is.
+        let mut delta = std::mem::take(&mut self.delta);
+        let mut events: Events<'_> = std::mem::take(&mut self.spare);
+        let reader = match self.readers.entry(index) {
+            Entry::Occupied(reader) => Some(reader.into_mut()),
+            Entry::Vacant(slot) => match self.spec.symphony.as_ref() {
+                Some(assignment) => Some(
+                    slot.insert(
+                        Reader::new(
+                            assignment,
+                            self.spec.tools.clone().unwrap_or_default(),
+                            &mut events,
+                        )?
+                        .first_call_only(self.spec.first_tool_call_only),
+                    ),
+                ),
+                None => None,
+            },
+        };
+        if let Some(reader) = reader {
             let reason = self
                 .finish_reasons
                 .get(&index)
                 .map_or("stop", String::as_str);
-            let mut delta = std::mem::take(&mut self.delta);
-            let mut events: Events<'_> = std::mem::take(&mut self.spare);
             if let Some(text) = flushed {
                 reader.tail(text, &mut delta, &mut events)?;
             }
@@ -2868,6 +2887,8 @@ impl<'a> ChatStream<'a> {
             self.delta = delta;
             return Ok(None);
         }
+        self.spare = events.recycle();
+        self.delta = delta;
 
         // Don't break - continue reading all Complete messages for n>1
         // Text the decoder held for a partial stop match: the

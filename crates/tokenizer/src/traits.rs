@@ -65,8 +65,10 @@ pub struct RendererCapabilities {
     /// popping it into a text prefix.
     pub native_assistant_continuation: bool,
     /// The renderer parses tool-call `arguments` strings itself with the
-    /// reference's tolerance (non-object and double-encoded values); the
-    /// gateway must forward them as written instead of pre-parsing them.
+    /// reference's tolerance (non-object and double-encoded values), or its
+    /// template writes them as the text the request sent (a template that
+    /// concatenates them cannot render an object); the gateway must forward
+    /// them as written instead of pre-parsing them.
     pub raw_tool_call_arguments: bool,
     /// The renderer declares the request's tools when `tool_choice` is
     /// `none` and tells the model not to call them, as its reference does;

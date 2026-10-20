@@ -29,8 +29,7 @@ use crate::routers::{
         context::{DispatchMetadata, ExecutionResult},
         proto_wrapper::ProtoGenerateComplete,
         regular::symphony::{
-            content_spans, engine_finish, finished, telemetry::Who, Assignment, Delta, Reader,
-            SymphonyError,
+            engine_finish, finished, telemetry::Who, Assignment, Delta, Reader, SymphonyError,
         },
         spec::{ChatResponseSpec, CompletionResponseSpec, MessagesResponseSpec},
         utils,
@@ -272,7 +271,8 @@ impl ResponseProcessor {
         choice.matched_stop = matched_stop_value(stop_decoder, complete);
         // The content's tokens alone keep their logprobs, as on the older path: none when
         // the message has no content (whitespace alone, which `adapt::chat::message` leaves
-        // out of the message).
+        // out of the message); the bytes the reader released at the end are placed where the
+        // output wrote them (`Reader::content_spans`).
         let has_content = choice.message.content.is_some();
         choice.logprobs = complete.output_logprobs().map(|ref proto_logprobs| {
             let mut logprobs = utils::convert_proto_to_openai_logprobs(
@@ -286,7 +286,10 @@ impl ResponseProcessor {
             } = &mut logprobs
             {
                 let keep = if has_content {
-                    content_tokens(reader.token_ends(), &content_spans(events.as_slice()))
+                    content_tokens(
+                        reader.token_ends(),
+                        &reader.content_spans(events.as_slice()),
+                    )
                 } else {
                     Vec::new()
                 };

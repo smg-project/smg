@@ -37,7 +37,10 @@ fn config(capture: Option<PathBuf>) -> Config {
         output_tokens: 3,
         realistic: false,
         engine: EngineParams::default(),
-        replay: ReplayConfig { capture },
+        replay: ReplayConfig {
+            capture,
+            ..ReplayConfig::default()
+        },
         ..Config::default()
     }
 }

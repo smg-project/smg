@@ -60,7 +60,7 @@ pub(crate) mod template;
 mod testing;
 
 use axum::http::HeaderMap;
-pub(crate) use symphony::{adapt::chat::content_spans, event::reasoning_text_tokens};
+pub(crate) use symphony::event::reasoning_text_tokens;
 
 use crate::{config::ParserChoice, routers::grpc::utils::StreamFailure};
 

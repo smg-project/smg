@@ -54,6 +54,11 @@ impl TokenSpeedGenerateStream {
         self.index
     }
 
+    /// The engine-side id of this choice's request.
+    pub fn request_id(&self) -> &str {
+        self.inner.request_id()
+    }
+
     /// Whether the engine already finished this choice and its terminal
     /// `Complete` is parked behind the chunk just yielded (the finish tick
     /// carried new tokens). A frontend that matched a stop on that chunk must

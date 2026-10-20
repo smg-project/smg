@@ -1747,6 +1747,47 @@ mod tests {
         )
     }
 
+    /// An engine whose declared layout of a positional struct puts a field
+    /// inside the prefix this client fills is refused at connect, by name; a
+    /// wire whose requests are named-field maps has nothing to check.
+    #[tokio::test]
+    async fn an_engine_whose_declared_layout_moved_a_field_is_refused_by_name() {
+        use crate::{
+            check_engine_layouts,
+            protocol::{sglang::SglangProtocol, vllm::VllmProtocol},
+        };
+        let ns = IpcNamespace::new().unwrap();
+        let (handshake, input, output) = (
+            ns.handshake_endpoint(),
+            ns.input_endpoint(),
+            ns.output_endpoint(),
+        );
+        let mut moved = default_ready_response();
+        moved.positional_layouts.insert(
+            "SamplingParams".to_string(),
+            ["max_new_tokens", "stop", "watermark"]
+                .map(str::to_string)
+                .to_vec(),
+        );
+        let (transport, engine) = tokio::join!(
+            connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
+            connect_to_frontend(&handshake, EngineId::from_engine_index(0), moved),
+        );
+        let transport = transport.unwrap();
+        let _engine = engine.unwrap();
+        assert!(check_engine_layouts::<VllmProtocol>(&transport).is_ok());
+        let error = check_engine_layouts::<SglangProtocol>(&transport)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "wire layout mismatch: engine EngineId(0000): `SamplingParams` field 2 is \
+                 `stop_token_ids` on this side and `watermark` on the engine's"
+            ),
+            "{error}"
+        );
+    }
+
     /// Connect `engine_count` mock ranks behind one transport. `lockstep`
     /// controls the data-parallel size they report at handshake, which is how
     /// the client tells a group that pauses as a unit (vLLM MoE DP) from ranks

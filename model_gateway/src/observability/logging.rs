@@ -566,6 +566,45 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
     LogGuard(())
 }
 
+/// Logging helpers for tests elsewhere in the crate.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use tracing::{subscriber::DefaultGuard, Dispatch};
+    use tracing_subscriber::{layer::SubscriberExt, Layer, Registry};
+
+    /// A test's subscriber: this thread's default until the value drops,
+    /// seeing every line the thread writes meanwhile.
+    ///
+    /// `tracing` caches per callsite whether any subscriber wants it, and
+    /// while it knows of a single live dispatcher it rebuilds the entry of a
+    /// callsite registered for the first time from the registering thread's
+    /// default alone. A test running beside this one with no subscriber of
+    /// its own, writing a line at such a callsite first, then caches it as
+    /// never enabled: the macro skips the line on every thread, this one
+    /// included, before any subscriber is asked, until the next dispatcher
+    /// registers. The second dispatcher held here keeps every rebuild over
+    /// all live dispatchers, the test's among them.
+    #[must_use = "dropping the value uninstalls the subscriber"]
+    pub(crate) struct TestSubscriber {
+        _guard: DefaultGuard,
+        _second: Dispatch,
+    }
+
+    /// `layer` over a registry as this thread's subscriber until the value
+    /// drops.
+    pub(crate) fn test_subscriber<L>(layer: L) -> TestSubscriber
+    where
+        L: Layer<Registry> + Send + Sync + 'static,
+    {
+        let second = Dispatch::new(Registry::default());
+        let guard = tracing::subscriber::set_default(Registry::default().with(layer));
+        TestSubscriber {
+            _guard: guard,
+            _second: second,
+        }
+    }
+}
+
 #[cfg(test)]
 mod writer_tests {
     use std::{

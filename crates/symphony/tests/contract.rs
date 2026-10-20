@@ -1797,6 +1797,29 @@ const DSML_OUTPUTS: &[&str] = &[
      </｜DSML｜ calls>",
     "<｜DSML｜ calls>\nprose where an invoke should be\n</｜DSML｜ calls>",
     "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+    // The recorded shapes with a text preamble: the template's blank line between the text and
+    // the block is the opener's; one call, two calls, and a preamble with a blank line of its own.
+    "The user wants detailed information about Apple Inc. stock. Let me call the tool.</think>\
+     I'll retrieve detailed stock information for Apple Inc.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke \
+     name=\"get_stock_info\">\n<｜DSML｜ parameter name=\"company_name\" string=\"true\">Apple Inc.\
+     </｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"detail_level\" string=\"true\">detailed\
+     </｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+    "</think>I'll fetch both exchange rates for you.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke \
+     name=\"get_exchange_rate\">\n<｜DSML｜ parameter name=\"base_currency\" string=\"true\">USD\
+     </｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"target_currency\" string=\"true\">AUD\
+     </｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"get_exchange_rate\">\n\
+     <｜DSML｜ parameter name=\"base_currency\" string=\"true\">USD</｜DSML｜ parameter>\n\
+     <｜DSML｜ parameter name=\"target_currency\" string=\"true\">CAD</｜DSML｜ parameter>\n\
+     </｜DSML｜ invoke>\n</｜DSML｜ calls>",
+    "</think>Step by step.\n\n**Step 1**\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n\
+     <｜DSML｜ parameter name=\"mols\" string=\"false\">5</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n\
+     </｜DSML｜ calls>",
+    // A third newline, and a space, before the blank line are content; the blank line a stream cut
+    // in two still leaves with the opener.
+    "</think>Sure.\n\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n</｜DSML｜ invoke>\n\
+     </｜DSML｜ calls>",
+    "</think>Sure. \n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n</｜DSML｜ invoke>\n\
+     </｜DSML｜ calls>",
 ];
 
 /// Outputs in the tagged syntax: the recorded shapes, and the cuts and faults the assembler

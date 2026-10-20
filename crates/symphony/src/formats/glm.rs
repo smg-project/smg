@@ -423,6 +423,132 @@ mod tests {
         }
     }
 
+    /// The tools of the recorded pythonic cases: a string, an array with an object.
+    fn stock_tools() -> Declared {
+        let tool = |name: &str, parameters: serde_json::Value| Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: name.to_string(),
+                description: None,
+                parameters,
+                strict: None,
+                extra: Default::default(),
+            },
+        };
+        let schema =
+            |properties: serde_json::Value| value!({"type": "object", "properties": properties});
+        Declared::of(&[
+            tool(
+                "get_stock_info",
+                schema(value!({"company": {"type": "string"}})),
+            ),
+            tool(
+                "todo",
+                schema(
+                    value!({"type": {"type": "string"}, "items": {"type": "array"}, "when": {"type": "object"}}),
+                ),
+            ),
+            tool(
+                "searchHotels",
+                schema(value!({"location": {"type": "string"}})),
+            ),
+        ])
+    }
+
+    /// A call written as Python inside the block's markers, right after the thought, as the
+    /// recorded cells show it: whole with one string, whole with nested arguments, and twice
+    /// with the second block cut by the end of the stream. None names a call: the block's bytes
+    /// are refused whole (the text where the name goes, then the marker that ended it, as the
+    /// call's own bytes; the opener that led into the block is the table's row), behind events
+    /// of no bytes, the first of them saying that text stands where the name should be; nothing
+    /// of the block is content, so the content is empty, and what an answer of nothing else
+    /// shows a client is the reader's decision. The same call in the template's own form is the
+    /// call, typed by the tool. Every chunking says the same.
+    #[test]
+    fn a_call_written_as_python_inside_the_tag_is_refused_whole_and_the_tagged_form_reads() {
+        struct Case {
+            output: &'static str,
+            refused: &'static str,
+        }
+        let cases = [
+            Case {
+                output: "</think><tool_call>get_stock_info(company=\"Apple\")</tool_call>",
+                refused: "get_stock_info(company=\"Apple\")</tool_call>",
+            },
+            Case {
+                output: concat!(
+                    "</think><tool_call>todo(type=\"add\", items=[{\"title\": \"Buy milk\", ",
+                    "\"tags\": [\"home\", \"food\"]}], when={\"day\": 1, \"hour\": 9})</tool_call>"
+                ),
+                refused: concat!(
+                    "todo(type=\"add\", items=[{\"title\": \"Buy milk\", ",
+                    "\"tags\": [\"home\", \"food\"]}], when={\"day\": 1, \"hour\": 9})</tool_call>"
+                ),
+            },
+            Case {
+                output: concat!(
+                    "</think><tool_call>searchHotels(location=\"San Diego\")",
+                    "<tool_call>searchHotels(location=\"San Diego\")"
+                ),
+                refused: concat!(
+                    "searchHotels(location=\"San Diego\")",
+                    "<tool_call>searchHotels(location=\"San Diego\")"
+                ),
+            },
+        ];
+        for case in &cases {
+            for pieces in plans(case.output) {
+                let events = run_with(stock_tools(), PROMPT, &pieces);
+                let place = || format!("{:?} in {} pieces", &case.output[..40], pieces.len());
+                assert_eq!(bytes(&events), case.output, "{}", place());
+                assert_eq!(content(&events), "", "{}", place());
+                assert!(calls_of(&events).is_empty(), "{}", place());
+                let malformed = malformed(&events);
+                assert!(
+                    malformed.iter().all(|(_, text)| text.is_empty()),
+                    "{}: {malformed:?}",
+                    place()
+                );
+                assert_eq!(
+                    malformed.first().map(|(why, _)| *why),
+                    Some(MalformedReason::TextWhereTheNameShouldBe),
+                    "{}",
+                    place()
+                );
+                assert_eq!(refused(&events), case.refused, "{}", place());
+                assert!(
+                    matches!(events.last(), Some(Event::Finish { tool_calls: 0, .. })),
+                    "{}",
+                    place()
+                );
+            }
+        }
+        // The template's own form of the first case: the call, with the string the tool
+        // declares, and nothing refused.
+        let output = concat!(
+            "</think><tool_call>get_stock_info<arg_key>company</arg_key>",
+            "<arg_value>Apple</arg_value></tool_call>"
+        );
+        for pieces in plans(output) {
+            let events = run_with(stock_tools(), PROMPT, &pieces);
+            assert_eq!(bytes(&events), output, "{} pieces", pieces.len());
+            assert_eq!(
+                calls_of(&events),
+                [("get_stock_info".to_string(), value!({"company": "Apple"}))],
+                "{} pieces",
+                pieces.len()
+            );
+            assert_eq!(content(&events), "", "{} pieces", pieces.len());
+            assert!(malformed(&events).is_empty(), "{} pieces", pieces.len());
+            assert_eq!(refused(&events), "", "{} pieces", pieces.len());
+            assert!(
+                matches!(events.last(), Some(Event::Finish { tool_calls: 1, .. })),
+                "{} pieces",
+                pieces.len()
+            );
+        }
+    }
+
     /// A recorded output: one well-formed call whose last value close the model wrote twice.
     const RECORDED_STRAY_CLOSE: &str = concat!(
         "The user wants to perform a t-test between two datasets:\n- Dataset A: [12, 24, 36]\n",

@@ -15,7 +15,7 @@ use openai_protocol::{
 use serde_json::{json, Value};
 use smg_grpc_client::{tokenspeed_proto::GenerateComplete, vllm_engine::proto};
 use symphony::{
-    formats::{deepseek_v4, plain, qwen3},
+    formats::{deepseek_v4, glm, plain, qwen3},
     CallSyntax, Format,
 };
 
@@ -343,6 +343,11 @@ async fn without_an_assignment_the_older_parsers_read_the_stream() {
 /// A whole `output` read by the non-streaming driver with the Qwen3 table, one logprob per
 /// character token: the choice and its reasoning token count.
 async fn fold(output: &str) -> (ChatChoice, u32) {
+    fold_with(output, qwen3(CallSyntax::Json), "<|im_start|>assistant\n").await
+}
+
+/// [`fold`] over `format` after `prompt`.
+async fn fold_with(output: &str, format: Format, prompt: &str) -> (ChatChoice, u32) {
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
     let output_ids: Vec<u32> = output.chars().map(u32::from).collect();
     let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
@@ -357,11 +362,7 @@ async fn fold(output: &str) -> (ChatChoice, u32) {
     });
     let mut decoder =
         StopSequenceDecoder::new(tokenizer.clone(), StopSequenceConfig::default(), false);
-    let spec = assigned(
-        chat_spec(true),
-        qwen3(CallSyntax::Json),
-        "<|im_start|>assistant\n",
-    );
+    let spec = assigned(chat_spec(true), format, prompt);
     let processor = ResponseProcessor::new(
         ToolParserFactory::new(),
         ReasoningParserFactory::new(),
@@ -422,6 +423,29 @@ async fn symphony_folds_a_whole_output_into_the_message() {
         "Hello ",
         "the content's tokens alone keep their logprobs"
     );
+}
+
+#[tokio::test]
+async fn a_refused_block_released_as_the_answer_keeps_its_tokens_logprobs() {
+    // The whole answer after the thought is a call written as Python inside the call tag: the
+    // reader releases the block, from its opener, as the content, and its tokens keep their
+    // logprobs, placed where the output wrote them, not where the released event stands. Two
+    // closed blocks with the template's newline between them the same, over the one slice.
+    let output = "plan</think><tool_call>get_stock_info(company=\"Apple\")</tool_call>";
+    let (choice, reasoning_tokens) = fold_with(output, glm(), "<|assistant|><think>").await;
+    let released = "<tool_call>get_stock_info(company=\"Apple\")</tool_call>";
+    assert_eq!(choice.message.content.as_deref(), Some(released));
+    assert_eq!(choice.message.reasoning_content.as_deref(), Some("plan"));
+    assert!(choice.message.tool_calls.is_none());
+    assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
+    assert_eq!(reasoning_tokens, 4);
+    assert_eq!(kept_logprob_tokens(&choice), released);
+    let output = "plan</think><tool_call>a(x=1)</tool_call>\n<tool_call>b(y=2)</tool_call>";
+    let (choice, _) = fold_with(output, glm(), "<|assistant|><think>").await;
+    let released = "<tool_call>a(x=1)</tool_call>\n<tool_call>b(y=2)</tool_call>";
+    assert_eq!(choice.message.content.as_deref(), Some(released));
+    assert!(choice.message.tool_calls.is_none());
+    assert_eq!(kept_logprob_tokens(&choice), released);
 }
 
 #[tokio::test]
@@ -968,6 +992,130 @@ async fn arguments_that_are_not_json_reach_the_client_whole_and_are_counted() {
     assert!(malformed.ends_with(" 1"), "{malformed}");
 }
 
+/// The same output on the Messages API, whole and streamed: the `tool_use` block's `input` is the
+/// value the accepted prefix's complete members make on both paths (the stream's deltas end at
+/// the break and a client's partial JSON reader closes them; the whole message closes the prefix
+/// the same way), nothing of the tail is text, the stop reason is `tool_use`, and the output is
+/// counted as malformed once, as on the chat path, whose arguments string begins with the prefix.
+#[tokio::test]
+async fn a_messages_call_whose_arguments_are_not_json_carries_the_prefixes_value_whole_and_streamed(
+) {
+    let output =
+        "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": 2.0 * Math.PI}}\n</tool_call>";
+    let spec = || assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    // The whole message.
+    let mut frame = complete(0, "stop");
+    if let Some(proto::generate_response::Response::Complete(complete)) = &mut frame.response {
+        complete.output_ids = output.chars().map(u32::from).collect();
+        complete.completion_tokens = complete.output_ids.len() as u32;
+    }
+    let (stream, server) = scripted_stream(vec![frame], "0").await;
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
+    let (result, scrape) = scraped(
+        ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::disabled(),
+        )
+        .process_non_streaming_messages_response(
+            context::ExecutionResult::Single { stream },
+            spec(),
+            dispatch(),
+            tokenizer,
+            &mut decoder,
+        ),
+    )
+    .await;
+    server.abort();
+    let (message, _) = match result {
+        Ok(message) => message,
+        Err(response) => panic!("the message was refused with {}", response.status()),
+    };
+    let blocks = serde_json::to_value(&message.content).expect("the blocks");
+    assert_eq!(blocks.as_array().map(Vec::len), Some(1), "{blocks}");
+    assert_eq!(blocks[0]["type"], "tool_use", "{blocks}");
+    assert_eq!(blocks[0]["name"], "lookup", "{blocks}");
+    assert_eq!(
+        blocks[0]["input"],
+        json!({"q": 2.0}),
+        "the prefix's complete members, nothing of the tail: {blocks}"
+    );
+    assert_eq!(
+        serde_json::to_value(message.stop_reason).expect("the stop reason"),
+        "tool_use"
+    );
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"qwen3\"", "outcome=\"malformed\""],
+    )
+    .expect("the outputs counter");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    let malformed = series_line(
+        &scrape,
+        "smg_symphony_malformed_total",
+        &["table=\"qwen3\"", "reason=\"invalid_arguments\""],
+    )
+    .expect("the malformed counter");
+    assert!(malformed.ends_with(" 1"), "{malformed}");
+
+    // The stream, cut inside the expression: the block's deltas are the prefix a strict reader
+    // accepts and nothing after the break, no text delta carries any of the tail, and a client's
+    // partial JSON reader closes the prefix into the whole message's input.
+    let ((result, events), scrape) = scraped(message_events(
+        vec![
+            chunk(
+                0,
+                "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": 2.0 * Ma",
+            ),
+            chunk(0, "th.PI}}\n</tool_call>"),
+            complete(0, "stop"),
+        ],
+        spec(),
+        None,
+    ))
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    let partial: String = events
+        .iter()
+        .filter_map(|event| event["delta"]["partial_json"].as_str())
+        .collect();
+    assert_eq!(partial, "{\"q\": 2.0 ");
+    assert!(
+        events
+            .iter()
+            .all(|event| event["delta"]["type"] != "text_delta"),
+        "nothing of the tail is text: {events:?}"
+    );
+    let closed_by_a_client: Value =
+        serde_json::from_str(&format!("{}}}", partial.trim_end())).expect("closed");
+    assert_eq!(closed_by_a_client, blocks[0]["input"]);
+    assert_eq!(message_stop_reason(&events), "tool_use");
+    let malformed = series_line(
+        &scrape,
+        "smg_symphony_malformed_total",
+        &["table=\"qwen3\"", "reason=\"invalid_arguments\""],
+    )
+    .expect("the malformed counter");
+    assert!(malformed.ends_with(" 1"), "{malformed}");
+
+    // The chat path carries the arguments as the model wrote them, a string that begins with the
+    // prefix the Messages paths close.
+    let (choice, _) = fold(output).await;
+    let arguments = choice
+        .message
+        .tool_calls
+        .as_ref()
+        .and_then(|calls| calls.first())
+        .and_then(|call| call.function.arguments.clone())
+        .expect("the chat arguments");
+    assert!(
+        arguments.starts_with(&partial),
+        "{arguments:?} vs {partial:?}"
+    );
+}
+
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn a_clean_whole_output_is_counted_and_writes_nothing() {
@@ -1016,4 +1164,306 @@ async fn a_malformed_region_in_a_stream_is_counted_and_written_once() {
     ));
     assert!(logs_contain("table=\"qwen3\""));
     assert!(logs_contain("choice=0"));
+}
+
+/// A streamed call to a function the request did not declare: the deltas carry the name as the
+/// model wrote it and the arguments whole, the wire's finish is `tool_calls`, and the output is counted
+/// once under `unknown_tool`, the call under its reason, with one line naming the function and
+/// the table. Nothing on the wire says so.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_streamed_call_to_an_undeclared_function_goes_out_as_written_and_is_counted() {
+    let output = QWEN3_OUTPUT.replace("\"lookup\"", "\"lookup_v2\"");
+    let spec = assigned(
+        chat_spec(true),
+        qwen3(CallSyntax::Json),
+        "<|im_start|>assistant\n",
+    );
+    // Cut inside the thought and inside the call's opening marker, as the declared call is.
+    let responses = vec![
+        chunk(0, &output[..9]),
+        chunk(0, &output[9..32]),
+        chunk(0, &output[32..]),
+        complete(0, "stop"),
+    ];
+    let ((result, events), scrape) = scraped(stream_events(responses, true, spec)).await;
+    assert!(result.is_ok(), "{result:?}");
+    let calls = tool_call_deltas(&events);
+    assert_eq!(calls[0]["function"]["name"], "lookup_v2", "{calls:#?}");
+    assert!(
+        calls[1..]
+            .iter()
+            .all(|call| call["function"]["name"].is_null()),
+        "{calls:#?}"
+    );
+    let arguments: String = calls
+        .iter()
+        .filter_map(|call| call["function"]["arguments"].as_str())
+        .collect();
+    assert_eq!(
+        serde_json::from_str::<Value>(&arguments).expect("the arguments as JSON"),
+        json!({"q": 1})
+    );
+    let finish = events
+        .iter()
+        .filter_map(|event| event["choices"][0]["finish_reason"].as_str())
+        .next_back()
+        .expect("a finish");
+    assert_eq!(finish, "tool_calls");
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"qwen3\"", "outcome=\"unknown_tool\""],
+    )
+    .expect("the outputs counter");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    let runs = series_line(
+        &scrape,
+        "smg_symphony_malformed_total",
+        &["table=\"qwen3\"", "reason=\"unknown_tool\""],
+    )
+    .expect("the reason counter");
+    assert!(runs.ends_with(" 1"), "{runs}");
+    assert!(logs_contain(
+        "Symphony read a call to a function the request did not declare; the call went out as the model named it"
+    ));
+    assert!(logs_contain("table=\"qwen3\""));
+    assert!(logs_contain("tool=\"lookup_v2\""));
+    assert!(logs_contain("undeclared_calls=1"));
+    // The line carries the engine's finish; `tool_calls` is the wire's refinement of it.
+    assert!(logs_contain("finish=\"stop\""));
+}
+
+/// The same call in a whole response: the message keeps it as the model named it, and the output
+/// is counted the same way.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_whole_output_calling_an_undeclared_function_keeps_the_call_and_is_counted() {
+    let output = QWEN3_OUTPUT.replace("\"lookup\"", "\"lookup_v2\"");
+    let ((choice, _), scrape) = scraped(fold(&output)).await;
+    assert_eq!(
+        choice.message.content.as_deref().map(str::trim),
+        Some("Hello")
+    );
+    let calls = choice.message.tool_calls.as_ref().expect("tool calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].function.name, "lookup_v2");
+    let arguments: Value =
+        serde_json::from_str(calls[0].function.arguments.as_deref().unwrap_or(""))
+            .expect("the arguments as JSON");
+    assert_eq!(arguments, json!({"q": 1}));
+    assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"qwen3\"", "outcome=\"unknown_tool\""],
+    )
+    .expect("the outputs counter");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    assert!(logs_contain("tool=\"lookup_v2\""));
+    assert!(logs_contain("tool_calls=1"));
+}
+
+/// An output of whitespace alone: the table holds it as the lead of the content and drops it
+/// when nothing follows; the reader delivers it as one content delta before the finish chunk,
+/// so the stream carries the answer the engine's own server would stream. The output is
+/// recorded as `empty`, with the engine's finish and the bytes released, once.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_stream_of_whitespace_alone_carries_it_as_one_delta_and_is_recorded_empty() {
+    let spec = assigned(
+        chat_spec(false),
+        qwen3(CallSyntax::Json),
+        "<|im_start|>assistant\n",
+    );
+    let mut responses: Vec<proto::GenerateResponse> = std::iter::repeat_n("\n", 24)
+        .map(|piece| chunk(0, piece))
+        .collect();
+    responses.push(complete(0, "length"));
+    let ((result, events), scrape) = scraped(stream_events(responses, false, spec)).await;
+    result.expect("the stream ends well");
+    // The opening chunk, one content delta of the whole answer, the finish chunk: the opening
+    // chunk's empty content is the public API's shape, not a delta.
+    let chunks: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["choices"][0].is_object())
+        .collect();
+    assert_eq!(chunks.len(), 3, "{events:#?}");
+    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+    assert_eq!(
+        chunks[1]["choices"][0]["delta"]["content"],
+        "\n".repeat(24),
+        "{events:#?}"
+    );
+    assert!(chunks[1]["choices"][0]["finish_reason"].is_null());
+    assert_eq!(chunks[2]["choices"][0]["finish_reason"], "length");
+    assert_eq!(chat_text(&events, 0, "content"), "\n".repeat(24));
+    assert_eq!(chat_text(&events, 0, "reasoning_content"), "");
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"qwen3\"", "outcome=\"empty\""],
+    )
+    .expect("the outputs counter");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    assert!(logs_contain(
+        "Symphony read an output with no text, reasoning or call: whitespace and framing alone, or nothing"
+    ));
+    assert!(logs_contain("finish=\"length\""));
+    assert!(logs_contain("whitespace_bytes=24"));
+    assert!(logs_contain("released_bytes=24"));
+}
+
+/// A choice whose first engine output is its `Complete`: the opening chunk, the finish chunk,
+/// and the output recorded as `empty` with the finish the engine gave.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_stream_of_no_tokens_is_recorded_empty_too() {
+    let spec = assigned(
+        chat_spec(false),
+        qwen3(CallSyntax::Json),
+        "<|im_start|>assistant\n",
+    );
+    let ((result, events), scrape) =
+        scraped(stream_events(vec![complete(0, "stop")], false, spec)).await;
+    result.expect("the stream ends well");
+    let chunks: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["choices"][0].is_object())
+        .collect();
+    assert_eq!(chunks.len(), 2, "{events:#?}");
+    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+    assert_eq!(chunks[1]["choices"][0]["finish_reason"], "stop");
+    assert_eq!(chat_text(&events, 0, "content"), "");
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"qwen3\"", "outcome=\"empty\""],
+    )
+    .expect("the outputs counter");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    assert!(logs_contain("finish=\"stop\""));
+    assert!(logs_contain("bytes=0"));
+    assert!(logs_contain("released_bytes=0"));
+}
+
+/// An output whose only answer is a call written as Python inside the block's markers, after
+/// a thought: the table refuses the block, so the stream would end with the reasoning deltas and
+/// a finish chunk alone. The reader releases the block, from its opener, as one content delta
+/// before the finish chunk, which stays last; no call delta is made of it; the output is counted
+/// as malformed under the reason, and its line says how many bytes went out.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_stream_whose_only_answer_is_a_python_call_in_the_tag_carries_it_as_content_before_the_finish(
+) {
+    let spec = assigned(chat_spec(true), glm(), "<|assistant|><think>");
+    let output = "plan</think><tool_call>get_stock_info(company=\"Apple\")</tool_call>";
+    let released = "<tool_call>get_stock_info(company=\"Apple\")</tool_call>";
+    let ((result, events), scrape) = scraped(stream_events(
+        vec![
+            chunk(0, &output[..12]),
+            chunk(0, &output[12..40]),
+            chunk(0, &output[40..]),
+            complete(0, "stop"),
+        ],
+        true,
+        spec,
+    ))
+    .await;
+    result.expect("the stream ends well");
+    assert_eq!(chat_text(&events, 0, "reasoning_content"), "plan");
+    assert_eq!(chat_text(&events, 0, "content"), released);
+    assert!(tool_call_deltas(&events).is_empty(), "{events:#?}");
+    let chunks: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["choices"][0].is_object())
+        .collect();
+    let content_at = chunks
+        .iter()
+        .position(|chunk| chunk["choices"][0]["delta"]["content"].is_string())
+        .expect("a content delta");
+    let finish_at = chunks
+        .iter()
+        .position(|chunk| chunk["choices"][0]["finish_reason"].is_string())
+        .expect("a finish chunk");
+    assert!(content_at < finish_at, "{events:#?}");
+    assert_eq!(finish_at, chunks.len() - 1, "{events:#?}");
+    assert_eq!(chunks[finish_at]["choices"][0]["finish_reason"], "stop");
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"glm\"", "outcome=\"malformed\""],
+    )
+    .expect("the outputs counter");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    let reason = series_line(
+        &scrape,
+        "smg_symphony_malformed_total",
+        &["table=\"glm\"", "reason=\"text_where_the_name_should_be\""],
+    )
+    .expect("the reason counter");
+    assert!(reason.ends_with(" 1"), "{reason}");
+    assert!(logs_contain(
+        "Symphony did not read the whole output as content, reasoning and calls"
+    ));
+    assert!(logs_contain(&format!("released_bytes={}", released.len())));
+}
+
+/// Two closed blocks after the thought, with the template's newline between them, cut by the
+/// stream at the newline and inside the second opener: the one content delta before the finish
+/// chunk is the output's own slice from the first opener to the last refused byte, the newline
+/// and the second opener in their places; the finish chunk stays last, and the line counts the
+/// whole slice.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_stream_of_two_refused_blocks_carries_the_bytes_between_them_before_the_finish() {
+    let spec = assigned(chat_spec(true), glm(), "<|assistant|><think>");
+    let output = "plan</think><tool_call>a(x=1)</tool_call>\n<tool_call>b(y=2)</tool_call>";
+    let released = "<tool_call>a(x=1)</tool_call>\n<tool_call>b(y=2)</tool_call>";
+    let ((result, events), scrape) = scraped(stream_events(
+        vec![
+            chunk(0, &output[..12]),
+            chunk(0, &output[12..41]),
+            chunk(0, &output[41..42]),
+            chunk(0, &output[42..47]),
+            chunk(0, &output[47..]),
+            complete(0, "stop"),
+        ],
+        true,
+        spec,
+    ))
+    .await;
+    result.expect("the stream ends well");
+    assert_eq!(chat_text(&events, 0, "reasoning_content"), "plan");
+    assert_eq!(chat_text(&events, 0, "content"), released);
+    assert!(tool_call_deltas(&events).is_empty(), "{events:#?}");
+    let chunks: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["choices"][0].is_object())
+        .collect();
+    let content_at: Vec<usize> = chunks
+        .iter()
+        .enumerate()
+        .filter(|(_, chunk)| {
+            chunk["choices"][0]["delta"]["content"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        })
+        .map(|(at, _)| at)
+        .collect();
+    let finish_at = chunks
+        .iter()
+        .position(|chunk| chunk["choices"][0]["finish_reason"].is_string())
+        .expect("a finish chunk");
+    assert_eq!(content_at, vec![finish_at - 1], "{events:#?}");
+    assert_eq!(finish_at, chunks.len() - 1, "{events:#?}");
+    assert_eq!(chunks[finish_at]["choices"][0]["finish_reason"], "stop");
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"glm\"", "outcome=\"malformed\""],
+    )
+    .expect("the outputs counter");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    assert!(logs_contain(&format!("released_bytes={}", released.len())));
 }

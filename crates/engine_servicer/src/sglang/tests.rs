@@ -1831,3 +1831,47 @@ async fn every_rank_of_a_data_parallel_publisher_reaches_the_gateway() {
     drop(stream);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
+
+/// A scheduler release whose sampling struct moved a field inside the prefix
+/// this servicer fills: the link fails at the handshake with the struct and
+/// the field named, before any request is sent to be refused one by one.
+#[tokio::test]
+async fn a_scheduler_whose_request_layout_moved_fails_the_link_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let server = SglangServicerServer::start(config(dir.path(), &handshake, model_info()))
+        .expect("servicer starts");
+    let mut moved = default_ready_response();
+    moved.positional_layouts.insert(
+        "SamplingParams".to_string(),
+        ["max_new_tokens", "stop", "watermark", "stop_token_ids"]
+            .map(str::to_string)
+            .to_vec(),
+    );
+    // The mock scheduler registers; the servicer refuses the link right after
+    // and drops the transport under the mock, whose connect may then fail.
+    let scheduler = tokio::time::timeout(
+        MOCK_DEADLINE,
+        connect_to_frontend(&handshake, EngineId::from_engine_index(0), moved),
+    );
+    let failed = wait_until(|| matches!(server.last_error(), Ok(Some(_))));
+    let (_scheduler, ()) = tokio::join!(scheduler, failed);
+    let error = server.last_error().unwrap().unwrap();
+    assert!(
+        error.contains(
+            "wire layout mismatch: engine EngineId(0000): `SamplingParams` field 2 is \
+             `stop_token_ids` on this side and `watermark` on the engine's"
+        ),
+        "{error}"
+    );
+    assert!(!server.engine_ready());
+    let mut client = SglangSchedulerClient::new(grpc_channel(server.address()).await);
+    let health = client
+        .health_check(sg::HealthCheckRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!health.healthy);
+    assert_eq!(health.message, "Engine connection failed");
+    server.stop(Duration::from_secs(5)).expect("clean stop");
+}

@@ -102,6 +102,17 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         false
     }
 
+    /// Whether this policy weighs a worker's load against the cache it holds
+    /// for the request and moves a request off a saturated holder itself
+    /// (cache-aware's count-pressure spill). Disaggregated pair placement
+    /// then leaves the absolute overload veto off a prefill pool this policy
+    /// places instead of steering a returning session away from the worker
+    /// holding its prefix (see `placement::select_pair`). A constant for the
+    /// policy's lifetime.
+    fn balances_load_against_affinity(&self) -> bool {
+        false
+    }
+
     /// Drop the state this policy keeps on a removed worker (a load-aware
     /// policy's dispatch tally), so it does not accumulate under worker
     /// churn (autoscaling, rolling updates). Default is a no-op for
@@ -362,13 +373,14 @@ pub struct SelectWorkerInfo<'a> {
     /// Which PD role this selection is for (default `Single`); namespaces
     /// header-based sticky routing so prefill and decode stick independently.
     pub role: WorkerRole,
-    /// Every worker of the pool this selection is over is vetoed by the
-    /// absolute overload thresholds, so that veto cannot steer it: the
-    /// policy takes a worker over them as it takes one under them (health,
-    /// the circuit breaker and the liveness veto still apply). Set by
-    /// disaggregated pair placement for such a pool (see
-    /// `placement::select_pair`); a single-worker placement keeps the
-    /// least-loaded steering default for it.
+    /// The absolute overload veto does not apply to this selection: the
+    /// pool's policy balances load against cache affinity itself
+    /// ([`LoadBalancingPolicy::balances_load_against_affinity`]), so it
+    /// takes a worker over the thresholds as it takes one under them, even
+    /// when every worker is over them (health, the circuit breaker and the
+    /// liveness veto still apply). Set by disaggregated pair placement for
+    /// such a prefill pool (see `placement::select_pair`); every other pool
+    /// keeps the veto and the least-loaded steering default.
     pub overload_lifted: bool,
 }
 

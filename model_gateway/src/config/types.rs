@@ -217,8 +217,11 @@ pub struct RouterConfig {
     /// new requests stop being routed to it until it makes progress. The same
     /// bound caps how long a disaggregated prefill side may produce nothing,
     /// with its worker answering no other side, before its request fails over
-    /// to another prefill worker; on the parallel dispatch shape it must
-    /// cover the decode-side wait a side's first response may see.
+    /// to another prefill worker (a worker whose current run of prompts has
+    /// not answered yet is given the time its backlog takes instead, two
+    /// minutes at most, the side keeping its decode admission room); on the
+    /// parallel dispatch shape it must cover the decode-side wait a side's
+    /// first response may see.
     #[serde(default = "default_worker_wedge_secs")]
     pub worker_wedge_secs: u64,
     /// Seconds without any contact from a worker whose KV-event stream pushes
@@ -273,9 +276,10 @@ pub struct RouterConfig {
     /// Absolute worker overload protection, on by default. A worker whose load
     /// report is at or above either threshold below is left out of routing
     /// while another worker is under them; when every worker is over them the
-    /// request goes to the least-loaded one (in gRPC and HTTP prefill/decode
-    /// pair placement such a pool is placed by its own policy, as if none
-    /// were over them; see `worker_overload_shed` for refusing instead).
+    /// request goes to the least-loaded one (see `worker_overload_shed` for
+    /// refusing instead). Unless `worker_overload_shed` is set, a
+    /// cache-aware prefill pool of gRPC and HTTP prefill/decode pair
+    /// placement is not steered by them: its spill gate balances it.
     /// Evaluated once per ingested load report, never per request. `false`
     /// switches both gateway thresholds off; per-worker `overload` blocks on
     /// a WorkerSpec still apply.
@@ -294,7 +298,8 @@ pub struct RouterConfig {
     pub worker_overload_token_usage: Option<f64>,
     /// Refuse a request with a 503 (`worker_overload_protection_shed`,
     /// Retry-After the poll interval) when every worker it could use is
-    /// overloaded, instead of steering it to the least-loaded one. Off by
+    /// overloaded, instead of steering it to the least-loaded one (or, for a
+    /// cache-aware prefill pool, placing it by its policy). Off by
     /// default: a fleet that is uniformly over the thresholds is still a
     /// fleet, and the dispatch-time re-check that sheds a worker flagged
     /// between selection and dispatch is part of the same opt-in.
@@ -1498,6 +1503,7 @@ impl PolicyConfig {
 pub enum DiscoveryConfig {
     Kubernetes(KubernetesDiscoveryConfig),
     File(FileDiscoveryConfig),
+    Slurm(SlurmDiscoveryConfig),
 }
 
 impl From<KubernetesDiscoveryConfig> for DiscoveryConfig {
@@ -1509,6 +1515,12 @@ impl From<KubernetesDiscoveryConfig> for DiscoveryConfig {
 impl From<FileDiscoveryConfig> for DiscoveryConfig {
     fn from(config: FileDiscoveryConfig) -> Self {
         Self::File(config)
+    }
+}
+
+impl From<SlurmDiscoveryConfig> for DiscoveryConfig {
+    fn from(config: SlurmDiscoveryConfig) -> Self {
+        Self::Slurm(config)
     }
 }
 
@@ -1627,12 +1639,15 @@ impl Default for KubernetesDiscoveryConfig {
     }
 }
 
-/// How often the file-discovery manifest is reread, changed or not, when no
-/// interval is given.
-pub const DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS: u64 = 30;
+/// The interval of a discovery provider's periodic pass when none is given,
+/// the same for every provider. Kubernetes and file discovery apply a change
+/// as it happens and use the pass to retry what earlier ones left undone;
+/// Slurm discovery polls on it. ([`KubernetesDiscoveryConfig`] keeps its own
+/// default, 120, for programmatic and serialized configuration.)
+pub const DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS: u64 = 30;
 
-fn default_file_discovery_check_interval_secs() -> u64 {
-    DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS
+fn default_discovery_check_interval_secs() -> u64 {
+    DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS
 }
 
 /// File worker discovery: the workers listed in a JSON manifest on disk.
@@ -1643,7 +1658,45 @@ fn default_file_discovery_check_interval_secs() -> u64 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileDiscoveryConfig {
     pub path: PathBuf,
-    #[serde(default = "default_file_discovery_check_interval_secs")]
+    #[serde(default = "default_discovery_check_interval_secs")]
+    pub check_interval_secs: u64,
+}
+
+/// Slurm worker discovery: one worker on every node of each running job whose
+/// name maps to a worker type.
+///
+/// Every `check_interval_secs`, `squeue` lists the running jobs with a mapped
+/// name, scoped to `user` (by default, the user the gateway runs as) and, when
+/// given, to `account` and `partition`. `scontrol` resolves each job's nodes,
+/// and every node serves one inference server on `port`.
+///
+/// Names map to worker types by the field that lists them: `job_names` are
+/// regular workers, the others the pools of disaggregated routing. A name maps
+/// to one type only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SlurmDiscoveryConfig {
+    #[serde(default)]
+    pub job_names: Vec<String>,
+    #[serde(default)]
+    pub encode_job_names: Vec<String>,
+    #[serde(default)]
+    pub prefill_job_names: Vec<String>,
+    #[serde(default)]
+    pub decode_job_names: Vec<String>,
+    /// The port of every discovered server.
+    pub port: u16,
+    /// The bootstrap port of the encode and prefill workers.
+    #[serde(default)]
+    pub bootstrap_port: Option<u16>,
+    /// The user whose jobs are discovered; by default, the user `squeue`
+    /// runs as.
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub partition: Option<String>,
+    #[serde(default = "default_discovery_check_interval_secs")]
     pub check_interval_secs: u64,
 }
 
@@ -3026,11 +3079,39 @@ discovery:
             discovery,
             Some(DiscoveryConfig::File(FileDiscoveryConfig {
                 path: "/run/smg/workers.json".into(),
-                check_interval_secs: DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
+                check_interval_secs: DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
             }))
         );
         let written = serde_json::to_value(discovery.unwrap()).unwrap();
         assert_eq!(written["provider"], "file");
+    }
+
+    /// The Slurm provider needs only its tag, a mapping and a port; the rest
+    /// default.
+    #[test]
+    fn tagged_slurm_discovery_reads_with_defaults() {
+        let discovery = read_discovery(serde_json::json!({
+            "provider": "slurm",
+            "job_names": ["smg-worker"],
+            "port": 8000,
+        }));
+        assert_eq!(
+            discovery,
+            Some(DiscoveryConfig::Slurm(SlurmDiscoveryConfig {
+                job_names: vec!["smg-worker".to_string()],
+                encode_job_names: vec![],
+                prefill_job_names: vec![],
+                decode_job_names: vec![],
+                port: 8000,
+                bootstrap_port: None,
+                user: None,
+                account: None,
+                partition: None,
+                check_interval_secs: DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
+            }))
+        );
+        let written = serde_json::to_value(discovery.unwrap()).unwrap();
+        assert_eq!(written["provider"], "slurm");
     }
 
     #[test]

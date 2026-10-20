@@ -31,6 +31,56 @@ pub fn mark_non_retryable(response: &mut Response) {
     response.extensions_mut().insert(NonRetryable);
 }
 
+/// The code of the gateway's answer for an upstream call its request timeout
+/// cut, the same on every path, so a client keys on one code whatever the
+/// transport behind the gateway.
+pub const REQUEST_TIMEOUT_CODE: &str = "call_upstream_timeout";
+
+/// Whether `error` is the request's own timeout on an upstream call: the
+/// client's budget (`--request-timeout-secs`, a worker's `timeout_secs`, a
+/// call's own bound) ran out while the request connected, waited for the
+/// head or read the body.
+///
+/// Not a connect timeout, which is a connect failure like a refused connect
+/// (the worker was never reached, and another may be), and not a timeout
+/// below the client (the OS giving up on a peer that stopped answering),
+/// which is the worker's connection failing under the request. Both stay the
+/// worker's fault, which the retry layer routes around.
+///
+/// A total timeout that runs out while the connect is still pending reads as
+/// the request's own as well (the client marks no phase): the budget is per
+/// attempt, and a replay could not fit in what is left of it. Keep the pool's
+/// connect timeout below the request timeout, as the defaults are (10 s
+/// against 1800 s), so a host that has gone dark fails as a connect timeout
+/// and is routed around.
+pub fn is_request_timeout(error: &reqwest::Error) -> bool {
+    if !error.is_timeout() || error.is_connect() {
+        return false;
+    }
+    let mut cause = std::error::Error::source(error);
+    while let Some(err) = cause {
+        if err
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+        {
+            return false;
+        }
+        cause = err.source();
+    }
+    true
+}
+
+/// The answer for an upstream call the request timeout cut: a `504` under
+/// [`REQUEST_TIMEOUT_CODE`], terminal for the retry layer. The timeout is the
+/// operator's bound on what a request may take, not a transient fault of the
+/// worker: a replay would run the work again on another worker and hold the
+/// client for a second timeout.
+pub fn request_timeout_response(message: impl Into<String>) -> Response {
+    let mut response = crate::error::gateway_timeout(REQUEST_TIMEOUT_CODE, message);
+    mark_non_retryable(&mut response);
+    response
+}
+
 /// Whether a response should be retried: a retryable status that has not been
 /// explicitly marked terminal by the code that produced it.
 ///
@@ -287,6 +337,21 @@ mod tests {
 
         assert!(matches!(res, Err(RetryError::MaxRetriesExceeded)));
         assert_eq!(calls.load(Ordering::Relaxed), cfg.max_retries);
+    }
+
+    /// The gateway's answer for a request its timeout cut carries a status
+    /// the retry layer would replay and the mark that it must not.
+    #[test]
+    fn a_request_timeout_answer_is_a_504_the_retry_layer_does_not_replay() {
+        let response = request_timeout_response("the worker did not answer in time");
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            crate::error::extract_error_code_from_response(&response),
+            REQUEST_TIMEOUT_CODE
+        );
+        assert!(is_retryable_status(response.status()));
+        assert!(!is_retryable_response(&response));
     }
 
     #[tokio::test]

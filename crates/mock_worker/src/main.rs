@@ -41,6 +41,21 @@ async fn main() -> ExitCode {
         }
     }
 
+    // A script file that cannot be read or holds a bad line is a config
+    // error too: checked once here, loaded for every worker.
+    if let Some(path) = &cfg.replay.script {
+        match mock_worker::script::load(path) {
+            Ok(answers) => tracing::info!(
+                "mock-worker: {answers} scripted answers from {}",
+                path.display()
+            ),
+            Err(e) => {
+                eprintln!("mock-worker: cannot load script: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
     tracing::info!(
         "mock-worker: {} http from :{}, {} grpc from :{}, model={}",
         cfg.http_count,

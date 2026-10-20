@@ -1,9 +1,9 @@
 //! The contract between a worker-discovery provider and the shared reconciler.
 //!
-//! A provider turns its source — Kubernetes Pods or a JSON manifest today;
-//! Slurm and Consul next — into these types and nothing else. The reconciler sees only these, so
-//! it never learns which kind of source produced a worker beyond the
-//! [`DiscoveryKind`] it is handed.
+//! A provider turns its source — Kubernetes Pods, a JSON manifest or Slurm
+//! jobs today; Consul next — into these types and nothing else. The
+//! reconciler sees only these, so it never learns which kind of source
+//! produced a worker beyond the [`DiscoveryKind`] it is handed.
 
 use std::collections::BTreeMap;
 
@@ -16,6 +16,7 @@ use crate::{observability::metrics::metrics_labels, worker::endpoint::Endpoint};
 pub(super) enum DiscoveryKind {
     Kubernetes,
     File,
+    Slurm,
 }
 
 impl DiscoveryKind {
@@ -29,6 +30,7 @@ impl DiscoveryKind {
         match self {
             DiscoveryKind::Kubernetes => "kubernetes",
             DiscoveryKind::File => "file",
+            DiscoveryKind::Slurm => "slurm",
         }
     }
 
@@ -37,6 +39,7 @@ impl DiscoveryKind {
         match self {
             DiscoveryKind::Kubernetes => metrics_labels::DISCOVERY_KUBERNETES,
             DiscoveryKind::File => metrics_labels::DISCOVERY_FILE,
+            DiscoveryKind::Slurm => metrics_labels::DISCOVERY_SLURM,
         }
     }
 }

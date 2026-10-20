@@ -69,7 +69,10 @@ use crate::{
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
             },
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
-            retry::{is_retryable_response, is_retryable_status, RetryExecutor},
+            retry::{
+                is_request_timeout, is_retryable_response, is_retryable_status,
+                request_timeout_response, RetryExecutor,
+            },
             sse_rechunk::{NoopObserver, SseRechunker},
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
@@ -1302,16 +1305,22 @@ impl Router {
     }
 
     /// Buffer a worker response body, capped at `limit` bytes; a larger body
-    /// is a misbehaving worker and yields a 502 before memory balloons.
-    async fn read_worker_body_capped<S, E>(mut stream: S, limit: usize) -> Result<Bytes, Response>
+    /// is a misbehaving worker and yields a 502 before memory balloons. The
+    /// request's own timeout running out mid-body ends the request as it does
+    /// before the head (see [`convert_reqwest_error`]).
+    async fn read_worker_body_capped<S>(mut stream: S, limit: usize) -> Result<Bytes, Response>
     where
-        S: Stream<Item = Result<Bytes, E>> + Unpin,
-        E: std::fmt::Display,
+        S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
     {
         let mut body = BytesMut::new();
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
+                Err(e) if is_request_timeout(&e) => {
+                    return Err(request_timeout_response(format!(
+                        "Failed to get response body: {e}"
+                    )));
+                }
                 Err(e) => {
                     return Err(error::internal_error(
                         "read_response_body_failed",
@@ -1768,14 +1777,21 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
         .unwrap_or_else(|| "unknown".to_string());
     let message = format!("{e}. URL: {url}");
 
+    // The request's own timeout (the client's budget: `--request-timeout-secs`
+    // or the worker's `timeout_secs`), before the head or while the body is
+    // read, is the end of the request: the 504 goes to the client once, with
+    // no replay on another worker (see `retry::request_timeout_response`).
+    if is_request_timeout(&e) {
+        return request_timeout_response(message);
+    }
+
     // reqwest files a request timeout under `Kind::Request` (with a `TimedOut`
     // source), so `is_request()` is true for it as well: the timeout and
     // connect arms have to be consulted before the generic request arm, or a
     // timed-out upstream reads as a plain 500 and the 504 path is unreachable.
-    // The same holds for the client's total timeout expiring while a
-    // non-streaming body is still being read: reqwest files that under
-    // `Kind::Body` with the same `TimedOut` source, so it is a 504 too rather
-    // than the body-error 500.
+    // The timeouts left here are not the request's own (the connect timeout,
+    // a timeout below the client): the worker's failure, answered as before
+    // and replayed.
     let (status, code) = if let Some(upstream_status) = e.status() {
         (upstream_status, "call_upstream_status_error")
     } else if e.is_timeout() {
@@ -2406,6 +2422,7 @@ mod tests {
     use crate::{
         config::types::{PolicyConfig, RoutingKeyOverrideConfig},
         middleware::ReportedRefusal,
+        observability::logging::test_support::test_subscriber,
         policies::CacheAwarePolicy,
         routers::common::{
             body_policy::{
@@ -2804,9 +2821,20 @@ mod tests {
     /// A round-robin router over `worker_urls`, each worker's breaker opening
     /// at `failure_threshold` failures.
     fn breaker_router(worker_urls: &[&str], retry: RetryConfig, failure_threshold: u32) -> Router {
+        breaker_router_with_client(worker_urls, retry, failure_threshold, None)
+    }
+
+    /// [`breaker_router`] whose workers send through `client` when one is
+    /// given (one with a short total timeout, for the request-timeout cases).
+    fn breaker_router_with_client(
+        worker_urls: &[&str],
+        retry: RetryConfig,
+        failure_threshold: u32,
+        client: Option<Arc<reqwest::Client>>,
+    ) -> Router {
         let worker_registry = Arc::new(WorkerRegistry::new());
         for url in worker_urls {
-            let worker = BasicWorkerBuilder::new(*url)
+            let mut builder = BasicWorkerBuilder::new(*url)
                 .worker_type(WorkerType::Regular)
                 .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
                     failure_threshold,
@@ -2814,9 +2842,11 @@ mod tests {
                     timeout_duration: Duration::from_secs(60),
                     window_duration: Duration::from_secs(60),
                 })
-                .health_config(no_health_check())
-                .build();
-            worker_registry.register_or_replace(Arc::new(worker));
+                .health_config(no_health_check());
+            if let Some(client) = &client {
+                builder = builder.http_client(Arc::clone(client));
+            }
+            worker_registry.register_or_replace(Arc::new(builder.build()));
         }
         Router {
             worker_registry,
@@ -2940,6 +2970,87 @@ mod tests {
         assert_eq!(hits.load(AtomicOrdering::SeqCst), 0);
     }
 
+    /// A worker that answers `/generate` with a 200 after `delay`, counting
+    /// the requests it took (on arrival, before the delay).
+    async fn delayed_upstream(delay: Duration) -> (String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&hits);
+        let app = axum::Router::new().route(
+            "/generate",
+            axum::routing::post(move || {
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.fetch_add(1, AtomicOrdering::SeqCst);
+                    tokio::time::sleep(delay).await;
+                    ([(CONTENT_TYPE, "application/json")], "{}")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// The gateway's client for the request-timeout cases: `timeout` is its
+    /// budget for a call to a worker, what `--request-timeout-secs` sets.
+    fn client_with_timeout(timeout: Duration) -> Arc<reqwest::Client> {
+        Arc::new(
+            crate::http_client::client_builder()
+                .timeout(timeout)
+                .build()
+                .unwrap(),
+        )
+    }
+
+    /// The request's timeout is its end: one attempt on one worker, the 504
+    /// `call_upstream_timeout` to the client after one timeout, no replay on
+    /// the other worker, and the worker that timed out charged once.
+    #[tokio::test]
+    async fn a_request_timeout_is_answered_once_and_not_replayed() {
+        let (slow_a, hits_a) = delayed_upstream(Duration::from_secs(10)).await;
+        let (slow_b, hits_b) = delayed_upstream(Duration::from_secs(10)).await;
+        let router = breaker_router_with_client(
+            &[&slow_a, &slow_b],
+            fast_retries(3),
+            1,
+            Some(client_with_timeout(Duration::from_secs(1))),
+        );
+
+        let started = Instant::now();
+        let response = generate(&router, "slow").await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "call_upstream_timeout"
+        );
+        assert!(!is_retryable_response(&response));
+        assert_eq!(
+            hits_a.load(AtomicOrdering::SeqCst) + hits_b.load(AtomicOrdering::SeqCst),
+            1,
+            "one attempt, on one worker"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1900),
+            "one timeout, not retries x timeout: {elapsed:?}"
+        );
+        let open = router
+            .worker_registry
+            .get_all()
+            .iter()
+            .filter(|worker| worker.circuit_breaker_state() == CircuitState::Open)
+            .count();
+        assert_eq!(open, 1, "the timeout is the one worker's failure sample");
+    }
+
     fn rerank_request() -> RerankRequest {
         RerankRequest {
             query: "q".to_string(),
@@ -3007,28 +3118,43 @@ mod tests {
         );
     }
 
-    fn body_chunks(chunks: &[&'static [u8]]) -> Vec<Result<Bytes, String>> {
-        chunks.iter().map(|c| Ok(Bytes::from_static(c))).collect()
+    /// The body of a worker's answer on `url`'s `/body`, as `client` reads it.
+    async fn worker_body(
+        client: &reqwest::Client,
+        url: &str,
+    ) -> impl Stream<Item = Result<Bytes, reqwest::Error>> + Unpin {
+        client
+            .post(format!("{url}/body"))
+            .send()
+            .await
+            .unwrap()
+            .bytes_stream()
     }
 
     #[tokio::test]
     async fn read_worker_body_capped_accepts_body_at_limit() {
-        let chunks = body_chunks(&[b"abc", b"def", b"gh"]);
+        let url = spawn_cut_stub("/body", "application/json", &["abc", "def", "gh"], false).await;
 
-        let body = Router::read_worker_body_capped(stream::iter(chunks), 8)
-            .await
-            .unwrap();
+        let body = Router::read_worker_body_capped(
+            worker_body(&crate::http_client::client(), &url).await,
+            8,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(body.as_ref(), b"abcdefgh");
     }
 
     #[tokio::test]
     async fn read_worker_body_capped_rejects_oversized_body_with_502() {
-        let chunks = body_chunks(&[b"abc", b"def", b"gh"]);
+        let url = spawn_cut_stub("/body", "application/json", &["abc", "def", "gh"], false).await;
 
-        let response = Router::read_worker_body_capped(stream::iter(chunks), 7)
-            .await
-            .unwrap_err();
+        let response = Router::read_worker_body_capped(
+            worker_body(&crate::http_client::client(), &url).await,
+            7,
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
@@ -3039,17 +3165,67 @@ mod tests {
 
     #[tokio::test]
     async fn read_worker_body_capped_maps_read_failure_to_500() {
-        let chunks = vec![Ok(Bytes::from_static(b"abc")), Err("boom".to_string())];
+        let url = spawn_cut_stub("/body", "application/json", &["abc"], true).await;
 
-        let response = Router::read_worker_body_capped(stream::iter(chunks), 8)
-            .await
-            .unwrap_err();
+        let response = Router::read_worker_body_capped(
+            worker_body(&crate::http_client::client(), &url).await,
+            8,
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
             extract_error_code_from_response(&response),
             "read_response_body_failed"
         );
+    }
+
+    /// Loopback engine stub on `/body` whose head and first chunk leave at
+    /// once and whose body then never ends, as an engine that stalls
+    /// mid-answer does: the client's own timeout is what ends the read.
+    async fn spawn_stalled_body_stub() -> String {
+        let app = axum::Router::new().route(
+            "/body",
+            axum::routing::post(|| async {
+                let head = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+                    b"{\"partial\":",
+                ))]);
+                (
+                    [(CONTENT_TYPE, "application/json")],
+                    Body::from_stream(head.chain(stream::pending())),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// The request's own timeout running out while the body is read is the
+    /// request's end: the same 504 as before the head, and as final.
+    #[tokio::test]
+    async fn read_worker_body_capped_ends_the_request_at_its_timeout() {
+        let url = spawn_stalled_body_stub().await;
+        let client = client_with_timeout(Duration::from_millis(200));
+
+        let response = Router::read_worker_body_capped(worker_body(&client, &url).await, 1 << 20)
+            .await
+            .unwrap_err();
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "call_upstream_timeout"
+        );
+        assert!(!is_retryable_response(&response));
     }
 
     fn least_load_policy() -> PolicyConfig {
@@ -4258,6 +4434,60 @@ mod tests {
             response.headers()[error::HEADER_X_SMG_ERROR_CODE],
             "call_upstream_timeout"
         );
+        assert!(
+            !is_retryable_response(&response),
+            "the request's own timeout is its end, not a worker fault to route around"
+        );
+    }
+
+    /// A timeout below the client is not the request's own: an `io` timeout
+    /// in the error's chain (the OS gave up on a peer that stopped
+    /// answering; here the request body's stream reports one) keeps today's
+    /// 504 and stays replayable, as a connection that failed under the
+    /// request is.
+    #[tokio::test]
+    async fn a_timeout_below_the_client_is_not_the_requests_own() {
+        // A stub that reads the whole request body, so the body's error
+        // reaches the client as the send's failure.
+        let app = axum::Router::new().route(
+            "/generate",
+            axum::routing::post(|_body: Bytes| async { "{}" }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let body = stream::iter([
+            Ok(Bytes::from_static(b"{\"text\":")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the peer stopped answering",
+            )),
+        ]);
+        let err = crate::http_client::client()
+            .post(format!("http://{addr}/generate"))
+            .body(reqwest::Body::wrap_stream(body))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            err.is_timeout(),
+            "reqwest reads the io timeout as one: {err:?}"
+        );
+        assert!(!is_request_timeout(&err));
+
+        let response = convert_reqwest_error(err);
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+            "call_upstream_timeout"
+        );
+        assert!(is_retryable_response(&response));
     }
 
     #[tokio::test]
@@ -4278,6 +4508,10 @@ mod tests {
         assert_eq!(
             response.headers()[error::HEADER_X_SMG_ERROR_CODE],
             "call_upstream_connection_failed"
+        );
+        assert!(
+            is_retryable_response(&response),
+            "a connect failure before any byte is replayed, as before"
         );
     }
 
@@ -4865,16 +5099,12 @@ mod tests {
     /// client retrying at once.
     #[tokio::test]
     async fn a_refusal_is_marked_and_written_at_warn_within_the_allowance() {
-        use tracing_subscriber::layer::SubscriberExt;
-
         let errors = Arc::new(AtomicUsize::new(0));
         let refusal_lines = Arc::new(AtomicUsize::new(0));
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::Registry::default().with(RefusalLineCounter {
-                errors: Arc::clone(&errors),
-                refusal_lines: Arc::clone(&refusal_lines),
-            }),
-        );
+        let _subscriber = test_subscriber(RefusalLineCounter {
+            errors: Arc::clone(&errors),
+            refusal_lines: Arc::clone(&refusal_lines),
+        });
         let router = create_test_regular_router();
         for worker in router.worker_registry.get_all() {
             worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);

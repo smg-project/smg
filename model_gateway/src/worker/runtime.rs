@@ -239,12 +239,25 @@ struct PrefillBook {
     /// The longest prompt answered with a first token (or one answer): the
     /// largest shape the engine has shown it runs; zero until one.
     longest_answered: u64,
+    /// Gateway clock at which `pending` last left zero: the start of the
+    /// current run of prompts waiting on the worker; zero while none is.
+    run_since_ms: u64,
+    /// Whether a prompt was answered since the current run began.
+    run_answered: bool,
+    /// How long the runs since the latest answer held prompts and ended
+    /// without answering any (given up on, or dropped): silence that the
+    /// idle spells between them do not erase. Zero after an answer.
+    unanswered_ms: u64,
 }
 
 impl PrefillBook {
     fn started(&mut self, tokens: u64, timed: bool, now_ms: u64) {
         if tokens == 0 {
             return;
+        }
+        if self.pending == 0 {
+            self.run_since_ms = now_ms.max(1);
+            self.run_answered = false;
         }
         self.pending = self.pending.saturating_add(tokens);
         *self.pending_prompts.entry(tokens).or_insert(0) += 1;
@@ -263,6 +276,19 @@ impl PrefillBook {
         if cached.is_some() {
             self.last_answer_ms = now_ms;
             self.longest_answered = self.longest_answered.max(tokens);
+            self.run_answered = true;
+            self.unanswered_ms = 0;
+        }
+        if self.pending == 0 && self.run_since_ms > 0 {
+            // A run that ends on a release with no answer leaves the time it
+            // held prompts unanswered behind, for the next run to start from.
+            if cached.is_none() {
+                let since = self.last_answer_ms.max(self.run_since_ms);
+                self.unanswered_ms = self
+                    .unanswered_ms
+                    .saturating_add(now_ms.saturating_sub(since));
+            }
+            self.run_since_ms = 0;
         }
         if !timed {
             return;
@@ -340,6 +366,20 @@ impl PrefillBook {
     fn answered_ago(&self, now_ms: u64) -> Option<Duration> {
         (self.last_answer_ms > 0)
             .then(|| Duration::from_millis(now_ms.saturating_sub(self.last_answer_ms)))
+    }
+
+    /// How long, as of `now_ms`, the current run of pending prompts has
+    /// waited for its first answer, plus what earlier runs since the latest
+    /// answer held prompts unanswered: the worker's silence with the spells
+    /// it held nothing left out (an idle worker owes no answer). `None`
+    /// while nothing is pending or once the run has had an answer.
+    fn unanswered_run(&self, now_ms: u64) -> Option<Duration> {
+        (self.run_since_ms > 0 && !self.run_answered).then(|| {
+            Duration::from_millis(
+                self.unanswered_ms
+                    .saturating_add(now_ms.saturating_sub(self.run_since_ms)),
+            )
+        })
     }
 
     /// Whether the engine is on a shape it has not shown it runs: a prompt
@@ -637,6 +677,15 @@ impl WorkerRuntime {
 
     pub fn prefill_cold_shape(&self, tokens: u64) -> bool {
         self.prefill.lock().cold_shape(tokens)
+    }
+
+    pub fn prefill_unanswered_run(&self) -> Option<Duration> {
+        self.prefill_unanswered_run_at(super::liveness::now_ms().max(1))
+    }
+
+    /// [`Self::prefill_unanswered_run`] as of `now_ms` on the gateway clock.
+    pub fn prefill_unanswered_run_at(&self, now_ms: u64) -> Option<Duration> {
+        self.prefill.lock().unanswered_run(now_ms)
     }
 
     pub fn swap_waiting_reqs(&self, waiting: i64) -> i64 {
@@ -1146,6 +1195,97 @@ mod tests {
             runtime.prefill_answered_ago_at(7_000),
             Some(Duration::from_millis(500)),
             "a non-streaming generation's one answer counts too"
+        );
+    }
+
+    #[test]
+    fn a_run_of_prompts_awaits_its_first_answer_from_its_start() {
+        // A prefill side past its own bound on a worker that answered
+        // nothing within it asks whether the worker's current run of
+        // pending prompts still awaits its first answer, and for how long:
+        // an idle spell is no silence, an answer ends the wait.
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        assert_eq!(
+            runtime.prefill_unanswered_run_at(5_000),
+            None,
+            "nothing at all"
+        );
+        // Never answered: waiting since its first prompt reached it.
+        runtime.note_prefill_started_at(1_000, true, 1_000);
+        runtime.note_prefill_started_at(1_000, true, 1_200);
+        assert_eq!(
+            runtime.prefill_unanswered_run_at(4_000),
+            Some(Duration::from_secs(3))
+        );
+        // A dropped stream is no answer, and the run goes on.
+        runtime.note_prefill_ended_at(1_000, true, None, 4_500);
+        assert_eq!(
+            runtime.prefill_unanswered_run_at(5_000),
+            Some(Duration::from_secs(4))
+        );
+        // An answer that ends the run, then an idle minute: the next run
+        // waits from its own start, not from the answer before it.
+        runtime.note_prefill_ended_at(1_000, true, Some(0), 6_000);
+        assert_eq!(runtime.prefill_unanswered_run_at(7_000), None, "idle");
+        runtime.note_prefill_started_at(1_000, true, 66_000);
+        assert_eq!(
+            runtime.prefill_unanswered_run_at(67_000),
+            Some(Duration::from_secs(1)),
+            "waiting since the burst after the idle minute"
+        );
+        assert_eq!(
+            runtime.prefill_answered_ago_at(67_000),
+            Some(Duration::from_secs(61)),
+            "the latest answer itself is still a minute back"
+        );
+        // An answer inside the run ends the wait for good: the run has
+        // shown the worker answers.
+        runtime.note_prefill_started_at(1_000, true, 67_500);
+        runtime.note_prefill_ended_at(1_000, true, Some(0), 68_000);
+        assert_eq!(runtime.prefill_unanswered_run_at(69_000), None);
+        assert_eq!(
+            runtime.prefill_answered_ago_at(69_000),
+            Some(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn a_run_that_ends_unanswered_leaves_its_silence_to_the_next() {
+        // The worker answered at 1.1 s, then held a prompt from 2 s until it
+        // was given up on at 60 s (a release with no answer), sat idle, and
+        // took its next prompt at 61 s. The run given up on is silence the
+        // next run starts from; the idle spells around it are not.
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        runtime.note_prefill_started_at(1_000, true, 1_000);
+        runtime.note_prefill_ended_at(1_000, true, Some(0), 1_100);
+        runtime.note_prefill_started_at(1_000, true, 2_000);
+        runtime.note_prefill_ended_at(1_000, true, None, 60_000);
+        assert_eq!(runtime.prefill_unanswered_run_at(60_500), None, "idle");
+        runtime.note_prefill_started_at(1_000, true, 61_000);
+        assert_eq!(
+            runtime.prefill_unanswered_run_at(62_000),
+            Some(Duration::from_secs(59)),
+            "58 s held unanswered before, one second since"
+        );
+        // Another run given up on, after one that was answered then left
+        // unanswered: only the time since the answer is carried.
+        runtime.note_prefill_ended_at(1_000, true, None, 63_000);
+        runtime.note_prefill_started_at(1_000, true, 64_000);
+        runtime.note_prefill_started_at(1_000, true, 64_000);
+        runtime.note_prefill_ended_at(1_000, true, Some(0), 65_000);
+        runtime.note_prefill_ended_at(1_000, true, None, 70_000);
+        runtime.note_prefill_started_at(1_000, true, 80_000);
+        assert_eq!(
+            runtime.prefill_unanswered_run_at(81_000),
+            Some(Duration::from_secs(6)),
+            "five seconds held since the answer at 65 s, one since the new run"
+        );
+        // An answer clears what was carried.
+        runtime.note_prefill_ended_at(1_000, true, Some(0), 82_000);
+        runtime.note_prefill_started_at(1_000, true, 90_000);
+        assert_eq!(
+            runtime.prefill_unanswered_run_at(91_000),
+            Some(Duration::from_secs(1))
         );
     }
 

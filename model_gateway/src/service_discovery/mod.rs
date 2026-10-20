@@ -5,7 +5,12 @@
 //!
 //! - [`kubernetes`] owns the Kubernetes client, reflector lifecycle, and the
 //!   Pod-to-desired-worker conversion.
-//! - [`file`] rereads a JSON manifest of workers on a fixed interval.
+//! - [`file`] rereads a JSON manifest of workers when it changes, and on a
+//!   fixed interval.
+//! - [`slurm`] polls Slurm for the running jobs whose names map to worker
+//!   types, and places a worker on each of their nodes.
+//! - [`snapshot`] keeps the last good snapshot the file and Slurm providers
+//!   read, which every pass reconciles.
 //! - [`provider`] defines the contract every provider produces: a
 //!   [`provider::DiscoveredWorker`] per worker, plus the provider's kind.
 //! - [`reconciler`] owns ownership, the registry diff and the `JobQueue`
@@ -23,6 +28,8 @@ mod kubernetes;
 mod provider;
 mod reconciler;
 mod runtime;
+mod slurm;
+mod snapshot;
 #[cfg(test)]
 pub(crate) mod testing;
 
@@ -34,3 +41,4 @@ pub use kubernetes::{
 };
 pub use reconciler::{DISCOVERY_ID_LABEL, DISCOVERY_PROVIDER_LABEL, DISCOVERY_SPEC_HASH_LABEL};
 pub use runtime::{start_service_discovery, RuntimeDiscoveryConfig};
+pub use slurm::SlurmProviderConfig;

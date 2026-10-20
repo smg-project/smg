@@ -287,6 +287,12 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                     .zmq_startup_timeout(Duration::from_secs(
                         app_context.router_config.zmq_startup_timeout_secs,
                     ))
+                    // The request bound of the HTTP worker client, for the
+                    // ZMQ link: a stream the engine leaves silent ends at it.
+                    .zmq_request_timeout(zmq_request_timeout(
+                        &spec,
+                        app_context.router_config.request_timeout_secs,
+                    ))
                     .overload_defaults(overload_defaults)
                     .labels(labels_for_rank(&labels, dp, &config.labels))
                     // The engine's report in this rank's space, sized by the
@@ -779,6 +785,19 @@ fn validate_overload_overrides(config: &WorkerSpec) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The bound on a request over a ZMQ worker's link: the worker's own
+/// `http_pool.timeout_secs` when it sets one, else the router's
+/// `request_timeout_secs` (`--request-timeout-secs`), the way the HTTP worker
+/// client resolves its per-request timeout, so a worker registered with a
+/// longer bound for its long generations keeps it on either link.
+fn zmq_request_timeout(spec: &WorkerSpec, router_request_timeout_secs: u64) -> Duration {
+    Duration::from_secs(
+        spec.http_pool
+            .timeout_secs
+            .unwrap_or(router_request_timeout_secs),
+    )
 }
 
 /// `zmq_handshake_address` only steers the ZMQ handshake bind; on any other
@@ -1960,6 +1979,18 @@ mod tests {
         spec.connection_mode = ConnectionMode::Zmq;
         spec.zmq_handshake_address = handshake_override.map(str::to_string);
         Arc::new(BasicWorkerBuilder::from_spec(spec).build())
+    }
+
+    /// The ZMQ link's request bound resolves as the HTTP worker client's
+    /// does: the worker's own `http_pool.timeout_secs` when set, else the
+    /// router's `request_timeout_secs`.
+    #[test]
+    fn zmq_request_timeout_takes_the_workers_pool_timeout_over_the_routers() {
+        let mut spec = WorkerSpec::new("ipc:///tmp/smg-zmq/bound.ipc");
+        spec.connection_mode = ConnectionMode::Zmq;
+        assert_eq!(zmq_request_timeout(&spec, 1800), Duration::from_secs(1800));
+        spec.http_pool.timeout_secs = Some(7200);
+        assert_eq!(zmq_request_timeout(&spec, 1800), Duration::from_secs(7200));
     }
 
     #[test]

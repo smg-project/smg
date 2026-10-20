@@ -8,7 +8,7 @@ must reach the kind node IP to probe hostNetwork worker ports.
 
 Run locally:
     pip install -e e2e_test && cargo build -p smg && \
-        SMG_KIND_E2E=1 pytest e2e_test/kind_discovery -m kind
+        SMG_KIND_E2E=1 pytest e2e_test/discovery/kind -m kind
 """
 
 from __future__ import annotations

@@ -471,6 +471,9 @@ struct Router {
     /// The `discovery` mapping, read by the same rules as
     /// `RouterConfig.discovery`.
     discovery: Option<config::DiscoveryConfig>,
+    /// The interval of `service_discovery=True` Kubernetes discovery
+    /// (`None`: the default every provider has, 30s).
+    discovery_check_interval_secs: Option<u64>,
     dp_aware: bool,
     dp_minimum_tokens_scheduler: bool,
     drain_settle_secs: u64,
@@ -966,7 +969,9 @@ impl Router {
             Some(DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
                 namespace: self.service_discovery_namespace.clone(),
                 port: self.service_discovery_port,
-                check_interval_secs: 60,
+                check_interval_secs: self
+                    .discovery_check_interval_secs
+                    .unwrap_or(config::DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS),
                 selector: self.selector.clone(),
                 encode_selector: self.encode_selector.clone(),
                 prefill_selector: self.prefill_selector.clone(),
@@ -1313,6 +1318,7 @@ impl Router {
         disable_retries = false,
         disable_tokenizer_autoload = false,
         discovery = None,
+        discovery_check_interval_secs = None,
         dp_aware = false,
         dp_minimum_tokens_scheduler = false,
         drain_settle_secs = 5,
@@ -1522,6 +1528,7 @@ impl Router {
         disable_retries: bool,
         disable_tokenizer_autoload: bool,
         discovery: Option<Bound<'_, PyAny>>,
+        discovery_check_interval_secs: Option<u64>,
         dp_aware: bool,
         dp_minimum_tokens_scheduler: bool,
         drain_settle_secs: u64,
@@ -1695,6 +1702,13 @@ impl Router {
                 "Pass service_discovery=True or a discovery mapping, not both",
             ));
         }
+        // A `discovery` mapping carries its own `check_interval_secs`.
+        if discovery_check_interval_secs.is_some() && !service_discovery {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "discovery_check_interval_secs applies to service_discovery=True; \
+                 a discovery mapping takes check_interval_secs",
+            ));
+        }
         let discovery = discovery
             .as_ref()
             .map(parse_discovery)
@@ -1761,6 +1775,7 @@ impl Router {
             disable_retries,
             disable_tokenizer_autoload,
             discovery,
+            discovery_check_interval_secs,
             dp_aware,
             dp_minimum_tokens_scheduler,
             drain_settle_secs,

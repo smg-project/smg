@@ -10,13 +10,15 @@ use std::{
 };
 
 use engine_zmq_client::{
+    check_engine_layouts,
     codec::OpaqueValue,
     connect_handshake,
     connector::{EngineCoreClient, SglangClient, TokenSpeedClient},
     protocol::{
         handshake::EngineCoreReadyResponse,
-        sglang::request::SglangRequest,
-        vllm::{request::EngineCoreRequest, sampling::EngineCoreSamplingParams},
+        sglang::{request::SglangRequest, SglangProtocol},
+        tokenspeed::TokenSpeedProtocol,
+        vllm::{request::EngineCoreRequest, sampling::EngineCoreSamplingParams, VllmProtocol},
         EngineLoad,
     },
     ConnectedEngine, StartupBudget,
@@ -36,7 +38,7 @@ use crate::{
         SglangProfileStart,
     },
     sockets::{ensure_ipc_socket_dir, zmq_socket_addresses, Handshake},
-    stream::ZmqGenerateStream,
+    stream::{RequestDeadline, ZmqGenerateStream},
     tokenspeed::{
         fan_out_tokenspeed_requests, translate_request_tokenspeed_for, GridTensors,
         TokenSpeedGenerateStream,
@@ -103,12 +105,17 @@ pub(crate) struct ZmqConnectionMeta {
     /// than on the client so every clone shares the one adoption.
     tokenizer_eos: OnceLock<EosTokenIds>,
     /// The engine's structured-output backend config, set once by the caller
-    /// that knows it (the servicer); unset keeps the translation's
-    /// per-constraint default.
+    /// that knows it (the servicer); unset is the engine's `auto`
+    /// ([`StructuredOutputsBackendConfig::default`]).
     structured_outputs_backend: OnceLock<StructuredOutputsBackendConfig>,
     /// The engine's supported tasks (`get_supported_tasks`), fetched on first
     /// use and kept for the connection, as vLLM's frontend keeps them.
     supported_tasks: tokio::sync::OnceCell<Arc<[String]>>,
+    /// The bound on every generate request this connection opens, from its
+    /// dispatch to its last message, set once by the caller that knows it
+    /// (see [`ZmqEngineClient::set_request_timeout`]); unset leaves the
+    /// streams unbounded.
+    request_timeout: OnceLock<Duration>,
 }
 
 /// Bind the SMG-side ZMQ sockets and complete the handshake with the
@@ -120,8 +127,12 @@ pub(crate) struct ZmqConnectionMeta {
 /// (an engine's HELLO, its READY, its registration on the input socket) may
 /// stay silent: the gateway did not launch the engine and sees no sign of
 /// life from it beside the wire, so this bound alone must cover the engine's
-/// init between its HELLO and its READY. Errors are plain reasons; the worker
-/// layer wraps them in its own error type.
+/// init between its HELLO and its READY. `request_timeout` is the gateway's
+/// bound on a request to a worker (`--request-timeout-secs`), which every
+/// generate stream this connection opens ends at, counted from its dispatch
+/// (see [`ZmqEngineClient::set_request_timeout`]); `None` leaves the
+/// streams unbounded. Errors are plain reasons; the worker layer wraps them
+/// in its own error type.
 pub async fn connect_for_worker(
     base_url: &str,
     model_id: String,
@@ -129,6 +140,7 @@ pub async fn connect_for_worker(
     handshake_override: Option<&str>,
     engine_count: usize,
     startup: Duration,
+    request_timeout: Option<Duration>,
 ) -> Result<ZmqEngineClient, String> {
     // The engine can't stop at EOS on its own (it has no tokenizer or model
     // config); resolve the EOS ids from the local model dir so every request
@@ -147,7 +159,7 @@ pub async fn connect_for_worker(
         );
         EosTokenIds::default()
     };
-    connect_with_eos(
+    let client = connect_with_eos(
         base_url,
         model_id,
         runtime,
@@ -156,7 +168,11 @@ pub async fn connect_for_worker(
         eos,
         startup,
     )
-    .await
+    .await?;
+    if let Some(timeout) = request_timeout {
+        client.set_request_timeout(timeout);
+    }
+    Ok(client)
 }
 
 /// [`connect_for_worker`] with the EOS set supplied by the caller: bind the
@@ -283,6 +299,16 @@ impl ZmqEngineClient {
             startup,
         )
         .await?;
+        // Once per engine, before its first request: an engine whose request
+        // structs are positional declares their field order at the handshake,
+        // and the protocol compares the prefixes its encoders fill against
+        // it, so a struct that moved under this client is named here instead
+        // of failing every request.
+        match dialect {
+            ZmqDialect::Vllm => check_engine_layouts::<VllmProtocol>(&transport)?,
+            ZmqDialect::TokenSpeed => check_engine_layouts::<TokenSpeedProtocol>(&transport)?,
+            ZmqDialect::Sglang => check_engine_layouts::<SglangProtocol>(&transport)?,
+        }
         let backend = match dialect {
             ZmqDialect::Vllm => ZmqBackend::Vllm(Arc::new(EngineCoreClient::new(transport))),
             ZmqDialect::TokenSpeed => {
@@ -298,6 +324,7 @@ impl ZmqEngineClient {
                 tokenizer_eos: OnceLock::new(),
                 structured_outputs_backend: OnceLock::new(),
                 supported_tasks: tokio::sync::OnceCell::new(),
+                request_timeout: OnceLock::new(),
             }),
         })
     }
@@ -326,8 +353,34 @@ impl ZmqEngineClient {
     /// keeps a single backend per process, chosen by the first request that
     /// needs one, so the caller resolves it once from the engine's
     /// `--structured-outputs-config` and every request carries the same one.
+    /// A connection nobody configures (the gateway's own worker link) runs
+    /// the engine's `auto`: xgrammar on every request.
     pub fn set_structured_outputs_backend(&self, config: StructuredOutputsBackendConfig) {
         let _ = self.meta.structured_outputs_backend.set(config);
+    }
+
+    /// Bound every generate request this connection opens from here on by
+    /// `timeout`, counted from the request's dispatch over the call that
+    /// opens its stream and over every message on it: a merged stream
+    /// ([`ZmqGenerateStream`]) still waiting on the engine at the deadline
+    /// ends there with a `DEADLINE_EXCEEDED` and its engine-side requests
+    /// are aborted, as a dropped stream's are.
+    /// The gateway's worker link sets its `--request-timeout-secs` here, the
+    /// bound its HTTP worker client carries; a connection nobody bounds
+    /// (a servicer's own link, whose caller bounds the gRPC call) leaves its
+    /// streams open for as long as the caller reads them. Set once: a later
+    /// call changes nothing.
+    pub fn set_request_timeout(&self, timeout: Duration) {
+        let _ = self.meta.request_timeout.set(timeout);
+    }
+
+    /// The deadline of a generate request dispatched now, when the
+    /// connection bounds its requests (see [`Self::set_request_timeout`]).
+    fn request_deadline(&self) -> Option<RequestDeadline> {
+        self.meta
+            .request_timeout
+            .get()
+            .map(|timeout| RequestDeadline::after(*timeout))
     }
 
     /// The tasks the engine's model runner serves (vLLM's
@@ -528,7 +581,12 @@ impl ZmqEngineClient {
         } else {
             TranslatedMedia::default()
         };
-        let structured_backend = self.meta.structured_outputs_backend.get().copied();
+        let structured_backend = self
+            .meta
+            .structured_outputs_backend
+            .get()
+            .copied()
+            .unwrap_or_default();
         // On the request's own `n`: every sub below carries `n = 1`.
         if let Some(sp) = req.sampling_params.as_ref() {
             refuse_greedy_choices(sp).map_err(tonic::Status::invalid_argument)?;
@@ -644,11 +702,13 @@ impl ZmqEngineClient {
                 "TokenSpeed ZMQ backend expects a TokenSpeed generate request",
             ));
         }
+        // The deadline counts from the dispatch: before the submits.
+        let deadline = self.request_deadline();
         let mut streams = SelectAll::new();
         for stream in self.generate_vllm_streams(req).await? {
             streams.push(stream);
         }
-        Ok(ZmqGenerateStream::Vllm(streams))
+        Ok(ZmqGenerateStream::vllm(streams).with_deadline(deadline))
     }
 
     /// [`Self::generate_vllm`] for a TokenSpeed backend and request.
@@ -656,11 +716,12 @@ impl ZmqEngineClient {
         &self,
         req: tokenspeed_proto::GenerateRequest,
     ) -> Result<ZmqGenerateStream, tonic::Status> {
+        let deadline = self.request_deadline();
         let mut streams = SelectAll::new();
         for stream in self.generate_tokenspeed_streams(req).await? {
             streams.push(stream);
         }
-        Ok(ZmqGenerateStream::TokenSpeed(streams))
+        Ok(ZmqGenerateStream::tokenspeed(streams).with_deadline(deadline))
     }
 
     /// [`Self::generate_vllm_streams`] for a TokenSpeed backend: the `n > 1`
@@ -718,11 +779,12 @@ impl ZmqEngineClient {
                 "selected-token logprobs require the SGLang gRPC servicer",
             ));
         }
+        let deadline = self.request_deadline();
         let mut streams = SelectAll::new();
         for stream in self.generate_sglang_streams(req).await? {
             streams.push(stream);
         }
-        Ok(ZmqGenerateStream::Sglang(streams))
+        Ok(ZmqGenerateStream::sglang(streams).with_deadline(deadline))
     }
 
     /// [`Self::generate_tokenspeed_streams`] for an SGLang backend: the
@@ -1248,6 +1310,237 @@ mod tests {
         let client = client.expect("the retry connects the engine");
         engine.expect("mock engine connected");
         assert_eq!(client.dialect(), ZmqDialect::Vllm);
+    }
+
+    /// The gateway's own connection (nothing configures the backend, as
+    /// behind `--worker-urls ipc://...`) against an engine that keeps the
+    /// backend of its first structured request for its life: whichever
+    /// constraint comes first, every later one carries the backend the engine
+    /// settled on, and that backend is the one a structural tag compiles on,
+    /// so the kind of the first request never decides whether a forced tool
+    /// call compiles later; a schema that backend cannot enforce is refused
+    /// before the engine instead of being answered off the schema, whether it
+    /// comes as a JSON-schema constraint or inside the structural tag of a
+    /// forced call (`tool_choice` required or a named function; the tag an
+    /// always-constrained worker takes for `auto` alike), and nothing refused
+    /// reaches the engine; an `auto` call carries no constraint and passes.
+    #[tokio::test]
+    async fn the_first_structured_request_never_strands_a_later_one() {
+        use engine_zmq_client::protocol::vllm::structured_outputs::{
+            StructuredOutputBackend, StructuredOutputConstraint,
+        };
+        use vllm::sampling_params::Constraint;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base_url = format!("ipc://{}", dir.path().join("w").display());
+        let handshake = format!("ipc://{}", dir.path().join("hs.sock").display());
+        let (client, engine) = tokio::join!(
+            connect_with_eos(
+                &base_url,
+                "m".to_string(),
+                RuntimeType::Vllm,
+                Handshake::TcpOrIpc(&handshake),
+                1,
+                EosTokenIds::default(),
+                Duration::from_secs(10),
+            ),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                default_ready_response()
+            ),
+        );
+        let client = client.expect("adapter connect");
+        let mut engine = engine.expect("mock engine");
+
+        // The engine's rule: the first structured request creates its one
+        // backend; a later request stamped for another would fail at grammar
+        // build (or, for a tag, compile on a backend that has no such format).
+        let mut engine_backend: Option<StructuredOutputBackend> = None;
+        // A forced call's structural tag as a parser with structural tags
+        // sends one: a `tag` per tool, its parameters the `json_schema`
+        // content; `at_least_one` for a forced call, off for the tag an
+        // always-constrained worker takes under `auto`.
+        let call_tag = |tools: &[(&str, serde_json::Value)], at_least_one: bool| {
+            let tags: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|(name, parameters)| {
+                    serde_json::json!({
+                        "begin": format!("<tool_call>\n{{\"name\": \"{name}\", \"arguments\": "),
+                        "content": {"type": "json_schema", "json_schema": parameters},
+                        "end": "}\n</tool_call>",
+                    })
+                })
+                .collect();
+            serde_json::json!({"format": {"type": "triggered_tags", "triggers": ["<tool_call>"],
+                "tags": tags, "at_least_one": at_least_one}})
+            .to_string()
+        };
+        let plain = (
+            "plain",
+            serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+        );
+        // An array parameter under `uniqueItems`, the shape tool corpora
+        // carry; a string with a length bound beside a pattern.
+        let tagged = (
+            "tagged",
+            serde_json::json!({"type": "object", "properties": {"tags": {"type": "array",
+                "items": {"type": "string"}, "uniqueItems": true}}, "required": ["tags"]}),
+        );
+        let bounded = (
+            "bounded",
+            serde_json::json!({"type": "object", "properties": {"code": {"type": "string",
+                "pattern": "^[a-z]+$", "maxLength": 8}}}),
+        );
+        // Held open: dropping a stream aborts its request on the same socket.
+        let mut streams = Vec::new();
+        for (id, constraint) in [
+            (
+                "json-answer-first",
+                Some(Constraint::JsonSchema(
+                    r#"{"type":"object","properties":{"city":{"type":"string"}}}"#.to_string(),
+                )),
+            ),
+            (
+                "forced-call",
+                Some(Constraint::StructuralTag(call_tag(
+                    std::slice::from_ref(&plain),
+                    true,
+                ))),
+            ),
+            ("json-object", Some(Constraint::JsonObject(true))),
+            ("regex", Some(Constraint::Regex("[0-9]+".to_string()))),
+            (
+                "grammar",
+                Some(Constraint::Grammar("root ::= \"a\"".to_string())),
+            ),
+            (
+                "choice",
+                Some(Constraint::Choice(vllm::ChoiceConstraint {
+                    choices: vec!["yes".to_string(), "no".to_string()],
+                })),
+            ),
+            (
+                "required-call-unenforceable",
+                Some(Constraint::StructuralTag(call_tag(
+                    &[plain.clone(), tagged.clone()],
+                    true,
+                ))),
+            ),
+            (
+                "named-call-unenforceable",
+                Some(Constraint::StructuralTag(call_tag(&[bounded], true))),
+            ),
+            ("auto-call", None),
+            (
+                "auto-tag-unenforceable",
+                Some(Constraint::StructuralTag(call_tag(&[plain, tagged], false))),
+            ),
+            (
+                "schema-xgrammar-lacks",
+                Some(Constraint::JsonSchema(
+                    r#"{"type":"integer","multipleOf":3}"#.to_string(),
+                )),
+            ),
+        ] {
+            let request = vllm::GenerateRequest {
+                request_id: id.to_string(),
+                input: Some(vllm::generate_request::Input::Tokenized(
+                    vllm::TokenizedInput {
+                        original_text: String::new(),
+                        input_ids: vec![1, 2, 3],
+                    },
+                )),
+                sampling_params: Some(vllm::SamplingParams {
+                    max_tokens: Some(8),
+                    constraint,
+                    ..Default::default()
+                }),
+                stream: true,
+                ..Default::default()
+            };
+            let outcome = client.generate_vllm_streams(request).await;
+            // Refused before the engine, as vLLM's frontend refuses a schema
+            // under `backend=xgrammar`: xgrammar would compile it with the
+            // keyword dropped and answer off the schema. The message names
+            // the keyword, where it stands and, in a tag, the call's tag by
+            // its `begin`, which carries the tool's name.
+            let refused_at = match id {
+                "required-call-unenforceable" | "auto-tag-unenforceable" => Some((
+                    "uniqueItems",
+                    "`/format/tags/1/content/json_schema/properties/tags`",
+                    Some("tagged"),
+                )),
+                "named-call-unenforceable" => Some((
+                    "minLength/maxLength beside pattern or format",
+                    "`/format/tags/0/content/json_schema/properties/code`",
+                    Some("bounded"),
+                )),
+                "schema-xgrammar-lacks" => Some(("multipleOf", "its root", None)),
+                _ => None,
+            };
+            if let Some((keyword, place, tool)) = refused_at {
+                let status = outcome.err().expect("refused");
+                assert_eq!(status.code(), Code::InvalidArgument, "{id}");
+                let message = status.message();
+                let call = tool.map_or(String::new(), |tool| {
+                    format!(
+                        " (inside the tag that begins `<tool_call>\\n{{\"name\": \"{tool}\", \
+                         \"arguments\": `)"
+                    )
+                });
+                assert!(
+                    message.contains(&format!("`{keyword}` at {place}{call}")),
+                    "{id}: {message}"
+                );
+                continue;
+            }
+            streams.push(outcome.expect("generate"));
+            let EngineInbound::Add(engine_request) = engine.recv().await.expect("inbound") else {
+                panic!("{id}: expected an add request");
+            };
+            // Nothing refused reached the engine: its next request is this one.
+            assert_eq!(
+                engine_request.request_id, id,
+                "{id}: another request reached the engine"
+            );
+            if id == "auto-call" {
+                // `auto` carries no constraint, so nothing to refuse.
+                assert!(
+                    engine_request
+                        .sampling_params
+                        .and_then(|sp| sp.structured_outputs)
+                        .is_none(),
+                    "{id}: an auto call carries no constraint"
+                );
+                continue;
+            }
+            let structured = engine_request
+                .sampling_params
+                .and_then(|sp| sp.structured_outputs)
+                .expect("structured outputs");
+            let settled = *engine_backend.get_or_insert(structured.backend);
+            assert_eq!(
+                structured.backend, settled,
+                "{id}: stamped for a backend the engine does not run"
+            );
+            if id == "choice" {
+                // xgrammar compiles no choice: it goes as the grammar vLLM's
+                // frontend substitutes.
+                assert!(
+                    matches!(
+                        structured.constraint,
+                        StructuredOutputConstraint::Grammar(_)
+                    ),
+                    "{id}: {:?}",
+                    structured.constraint
+                );
+            }
+        }
+        // The backend the engine settled on is the one the triggered-tags
+        // format compiles on.
+        assert_eq!(engine_backend, Some(StructuredOutputBackend::Xgrammar));
+        drop(streams);
     }
 
     /// The dialect is resolved before the handshake, so a runtime with no ZMQ

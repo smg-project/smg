@@ -3264,6 +3264,13 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_management: Option<Vec<ContextManagementEntry>>,
 
+    /// Client-side tracing metadata (Codex sends installation / session /
+    /// thread / turn ids and a W3C traceparent here on every request).
+    /// Accepted so such clients are not rejected with `unknown_parameter`;
+    /// never serialized, so it does not reach the workers.
+    #[serde(default, skip_serializing)]
+    pub client_metadata: Option<HashMap<String, Value>>,
+
     /// Top-k sampling parameter (an engine extension)
     #[serde(default = "default_top_k")]
     #[validate(custom(function = "validate_top_k_value"))]
@@ -3324,6 +3331,7 @@ impl Default for ResponsesRequest {
             safety_identifier: None,
             stream_options: None,
             context_management: None,
+            client_metadata: None,
             top_k: default_top_k(),
             min_p: 0.0,
             repetition_penalty: default_repetition_penalty(),
@@ -3479,9 +3487,13 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
     };
 
     let has_tools = request.tools.as_ref().is_some_and(|t| !t.is_empty());
+    // `none` and `auto` name no tool, so they stand without tools (with nothing
+    // to call, `auto` answers in text as an omitted `tool_choice` does); Codex
+    // sends `tools: []` with `tool_choice: "auto"` when it compacts a
+    // conversation.
     let is_some_choice = !matches!(
         tool_choice,
-        ResponsesToolChoice::Options(ToolChoiceOptions::None)
+        ResponsesToolChoice::Options(ToolChoiceOptions::None | ToolChoiceOptions::Auto)
     );
 
     // Check if tool_choice requires tools but none are provided
@@ -4720,6 +4732,27 @@ mod tests {
             plain["output_tokens_details"],
             serde_json::json!({"reasoning_tokens": 0})
         );
+    }
+
+    /// Codex puts `client_metadata` on every request: it must parse, and it
+    /// must not be forwarded to the workers.
+    #[test]
+    fn client_metadata_is_accepted_and_not_forwarded() {
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "hi",
+            "client_metadata": {"session_id": "s", "x-codex-window-id": "s:0"},
+        }))
+        .expect("client_metadata parses");
+        assert_eq!(
+            request
+                .client_metadata
+                .as_ref()
+                .and_then(|m| m.get("session_id")),
+            Some(&Value::from("s"))
+        );
+        let forwarded = serde_json::to_value(&request).expect("a JSON request");
+        assert!(forwarded.get("client_metadata").is_none());
     }
 
     /// Lock `as_str()` to the canonical serde tag for the unit variants

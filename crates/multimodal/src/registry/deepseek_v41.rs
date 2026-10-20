@@ -62,8 +62,11 @@ impl ModelProcessorSpec for DeepseekV41VisionSpec {
     }
 
     /// The V4.1 renderer inlines the placeholder at each image part's
-    /// position (vLLM `_normalize_messages`, SGLang `process_image_messages`),
-    /// so part order is protocol-visible.
+    /// position, so part order is protocol-visible: a string template of the
+    /// family gets the media parts where the request put them. The family's
+    /// own renderer takes the parts and places them itself, whatever this
+    /// says, and its profile wins over any template, so this is read only
+    /// for a model of the family served without it.
     fn media_part_order(&self) -> MediaPartOrder {
         MediaPartOrder::Authored
     }

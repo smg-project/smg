@@ -189,6 +189,7 @@ pub mod metrics_labels {
     pub const DISCOVERY_STATIC: &str = "static";
     pub const DISCOVERY_KUBERNETES: &str = "kubernetes";
     pub const DISCOVERY_FILE: &str = "file";
+    pub const DISCOVERY_SLURM: &str = "slurm";
     pub const DISCOVERY_CONSUL: &str = "consul";
     pub const DISCOVERY_MANUAL: &str = "manual";
 
@@ -201,6 +202,11 @@ pub mod metrics_labels {
     // and rejected as invalid
     pub const SNAPSHOT_ERROR_UNREADABLE: &str = "unreadable";
     pub const SNAPSHOT_ERROR_INVALID: &str = "invalid";
+
+    // Discovered workers a provider left out of an otherwise good snapshot:
+    // their record could not be used, or one started earlier at their address
+    pub const DISCOVERY_SKIP_INVALID: &str = "invalid";
+    pub const DISCOVERY_SKIP_CONFLICT: &str = "conflict";
 
     // Rate limit results
     pub const RATE_LIMIT_ALLOWED: &str = "allowed";

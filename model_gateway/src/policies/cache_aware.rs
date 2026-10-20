@@ -1468,6 +1468,13 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         "cache_aware"
     }
 
+    /// The count-pressure gate moves a request off a holder loaded well past
+    /// the pool's mean (`candidate_requires_spill`), so the holder of a
+    /// request's prefix keeps it until then.
+    fn balances_load_against_affinity(&self) -> bool {
+        true
+    }
+
     fn needs_request_text(&self) -> bool {
         true // Cache-aware policy needs request text for cache affinity
     }
