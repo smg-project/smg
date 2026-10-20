@@ -103,6 +103,7 @@ mod tests {
                 labels: None,
                 api_key: None,
                 health: None,
+                readmit: None,
             },
             worker_url: worker.url().to_string(),
             app_context: Some(create_test_app_context()),

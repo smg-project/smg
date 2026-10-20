@@ -522,6 +522,7 @@ impl JobQueue {
                         labels: None,
                         api_key: None,
                         health: None,
+                        readmit: None,
                     },
                     Arc::clone(context),
                 );

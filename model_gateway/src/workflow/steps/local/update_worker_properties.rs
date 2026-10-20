@@ -844,6 +844,7 @@ mod tests {
                 labels: None,
                 api_key: None,
                 health: None,
+                readmit: None,
             },
             worker_url: worker.url().to_string(),
             app_context: Some(app_context),
