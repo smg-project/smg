@@ -3879,6 +3879,17 @@ async fn a_streamed_turn_runs_its_whole_calls_and_ends_as_the_upstream_ends_it()
         ])
     };
     let then = |event: &Value| vec![whole.clone(), vec![event.clone()]];
+    // A call of the client's own function beside an MCP call: index 1.
+    let client = |arguments: &str, status: &str| json!({"id": "fc_client", "type": "function_call", "call_id": "call_client", "name": "get_weather", "arguments": arguments, "status": status});
+    let client_added = json!({"type": "response.output_item.added", "output_index": 1, "item": client("", "in_progress")});
+    let client_delta = json!({"type": "response.function_call_arguments.delta", "output_index": 1, "item_id": "fc_client", "delta": "{\"city\":"});
+    let client_cut = end(
+        "incomplete",
+        json!([
+            call(part, "incomplete"),
+            client("{\"city\":", "in_progress")
+        ]),
+    );
     // (case, the request's max_tool_calls, the upstream's turns)
     let cases = [
         ("no call, incomplete", None, one(&[&cut_off])),
@@ -3955,7 +3966,14 @@ async fn a_streamed_turn_runs_its_whole_calls_and_ends_as_the_upstream_ends_it()
             Some(1),
             two_whole(&both_incomplete),
         ),
+        (
+            "a client call beside an MCP call, both cut, incomplete",
+            None,
+            one(&[&added, &delta, &client_added, &client_delta, &client_cut]),
+        ),
     ];
+    // Every request also declares a function of the client's own.
+    let client_function: ResponseTool = serde_json::from_value(json!({"type": "function", "name": "get_weather", "parameters": {"type": "object", "properties": {}}})).expect("a function tool");
     let terminal = |frame: &Value| {
         matches!(
             frame["type"].as_str(),
@@ -3967,7 +3985,12 @@ async fn a_streamed_turn_runs_its_whole_calls_and_ends_as_the_upstream_ends_it()
     for (n, (case, limit, case_turns)) in cases.into_iter().enumerate() {
         *script.lock().expect("the script") = (format!("resp_case{n}"), case_turns.into());
         let (turns_before, calls_before) = (turns.load(Ordering::SeqCst), mcp.call_count());
-        let body = stream_body(router.as_ref(), mcp_request(&mcp.url(), limit, true, true)).await;
+        let mut request = mcp_request(&mcp.url(), limit, true, true);
+        request
+            .tools
+            .get_or_insert_with(Vec::new)
+            .push(client_function.clone());
+        let body = stream_body(router.as_ref(), request).await;
         // Every frame, the sentinel too: its event, or `{"type": "[DONE]"}`.
         let frames: Vec<Value> = sse_frames(&body)
             .iter()
@@ -4057,10 +4080,11 @@ async fn a_streamed_turn_runs_its_whole_calls_and_ends_as_the_upstream_ends_it()
             .response_storage
             .get_response(&id)
             .await
-            .expect("storage");
-        let stored = match (record.map(|stored| stored.raw_response), ended) {
+            .expect("storage")
+            .map(|stored| stored.raw_response);
+        let stored = match (&record, ended) {
             (None, _) => "no record".to_string(),
-            (Some(record), Some(ended)) if record == *ended => {
+            (Some(record), Some(ended)) if record == ended => {
                 "the record is the terminal's response".to_string()
             }
             (Some(record), _) => format!(
@@ -4068,16 +4092,49 @@ async fn a_streamed_turn_runs_its_whole_calls_and_ends_as_the_upstream_ends_it()
                 record["status"]
             ),
         };
-        let lifecycle = if lifecycles.is_empty() {
-            "every item closed in the terminal".to_string()
+        // Any MCP event, closed item, or terminal or record `mcp_call` for an
+        // id the stream never announced.
+        let announced: Vec<&Value> = frames
+            .iter()
+            .filter(|frame| frame["type"] == "response.output_item.added")
+            .map(|frame| &frame["item"]["id"])
+            .collect();
+        let mut phantoms: Vec<String> = frames
+            .iter()
+            .filter_map(|frame| match text(&frame["type"]) {
+                kind if kind == "response.output_item.done" => Some((kind, &frame["item"]["id"])),
+                kind if kind.starts_with("response.mcp_call") => Some((kind, &frame["item_id"])),
+                _ => None,
+            })
+            .filter(|(_, id)| !announced.contains(id))
+            .map(|(kind, id)| format!("{kind} {}", text(id)))
+            .collect();
+        for (place, response) in [("terminal", ended), ("record", record.as_ref())] {
+            let output = response
+                .and_then(|response| response["output"].as_array())
+                .into_iter()
+                .flatten();
+            for item in output
+                .filter(|item| item["type"] == "mcp_call" && !announced.contains(&&item["id"]))
+            {
+                phantoms.push(format!("{place} mcp_call {}", text(&item["id"])));
+            }
+        }
+        let lifecycle = match (lifecycles.is_empty(), ended.is_some()) {
+            (false, _) => lifecycles.join("; "),
+            (true, true) => "every item closed in the terminal".to_string(),
+            (true, false) => "every item closed".to_string(),
+        };
+        let phantoms = if phantoms.is_empty() {
+            String::new()
         } else {
-            lifecycles.join("; ")
+            format!(", phantom MCP {}", phantoms.join("; "))
         };
         let (turns, calls) = (
             turns.load(Ordering::SeqCst) - turns_before,
             mcp.call_count() - calls_before,
         );
-        got.push(format!("{case}: turns {turns}, MCP calls {calls}, closed [{}], ends [{}], {lifecycle}, {stored}", closed.join("; "), ends.join(", ")));
+        got.push(format!("{case}: turns {turns}, MCP calls {calls}, closed [{}], ends [{}], {lifecycle}, {stored}{phantoms}", closed.join("; "), ends.join(", ")));
     }
 
     let (ran, unran, unran_part) = (
@@ -4093,7 +4150,7 @@ async fn a_streamed_turn_runs_its_whole_calls_and_ends_as_the_upstream_ends_it()
         got,
         [
             format!("no call, incomplete: turns 1, MCP calls 0, closed [], ends [response.incomplete [mcp_list_tools:, message:incomplete; {incomplete}], [DONE]], {whole_stored}"),
-            "no call, error: turns 1, MCP calls 0, closed [], ends [error], every item closed in the terminal, no record".to_string(),
+            "no call, error: turns 1, MCP calls 0, closed [], ends [error], every item closed, no record".to_string(),
             format!("added, failed: turns 1, MCP calls 0, closed [failed {{}}], ends [response.failed [mcp_list_tools:, mcp_call:failed; {failed}], [DONE]], {whole_stored}"),
             format!("added, partial arguments, failed: turns 1, MCP calls 0, closed [{unran_part}], ends [response.failed [mcp_list_tools:, mcp_call:failed; {failed}], [DONE]], {whole_stored}"),
             format!("added, partial arguments, incomplete: turns 1, MCP calls 0, closed [{unran_part}], ends [response.incomplete [mcp_list_tools:, mcp_call:failed; {incomplete}], [DONE]], {whole_stored}"),
@@ -4108,9 +4165,378 @@ async fn a_streamed_turn_runs_its_whole_calls_and_ends_as_the_upstream_ends_it()
             "added, error, the call's rest: turns 1, MCP calls 0, closed [], ends [error], mcp_stub never closed, no record".to_string(),
             format!("a call, then incomplete: turns 2, MCP calls 1, closed [{ran}], ends [response.incomplete [mcp_list_tools:, mcp_call:completed, message:incomplete; {incomplete}], [DONE]], {whole_stored}"),
             format!("a call, then failed: turns 2, MCP calls 1, closed [{ran}], ends [response.failed [mcp_list_tools:, mcp_call:completed, message:in_progress; {failed}], [DONE]], {whole_stored}"),
-            format!("a call, then error: turns 2, MCP calls 1, closed [{ran}], ends [error], every item closed in the terminal, no record"),
+            format!("a call, then error: turns 2, MCP calls 1, closed [{ran}], ends [error], every item closed, no record"),
             format!("two whole calls over max_tool_calls 1, failed: turns 1, MCP calls 1, closed [{ran}; {unran}], ends [response.completed [mcp_list_tools:, mcp_call:completed, mcp_call:failed; {at_limit}], [DONE]], {whole_stored}"),
             format!("two whole calls over max_tool_calls 1, incomplete: turns 1, MCP calls 1, closed [{ran}; {unran}], ends [response.completed [mcp_list_tools:, mcp_call:completed, mcp_call:failed; {at_limit}], [DONE]], {whole_stored}"),
+            format!("a client call beside an MCP call, both cut, incomplete: turns 1, MCP calls 0, closed [{unran_part}], ends [response.incomplete [mcp_list_tools:, mcp_call:failed, function_call:in_progress; {incomplete}], [DONE]], fc_client never closed, the record is the terminal's response"),
+        ]
+    );
+    server.abort();
+    mcp.stop().await;
+}
+
+/// A turn that asks for a function the client declared, beside the session's
+/// calls, on each path a call takes: run, cut at the request's
+/// `max_tool_calls`, or left unrun at the upstream's end, with the client's
+/// call first and last. Only the session's calls run and count against the
+/// allowance. The client's call never reaches the session and is never closed
+/// as an `mcp_call`; the turn that asks for it ends the loop, on the
+/// upstream's own terminal when the upstream ended that turn `incomplete` or
+/// `failed`, and the client receives the call, whole, as the `function_call`
+/// it runs, in the terminal and the record alike. (On the wire its item is announced and not closed,
+/// and its arguments go out as `mcp_call_arguments` events, as before.) A
+/// call to a name the request does not declare is still the session's to
+/// refuse: the refusal goes back to the model, and the loop goes on.
+#[tokio::test]
+async fn a_streamed_turn_leaves_a_call_of_the_clients_own_to_the_client() {
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
+
+    use axum::response::IntoResponse;
+    use serde_json::{json, Value};
+    let response = |status: &str, output: Value| json!({"object": "response", "created_at": 1_700_000_000, "model": "mock-model", "status": status, "output": output});
+    let call = |id: &str, name: &str, arguments: &str| json!({"id": format!("fc_{id}"), "type": "function_call", "call_id": format!("call_{id}"), "name": name, "arguments": arguments, "status": "completed"});
+    let (one, two) = (
+        call("one", "brave_web_search", "{\"query\":\"smg\"}"),
+        call("two", "brave_web_search", "{\"query\":\"smg\"}"),
+    );
+    // The client's own function, which every request declares, and a name
+    // that no request declares and the session has no tool for.
+    let client = call("client", "get_weather", "{\"city\":\"Paris\"}");
+    let unknown = call("unknown", "get_stock_price", "{\"ticker\":\"SMG\"}");
+    // A call's events at `index`: whole, or cut after part of its arguments.
+    let added = |index: usize, item: &Value| {
+        let mut item = item.clone();
+        item["arguments"] = "".into();
+        item["status"] = "in_progress".into();
+        json!({"type": "response.output_item.added", "output_index": index, "item": item})
+    };
+    let delta = |index: usize, item: &Value, delta: &str| json!({"type": "response.function_call_arguments.delta", "output_index": index, "item_id": item["id"], "delta": delta});
+    let whole = |index: usize, item: &Value| {
+        let arguments = item["arguments"].as_str().unwrap_or_default();
+        vec![
+            added(index, item),
+            delta(index, item, arguments),
+            json!({"type": "response.function_call_arguments.done", "output_index": index, "item_id": item["id"], "arguments": arguments}),
+            json!({"type": "response.output_item.done", "output_index": index, "item": item}),
+        ]
+    };
+    let cut = |index: usize, item: &Value| vec![added(index, item), delta(index, item, "{\"q")];
+    let cut_short = |item: &Value| {
+        let mut item = item.clone();
+        item["arguments"] = "{\"q".into();
+        item["status"] = "incomplete".into();
+        item
+    };
+    let end = |status: &str, output: &[&Value]| {
+        let mut response = response(status, json!(output));
+        if status == "incomplete" {
+            response["incomplete_details"] = json!({"reason": "max_output_tokens"});
+        } else if status == "failed" {
+            response["error"] = json!({"code": "server_error", "message": "the model failed"});
+        }
+        json!({"type": format!("response.{status}"), "response": response})
+    };
+    let turn = |calls: Vec<Vec<Value>>, terminal: Value| {
+        calls
+            .into_iter()
+            .flatten()
+            .chain([terminal])
+            .collect::<Vec<_>>()
+    };
+    let message = json!({"id": "msg_stub", "type": "message", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": "answered", "annotations": []}]});
+    let answer = vec![
+        json!({"type": "response.output_item.added", "output_index": 0, "item": message}),
+        json!({"type": "response.output_item.done", "output_index": 0, "item": message}),
+        end("completed", &[&message]),
+    ];
+
+    // The case's id and its scripted turns, which the requests take in order,
+    // and the body of every request the upstream receives.
+    let script: Arc<Mutex<(String, VecDeque<Vec<Value>>)>> = Arc::default();
+    let requests: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let (next, received) = (Arc::clone(&script), Arc::clone(&requests));
+    let (upstream, server) = stub_upstream(axum::routing::post(move |body: String| {
+        received
+            .lock()
+            .expect("the requests")
+            .push(serde_json::from_str(&body).unwrap_or_default());
+        let mut script = next.lock().expect("the script");
+        let mut events = script.1.pop_front().unwrap_or_else(|| answer.clone());
+        let mut created = response("in_progress", json!([]));
+        for response in events
+            .iter_mut()
+            .filter_map(|event| event.get_mut("response"))
+            .chain([&mut created])
+        {
+            response["id"] = script.0.as_str().into();
+        }
+        let body = sse_turn(&created, events);
+        async move { ([(CONTENT_TYPE, "text/event-stream")], body).into_response() }
+    }))
+    .await;
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let (router, ctx, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
+
+    // (case, the request's max_tool_calls, the upstream's first turn)
+    let cases = [
+        (
+            "the client's call last, run",
+            None,
+            turn(
+                vec![whole(0, &one), whole(1, &client)],
+                end("completed", &[&one, &client]),
+            ),
+        ),
+        (
+            "the client's call first, run",
+            None,
+            turn(
+                vec![whole(0, &client), whole(1, &one)],
+                end("completed", &[&client, &one]),
+            ),
+        ),
+        (
+            "the client's call last, max_tool_calls 1",
+            Some(1),
+            turn(
+                vec![whole(0, &one), whole(1, &client)],
+                end("completed", &[&one, &client]),
+            ),
+        ),
+        (
+            "the client's call first, max_tool_calls 1",
+            Some(1),
+            turn(
+                vec![whole(0, &client), whole(1, &one)],
+                end("completed", &[&client, &one]),
+            ),
+        ),
+        (
+            "the client's call last, cut at max_tool_calls 1",
+            Some(1),
+            turn(
+                vec![whole(0, &one), whole(1, &two), whole(2, &client)],
+                end("completed", &[&one, &two, &client]),
+            ),
+        ),
+        (
+            "the client's call first, cut at max_tool_calls 1",
+            Some(1),
+            turn(
+                vec![whole(0, &client), whole(1, &one), whole(2, &two)],
+                end("completed", &[&client, &one, &two]),
+            ),
+        ),
+        (
+            "the client's call last, the upstream's end",
+            None,
+            turn(
+                vec![cut(0, &one), whole(1, &client)],
+                end("incomplete", &[&cut_short(&one), &client]),
+            ),
+        ),
+        (
+            "the client's call first, the upstream's end",
+            None,
+            turn(
+                vec![whole(0, &client), cut(1, &one)],
+                end("incomplete", &[&client, &cut_short(&one)]),
+            ),
+        ),
+        (
+            "the client's call last, a whole turn ended incomplete",
+            None,
+            turn(
+                vec![whole(0, &one), whole(1, &client)],
+                end("incomplete", &[&one, &client]),
+            ),
+        ),
+        (
+            "the client's call first, a whole turn ended failed",
+            None,
+            turn(
+                vec![whole(0, &client), whole(1, &one)],
+                end("failed", &[&client, &one]),
+            ),
+        ),
+        (
+            "an undeclared call, run",
+            None,
+            turn(vec![whole(0, &unknown)], end("completed", &[&unknown])),
+        ),
+        (
+            "an undeclared call, the upstream's end",
+            None,
+            turn(
+                vec![cut(0, &unknown)],
+                end("incomplete", &[&cut_short(&unknown)]),
+            ),
+        ),
+    ];
+    let client_function: ResponseTool = serde_json::from_value(json!({"type": "function", "name": "get_weather", "parameters": {"type": "object", "properties": {}}})).expect("a function tool");
+    let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
+    let mut got = Vec::new();
+    for (n, (case, limit, first)) in cases.into_iter().enumerate() {
+        *script.lock().expect("the script") = (format!("resp_own{n}"), VecDeque::from([first]));
+        requests.lock().expect("the requests").clear();
+        let server_before = mcp.tool_calls().len();
+        let mut request = mcp_request(&mcp.url(), limit, true, true);
+        request
+            .tools
+            .get_or_insert_with(Vec::new)
+            .push(client_function.clone());
+        let frames = frame_events(&stream_body(router.as_ref(), request).await);
+
+        // What each upstream request after the first hands back to the model.
+        let requests = requests.lock().expect("the requests").clone();
+        let outputs: Vec<String> = requests
+            .iter()
+            .skip(1)
+            .flat_map(|request| request["input"].as_array().cloned().unwrap_or_default())
+            .filter(|item| item["type"] == "function_call_output")
+            .map(|item| format!("{} {}", text(&item["call_id"]), text(&item["output"])))
+            .collect();
+        let server: Vec<String> = mcp.tool_calls().split_off(server_before);
+        // The loop's own closures: each mcp_call it ends, and why one failed.
+        let closed: Vec<String> = frames
+            .iter()
+            .filter(|frame| {
+                frame["type"] == "response.output_item.done" && frame["item"]["type"] == "mcp_call"
+            })
+            .map(|frame| {
+                let item = &frame["item"];
+                match item["error"]["content"].as_str() {
+                    Some(error) => {
+                        format!("{} {}: {error}", text(&item["name"]), text(&item["status"]))
+                    }
+                    None => format!("{} {}", text(&item["name"]), text(&item["status"])),
+                }
+            })
+            .collect();
+        // The events of the call that is not the session's, by either id.
+        let ids = ["fc_client", "mcp_client", "fc_unknown", "mcp_unknown"];
+        let wire: Vec<String> = frames
+            .iter()
+            .filter_map(|frame| {
+                let id = frame["item_id"]
+                    .as_str()
+                    .or_else(|| frame["item"]["id"].as_str())?;
+                ids.contains(&id).then(|| {
+                    format!(
+                        "{} {id}",
+                        text(&frame["type"]).trim_start_matches("response.")
+                    )
+                })
+            })
+            .collect();
+        let terminals: Vec<&Value> = frames
+            .iter()
+            .filter(|frame| {
+                matches!(
+                    frame["type"].as_str(),
+                    Some(
+                        "response.completed" | "response.incomplete" | "response.failed" | "error"
+                    )
+                )
+            })
+            .collect();
+        let ends: Vec<String> = terminals
+            .iter()
+            .map(|frame| {
+                let response = &frame["response"];
+                let mut items = item_shapes(response)
+                    .into_iter()
+                    .map(|(kind, status, name)| format!("{kind}:{status}:{name}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                for field in ["incomplete_details", "error"] {
+                    if !response[field].is_null() {
+                        items.push_str(&format!("; {field} {}", response[field]));
+                    }
+                }
+                format!("{} [{items}]", text(&frame["type"]))
+            })
+            .collect();
+        let ended = terminals.last().map(|frame| &frame["response"]);
+        // The client's call as the terminal hands it over, to be run.
+        let handed: Vec<String> = ended
+            .and_then(|response| response["output"].as_array())
+            .into_iter()
+            .flatten()
+            .filter(|item| item["type"] == "function_call")
+            .map(|item| {
+                format!(
+                    "{} {} {} {} {}",
+                    text(&item["id"]),
+                    text(&item["call_id"]),
+                    text(&item["name"]),
+                    text(&item["arguments"]),
+                    text(&item["status"])
+                )
+            })
+            .collect();
+        let id = smg_data_connector::ResponseId::from(format!("resp_own{n}"));
+        let record = ctx
+            .response_storage
+            .get_response(&id)
+            .await
+            .expect("storage")
+            .map(|stored| stored.raw_response);
+        let stored = match (&record, ended) {
+            (None, _) => "no record".to_string(),
+            (Some(record), Some(ended)) if record == ended => {
+                "the record is the terminal's response".to_string()
+            }
+            (Some(record), _) => format!(
+                "a {} record unlike the terminal's response",
+                record["status"]
+            ),
+        };
+        got.push(format!(
+            "{case}: turns {}, the server's calls {server:?}, outputs to the model {outputs:?}, closed {closed:?}, the undeclared or client call's events {wire:?}, ends {ends:?}, handed to the client {handed:?}, {stored}",
+            requests.len()
+        ));
+    }
+
+    let ran = "brave_web_search completed";
+    let limit = "brave_web_search failed: Not executed - response stopped due to limit";
+    let unended =
+        "brave_web_search failed: Not executed - response ended before its calls were complete";
+    let refused = "Tool 'get_stock_price' is not in this session's exposed tool map";
+    let client_wire = "[\"output_item.added fc_client\", \"mcp_call_arguments.delta mcp_client\", \"mcp_call_arguments.done mcp_client\"]";
+    let handed = "[\"fc_client call_client get_weather {\\\"city\\\":\\\"Paris\\\"} completed\"]";
+    let stored = "the record is the terminal's response";
+    let incomplete = "incomplete_details {\\\"reason\\\":\\\"max_output_tokens\\\"}";
+    let at_limit = "incomplete_details {\\\"reason\\\":\\\"max_tool_calls\\\"}";
+    let failed =
+        "error {\\\"code\\\":\\\"server_error\\\",\\\"message\\\":\\\"the model failed\\\"}";
+    let run = |case: &str| {
+        format!("{case}: turns 1, the server's calls [\"brave_web_search\"], outputs to the model [], closed [\"{ran}\"], the undeclared or client call's events {client_wire}, ends [\"response.completed [mcp_list_tools::, mcp_call:completed:brave_web_search, function_call:completed:get_weather]\"], handed to the client {handed}, {stored}")
+    };
+    let cut_at_limit = |case: &str| {
+        format!("{case}: turns 1, the server's calls [\"brave_web_search\"], outputs to the model [], closed [\"{ran}\", \"{limit}\"], the undeclared or client call's events {client_wire}, ends [\"response.completed [mcp_list_tools::, mcp_call:completed:brave_web_search, mcp_call:failed:brave_web_search, function_call:completed:get_weather; {at_limit}]\"], handed to the client {handed}, {stored}")
+    };
+    let upstream_end = |case: &str| {
+        format!("{case}: turns 1, the server's calls [], outputs to the model [], closed [\"{unended}\"], the undeclared or client call's events {client_wire}, ends [\"response.incomplete [mcp_list_tools::, mcp_call:failed:brave_web_search, function_call:completed:get_weather; {incomplete}]\"], handed to the client {handed}, {stored}")
+    };
+    assert_eq!(
+        got,
+        [
+            run("the client's call last, run"),
+            run("the client's call first, run"),
+            run("the client's call last, max_tool_calls 1"),
+            run("the client's call first, max_tool_calls 1"),
+            cut_at_limit("the client's call last, cut at max_tool_calls 1"),
+            cut_at_limit("the client's call first, cut at max_tool_calls 1"),
+            upstream_end("the client's call last, the upstream's end"),
+            upstream_end("the client's call first, the upstream's end"),
+            format!("the client's call last, a whole turn ended incomplete: turns 1, the server's calls [\"brave_web_search\"], outputs to the model [], closed [\"{ran}\"], the undeclared or client call's events {client_wire}, ends [\"response.incomplete [mcp_list_tools::, mcp_call:completed:brave_web_search, function_call:completed:get_weather; {incomplete}]\"], handed to the client {handed}, {stored}"),
+            format!("the client's call first, a whole turn ended failed: turns 1, the server's calls [\"brave_web_search\"], outputs to the model [], closed [\"{ran}\"], the undeclared or client call's events {client_wire}, ends [\"response.failed [mcp_list_tools::, mcp_call:completed:brave_web_search, function_call:completed:get_weather; {failed}]\"], handed to the client {handed}, {stored}"),
+            format!("an undeclared call, run: turns 2, the server's calls [], outputs to the model [\"call_unknown {{\\\"error\\\":\\\"{refused}\\\"}}\"], closed [\"get_stock_price failed: {refused}\"], the undeclared or client call's events [\"output_item.added fc_unknown\", \"mcp_call_arguments.delta mcp_unknown\", \"mcp_call_arguments.done mcp_unknown\", \"mcp_call.completed mcp_unknown\", \"output_item.done mcp_unknown\"], ends [\"response.completed [mcp_list_tools::, mcp_call:failed:get_stock_price, message:completed:]\"], handed to the client [], {stored}"),
+            format!("an undeclared call, the upstream's end: turns 1, the server's calls [], outputs to the model [], closed [\"get_stock_price failed: Not executed - response ended before its calls were complete\"], the undeclared or client call's events [\"output_item.added fc_unknown\", \"mcp_call.failed mcp_unknown\", \"output_item.done mcp_unknown\"], ends [\"response.incomplete [mcp_list_tools::, mcp_call:failed:get_stock_price; {incomplete}]\"], handed to the client [], {stored}"),
         ]
     );
     server.abort();

@@ -856,6 +856,19 @@ pub(super) fn handle_streaming_with_tool_interception(
         let provider = ApiProvider::from_url(&url_clone);
         let auth_header =
             provider.extract_auth_header(headers_opt.as_ref(), worker_api_key.as_ref());
+        // A call to a function the request declares is the client's to run:
+        // the loop does not run it or count it, never turns it into an
+        // `mcp_call`, and the response keeps it as the client's
+        // `function_call`. Every other call is the loop's, to run or to close
+        // as not executed. The set must be exactly the one
+        // `retained_output_items` keeps, the request's `function` tools: a
+        // call the loop declines and the response drops would be lost.
+        let is_client_function = |name: &str| {
+            original_request.tools.iter().flatten().any(|tool| {
+                matches!(tool, ResponseTool::Function(function_tool)
+                    if function_tool.function.name == name)
+            })
+        };
 
         let (handler, end) = loop {
             // Make streaming request
@@ -1066,8 +1079,14 @@ pub(super) fn handle_streaming_with_tool_interception(
             if upstream_terminal.is_some()
                 || (!tool_calls_detected && !handler.has_runnable_calls())
             {
+                // The client's own calls stay in the response as they are.
+                let unrun = handler
+                    .take_pending_calls()
+                    .into_iter()
+                    .filter(|call| !is_client_function(&call.name))
+                    .collect();
                 if !skip_streaming_tool_calls(
-                    handler.take_pending_calls(),
+                    unrun,
                     &session,
                     &format_registry,
                     &tx,
@@ -1084,8 +1103,12 @@ pub(super) fn handle_streaming_with_tool_interception(
                 break (handler, end);
             }
 
-            // Execute tools
-            let mut pending_calls = handler.take_pending_calls();
+            // Execute tools: every call but the client's own, which neither
+            // runs nor counts against the allowance below.
+            let (client_calls, mut pending_calls): (Vec<_>, Vec<_>) = handler
+                .take_pending_calls()
+                .into_iter()
+                .partition(|call| is_client_function(&call.name));
 
             // Check iteration limit
             state.iteration += 1;
@@ -1145,6 +1168,21 @@ pub(super) fn handle_streaming_with_tool_interception(
                     return;
                 }
                 break (handler, ToolLoopEnd::ToolCallLimit);
+            }
+
+            // Only the client can answer its own calls, so the upstream turn
+            // cannot resume without them: the loop ends, on the upstream's
+            // own terminal if it ended the turn `incomplete` or `failed`.
+            if !client_calls.is_empty() {
+                let status = handler
+                    .snapshot_final_response()
+                    .map(|response| response["status"].clone());
+                let end = match status.as_ref().and_then(Value::as_str) {
+                    Some("incomplete") => ToolLoopEnd::UpstreamTerminal(ResponseEvent::INCOMPLETE),
+                    Some("failed") => ToolLoopEnd::UpstreamTerminal(ResponseEvent::FAILED),
+                    _ => ToolLoopEnd::Answered,
+                };
+                break (handler, end);
             }
 
             // Build resume payload
