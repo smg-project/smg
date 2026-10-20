@@ -17,6 +17,11 @@
 //!   worker would serve from cache for that prompt right now;
 //!   `GET /admin/truth`: per worker, what it served over every admitted
 //!   request.
+//! - `POST /admin/script/{worker}` with one scripted answer or an array of
+//!   them: what the worker's next requests get, in order (`all`: whichever
+//!   worker gets the request), or, with a `key` or `input_ids`, what every
+//!   worker answers to that prompt; `GET` reads the queue length and the hit
+//!   and miss counts, `DELETE` drops the queue ([`crate::script`]).
 //!
 //! Worker names are `grpc:<port>` / `http:<port>` / `zmq:<index>`; `all`
 //! addresses every worker.
@@ -41,6 +46,7 @@ use tokio::net::TcpListener;
 use crate::{
     config::Config,
     engine::{self, Engine, FaultScope, RequestFault},
+    script,
 };
 
 struct AdminState {
@@ -70,6 +76,10 @@ fn router(state: Arc<AdminState>) -> Router {
         .route("/admin/fault/{worker}/fail", post(fault_fail))
         .route("/admin/truth", get(truth_served))
         .route("/admin/truth/{worker}", post(truth_prompt))
+        .route(
+            "/admin/script/{worker}",
+            get(script_status).post(script_enqueue).delete(script_clear),
+        )
         // What a gRPC worker reports about itself, by port: whether its
         // health check answers serving, and the info the gateway turns into
         // labels. For beds that change an engine's reported settings between
@@ -116,6 +126,38 @@ async fn info_patch(Path(port): Path<u16>, Json(body): Json<Value>) -> Response 
         }
         None => (StatusCode::BAD_REQUEST, "body: a JSON object").into_response(),
     }
+}
+
+/// Body: one scripted answer or an array of them ([`script::Answer::parse`]
+/// names the fields). Each goes to the end of the worker's queue (`all`: the
+/// queue every worker falls back to), or under its prompt's key when it has
+/// one. Answers the worker's script state.
+async fn script_enqueue(Path(worker): Path<String>, Json(body): Json<Value>) -> Response {
+    let items: Vec<&Value> = match &body {
+        Value::Array(items) => items.iter().collect(),
+        one => vec![one],
+    };
+    let mut answers = Vec::with_capacity(items.len());
+    for (n, item) in items.into_iter().enumerate() {
+        match script::Answer::parse(item) {
+            Ok(scripted) => answers.push(scripted),
+            Err(why) => {
+                return (StatusCode::BAD_REQUEST, format!("answer {n}: {why}")).into_response()
+            }
+        }
+    }
+    Json(script::enqueue(&worker, answers)).into_response()
+}
+
+/// The worker's queued answers, hits and misses, and the keyed answers of
+/// the process.
+async fn script_status(Path(worker): Path<String>) -> Json<Value> {
+    Json(script::status(&worker))
+}
+
+/// Drop the worker's queued answers (`all`: every queue); keyed answers stay.
+async fn script_clear(Path(worker): Path<String>) -> Json<Value> {
+    Json(script::clear(&worker))
 }
 
 /// Serve the admin API on `port` until the process exits.

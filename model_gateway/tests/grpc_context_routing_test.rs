@@ -68,6 +68,7 @@ impl Engine {
             output_tokens: 1,
             replay: mock_worker::config::ReplayConfig {
                 capture: Some(capture.clone()),
+                ..Default::default()
             },
             ..Default::default()
         });

@@ -29,6 +29,7 @@ use crate::{
     drain::InFlight,
     engine::{self, Engine, KvEventStream, LoadsLike, NewRequest},
     replay::Capture,
+    script::{self, Answer, MatchedStop},
 };
 
 /// Serve the mock TokenSpeed gRPC service on `port` until the process exits.
@@ -81,12 +82,16 @@ pub async fn serve_with_listener_until(
         },
         None => None,
     };
+    if let Err(e) = script::ensure_loaded(&cfg) {
+        tracing::error!("grpc worker {addr:?} cannot load script: {e}");
+        return;
+    }
     // One simulated engine per listener (i.e. per virtual worker), registered
     // in the process fleet under `grpc:<port>` for the oracle and admin API.
     let name = format!("grpc:{}", addr.map(|a| a.port()).unwrap_or(0));
     let engine = cfg
         .realistic
-        .then(|| Engine::spawn_named(cfg.engine.clone(), name, true));
+        .then(|| Engine::spawn_named(cfg.engine.clone(), name.clone(), true));
     // The worker's vLLM-wire KV-event publisher, numbered by its port offset.
     let publisher = engine.as_ref().and_then(|engine| {
         let port = addr.map(|a| a.port())?;
@@ -106,6 +111,7 @@ pub async fn serve_with_listener_until(
     };
     let service = MockScheduler {
         cfg,
+        name,
         engine,
         capture,
         stopped,
@@ -177,6 +183,9 @@ fn connections(listener: TcpListener) -> impl Stream<Item = std::io::Result<TcpS
 #[derive(Clone)]
 struct MockScheduler {
     cfg: Arc<Config>,
+    /// The worker's name in the process (`grpc:<port>`): what the admin API
+    /// and the script store address it by.
+    name: String,
     /// Present iff the worker runs the realistic engine simulator.
     engine: Option<Engine>,
     /// Present iff `--capture` is set: every `Generate` request is recorded.
@@ -217,6 +226,26 @@ impl TokenSpeedScheduler for MockScheduler {
                 tracing::error!("capturing request {} failed: {e}", req.request_id);
                 return Err(Status::internal(format!("mock-worker capture failed: {e}")));
             }
+        }
+
+        // A scripted answer, ahead of either engine mode: the worker's queue
+        // or the prompt's key decides ([`crate::script`]).
+        let prompt_ids: &[u32] = req
+            .tokenized
+            .as_ref()
+            .map(|tokenized| tokenized.input_ids.as_slice())
+            .unwrap_or(&[]);
+        if let Some(answer) = script::take(&self.name, prompt_ids) {
+            let prompt_tokens = answer.prompt_tokens(prompt_ids.len());
+            let stream = scripted_stream(
+                answer,
+                req.request_id.clone(),
+                prompt_tokens,
+                req.stream,
+                req.return_logprob,
+                self.cfg.weight_version.clone(),
+            );
+            return Ok(Response::new(Box::pin(in_flight.until_done(stream))));
         }
 
         // Realistic mode: submit to the engine simulator and stream its output.
@@ -688,6 +717,120 @@ fn generate_stream(
                 }
                 None => return None,
             }
+        }
+    }))
+}
+
+/// The generate stream of a scripted answer: a `Chunk` per frame when the
+/// request streams, then the `Complete`, with the answer's pause before every
+/// frame but the first; the logprobs ride along when the request asked for
+/// them. A `Complete` that follows no chunk is what a non-streaming request
+/// reads, as it reads the engine's.
+fn scripted_stream(
+    answer: Answer,
+    request_id: String,
+    prompt_tokens: u32,
+    stream_chunks: bool,
+    return_logprob: bool,
+    weight_version: Option<String>,
+) -> GenStream {
+    struct Scripted {
+        answer: Answer,
+        frames: std::collections::VecDeque<script::Frame>,
+        request_id: String,
+        prompt_tokens: u32,
+        stream_chunks: bool,
+        return_logprob: bool,
+        weight_version: Option<String>,
+        /// Output tokens sent so far (the chunks' running `completion_tokens`).
+        sent: u32,
+        started: bool,
+        done: bool,
+    }
+    let frames = answer.token_frames().into();
+    let init = Scripted {
+        answer,
+        frames,
+        request_id,
+        prompt_tokens,
+        stream_chunks,
+        return_logprob,
+        weight_version,
+        sent: 0,
+        started: false,
+        done: false,
+    };
+    Box::pin(stream::unfold(init, |mut st| async move {
+        loop {
+            if st.done {
+                return None;
+            }
+            let Some(frame) = st.frames.pop_front() else {
+                st.done = true;
+                let answer = &st.answer;
+                let output_logprobs = answer
+                    .logprobs
+                    .as_ref()
+                    .filter(|logprobs| {
+                        st.return_logprob && logprobs.len() == answer.output_ids.len()
+                    })
+                    .map(|logprobs| ts::OutputLogProbs {
+                        token_logprobs: logprobs.clone(),
+                        token_ids: answer.output_ids.clone(),
+                        top_logprobs: Vec::new(),
+                    });
+                let matched_stop = answer.matched_stop.as_ref().map(|stop| match stop {
+                    MatchedStop::Token(id) => {
+                        ts::generate_complete::MatchedStop::MatchedTokenId(*id)
+                    }
+                    MatchedStop::Text(text) => {
+                        ts::generate_complete::MatchedStop::MatchedStopStr(text.clone())
+                    }
+                });
+                let complete = ts::GenerateResponse {
+                    request_id: st.request_id.clone(),
+                    response: Some(GenResp::Complete(ts::GenerateComplete {
+                        output_ids: answer.output_ids.clone(),
+                        finish_reason: answer.finish_reason.clone(),
+                        prompt_tokens: st.prompt_tokens,
+                        completion_tokens: answer.completion_tokens(),
+                        cached_tokens: answer.cached_tokens,
+                        output_logprobs,
+                        matched_stop,
+                        index: 0,
+                        weight_version: st.weight_version.clone(),
+                        ..Default::default()
+                    })),
+                };
+                return Some((Ok(complete), st));
+            };
+            if st.started && !st.answer.delay.is_zero() {
+                tokio::time::sleep(st.answer.delay).await;
+            }
+            st.started = true;
+            st.sent += u32::try_from(frame.ids.len()).unwrap_or(u32::MAX);
+            if !st.stream_chunks {
+                continue;
+            }
+            let output_logprobs = (st.return_logprob && frame.logprobs.len() == frame.ids.len())
+                .then(|| ts::OutputLogProbs {
+                    token_logprobs: frame.logprobs.clone(),
+                    token_ids: frame.ids.clone(),
+                    top_logprobs: Vec::new(),
+                });
+            let chunk = ts::GenerateResponse {
+                request_id: st.request_id.clone(),
+                response: Some(GenResp::Chunk(ts::GenerateStreamChunk {
+                    token_ids: frame.ids,
+                    prompt_tokens: st.prompt_tokens,
+                    completion_tokens: st.sent,
+                    cached_tokens: st.answer.cached_tokens,
+                    output_logprobs,
+                    index: 0,
+                    weight_version: st.weight_version.clone(),
+                })),
+            };
+            return Some((Ok(chunk), st));
         }
     }))
 }
