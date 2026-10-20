@@ -94,7 +94,7 @@ pub(crate) enum Fallback {
     /// labels or the flags, for a model the registry does not know: every table reads the thought
     /// channel, so the name selects nothing, and nothing else selects a table.
     ReasoningNameOnly,
-    /// A legacy tool-call parser's name no table answers to (`pythonic`, `mistral`): the way back
+    /// A legacy tool-call parser's name no table answers to (`pythonic`): the way back
     /// to the legacy parsers for one model (the labels) or for the models the registry does not
     /// know (the flags).
     LegacyToolName,
@@ -1236,18 +1236,19 @@ mod tests {
         }
 
         // The flags' way back, for a model the registry does not know; the registry's table
-        // reads one it knows whatever they name.
-        let mistral = pair(Some("mistral"), None);
+        // reads one it knows whatever they name. The tool-call name is one no table answers
+        // to (`pythonic`): a name a table answers to (`mistral`) names that table instead.
+        let pythonic = pair(Some("pythonic"), None);
         let passthrough = pair(None, Some("passthrough"));
         assert_eq!(
-            why(&ModelNames::flagged(&mistral), unknown),
+            why(&ModelNames::flagged(&pythonic), unknown),
             Some(Fallback::LegacyToolName)
         );
         assert_eq!(
             why(&ModelNames::flagged(&passthrough), unknown),
             Some(Fallback::Passthrough)
         );
-        assert_eq!(why(&ModelNames::flagged(&mistral), known), None);
+        assert_eq!(why(&ModelNames::flagged(&pythonic), known), None);
         assert_eq!(why(&ModelNames::flagged(&passthrough), known), None);
 
         // Nothing anywhere: a reasoning name alone that no table answers to, in the labels or
@@ -1267,7 +1268,7 @@ mod tests {
             Some(Fallback::ReasoningNameOnly)
         );
         assert_eq!(
-            why(&labeled(r1, &mistral), unknown),
+            why(&labeled(r1, &pythonic), unknown),
             Some(Fallback::LegacyToolName)
         );
 
