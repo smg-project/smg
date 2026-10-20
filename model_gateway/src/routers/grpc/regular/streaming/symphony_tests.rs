@@ -992,6 +992,130 @@ async fn arguments_that_are_not_json_reach_the_client_whole_and_are_counted() {
     assert!(malformed.ends_with(" 1"), "{malformed}");
 }
 
+/// The same output on the Messages API, whole and streamed: the `tool_use` block's `input` is the
+/// value the accepted prefix's complete members make on both paths (the stream's deltas end at
+/// the break and a client's partial JSON reader closes them; the whole message closes the prefix
+/// the same way), nothing of the tail is text, the stop reason is `tool_use`, and the output is
+/// counted as malformed once, as on the chat path, whose arguments string begins with the prefix.
+#[tokio::test]
+async fn a_messages_call_whose_arguments_are_not_json_carries_the_prefixes_value_whole_and_streamed(
+) {
+    let output =
+        "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": 2.0 * Math.PI}}\n</tool_call>";
+    let spec = || assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    // The whole message.
+    let mut frame = complete(0, "stop");
+    if let Some(proto::generate_response::Response::Complete(complete)) = &mut frame.response {
+        complete.output_ids = output.chars().map(u32::from).collect();
+        complete.completion_tokens = complete.output_ids.len() as u32;
+    }
+    let (stream, server) = scripted_stream(vec![frame], "0").await;
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
+    let (result, scrape) = scraped(
+        ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::disabled(),
+        )
+        .process_non_streaming_messages_response(
+            context::ExecutionResult::Single { stream },
+            spec(),
+            dispatch(),
+            tokenizer,
+            &mut decoder,
+        ),
+    )
+    .await;
+    server.abort();
+    let (message, _) = match result {
+        Ok(message) => message,
+        Err(response) => panic!("the message was refused with {}", response.status()),
+    };
+    let blocks = serde_json::to_value(&message.content).expect("the blocks");
+    assert_eq!(blocks.as_array().map(Vec::len), Some(1), "{blocks}");
+    assert_eq!(blocks[0]["type"], "tool_use", "{blocks}");
+    assert_eq!(blocks[0]["name"], "lookup", "{blocks}");
+    assert_eq!(
+        blocks[0]["input"],
+        json!({"q": 2.0}),
+        "the prefix's complete members, nothing of the tail: {blocks}"
+    );
+    assert_eq!(
+        serde_json::to_value(message.stop_reason).expect("the stop reason"),
+        "tool_use"
+    );
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"qwen3\"", "outcome=\"malformed\""],
+    )
+    .expect("the outputs counter");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    let malformed = series_line(
+        &scrape,
+        "smg_symphony_malformed_total",
+        &["table=\"qwen3\"", "reason=\"invalid_arguments\""],
+    )
+    .expect("the malformed counter");
+    assert!(malformed.ends_with(" 1"), "{malformed}");
+
+    // The stream, cut inside the expression: the block's deltas are the prefix a strict reader
+    // accepts and nothing after the break, no text delta carries any of the tail, and a client's
+    // partial JSON reader closes the prefix into the whole message's input.
+    let ((result, events), scrape) = scraped(message_events(
+        vec![
+            chunk(
+                0,
+                "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": 2.0 * Ma",
+            ),
+            chunk(0, "th.PI}}\n</tool_call>"),
+            complete(0, "stop"),
+        ],
+        spec(),
+        None,
+    ))
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    let partial: String = events
+        .iter()
+        .filter_map(|event| event["delta"]["partial_json"].as_str())
+        .collect();
+    assert_eq!(partial, "{\"q\": 2.0 ");
+    assert!(
+        events
+            .iter()
+            .all(|event| event["delta"]["type"] != "text_delta"),
+        "nothing of the tail is text: {events:?}"
+    );
+    let closed_by_a_client: Value =
+        serde_json::from_str(&format!("{}}}", partial.trim_end())).expect("closed");
+    assert_eq!(closed_by_a_client, blocks[0]["input"]);
+    assert_eq!(message_stop_reason(&events), "tool_use");
+    let malformed = series_line(
+        &scrape,
+        "smg_symphony_malformed_total",
+        &["table=\"qwen3\"", "reason=\"invalid_arguments\""],
+    )
+    .expect("the malformed counter");
+    assert!(malformed.ends_with(" 1"), "{malformed}");
+
+    // The chat path carries the arguments as the model wrote them, a string that begins with the
+    // prefix the Messages paths close.
+    let (choice, _) = fold(output).await;
+    let arguments = choice
+        .message
+        .tool_calls
+        .as_ref()
+        .and_then(|calls| calls.first())
+        .and_then(|call| call.function.arguments.clone())
+        .expect("the chat arguments");
+    assert!(
+        arguments.starts_with(&partial),
+        "{arguments:?} vs {partial:?}"
+    );
+}
+
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn a_clean_whole_output_is_counted_and_writes_nothing() {

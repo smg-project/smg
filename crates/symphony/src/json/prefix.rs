@@ -34,7 +34,7 @@
 //! them; where the judge refuses, the readers say so once, by a `Malformed { InvalidArguments }`
 //! event of no bytes, and send the bytes from there as the model wrote them, nothing twice.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, cmp::Ordering};
 
 /// The nesting the prefix parser allows, which is [`PartialJson::DEFAULT_MAX_DEPTH`].
 const DEEPEST: usize = 32;
@@ -349,6 +349,76 @@ impl Prefix {
         }
         out.push_str(&fragment[copied..]);
         Cow::Owned(out)
+    }
+
+    /// `text`, judged from its start, closed into the whole value its complete members make:
+    /// the bytes up to where they stop being a prefix (or all of them), cut back to the end of
+    /// the last member complete at every level, so that a string, a number or a word cut at the
+    /// end is left out with the key or the comma it was to follow, and the containers still open
+    /// closed. A whole value comes back as it stands, the whitespace before it included and the
+    /// whitespace after it, which the judge refuses, left off; `None` when nothing complete stands
+    /// in `text`: whitespace alone, or a scalar cut short at the top (`"ab`, `nul`, `1.`). What
+    /// comes back is one whole value a strict reader accepts (a number out of the reader's range
+    /// excepted, as at [`Self::feed`]).
+    ///
+    /// This is the value a client's partial JSON reader ends with from the fragments an assembler
+    /// sent: the prefix the judge accepted, complete members only. The Messages adapter reads a
+    /// call's `input` from it where the fragments are no whole JSON (the output cut, or the model
+    /// wrote something else after the prefix), so that the whole message carries what the stream
+    /// gave; a rare path, run once per such call over its arguments.
+    pub fn closed(text: &str) -> Option<String> {
+        let mut judge = Prefix::default();
+        // Up to where each level's content is complete members: the top first, then one entry
+        // per open container, each starting right after its opening bracket.
+        let mut done = vec![0usize];
+        for (at, c) in text.char_indices() {
+            let depth = judge.open.len();
+            let token = judge.token;
+            judge.step(at, c);
+            // A number or a word that `c` ended, or a string that `c` closed, is a complete
+            // member of the innermost container, whatever the judge then said of `c`.
+            let end = match (token, judge.token) {
+                (Token::Num(_) | Token::Lit { .. }, Token::None) => Some(at),
+                (Token::Str { key: false, .. }, Token::None) => Some(at + c.len_utf8()),
+                _ => None,
+            };
+            if let (Some(end), Some(level)) = (end, done.get_mut(depth)) {
+                *level = end;
+            }
+            if judge.invalid.is_some() {
+                break;
+            }
+            match judge.open.len().cmp(&depth) {
+                Ordering::Greater => done.push(at + c.len_utf8()),
+                Ordering::Less => {
+                    done.pop();
+                    if let Some(parent) = done.last_mut() {
+                        *parent = at + c.len_utf8();
+                    }
+                }
+                Ordering::Equal => {}
+            }
+        }
+        let complete = judge.invalid.is_none()
+            && match judge.token {
+                Token::None => matches!(judge.expect, Expect::CommaOrClose | Expect::End),
+                Token::Num(state) => state.whole(),
+                Token::Lit { expected, len, .. } => len == expected.len(),
+                Token::Str { .. } => false,
+            };
+        let cut = if complete { text.len() } else { *done.last()? };
+        if cut == 0 {
+            return None;
+        }
+        let mut out = String::with_capacity(cut + judge.open.len());
+        out.push_str(&text[..cut]);
+        for container in judge.open.iter().rev() {
+            out.push(match container {
+                Container::Object => '}',
+                Container::Array => ']',
+            });
+        }
+        Some(out)
     }
 
     /// One character, at byte offset `at` of the whole text.
@@ -1001,5 +1071,163 @@ mod tests {
         assert_eq!(prefix.feed(r#"{"a": 1 "#), None);
         assert_eq!(prefix.feed(r#""b""#), Some(8));
         assert_eq!(prefix.feed(": 2}"), Some(8));
+    }
+
+    /// The closure of a text: the prefix a strict reader accepts, cut back to its complete
+    /// members and closed. A string, a number or a word cut at the end leaves with the key or the
+    /// comma before it; a number or a word whole at the end stays, as does an empty container; the
+    /// bytes from the first refused byte on are not read, so arguments that stop being JSON close
+    /// where the readers stopped sending them; a whole value is itself, and nothing complete is
+    /// `None`.
+    #[test]
+    fn closed_is_the_prefixs_complete_members_in_their_containers() {
+        for (text, expected) in [
+            // A call whose arguments stop being JSON: the whole arguments as the model wrote them
+            // close where the judge refused (the number ends before the space it refused after),
+            // as the prefix the readers sent closes.
+            (
+                r#"{"start_range": 0, "end_range": 2.0 * Math.PI, "frequency": 5}"#,
+                Some(r#"{"start_range": 0, "end_range": 2.0}"#),
+            ),
+            (
+                r#"{"start_range": 0, "end_range": 2.0 "#,
+                Some(r#"{"start_range": 0, "end_range": 2.0 }"#),
+            ),
+            // The output cut inside a string value: the member leaves, the ones before it stay.
+            (r#"{"drink_id": "lat"#, Some("{}")),
+            (
+                r#"{"city": "Paris", "drink_id": "lat"#,
+                Some(r#"{"city": "Paris"}"#),
+            ),
+            (r#"{"q": "say \"hi\" and"#, Some("{}")),
+            (
+                r#"{"q": "say \"hi\"", "n": 1"#,
+                Some(r#"{"q": "say \"hi\"", "n": 1}"#),
+            ),
+            (r#"{"a": "é", "b": "ü"#, Some(r#"{"a": "é"}"#)),
+            // Cut at a key, a colon or a comma: the member under way leaves, no comma dangles.
+            (r#"{"city": "Paris", "zip"#, Some(r#"{"city": "Paris"}"#)),
+            (r#"{"city": "Paris", "zip""#, Some(r#"{"city": "Paris"}"#)),
+            (r#"{"city": "Paris", "zip":"#, Some(r#"{"city": "Paris"}"#)),
+            (r#"{"city": "Paris", "zip": "#, Some(r#"{"city": "Paris"}"#)),
+            (r#"{"city": "Paris","#, Some(r#"{"city": "Paris"}"#)),
+            (r#"{"city": "Paris", "#, Some(r#"{"city": "Paris"}"#)),
+            (r#"{"a": 1, "b\u00"#, Some(r#"{"a": 1}"#)),
+            ("[1, 2,", Some("[1, 2]")),
+            ("[1, 2, ", Some("[1, 2]")),
+            // A number or a word: whole at the end it stays, cut short it leaves.
+            (
+                r#"{"city": "Paris", "zip": 7"#,
+                Some(r#"{"city": "Paris", "zip": 7}"#),
+            ),
+            (
+                r#"{"city": "Paris", "zip": 7."#,
+                Some(r#"{"city": "Paris"}"#),
+            ),
+            (r#"{"zip": 1e5"#, Some(r#"{"zip": 1e5}"#)),
+            (r#"{"zip": 1e"#, Some("{}")),
+            (r#"{"zip": -"#, Some("{}")),
+            (r#"{"ok": true"#, Some(r#"{"ok": true}"#)),
+            (r#"{"ok": t"#, Some("{}")),
+            (r#"{"ok": null"#, Some(r#"{"ok": null}"#)),
+            (r#"{"ok": nul"#, Some("{}")),
+            ("[1, 2", Some("[1, 2]")),
+            // Open containers close at every level; an empty one stays.
+            (
+                r#"{"a": {"b": 1, "c": [1, 2"#,
+                Some(r#"{"a": {"b": 1, "c": [1, 2]}}"#),
+            ),
+            (
+                r#"{"a": {"b": 1, "c": [1, "x"#,
+                Some(r#"{"a": {"b": 1, "c": [1]}}"#),
+            ),
+            (
+                r#"{"a": {"b": 1, "c": {"#,
+                Some(r#"{"a": {"b": 1, "c": {}}}"#),
+            ),
+            (r#"{"a": ["#, Some(r#"{"a": []}"#)),
+            (
+                r#"{"a": [1, [2, 3], [4"#,
+                Some(r#"{"a": [1, [2, 3], [4]]}"#),
+            ),
+            ("[", Some("[]")),
+            ("{", Some("{}")),
+            (" {", Some(" {}")),
+            // Refused bytes end the reading: a bracket of the wrong kind, a word that is no
+            // literal, a surrogate without its other half, anything after the value.
+            ("[1, 2}", Some("[1, 2]")),
+            (r#"{"a": [1}"#, Some(r#"{"a": [1]}"#)),
+            (r#"{"a": 1, "b": nulx}"#, Some(r#"{"a": 1}"#)),
+            (r#"{"a": 1, "b": "x\ud800y"}"#, Some(r#"{"a": 1}"#)),
+            (r#"{"a": "x\ud800y"}"#, Some("{}")),
+            (r#"{"a": 1} "#, Some(r#"{"a": 1}"#)),
+            (r#"{"a": 1}x"#, Some(r#"{"a": 1}"#)),
+            // A whole value is itself.
+            (r#"{"a": 1}"#, Some(r#"{"a": 1}"#)),
+            (
+                r#" {"a": [1, {"b": null}]}"#,
+                Some(r#" {"a": [1, {"b": null}]}"#),
+            ),
+            ("12", Some("12")),
+            (r#""abc""#, Some(r#""abc""#)),
+            ("true", Some("true")),
+            // Nothing complete.
+            ("", None),
+            ("  ", None),
+            (r#""ab"#, None),
+            ("t", None),
+            ("1.", None),
+            ("-", None),
+            ("not json", None),
+            ("x", None),
+            (r#""x\ud800y""#, None),
+        ] {
+            let closed = Prefix::closed(text);
+            assert_eq!(closed.as_deref(), expected, "{text:?}");
+            if let Some(closed) = closed {
+                assert!(
+                    serde_json::from_str::<serde_json::Value>(&closed).is_ok(),
+                    "{text:?}: {closed:?} is no JSON"
+                );
+            }
+        }
+    }
+
+    /// At every cut of every text of the corpus the closure is one whole value a strict reader
+    /// takes, made of the cut's bytes and closing brackets alone, and closed again it is itself;
+    /// a text that is one whole value comes back as it stands (the whitespace after the value,
+    /// which the judge refuses, left off).
+    #[test]
+    fn closed_at_every_cut_is_one_whole_value_made_of_the_cuts_bytes() {
+        let mut cuts = 0;
+        let mut closures = 0;
+        for text in every_text() {
+            for cut in 0..=text.len() {
+                if !text.is_char_boundary(cut) {
+                    continue;
+                }
+                let prefix = &text[..cut];
+                cuts += 1;
+                let Some(closed) = Prefix::closed(prefix) else {
+                    continue;
+                };
+                closures += 1;
+                assert!(
+                    serde_json::from_str::<serde_json::Value>(&closed).is_ok(),
+                    "{prefix:?}: {closed:?} is no JSON"
+                );
+                let head = closed.trim_end_matches(['}', ']']);
+                assert!(
+                    prefix.starts_with(head),
+                    "{prefix:?}: {closed:?} is not the cut's bytes closed"
+                );
+                assert_eq!(Prefix::closed(&closed).as_deref(), Some(closed.as_str()));
+                if cut == text.len() && serde_json::from_str::<serde_json::Value>(&text).is_ok() {
+                    assert_eq!(closed, text.trim_end(), "a whole value is itself");
+                }
+            }
+        }
+        assert!(cuts > 700, "{cuts} cuts");
+        assert!(closures > 500, "{closures} closures");
     }
 }
