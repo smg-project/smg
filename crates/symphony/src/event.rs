@@ -189,6 +189,40 @@ pub enum MalformedReason {
 }
 
 impl MalformedReason {
+    /// Every reason, in the enum's order: what a reader that labels or counts the reasons
+    /// iterates, so that a reason added to the crate is in its list from the start (the crate's
+    /// own test names every variant beside it; the enum is non-exhaustive outside the crate).
+    pub const ALL: [Self; 28] = [
+        Self::UnterminatedRegion,
+        Self::InvalidArguments,
+        Self::UnknownTool,
+        Self::TextBetweenTags,
+        Self::TagOutOfPlace,
+        Self::TagCutShort,
+        Self::TagTail,
+        Self::EmptyName,
+        Self::CallWithoutName,
+        Self::CallWithoutFunctionTag,
+        Self::SecondFunctionTag,
+        Self::ClosedBeforeTheName,
+        Self::TextWhereTheNameShouldBe,
+        Self::TextBetweenCalls,
+        Self::TextWhereAnArgumentShouldBegin,
+        Self::TextInPlaceOfTheList,
+        Self::TextAfterTheArguments,
+        Self::TextAfterTheList,
+        Self::NameWithoutArguments,
+        Self::NameWithoutACall,
+        Self::KeyWrittenTwice,
+        Self::KeyWithoutAValue,
+        Self::KeyCutShort,
+        Self::ValueCutShort,
+        Self::EmptyKey,
+        Self::BlockWithoutACompleteCall,
+        Self::NoForcedFunction,
+        Self::MarkerOutOfPlace,
+    ];
+
     /// The sentence a log or a report shows for the reason.
     pub fn sentence(self) -> &'static str {
         match self {
@@ -562,6 +596,48 @@ pub fn first_call_only(events: &mut [Event]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_reason_is_in_all_once_in_the_enums_order() {
+        // The match names every variant and has no wildcard arm, so a variant added to the enum
+        // fails this build until the list carries it; the list holds each once, in order.
+        let place = |why: MalformedReason| -> usize {
+            match why {
+                MalformedReason::UnterminatedRegion => 0,
+                MalformedReason::InvalidArguments => 1,
+                MalformedReason::UnknownTool => 2,
+                MalformedReason::TextBetweenTags => 3,
+                MalformedReason::TagOutOfPlace => 4,
+                MalformedReason::TagCutShort => 5,
+                MalformedReason::TagTail => 6,
+                MalformedReason::EmptyName => 7,
+                MalformedReason::CallWithoutName => 8,
+                MalformedReason::CallWithoutFunctionTag => 9,
+                MalformedReason::SecondFunctionTag => 10,
+                MalformedReason::ClosedBeforeTheName => 11,
+                MalformedReason::TextWhereTheNameShouldBe => 12,
+                MalformedReason::TextBetweenCalls => 13,
+                MalformedReason::TextWhereAnArgumentShouldBegin => 14,
+                MalformedReason::TextInPlaceOfTheList => 15,
+                MalformedReason::TextAfterTheArguments => 16,
+                MalformedReason::TextAfterTheList => 17,
+                MalformedReason::NameWithoutArguments => 18,
+                MalformedReason::NameWithoutACall => 19,
+                MalformedReason::KeyWrittenTwice => 20,
+                MalformedReason::KeyWithoutAValue => 21,
+                MalformedReason::KeyCutShort => 22,
+                MalformedReason::ValueCutShort => 23,
+                MalformedReason::EmptyKey => 24,
+                MalformedReason::BlockWithoutACompleteCall => 25,
+                MalformedReason::NoForcedFunction => 26,
+                MalformedReason::MarkerOutOfPlace => 27,
+            }
+        };
+        for (at, why) in MalformedReason::ALL.into_iter().enumerate() {
+            assert_eq!(place(why), at, "{why:?}");
+            assert!(!why.sentence().is_empty(), "{why:?}");
+        }
+    }
 
     #[test]
     fn reasoning_text_tokens_sum_the_reasoning_texts_alone() {

@@ -752,44 +752,14 @@ mod tests {
         assert_eq!(first.at, 0);
     }
 
-    /// Every reason the crate names today, in its order.
-    const KNOWN_REASONS: [MalformedReason; 28] = [
-        MalformedReason::UnterminatedRegion,
-        MalformedReason::InvalidArguments,
-        MalformedReason::UnknownTool,
-        MalformedReason::TextBetweenTags,
-        MalformedReason::TagOutOfPlace,
-        MalformedReason::TagCutShort,
-        MalformedReason::TagTail,
-        MalformedReason::EmptyName,
-        MalformedReason::CallWithoutName,
-        MalformedReason::CallWithoutFunctionTag,
-        MalformedReason::SecondFunctionTag,
-        MalformedReason::ClosedBeforeTheName,
-        MalformedReason::TextWhereTheNameShouldBe,
-        MalformedReason::TextBetweenCalls,
-        MalformedReason::TextWhereAnArgumentShouldBegin,
-        MalformedReason::TextInPlaceOfTheList,
-        MalformedReason::TextAfterTheArguments,
-        MalformedReason::TextAfterTheList,
-        MalformedReason::NameWithoutArguments,
-        MalformedReason::NameWithoutACall,
-        MalformedReason::KeyWrittenTwice,
-        MalformedReason::KeyWithoutAValue,
-        MalformedReason::KeyCutShort,
-        MalformedReason::ValueCutShort,
-        MalformedReason::EmptyKey,
-        MalformedReason::BlockWithoutACompleteCall,
-        MalformedReason::NoForcedFunction,
-        MalformedReason::MarkerOutOfPlace,
-    ];
-
     #[test]
     fn every_reason_the_crate_names_has_a_label_of_its_own_spelled_as_the_crate_spells_it() {
-        // The label is the crate's serde spelling of the reason, so a line, a trace and the
-        // counter agree on the name; no two reasons share a label, and none lands on `other`.
+        // The crate's own list of its reasons (`MalformedReason::ALL`, held to the enum by the
+        // crate's test) drives this: the label is the crate's serde spelling of the reason, so a
+        // line, a trace and the counter agree on the name; no two reasons share a label, none
+        // lands on `other`, and a reason added to the crate fails this test until it has a label.
         let mut labels = std::collections::HashSet::new();
-        for (index, why) in KNOWN_REASONS.into_iter().enumerate() {
+        for (index, why) in MalformedReason::ALL.into_iter().enumerate() {
             let label = reason_label(why);
             let spelled = serde_json::to_value(why).expect("a reason serializes");
             assert_eq!(Some(label), spelled.as_str(), "{why:?}");
