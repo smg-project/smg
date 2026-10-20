@@ -63,7 +63,7 @@ as of `tokenizer/src/*`.
   `tokenizer_config.json` or overridable with an explicit template path.
 - Exposes `apply_chat_template` for JSON message payloads and template parameters.
 - GLM-5.3 and GLM-5.3-Flash use native Rust chat rendering when checkpoint metadata and
-  the shipped template match a supported revision. Custom or unknown templates keep MiniJinja.
+  the template matches the current official one. Any other template keeps MiniJinja.
 
 ### TiktokenTokenizer (`tiktoken.rs`)
 - Wraps the `tiktoken-rs` `CoreBPE` builders (`cl100k_base`, `p50k_base`, `p50k_edit`, `r50k_base`).

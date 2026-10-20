@@ -222,8 +222,6 @@ mod tests {
     fn native_renderer_requires_checkpoint_and_known_template_and_refreshes_on_override() {
         use super::super::Renderer;
         const FLASH: &str = include_str!("../../tests/fixtures/glm53/chat_template_flash.jinja");
-        const FLASH_ORIGINAL: &str =
-            include_str!("../../tests/fixtures/glm53/chat_template_flash_original.jinja");
         for (config, source, expected) in [
             (
                 serde_json::json!({"model_type": "glm_moe_dsa", "architectures": ["GlmMoeDsaForCausalLM"]}),
@@ -233,11 +231,6 @@ mod tests {
             (
                 serde_json::json!({"model_type": "glm5_next", "architectures": ["Glm5NextForConditionalGeneration"]}),
                 FLASH,
-                Some(glm53::Template::Flash),
-            ),
-            (
-                serde_json::json!({"model_type": "glm5_next", "architectures": ["Glm5NextForConditionalGeneration"]}),
-                FLASH_ORIGINAL,
                 Some(glm53::Template::Flash),
             ),
             (

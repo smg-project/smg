@@ -15,14 +15,10 @@ use serde_json::Value;
 
 use crate::chat_template::{self, ChatTemplateParams};
 
-/// Exact shipped templates identify the supported renderer revision. Custom
-/// templates retain MiniJinja; checkpoint metadata alone cannot identify 5.3.
+/// The current official templates identify the supported renderer revision.
+/// Other templates retain MiniJinja; checkpoint metadata alone cannot identify 5.3.
 const TEXT_TEMPLATE: &str = include_str!("../../tests/fixtures/glm53/chat_template.jinja");
 const FLASH_TEMPLATE: &str = include_str!("../../tests/fixtures/glm53/chat_template_flash.jinja");
-const FLASH_TEMPLATE_ORIGINAL: &str =
-    include_str!("../../tests/fixtures/glm53/chat_template_flash_original.jinja");
-const TEXT_TEMPLATE_VLLM: &str =
-    include_str!("../../tests/fixtures/glm53/chat_template_vllm.jinja");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Template {
@@ -35,9 +31,9 @@ impl Template {
         // The shared .jinja loader trims the file and expands literal \n.
         // tokenizer_config.json and set_chat_template retain the original.
         let matches = |known: &str| source == known || source == known.trim().replace("\\n", "\n");
-        if matches(TEXT_TEMPLATE) || matches(TEXT_TEMPLATE_VLLM) {
+        if matches(TEXT_TEMPLATE) {
             Some(Self::Text)
-        } else if matches(FLASH_TEMPLATE) || matches(FLASH_TEMPLATE_ORIGINAL) {
+        } else if matches(FLASH_TEMPLATE) {
             Some(Self::Flash)
         } else {
             None
@@ -485,15 +481,11 @@ mod tests {
         .unwrap();
         let loaded_text = TEXT_TEMPLATE.trim().replace("\\n", "\n");
         let loaded_flash = FLASH_TEMPLATE.trim().replace("\\n", "\n");
-        let loaded_flash_original = FLASH_TEMPLATE_ORIGINAL.trim().replace("\\n", "\n");
         for (source, template) in [
             (TEXT_TEMPLATE, Template::Text),
-            (TEXT_TEMPLATE_VLLM, Template::Text),
             (FLASH_TEMPLATE, Template::Flash),
-            (FLASH_TEMPLATE_ORIGINAL, Template::Flash),
             (loaded_text.as_str(), Template::Text),
             (loaded_flash.as_str(), Template::Flash),
-            (loaded_flash_original.as_str(), Template::Flash),
         ] {
             assert_eq!(Template::detect(source), Some(template));
             let jinja = ChatTemplateState::new(Some(source.into())).unwrap();
