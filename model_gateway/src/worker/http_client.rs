@@ -44,6 +44,8 @@ fn tune_http2(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
 /// process-constant, so they apply to every entry instead of keying it.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct ClientKey {
+    /// Below `timeout_secs` (see `key`): the connect phase must time out as
+    /// a connect failure, never as the request's own timeout.
     connect_timeout_secs: u64,
     pool_max_idle_per_host: usize,
     /// `0` keeps idle connections indefinitely.
@@ -100,19 +102,28 @@ impl WorkerHttpClientCache {
     }
 
     fn key(&self, pool_config: &HttpPoolConfig, http2: bool) -> ClientKey {
+        let timeout_secs = pool_config
+            .timeout_secs
+            .unwrap_or(self.request_timeout_secs);
+        // The connect timeout stays below the request timeout. A total timeout
+        // that runs out while the connect is still pending reads as the
+        // request's own (`retry::is_request_timeout`: terminal for the retry
+        // layer), so a host that has gone dark must fail as a connect timeout
+        // first, which the retry layer routes around; with the defaults (10 s
+        // against 1800 s) nothing changes.
+        let connect_timeout_secs = pool_config
+            .connect_timeout_secs
+            .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS)
+            .min(timeout_secs.saturating_sub(1).max(1));
         ClientKey {
-            connect_timeout_secs: pool_config
-                .connect_timeout_secs
-                .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
+            connect_timeout_secs,
             pool_max_idle_per_host: pool_config
                 .pool_max_idle_per_host
                 .unwrap_or(DEFAULT_POOL_MAX_IDLE_PER_HOST),
             pool_idle_timeout_secs: pool_config
                 .pool_idle_timeout_secs
                 .unwrap_or(self.pool_idle_timeout_secs),
-            timeout_secs: pool_config
-                .timeout_secs
-                .unwrap_or(self.request_timeout_secs),
+            timeout_secs,
             http2,
         }
     }
@@ -432,6 +443,59 @@ mod tests {
             axum::serve(listener, app).await.expect("echo serve");
         });
         format!("http://{addr}/probe")
+    }
+
+    /// The connect timeout never reaches the request timeout: a request
+    /// timeout of 2 s clamps the default 10 s connect timeout to 1 s, a
+    /// worker's own 30 s request timeout leaves it at 10 s, and an explicit
+    /// connect timeout above the request timeout is clamped the same way, so
+    /// a host that has gone dark fails as a connect timeout (routed around)
+    /// before the request's own timeout (terminal) can fire.
+    #[test]
+    fn connect_timeout_stays_below_the_request_timeout() {
+        let short = cache(RouterConfig {
+            request_timeout_secs: 2,
+            ..RouterConfig::default()
+        });
+        assert_eq!(
+            short
+                .key(&HttpPoolConfig::default(), false)
+                .connect_timeout_secs,
+            1
+        );
+        assert_eq!(
+            short
+                .key(
+                    &HttpPoolConfig {
+                        timeout_secs: Some(30),
+                        ..Default::default()
+                    },
+                    false
+                )
+                .connect_timeout_secs,
+            DEFAULT_CONNECT_TIMEOUT_SECS
+        );
+        assert_eq!(
+            short
+                .key(
+                    &HttpPoolConfig {
+                        connect_timeout_secs: Some(3),
+                        ..Default::default()
+                    },
+                    false
+                )
+                .connect_timeout_secs,
+            1
+        );
+        let long = cache(RouterConfig {
+            request_timeout_secs: 1800,
+            ..RouterConfig::default()
+        });
+        let key = long.key(&HttpPoolConfig::default(), false);
+        assert_eq!(
+            (key.connect_timeout_secs, key.timeout_secs),
+            (DEFAULT_CONNECT_TIMEOUT_SECS, 1800)
+        );
     }
 
     #[test]
