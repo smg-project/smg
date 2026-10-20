@@ -310,8 +310,9 @@ What the table says beyond the others:
   and the answer another, so an engine that starts a grammar after its reasoning parser hands
   over at `<|content_text|>`, not at the thought's `<|end_message|>`, which ends every message
   alike. `Format::answer_grammar` writes the thought the model may write first (its message,
-  closed, and `<|message_model|>`), then `<|content_text|>` as optional, unless the engine says
-  it starts at the first token, then the schema and `<|end_message|>`: an engine that consumed the
+  closed, and `<|message_model|>`) with `<|content_text|>` owed after it, or `<|content_text|>`
+  alone as optional unless the engine says it starts at the first token, then the schema and
+  `<|end_message|>`: an engine that consumed the
   model's own marker writes the JSON at once, one that starts before the thought writes the
   marker itself. Before this, the tag's `begin` wrote the marker again after the model's own on
   such an engine, and the answer came back as `<|content_text|>{...}`.
