@@ -21,8 +21,9 @@
 //! rejects the whole poll, and the last good one stays. A job that cannot be
 //! placed is left out alone: one whose hostlist does not expand, with a node
 //! `scontrol` does not know or without a usable address, or running with no
-//! start time. So is an address two placements claim, since which job's
-//! server holds the port is unknown. What a poll leaves out is counted on
+//! start time. An address two placements claim stays with the job that
+//! started first, whose server holds the port since a later one cannot bind
+//! it, and is left out for the others. What a poll leaves out is counted on
 //! `smg_discovery_skipped_total` and logged when it first appears.
 //!
 //! `squeue`'s answer is filtered again here, by cluster, state, name, user,
@@ -391,38 +392,40 @@ async fn poll(
                 compat_labels: BTreeMap::new(),
             });
         }
-        placed.extend(workers);
+        let started = (*start_time, job.id);
+        placed.extend(workers.into_iter().map(|worker| (started, worker)));
     }
 
     // Two placements at one address: Slurm shares a node between jobs unless
-    // they run `--exclusive`, but only one server can listen on the port.
-    let mut claims: HashMap<EndpointKey, Vec<String>> = HashMap::new();
-    for worker in &placed {
-        claims
+    // they run `--exclusive`, but only one server can listen on the port. The
+    // job that started first (the lower id within a second) holds it, as a
+    // later server cannot bind a port in use, so it keeps the address.
+    let mut holders: HashMap<EndpointKey, ((i64, u64), String)> = HashMap::new();
+    for (started, worker) in &placed {
+        let holder = holders
             .entry(worker.endpoint.key())
-            .or_default()
-            .push(worker.discovery_id.clone());
-    }
-    let mut conflicts: Vec<Skip> = Vec::new();
-    for worker in &placed {
-        let ids = &claims[&worker.endpoint.key()];
-        if ids.len() > 1 && ids[0] == worker.discovery_id {
-            conflicts.push(Skip {
-                reason: metrics_labels::DISCOVERY_SKIP_CONFLICT,
-                message: format!(
-                    "{} all place a worker at {}, where one server listens on the configured \
-                     port; run worker jobs with --exclusive",
-                    ids.join(", "),
-                    worker.endpoint.redacted()
-                ),
-            });
+            .or_insert_with(|| (*started, worker.discovery_id.clone()));
+        if *started < holder.0 {
+            *holder = (*started, worker.discovery_id.clone());
         }
     }
-    skipped.extend(conflicts);
-    let workers = placed
-        .into_iter()
-        .filter(|worker| claims[&worker.endpoint.key()].len() == 1)
-        .collect();
+    let mut workers = Vec::new();
+    for (_, worker) in placed {
+        let (_, holder) = &holders[&worker.endpoint.key()];
+        if *holder == worker.discovery_id {
+            workers.push(worker);
+            continue;
+        }
+        skipped.push(Skip {
+            reason: metrics_labels::DISCOVERY_SKIP_CONFLICT,
+            message: format!(
+                "{} places a worker at {}, where {holder} started first and holds the \
+                 configured port; run worker jobs with --exclusive",
+                worker.discovery_id,
+                worker.endpoint.redacted()
+            ),
+        });
+    }
     Ok(PollOutcome { workers, skipped })
 }
 
@@ -1353,11 +1356,12 @@ mod tests {
     }
 
     /// Slurm shares a node between jobs unless they run `--exclusive`, but
-    /// only one server can listen on the port, and which one is unknown: the
-    /// address is left out for every job claiming it, and every other
-    /// placement stands, a job's other nodes included.
+    /// only one server can listen on the port: the one of the job that
+    /// started first, as a later server cannot bind a port in use. That job
+    /// keeps the address, a later one is left out there, and every other
+    /// placement stands, the later job's other nodes included.
     #[tokio::test]
-    async fn two_jobs_on_one_node_leave_that_address_out() {
+    async fn two_jobs_on_one_node_leave_it_to_the_first_started() {
         let mut slurm = FakeSlurm::recorded();
         // Job 2 shares job 1's node, and has a node of its own too.
         slurm.job_mut(2).nodes = "n1,n2".to_string();
@@ -1368,17 +1372,43 @@ mod tests {
         config
             .roles
             .insert("smg-decode".to_string(), WorkerType::Regular);
+        let on_n1 = |outcome: &PollOutcome| {
+            let worker = outcome
+                .workers
+                .iter()
+                .find(|worker| worker.endpoint.render() == "10.0.1.1:8000");
+            worker.unwrap().discovery_id.clone()
+        };
+        let conflict = |outcome: &PollOutcome| {
+            assert_eq!(outcome.skipped.len(), 1, "{:?}", outcome.skipped);
+            let skip = outcome.skipped[0].clone();
+            assert_eq!(skip.reason, metrics_labels::DISCOVERY_SKIP_CONFLICT);
+            skip.message
+        };
 
+        // Started in the same second as job 1, job 2 is taken as the later.
         let outcome = poll(&slurm, &config).await.unwrap();
-        assert_eq!(urls_of(&outcome), ["10.0.1.2:8000", "10.0.1.4:8000"]);
-        assert_eq!(outcome.skipped.len(), 1, "{:?}", outcome.skipped);
-        let skip = &outcome.skipped[0];
-        assert_eq!(skip.reason, metrics_labels::DISCOVERY_SKIP_CONFLICT);
+        let urls = ["10.0.1.1:8000", "10.0.1.2:8000", "10.0.1.4:8000"];
+        assert_eq!(urls_of(&outcome), urls);
+        assert!(on_n1(&outcome).starts_with("smgtest/1/"));
+        let message = conflict(&outcome);
         assert!(
-            skip.message.contains("place a worker at 10.0.1.1:8000"),
-            "{skip:?}"
+            message.starts_with("smgtest/2/")
+                && message.contains("places a worker at 10.0.1.1:8000, where smgtest/1/"),
+            "{message}"
         );
-        assert!(skip.message.contains("smgtest/1/") && skip.message.contains("smgtest/2/"));
+
+        // Started a second before job 1, job 2 keeps the node.
+        let first = slurm.job_mut(1).start_time.unwrap();
+        slurm.job_mut(2).start_time = Some(first - 1);
+        let outcome = poll(&slurm, &config).await.unwrap();
+        assert_eq!(urls_of(&outcome), urls);
+        assert!(on_n1(&outcome).starts_with("smgtest/2/"));
+        let message = conflict(&outcome);
+        assert!(
+            message.starts_with("smgtest/1/") && message.contains("where smgtest/2/"),
+            "{message}"
+        );
     }
 
     /// With no job to place, `scontrol` is not asked about nodes at all: asked

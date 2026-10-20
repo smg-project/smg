@@ -204,7 +204,7 @@ pub mod metrics_labels {
     pub const SNAPSHOT_ERROR_INVALID: &str = "invalid";
 
     // Discovered workers a provider left out of an otherwise good snapshot:
-    // their record could not be used, or two claimed one address
+    // their record could not be used, or one started earlier at their address
     pub const DISCOVERY_SKIP_INVALID: &str = "invalid";
     pub const DISCOVERY_SKIP_CONFLICT: &str = "conflict";
 
