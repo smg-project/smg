@@ -1136,12 +1136,10 @@ async fn structured_output_backend_follows_the_launcher_config() {
     }
 
     // `auto` is xgrammar for every constraint: a Lark grammar goes there
-    // unchanged (vLLM 0.30 parses Lark there), a schema with a feature
-    // xgrammar lacks goes there too (sent to guidance, as vLLM's own frontend
-    // would, it pins a fresh engine on guidance and fails every structural
-    // tag after it), and a choice is lowered to the grammar xgrammar
-    // compiles. The streams stay open so no abort interleaves with the
-    // engine's inbound requests.
+    // unchanged (vLLM 0.30 parses Lark there) and a choice is lowered to the
+    // grammar xgrammar compiles; a schema with a feature xgrammar lacks is
+    // refused before the engine (below). The streams stay open so no abort
+    // interleaves with the engine's inbound requests.
     let mut h = harness(model_info(), None).await;
     let lark = "start: \"yes\" | \"no\"";
     let mut streams = Vec::new();
@@ -1151,14 +1149,6 @@ async fn structured_output_backend_follows_the_launcher_config() {
             Constraint::Grammar(lark.to_string()),
             StructuredOutputBackend::Xgrammar,
             StructuredOutputConstraint::Grammar(lark.to_string()),
-        ),
-        (
-            "so3",
-            Constraint::JsonSchema(r#"{"type":"integer","multipleOf":3}"#.to_string()),
-            StructuredOutputBackend::Xgrammar,
-            StructuredOutputConstraint::Json(
-                serde_json::json!({"type": "integer", "multipleOf": 3}),
-            ),
         ),
         (
             "so4",
@@ -1186,6 +1176,16 @@ async fn structured_output_backend_follows_the_launcher_config() {
         assert_eq!(structured.backend, expected_backend, "{id}");
         assert_eq!(structured.constraint, expected_constraint, "{id}");
     }
+    // A schema with a feature xgrammar lacks is refused under `auto` before it
+    // reaches the engine, as vLLM's frontend refuses it under
+    // `backend=xgrammar`: xgrammar would compile it with the keyword dropped
+    // and the engine would answer off the schema.
+    let mut request = generate_request("so3", true, Vec::new());
+    request.sampling_params.as_mut().unwrap().constraint = Some(Constraint::JsonSchema(
+        r#"{"type":"integer","multipleOf":3}"#.to_string(),
+    ));
+    let status = h.client.generate(request).await.expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
     drop(streams);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

@@ -17,10 +17,11 @@ use crate::error::{Error, Result};
 /// on every constraint: a structural tag in the triggered-tags format
 /// compiles on xgrammar alone (guidance's parser knows only the legacy
 /// structures/triggers shape), so an engine that may receive one must settle
-/// on xgrammar whichever constraint reaches it first. A JSON schema with
-/// features xgrammar does not compile fails on its own request at the
-/// engine's grammar build, instead of pinning guidance and failing every
-/// structural tag after it.
+/// on xgrammar whichever constraint reaches it first. xgrammar compiles a
+/// JSON schema with features it lacks with those keywords dropped (an answer
+/// off the schema, not an error), so a sender that stamps it refuses such a
+/// schema before it reaches the engine, as vLLM's frontend does under
+/// `backend=xgrammar` ([`has_xgrammar_unsupported_json_features`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StructuredOutputBackend {
@@ -101,8 +102,11 @@ impl StructuredOutputsParams {
     }
 
     /// The constraint under the default backend. A choice stays a choice
-    /// here; [`with_backend`](Self::with_backend) lowers it to the grammar
-    /// xgrammar compiles when it pins that backend.
+    /// here: the sender pins the engine's backend through
+    /// [`with_backend`](Self::with_backend) before it sends, which lowers a
+    /// choice to the grammar xgrammar compiles and keeps it for a backend
+    /// that serves choices itself (guidance); lowering here would hand that
+    /// backend a grammar it does not parse.
     fn from_constraint(constraint: StructuredOutputConstraint) -> Self {
         Self {
             constraint,
@@ -152,6 +156,127 @@ pub fn choice_as_grammar(choices: &[String]) -> String {
         .map(|choice| format!("\"{}\"", escape(choice)))
         .collect();
     format!("root ::= {}", alternatives.join(" | "))
+}
+
+/// Whether a nested schema value (an object, or an array of objects) fails
+/// `check`, the recursion both feature checks share.
+fn any_nested(obj: &serde_json::Map<String, Value>, check: fn(&Value) -> bool) -> bool {
+    obj.values().any(|value| match value {
+        Value::Object(_) => check(value),
+        Value::Array(items) => items.iter().any(|item| item.is_object() && check(item)),
+        _ => false,
+    })
+}
+
+/// vLLM's `has_xgrammar_unsupported_json_features`
+/// (`v1/structured_output/backend_xgrammar.py`), keyword for keyword: the
+/// schema features xgrammar's converter drops instead of refusing. vLLM's
+/// frontend refuses such a schema with a 400 under `backend=xgrammar`
+/// (`validate_xgrammar_grammar`); a sender stamping xgrammar does the same. A
+/// schema given as a string is parsed as the frontend parses it; one that is
+/// not JSON is left to xgrammar, which refuses it at compile.
+pub fn has_xgrammar_unsupported_json_features(schema: &Value) -> bool {
+    const STRING_SUPPORTED_FORMATS: [&str; 14] = [
+        "email",
+        "date",
+        "time",
+        "date-time",
+        "duration",
+        "ipv4",
+        "ipv6",
+        "hostname",
+        "uuid",
+        "uri",
+        "uri-reference",
+        "uri-template",
+        "json-pointer",
+        "relative-json-pointer",
+    ];
+    fn schema_types(obj: &serde_json::Map<String, Value>) -> Vec<&str> {
+        match obj.get("type") {
+            Some(Value::String(one)) => vec![one.as_str()],
+            Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).collect(),
+            _ => Vec::new(),
+        }
+    }
+    fn has_pattern_and_length_bounds(obj: &serde_json::Map<String, Value>) -> bool {
+        (obj.contains_key("pattern") || obj.contains_key("format"))
+            && (obj.contains_key("minLength") || obj.contains_key("maxLength"))
+    }
+    fn check(value: &Value) -> bool {
+        let Value::Object(obj) = value else {
+            return false;
+        };
+        let types = schema_types(obj);
+        let has = |kind: &str| types.contains(&kind);
+        if (has("integer") || has("number")) && obj.contains_key("multipleOf") {
+            return true;
+        }
+        if has("array")
+            && ["uniqueItems", "contains", "minContains", "maxContains"]
+                .iter()
+                .any(|key| obj.contains_key(*key))
+        {
+            return true;
+        }
+        if has("string")
+            && obj.get("format").is_some_and(|format| {
+                !format
+                    .as_str()
+                    .is_some_and(|format| STRING_SUPPORTED_FORMATS.contains(&format))
+            })
+        {
+            return true;
+        }
+        // xgrammar drops minLength/maxLength next to a pattern or format.
+        if has("string") && has_pattern_and_length_bounds(obj) {
+            return true;
+        }
+        if has("object")
+            && obj
+                .get("propertyNames")
+                .and_then(Value::as_object)
+                .is_some_and(has_pattern_and_length_bounds)
+        {
+            return true;
+        }
+        // propertyNames conflicts with the other property keywords.
+        if has("object")
+            && obj.contains_key("propertyNames")
+            && (obj.contains_key("properties")
+                || obj.contains_key("patternProperties")
+                || obj
+                    .get("additionalProperties")
+                    .is_some_and(Value::is_object)
+                || obj
+                    .get("unevaluatedProperties")
+                    .is_some_and(|value| *value != Value::Bool(true)))
+        {
+            return true;
+        }
+        // Several patternProperties, or one next to properties, conflict.
+        if has("object")
+            && obj
+                .get("patternProperties")
+                .and_then(Value::as_object)
+                .is_some_and(|patterns| obj.contains_key("properties") || patterns.len() > 1)
+        {
+            return true;
+        }
+        any_nested(obj, check)
+    }
+    let parsed: Value;
+    let schema = match schema {
+        Value::String(text) => match serde_json::from_str::<Value>(text) {
+            Ok(value) => {
+                parsed = value;
+                &parsed
+            }
+            Err(_) => return false,
+        },
+        other => other,
+    };
+    check(schema)
 }
 
 /// `true` when a boolean is `false`; used to drop default-`false` flags from the
@@ -410,6 +535,45 @@ mod tests {
             serde_json::to_value(StructuredOutputsParams::structural_tag(r#"{"format":{}}"#))
                 .unwrap();
         assert_eq!(value["structural_tag"], r#"{"format":{}}"#);
+    }
+
+    /// vLLM's static xgrammar feature check, the one a sender stamping
+    /// xgrammar refuses a schema by: the keywords xgrammar would drop, nested
+    /// and under a list-valued type as well; a plain object passes, and a
+    /// schema string is parsed as the frontend parses it.
+    #[test]
+    fn xgrammar_unsupported_features_are_detected() {
+        let lacks = |schema: Value| has_xgrammar_unsupported_json_features(&schema);
+        assert!(!lacks(
+            serde_json::json!({"type": "object", "properties": {"a": {"type": "integer"}}})
+        ));
+        assert!(lacks(
+            serde_json::json!({"type": "integer", "multipleOf": 5})
+        ));
+        // Nested, and under a list-valued type.
+        assert!(lacks(
+            serde_json::json!({"type": "object", "properties": {"tags": {
+            "type": ["array", "null"], "uniqueItems": true}}})
+        ));
+        assert!(!lacks(
+            serde_json::json!({"type": "string", "format": "email"})
+        ));
+        assert!(lacks(
+            serde_json::json!({"type": "string", "format": "iri"})
+        ));
+        assert!(lacks(
+            serde_json::json!({"type": "string", "pattern": "^a", "maxLength": 3})
+        ));
+        assert!(lacks(serde_json::json!({"type": "object",
+            "propertyNames": {"pattern": "^x"}, "properties": {"x": {}}})));
+        assert!(lacks(serde_json::json!({"type": "object",
+            "patternProperties": {"^a": {}, "^b": {}}})));
+        // A schema string is parsed like the frontend parses it; one that is
+        // not JSON is left to xgrammar.
+        assert!(lacks(Value::String(
+            r#"{"type":"number","multipleOf":0.5}"#.into()
+        )));
+        assert!(!lacks(Value::String("not json".into())));
     }
 
     #[test]

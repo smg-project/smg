@@ -1252,7 +1252,8 @@ mod tests {
     /// constraint comes first, every later one carries the backend the engine
     /// settled on, and that backend is the one a structural tag compiles on,
     /// so the kind of the first request never decides whether a forced tool
-    /// call compiles later.
+    /// call compiles later; a schema that backend cannot enforce is refused
+    /// before the engine instead of being answered off the schema.
     #[tokio::test]
     async fn the_first_structured_request_never_strands_a_later_one() {
         use engine_zmq_client::protocol::vllm::structured_outputs::{
@@ -1332,12 +1333,16 @@ mod tests {
                 stream: true,
                 ..Default::default()
             };
-            streams.push(
-                client
-                    .generate_vllm_streams(request)
-                    .await
-                    .expect("generate"),
-            );
+            let outcome = client.generate_vllm_streams(request).await;
+            if id == "schema-xgrammar-lacks" {
+                // Refused before the engine, as vLLM's frontend refuses it
+                // under `backend=xgrammar`: xgrammar would compile it with
+                // `multipleOf` dropped and answer off the schema.
+                let status = outcome.err().expect("refused");
+                assert_eq!(status.code(), Code::InvalidArgument, "{id}");
+                continue;
+            }
+            streams.push(outcome.expect("generate"));
             let EngineInbound::Add(engine_request) = engine.recv().await.expect("inbound") else {
                 panic!("{id}: expected an add request");
             };
