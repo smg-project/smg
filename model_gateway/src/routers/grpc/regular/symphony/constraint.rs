@@ -767,9 +767,14 @@ mod tests {
                 }
             })
         };
-        let unknown = tag_of(symphony::GrammarStart::Unknown).expect("a tag with the prefix");
-        assert_eq!(unknown["format"]["elements"][0]["type"], "any_text");
-        assert_eq!(unknown["format"]["elements"][1]["type"], "json_schema");
+        // Where the workers do not say, the answer takes no prefix either: free text before a
+        // schema constrains nothing, so the schema stands alone and goes to the engine as the
+        // request's own, as it does after the gate.
+        assert_eq!(
+            tag_of(symphony::GrammarStart::Unknown),
+            None,
+            "the schema stands alone where the workers do not say"
+        );
         assert_eq!(
             tag_of(symphony::GrammarStart::AfterReasoning),
             None,
@@ -1270,16 +1275,12 @@ mod tests {
         assert!(answer(&ModelNames::default(), content_first.clone(), false)
             .expect("read")
             .is_none());
-        // With the prompt inside the thought, the schema follows the prefix a forced call takes,
-        // free text that closes the thought, so the JSON is not written inside it.
-        let led = tag_of(answer(&ModelNames::default(), content_first, true));
-        assert_eq!(led["format"]["type"], "sequence", "{led}");
-        assert_eq!(led["format"]["elements"][0]["type"], "any_text", "{led}");
-        assert_eq!(
-            led["format"]["elements"][1],
-            json!({"type": "json_schema", "json_schema": {"type": "object"}}),
-            "{led}"
-        );
+        // With the prompt inside the thought and the engine silent on where it starts the
+        // grammar, the schema stands alone as well: a free-text prefix would let the answer run
+        // on unconstrained, and the engine's own constraint applies where the engine starts.
+        assert!(answer(&ModelNames::default(), content_first, true)
+            .expect("read")
+            .is_none());
         // A table that admits a thought before its answer (MiniMax M3's) keeps that tag with the
         // thought closed: the thought the model may write first, then the schema.
         let thought_first = tag_of(answer(
