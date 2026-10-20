@@ -112,7 +112,9 @@ whole JSON follows. So the schema stands alone where the engine runs a reasoning
 the grammar after the model's own close, and where the engine does not say where it starts, the
 engine's own constraint applied where the engine starts; where it says it starts at the first
 token, the thought as a tag closed by its own marker leads the schema, so the model thinks before
-it answers and free text cannot run on after the close. A table may bound the runs of whitespace the answer's JSON holds between
+it answers and free text cannot run on after the close; where the engines a request may run on
+name different starts (`GrammarStart::Either`), no one tag fits both and the answer keeps the
+prefix, loosely, as a forced call does. A table may bound the runs of whitespace the answer's JSON holds between
 its tokens (`Format::bounds_answer_whitespace`, written as xgrammar's `max_whitespace_cnt` on the
 answer's schema node; an xgrammar before 0.2.7 ignores the key): a model held to its answer's JSON
 after a long thought, by an engine that starts the grammar at the first token, may drift into tabs
