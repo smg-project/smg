@@ -1,5 +1,7 @@
-//! The chat renderers with an encoder of their own, and what each answers
-//! for the template questions the gateway asks around a render.
+//! The chat renderers with an encoder of their own, what each answers for
+//! the template questions the gateway asks around a render, and the segment
+//! form of a prompt such a renderer hands its backend: control tokens the
+//! renderer wrote, and plain text in which the same spellings stay text.
 
 use std::collections::HashMap;
 
@@ -16,6 +18,42 @@ pub mod deepseek_v4;
 pub mod deepseek_v41;
 pub mod kimi_k25_tools;
 pub mod kimi_k3_xtml;
+pub(crate) mod marks;
+
+/// One piece of a rendered prompt, tagged with how special-token strings in
+/// it must be encoded (the Kimi reference's `EncodeSegment { text,
+/// allow_special }`; the DeepSeek reference's special ranges). Each backend
+/// encodes a list of these: the tiktoken backend for the K3 renderer, the
+/// Hugging Face backend for the DeepSeek renderers (see `marks`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptSegment {
+    pub(crate) text: String,
+    /// `true`: special-token strings map to their control ids (structural
+    /// markers emitted by the renderer). `false`: ordinary BPE, so a literal
+    /// marker string inside message text stays text.
+    pub(crate) allow_special: bool,
+}
+
+impl PromptSegment {
+    pub(crate) fn control(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            allow_special: true,
+        }
+    }
+
+    pub(crate) fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            allow_special: false,
+        }
+    }
+}
+
+/// The flat prompt string: segment texts concatenated in order.
+pub(crate) fn join_segments(segments: &[PromptSegment]) -> String {
+    segments.iter().map(|s| s.text.as_str()).collect()
+}
 
 /// A renderer's own rule for the thinking mode a request renders with, from
 /// the template kwargs and the request's `thinking` field.

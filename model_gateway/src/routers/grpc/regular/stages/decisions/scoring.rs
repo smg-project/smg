@@ -192,8 +192,15 @@ fn render_prompt(tokenizer: &Arc<dyn Tokenizer>, content: &str) -> Result<String
     if !matches!(rendered.encoding, PromptEncoding::FromText)
         || rendered.unbilled_prompt_tokens != 0
     {
+        // A renderer that prepared the encode itself: a template rendered by
+        // segments, or a control-token spelling inside the request text that
+        // the renderer keeps as text. Decisions encodes its prompt and the
+        // answer labels from the text, so it needs a text that encodes to
+        // the prompt's ids.
         return Err(
-            "Decisions requires a lossless text chat template, not a deferred prompt encoder"
+            "Decisions requires a prompt whose text encodes to its ids: this renderer \
+                    prepared a deferred encode (a template rendered by segments, or a \
+                    control-token spelling inside the request text)"
                 .into(),
         );
     }
@@ -567,7 +574,7 @@ mod tests {
     async fn rejects_deferred_encoders_before_label_scoring() {
         let tokenizer = Arc::new(MockTokenizer::new().with_deferred_chat_ids(vec![1]));
         let result = prepare_decisions(&request(), tokenizer, false).await;
-        assert!(result.err().unwrap().contains("encoder"));
+        assert!(result.err().unwrap().contains("deferred encode"));
     }
 
     #[tokio::test]

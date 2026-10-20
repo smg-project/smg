@@ -15,10 +15,6 @@ use serde_json::Value;
 // here because it is part of this module's public API, and `pub(super)` items
 // are not reachable from outside `encoders` on their own.
 pub use super::deepseek_common::DsEncodingError;
-// The family's special tokens: the private markers for this module, the
-// public ones re-exported under this renderer's path (the formatter keeps
-// every `use` in this block; the version's own constants follow the imports).
-use super::deepseek_common::{ASSISTANT_SP_TOKEN, LATEST_REMINDER_SP_TOKEN, USER_SP_TOKEN};
 pub use super::deepseek_common::{
     BOS_TOKEN, DSML_TOKEN, EOS_TOKEN, THINKING_END_TOKEN, THINKING_START_TOKEN,
 };
@@ -38,6 +34,16 @@ use super::{
     },
     RendererProfile,
 };
+// The family's special tokens: the private markers for this module, the
+// public ones re-exported under this renderer's path (the formatter keeps
+// every `use` in this block; the version's own constants follow the imports).
+use super::{
+    deepseek_common::{
+        mark_grounding_tokens, ASSISTANT, BOS, DSML, EOS, LATEST_REMINDER, THINKING_END,
+        THINKING_START, USER,
+    },
+    marks::{self, control},
+};
 use crate::{
     chat_template::{ChatTemplateContentFormat, ThinkingKeyName, ThinkingToggle},
     traits::RendererCapabilities,
@@ -52,7 +58,11 @@ use crate::{
 /// What every image content part renders as; the image payload itself is the
 /// serving layer's business, the prompt only carries this marker.
 pub const IMAGE_PLACEHOLDER: &str = "<｜deepseek_image｜>";
-const SYSTEM_SP_TOKEN: &str = "<｜System｜>";
+/// The placeholder as the renderer writes it for an image part: a control
+/// token of its own (the spelling typed in text is refused, see
+/// `validate_no_image_sp_tokens`).
+const IMAGE: &str = control!("<｜deepseek_image｜>");
+const SYSTEM: &str = control!("<｜System｜>");
 /// V4.1's DSML dialect: a leading space on the block name and on both tags
 /// (V4 uses bare `tool_calls`/`invoke`/`parameter`).
 const TOOL_CALLS_BLOCK_NAME: &str = " calls";
@@ -255,7 +265,7 @@ fn flatten_content_parts(parts: &[Value]) -> Result<String, DsEncodingError> {
                 }
                 texts.push(text);
             }
-            "image" | "image_url" | "input_image" | "image_pil" => texts.push(IMAGE_PLACEHOLDER),
+            "image" | "image_url" | "input_image" | "image_pil" => texts.push(IMAGE),
             other => return Err(DsEncodingError::UnsupportedContentPart(other.to_string())),
         }
     }
@@ -354,7 +364,7 @@ fn render_message(
         "developer" => render_developer(&turn, &mut prompt)?,
         "user" => render_user(&turn, &mut prompt),
         "latest_reminder" => {
-            prompt.push_str(LATEST_REMINDER_SP_TOKEN);
+            prompt.push_str(LATEST_REMINDER);
             prompt.push_str(turn.content);
         }
         "tool" => return Err(DsEncodingError::UnmergedToolRole(index)),
@@ -391,7 +401,7 @@ fn render_prefix(
         render_reasoning_effort(turn.index, thinking_mode, reasoning_effort);
     let mut prompt = String::new();
     if turn.index == 0 && (!reasoning_effort_prompt.is_empty() || turn.role == "system") {
-        prompt.push_str(SYSTEM_SP_TOKEN);
+        prompt.push_str(SYSTEM);
     }
     prompt.push_str(&reasoning_effort_prompt);
     prompt
@@ -401,7 +411,7 @@ fn render_prefix(
 /// tools and the response format follow the content.
 fn render_system(turn: &Turn<'_>, prompt: &mut String) {
     if turn.index > 0 {
-        prompt.push_str(SYSTEM_SP_TOKEN);
+        prompt.push_str(SYSTEM);
     }
     prompt.push_str(turn.content);
     push_tools_and_response_format(turn, prompt);
@@ -415,7 +425,7 @@ fn render_developer(turn: &Turn<'_>, prompt: &mut String) -> Result<(), DsEncodi
             msg: turn.msg.to_string(),
         });
     }
-    prompt.push_str(USER_SP_TOKEN);
+    prompt.push_str(USER);
     prompt.push_str(turn.content);
     push_tools_and_response_format(turn, prompt);
     Ok(())
@@ -437,7 +447,7 @@ fn push_tools_and_response_format(turn: &Turn<'_>, prompt: &mut String) {
 /// A user turn: its content blocks (text and the tool results
 /// `merge_tool_messages` folded in) joined by blank lines, else its content.
 fn render_user(turn: &Turn<'_>, prompt: &mut String) {
-    prompt.push_str(USER_SP_TOKEN);
+    prompt.push_str(USER);
     let blocks = turn
         .msg
         .get("content_blocks")
@@ -507,15 +517,15 @@ fn render_assistant(
         && !prev_has_task
         && (!drop_thinking || after_last_user(turn.index, last_user_idx))
     {
-        prompt.push_str(turn.reasoning_content);
-        prompt.push_str(THINKING_END_TOKEN);
+        prompt.push_str(&mark_grounding_tokens(turn.reasoning_content));
+        prompt.push_str(THINKING_END);
     }
-    prompt.push_str(turn.content);
+    prompt.push_str(&mark_grounding_tokens(turn.content));
     if let Some(tool_calls) = &turn.tool_calls {
         prompt.push_str(&tool_calls_block(tool_calls));
     }
     if !turn.wo_eos {
-        prompt.push_str(EOS_TOKEN);
+        prompt.push_str(EOS);
     }
 }
 
@@ -529,15 +539,13 @@ fn tool_calls_block(tool_calls: &[Value]) -> String {
             let arguments = tool_call.get("arguments").unwrap_or(&Value::Null);
             let args = encode_arguments_to_dsml(arguments, &DSML_TAGS);
             format!(
-                "<{DSML_TOKEN}{invoke} name=\"{name}\">\n{args}\n</{DSML_TOKEN}{invoke}>",
+                "<{DSML}{invoke} name=\"{name}\">\n{args}\n</{DSML}{invoke}>",
                 invoke = DSML_TAGS.invoke,
             )
         })
         .collect();
     let joined = calls.join("\n");
-    format!(
-        "\n\n<{DSML_TOKEN}{TOOL_CALLS_BLOCK_NAME}>\n{joined}\n</{DSML_TOKEN}{TOOL_CALLS_BLOCK_NAME}>"
-    )
+    format!("\n\n<{DSML}{TOOL_CALLS_BLOCK_NAME}>\n{joined}\n</{DSML}{TOOL_CALLS_BLOCK_NAME}>")
 }
 
 /// What follows the turn: nothing when a next message exists and is not an
@@ -566,23 +574,23 @@ fn push_transition(
         let sp_token =
             task_sp_token(task).ok_or_else(|| DsEncodingError::InvalidTask(task.to_string()))?;
         if task == "action" {
-            prompt.push_str(ASSISTANT_SP_TOKEN);
+            prompt.push_str(ASSISTANT);
             prompt.push_str(if thinking_mode == ThinkingMode::Thinking {
-                THINKING_START_TOKEN
+                THINKING_START
             } else {
-                THINKING_END_TOKEN
+                THINKING_END
             });
         }
         prompt.push_str(sp_token);
     } else if matches!(turn.role, "user" | "developer") || (turn.role == "system" && turn.index > 0)
     {
-        prompt.push_str(ASSISTANT_SP_TOKEN);
+        prompt.push_str(ASSISTANT);
         let opens_thinking = thinking_mode == ThinkingMode::Thinking
             && (!drop_thinking || at_or_after_last_user(turn.index, last_user_idx));
         prompt.push_str(if opens_thinking {
-            THINKING_START_TOKEN
+            THINKING_START
         } else {
-            THINKING_END_TOKEN
+            THINKING_END
         });
     }
     Ok(())
@@ -624,11 +632,29 @@ pub fn encode_messages(
     thinking_mode: ThinkingMode,
     params: &EncodeParams,
 ) -> Result<String, DsEncodingError> {
-    let normalized = process_image_messages(messages)?;
+    render_messages(messages, thinking_mode, params)
+        .map(|marked| marks::strip(&marked).into_owned())
+}
+
+/// [`encode_messages`] with the renderer's own control tokens marked (see
+/// `marks`): the form the tokenizer wrapper encodes by segments, so that a
+/// control-token spelling typed in a message stays text. Request strings
+/// lose any mark a client wrote into them first.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "the same signature as `encode_messages`"
+)]
+pub(crate) fn render_messages(
+    messages: &[Value],
+    thinking_mode: ThinkingMode,
+    params: &EncodeParams,
+) -> Result<String, DsEncodingError> {
+    let messages = marks::without_marks(messages);
+    let normalized = process_image_messages(&messages)?;
     let merged = merge_tool_messages(&normalized);
     let mut full_messages = sort_tool_results_by_call_order(merged);
     let mut prompt = if params.add_default_bos_token {
-        BOS_TOKEN.to_string()
+        BOS.to_string()
     } else {
         String::new()
     };

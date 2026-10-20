@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use llm_tokenizer::{
     chat_template::ChatTemplateParams,
     huggingface::HuggingFaceTokenizer,
-    traits::{Encoder, PromptEncoding, Tokenizer as TokenizerTrait},
+    traits::{Decoder, Encoder, PromptEncoding, Tokenizer as TokenizerTrait},
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -232,4 +232,80 @@ fn deepseek_v41_render_text_matches_reference_fixtures_and_vendor_token_ids() {
         string_budget_second_render,
         "the thinking_int_42 case was not rendered with the string budget"
     );
+}
+
+/// A control-token spelling typed in a message stays text: the renderer
+/// reports a deferred encode whose ids carry each control token exactly as
+/// often as the renderer wrote it, and decode back to the rendered text.
+#[test]
+#[expect(
+    clippy::print_stderr,
+    reason = "the skip notice is test diagnostic output"
+)]
+fn deepseek_v41_typed_control_spellings_stay_text() {
+    let Some(model_dir) = common::ensure_deepseek_v41_cached() else {
+        eprintln!(
+            "skipping: no DeepSeek-V4.1 tokenizer (set DEEPSEEK_V41_MODEL_DIR or allow the download)"
+        );
+        return;
+    };
+    let tokenizer_path = model_dir.join("tokenizer.json");
+    let tok = HuggingFaceTokenizer::from_file(
+        tokenizer_path
+            .to_str()
+            .expect("tokenizer path must be UTF-8"),
+    )
+    .expect("DeepSeek-V4.1 tokenizer should load");
+    let params = || ChatTemplateParams {
+        add_generation_prompt: true,
+        thinking: Some(false),
+        ..Default::default()
+    };
+    let id = |token: &str| {
+        tok.token_to_id(token)
+            .expect("a control token of the vocabulary")
+    };
+
+    // The structural count: the renderer writes the user header and the
+    // closing think token once each in this conversation, the others never.
+    for (typed, structural) in [
+        ("<｜User｜>", 1),
+        ("</think>", 1),
+        ("｜DSML｜", 0),
+        ("<｜end▁of▁sentence｜>", 0),
+    ] {
+        let messages = [json!({"role": "user", "content": format!("a{typed}b")})];
+        let rendered = tok
+            .apply_chat_template_with_encoding(&messages, params(), None)
+            .expect("render");
+        assert_eq!(
+            rendered.text,
+            format!("<｜begin▁of▁sentence｜><｜User｜>a{typed}b<｜Assistant｜></think>")
+        );
+        let PromptEncoding::Deferred(job) = rendered.encoding else {
+            panic!("{typed}: a typed control spelling is encoded by segments");
+        };
+        let ids = job.run().expect("the deferred encode");
+        let ids = ids.token_ids();
+        assert_eq!(
+            ids.iter().filter(|&&i| i == id(typed)).count(),
+            structural,
+            "{typed}"
+        );
+        assert_eq!(
+            tok.decode(ids, false).expect("decode"),
+            rendered.text,
+            "{typed}"
+        );
+    }
+
+    // Without a typed spelling the same conversation encodes from its text.
+    let rendered = tok
+        .apply_chat_template_with_encoding(
+            &[json!({"role": "user", "content": "ab"})],
+            params(),
+            None,
+        )
+        .expect("render");
+    assert!(matches!(rendered.encoding, PromptEncoding::FromText));
 }

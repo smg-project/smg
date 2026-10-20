@@ -20,12 +20,12 @@ use crate::{
         ChatTemplateParams, ChatTemplateState, ThinkingKeyName, ThinkingToggle,
     },
     encoders::{
+        join_segments,
         kimi_k25_tools::apply_kimi_k25_tools,
         kimi_k3_xtml::{
-            self, apply_kimi_k3_xtml_with_effort_default, join_segments,
-            render_kimi_k3_xtml_prompt, PromptSegment, RenderedXtml,
+            self, apply_kimi_k3_xtml_with_effort_default, render_kimi_k3_xtml_prompt, RenderedXtml,
         },
-        RendererProfile,
+        PromptSegment, RendererProfile,
     },
     factory::discover_chat_template_in_dir,
     kimi_k2_tokenizer,

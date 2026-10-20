@@ -199,14 +199,14 @@ type AddedTokenList = Vec<(String, u32)>;
 
 /// One set of added tokens, matched leftmost-longest as `AddedVocabulary`
 /// matches them.
-struct AddedTokens {
+pub(crate) struct AddedTokens {
     automaton: AhoCorasick,
     ids: Vec<u32>,
 }
 
 impl AddedTokens {
     /// The matcher over `tokens`, none for no tokens.
-    fn build(tokens: &[(String, u32)]) -> Result<Option<Self>, Declined> {
+    pub(crate) fn build(tokens: &[(String, u32)]) -> Result<Option<Self>, Declined> {
         if tokens.is_empty() {
             return Ok(None);
         }
@@ -218,6 +218,16 @@ impl AddedTokens {
             automaton,
             ids: tokens.iter().map(|(_, id)| *id).collect(),
         }))
+    }
+
+    /// The byte ranges of the added tokens in `text`, in order.
+    pub(crate) fn ranges<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> impl Iterator<Item = std::ops::Range<usize>> + 'a {
+        self.automaton
+            .find_iter(text)
+            .map(|found| found.start()..found.end())
     }
 
     /// Calls `f` with each segment in order: an added token's id, or a text
@@ -493,6 +503,19 @@ impl NativeEncoder {
         self.encode_with(model, text, text.len() >= PARALLEL_MIN_BYTES)
     }
 
+    /// The ids of `text` with no added token cut out of it: every spelling
+    /// in it, a special token's included, goes through the stages and the
+    /// model as text. The plain segments of a prompt rendered by segments
+    /// are encoded this way (see `encoders::marks`); otherwise as
+    /// [`Self::encode`].
+    pub(crate) fn encode_plain(
+        &self,
+        model: &ModelWrapper,
+        text: &str,
+    ) -> Result<Vec<u32>, Fallback> {
+        self.encode_units(model, text, text.len() >= PARALLEL_MIN_BYTES, false)
+    }
+
     /// [`Self::encode`] with the thread pool used or not; the ids are the
     /// same either way (the units are encoded by the same code in the same
     /// order).
@@ -502,10 +525,22 @@ impl NativeEncoder {
         text: &str,
         parallel: bool,
     ) -> Result<Vec<u32>, Fallback> {
+        self.encode_units(model, text, parallel, true)
+    }
+
+    /// The encode behind [`Self::encode_with`] and [`Self::encode_plain`]:
+    /// `added` says whether the added tokens are cut out of the text first.
+    fn encode_units(
+        &self,
+        model: &ModelWrapper,
+        text: &str,
+        parallel: bool,
+        added: bool,
+    ) -> Result<Vec<u32>, Fallback> {
         if self.normalizer == Normalizer::Nfc && !is_nfc(text) {
             return Err(Fallback::NotNfc);
         }
-        let units = self.units(text, parallel);
+        let units = self.units(text, parallel, added);
         if parallel && units.len() >= 2 {
             let encoded: Result<Vec<Vec<u32>>, Fallback> = units
                 .par_iter()
@@ -529,11 +564,12 @@ impl NativeEncoder {
     /// The input as the units its encode is made of: the added tokens
     /// matched on the raw text, then the ones matched after normalization on
     /// the texts between them (the text is in its normal form here, see
-    /// [`Self::encode_with`]), and the texts between all of them; for the
+    /// [`Self::encode_units`]), and the texts between all of them; for the
     /// thread pool a long text is cut further at stable boundaries
     /// ([`Self::stable_cut`]). Both kinds of added token come out before any
-    /// cut: a cut inside one would turn it into pieces.
-    fn units<'t>(&self, text: &'t str, chunked: bool) -> Vec<Segment<'t>> {
+    /// cut: a cut inside one would turn it into pieces. With `added` off no
+    /// token is cut out: the whole text is text.
+    fn units<'t>(&self, text: &'t str, chunked: bool, added: bool) -> Vec<Segment<'t>> {
         let mut units = Vec::new();
         let push_text = |text: &'t str, units: &mut Vec<Segment<'t>>| {
             let mut rest = text;
@@ -554,6 +590,10 @@ impl NativeEncoder {
                 }),
                 None => push_text(text, units),
             };
+        if !added {
+            push_text(text, &mut units);
+            return units;
+        }
         match &self.raw_added {
             Some(added) => added.split(text, |segment| match segment {
                 Segment::Added(id) => units.push(Segment::Added(id)),
@@ -1310,7 +1350,7 @@ mod tests {
                 if shape.nfc {
                     text = text.nfc().collect();
                 }
-                let units = native.units(&text, true).len();
+                let units = native.units(&text, true, true).len();
                 assert!(
                     units >= 4,
                     "{}: {units} units for {} bytes",
@@ -1363,7 +1403,7 @@ mod tests {
         let mut text = "x".repeat(PARALLEL_CHUNK_BYTES + 5);
         text.push_str("foo bar");
         text.push_str(&long_text(&mut state, &[], 3 * PARALLEL_CHUNK_BYTES));
-        let units = native.units(&text, true);
+        let units = native.units(&text, true, true);
         assert!(
             units
                 .iter()
@@ -1403,7 +1443,7 @@ mod tests {
         let mut text = "0.125, -3.5, 42, ".repeat(PARALLEL_CHUNK_BYTES / 8);
         assert!(text.len() > 2 * PARALLEL_CHUNK_BYTES);
         text.push_str(&long_text(&mut state, &[], 4 * PARALLEL_CHUNK_BYTES));
-        let units = native.units(&text, true);
+        let units = native.units(&text, true, true);
         assert!(
             units.len() > 2,
             "{} units: the prose after the table is chunked",
@@ -1440,7 +1480,7 @@ mod tests {
                 out
             };
             let mut chunked = Vec::new();
-            let units = native.units(&text, true);
+            let units = native.units(&text, true, true);
             assert!(
                 units.len() >= 2,
                 "{}: no cut in {} bytes",

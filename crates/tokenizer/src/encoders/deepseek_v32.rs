@@ -12,10 +12,10 @@ use thiserror::Error;
 use super::{
     deepseek_common::{
         after_last_user, at_or_after_last_user, find_last_user_index, to_json,
-        tool_calls_from_openai_format, tool_schemas, tools_from_openai_format, ASSISTANT_SP_TOKEN,
-        USER_SP_TOKEN,
+        tool_calls_from_openai_format, tool_schemas, tools_from_openai_format, ASSISTANT, BOS,
+        DSML, EOS, THINKING_END, THINKING_START, USER,
     },
-    RendererProfile,
+    marks, RendererProfile,
 };
 use crate::chat_template::{ThinkingKeyName, ThinkingToggle};
 
@@ -114,9 +114,9 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
 /// Mirrors `TOOLS_SYSTEM_TEMPLATE` from the Python source, including the
 /// blank lines between paragraphs that the upstream template preserves.
 fn render_tools_template(tool_schemas: &str) -> String {
-    let dsml = DSML_TOKEN;
-    let tstart = THINKING_START_TOKEN;
-    let tend = THINKING_END_TOKEN;
+    let dsml = DSML;
+    let tstart = THINKING_START;
+    let tend = THINKING_END;
     format!(
 "## Tools
 
@@ -161,7 +161,7 @@ fn response_format_block(schema: &str) -> String {
 }
 
 fn user_msg(content: &str) -> String {
-    format!("{USER_SP_TOKEN}{content}{ASSISTANT_SP_TOKEN}")
+    format!("{USER}{content}{ASSISTANT}")
 }
 
 /// Mirrors `encode_arguments_to_dsml`. `tool_call["arguments"]` is a JSON
@@ -196,7 +196,7 @@ fn encode_arguments_to_dsml(tool_call: &Value) -> Result<String, DsEncodingError
             other => ("false", to_json(other)),
         };
         parts.push(format!(
-            "<{DSML_TOKEN}parameter name=\"{k}\" string=\"{is_str}\">{value_str}</{DSML_TOKEN}parameter>",
+            "<{DSML}parameter name=\"{k}\" string=\"{is_str}\">{value_str}</{DSML}parameter>",
         ));
     }
     Ok(parts.join("\n"))
@@ -294,9 +294,9 @@ fn render_message(
 /// the opener when the turn thinks, the closer otherwise.
 fn thinking_token(opens_thinking: bool) -> &'static str {
     if opens_thinking {
-        THINKING_START_TOKEN
+        THINKING_START
     } else {
-        THINKING_END_TOKEN
+        THINKING_END
     }
 }
 
@@ -471,13 +471,13 @@ fn render_assistant(
             let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let args = encode_arguments_to_dsml(tc)?;
             rendered.push(format!(
-                "<{DSML_TOKEN}invoke name=\"{name}\">\n{args}\n</{DSML_TOKEN}invoke>",
+                "<{DSML}invoke name=\"{name}\">\n{args}\n</{DSML}invoke>",
             ));
         }
         let joined = rendered.join("\n");
         let _ = write!(
             tool_calls_content,
-            "\n\n<{DSML_TOKEN}function_calls>\n{joined}\n</{DSML_TOKEN}function_calls>"
+            "\n\n<{DSML}function_calls>\n{joined}\n</{DSML}function_calls>"
         );
     }
 
@@ -492,13 +492,13 @@ fn render_assistant(
             ));
         }
         thinking_part.push_str(parts.reasoning_content);
-        thinking_part.push_str(THINKING_END_TOKEN);
+        thinking_part.push_str(THINKING_END);
     }
 
     prompt.push_str(&thinking_part);
     prompt.push_str(summary_content);
     prompt.push_str(&tool_calls_content);
-    prompt.push_str(EOS_TOKEN);
+    prompt.push_str(EOS);
     Ok(())
 }
 
@@ -550,10 +550,27 @@ pub fn encode_messages(
     thinking_mode: ThinkingMode,
     params: &EncodeParams,
 ) -> Result<String, DsEncodingError> {
-    let mut full_messages: Vec<Value> = messages.to_vec();
+    render_messages(messages, thinking_mode, params)
+        .map(|marked| marks::strip(&marked).into_owned())
+}
+
+/// [`encode_messages`] with the renderer's own control tokens marked (see
+/// `marks`): the form the tokenizer wrapper encodes by segments, so that a
+/// control-token spelling typed in a message stays text. Request strings
+/// lose any mark a client wrote into them first.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "the same signature as `encode_messages`"
+)]
+pub(crate) fn render_messages(
+    messages: &[Value],
+    thinking_mode: ThinkingMode,
+    params: &EncodeParams,
+) -> Result<String, DsEncodingError> {
+    let mut full_messages: Vec<Value> = marks::without_marks(messages).into_owned();
 
     let mut prompt = if params.add_default_bos_token {
-        BOS_TOKEN.to_string()
+        BOS.to_string()
     } else {
         String::new()
     };
@@ -577,7 +594,10 @@ pub fn encode_messages(
 mod tests {
     use serde_json::json;
 
-    use super::*;
+    use super::{
+        super::deepseek_common::{ASSISTANT_SP_TOKEN, USER_SP_TOKEN},
+        *,
+    };
 
     fn user(text: &str) -> Value {
         json!({ "role": "user", "content": text })
