@@ -325,13 +325,13 @@ mod tests {
     use super::*;
     use crate::worker::{BasicWorkerBuilder, WorkerType};
 
-    /// A worker in `group` (none = unlabelled) carrying `weight` (none =
-    /// no weight label); `up` false makes it unavailable.
     /// The selection's admission in these tests: availability.
     fn available(worker: &dyn Worker) -> bool {
         worker.is_available()
     }
 
+    /// A worker in `group` (none = unlabelled) carrying `weight` (none =
+    /// no weight label); `up` false makes it unavailable.
     fn worker(url: &str, group: Option<&str>, weight: Option<&str>, up: bool) -> Arc<dyn Worker> {
         let mut labels = HashMap::new();
         if let Some(group) = group {

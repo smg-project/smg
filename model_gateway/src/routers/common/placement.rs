@@ -312,34 +312,43 @@ pub(crate) fn select_from(
             &untried
         }
     };
-    if available.is_empty() {
-        return overload_fallback(registry, policy.name(), model_id, candidates);
-    }
-
     // Cached hash ring for consistent hashing (O(log n) lookup).
     let hash_ring = registry.get_hash_ring(model_id);
+    let info = SelectWorkerInfo {
+        request_text: inputs.text,
+        tokens: inputs.tokens,
+        headers: inputs.headers,
+        routing_key: policies.resolve_routing_key(inputs.headers),
+        rid_key: inputs.rid_key,
+        cache_namespace: inputs.cache_namespace,
+        hash_ring,
+        role: WorkerRole::Single,
+        overload_lifted: false,
+    };
+    if available.is_empty() {
+        return overload_fallback(
+            registry,
+            policies,
+            policy.name(),
+            model_id,
+            candidates,
+            &info,
+        );
+    }
 
     // The registry applies the routing-key sticky override when enabled and
     // otherwise delegates to the configured policy.
-    let Some(idx) = policies.select_worker_for_model(
-        &policy,
-        model_id,
-        available,
-        &SelectWorkerInfo {
-            request_text: inputs.text,
-            tokens: inputs.tokens,
-            headers: inputs.headers,
-            routing_key: policies.resolve_routing_key(inputs.headers),
-            rid_key: inputs.rid_key,
-            cache_namespace: inputs.cache_namespace,
-            hash_ring,
-            role: WorkerRole::Single,
-            overload_lifted: false,
-        },
-    ) else {
+    let Some(idx) = policies.select_worker_for_model(&policy, model_id, available, &info) else {
         // A policy that filters availability itself misses on an
         // all-overloaded pool the same way the pre-filter empties.
-        return overload_fallback(registry, policy.name(), model_id, candidates);
+        return overload_fallback(
+            registry,
+            policies,
+            policy.name(),
+            model_id,
+            candidates,
+            &info,
+        );
     };
     let selected = available[idx].clone();
 
@@ -358,19 +367,48 @@ pub(crate) fn select_from(
 /// worker, recorded as a selection under `policy`. Under
 /// `--worker-overload-shed` an overloaded worker is never taken (the caller
 /// sheds an all-overloaded pool); `None` when the pool is not all-vetoed or
-/// has nothing routable.
+/// has nothing routable. Under `--traffic-split` the pool is narrowed to one
+/// group first, admitted as a lifted pool is (every veto but the overload
+/// one), by the request's key where it has one and at random otherwise, so
+/// a canary takes its weight's share of a spike and not the least-loaded
+/// worker's; a pool whose groups all weigh 0 is declined rather than served
+/// from the drained build; a pool the split does not apply to (one group,
+/// or no admitted member: every worker stalled) keeps the least-loaded pick.
 fn overload_fallback(
     registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
     policy: &'static str,
     model_id: &str,
     candidates: &[Arc<dyn Worker>],
+    info: &SelectWorkerInfo,
 ) -> Option<Arc<dyn Worker>> {
-    let selected = overload::fallback_if_all_vetoed(
-        candidates,
-        model_id,
-        STAGE_SELECTION,
-        registry.overload_shed_enabled(),
-    )?;
+    let shedding = registry.overload_shed_enabled();
+    let whole =
+        || overload::fallback_if_all_vetoed(candidates, model_id, STAGE_SELECTION, shedding);
+    let selected = if policies.traffic_split_enabled() {
+        let admits = |worker: &dyn Worker| worker.routing_state().eligible_ignoring_overload();
+        if traffic_split::drained(candidates, admits) {
+            return None;
+        }
+        match traffic_split::Split::plan(candidates, admits) {
+            Some(split) => {
+                let arm = match policies.effective_sticky_key(info) {
+                    Some((key, _)) => split.arm_for_key(key),
+                    None => split.arm_at_random(&mut rand::rng()),
+                };
+                Metrics::record_traffic_split_selection(model_id, arm.name);
+                let members: Vec<Arc<dyn Worker>> = arm
+                    .members
+                    .iter()
+                    .map(|&idx| Arc::clone(&candidates[idx]))
+                    .collect();
+                overload::fallback_if_all_vetoed(&members, model_id, STAGE_SELECTION, shedding)?
+            }
+            None => whole()?,
+        }
+    } else {
+        whole()?
+    };
     Metrics::record_worker_selection(
         metrics_labels::WORKER_REGULAR,
         selected.connection_mode().as_metric_label(),
@@ -2086,6 +2124,73 @@ mod tests {
         );
     }
 
+    /// Every worker of a split pool over the overload thresholds: the steering
+    /// default narrows the pool to one group first, so the canary takes its
+    /// weight's share of the spike and not the least-loaded worker's, a canary
+    /// at weight 0 takes nothing, and a pool whose groups all weigh 0 is
+    /// declined rather than served from the drained build.
+    #[test]
+    fn an_all_overloaded_pool_under_the_split_keeps_the_groups_weights() {
+        let grouped = |stable_weight: &str, canary_weight: &str| {
+            let registry = WorkerRegistry::new();
+            for (url, group, weight) in [
+                ("http://s:1", "stable", stable_weight),
+                ("http://s:2", "stable", stable_weight),
+                ("http://c:1", "canary", canary_weight),
+            ] {
+                registry
+                    .register(Arc::new(
+                        BasicWorkerBuilder::new(url)
+                            .model(ModelCard::new(MODEL))
+                            .worker_type(WorkerType::Regular)
+                            .connection_mode(ConnectionMode::Http)
+                            .runtime_type(RuntimeType::Sglang)
+                            .label("traffic_group", group)
+                            .label("traffic_weight", weight)
+                            .health_config(HealthCheckConfig {
+                                disable_health_check: true,
+                                ..Default::default()
+                            })
+                            .build(),
+                    ))
+                    .expect("worker registers");
+            }
+            for worker in registry.get_all() {
+                registry.set_worker_overloaded(&worker, true);
+            }
+            registry
+        };
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin).with_traffic_split(true);
+        let registry = grouped("90", "10");
+        let canary = (0..100)
+            .filter(|_| {
+                pick(&registry, &policies, PlacementInputs::default()).base_url() == "http://c:1"
+            })
+            .count();
+        assert!(canary <= 25, "the canary took {canary} of 100 at weight 10");
+        let registry = grouped("90", "0");
+        for _ in 0..50 {
+            assert_ne!(
+                pick(&registry, &policies, PlacementInputs::default()).base_url(),
+                "http://c:1",
+                "a drained canary took a request from the steering default"
+            );
+        }
+        let registry = grouped("0", "0");
+        assert!(
+            select_single(
+                &registry,
+                &policies,
+                MODEL,
+                RoutingPool::HttpRegular,
+                None,
+                PlacementInputs::default(),
+            )
+            .is_none(),
+            "a pool whose groups all weigh 0 is declined, not served"
+        );
+    }
+
     /// A routing key pins consistent hashing to one worker; once that worker
     /// was tried, the retry falls through to the next node on the ring, and
     /// a pool with nothing untried left is used whole.
@@ -2741,7 +2846,7 @@ mod tests {
                 canary += 1;
             }
         }
-        assert!(canary <= 40, "the canary took {canary} of 100 at weight 10");
+        assert!(canary <= 25, "the canary took {canary} of 100 at weight 10");
         // The canary drained: nothing lands on it, lifted or not.
         let registry = grouped("0");
         let pairs = pairs_of(&registry, &policies);

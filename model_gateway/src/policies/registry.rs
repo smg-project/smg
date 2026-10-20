@@ -358,8 +358,10 @@ impl PolicyRegistry {
     /// Resolve the effective sticky key: a valid configured routing-key header
     /// wins, with the rid-derived key as fallback. Header keys get the same
     /// lineage stripping as rid keys, so a
-    /// proxy forwarding `conv_t2` as a header pins the entry `conv`.
-    fn effective_sticky_key<'a>(
+    /// proxy forwarding `conv_t2` as a header pins the entry `conv`. The
+    /// single-worker placement's all-vetoed fallback reads it too, to keep a
+    /// keyed request in one traffic group.
+    pub(crate) fn effective_sticky_key<'a>(
         &self,
         info: &SelectWorkerInfo<'a>,
     ) -> Option<(&'a str, &'static str)> {
