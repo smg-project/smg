@@ -1200,11 +1200,12 @@ mod tests {
 
     use axum::http::StatusCode;
     use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
-    use tracing_subscriber::{layer::SubscriberExt, Layer, Registry};
+    use tracing_subscriber::Layer;
 
     use super::*;
     use crate::{
         config::types::{PdPairingMode, PolicyConfig},
+        observability::logging::test_support::test_subscriber,
         policies::{CacheAwarePolicy, RoundRobinPolicy},
         worker::{runtime::StallReason, BasicWorkerBuilder, ModelCard, PdWire, WorkerType},
     };
@@ -2241,9 +2242,7 @@ mod tests {
     #[test]
     fn a_refusal_is_marked_and_written_once_at_warn_with_the_pools_state() {
         let lines = Arc::new(Mutex::new(Vec::new()));
-        let _guard = tracing::subscriber::set_default(
-            Registry::default().with(EventLines(tracing::Level::WARN, Arc::clone(&lines))),
-        );
+        let _subscriber = test_subscriber(EventLines(tracing::Level::WARN, Arc::clone(&lines)));
         let registry = WorkerRegistry::new();
         let down = BasicWorkerBuilder::new("http://worker-down:8080")
             .model(ModelCard::new("m1"))
@@ -2373,9 +2372,7 @@ mod tests {
     #[test]
     fn a_503_for_a_name_without_workers_shares_one_allowance_with_the_other_unknown_names() {
         let lines = Arc::new(Mutex::new(Vec::new()));
-        let _guard = tracing::subscriber::set_default(
-            Registry::default().with(EventLines(tracing::Level::WARN, Arc::clone(&lines))),
-        );
+        let _subscriber = test_subscriber(EventLines(tracing::Level::WARN, Arc::clone(&lines)));
         let registry = WorkerRegistry::new();
         let down = BasicWorkerBuilder::new("http://worker-down:8080")
             .model(ModelCard::new("m1"))
@@ -2451,9 +2448,7 @@ mod tests {
     #[test]
     fn the_refusal_line_names_the_reason_the_router_gives_not_the_clients_message() {
         let lines = Arc::new(Mutex::new(Vec::new()));
-        let _guard = tracing::subscriber::set_default(
-            Registry::default().with(EventLines(tracing::Level::WARN, Arc::clone(&lines))),
-        );
+        let _subscriber = test_subscriber(EventLines(tracing::Level::WARN, Arc::clone(&lines)));
         let registry = WorkerRegistry::new();
         let idle = BasicWorkerBuilder::new("http://worker-idle:8080")
             .model(ModelCard::new("m1"))

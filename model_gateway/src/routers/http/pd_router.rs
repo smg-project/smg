@@ -2872,6 +2872,7 @@ mod tests {
     use crate::{
         config::{types::PdPairingMode, PolicyConfig},
         middleware::ReportedRefusal,
+        observability::logging::test_support::test_subscriber,
         routers::common::sse::SSE_CHANNEL_BUFFER,
         tenant::TenantKey,
         worker::{BasicWorkerBuilder, WorkerType},
@@ -6436,16 +6437,12 @@ mod tests {
     #[tokio::test]
     async fn a_refusal_for_a_role_that_is_down_is_marked_and_written_at_warn_within_the_allowance()
     {
-        use tracing_subscriber::layer::SubscriberExt;
-
         let errors = Arc::new(AtomicUsize::new(0));
         let refusal_lines = Arc::new(AtomicUsize::new(0));
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::Registry::default().with(RefusalLineCounter {
-                errors: Arc::clone(&errors),
-                refusal_lines: Arc::clone(&refusal_lines),
-            }),
-        );
+        let _subscriber = test_subscriber(RefusalLineCounter {
+            errors: Arc::clone(&errors),
+            refusal_lines: Arc::clone(&refusal_lines),
+        });
         let router = create_test_pd_router();
         let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
         let allowance = usize::try_from(placement::REFUSAL_LINES_PER_SECOND).unwrap();

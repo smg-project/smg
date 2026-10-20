@@ -2406,6 +2406,7 @@ mod tests {
     use crate::{
         config::types::{PolicyConfig, RoutingKeyOverrideConfig},
         middleware::ReportedRefusal,
+        observability::logging::test_support::test_subscriber,
         policies::CacheAwarePolicy,
         routers::common::{
             body_policy::{
@@ -4865,16 +4866,12 @@ mod tests {
     /// client retrying at once.
     #[tokio::test]
     async fn a_refusal_is_marked_and_written_at_warn_within_the_allowance() {
-        use tracing_subscriber::layer::SubscriberExt;
-
         let errors = Arc::new(AtomicUsize::new(0));
         let refusal_lines = Arc::new(AtomicUsize::new(0));
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::Registry::default().with(RefusalLineCounter {
-                errors: Arc::clone(&errors),
-                refusal_lines: Arc::clone(&refusal_lines),
-            }),
-        );
+        let _subscriber = test_subscriber(RefusalLineCounter {
+            errors: Arc::clone(&errors),
+            refusal_lines: Arc::clone(&refusal_lines),
+        });
         let router = create_test_regular_router();
         for worker in router.worker_registry.get_all() {
             worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
