@@ -1932,6 +1932,7 @@ mod tests {
                 formats::deepseek_v4(),
                 value!([
                     "<｜DSML｜tool_calls>",
+                    "\n\n<｜DSML｜tool_calls>",
                     "</｜DSML｜tool_calls>",
                     "<｜DSML｜invoke name=\"",
                     "</｜DSML｜invoke>",
@@ -2456,6 +2457,7 @@ mod tests {
             open["format"]["elements"][0],
             value!({"type": "any_text", "excludes": [
                 "<｜DSML｜tool_calls>",
+                "\n\n<｜DSML｜tool_calls>",
                 "</｜DSML｜tool_calls>",
                 "<｜DSML｜invoke name=\"",
                 "</｜DSML｜invoke>",

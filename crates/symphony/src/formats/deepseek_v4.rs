@@ -21,6 +21,12 @@
 //! its thought. The table starts there too (the unopened row, `<｜end▁of▁sentence｜>` ending a turn
 //! the model wrote), so `</think>` closes the thought instead of reaching the content.
 //!
+//! The block's opener is spelled as the family's reference parser spells it: the blank line the
+//! template writes before the block and the tag, `\n\n<｜DSML｜tool_calls>`, so the blank line
+//! leaves with the tag wherever the block opens, after a text preamble, after the thought's close,
+//! at the turn's start or after a tool result, and the content ends where the model's text does.
+//! The tag alone opens the block too, for a block the model writes without the blank line.
+//!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
 use crate::{
@@ -34,6 +40,12 @@ pub fn deepseek_v4() -> Format {
         .terminal("think_open", "<think>")
         .terminal("think_close", "</think>")
         .terminal("calls_open", "<｜DSML｜tool_calls>")
+        // The opener with the blank line the template writes before the block (the syntax's
+        // `before_block`), the spelling the reference parser looks for: the scanner takes the
+        // longer marker where the blank line stands, and holds a newline that may begin it, so a
+        // stream reads as the whole does. Its rows come after the bare opener's, which the
+        // structural tags derive the block's opener from.
+        .terminal("separated_calls_open", "\n\n<｜DSML｜tool_calls>")
         .terminal("calls_close", "</｜DSML｜tool_calls>")
         .terminal("invoke_open", "<｜DSML｜invoke name=\"")
         .terminal("invoke_close", Tags::DSML_V4.invoke_close)
@@ -45,6 +57,8 @@ pub fn deepseek_v4() -> Format {
         .transition("reasoning", "think_close", "content")
         .transition("content", "calls_open", "calls")
         .transition("reasoning", "calls_open", "calls")
+        .transition("content", "separated_calls_open", "calls")
+        .transition("reasoning", "separated_calls_open", "calls")
         .transition("calls", "invoke_open", "invoke")
         .transition("invoke", "invoke_close", "calls")
         .transition("invoke", "invoke_open", "invoke")
@@ -62,7 +76,9 @@ mod tests {
     use super::*;
     use crate::{
         ids::CallIds,
-        testing::{arguments_of, bytes, content, drive, drive_to, reasoning},
+        testing::{
+            arguments_of, bytes, content, drive, drive_to, reasoning, the_same_at_every_cut,
+        },
     };
 
     fn ids() -> CallIds {
@@ -130,7 +146,7 @@ mod tests {
         let events = run("<｜Assistant｜><think>", &[OUTPUT]);
         assert_eq!(bytes(&events), OUTPUT);
         assert_eq!(
-            events[..6],
+            events[..5],
             [
                 Event::ReasoningStart,
                 Event::Reasoning(Text::uncounted(
@@ -139,19 +155,14 @@ mod tests {
                 )),
                 dropped("</think>"),
                 Event::ReasoningEnd,
-                // The template's two newlines before the block: held until the block's opener
-                // said they were its spacing, not content.
-                Event::Dropped {
-                    text: Text::uncounted("\n\n"),
-                    why: DropReason::Whitespace,
-                },
-                dropped("<｜DSML｜tool_calls>"),
+                // The template's blank line before the block is the opener's: one marker.
+                dropped("\n\n<｜DSML｜tool_calls>"),
             ]
         );
-        assert_eq!(events[6], dropped("\n"), "the wrapping before the invoke");
-        assert_eq!(events[7], dropped("<｜DSML｜invoke name=\""));
+        assert_eq!(events[5], dropped("\n"), "the wrapping before the invoke");
+        assert_eq!(events[6], dropped("<｜DSML｜invoke name=\""));
         assert_eq!(
-            events[8],
+            events[7],
             Event::ToolCallStart {
                 index: 0,
                 id: ids().id(0),
@@ -180,11 +191,12 @@ mod tests {
 
     #[test]
     fn the_older_parsers_fixtures_give_the_same_calls_with_their_types() {
-        // Content before the block stays content, its two newlines included; `string="false"`
+        // Content before the block ends where the text does: the blank line the template writes
+        // before the block is the opener's (the older parser strips it too); `string="false"`
         // values are JSON.
         let events = run("<｜Assistant｜></think>", &[ANSWER]);
         assert_eq!(bytes(&events), ANSWER);
-        assert_eq!(content(&events), "Sure, adding them.\n\n");
+        assert_eq!(content(&events), "Sure, adding them.");
         assert_eq!(calls_of(&events), [(0, "add_integers".to_string())]);
         assert_eq!(arguments_of(&events, 0), r#"{"a": 17, "b": 25}"#);
         assert!(matches!(
@@ -404,15 +416,16 @@ mod tests {
     }
 
     #[test]
-    fn the_spacing_between_the_thought_and_the_block_is_not_content_whole_or_streamed() {
-        // The encoder's turn has nothing between `</think>` and the block but the template's two
-        // newlines: whole, byte by byte and in a tokenizer's pieces they are dropped as the
-        // spacing they are, and no feed's events carry content, so a client of the stream gets
-        // what the whole answer has: no content.
+    fn the_blank_line_between_the_thought_and_the_block_is_the_openers_whole_or_streamed() {
+        // The encoder's turn has nothing between `</think>` and the block but the template's
+        // blank line: whole, byte by byte and in a tokenizer's pieces it leaves with the tag as
+        // the block's opener, no whitespace dropped on its own, and no feed's events carry
+        // content, so a client of the stream gets what the whole answer has: no content.
         let prompt = "<｜Assistant｜><think>";
         let whole = run(prompt, &[OUTPUT]);
         assert_eq!(content(&whole), "");
-        assert_eq!(spacing(&whole), ["\n\n"]);
+        assert_eq!(spacing(&whole), Vec::<&str>::new());
+        assert!(whole.contains(&dropped("\n\n<｜DSML｜tool_calls>")));
         let per_char: Vec<&str> = OUTPUT
             .char_indices()
             .map(|(i, c)| &OUTPUT[i..i + c.len_utf8()])
@@ -425,7 +438,11 @@ mod tests {
             let events = run(prompt, &pieces);
             assert_eq!(bytes(&events), OUTPUT, "{pieces:?}");
             assert_eq!(content(&events), "", "{pieces:?}");
-            assert_eq!(spacing(&events), ["\n\n"], "{pieces:?}");
+            assert_eq!(spacing(&events), Vec::<&str>::new(), "{pieces:?}");
+            assert!(
+                events.contains(&dropped("\n\n<｜DSML｜tool_calls>")),
+                "{pieces:?}"
+            );
             assert_eq!(
                 arguments_of(&events, 0),
                 r#"{"location": "Beijing", "unit": "celsius"}"#,
@@ -437,15 +454,16 @@ mod tests {
                 "{pieces:?}"
             );
         }
-        // Content before the block keeps its two newlines, whole and streamed: they follow text.
+        // Content before the block ends where the text does, whole and streamed: the blank line
+        // after it is the opener's, and no content delta carries it.
         let (text, block) = ANSWER.split_once("\n\n").expect("the content's end");
         let pieces = [text, "\n\n", block];
         let events = run("<｜Assistant｜></think>", &pieces);
-        assert_eq!(content(&events), "Sure, adding them.\n\n");
+        assert_eq!(content(&events), "Sure, adding them.");
         assert_eq!(spacing(&events), Vec::<&str>::new());
         assert_eq!(
             content_deltas("<｜Assistant｜></think>", &pieces),
-            ["Sure, adding them.", "\n\n"]
+            ["Sure, adding them."]
         );
     }
 
@@ -811,16 +829,10 @@ mod tests {
             let events = run(&prompt, &[turn.output]);
             assert_eq!(bytes(&events), turn.output, "{:?}", turn.output);
             assert_eq!(reasoning(&events), turn.reasoning, "{:?}", turn.output);
-            // The two newlines the template writes before a block follow the content here,
-            // exactly two of them, where there is content; the encoder's parser skips them
-            // (bellwether #17). Where the thought's close is all that comes before them, they
-            // are the template's spacing, dropped, as the encoder's parser has it.
-            let expected = if turn.calls.is_empty() || turn.content.is_empty() {
-                turn.content.to_string()
-            } else {
-                format!("{}\n\n", turn.content)
-            };
-            assert_eq!(content(&events), expected, "{:?}", turn.output);
+            // The blank line the template writes before a block is the opener's, after content
+            // as after the thought's close: the content is what the encoder's parser reads, which
+            // looks for the block as the blank line and the tag.
+            assert_eq!(content(&events), turn.content, "{:?}", turn.output);
             let read: Vec<(String, serde_json::Value)> = calls_of(&events)
                 .into_iter()
                 .map(|(index, name)| {
@@ -950,5 +962,156 @@ mod tests {
                 "{pieces:?}: {reasons:?}"
             );
         }
+    }
+
+    /// A block with one call and no arguments, as the encoder writes it.
+    const BARE_BLOCK: &str =
+        "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"f\">\n\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+
+    /// Reads `output` after `prompt` whole, a character at a time and at every two-way cut, each
+    /// reading saying what the whole does; the content, the reasoning and the calls.
+    fn however_cut(prompt: &str, output: &str) -> (String, String, Vec<(String, String)>) {
+        assert_eq!(bytes(&run(prompt, &[output])), output);
+        let said = the_same_at_every_cut(|pieces| run(prompt, pieces), output);
+        (said.content, said.reasoning, said.calls)
+    }
+
+    #[test]
+    fn a_preamble_ends_where_the_templates_blank_line_before_the_block_begins() {
+        // The turns the encoder renders for a call after content, in thinking and in chat mode:
+        // the content is the text alone, as the encoder's parser reads it, whole, a character at
+        // a time and at every cut; the call reads as before.
+        let turns: Vec<&EncoderTurn> = ENCODER_TURNS
+            .iter()
+            .filter(|turn| turn.content == "Let me check.")
+            .collect();
+        assert_eq!(turns.len(), 2, "thinking and chat");
+        for turn in turns {
+            let prompt = format!("<｜Assistant｜>{}", turn.tail);
+            let (content, reasoning, calls) = however_cut(&prompt, turn.output);
+            assert_eq!(content, "Let me check.", "{:?}", turn.output);
+            assert_eq!(reasoning, turn.reasoning, "{:?}", turn.output);
+            assert_eq!(
+                calls,
+                [(
+                    "get_weather".to_string(),
+                    r#"{"location": "Paris"}"#.to_string()
+                )],
+                "{:?}",
+                turn.output
+            );
+        }
+        // A blank line inside the content is the text's; the one before the block alone goes.
+        let output = format!("</think>Step by step.\n\n**Step 1**\n\n{BARE_BLOCK}");
+        let (content, _, calls) = however_cut("<｜Assistant｜><think>", &output);
+        assert_eq!(content, "Step by step.\n\n**Step 1**");
+        assert_eq!(calls, [("f".to_string(), "{}".to_string())]);
+    }
+
+    #[test]
+    fn exactly_the_blank_line_before_the_block_is_the_openers() {
+        // As the reference parser reads it: a third newline before the blank line is content,
+        // and so is a space before it; a block opened without the blank line, or after one
+        // newline, is still the block, the newline content.
+        for (between, content) in [
+            ("\n\n", "Sure."),
+            ("\n\n\n", "Sure.\n"),
+            (" \n\n", "Sure. "),
+            ("", "Sure."),
+            ("\n", "Sure.\n"),
+        ] {
+            let output = format!("</think>Sure.{between}{BARE_BLOCK}");
+            let (said, _, calls) = however_cut("<｜Assistant｜><think>", &output);
+            assert_eq!(said, content, "{between:?}");
+            assert_eq!(calls, [("f".to_string(), "{}".to_string())], "{between:?}");
+        }
+    }
+
+    #[test]
+    fn the_blank_line_before_the_block_leaves_no_content_delta() {
+        // The encoder's turn with a preamble in a tokenizer's pieces: the content deltas carry
+        // the preamble and nothing after it, so the stream shows the content the whole has.
+        let turn = ENCODER_TURNS
+            .iter()
+            .find(|turn| turn.tail == "<think>" && turn.content == "Let me check.")
+            .expect("the shape");
+        let (before, block) = turn
+            .output
+            .split_once("\n\n<｜DSML｜tool_calls>")
+            .expect("the block");
+        assert_eq!(before, "Say something first.</think>Let me check.");
+        let mut pieces = vec![
+            "Say something first.",
+            "</think>",
+            "Let",
+            " me",
+            " check",
+            ".\n\n",
+            "<｜DSML｜tool_calls>",
+        ];
+        pieces.extend(block.split_inclusive('\n'));
+        assert_eq!(pieces.concat(), turn.output);
+        let deltas = content_deltas("<｜Assistant｜><think>", &pieces);
+        assert_eq!(deltas, ["Let", " me", " check", "."]);
+        // The blank line alone in a delta, then the opener, at a chat turn's start: no content.
+        let deltas = content_deltas("<｜Assistant｜></think>", &["\n\n", BARE_BLOCK]);
+        assert_eq!(deltas, Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_turn_after_a_tool_result_reads_the_opener_as_the_turns_start_does() {
+        // The template renders a tool result as a block inside a user message and opens the
+        // model's turn after it, `<｜Assistant｜>` with the thought opened (thinking) or closed
+        // (chat), or leaves the turn unopened when a system note follows the result; the blank
+        // line before a block is the opener's whether or not text came before it, so no mode and
+        // no start shows it as content.
+        let result = concat!(
+            "<｜User｜>Weather in Paris?<｜Assistant｜><think>Need the weather.</think>\n\n",
+            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n",
+            "<｜DSML｜parameter name=\"location\" string=\"true\">Paris</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n</｜DSML｜tool_calls><｜end▁of▁sentence｜>",
+            "<｜User｜><tool_result>{\"temperature\": 22}</tool_result>"
+        );
+        let thinking = format!("{result}<｜Assistant｜><think>");
+        let chat = format!("{result}<｜Assistant｜></think>");
+        let unopened = format!("{result}# Environment\n - Platform: linux");
+        for (prompt, output, expected) in [
+            (
+                &thinking,
+                format!("Check again.</think>\n\n{BARE_BLOCK}"),
+                ("", "Check again."),
+            ),
+            (
+                &thinking,
+                format!("Check again.</think>It is 22 degrees; checking again.\n\n{BARE_BLOCK}"),
+                ("It is 22 degrees; checking again.", "Check again."),
+            ),
+            (&chat, format!("\n\n{BARE_BLOCK}"), ("", "")),
+            (
+                &chat,
+                format!("Checking again.\n\n{BARE_BLOCK}"),
+                ("Checking again.", ""),
+            ),
+            (
+                &unopened,
+                format!("Check again.</think>Checking again.\n\n{BARE_BLOCK}"),
+                ("Checking again.", "Check again."),
+            ),
+        ] {
+            let (content, reasoning, calls) = however_cut(prompt, &output);
+            assert_eq!(
+                (content.as_str(), reasoning.as_str()),
+                expected,
+                "{output:?}"
+            );
+            assert_eq!(calls, [("f".to_string(), "{}".to_string())], "{output:?}");
+        }
+    }
+
+    #[test]
+    fn the_opener_with_its_blank_line_is_spelled_as_the_tags_write_it() {
+        // The reading and the writing agree on what the template puts before the block.
+        let spelled = format!("{}<｜DSML｜tool_calls>", Tags::DSML_V4.before_block);
+        assert!(deepseek_v4().terminal_texts().any(|text| text == spelled));
     }
 }

@@ -1925,11 +1925,21 @@ const QWEN3_TAGGED_DIRECT_OUTPUTS: &[&str] = &[
 ];
 
 /// DeepSeek V4's DSML as its reference encoder renders it (the thought the prompt opens written
-/// here, since the replay starts from an empty prompt), and one cut short.
+/// here, since the replay starts from an empty prompt): a call after a thought, a call with
+/// numbers, two calls after content, a call after content in thinking and in chat mode with the
+/// blank line before the block, a third newline and a space before it, a thought cut short,
+/// content alone, and two cut short.
 const DEEPSEEK_V4_OUTPUTS: &[&str] = &[
     "<think>The user asks.</think>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Beijing</｜DSML｜parameter>\n<｜DSML｜parameter name=\"unit\" string=\"true\">celsius</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
     "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"add_integers\">\n<｜DSML｜parameter name=\"a\" string=\"false\">17</｜DSML｜parameter>\n<｜DSML｜parameter name=\"b\" string=\"false\">25</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
     "Sure.\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Rome</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+    // The turns the encoder renders for a call after content, in thinking and in chat mode: the
+    // blank line between the text and the block is the opener's; a third newline, and a space,
+    // before it are content.
+    "<think>Say something first.</think>Let me check.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+    "Let me check.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+    "Sure.\n\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"f\">\n\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+    "Sure. \n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"f\">\n\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
     "<think>still thinking",
     "Hello!",
     "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Par",
@@ -1938,13 +1948,21 @@ const DEEPSEEK_V4_OUTPUTS: &[&str] = &[
 
 /// DeepSeek V3.2's DSML as its reference encoder renders it (the thought the prompt opens written
 /// here, since the replay starts from an empty prompt): a call after a thought, a call with a
-/// number and a boolean, two calls after content, an invoke with no parameters, a thought cut
-/// short, content alone, and one cut short.
+/// number and a boolean, two calls after content, an invoke with no parameters, a call after
+/// content in thinking and in chat mode with the blank line before the block, a third newline and
+/// a space before it, a thought cut short, content alone, and one cut short.
 const DEEPSEEK_V3_2_OUTPUTS: &[&str] = &[
     "<think>The user asks.</think>\n\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Beijing</｜DSML｜parameter>\n<｜DSML｜parameter name=\"unit\" string=\"true\">celsius</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
     "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"add_integers\">\n<｜DSML｜parameter name=\"a\" string=\"false\">17</｜DSML｜parameter>\n<｜DSML｜parameter name=\"b\" string=\"false\">true</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
     "Sure.\n\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Rome</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
     "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"noop\">\n\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
+    // The turns the encoder renders for a call after content, in thinking and in chat mode: the
+    // blank line between the text and the block is the opener's; a third newline, and a space,
+    // before it are content.
+    "<think>Say something first.</think>Let me check.\n\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
+    "Let me check.\n\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
+    "Sure.\n\n\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"f\">\n\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
+    "Sure. \n\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"f\">\n\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
     "<think>still thinking",
     "Hello!",
     "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Par",
