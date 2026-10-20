@@ -33,14 +33,15 @@ use crate::format::{CallSyntax, Emits, Format};
 /// The text between a call's name and its arguments: the fence the template opens.
 pub const FENCE_OPEN: &str = "\n```json\n";
 
-/// The DeepSeek V3 table. The tool outputs' opener leaves the calls block as the block's close
-/// does: the template writes the turn opener after a user message only, so after a tool result
-/// the prompt's replay walks the call turn, and the R1 distills' template ends a turn with one
-/// call with neither `<｜tool▁calls▁end｜>` nor `<｜end▁of▁sentence｜>`; the walk goes on past the
-/// tool outputs in content, where the model's own `<think>`, or one the client prefilled, opens
-/// the thought. The tool outputs' close is a terminal too, a row from content to itself, so the
-/// outputs' text is not text the content stay has written: the answer after a tool result starts
-/// with nothing begun, and whitespace alone ahead of its thought or call is held, not shown.
+/// The DeepSeek V3 table. The tool outputs are a state of their own, entered from the calls block
+/// or from content on `<｜tool▁outputs▁begin｜>` and left for content on `<｜tool▁outputs▁end｜>`,
+/// with no other row: the template writes the turn opener after a user message only, so after a
+/// tool result the prompt's replay walks the call turn, and the R1 distills' template ends a turn
+/// with one call with neither `<｜tool▁calls▁end｜>` nor `<｜end▁of▁sentence｜>`, so the opener is
+/// what leaves the block there; nothing quoted inside a tool's output moves the walk; and the
+/// close starts the answer with nothing begun, so whitespace alone ahead of its thought or call
+/// is held, and the model's own `<think>`, or one the client prefilled, opens the thought from
+/// content as it does after `<｜Assistant｜>`.
 pub fn deepseek_v3() -> Format {
     Format::new("deepseek_v3")
         .terminal("think_open", "<think>")
@@ -55,6 +56,7 @@ pub fn deepseek_v3() -> Format {
         .state("reasoning", Emits::Reasoning)
         .state("calls", Emits::Wrapper)
         .state("call", Emits::Arguments)
+        .state("outputs", Emits::Content)
         .transition("content", "think_open", "reasoning")
         .transition("reasoning", "think_close", "content")
         .transition("content", "calls_open", "calls")
@@ -64,8 +66,9 @@ pub fn deepseek_v3() -> Format {
         .transition("call", "call_open", "call")
         .transition("call", "calls_close", "content")
         .transition("calls", "calls_close", "content")
-        .transition("calls", "outputs_open", "content")
-        .transition("content", "outputs_close", "content")
+        .transition("calls", "outputs_open", "outputs")
+        .transition("content", "outputs_open", "outputs")
+        .transition("outputs", "outputs_close", "content")
         .calls(CallSyntax::NamedArguments {
             marker: FENCE_OPEN,
             between_calls: "\n",
@@ -498,9 +501,9 @@ mod tests {
         assert_eq!(reasoning(&events), "Warm.");
         assert_eq!(content(&events), "It is 18 degrees.");
         assert!(calls(&events).is_empty());
-        // The tool outputs' text is not text the content stay has written (their close is a row
-        // from content to itself): the answer starts with nothing begun, and whitespace alone
-        // ahead of its thought is held, not shown as content.
+        // The tool outputs are a state of their own, left for content on their close: the
+        // answer starts with nothing begun, and whitespace alone ahead of its thought is held,
+        // not shown as content.
         let events = run(one_call, &["\n<think>Warm.</think>It is 18 degrees."]);
         assert_eq!(reasoning(&events), "Warm.");
         assert_eq!(
@@ -515,6 +518,21 @@ mod tests {
             "It is 18 degrees.",
             "the lead is held after an ended block too"
         );
+        // Nothing quoted inside a tool's output moves the walk: a literal `<think>` or a calls
+        // opener in the result's text stays there, and the answer after it is content.
+        let quoted = "<｜User｜>Weather in Paris?<｜Assistant｜><｜tool▁calls▁begin｜>\
+                      <｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n\
+                      {\"city\": \"Paris\"}\n```<｜tool▁call▁end｜><｜tool▁outputs▁begin｜>\
+                      <｜tool▁output▁begin｜>{\"note\": \"<think> and <｜tool▁calls▁begin｜> \
+                      are text here\"}<｜tool▁output▁end｜><｜tool▁outputs▁end｜>";
+        assert!(
+            !format.reasoning_open(quoted),
+            "a quoted marker moves nothing"
+        );
+        let events = run(quoted, &["It is 18 degrees."]);
+        assert_eq!(content(&events), "It is 18 degrees.");
+        assert_eq!(reasoning(&events), "");
+        assert!(calls(&events).is_empty());
         // A thought the client prefilled after the tool result (`continue_final_message`) is
         // read: the walk went past the tool outputs, and `<think>` opened the thought.
         let prefilled = format!("{one_call}<think>\nThe tool says");

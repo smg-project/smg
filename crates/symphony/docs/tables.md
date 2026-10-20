@@ -236,16 +236,20 @@ is the terminal that leaves the call. Beyond that:
   text, so the free text before the calls (a thought the prompt opened) may still hold a fenced
   draft of the arguments: only the table's terminals are kept out of it. Not yet read live on an
   engine.
-- **The tool outputs' opener leaves the calls block.** The template writes the turn opener after a
+- **The tool outputs are a state of their own.** The template writes the turn opener after a
   user message only, so after a tool result the prompt's replay walks the call turn, and the R1
   distills' template writes `<｜tool▁calls▁end｜><｜end▁of▁sentence｜>` after the second call and
-  later only, so a turn with one call ends with neither: without the row the walk stayed in the
-  block and the next turn read as wrapper text. `<｜tool▁outputs▁begin｜>` is a terminal with a row
-  from the block to content, so the walk goes on past the tool outputs, and the model's own
-  `<think>`, or one the client prefilled (`continue_final_message`), opens the thought there as it
-  does after `<｜Assistant｜>`; a marker quoted inside a tool's output moves the walk, as it does
-  after an ended block. Bellwether's R1-line sets hold content alone, so the module test pins the
-  one-call history as that template renders it, and the prefilled thought.
+  later only, so a turn with one call ends with neither: without a row for the outputs the walk
+  stayed in the block and the next turn read as wrapper text. `<｜tool▁outputs▁begin｜>` and
+  `<｜tool▁outputs▁end｜>` are terminals, and the outputs between them a state entered from the
+  block or from content and left for content, with no other row: nothing quoted inside a tool's
+  output moves the walk (a `<think>` or a calls opener in a result's text stays there), and the
+  close starts the answer with nothing begun, for every template that ends its block as much as
+  for the distills' one-call turn, so whitespace alone ahead of its thought or call is held, not
+  shown, and the model's own `<think>`, or one the client prefilled (`continue_final_message`),
+  opens the thought from content as it does after `<｜Assistant｜>`. Bellwether's R1-line sets hold
+  content alone, so the module test pins the one-call history as that template renders it, the
+  quoted markers, the held lead, and the prefilled thought.
 
 ## GLM 4.5 and 4.6 (`glm4`)
 
