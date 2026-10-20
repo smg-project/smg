@@ -1512,14 +1512,18 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         )
     }
 
-    /// Combine native profiles with checkpoint-specific Jinja media handling.
+    /// Combine native profiles with what the Jinja template answers for the
+    /// checkpoint: its media handling and how it takes tool-call arguments.
     fn renderer_capabilities(&self) -> crate::traits::RendererCapabilities {
         // A renderer with an encoder of its own answers from its profile; the
         // Jinja renderer continues a trailing assistant message the way
-        // transformers' `continue_final_message` does.
+        // transformers' `continue_final_message` does, and takes a history
+        // call's arguments as the text the request sent when its template
+        // writes them that way.
         self.profile.map_or_else(
             || crate::traits::RendererCapabilities {
                 media_handling: self.media_handling,
+                raw_tool_call_arguments: self.chat_template.raw_tool_call_arguments(),
                 ..RendererProfile::TEMPLATE_CAPABILITIES
             },
             |profile| profile.capabilities,

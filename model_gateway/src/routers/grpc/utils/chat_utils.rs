@@ -780,9 +780,10 @@ pub(crate) fn process_chat_messages_with_placeholders(
         )?;
 
         // Process tool call arguments in assistant messages. Renderers that
-        // parse `arguments` strings themselves with the reference's tolerance
-        // (DeepSeek-V4.1) get them as written; every other template gets the
-        // parsed object the Transformers docs expect.
+        // parse `arguments` strings themselves with the reference's tolerance,
+        // and templates that write them as the text the request sent, get
+        // them as written; every other template gets the parsed object the
+        // Transformers docs expect.
         if !tokenizer.renderer_capabilities().raw_tool_call_arguments {
             process_tool_call_arguments(&mut transformed_messages)?;
         }
@@ -2574,6 +2575,77 @@ mod tests {
         assert_eq!(
             raw["messages"][1]["tool_calls"][0]["function"]["arguments"],
             json!("{\"city\": \"Hangzhou\"}")
+        );
+    }
+
+    /// A Jinja template that writes a history call's arguments by string
+    /// concatenation (the DeepSeek V3 line's own templates do) tells the
+    /// gateway through its renderer capabilities, and the arguments reach it
+    /// as the request sent them, spelling and all; a template that serializes
+    /// the object gets the object, as before.
+    #[test]
+    fn a_template_that_writes_the_arguments_as_text_gets_them_as_the_request_sent_them() {
+        let concatenating = "{% for m in messages %}{% if m.tool_calls %}{% for t in m.tool_calls %}\
+                             {{ '<call>' + t.function.name + ':' + t.function.arguments + '</call>' }}\
+                             {% endfor %}{% else %}{{ m.content }}{% endif %}{% endfor %}";
+        let serializing = "{% for m in messages %}{% if m.tool_calls %}{% for t in m.tool_calls %}\
+                           <call>{{ t.function.name }}:{{ t.function.arguments | tojson }}</call>\
+                           {% endfor %}{% else %}{{ m.content }}{% endif %}{% endfor %}";
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Weather in Rome?"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"city\":\"Rome\"}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "24"},
+                {"role": "user", "content": "And Paris?"}
+            ]
+        }))
+        .unwrap();
+
+        let rendered = |template: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("tokenizer.json"),
+                r#"{"version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+                    "normalizer": null, "pre_tokenizer": {"type": "Whitespace"},
+                    "post_processor": null, "decoder": null,
+                    "model": {"type": "BPE", "vocab": {"hello": 0}, "merges": []}}"#,
+            )
+            .unwrap();
+            std::fs::write(
+                dir.path().join("tokenizer_config.json"),
+                json!({"chat_template": template}).to_string(),
+            )
+            .unwrap();
+            let tok = llm_tokenizer::create_tokenizer(dir.path().to_str().unwrap()).unwrap();
+            let raw = tok.renderer_capabilities().raw_tool_call_arguments;
+            (
+                raw,
+                process_chat_messages(&request, tok.as_ref(), None)
+                    .unwrap()
+                    .text,
+            )
+        };
+
+        let (raw, text) = rendered(concatenating);
+        assert!(raw);
+        assert_eq!(
+            text,
+            "Weather in Rome?<call>get_weather:{\"city\":\"Rome\"}</call>24And Paris?"
+        );
+        let (raw, text) = rendered(serializing);
+        assert!(!raw);
+        assert_eq!(
+            text,
+            "Weather in Rome?<call>get_weather:{\"city\": \"Rome\"}</call>24And Paris?"
         );
     }
 

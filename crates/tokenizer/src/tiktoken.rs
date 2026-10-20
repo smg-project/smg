@@ -931,11 +931,16 @@ impl TokenizerTrait for TiktokenTokenizer {
     fn renderer_capabilities(&self) -> RendererCapabilities {
         // A renderer with an encoder of its own answers from its profile; the
         // others render through the Jinja template, which continues a
-        // trailing assistant message the way transformers does.
-        self.profile
-            .map_or(RendererProfile::TEMPLATE_CAPABILITIES, |profile| {
-                profile.capabilities
-            })
+        // trailing assistant message the way transformers does and takes a
+        // history call's arguments as the text the request sent when it
+        // writes them that way.
+        self.profile.map_or_else(
+            || RendererCapabilities {
+                raw_tool_call_arguments: self.chat_template.raw_tool_call_arguments(),
+                ..RendererProfile::TEMPLATE_CAPABILITIES
+            },
+            |profile| profile.capabilities,
+        )
     }
 
     fn native_thinking_mode(
