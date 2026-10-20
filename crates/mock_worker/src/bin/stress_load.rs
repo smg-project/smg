@@ -15,8 +15,10 @@
 //! function schemas), `responses` (the Responses API with `store: true`,
 //! `--chain` requests per session linked by `previous_response_id`) and
 //! `image` (`--image <file>` inline as a data URL, `--images-per-request`
-//! copies, before the text). `--tenants N` spreads the requests over N
-//! tenant ids sent in `--tenant-header`.
+//! copies, before the text), `messages` (the Messages API, one user message)
+//! and `embeddings` (the prompt as the input). `--json-schema` asks a chat
+//! request for a JSON answer under a fixed schema. `--tenants N` spreads the
+//! requests over N tenant ids sent in `--tenant-header`.
 //!
 //! Prompts are deterministic from `--seed`: `--distinct` distinct prompts of
 //! about `--prompt-tokens` words (one token each for a large-vocabulary BPE),
@@ -81,12 +83,16 @@ enum Mode {
     /// Chat completions with `--images-per-request` inline images
     /// (`--image`, as data URLs) before the text.
     Image,
+    /// `POST /v1/messages` (the Messages API) with one user message.
+    Messages,
+    /// `POST /v1/embeddings` with the prompt as the input.
+    Embeddings,
 }
 
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "stress_load",
-    about = "Open-loop load client for the gateway stress bed (chat, tools, responses, image)"
+    about = "Open-loop load client for the gateway stress bed (chat, tools, responses, image, messages, embeddings)"
 )]
 struct Args {
     /// Gateway base URL.
@@ -127,6 +133,10 @@ struct Args {
     /// `max_tokens` (`max_output_tokens` for responses).
     #[arg(long, default_value_t = 8)]
     max_tokens: u32,
+    /// Chat requests ask for a JSON answer under a fixed object schema
+    /// (`response_format: json_schema`).
+    #[arg(long, default_value_t = false)]
+    json_schema: bool,
     /// Spread the requests over this many tenant ids (0: no tenant header).
     #[arg(long, default_value_t = 0)]
     tenants: usize,
@@ -227,6 +237,28 @@ fn prompt(args: &Args, i: usize) -> String {
 
 fn user(text: impl Into<String>) -> Value {
     json!({"role": "user", "content": text.into()})
+}
+
+/// The `response_format` of a `--json-schema` chat request: a small object
+/// with a string, a bounded integer and an enum, every field required.
+fn answer_schema() -> Value {
+    json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "answer",
+            "strict": true,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "answer": {"type": "string"},
+                    "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+                    "status": {"type": "string", "enum": ["ok", "unsure"]}
+                },
+                "required": ["answer", "confidence", "status"],
+                "additionalProperties": false
+            }
+        }
+    })
 }
 
 fn tool_schemas(n: usize) -> Vec<Value> {
@@ -345,15 +377,37 @@ fn build_bodies(args: &Args) -> Result<Vec<Bytes>> {
     if args.mode == Mode::Image && images.is_empty() {
         anyhow::bail!("--mode image needs at least one --image <file>");
     }
+    if args.mode == Mode::Embeddings && args.stream {
+        anyhow::bail!("--mode embeddings answers one JSON object: drop --stream");
+    }
+    if args.json_schema && args.mode != Mode::Chat {
+        anyhow::bail!("--json-schema applies to --mode chat only");
+    }
     let mut bodies = Vec::with_capacity(distinct);
     for i in 0..distinct {
         let body = match args.mode {
-            Mode::Chat => json!({
+            Mode::Chat => {
+                let mut body = json!({
+                    "model": args.model,
+                    "messages": [user(prompt(args, i))],
+                    "max_tokens": args.max_tokens,
+                    "stream": args.stream,
+                    "stream_options": if args.stream { json!({"include_usage": true}) } else { Value::Null },
+                });
+                if args.json_schema {
+                    body["response_format"] = answer_schema();
+                }
+                body
+            }
+            Mode::Messages => json!({
                 "model": args.model,
-                "messages": [user(prompt(args, i))],
                 "max_tokens": args.max_tokens,
+                "messages": [user(prompt(args, i))],
                 "stream": args.stream,
-                "stream_options": if args.stream { json!({"include_usage": true}) } else { Value::Null },
+            }),
+            Mode::Embeddings => json!({
+                "model": args.model,
+                "input": prompt(args, i),
             }),
             Mode::Tools => json!({
                 "model": args.model,
@@ -564,13 +618,16 @@ fn find_frame_end(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\n\n")
 }
 
-/// Whether an SSE frame carries a visible token: a `content` (or
-/// `reasoning_content`, or a Responses `delta`) string that is not empty.
+/// Whether an SSE frame carries a visible token: a `content` or
+/// `reasoning_content` string (chat), a Responses `delta`, or a Messages
+/// `text` or `thinking` delta, that is not empty.
 fn frame_has_token(frame: &[u8]) -> bool {
     for key in [
         &b"\"content\":\""[..],
         &b"\"reasoning_content\":\""[..],
         &b"\"delta\":\""[..],
+        &b"\"text\":\""[..],
+        &b"\"thinking\":\""[..],
     ] {
         if let Some(pos) = frame.windows(key.len()).position(|w| w == key) {
             if frame.get(pos + key.len()).is_some_and(|&c| c != b'"') {
@@ -595,21 +652,25 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// Whether an SSE frame reports a failure after the head already said 200:
-/// the router's `data: {"error":{...}}` frame, or a Responses
-/// `response.failed` event.
+/// the router's `data: {"error":{...}}` frame, a Responses `response.failed`
+/// event, or the Messages API's `error` event (`{"type":"error",...}`).
 fn frame_is_error(frame: &[u8]) -> bool {
     frame_data(frame).is_some_and(|data| {
-        data.starts_with(b"{\"error\"") || contains(data, b"\"type\":\"response.failed\"")
+        data.starts_with(b"{\"error\"")
+            || data.starts_with(b"{\"type\":\"error\"")
+            || contains(data, b"\"type\":\"response.failed\"")
     })
 }
 
-/// Whether an SSE frame ends its stream in order: `data: [DONE]`, or a
-/// Responses `response.completed` / `response.incomplete` event.
+/// Whether an SSE frame ends its stream in order: `data: [DONE]`, a
+/// Responses `response.completed` / `response.incomplete` event, or the
+/// Messages API's `message_stop`.
 fn frame_is_last(frame: &[u8]) -> bool {
     frame_data(frame).is_some_and(|data| {
         data == b"[DONE]"
             || contains(data, b"\"type\":\"response.completed\"")
             || contains(data, b"\"type\":\"response.incomplete\"")
+            || contains(data, b"\"type\":\"message_stop\"")
     })
 }
 
@@ -935,6 +996,8 @@ fn interim_line(stats: &Stats, t: f64) -> String {
 async fn run(args: Args) -> Result<Summary> {
     let path = match args.mode {
         Mode::Responses => "/v1/responses",
+        Mode::Messages => "/v1/messages",
+        Mode::Embeddings => "/v1/embeddings",
         _ => "/v1/chat/completions",
     };
     let url = format!("{}{}", args.gateway.trim_end_matches('/'), path);
@@ -1098,6 +1161,61 @@ mod tests {
         assert!(responses_body(&r, 3, None)
             .windows(20)
             .all(|w| w != b"previous_response_id"));
+    }
+
+    #[test]
+    fn messages_embeddings_and_json_schema_bodies() {
+        let m = build_bodies(&args(Mode::Messages)).unwrap();
+        let v: Value = serde_json::from_slice(&m[0]).unwrap();
+        assert_eq!(v["messages"][0]["role"], "user");
+        assert_eq!(v["max_tokens"], 8);
+        assert!(v.get("tools").is_none());
+
+        let e = build_bodies(&args(Mode::Embeddings)).unwrap();
+        let v: Value = serde_json::from_slice(&e[1]).unwrap();
+        assert!(v["input"].as_str().unwrap().contains("[session 1]"));
+        assert!(v.get("messages").is_none());
+
+        let mut c = args(Mode::Chat);
+        c.json_schema = true;
+        let v: Value = serde_json::from_slice(&build_bodies(&c).unwrap()[0]).unwrap();
+        assert_eq!(v["response_format"]["type"], "json_schema");
+        assert_eq!(
+            v["response_format"]["json_schema"]["schema"]["required"][0],
+            "answer"
+        );
+        assert!(build_bodies(&args(Mode::Chat)).unwrap()[0]
+            .windows(15)
+            .all(|w| w != b"response_format"));
+
+        assert!(frame_is_last(
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}"
+        ));
+        assert!(frame_has_token(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}"
+        ));
+        assert!(!frame_has_token(
+            b"event: content_block_delta\ndata: {\"delta\":{\"type\":\"text_delta\",\"text\":\"\"}}"
+        ));
+        assert!(frame_has_token(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Hm\"}}"
+        ));
+        assert!(frame_is_error(
+            b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}"
+        ));
+        assert!(!frame_is_error(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"type\\\":\\\"error\\\"}\"}}]}"
+        ));
+
+        let mut e = args(Mode::Embeddings);
+        e.stream = true;
+        assert!(build_bodies(&e).is_err(), "an embeddings stream is refused");
+        let mut m = args(Mode::Messages);
+        m.json_schema = true;
+        assert!(
+            build_bodies(&m).is_err(),
+            "--json-schema outside chat is refused"
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@ allocate and copy" for eight traffic shapes.
 | file | what |
 |---|---|
 | `bed.sh up\|down\|status` | the fleet (12 realistic gRPC engines with KV events, an admin API) and the gateway, registered and probed; the gateway can be pinned to a cpu list and runs in its own transient systemd user scope when available, so its cgroup memory can be sampled |
-| `stress_load` (bin of `crates/mock_worker`) | the open-loop client: `--mode chat\|tools\|responses\|image`, `--stream`, `--rate`, deterministic prompts with shared heads, tenants, tool-heavy conversations, `previous_response_id` chains, inline images; TTFB/TTFT/e2e percentiles, frames and inter-frame gaps, status and error counts |
+| `stress_load` (bin of `crates/mock_worker`) | the open-loop client: `--mode chat\|tools\|responses\|image\|messages\|embeddings`, `--json-schema`, `--stream`, `--rate`, deterministic prompts with shared heads, tenants, tool-heavy conversations, `previous_response_id` chains, inline images; TTFB/TTFT/e2e percentiles, frames and inter-frame gaps, status and error counts |
 | `cell.sh <name> -- <client args>` | one cell: the sampler on the gateway, the client pinned elsewhere, optional `perf record -g` and heap-profile windows inside the sampled window, the metrics before and after |
 | `sample.py` | once a second: the gateway's CPU time, RSS (anon/file), threads, fds, cgroup `memory.current`/anon, and every 5 s the allocator gauges and request counters from `/metrics` |
 | `run_all.sh [family ...]` | the matrix below, each family on a bed of its own, cells interleaved and repeated |
