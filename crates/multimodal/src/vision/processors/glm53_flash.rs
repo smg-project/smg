@@ -5,8 +5,9 @@ use std::borrow::Cow;
 use image::{imageops::FilterType, DynamicImage, GenericImageView};
 use ndarray::Array2;
 
+use super::qwen_vl_base::pixel_norm;
 use crate::{
-    encoder_inputs::ModelSpecificValue,
+    encoder_inputs::{EncoderInput, ModelSpecificValue, PixelNorm},
     types::RgbFrameRef,
     vision::{
         preprocessor_config::PreProcessorConfig,
@@ -48,8 +49,11 @@ struct Geometry {
     content: (usize, usize),
 }
 
+/// The image's own bytes in the patch layout, with the normalization a
+/// float destination applies.
 struct Patches {
-    values: Vec<f32>,
+    values: Vec<u8>,
+    norm: PixelNorm,
     grid: (usize, usize, usize),
     count: usize,
     tokens: usize,
@@ -264,18 +268,24 @@ fn video_token_budget(config: &PreProcessorConfig) -> Result<usize, TransformErr
     Ok(extra_usize(config, "max_image_tokens", MAX_VIDEO_TOKENS)?.min(VIDEO_TOKEN_CAP))
 }
 
-fn pixel_lut(
+/// The reference's fused rescale and normalize for these settings
+/// (`(byte - mean / rescale) / (std / rescale)`, the rounding transformers'
+/// processor and an engine that normalizes on device share), refused where
+/// a setting is not finite, a std is zero, or a byte would map to a
+/// non-finite value.
+fn glm_pixel_norm(
     config: &PreProcessorConfig,
     params: Params,
-) -> Result<[[f32; 256]; 3], TransformError> {
+) -> Result<PixelNorm, TransformError> {
     let do_rescale = config.do_rescale.unwrap_or(true);
     let do_normalize = config.do_normalize.unwrap_or(true);
     let rescale = if do_rescale {
-        config.rescale_factor.unwrap_or(1.0 / 255.0)
+        config.get_rescale_factor()
     } else {
         1.0
     };
     if !rescale.is_finite()
+        || (do_rescale && rescale == 0.0)
         || (do_normalize
             && (params.mean.iter().any(|value| !value.is_finite())
                 || params
@@ -285,23 +295,16 @@ fn pixel_lut(
     {
         return Err(shape("invalid GLM pixel rescale or normalization values"));
     }
-    let lut = std::array::from_fn(|channel| {
-        let scale = (if do_normalize {
-            rescale / params.std[channel]
-        } else {
-            rescale
-        }) as f32;
-        let bias = (if do_normalize {
-            -params.mean[channel] / params.std[channel]
-        } else {
-            0.0
-        }) as f32;
-        std::array::from_fn(|value| value as f32 * scale + bias)
-    });
-    lut.iter()
+    let channel_block = product(
+        &[params.temporal, params.patch, params.patch],
+        "GLM channel block",
+    )?;
+    let norm = pixel_norm(config, params.mean, params.std, channel_block);
+    norm.table_f32()
+        .iter()
         .flatten()
         .all(|value| value.is_finite())
-        .then_some(lut)
+        .then_some(norm)
         .ok_or_else(|| shape("GLM pixel transform overflow"))
 }
 
@@ -396,7 +399,7 @@ fn encode<F: RgbSource>(
     values
         .try_reserve_exact(expected)
         .map_err(|error| shape(format!("cannot reserve GLM patch output: {error}")))?;
-    let lut = pixel_lut(config, params)?;
+    let norm = glm_pixel_norm(config, params)?;
     let filter = pil_to_filter(config.resampling.or(Some(3)));
     let merged_patch = params.merge * params.patch;
 
@@ -413,7 +416,7 @@ fn encode<F: RgbSource>(
                 let (y0, x0) = (patch_row * merged_patch, patch_col * merged_patch);
                 for merge_h in 0..params.merge {
                     for merge_w in 0..params.merge {
-                        for (channel, channel_lut) in lut.iter().enumerate() {
+                        for channel in 0..3 {
                             for temporal in 0..params.temporal {
                                 let raw = prepared.get(temporal).unwrap_or(last).as_ref();
                                 for patch_y in 0..params.patch {
@@ -422,7 +425,7 @@ fn encode<F: RgbSource>(
                                         + merge_w * params.patch;
                                     let mut source = row * 3 + channel;
                                     for _ in 0..params.patch {
-                                        values.push(channel_lut[raw[source] as usize]);
+                                        values.push(raw[source]);
                                         source += 3;
                                     }
                                 }
@@ -436,6 +439,7 @@ fn encode<F: RgbSource>(
     debug_assert_eq!(values.len(), expected);
     Ok(Patches {
         values,
+        norm,
         grid: (grid_t, grid_h, grid_w),
         count,
         tokens: count / (params.merge * params.merge),
@@ -460,28 +464,30 @@ fn preprocess_video_frames<F: RgbSource>(
     let features = 3 * params.temporal * params.patch * params.patch;
     let tensor = Array2::from_shape_vec((patches.count, features), patches.values)
         .map_err(|error| shape(format!("failed to build GLM video patches: {error}")))?;
-    Ok(
-        PreprocessedEncoderInputs::new(tensor, vec![patches.tokens], vec![original])
-            .with_extra(
-                "video_grid_thw",
-                ModelSpecificValue::int_2d(vec![grid_t as i64, grid_h as i64, grid_w as i64], 1, 3),
-            )
-            .with_extra(
-                "patches_per_video",
-                ModelSpecificValue::int_1d(vec![patches.count as i64]),
-            )
-            .with_extra(
-                "patches_per_image",
-                ModelSpecificValue::int_1d(vec![patches.count as i64]),
-            )
-            .with_extra(
-                "video_second_per_grid",
-                ModelSpecificValue::Tensor {
-                    data: vec![params.temporal as f32 / fps],
-                    shape: vec![1],
-                },
-            ),
+    Ok(PreprocessedEncoderInputs::new(
+        EncoderInput::bytes(tensor, patches.norm),
+        vec![patches.tokens],
+        vec![original],
     )
+    .with_extra(
+        "video_grid_thw",
+        ModelSpecificValue::int_2d(vec![grid_t as i64, grid_h as i64, grid_w as i64], 1, 3),
+    )
+    .with_extra(
+        "patches_per_video",
+        ModelSpecificValue::int_1d(vec![patches.count as i64]),
+    )
+    .with_extra(
+        "patches_per_image",
+        ModelSpecificValue::int_1d(vec![patches.count as i64]),
+    )
+    .with_extra(
+        "video_second_per_grid",
+        ModelSpecificValue::Tensor {
+            data: vec![params.temporal as f32 / fps],
+            shape: vec![1],
+        },
+    ))
 }
 
 fn rgb_len(width: usize, height: usize) -> Result<usize, TransformError> {
@@ -528,6 +534,12 @@ impl VisionPreProcessor for Glm53FlashProcessor {
         PreProcessorConfig::CLIP_STD
     }
 
+    /// The patches are the image's own bytes, so an engine that normalizes on
+    /// device takes them as they are.
+    fn emits_pixel_bytes(&self) -> bool {
+        true
+    }
+
     fn preprocess(
         &self,
         images: &[DynamicImage],
@@ -537,6 +549,7 @@ impl VisionPreProcessor for Glm53FlashProcessor {
             return Err(TransformError::EmptyBatch);
         }
         let params = Params::from_config(config, false)?;
+        let norm = glm_pixel_norm(config, params)?;
         let mut values = Vec::new();
         let mut grids = Vec::with_capacity(images.len() * 3);
         let mut counts = Vec::with_capacity(images.len());
@@ -557,7 +570,7 @@ impl VisionPreProcessor for Glm53FlashProcessor {
         let tensor = Array2::from_shape_vec((total, features), values)
             .map_err(|error| shape(format!("failed to build GLM image patches: {error}")))?;
         Ok(PreprocessedEncoderInputs::new(
-            tensor,
+            EncoderInput::bytes(tensor, norm),
             tokens,
             images.iter().map(GenericImageView::dimensions).collect(),
         )
@@ -795,6 +808,45 @@ mod tests {
         config.image_std = None;
         config.rescale_factor = Some(f64::NAN);
         assert!(first(&config).is_err());
+    }
+
+    /// The patches are the image's own bytes, so an engine that normalizes on
+    /// device takes them unchanged; a float destination maps each byte the
+    /// way transformers' processor does, `(byte - mean / rescale) / (std /
+    /// rescale)` in f32.
+    #[test]
+    fn patches_are_pixel_bytes_normalized_with_the_references_rounding() {
+        let processor = Glm53FlashProcessor::new();
+        assert!(processor.emits_pixel_bytes());
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(28, 28, Rgb([255, 128, 7])));
+        let mut config = config(MAX_IMAGE_TOKENS);
+        config.do_resize = Some(false);
+        let output = processor
+            .preprocess(std::slice::from_ref(&image), &config)
+            .unwrap();
+        let EncoderInput::U8 { patches, norm } = &output.encoder_input else {
+            panic!("GLM patches should be pixel bytes");
+        };
+        let channel_block = TEMPORAL_PATCH_SIZE * PATCH_SIZE * PATCH_SIZE;
+        assert_eq!(norm.channel_block, channel_block);
+        assert_eq!(patches[[0, 0]], 255);
+        assert_eq!(patches[[0, channel_block]], 128);
+        assert_eq!(patches[[0, 2 * channel_block]], 7);
+        let into_bytes = (1.0 / (1.0 / 255.0_f64)) as f32;
+        let reference = |byte: f32, channel: usize| {
+            (byte - PreProcessorConfig::CLIP_MEAN[channel] as f32 * into_bytes)
+                / (PreProcessorConfig::CLIP_STD[channel] as f32 * into_bytes)
+        };
+        let floats = output.encoder_input.as_f32();
+        assert_eq!(floats[[0, 0]].to_bits(), reference(255.0, 0).to_bits());
+        assert_eq!(
+            floats[[0, channel_block]].to_bits(),
+            reference(128.0, 1).to_bits()
+        );
+        assert_eq!(
+            floats[[0, 2 * channel_block]].to_bits(),
+            reference(7.0, 2).to_bits()
+        );
     }
 
     #[test]

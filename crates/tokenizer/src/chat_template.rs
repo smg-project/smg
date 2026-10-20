@@ -1141,6 +1141,12 @@ fn serialize_with_python_json<T: Serialize>(
     })
 }
 
+/// Compact JSON spelling shared by the Jinja filter and native renderers.
+pub(crate) fn compact_python_json(value: &JsonValue) -> Result<String> {
+    serialize_with_python_json(value, None, JsonSeparators::python_default(None), false)
+        .map_err(Into::into)
+}
+
 /// Custom tojson filter compatible with HuggingFace transformers' implementation.
 ///
 /// HuggingFace transformers registers a custom `tojson` filter that accepts additional
@@ -1449,7 +1455,9 @@ fn detect_root_role_support(template: &str) -> bool {
 /// message is not the first message (the engine's `_consolidate_system_messages`,
 /// which follows the rewrite in its renderer). `None` when no message has
 /// the role, so the caller keeps its slice.
-fn developer_messages_as_system(messages: &[serde_json::Value]) -> Option<Vec<serde_json::Value>> {
+pub(crate) fn developer_messages_as_system(
+    messages: &[serde_json::Value],
+) -> Option<Vec<serde_json::Value>> {
     let is_developer =
         |m: &serde_json::Value| m.get("role").and_then(|r| r.as_str()) == Some("developer");
     if !messages.iter().any(is_developer) {
@@ -1481,7 +1489,9 @@ fn developer_messages_as_system(messages: &[serde_json::Value]) -> Option<Vec<se
 /// [`developer_messages_as_system`]), so a template that reads one leading
 /// system message keeps a system message that followed the root. `None`
 /// when no message has the role, so the caller keeps its slice.
-fn root_messages_as_system(messages: &[serde_json::Value]) -> Option<Vec<serde_json::Value>> {
+pub(crate) fn root_messages_as_system(
+    messages: &[serde_json::Value],
+) -> Option<Vec<serde_json::Value>> {
     let is_root = |m: &serde_json::Value| m.get("role").and_then(|r| r.as_str()) == Some("root");
     if !messages.iter().any(is_root) {
         return None;
@@ -1671,6 +1681,18 @@ fn render_continuing_final_message(
     messages: &[JsonValue],
     params: ChatTemplateParams,
 ) -> Result<(String, bool)> {
+    continue_final_message(messages, params, |messages, params| {
+        render_messages(env, messages.iter(), params).map(|(text, _)| text)
+    })
+}
+
+/// Continue a message with the same marker, cut and fallback rules for both
+/// Jinja and native renderers. The supplied renderer receives no continuation flag.
+pub(crate) fn continue_final_message(
+    messages: &[JsonValue],
+    params: ChatTemplateParams,
+    render: impl Fn(&[JsonValue], ChatTemplateParams) -> Result<String>,
+) -> Result<(String, bool)> {
     if params.add_generation_prompt {
         return Err(anyhow!(
             "continue_final_message and add_generation_prompt are not compatible"
@@ -1689,7 +1711,9 @@ fn render_continuing_final_message(
             continue_final_message: false,
             ..params
         };
-        let (rendered, _) = render_messages(env, head.iter().chain(iter::once(&tagged)), params)?;
+        let mut tagged_messages = head.to_vec();
+        tagged_messages.push(tagged);
+        let rendered = render(&tagged_messages, params)?;
         cut_at_final_message(rendered, text, &marker)
     })();
     let reason = match continued {
@@ -1707,8 +1731,7 @@ fn render_continuing_final_message(
         ));
     }
     tracing::debug!(%reason, "appending the continued message after the generation prompt");
-    let (mut prompt, _) = render_chat_template(
-        env,
+    let mut prompt = render(
         head,
         ChatTemplateParams {
             add_generation_prompt: true,
@@ -1815,7 +1838,9 @@ fn render_messages<'a>(
 
 /// The messages with every string `content` of a non-tool message replaced by
 /// a one-item text part list, or `None` when no message has one.
-fn string_content_as_text_parts(messages: &[serde_json::Value]) -> Option<Vec<serde_json::Value>> {
+pub(crate) fn string_content_as_text_parts(
+    messages: &[serde_json::Value],
+) -> Option<Vec<serde_json::Value>> {
     fn needs_wrap(message: &serde_json::Value) -> bool {
         message
             .get("content")

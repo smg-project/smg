@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     io::Write,
     path::{Path, PathBuf},
     process::{Output, Stdio},
@@ -171,6 +172,17 @@ pub enum FrameSampling {
     /// (`numpy.linspace(0, n - 1, max_frames)` truncated to integers), the
     /// way vLLM's default video loader samples. The rate is not a factor.
     UpTo { max_frames: usize },
+    /// [`Self::UpTo`], then, when that kept every frame of the clip, the
+    /// GLM-5-Next reference video processor's own `sample_frames` at the
+    /// configured rate over those frames, at most `rate_max_frames` of them
+    /// ([`glm5_next_frame_indices`]): vLLM hands that processor the loader's
+    /// frames and lets it resample exactly when the loader took them all
+    /// (`do_sample_frames`), and keeps a longer clip's loader picks as they
+    /// are.
+    UpToThenRate {
+        max_frames: usize,
+        rate_max_frames: usize,
+    },
     /// `trunc(duration x rate)` frames, at most `max_frames` and never more
     /// than the clip has, aligned down to a multiple of `frame_factor` (and
     /// never below it unless the clip is shorter), at the positions of
@@ -198,6 +210,24 @@ impl FrameSampling {
                 max_frames: usize::MAX,
             },
             (Self::UpTo { .. }, Some(max_frames)) => Self::UpTo { max_frames },
+            (
+                Self::UpToThenRate {
+                    rate_max_frames, ..
+                },
+                Some(0),
+            ) => Self::UpToThenRate {
+                max_frames: usize::MAX,
+                rate_max_frames,
+            },
+            (
+                Self::UpToThenRate {
+                    rate_max_frames, ..
+                },
+                Some(max_frames),
+            ) => Self::UpToThenRate {
+                max_frames,
+                rate_max_frames,
+            },
             (sampling, _) => sampling,
         }
     }
@@ -1689,6 +1719,12 @@ fn adaptive_decoder_threads(available_cpus: usize, active_decodes: usize) -> i32
 pub fn sampled_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
     match cfg.sampling {
         FrameSampling::UpTo { max_frames } => up_to_frame_indices(total_frames, max_frames),
+        FrameSampling::UpToThenRate { max_frames, .. } => resampled_after_loader(
+            up_to_frame_indices(total_frames, max_frames),
+            total_frames,
+            fps,
+            cfg,
+        ),
         _ if total_frames == 0 => Vec::new(),
         FrameSampling::Even => even_frame_indices(total_frames, fps, cfg),
         FrameSampling::EvenRounded => even_rounded_frame_indices(total_frames, fps, cfg),
@@ -1790,6 +1826,110 @@ fn loader_frame_indices(claimed: usize, visible: usize, max_frames: usize) -> Ve
         .into_iter()
         .filter(|index| *index < visible)
         .collect()
+}
+
+/// The loader's `picks` of a clip of `total_frames` at `fps`, resampled by
+/// [`glm5_next_frame_indices`] at `cfg.sample_fps` when the sampling is
+/// [`FrameSampling::UpToThenRate`] and the loader kept every frame; the
+/// picks as they are otherwise, and for a clip whose rate is unknown.
+fn resampled_after_loader(
+    picks: Vec<usize>,
+    total_frames: usize,
+    fps: f64,
+    cfg: VideoFetchConfig,
+) -> Vec<usize> {
+    let FrameSampling::UpToThenRate {
+        rate_max_frames, ..
+    } = cfg.sampling
+    else {
+        return picks;
+    };
+    if picks.len() != total_frames {
+        return picks;
+    }
+    glm5_next_frame_indices(total_frames, fps, cfg.sample_fps, rate_max_frames).unwrap_or(picks)
+}
+
+/// `Glm5NextVideoProcessor.sample_frames` (transformers) over a clip of
+/// `total_frames` at `fps`, at `target_fps`, at most `max_frames`, with the
+/// clip's duration taken as `total_frames / fps` as vLLM's loader reports
+/// it: one frame each time the stream's clock reaches the next sampling
+/// instant, up to the clip's whole seconds, else numpy's `linspace`
+/// truncated to integers where that gives too few or too many; duplicates
+/// dropped, and the last frame repeated to an even count. `None` when the
+/// clip's rate is unknown or the rule picks nothing (a clip shorter than one
+/// sampling interval), both of which the reference refuses.
+fn glm5_next_frame_indices(
+    total_frames: usize,
+    fps: f64,
+    target_fps: f32,
+    max_frames: usize,
+) -> Option<Vec<usize>> {
+    if total_frames == 0 || !(fps.is_finite() && fps > 0.0) {
+        return None;
+    }
+    let target_fps = f64::from(target_fps);
+    let duration = total_frames as f64 / fps;
+    let max_seconds = duration.trunc();
+    let extract = ((duration * target_fps) as usize).min(max_frames);
+    let last = (total_frames - 1) as f64;
+    let mut picks = if total_frames < extract {
+        numpy_linspace_indices(0.0, last, extract)
+    } else {
+        let duration_per_frame = 1.0 / fps;
+        let interval = 1.0 / target_fps;
+        let mut current_second = 0.0;
+        let mut picks = Vec::new();
+        for index in 0..total_frames {
+            if index as f64 * duration_per_frame >= current_second {
+                current_second += interval;
+                picks.push(index);
+                if current_second >= max_seconds {
+                    break;
+                }
+            }
+        }
+        picks
+    };
+    if picks.len() < extract {
+        let (start, end) = match (picks.first(), picks.last()) {
+            (Some(&start), Some(&end)) => (start as f64, end as f64),
+            _ => (0.0, last),
+        };
+        picks = numpy_linspace_indices(start, end, extract);
+    } else if picks.len() > extract {
+        picks = numpy_linspace_indices(0.0, last, extract);
+    }
+    let mut seen = HashSet::new();
+    picks.retain(|index| seen.insert(*index));
+    let last_pick = *picks.last()?;
+    if picks.len() % 2 == 1 {
+        picks.push(last_pick);
+    }
+    Some(picks)
+}
+
+/// `numpy.linspace(start, end, count, dtype=int)`: `i * step`, then `+ start`
+/// (two roundings, as numpy computes it), in float64 for `step = (end -
+/// start) / (count - 1)`, the last position `end` itself, each truncated
+/// toward zero.
+fn numpy_linspace_indices(start: f64, end: f64, count: usize) -> Vec<usize> {
+    match count {
+        0 => Vec::new(),
+        1 => vec![start as usize],
+        _ => {
+            let step = (end - start) / (count - 1) as f64;
+            (0..count)
+                .map(|index| {
+                    if index + 1 == count {
+                        end as usize
+                    } else {
+                        (index as f64 * step + start) as usize
+                    }
+                })
+                .collect()
+        }
+    }
 }
 
 fn even_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
@@ -2038,7 +2178,10 @@ async fn decode_video_with_ffmpeg(
     // A container claiming more frames than its stream holds leaves the
     // selection short. The engine's loader then sizes the clip by the frames
     // it can see; the rate-based samplings resample instead.
-    if matches!(cfg.sampling, FrameSampling::UpTo { .. }) {
+    if matches!(
+        cfg.sampling,
+        FrameSampling::UpTo { .. } | FrameSampling::UpToThenRate { .. }
+    ) {
         if let Some(resized) = probe_decoded_frame_count(input_path)
             .await
             .ok()
@@ -3247,12 +3390,18 @@ impl FrameSelection {
     fn from_metadata(metadata: VideoMetadata, cfg: VideoFetchConfig) -> Option<Self> {
         let source_fps = metadata.source_fps?;
         let (total_frames, frame_indices) = match cfg.sampling {
-            FrameSampling::UpTo { max_frames } => {
+            FrameSampling::UpTo { max_frames } | FrameSampling::UpToThenRate { max_frames, .. } => {
                 let claimed = metadata.container_frames.unwrap_or(0);
                 let visible = metadata.total_frames.unwrap_or(claimed);
+                let total_frames = loader_frame_total(claimed, visible);
                 (
-                    loader_frame_total(claimed, visible),
-                    loader_frame_indices(claimed, visible, max_frames),
+                    total_frames,
+                    resampled_after_loader(
+                        loader_frame_indices(claimed, visible, max_frames),
+                        total_frames,
+                        source_fps,
+                        cfg,
+                    ),
                 )
             }
             FrameSampling::Even
@@ -3285,18 +3434,22 @@ impl FrameSelection {
     /// The selection once the stream turns out to hold `visible` frames,
     /// `None` when that changes nothing or the sampling is rate-based.
     fn sized_to_visible(&self, visible: usize, cfg: VideoFetchConfig) -> Option<Self> {
-        let FrameSampling::UpTo { max_frames } = cfg.sampling else {
+        let (FrameSampling::UpTo { max_frames } | FrameSampling::UpToThenRate { max_frames, .. }) =
+            cfg.sampling
+        else {
             return None;
         };
-        let frame_indices = loader_frame_indices(self.total_frames, visible, max_frames);
+        let total_frames = loader_frame_total(self.total_frames, visible);
+        let frame_indices = resampled_after_loader(
+            loader_frame_indices(self.total_frames, visible, max_frames),
+            total_frames,
+            self.source_fps,
+            cfg,
+        );
         if frame_indices.is_empty() || frame_indices == self.frame_indices {
             return None;
         }
-        Some(Self::new(
-            self.source_fps,
-            loader_frame_total(self.total_frames, visible),
-            frame_indices,
-        ))
+        Some(Self::new(self.source_fps, total_frames, frame_indices))
     }
 
     fn unique_count(&self) -> usize {
@@ -4641,6 +4794,76 @@ mod video_sampling_tests {
                 0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180, 195, 210, 225, 240, 255,
                 270, 285, 299
             ]
+        );
+    }
+
+    fn up_to_then_rate_cfg(sample_fps: f32) -> VideoFetchConfig {
+        VideoFetchConfig {
+            sample_fps,
+            sampling: FrameSampling::UpToThenRate {
+                max_frames: 32,
+                rate_max_frames: 2048,
+            },
+            ..VideoFetchConfig::default()
+        }
+    }
+
+    /// A clip the loader keeps whole is resampled by the GLM-5-Next reference
+    /// processor's `sample_frames`; the expected picks are transformers' own
+    /// for each clip (`total_frames`, `fps`, sampling rate). A longer clip
+    /// keeps the loader's picks, and a clip shorter than one sampling
+    /// interval, which the reference refuses, keeps the loader's frames.
+    #[test]
+    fn up_to_then_rate_resamples_a_clip_the_loader_kept_whole() {
+        let cases: &[(usize, f64, f32, &[usize])] = &[
+            (32, 8.0, 2.0, &[0, 4, 8, 12, 16, 20, 24, 28]),
+            (30, 30.0, 2.0, &[0, 15]),
+            (17, 8.0, 2.0, &[0, 4, 8, 12]),
+            (31, 10.0, 2.0, &[0, 5, 10, 15, 20, 25]),
+            (25, 29.97, 2.0, &[0, 0]),
+            (12, 2.0, 2.0, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+            (7, 1.0, 2.0, &[0, 1, 2, 3, 4, 5, 6, 6]),
+            (10, 3.0, 2.0, &[0, 2, 3, 5, 6, 8]),
+            (32, 8.0, 1.0, &[0, 8, 16, 24]),
+            (
+                20,
+                4.0,
+                5.0,
+                &[
+                    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                ],
+            ),
+        ];
+        for &(total, fps, rate, expected) in cases {
+            assert_eq!(
+                sampled_frame_indices(total, fps, up_to_then_rate_cfg(rate)),
+                expected,
+                "{total} frames at {fps} fps, sampled at {rate}"
+            );
+        }
+        assert_eq!(
+            glm5_next_frame_indices(90, 30.0, 2.0, 2048),
+            Some(vec![0, 15, 30, 45, 60, 75])
+        );
+        assert_eq!(glm5_next_frame_indices(5, 24.0, 2.0, 2048), None);
+        assert_eq!(
+            sampled_frame_indices(5, 24.0, up_to_then_rate_cfg(2.0)),
+            vec![0, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            sampled_frame_indices(50, 10.0, up_to_then_rate_cfg(2.0)),
+            sampled_frame_indices(50, 10.0, up_to_cfg(32))
+        );
+        assert_eq!(
+            FrameSampling::UpToThenRate {
+                max_frames: 32,
+                rate_max_frames: 2048
+            }
+            .with_frame_budget(Some(16)),
+            FrameSampling::UpToThenRate {
+                max_frames: 16,
+                rate_max_frames: 2048
+            }
         );
     }
 
