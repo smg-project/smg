@@ -63,7 +63,7 @@ pub(crate) async fn stream_request_execution_with_tool(
     //        //    - Forward: transform, remap output_index, update sequence_number,
     //        //      send via tx. Skip lifecycle events on subsequent iterations.
     //        //    - Buffer: accumulate tool call arguments.
-    //        //    - ExecuteTools: forward final event, break inner loop.
+    //        //    - ExecuteTools: the turn ended holding calls, break inner loop.
     //        // e. Update next_output_index from handler.
     //        // f. Preserve response ID from first iteration.
     //        //

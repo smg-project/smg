@@ -3599,3 +3599,127 @@ async fn an_unreachable_upstream_ends_the_stream_with_the_typed_error_event() {
     assert!(event["param"].is_null(), "{body}");
     mcp.stop().await;
 }
+
+/// Turns of two parallel calls under an allowance of two, streamed and not
+/// (an upstream that asks for two calls on every turn; streamed, the first
+/// call is added and done before the second is added, as the Responses API
+/// streams parallel calls). Both loops run the first turn's two calls in one
+/// round trip and stop at the second turn, both of its calls over the
+/// allowance: two upstream turns each, and the same response.
+#[tokio::test]
+async fn a_streamed_turn_of_parallel_calls_runs_them_in_one_round_trip_as_unstreamed() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use axum::response::IntoResponse;
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let mut runs = Vec::new();
+    for stream in [true, false] {
+        let turns = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&turns);
+        let (upstream, server) = stub_upstream(axum::routing::post(move |body: String| {
+            let turn = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                let calls: Vec<serde_json::Value> = ["a", "b"]
+                    .iter()
+                    .map(|call| {
+                        serde_json::json!({
+                            "id": format!("fc_stub_{turn}{call}"), "type": "function_call",
+                            "call_id": format!("call_stub_{turn}{call}"), "name": "brave_web_search",
+                            "arguments": "{\"query\":\"smg\"}", "status": "completed"
+                        })
+                    })
+                    .collect();
+                let response = |status: &str, output: &[serde_json::Value]| {
+                    serde_json::json!({
+                        "id": format!("resp_stub_{turn}"), "object": "response",
+                        "created_at": 1_700_000_000, "model": "mock-model",
+                        "status": status, "output": output
+                    })
+                };
+                if !serde_json::from_str::<serde_json::Value>(&body)
+                    .is_ok_and(|request| request["stream"] == true)
+                {
+                    return axum::Json(response("completed", &calls)).into_response();
+                }
+                let mut events = vec![
+                    serde_json::json!({"type": "response.created", "response": response("in_progress", &[])}),
+                    serde_json::json!({"type": "response.in_progress", "response": response("in_progress", &[])}),
+                ];
+                for (index, call) in calls.iter().enumerate() {
+                    let (id, arguments) = (&call["id"], &call["arguments"]);
+                    events.extend([
+                        serde_json::json!({"type": "response.output_item.added", "output_index": index, "item": call}),
+                        serde_json::json!({"type": "response.function_call_arguments.delta", "output_index": index, "item_id": id, "delta": arguments}),
+                        serde_json::json!({"type": "response.function_call_arguments.done", "output_index": index, "item_id": id, "arguments": arguments}),
+                        serde_json::json!({"type": "response.output_item.done", "output_index": index, "item": call}),
+                    ]);
+                }
+                events.push(serde_json::json!({"type": "response.completed", "response": response("completed", &calls)}));
+                let body: String = events
+                    .iter()
+                    .enumerate()
+                    .map(|(sequence_number, event)| {
+                        let mut event = event.clone();
+                        event["sequence_number"] = sequence_number.into();
+                        format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap_or_default())
+                    })
+                    .collect();
+                ([(CONTENT_TYPE, "text/event-stream")], body).into_response()
+            }
+        }))
+        .await;
+        let (router, _ctx, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
+
+        let request = mcp_request(&mcp.url(), Some(2), stream, false);
+        let response = if stream {
+            let body = stream_body(router.as_ref(), request).await;
+            frame_events(&body)
+                .last()
+                .map(|terminal| terminal["response"].clone())
+                .expect("a terminal")
+        } else {
+            let response = router
+                .route_responses(None, &test_tenant_meta(), request.clone(), &request.model)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            serde_json::from_slice::<serde_json::Value>(&bytes).expect("json")
+        };
+        runs.push((
+            stream,
+            turns.load(Ordering::SeqCst),
+            response["incomplete_details"].clone(),
+            item_shapes(&response),
+        ));
+        server.abort();
+    }
+
+    let shape = |kind: &str, status: &str, name: &str| {
+        (kind.to_string(), status.to_string(), name.to_string())
+    };
+    let two_turns = |stream| {
+        (
+            stream,
+            2,
+            serde_json::json!({ "reason": "max_tool_calls" }),
+            vec![
+                shape("mcp_list_tools", "", ""),
+                shape("mcp_call", "completed", "brave_web_search"),
+                shape("mcp_call", "completed", "brave_web_search"),
+                shape("mcp_call", "failed", "brave_web_search"),
+                shape("mcp_call", "failed", "brave_web_search"),
+            ],
+        )
+    };
+    assert_eq!(
+        runs,
+        [two_turns(true), two_turns(false)],
+        "(streamed, upstream turns, incomplete_details, the response's items)"
+    );
+    mcp.stop().await;
+}

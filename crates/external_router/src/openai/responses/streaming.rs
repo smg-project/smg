@@ -966,7 +966,14 @@ pub(super) fn handle_streaming_with_tool_interception(
                                     }
                                 }
                                 StreamAction::Buffer => {
-                                    // Don't forward, just buffer
+                                    // Don't forward, just buffer. That includes the
+                                    // upstream umbrella `output_item.done` of a tracked
+                                    // call: forwarding it would emit
+                                    // `response.output_item.done` BEFORE
+                                    // `response.<tool>.completed`, violating spec
+                                    // sub-event ordering. The tool loop emits its own
+                                    // `output_item.done` at the correct position after
+                                    // the `.completed` sub-event.
                                 }
                                 StreamAction::Drop => {
                                     // R6.7c native passthrough: upstream
@@ -984,38 +991,14 @@ pub(super) fn handle_streaming_with_tool_interception(
                                     // kick the tool loop — there is no
                                     // dispatched call to finish.
                                 }
-                                StreamAction::ExecuteTools {
-                                    forward_triggering_event,
-                                } => {
-                                    // When the upstream signals tool completion via
-                                    // `output_item.done` (instead of a preceding
-                                    // `function_call_arguments.done`), forwarding the
-                                    // event here would emit an umbrella
-                                    // `response.output_item.done` BEFORE
-                                    // `response.<tool>.completed`, violating spec
-                                    // sub-event ordering. The tool loop emits its own
-                                    // `output_item.done` at the correct position after
-                                    // the `.completed` sub-event; suppress here.
-                                    if forward_triggering_event
-                                        && !forward_streaming_event(
-                                            SseEventData {
-                                                raw_block: &raw_block,
-                                                event_name,
-                                                data: data.as_ref(),
-                                                pre_parsed: None,
-                                            },
-                                            &mut handler,
-                                            &tx,
-                                            &mut sse_encoder,
-                                            &streaming_ctx,
-                                            &mut sequence_number,
-                                        )
-                                        .await
-                                    {
-                                        return;
-                                    }
+                                StreamAction::ExecuteTools => {
+                                    // The upstream ended its turn holding calls. A
+                                    // turn of parallel calls streams them one after
+                                    // another, so only now is every call of the turn
+                                    // read; the terminal itself is not forwarded (the
+                                    // loop ends the client's stream with its own).
                                     tool_calls_detected = true;
-                                    break; // Exit stream processing to execute tools
+                                    break; // Exit stream processing to execute the turn's calls
                                 }
                             }
                         }
@@ -1044,8 +1027,10 @@ pub(super) fn handle_streaming_with_tool_interception(
                 preserved_response_id = Some(id);
             }
 
-            // The model answered without asking for a tool: the loop's end.
-            if !tool_calls_detected {
+            // The model answered without asking for a tool: the loop's end. A
+            // body that closed before its terminal event ends the turn too,
+            // and the calls it completed run all the same.
+            if !tool_calls_detected && !handler.has_complete_calls() {
                 break (handler, ToolLoopEnd::Answered);
             }
 
@@ -1351,6 +1336,112 @@ mod tests {
             .expect("an object")
             .remove("incomplete_details");
         assert_eq!(answered, limited, "the note is the only difference");
+    }
+
+    /// A turn of parallel calls as a Responses upstream streams it: one item
+    /// after another, each call complete before the next is added, then the
+    /// turn's terminal event. The loop leaves the upstream body when the
+    /// handler answers `ExecuteTools` and runs the calls it holds then; a call
+    /// read after that point is never run, never in the history, never on the
+    /// wire. So the loop leaves at the terminal and no sooner, with every call
+    /// of the turn in the batch, in order, whether a call completes with its
+    /// arguments events or with its `output_item.done` alone.
+    #[test]
+    fn a_turn_of_parallel_calls_is_read_to_its_terminal_before_its_calls_run() {
+        let call_events = |index: usize, id: &str, with_arguments_events: bool| {
+            let arguments = format!("{{\"query\":\"{id}\"}}");
+            let item = |arguments: &str, status: &str| {
+                json!({
+                    "id": format!("fc_{id}"), "type": "function_call",
+                    "call_id": format!("call_{id}"), "name": "search",
+                    "arguments": arguments, "status": status
+                })
+            };
+            let mut events = vec![json!({
+                "type": "response.output_item.added", "output_index": index,
+                "item": item("", "in_progress")
+            })];
+            if with_arguments_events {
+                events.push(json!({
+                    "type": "response.function_call_arguments.delta", "output_index": index,
+                    "item_id": format!("fc_{id}"), "delta": arguments
+                }));
+                events.push(json!({
+                    "type": "response.function_call_arguments.done", "output_index": index,
+                    "item_id": format!("fc_{id}"), "arguments": arguments
+                }));
+            }
+            events.push(json!({
+                "type": "response.output_item.done", "output_index": index,
+                "item": item(&arguments, "completed")
+            }));
+            events
+        };
+
+        let mut got = Vec::new();
+        for (shape, with_arguments_events) in [
+            ("output_item.done alone", false),
+            ("arguments events", true),
+        ] {
+            let response = |status: &str| {
+                json!({
+                    "id": "resp_turn", "object": "response", "status": status, "output": []
+                })
+            };
+            let mut events = vec![
+                json!({"type": "response.created", "response": response("in_progress")}),
+                json!({"type": "response.in_progress", "response": response("in_progress")}),
+            ];
+            events.extend(call_events(0, "a", with_arguments_events));
+            events.extend(call_events(1, "b", with_arguments_events));
+            events.push(json!({"type": "response.completed", "response": response("completed")}));
+            let body: String = events
+                .iter()
+                .map(|event| {
+                    format!(
+                        "event: {}\ndata: {event}\n\n",
+                        event["type"].as_str().unwrap_or_default()
+                    )
+                })
+                .collect();
+
+            // What the loop does with the body: each block through the
+            // handler, until the handler answers `ExecuteTools`.
+            let mut handler = StreamingToolHandler::with_starting_index(0);
+            let mut chunks = ChunkProcessor::new();
+            chunks.push_chunk(body.as_bytes());
+            let mut left_at = None;
+            while let Some(block) = chunks.next_block() {
+                let (event_name, data) = parse_sse_block(&block);
+                let action = handler.process_event(event_name, &data);
+                if matches!(action, StreamAction::ExecuteTools) {
+                    left_at = event_name.map(str::to_string);
+                    break;
+                }
+            }
+            let batch: Vec<String> = handler
+                .take_pending_calls()
+                .into_iter()
+                .map(|call| call.call_id)
+                .collect();
+            got.push((shape, left_at, batch));
+        }
+
+        let read_to_the_terminal = |shape| {
+            (
+                shape,
+                Some("response.completed".to_string()),
+                vec!["call_a".to_string(), "call_b".to_string()],
+            )
+        };
+        assert_eq!(
+            got,
+            [
+                read_to_the_terminal("output_item.done alone"),
+                read_to_the_terminal("arguments events"),
+            ],
+            "(shape, the event the loop leaves the upstream turn at, the calls it runs)"
+        );
     }
 
     /// The error event that ends a failed stream is the frame every router

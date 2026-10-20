@@ -29,6 +29,15 @@ pub(crate) enum StreamAction {
     /// Pass this event to the client.
     Forward,
     /// Accumulate the event for tool execution, do not send downstream.
+    ///
+    /// Also the upstream umbrella `output_item.done` of a call the handler
+    /// tracks: forwarding it would emit a duplicate umbrella
+    /// `response.output_item.done` that fires BEFORE the sub-event
+    /// `response.<type>.completed` — violating the spec sub-event ordering
+    /// (spec §streaming: the umbrella `output_item.done` is always the LAST
+    /// event for a given item). The tool_loop's
+    /// `send_tool_call_completion_events` emits the correct umbrella
+    /// `output_item.done` in its proper position once the call has run.
     Buffer,
     /// Drop the upstream event from the wire without triggering tool
     /// execution.
@@ -46,23 +55,17 @@ pub(crate) enum StreamAction {
     /// loop — native passthrough items are not tracked in the handler's
     /// pending-call registry, so there is nothing to dispatch.
     Drop,
-    /// The upstream signalled tool-call completion — run the MCP tool now.
+    /// The upstream ended its turn holding tool calls — run them now, every
+    /// call of the turn as one batch.
     ///
-    /// `forward_triggering_event` distinguishes two upstream shapes:
-    ///
-    /// * When the upstream emits `function_call_arguments.done` we want to
-    ///   forward the event (it becomes `mcp_call_arguments.done`, a sub-event
-    ///   that belongs BEFORE `response.<type>.completed`).
-    /// * When the upstream skips the delta/done arguments events and signals
-    ///   tool completion with `output_item.done` for the `function_call`
-    ///   item, forwarding it would emit a duplicate umbrella
-    ///   `response.output_item.done` event that fires BEFORE the sub-event
-    ///   `response.<type>.completed` — violating the spec sub-event ordering
-    ///   (spec §streaming: the umbrella `output_item.done` is always the
-    ///   LAST event for a given item). The tool_loop's
-    ///   `send_tool_call_completion_events` emits the correct umbrella
-    ///   `output_item.done` in its proper position.
-    ExecuteTools { forward_triggering_event: bool },
+    /// A turn of parallel calls streams them one item after another, each
+    /// call complete (`function_call_arguments.done`, then its
+    /// `output_item.done`) before the next is added, so no call's own
+    /// completion says the batch is whole: only the turn's terminal event
+    /// does (`response.completed`, or `response.incomplete` /
+    /// `response.failed`). The terminal is not forwarded; the tool loop ends
+    /// the client's stream with its own `response.completed`.
+    ExecuteTools,
 }
 
 /// Maps upstream output indices to sequential downstream indices
@@ -224,6 +227,16 @@ impl StreamingToolHandler {
                 }
                 StreamAction::Forward
             }
+            // The upstream's turn ends here, however it ended it. Its calls
+            // stream one item after another, so only the terminal says the
+            // batch is whole: every call of the turn runs now, as the
+            // non-streamed loop runs every call of the response it reads.
+            // Without a call to run, the terminal is the answer's.
+            ResponseEvent::COMPLETED | ResponseEvent::INCOMPLETE | ResponseEvent::FAILED
+                if self.has_complete_calls() =>
+            {
+                StreamAction::ExecuteTools
+            }
             ResponseEvent::COMPLETED => StreamAction::Forward,
             OutputItemEvent::ADDED => self.handle_output_item_added(&parsed),
             FunctionCallEvent::ARGUMENTS_DELTA => self.handle_arguments_delta(&parsed),
@@ -277,9 +290,10 @@ impl StreamingToolHandler {
                 // the upstream envelope rather than forwarding it, so the
                 // wire order the client sees satisfies the spec invariant
                 // that `output_item.done` is the LAST event for a given
-                // item. Unlike the MCP-dispatch arm, this path does NOT
-                // kick the tool loop (there is nothing to dispatch — the
-                // item was not intercepted).
+                // item. Unlike the MCP-dispatch arm, whose umbrella the
+                // tool loop emits itself once it has run the call, this
+                // path has nothing to dispatch (the item was not
+                // intercepted).
                 //
                 // We `take()` the index out of the set (via `remove`) so
                 // that only the FIRST `output_item.done` for a
@@ -292,12 +306,13 @@ impl StreamingToolHandler {
                 // umbrella for the passthrough item.
                 if is_tool_call_done && belongs_to_pending_call && self.has_complete_calls() {
                     // MCP-dispatch path (R6.7b): suppress the upstream
-                    // umbrella event and kick the tool loop — it will emit
-                    // its own `output_item.done` at the correct position,
-                    // AFTER `response.<type>.completed`.
-                    StreamAction::ExecuteTools {
-                        forward_triggering_event: false,
-                    }
+                    // umbrella event — the tool loop will emit its own
+                    // `output_item.done` at the correct position, AFTER
+                    // `response.<type>.completed`. It does not kick the tool
+                    // loop yet: a turn of parallel calls adds its next call
+                    // after this one's umbrella, and the turn's calls run
+                    // together at its terminal event.
+                    StreamAction::Buffer
                 } else if is_tool_call_done
                     && done_output_index
                         .is_some_and(|idx| self.native_passthrough_tool_call_indices.remove(&idx))
@@ -405,17 +420,12 @@ impl StreamingToolHandler {
             }
         }
 
-        if self.has_complete_calls() {
-            // Forward the triggering event — `function_call_arguments.done`
-            // becomes `mcp_call_arguments.done` which is a sub-event
-            // belonging BEFORE `response.<type>.completed` and therefore
-            // safe to forward inline here.
-            StreamAction::ExecuteTools {
-                forward_triggering_event: true,
-            }
-        } else {
-            StreamAction::Forward
-        }
+        // Forward the event — `function_call_arguments.done` becomes
+        // `mcp_call_arguments.done` which is a sub-event belonging BEFORE
+        // `response.<type>.completed` and therefore safe to forward inline
+        // here. One call's arguments being done does not end the turn: the
+        // turn's calls run together at its terminal event.
+        StreamAction::Forward
     }
 
     fn find_call_mut(&mut self, output_index: usize) -> Option<&mut FunctionCallInProgress> {
@@ -498,7 +508,8 @@ impl StreamingToolHandler {
             .expect("Just pushed to pending_calls, must have at least one element")
     }
 
-    fn has_complete_calls(&self) -> bool {
+    /// Whether the turn holds calls to run: at least one, each of them named.
+    pub fn has_complete_calls(&self) -> bool {
         !self.pending_calls.is_empty() && self.pending_calls.iter().all(|c| c.is_complete())
     }
 
@@ -552,13 +563,14 @@ mod tests {
     }
 
     #[test]
-    fn output_item_done_triggers_execute_tools_without_forwarding() {
+    fn output_item_done_is_buffered_without_forwarding() {
         // When the upstream signals tool-call completion via
         // `output_item.done` for a function_call item (no preceding
         // `function_call_arguments.done`), the handler must ask the
-        // caller NOT to forward the triggering event — the tool loop
-        // will emit its own umbrella `output_item.done` at the correct
-        // position after `response.<tool>.completed`.
+        // caller NOT to forward the event — the tool loop will emit its
+        // own umbrella `output_item.done` at the correct position after
+        // `response.<tool>.completed`. Nor may it run the tools yet: the
+        // turn can add another call after this one.
         let mut handler = StreamingToolHandler::with_starting_index(0);
         bootstrap_function_call_added(&mut handler);
 
@@ -577,19 +589,14 @@ mod tests {
 
         let action = handler.process_event(Some("response.output_item.done"), done_event);
 
-        match action {
-            StreamAction::ExecuteTools {
-                forward_triggering_event,
-            } => assert!(
-                !forward_triggering_event,
-                "output_item.done must be suppressed to avoid a duplicate umbrella event"
-            ),
-            other => panic!("expected ExecuteTools, got {other:?}"),
-        }
+        assert!(
+            matches!(action, StreamAction::Buffer),
+            "output_item.done must be suppressed to avoid a duplicate umbrella event; got {action:?}"
+        );
     }
 
     /// Assert that an `output_item.done` for `item_type` is suppressed (the
-    /// gate returns `ExecuteTools { forward_triggering_event: false }`) when
+    /// gate returns `Buffer`, holding it back from the wire) when
     /// a tool call is already pending. The gate must match every hosted
     /// tool-call item type — OpenAI cloud passthrough of native hosted
     /// tools (which emits the item directly with its hosted-tool type) would
@@ -613,15 +620,11 @@ mod tests {
 
         let action = handler.process_event(Some("response.output_item.done"), &done_event);
 
-        match action {
-            StreamAction::ExecuteTools {
-                forward_triggering_event,
-            } => assert!(
-                !forward_triggering_event,
-                "output_item.done for {item_type} must be suppressed to avoid a duplicate umbrella event"
-            ),
-            other => panic!("expected ExecuteTools for {item_type}, got {other:?}"),
-        }
+        assert!(
+            matches!(action, StreamAction::Buffer),
+            "output_item.done for {item_type} must be suppressed to avoid a duplicate umbrella \
+             event; got {action:?}"
+        );
     }
 
     #[test]
@@ -697,10 +700,12 @@ mod tests {
     }
 
     #[test]
-    fn arguments_done_triggers_execute_tools_with_forwarding() {
+    fn arguments_done_forwards_without_running_the_tools() {
         // Forwarding is safe for `function_call_arguments.done` because it
         // becomes `mcp_call_arguments.done` — a sub-event that belongs
         // BEFORE `response.<tool>.completed` per spec sub-event ordering.
+        // One call's arguments being done does not end the turn, so the
+        // tools do not run yet.
         let mut handler = StreamingToolHandler::with_starting_index(0);
         bootstrap_function_call_added(&mut handler);
 
@@ -714,14 +719,39 @@ mod tests {
         let action =
             handler.process_event(Some("response.function_call_arguments.done"), args_done);
 
-        match action {
-            StreamAction::ExecuteTools {
-                forward_triggering_event,
-            } => assert!(
-                forward_triggering_event,
-                "function_call_arguments.done forwards as mcp_call_arguments.done"
-            ),
-            other => panic!("expected ExecuteTools, got {other:?}"),
+        assert!(
+            matches!(action, StreamAction::Forward),
+            "function_call_arguments.done forwards as mcp_call_arguments.done; got {action:?}"
+        );
+    }
+
+    #[test]
+    fn the_turns_terminal_runs_its_calls_however_the_upstream_ends_it() {
+        // The terminal event ends the upstream's turn: with a call
+        // collected, the handler asks the loop to run the turn's calls (the
+        // terminal itself is not forwarded); without one, the terminal is
+        // the answer's and passes as before.
+        for terminal in [
+            ResponseEvent::COMPLETED,
+            ResponseEvent::INCOMPLETE,
+            ResponseEvent::FAILED,
+        ] {
+            let event = format!(r#"{{"type": "{terminal}", "response": {{"id": "resp_test"}}}}"#);
+
+            let mut handler = StreamingToolHandler::with_starting_index(0);
+            bootstrap_function_call_added(&mut handler);
+            let action = handler.process_event(Some(terminal), &event);
+            assert!(
+                matches!(action, StreamAction::ExecuteTools),
+                "{terminal} with a call collected runs it; got {action:?}"
+            );
+
+            let mut handler = StreamingToolHandler::with_starting_index(0);
+            let action = handler.process_event(Some(terminal), &event);
+            assert!(
+                matches!(action, StreamAction::Forward),
+                "{terminal} without a call is the answer's; got {action:?}"
+            );
         }
     }
 
@@ -891,9 +921,9 @@ mod tests {
         // R6.7c invariant: both arms of the gate must fire correctly when
         // a single stream carries an MCP-dispatched function_call at one
         // output_index AND a native-passthrough hosted tool-call at
-        // another. The function_call's done goes through the
-        // `ExecuteTools` arm (R6.7b); the hosted tool-call's done goes
-        // through the `Drop` arm (R6.7c). Neither re-narrows the other.
+        // another. The function_call's done goes through the `Buffer` arm
+        // (R6.7b); the hosted tool-call's done goes through the `Drop` arm
+        // (R6.7c). Neither re-narrows the other.
         let mut handler = StreamingToolHandler::with_starting_index(0);
 
         // MCP-dispatch path: function_call at output_index 0.
@@ -923,9 +953,9 @@ mod tests {
             "native passthrough hosted-tool done must Drop; got {action:?}"
         );
 
-        // Second done — function_call at output_index 0 should
-        // ExecuteTools (the MCP-dispatch arm). This confirms R6.7c did
-        // not accidentally funnel the function_call into the new branch.
+        // Second done — function_call at output_index 0 should Buffer
+        // (the MCP-dispatch arm). This confirms R6.7c did not accidentally
+        // funnel the function_call into the new branch.
         let function_call_done = r#"{
           "type": "response.output_item.done",
           "output_index": 0,
@@ -939,17 +969,11 @@ mod tests {
           }
         }"#;
         let action = handler.process_event(Some("response.output_item.done"), function_call_done);
-        match action {
-            StreamAction::ExecuteTools {
-                forward_triggering_event,
-            } => assert!(
-                !forward_triggering_event,
-                "MCP-dispatch arm must still suppress the upstream umbrella"
-            ),
-            other => panic!(
-                "function_call done must go through MCP-dispatch arm (ExecuteTools), got {other:?}"
-            ),
-        }
+        assert!(
+            matches!(action, StreamAction::Buffer),
+            "function_call done must go through MCP-dispatch arm (Buffer), which still suppresses \
+             the upstream umbrella; got {action:?}"
+        );
     }
 
     #[test]
