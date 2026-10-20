@@ -1369,16 +1369,32 @@ pub(crate) fn select_pair(
     // A decode pool all over the thresholds pairs by load, as the default
     // paired it: the least-loaded of the pick's partners, counted as a veto
     // fallback and not as a selection of the decode policy. Any other keeps
-    // the veto for its policy. Either way the decode follows the traffic
-    // group the prefill side was split into, or the named group an unsplit
-    // prefill was picked from, so a pair never spans two groups; an unsplit
-    // prefill from the default group leaves it to decide for itself (see
+    // the veto for its policy. Either way the decode side is confined under
+    // `--traffic-split` as one side of a request is: it follows the group
+    // the prefill side reported (the one it was split into, or the named
+    // group an unsplit prefill was picked from) while its partners have that
+    // group in the draw, else draws its own arm, so a pair never spans two
+    // groups both pools carry and a canary one pool alone carries keeps its
+    // share; partners whose groups all weigh 0 are declined, so a drained
+    // canary takes no fallback pair (by load: `side_arm`; under the policy:
     // `PolicyRegistry::select_worker_for_model_split`).
     let selected_decode = if lift_decode {
+        let arm = if policies.traffic_split_enabled() {
+            info.role = WorkerRole::Decode;
+            let key = policies.effective_sticky_key(&info).map(|(key, _)| key);
+            match side_arm(key, &decode, &|_: &dyn Worker| true, prefill_group) {
+                Ok(side) => side.confined,
+                Err(Drained) => {
+                    return Err(declined(WorkerRole::Decode, decode_policy.name()));
+                }
+            }
+        } else {
+            None
+        };
         overload::least_loaded_uniform(
-            decode.iter().filter(|d| {
-                prefill_group.is_none_or(|group| traffic_split::group_of(d.as_ref()) == group)
-            }),
+            decode
+                .iter()
+                .filter(|d| arm.is_none_or(|group| traffic_split::group_of(d.as_ref()) == group)),
             &mut rand::rng(),
         )
         .cloned()
@@ -3195,7 +3211,7 @@ mod tests {
             }
         }
         assert!(
-            canary <= 30,
+            (1..=25).contains(&canary),
             "the prefill canary took {canary} of 100 at weight 10"
         );
         // Two named groups on the decode pool alone, the prefill pool
@@ -3228,7 +3244,7 @@ mod tests {
             }
         }
         assert!(
-            canary <= 30,
+            (1..=25).contains(&canary),
             "the decode canary took {canary} of 100 at weight 10"
         );
     }
@@ -3271,6 +3287,88 @@ mod tests {
                 "the drained decode canary took a steered pair"
             );
         }
+    }
+
+    /// The prefills under the thresholds and every decode over them, the
+    /// groups on one pool only under `--traffic-split`: the decode pool is
+    /// paired by load, and that pick is confined as the policies confine a
+    /// side, so a prefill-only canary pairs with the unlabelled decode, a
+    /// decode-only canary keeps its share, and a drained decode canary takes
+    /// nothing.
+    #[test]
+    fn a_lifted_decode_pool_follows_the_groups_of_the_pool_that_carries_them() {
+        let policies = cohort_policies().with_traffic_split(true);
+        let lift_decodes = |registry: &WorkerRegistry| {
+            for worker in registry.get_all() {
+                if *worker.worker_type() == WorkerType::Decode {
+                    registry.set_worker_overloaded(&worker, true);
+                }
+            }
+        };
+        let steered = |registry: &WorkerRegistry, draws: usize| -> Vec<Pair> {
+            let pairs = pairs_of(registry, &policies);
+            (0..draws)
+                .map(|_| {
+                    select_pair(
+                        registry,
+                        &policies,
+                        MODEL,
+                        &pairs,
+                        None,
+                        true,
+                        None,
+                        PlacementInputs::default(),
+                    )
+                    .expect("a pair")
+                })
+                .collect()
+        };
+        // A canary on the prefill pool alone, the decode pool unlabelled.
+        let registry = labelled_pd_registry(&[
+            ("grpc://ps:1", WorkerType::Prefill, Some(("stable", "90"))),
+            ("grpc://pc:1", WorkerType::Prefill, Some(("canary", "10"))),
+            ("grpc://d:1", WorkerType::Decode, None),
+        ]);
+        lift_decodes(&registry);
+        let pairs = steered(&registry, 100);
+        assert!(pairs.iter().all(|pair| pair.decode.url() == "grpc://d:1"));
+        let canary = pairs
+            .iter()
+            .filter(|pair| traffic_split::group_of(pair.prefill.as_ref()) == "canary")
+            .count();
+        assert!(
+            (1..=25).contains(&canary),
+            "the prefill canary took {canary} of 100 at weight 10"
+        );
+        // Two named groups on the decode pool alone, the prefill pool
+        // unlabelled: the decode side draws its own arm.
+        let registry = labelled_pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, None),
+            ("grpc://ds:1", WorkerType::Decode, Some(("stable", "90"))),
+            ("grpc://dc:1", WorkerType::Decode, Some(("canary", "10"))),
+        ]);
+        lift_decodes(&registry);
+        let canary = steered(&registry, 100)
+            .iter()
+            .filter(|pair| traffic_split::group_of(pair.decode.as_ref()) == "canary")
+            .count();
+        assert!(
+            (1..=25).contains(&canary),
+            "the decode canary took {canary} of 100 at weight 10"
+        );
+        // The decode canary drained: the least-loaded pick never lands on it.
+        let registry = labelled_pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, None),
+            ("grpc://ds:1", WorkerType::Decode, Some(("stable", "90"))),
+            ("grpc://dc:1", WorkerType::Decode, Some(("canary", "0"))),
+        ]);
+        lift_decodes(&registry);
+        assert!(
+            steered(&registry, 50)
+                .iter()
+                .all(|pair| pair.decode.url() == "grpc://ds:1"),
+            "the drained decode canary took a fallback pair"
+        );
     }
 
     /// One prefill worker over the thresholds beside one under them, as the
