@@ -554,12 +554,18 @@ mod tests {
     #[test]
     fn every_reason_is_in_all_once_with_its_own_sentence_and_name() {
         // One definition writes the enum, `ALL` and the sentences, so the list cannot drift from
-        // the enum; what is checked is the list itself: each reason once, a sentence of its own,
-        // and a serde name that reads back to it.
+        // the enum; what is checked is the list itself: each reason once, a sentence of its own
+        // (non-empty and shared with no other reason, so a sampled line names one reason), and a
+        // serde name that reads back to it.
         let mut seen = std::collections::HashSet::new();
+        let mut sentences = std::collections::HashSet::new();
         for why in MalformedReason::ALL.iter().copied() {
             assert!(seen.insert(why), "{why:?} is listed twice");
             assert!(!why.sentence().is_empty(), "{why:?}");
+            assert!(
+                sentences.insert(why.sentence()),
+                "{why:?} shares its sentence with another reason"
+            );
             let name = serde_json::to_value(why).expect("a reason serializes");
             let back: MalformedReason =
                 serde_json::from_value(name.clone()).expect("the name reads back");

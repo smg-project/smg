@@ -754,8 +754,8 @@ mod tests {
 
     #[test]
     fn every_reason_the_crate_names_has_a_label_of_its_own_spelled_as_the_crate_spells_it() {
-        // The crate's own list of its reasons (`MalformedReason::ALL`, held to the enum by the
-        // crate's test) drives this: the label is the crate's serde spelling of the reason, so a
+        // The crate's own list of its reasons (`MalformedReason::ALL`, written with the enum by
+        // one macro list) drives this: the label is the crate's serde spelling of the reason, so a
         // line, a trace and the counter agree on the name; no two reasons share a label, none
         // lands on `other`, and a reason added to the crate fails this test until it has a label.
         let mut labels = std::collections::HashSet::new();
