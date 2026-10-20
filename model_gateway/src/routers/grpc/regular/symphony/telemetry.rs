@@ -759,7 +759,7 @@ mod tests {
         // line, a trace and the counter agree on the name; no two reasons share a label, none
         // lands on `other`, and a reason added to the crate fails this test until it has a label.
         let mut labels = std::collections::HashSet::new();
-        for (index, why) in MalformedReason::ALL.into_iter().enumerate() {
+        for (index, why) in MalformedReason::ALL.iter().copied().enumerate() {
             let label = reason_label(why);
             let spelled = serde_json::to_value(why).expect("a reason serializes");
             assert_eq!(Some(label), spelled.as_str(), "{why:?}");
