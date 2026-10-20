@@ -1778,6 +1778,126 @@ fn a_hash_index_holder_is_priced_at_its_boundary() {
     }
 }
 
+/// Five hits on a 100,000-token prompt whose first 99,000 tokens w1 holds,
+/// then two cold prompts of 20,000 and 10,000 tokens, under equal load
+/// reports: the pick of the second cold prompt.
+fn cold_pick_after_cached_hits(balance_uncached_credit: bool) -> usize {
+    let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+        balance_uncached_credit,
+        ..test_config()
+    });
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    let context: Vec<u32> = (0..99_000).collect();
+    seed_token_tenants(&policy, &workers, &context, &["http://w1:8000"]);
+    update_expected_wait_loads(&policy, &workers, &[0, 0]);
+    let route = |tokens: &[u32]| {
+        policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(tokens),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+    };
+    for turn in 0..5u32 {
+        let mut prompt = context.clone();
+        prompt.extend(1_000_000 + turn * 1_000..1_000_000 + (turn + 1) * 1_000);
+        assert_eq!(route(&prompt), 0, "hit {turn} stays with its holder");
+    }
+    let first_cold: Vec<u32> = (2_000_000..2_020_000).collect();
+    assert_eq!(
+        route(&first_cold),
+        1,
+        "the first cold prompt takes the idle worker"
+    );
+    let second_cold: Vec<u32> = (3_000_000..3_010_000).collect();
+    route(&second_cold)
+}
+
+/// The token-work LeastLoad books on w1 after it takes a `prompt_len`-token
+/// prompt whose first `held_len` tokens it holds, picked for `role`.
+fn credit_booked_for_a_hit(
+    balance_uncached_credit: bool,
+    role: WorkerRole,
+    prompt_len: u32,
+    held_len: u32,
+) -> u64 {
+    let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+        balance_uncached_credit,
+        ..test_config()
+    });
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    let prompt: Vec<u32> = (0..prompt_len).collect();
+    seed_token_tenants(
+        &policy,
+        &workers,
+        &prompt[..held_len as usize],
+        &["http://w1:8000"],
+    );
+    let info = SelectWorkerInfo {
+        tokens: Some(&prompt),
+        role,
+        ..Default::default()
+    };
+    assert_eq!(
+        policy.select_worker(&workers, &info),
+        Some(0),
+        "the holder takes it"
+    );
+    policy.load_scorer.load_state_for_test("http://w1:8000").1
+}
+
+#[test]
+fn uncached_credit_never_books_more_than_the_whole_prompt() {
+    // A 512-token prompt with 384 tokens held still needs 128, under the
+    // mean prefill's floor of 1,024: the credit stops at the 512 a miss, or
+    // the uncredited pick, books.
+    assert_eq!(
+        credit_booked_for_a_hit(true, WorkerRole::Single, 512, 384),
+        512
+    );
+    assert_eq!(
+        credit_booked_for_a_hit(false, WorkerRole::Single, 512, 384),
+        512
+    );
+    // A long prompt books what it still needs, floored at the mean prefill.
+    assert_eq!(
+        credit_booked_for_a_hit(true, WorkerRole::Single, 100_000, 99_000),
+        1_024
+    );
+    assert_eq!(
+        credit_booked_for_a_hit(true, WorkerRole::Single, 100_000, 90_000),
+        10_000
+    );
+}
+
+#[test]
+fn uncached_credit_leaves_a_decode_pick_booked_whole() {
+    // A decode worker prefills nothing again, so its pick keeps the whole
+    // prompt's credit; the prefill pick of the same prompt books what it
+    // still needs.
+    assert_eq!(
+        credit_booked_for_a_hit(true, WorkerRole::Decode, 100_000, 99_000),
+        100_000
+    );
+    assert_eq!(
+        credit_booked_for_a_hit(true, WorkerRole::Prefill, 100_000, 99_000),
+        1_024
+    );
+}
+
+#[test]
+fn uncached_credit_books_a_hit_at_the_prefill_it_still_needs() {
+    // Booked whole, w1's five hits weigh 500,000 tokens against w2's cold
+    // 20,000, so the second cold prompt goes to w2. Booked at the prefill
+    // each still needed (1,000 tokens, floored at the mean prefill of 1,024:
+    // 5,120 in all), w1 is the emptier worker and takes it.
+    assert_eq!(cold_pick_after_cached_hits(false), 1);
+    assert_eq!(cold_pick_after_cached_hits(true), 0);
+}
+
 #[test]
 fn kv_pressure_still_forces_expected_wait_fallback() {
     let policy = CacheAwarePolicy::with_config(CacheAwareConfig {

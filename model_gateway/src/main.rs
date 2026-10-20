@@ -503,6 +503,16 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 0, help_heading = "Routing Policy")]
     balance_prefix_margin_tokens: u32,
 
+    /// Credit a cache_aware pick on a worker holding the request's prefix
+    /// with the prompt it still has to prefill (its token count less the
+    /// held tokens, never under the mean prefill nor over the whole prompt)
+    /// instead of the whole prompt, in the expected-wait estimate later picks
+    /// read, so a hit on a long cached conversation does not steer the next
+    /// miss away from that worker as if it were the whole context's work.
+    /// Misses, spills and decode picks keep the whole prompt. Off by default
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    balance_uncached_credit: bool,
+
     /// Seconds between the bucket policy's boundary adjustments (at least 1)
     #[arg(long, default_value_t = 5, help_heading = "Routing Policy")]
     bucket_adjust_interval_secs: usize,
@@ -2578,6 +2588,7 @@ impl CliArgs {
                     .then(|| self.routing.selection_policy.clone()),
                 selection_accounting_ttl_ms: self.routing.selection_accounting_ttl_ms,
                 balance_prefix_margin_tokens: self.routing.balance_prefix_margin_tokens,
+                balance_uncached_credit: self.routing.balance_uncached_credit,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_metric: self.routing.power_of_two_load_metric,
@@ -5528,6 +5539,28 @@ mod tests {
                 balance_prefix_margin_tokens,
                 ..
             } => assert_eq!(*balance_prefix_margin_tokens, 0),
+            other => panic!("expected cache_aware policy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn balance_uncached_credit_flag_reaches_the_cache_aware_policy_and_defaults_off() {
+        let on = cli_args_from(&["--balance-uncached-credit"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        match &on.policy {
+            PolicyConfig::CacheAware {
+                balance_uncached_credit,
+                ..
+            } => assert!(*balance_uncached_credit),
+            other => panic!("expected cache_aware policy, got {other:?}"),
+        }
+        let off = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        match &off.policy {
+            PolicyConfig::CacheAware {
+                balance_uncached_credit,
+                ..
+            } => assert!(!*balance_uncached_credit),
             other => panic!("expected cache_aware policy, got {other:?}"),
         }
     }

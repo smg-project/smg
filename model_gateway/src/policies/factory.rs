@@ -51,6 +51,7 @@ impl PolicyFactory {
                 selection_policy,
                 selection_accounting_ttl_ms,
                 balance_prefix_margin_tokens,
+                balance_uncached_credit,
             } => {
                 let config = CacheAwareConfig {
                     cache_threshold: *cache_threshold,
@@ -69,6 +70,7 @@ impl PolicyFactory {
                     selection_policy: selection_policy.clone(),
                     selection_accounting_ttl_ms: *selection_accounting_ttl_ms,
                     balance_prefix_margin_tokens: *balance_prefix_margin_tokens,
+                    balance_uncached_credit: *balance_uncached_credit,
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
             }
@@ -171,6 +173,7 @@ mod tests {
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
             balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
         });
         assert_eq!(policy.name(), "cache_aware");
 

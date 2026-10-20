@@ -499,6 +499,12 @@ impl LeastLoadPolicy {
             .unwrap_or(self.mean_prefill_tokens as u64)
     }
 
+    /// The mean prefill (tokens): the work a request of unknown size, or a
+    /// reported running request, is priced at.
+    pub(super) fn mean_prefill_tokens(&self) -> u32 {
+        self.mean_prefill_tokens
+    }
+
     /// Argmin of the expected-wait score over `candidates` (indices into
     /// `workers`), crediting the winner's in-flight estimate. The nominal
     /// throughput and dark-fleet fallback are scoped to `candidates`, so a
@@ -516,6 +522,22 @@ impl LeastLoadPolicy {
         candidates: &[usize],
         info: &SelectWorkerInfo,
         policy: &'static str,
+    ) -> Option<usize> {
+        self.select_min_expected_wait_credited(workers, candidates, info, policy, None)
+    }
+
+    /// [`Self::select_min_expected_wait`], crediting the winner with
+    /// `credit(winner)` tokens of work instead of the request's whole prompt
+    /// ([`Self::request_tokens`]) when `credit` is given: a caller that knows
+    /// how much of the prompt the winner already holds in its cache credits
+    /// the work left to prefill.
+    pub(super) fn select_min_expected_wait_credited(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        candidates: &[usize],
+        info: &SelectWorkerInfo,
+        policy: &'static str,
+        credit: Option<&dyn Fn(usize) -> u64>,
     ) -> Option<usize> {
         let snapshot = self.snapshot();
         let snapshot = snapshot.as_deref();
@@ -622,7 +644,7 @@ impl LeastLoadPolicy {
 
         // In-flight correction: credit the chosen worker with this request's
         // token-work until its next poll refreshes the snapshot.
-        let req_tokens = self.request_tokens(info);
+        let req_tokens = credit.map_or_else(|| self.request_tokens(info), |credit| credit(best));
         inflight
             .entry(workers[best].url().to_string())
             .or_default()
@@ -1613,6 +1635,40 @@ mod tests {
         for worker in &workers {
             assert_eq!(policy.load_state_for_test(worker.url()), (true, 0, 0));
         }
+    }
+
+    #[test]
+    fn a_credited_selection_books_the_work_the_caller_gives() {
+        // a's report is the lighter: it wins both picks. Uncredited, the
+        // 64-token prompt is booked whole; credited, the caller's count is.
+        let policy = LeastLoadPolicy::new();
+        let feed = TestFeed::attached_to(&policy);
+        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let mut loads = HashMap::new();
+        loads.insert("http://a:8000".to_string(), make_load(0, 0.1, 100.0));
+        loads.insert("http://b:8000".to_string(), make_load(10_000, 0.1, 100.0));
+        feed.publish(&loads);
+        let tokens: Vec<u32> = (0..64).collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+
+        let picked = policy.select_min_expected_wait(&workers, &[0, 1], &info, "test");
+        assert_eq!(picked, Some(0));
+        assert_eq!(policy.load_state_for_test("http://a:8000"), (true, 64, 1));
+
+        let credit = |idx: usize| if idx == 0 { 7 } else { 1_000 };
+        let picked = policy.select_min_expected_wait_credited(
+            &workers,
+            &[0, 1],
+            &info,
+            "test",
+            Some(&credit),
+        );
+        assert_eq!(picked, Some(0));
+        assert_eq!(policy.load_state_for_test("http://a:8000"), (true, 71, 2));
+        assert_eq!(policy.load_state_for_test("http://b:8000"), (true, 0, 0));
     }
 
     #[test]

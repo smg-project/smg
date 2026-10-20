@@ -193,6 +193,13 @@ pub struct CacheAwareConfig {
     /// 1024, the mean prefill LeastLoad prices a queued request at); decode
     /// picks are never priced, as a decode worker prefills nothing again.
     pub balance_prefix_margin_tokens: u32,
+    /// Credit a pick on a worker holding the request's prefix with the
+    /// prompt it still has to prefill (its token count less the held tokens,
+    /// never under the mean prefill nor over the whole prompt) instead of the
+    /// whole prompt, in the expected-wait estimate later picks read: a hit on
+    /// a long cached conversation is not booked as its whole context's work.
+    /// Misses, spills and decode picks keep the whole prompt. Off by default.
+    pub balance_uncached_credit: bool,
     pub eviction_interval_secs: u64,
     pub max_tree_size: usize,
     /// Backend KV cache block size (tokens per block) for event-driven routing.
@@ -255,6 +262,7 @@ impl Default for CacheAwareConfig {
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.1,
             balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
             eviction_interval_secs: 30,
             max_tree_size: 10000,
             block_size: 16,

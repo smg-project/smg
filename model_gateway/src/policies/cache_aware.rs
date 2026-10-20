@@ -64,6 +64,9 @@
                              least its held tokens over this many tokens per request, up to the
                              configured absolute threshold (0, the default: the held prefix does not
                              count; decode picks are never priced)
+    balance_uncached_credit: Credit a pick on a holder with the prompt it still has to prefill (never
+                             under the mean prefill nor over the whole prompt) instead of the whole
+                             prompt (default off; decode picks keep the whole prompt)
     balance_rel_threshold:   Relative margin of the spill gate (multiple of the fleet mean)
     eviction_interval_secs:  Interval between LRU eviction / TTL sweep cycles
     max_tree_size:           Max total size (chars/tokens) of each model's approximate tree,
@@ -1879,6 +1882,46 @@ impl CacheAwarePolicy {
             .select_min_expected_wait(workers, candidates, info, self.name())
     }
 
+    /// [`Self::select_expected_wait`] over holders of the request's prefix,
+    /// `held` giving the tokens each holds. With `balance_uncached_credit`
+    /// the winner is credited the prompt it still has to prefill, its token
+    /// count less the held tokens, never under the mean prefill nor over the
+    /// whole prompt (a miss's credit), instead of the whole prompt: a hit on
+    /// a long cached conversation is not booked as the full context's work,
+    /// so the next miss is not steered away from that worker as if it were.
+    /// Requests without token ids keep the mean-prefill credit, and decode
+    /// picks the whole prompt (a decode worker prefills nothing).
+    fn select_expected_wait_on_holders(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        candidates: &[usize],
+        held: &[(usize, f64)],
+        info: &SelectWorkerInfo,
+    ) -> Option<usize> {
+        let credited = self.config.balance_uncached_credit && info.role != WorkerRole::Decode;
+        let Some(tokens) = info.tokens.filter(|_| credited) else {
+            return self.select_expected_wait(workers, candidates, info);
+        };
+        let prompt = tokens.len() as u64;
+        let floor = u64::from(self.load_scorer.mean_prefill_tokens());
+        let uncached = |idx: usize| {
+            let held_tokens = held
+                .iter()
+                .find(|&&(holder, _)| holder == idx)
+                .map_or(0.0, |&(_, held_tokens)| held_tokens);
+            ((prompt as f64 - held_tokens).max(0.0) as u64)
+                .max(floor)
+                .min(prompt)
+        };
+        self.load_scorer.select_min_expected_wait_credited(
+            workers,
+            candidates,
+            info,
+            self.name(),
+            Some(&uncached),
+        )
+    }
+
     /// The count-pressure gate's comparison alone, with no trace record: a
     /// worker holding more than `balance_rel_threshold` times the mean load
     /// AND the absolute margin ([`Self::absolute_margin`]) above it is over
@@ -2211,7 +2254,12 @@ impl CacheAwarePolicy {
             {
                 Metrics::record_cache_aware_prefix_margin_held();
             }
-            return self.select_expected_wait(workers, &safe_affinity, info);
+            return self.select_expected_wait_on_holders(
+                workers,
+                &safe_affinity,
+                affinity_candidates,
+                info,
+            );
         }
 
         // A miss has no affinity candidates and is not a spill: every

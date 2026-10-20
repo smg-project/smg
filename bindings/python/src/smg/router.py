@@ -317,6 +317,12 @@ class Router:
             a skew that moves a shallow one (decode picks are never priced). Suits
             prefill pools serving long multi-turn sessions, e.g. 1024. Default: 0
             (unpriced)
+        balance_uncached_credit: Credit a cache-aware pick on a worker holding the
+            request's prefix with the prompt it still has to prefill (its token
+            count less the held tokens, never under the mean prefill nor over the
+            whole prompt) instead of the whole prompt, in the expected-wait
+            estimate later picks read. Misses, spills and decode picks keep the
+            whole prompt. Default: False
         eviction_interval_secs: Interval in seconds between cache eviction operations
             in cache-aware routing. Default: 60
         overlap_decay: Cache-aware anti-hotspot decay: each candidate's overlap score

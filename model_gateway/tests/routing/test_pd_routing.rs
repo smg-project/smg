@@ -176,6 +176,7 @@ mod pd_routing_unit_tests {
                     selection_policy: None,
                     selection_accounting_ttl_ms: 0,
                     balance_prefix_margin_tokens: 0,
+                    balance_uncached_credit: false,
                 },
             ),
             (

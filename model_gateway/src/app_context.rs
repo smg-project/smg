@@ -1246,6 +1246,7 @@ mod tests {
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
             balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
         });
         let builder = AppContextBuilder::new()
             .with_client(&config, 5)
@@ -1292,6 +1293,7 @@ mod tests {
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
             balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
         }));
     }
 
@@ -1318,6 +1320,7 @@ mod tests {
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
             balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
         };
 
         let mut config = config_with_policy(PolicyConfig::Random);

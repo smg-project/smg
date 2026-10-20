@@ -892,6 +892,7 @@ impl ConfigValidator {
                 selection_policy,
                 selection_accounting_ttl_ms: _,
                 balance_prefix_margin_tokens: _,
+                balance_uncached_credit: _,
             } => {
                 Self::validate_cache_boundaries(cache_boundaries)?;
 
@@ -3692,6 +3693,7 @@ mod tests {
                 selection_policy: None,
                 selection_accounting_ttl_ms: 0,
                 balance_prefix_margin_tokens: 0,
+                balance_uncached_credit: false,
             },
         );
 
@@ -3725,6 +3727,7 @@ mod tests {
                     selection_policy: None,
                     selection_accounting_ttl_ms: 0,
                     balance_prefix_margin_tokens: 0,
+                    balance_uncached_credit: false,
                 },
             )
         };
@@ -3780,6 +3783,7 @@ mod tests {
                     selection_policy: None,
                     selection_accounting_ttl_ms: 0,
                     balance_prefix_margin_tokens: 0,
+                    balance_uncached_credit: false,
                 },
             )
         };
@@ -3913,6 +3917,7 @@ mod tests {
                     selection_policy: None,
                     selection_accounting_ttl_ms: 0,
                     balance_prefix_margin_tokens: 0,
+                    balance_uncached_credit: false,
                 },
             )
         };
@@ -3968,6 +3973,7 @@ mod tests {
                 selection_policy: None,
                 selection_accounting_ttl_ms: 0,
                 balance_prefix_margin_tokens: 0,
+                balance_uncached_credit: false,
             },
         );
 
@@ -4092,6 +4098,7 @@ mod tests {
                 selection_policy: None,
                 selection_accounting_ttl_ms: 0,
                 balance_prefix_margin_tokens: 0,
+                balance_uncached_credit: false,
             },
         );
 
@@ -4147,6 +4154,7 @@ mod tests {
                     selection_policy: None,
                     selection_accounting_ttl_ms: 0,
                     balance_prefix_margin_tokens: 0,
+                    balance_uncached_credit: false,
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_metric: Default::default(),
@@ -4284,6 +4292,7 @@ mod tests {
                     selection_policy: None,
                     selection_accounting_ttl_ms: 0,
                     balance_prefix_margin_tokens: 0,
+                    balance_uncached_credit: false,
                 }),
                 prefill_policy: None,
                 decode_policy: None,

@@ -1208,6 +1208,14 @@ pub enum PolicyConfig {
         /// request at); decode picks are never priced.
         #[serde(default)]
         balance_prefix_margin_tokens: u32,
+        /// Credit a pick on a worker holding the request's prefix with the
+        /// prompt it still has to prefill (its token count less the held
+        /// tokens, never under the mean prefill nor over the whole prompt)
+        /// instead of the whole prompt, in the expected-wait estimate later
+        /// picks read. Misses, spills and decode picks keep the whole
+        /// prompt. Off by default.
+        #[serde(default)]
+        balance_uncached_credit: bool,
         eviction_interval_secs: u64,
         max_tree_size: usize,
         #[serde(default = "default_block_size")]
@@ -2682,6 +2690,7 @@ mod tests {
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
             balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -2714,6 +2723,7 @@ mod tests {
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
             balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
@@ -2747,6 +2757,7 @@ mod tests {
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
             balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
         };
 
         match cache_aware {
@@ -2830,6 +2841,44 @@ mod tests {
                 balance_prefix_margin_tokens,
                 ..
             } => assert_eq!(balance_prefix_margin_tokens, 1024),
+            _ => panic!("Expected CacheAware"),
+        }
+    }
+
+    #[test]
+    fn test_cache_aware_uncached_credit_defaults_off_when_absent_and_round_trips() {
+        let json = r#"{
+            "type": "cache_aware",
+            "cache_threshold": 0.5,
+            "balance_abs_threshold": 32,
+            "balance_rel_threshold": 1.1,
+            "eviction_interval_secs": 60,
+            "max_tree_size": 1000
+        }"#;
+        match serde_json::from_str(json).unwrap() {
+            PolicyConfig::CacheAware {
+                balance_uncached_credit,
+                ..
+            } => assert!(!balance_uncached_credit),
+            _ => panic!("Expected CacheAware"),
+        }
+
+        let json = r#"{
+            "type": "cache_aware",
+            "cache_threshold": 0.5,
+            "balance_abs_threshold": 32,
+            "balance_rel_threshold": 1.1,
+            "balance_uncached_credit": true,
+            "eviction_interval_secs": 60,
+            "max_tree_size": 1000
+        }"#;
+        let policy: PolicyConfig = serde_json::from_str(json).unwrap();
+        let serialized = serde_json::to_string(&policy).unwrap();
+        match serde_json::from_str(&serialized).unwrap() {
+            PolicyConfig::CacheAware {
+                balance_uncached_credit,
+                ..
+            } => assert!(balance_uncached_credit),
             _ => panic!("Expected CacheAware"),
         }
     }
@@ -3508,6 +3557,7 @@ discovery:
                 selection_policy: None,
                 selection_accounting_ttl_ms: 0,
                 balance_prefix_margin_tokens: 0,
+                balance_uncached_credit: false,
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_metric: Default::default(),
@@ -3549,6 +3599,7 @@ discovery:
                 selection_policy: None,
                 selection_accounting_ttl_ms: 0,
                 balance_prefix_margin_tokens: 0,
+                balance_uncached_credit: false,
             }),
             decode_policy: None,
         };
@@ -3616,6 +3667,7 @@ discovery:
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
             balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
         };
 
         match pd.get_prefill_policy(&main_policy) {

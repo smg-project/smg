@@ -310,6 +310,8 @@ class RouterArgs:
     balance_prefix_margin_tokens: int = 0
     balance_rel_threshold: float = 1.5
     balance_token_usage_threshold: float = 1.0
+    # Credit a pick on a holder with the prompt it still has to prefill
+    balance_uncached_credit: bool = False
     block_size: int = 16
     bootstrap_port_annotation: str = "sglang.ai/bootstrap-port"
     bucket_adjust_interval_secs: int = 5
@@ -1047,6 +1049,19 @@ class RouterArgs:
                 " the holder's whole match even when the spill target holds part of it; without"
                 " KV events the held length is the approximate tree's routing history, not"
                 " confirmed engine residency. Decode picks are never priced."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}balance-uncached-credit",
+            action="store_true",
+            help=(
+                "Credit a cache-aware pick on a worker holding the request's prefix with the"
+                " prompt it still has to prefill (its token count less the held tokens, never"
+                " under the mean prefill nor over the whole prompt) instead of the whole prompt,"
+                " in the expected-wait estimate later picks read, so a hit on a long cached"
+                " conversation does not steer the next miss away from that worker as if it were"
+                " the whole context's work. Misses, spills and decode picks keep the whole"
+                " prompt. Off by default."
             ),
         )
         routing_group.add_argument(
