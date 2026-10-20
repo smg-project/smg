@@ -34,8 +34,10 @@ use crate::format::{CallSyntax, Emits, Format};
 pub const FENCE_OPEN: &str = "\n```json\n";
 
 /// The DeepSeek V3 table. The tool outputs are a state of their own, entered from the calls block
-/// or from content on `<｜tool▁outputs▁begin｜>` and left for content on `<｜tool▁outputs▁end｜>`,
-/// with no other row: the template writes the turn opener after a user message only, so after a
+/// or from content on `<｜tool▁outputs▁begin｜>`, or from content on `<｜tool▁output▁begin｜>` (the
+/// R1 line's templates write the outer opener, like `<｜Assistant｜>`, for the conversation's first
+/// tool turn only), and left for content on `<｜tool▁outputs▁end｜>`, with no other row: the
+/// template writes the turn opener after a user message only, so after a
 /// tool result the prompt's replay walks the call turn, and the R1 distills' template ends a turn
 /// with one call with neither `<｜tool▁calls▁end｜>` nor `<｜end▁of▁sentence｜>`, so the opener is
 /// what leaves the block there; nothing quoted inside a tool's output moves the walk; and the
@@ -51,6 +53,7 @@ pub fn deepseek_v3() -> Format {
         .terminal("call_open", "<｜tool▁call▁begin｜>function<｜tool▁sep｜>")
         .terminal("call_close", "```<｜tool▁call▁end｜>")
         .terminal("outputs_open", "<｜tool▁outputs▁begin｜>")
+        .terminal("output_open", "<｜tool▁output▁begin｜>")
         .terminal("outputs_close", "<｜tool▁outputs▁end｜>")
         .state("content", Emits::Content)
         .state("reasoning", Emits::Reasoning)
@@ -68,6 +71,7 @@ pub fn deepseek_v3() -> Format {
         .transition("calls", "calls_close", "content")
         .transition("calls", "outputs_open", "outputs")
         .transition("content", "outputs_open", "outputs")
+        .transition("content", "output_open", "outputs")
         .transition("outputs", "outputs_close", "content")
         .calls(CallSyntax::NamedArguments {
             marker: FENCE_OPEN,
@@ -533,6 +537,29 @@ mod tests {
         assert_eq!(content(&events), "It is 18 degrees.");
         assert_eq!(reasoning(&events), "");
         assert!(calls(&events).is_empty());
+        // The R1 line's templates write `<｜Assistant｜>` and `<｜tool▁outputs▁begin｜>` for the
+        // conversation's first tool turn only, so a later turn's call and results are walked
+        // from that first opener, in content: the inner `<｜tool▁output▁begin｜>` takes the walk
+        // into the outputs there, and the close leaves them with nothing begun.
+        let later = "<｜User｜>u1<｜Assistant｜><｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function\
+                     <｜tool▁sep｜>f\n```json\n{}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>\
+                     <｜end▁of▁sentence｜><｜tool▁outputs▁begin｜><｜tool▁output▁begin｜>r1\
+                     <｜tool▁output▁end｜><｜tool▁outputs▁end｜>answer1<｜end▁of▁sentence｜>\
+                     <｜User｜>u2\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>g\n```json\n{}\n```\
+                     <｜tool▁call▁end｜><｜tool▁calls▁end｜><｜end▁of▁sentence｜><｜tool▁output▁begin｜>\
+                     {\"note\": \"<think>\"}<｜tool▁output▁end｜><｜tool▁outputs▁end｜>";
+        assert!(
+            !format.reasoning_open(later),
+            "a later turn's result moves nothing"
+        );
+        let events = run(later, &["\n<think>Warm.</think>It is 18 degrees."]);
+        assert_eq!(reasoning(&events), "Warm.");
+        assert_eq!(
+            content(&events),
+            "It is 18 degrees.",
+            "nothing begun after a later result"
+        );
+        assert!(calls(&events).is_empty());
         // A thought the client prefilled after the tool result (`continue_final_message`) is
         // read: the walk went past the tool outputs, and `<think>` opened the thought.
         let prefilled = format!("{one_call}<think>\nThe tool says");
@@ -669,6 +696,7 @@ mod tests {
                 "<｜tool▁call▁begin｜>function<｜tool▁sep｜>",
                 "```<｜tool▁call▁end｜>",
                 "<｜tool▁outputs▁begin｜>",
+                "<｜tool▁output▁begin｜>",
                 "<｜tool▁outputs▁end｜>",
             ])
         );

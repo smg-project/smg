@@ -242,7 +242,10 @@ is the terminal that leaves the call. Beyond that:
   later only, so a turn with one call ends with neither: without a row for the outputs the walk
   stayed in the block and the next turn read as wrapper text. `<｜tool▁outputs▁begin｜>` and
   `<｜tool▁outputs▁end｜>` are terminals, and the outputs between them a state entered from the
-  block or from content and left for content, with no other row: nothing quoted inside a tool's
+  block or from content and left for content, with no other row; the inner `<｜tool▁output▁begin｜>`
+  enters it from content as well, since the R1 line's templates write the outer opener, like
+  `<｜Assistant｜>`, for the conversation's first tool turn only, and a later turn's results are
+  walked from that first opener. Nothing quoted inside a tool's
   output moves the walk (a `<think>` or a calls opener in a result's text stays there), and the
   close starts the answer with nothing begun, for every template that ends its block as much as
   for the distills' one-call turn, so whitespace alone ahead of its thought or call is held, not
