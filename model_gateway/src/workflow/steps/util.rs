@@ -6,7 +6,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use smg_grpc_client::connect_channel_with_timeout;
 
-use crate::routers::grpc::client::GrpcClient;
+use crate::routers::grpc::client::{GrpcClient, HealthCheckResponse};
 
 fn strip_scheme<'a>(url: &'a str, scheme: &str) -> Option<&'a str> {
     url.get(..scheme.len())
@@ -92,9 +92,31 @@ pub(crate) async fn try_http_reachable(
     Ok(())
 }
 
-/// Perform a single gRPC health check with a specific runtime type.
-///
-/// Also used by `DetectBackendStep` for runtime identification.
+/// One gRPC health RPC to the engine at `grpc_url`, spoken to as
+/// `runtime_type`: its answer, healthy or not, or why there was none (the
+/// endpoint unreachable, the RPC failed or timed out, another runtime's
+/// service there). An answer identifies the runtime whatever it says about
+/// the engine; `DetectBackendStep` reads it so.
+pub(crate) async fn grpc_health_answer(
+    grpc_url: &str,
+    timeout_secs: u64,
+    runtime_type: &str,
+) -> Result<HealthCheckResponse, String> {
+    let connect_future = GrpcClient::connect(grpc_url, runtime_type);
+    let client = tokio::time::timeout(Duration::from_secs(timeout_secs), connect_future)
+        .await
+        .map_err(|_| "gRPC connection timeout".to_string())?
+        .map_err(|e| format!("gRPC connection failed: {e}"))?;
+
+    let health_future = client.health_check();
+    tokio::time::timeout(Duration::from_secs(timeout_secs), health_future)
+        .await
+        .map_err(|_| "gRPC health check timeout".to_string())?
+        .map_err(|e| format!("gRPC health check failed: {e}"))
+}
+
+/// Perform a single gRPC health check with a specific runtime type: the
+/// engine answered on that runtime's service and reports itself healthy.
 ///
 /// The answer counts, not only the RPC: an engine that reports itself not
 /// healthy (a servicer that bound its port while its engine still loads the
@@ -107,17 +129,7 @@ pub(crate) async fn do_grpc_health_check(
     timeout_secs: u64,
     runtime_type: &str,
 ) -> Result<(), String> {
-    let connect_future = GrpcClient::connect(grpc_url, runtime_type);
-    let client = tokio::time::timeout(Duration::from_secs(timeout_secs), connect_future)
-        .await
-        .map_err(|_| "gRPC connection timeout".to_string())?
-        .map_err(|e| format!("gRPC connection failed: {e}"))?;
-
-    let health_future = client.health_check();
-    let response = tokio::time::timeout(Duration::from_secs(timeout_secs), health_future)
-        .await
-        .map_err(|_| "gRPC health check timeout".to_string())?
-        .map_err(|e| format!("gRPC health check failed: {e}"))?;
+    let response = grpc_health_answer(grpc_url, timeout_secs, runtime_type).await?;
     if !response.healthy {
         return Err(not_healthy_error(&response.message));
     }
@@ -229,6 +241,40 @@ pub(crate) async fn try_grpc_reachable(url: &str, timeout_secs: u64) -> Result<(
         .map_err(|_| "gRPC reachability timeout".to_string())?
 }
 
+/// A mock gRPC engine on an ephemeral loopback port for the probes' tests,
+/// answering its health check as its overrides say (healthy until told
+/// otherwise): its `grpc://` URL and those overrides.
+#[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test helper: the mock engine's serve task runs for the test process's lifetime"
+)]
+pub(crate) async fn mock_grpc_engine() -> (
+    String,
+    std::sync::Arc<mock_worker::overrides::WorkerOverrides>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the mock engine");
+    let port = listener
+        .local_addr()
+        .expect("the mock engine's address")
+        .port();
+    let config = std::sync::Arc::new(mock_worker::config::Config {
+        http_count: 0,
+        grpc_base_port: port,
+        grpc_count: 1,
+        model_id: "probe-model".to_string(),
+        tokenizer_path: "probe-model".to_string(),
+        ..mock_worker::config::Config::default()
+    });
+    tokio::spawn(mock_worker::grpc::serve_with_listener(config, listener));
+    (
+        format!("grpc://127.0.0.1:{port}"),
+        mock_worker::overrides::for_port(port),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -238,8 +284,6 @@ mod tests {
             Arc,
         },
     };
-
-    use tokio::net::TcpListener;
 
     use super::*;
 
@@ -359,30 +403,6 @@ mod tests {
         }
     }
 
-    /// A mock gRPC engine on an ephemeral loopback port, answering its health
-    /// check as its overrides say (healthy until told otherwise).
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "test helper: the mock engine's serve task runs for the test process's lifetime"
-    )]
-    async fn mock_grpc_engine() -> (String, Arc<mock_worker::overrides::WorkerOverrides>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let config = Arc::new(mock_worker::config::Config {
-            http_count: 0,
-            grpc_base_port: port,
-            grpc_count: 1,
-            model_id: "probe-model".to_string(),
-            tokenizer_path: "probe-model".to_string(),
-            ..mock_worker::config::Config::default()
-        });
-        tokio::spawn(mock_worker::grpc::serve_with_listener(config, listener));
-        (
-            format!("grpc://127.0.0.1:{port}"),
-            mock_worker::overrides::for_port(port),
-        )
-    }
-
     /// An engine that answers its health check but reports itself not healthy
     /// (its model still loading, say) is not reachable yet: the probe fails
     /// with the engine's reason, for the runtime it speaks and in the
@@ -392,6 +412,14 @@ mod tests {
         let (url, engine) = mock_grpc_engine().await;
         engine.set_serving(false);
 
+        let answer = grpc_health_answer(&url, 5, "tokenspeed")
+            .await
+            .expect("the runtime answers its health RPC whether or not the engine is healthy");
+        assert!(!answer.healthy);
+        assert_eq!(answer.message, "not serving");
+        grpc_health_answer(&url, 5, "vllm")
+            .await
+            .expect_err("another runtime's service does not answer there");
         let err = do_grpc_health_check(&url, 5, "tokenspeed")
             .await
             .expect_err("an engine reporting not healthy must not pass the probe");
