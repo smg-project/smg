@@ -355,6 +355,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ),
     // A bare JSON list of calls, or content; no thought.
     ("llama-xlam-2-8b-fc-r", GenerationPrompt::Plain),
+    // The Mistral list behind `[TOOL_CALLS]`; Mistral Small 3's template renders no tool call,
+    // so its recorded sets hold content alone, and no thought.
+    ("mistral-small-24b-instruct-2501", GenerationPrompt::Plain),
     // An XML tree of arguments behind a separator token; the model writes the thought or closes
     // an empty one, and the generation prompt adds nothing.
     ("minimax-m3", GenerationPrompt::ModelDecides),
@@ -566,6 +569,10 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
         "llama-3.3-nemotron-70b-reward-principle",
         GenerationPrompt::Plain,
     ),
+    // Llama 3.2's own template: the same one call alone, `parameters` naming the arguments, no
+    // thought; the model's `<|python_tag|>`, which the template never writes, is dropped.
+    ("llama-3.2-1b-instruct", GenerationPrompt::Plain),
+    ("llama-3.2-11b-vision-instruct", GenerationPrompt::Plain),
     // FunctionGemma: Gemma's calls between `<start_function_call>` and `<end_function_call>`,
     // `<escape>` around a string and `None` for a null; the template has no thought.
     ("functiongemma-270m-it", GenerationPrompt::Plain),
@@ -649,6 +656,7 @@ impl Recorded for Table {
             | Self::Inkling
             | Self::Gemma4
             | Self::FunctionGemma
+            | Self::Mistral
             | Self::MistralV13
             | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
@@ -822,6 +830,14 @@ const MEASURED_OPENERS: &[(&str, &str)] = &[
         "bytedance-seed-oss-36b-alternate-tokenizer",
         "<|start_header_id|>assistant<|end_header_id|>",
     ),
+    (
+        "llama-3.2-1b-instruct",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "llama-3.2-11b-vision-instruct",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
     ("exaone-4.5-33b", "<|assistant|>"),
     (
         "llama-3-1-nemotron-ultra-253b-cpt-v1",
@@ -849,33 +865,153 @@ const MEASURED_OPENERS: &[(&str, &str)] = &[
     ),
 ];
 
+/// What a recorded model's own chat template writes after the thought's close before a call,
+/// where it is not its table's, measured against the rendered prompts (bellwether's
+/// `render/common.jsonl`, `tools-call-arguments-object`): the NVIDIA Nemotron 3 groups and Step
+/// 3.5 Flash write `</think>\n<tool_call>` where the Qwen 3.5 template behind their table writes
+/// two newlines.
+/// The registry's groups carry it as the group's `after`; the test after the next reads the
+/// rendered prompts themselves where the tree holds them.
+const MEASURED_AFTER: &[(&str, &str)] = &[
+    ("cosmos3-edge", "\n"),
+    ("cosmos3-edge-policy-droid", "\n"),
+    ("nemotron-cascade-2-30b-a3b", "\n"),
+    ("nvidia-nemotron-3-nano-30b-a3b-bf16", "\n"),
+    ("nvidia-nemotron-3-nano-4b-bf16", "\n"),
+    ("nvidia-nemotron-3-super-120b-a12b-bf16", "\n"),
+    ("nvidia-nemotron-3-ultra-550b-a55b-bf16", "\n"),
+    ("nvidia-nemotron-3.5-lightning-30b-a3b-bf16", "\n"),
+    ("nvidia-nemotron-labs-3-elastic-30b-a3b-bf16", "\n"),
+    ("nvidia-nemotron-labs-3-puzzle-75b-a9b-bf16", "\n"),
+    ("step-3.5-flash", "\n"),
+];
+
 #[test]
-fn every_measured_opener_is_the_registrys() {
-    for (slug, opener) in MEASURED_OPENERS {
-        let model = model_of(slug);
-        let table = table_for(&model).unwrap_or_else(|| panic!("{slug}: not in the registry"));
-        assert_eq!(
-            for_model(&model),
-            Some(table.format().opens_turn(opener)),
-            "{slug}: the registry's opener"
+fn every_measured_opener_and_text_after_the_close_is_the_registrys() {
+    for (slug, _) in MEASURED_OPENERS.iter().chain(MEASURED_AFTER) {
+        assert!(
+            MODELS.iter().any(|(recorded, _)| recorded == slug),
+            "{slug}: measured but not recorded"
         );
     }
-    // The other recorded models render their own table's opener: the registry gives them none.
     for (slug, _) in MODELS {
-        if MEASURED_OPENERS
+        let model = model_of(slug);
+        let table = table_for(&model).unwrap_or_else(|| panic!("{slug}: not in the registry"));
+        // The table as it is, with the measured opener and text after the close where the
+        // model's template writes its own; the other recorded models render their table's.
+        let mut expected = table.format();
+        if let Some((_, opener)) = MEASURED_OPENERS
             .iter()
-            .any(|(measured, _)| measured == slug)
+            .find(|(measured, _)| measured == slug)
         {
+            expected = expected.opens_turn(opener);
+        }
+        if let Some((_, after)) = MEASURED_AFTER.iter().find(|(measured, _)| measured == slug) {
+            expected = expected.with_thought_after(after);
+        }
+        assert_eq!(
+            for_model(&model),
+            Some(expected),
+            "{slug}: the registry's opener and text after the thought's close"
+        );
+    }
+}
+
+/// The text after the thought's close before a call, read from each recorded model's rendered
+/// `tools-call-arguments-object` (`render/common.jsonl`, the reference's `text`: the assistant
+/// turn that made the call),
+/// is the registry's for it: the table's layout, or the group's own `after`. Skipped where the
+/// tree is not given; a model the tree has not recorded, a table without a thought layout or a
+/// close, dots3, whose template writes the call's own lead before every block, and a turn whose
+/// template wrote text of the message there, are not read; a tree under which nothing is read
+/// fails, and so does a measured group ([`MEASURED_AFTER`]) the tree records but this test cannot
+/// read.
+#[test]
+#[expect(
+    clippy::print_stderr,
+    reason = "the skip notice and the count are test diagnostic output"
+)]
+fn every_recorded_models_text_after_the_thoughts_close_is_the_registrys() {
+    let Some(root) = std::env::var_os(FIXTURES_ENV).map(PathBuf::from) else {
+        eprintln!(
+            "skipping: {FIXTURES_ENV} is not set; \
+             point it at the fixtures/ directory of a bellwether checkout"
+        );
+        return;
+    };
+    let mut read = Vec::new();
+    let mut wrong = Vec::new();
+    for (slug, _) in MODELS {
+        // A measured group the tree records must be read: a rendering that cannot be read as
+        // this test reads it would leave its `after` unchecked without a word.
+        let measured = MEASURED_AFTER.iter().any(|(measured, _)| measured == slug);
+        let mut unread = |why: String| {
+            if measured {
+                wrong.push(format!("{slug}: {why}"));
+            }
+        };
+        let format =
+            for_model(&model_of(slug)).unwrap_or_else(|| panic!("{slug}: not in the registry"));
+        let Some(thought) = format.layout().and_then(|layout| layout.thought.as_ref()) else {
+            continue;
+        };
+        let Some(close) = thought.close.as_deref() else {
+            continue;
+        };
+        if format.name() == "dots3" {
             continue;
         }
-        let model = model_of(slug);
-        let table = table_for(&model).unwrap_or_else(|| panic!("{slug}: not in the registry"));
-        assert_eq!(
-            for_model(&model),
-            Some(table.format()),
-            "{slug}: an opener the template does not write"
-        );
+        let Ok(text) = fs::read_to_string(root.join(slug).join("render").join("common.jsonl"))
+        else {
+            continue;
+        };
+        let Some(rendered) = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|case| {
+                case["id"]
+                    .as_str()
+                    .is_some_and(|id| id.ends_with("/render/tools-call-arguments-object"))
+            })
+            .and_then(|case| case["reference"]["text"].as_str().map(str::to_string))
+        else {
+            unread("no rendered tools-call-arguments-object with a reference text".to_string());
+            continue;
+        };
+        let Some(at) = rendered.find(close) else {
+            unread(format!("no {close:?} in the rendered call turn"));
+            continue;
+        };
+        let rest = &rendered[at + close.len()..];
+        let between = &rest[..rest.find('<').unwrap_or(rest.len())];
+        // A turn whose template wrote text of the message between the close and the call (a
+        // `None` for a content the request left out) says nothing about the layout.
+        if !between.chars().all(|c| c == '\n' || c == ' ') {
+            unread(format!(
+                "{between:?} between {close:?} and the call is message text"
+            ));
+            continue;
+        }
+        if between != &*thought.after {
+            wrong.push(format!(
+                "{slug} ({}): the template writes {between:?} after {close:?} before the call, the registry {:?}",
+                format.name(),
+                &*thought.after
+            ));
+        }
+        read.push(*slug);
     }
+    eprintln!(
+        "{} recorded models' rendered call turns read: {}",
+        read.len(),
+        read.join(", ")
+    );
+    assert!(
+        !read.is_empty(),
+        "no rendered call turn read under {}: is it the fixtures/ directory?",
+        root.display()
+    );
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 /// The id the registry knows `slug` by. Bellwether's slug is the repository name in lower case

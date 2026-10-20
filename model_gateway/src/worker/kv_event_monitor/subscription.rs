@@ -594,7 +594,7 @@ impl KvEventMonitor {
 
     /// Drain `stream` to its end: each batch applied to the index (a batch
     /// the index applied is the stream working), each batch's load record
-    /// forwarded to the monitor as a poll of this worker received now; the
+    /// forwarded to the monitor only if its rank belongs to this worker; the
     /// worker's removal ends the stream at once.
     async fn drain_stream(
         sub: &WorkerSubscription<'_>,
@@ -610,14 +610,18 @@ impl KvEventMonitor {
         };
         // The load record on a batch is a poll of this worker, received now.
         let on_load = |batch: &KvEventBatch, load: &EngineLoad| {
+            let dp_rank = batch.dp_rank.unwrap_or(0);
+            if dp_rank < 0
+                || sub
+                    .worker
+                    .dp_rank()
+                    .is_some_and(|rank| usize::try_from(dp_rank) != Ok(rank))
+            {
+                return;
+            }
             liveness::on_contact(sub.worker);
             if let Some(monitor) = sub.load_sink.and_then(Weak::upgrade) {
-                monitor.apply_pushed_load(
-                    sub.worker,
-                    batch.dp_rank.unwrap_or(0),
-                    load,
-                    Instant::now(),
-                );
+                monitor.apply_pushed_load(sub.worker, dp_rank, load, Instant::now());
             }
         };
         let result = tokio::select! {
@@ -687,7 +691,7 @@ mod tests {
     use tonic::{transport::Server, Request, Response, Status};
 
     use super::*;
-    use crate::worker::BasicWorkerBuilder;
+    use crate::worker::{worker::StallReason, BasicWorkerBuilder};
 
     /// One batch of stored events, one block per event, `(hash, block_size)` each.
     fn stored_batch(blocks: &[(i64, usize)]) -> KvEventBatch {
@@ -1109,6 +1113,80 @@ mod tests {
                     "case 2: the removal cuts an open stream"
                 ),
             }
+            server.abort();
+        }
+    }
+
+    /// Load-only batches contact only their eligible rank, while admitted KV
+    /// events still contact the subscriber even when their load is foreign.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pushed_load_contact_respects_virtual_rank_without_filtering_events() {
+        for (pinned, rank, load_only, contact) in [
+            (Some(1), Some(0), true, false),
+            (Some(1), Some(-1), true, false),
+            (Some(1), Some(1), true, true),
+            (Some(1), None, true, false),
+            (Some(0), None, true, true),
+            (None, Some(2), true, true),
+            (None, Some(-1), true, false),
+            (Some(1), Some(0), false, true),
+        ] {
+            let batch = KvEventBatch {
+                dp_rank: rank,
+                load: Some(EngineLoad {
+                    load_only,
+                    ..Default::default()
+                }),
+                ..if load_only {
+                    KvEventBatch::default()
+                } else {
+                    stored_batch(&[(42, 16)])
+                }
+            };
+            let (addr, server) = serve(Subscribe::Stream(vec![Ok(batch)])).await;
+            let (_transport_worker, client) = connected(addr).await;
+            let mut builder = BasicWorkerBuilder::new(format!("grpc://{addr}"));
+            if let Some(pinned) = pinned {
+                builder = builder.dp_config(pinned, 8);
+            }
+            let worker: Arc<dyn Worker> = Arc::new(builder.build());
+            let indexer = KvIndex::chain();
+            let worker_id = indexer.intern_worker(worker.url()).unwrap();
+            let block_sizes = DashMap::new();
+            let sub = WorkerSubscription {
+                worker: &worker,
+                worker_url: worker.url(),
+                worker_id,
+                indexer: &indexer,
+                block_sizes: &block_sizes,
+                model_id: "m",
+                load_sink: None,
+                wake: None,
+            };
+            let (_keep, mut shutdown_rx) = oneshot::channel();
+            let Subscribed::Stream(stream) =
+                subscribe_with_deadline(&client, 0, None, &mut shutdown_rx, Duration::from_secs(5))
+                    .await
+            else {
+                panic!("the server answers with a stream");
+            };
+            worker.set_stall(Some(StallReason::Unreachable));
+            let mut state = WorkerStreamState::default();
+            let drained = tokio::time::timeout(
+                Duration::from_secs(5),
+                KvEventMonitor::drain_stream(&sub, stream, &mut state, &mut shutdown_rx),
+            )
+            .await
+            .expect("the finite stream ends");
+            assert!(matches!(
+                drained,
+                Drained::Ended { result: StreamResult::Ended, applied } if applied != load_only
+            ));
+            assert_eq!(
+                worker.stall_reason().is_none(),
+                contact,
+                "pinned={pinned:?}, rank={rank:?}, load_only={load_only}"
+            );
             server.abort();
         }
     }

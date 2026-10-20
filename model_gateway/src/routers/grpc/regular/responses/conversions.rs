@@ -113,10 +113,14 @@ fn responses_to_chat_with_tools(
         req.model.clone()
     };
 
-    // A tool result under a call id the previous assistant turn did not issue
-    // is a malformed history under the contracts that say so (the public
-    // API's words for it), answered as a bad request, not sent to the engine.
-    // Only that: a result with no call before it is left to the engine.
+    // A tool result no call of the assistant turn right before it issued,
+    // under an unknown id or with no call before it at all, is a malformed
+    // history under the contracts that say so (the public API's words for
+    // it), answered as a bad request, not sent to the engine as a turn the
+    // model never asked for. The history loader keeps a stored turn with its
+    // calls and drops a stored result whose call did not survive the reload
+    // (`history::load_history`), so a result with no call before it here is
+    // the client's.
     if let Some(call_id) = ProviderProfile::for_model(&model).unanswerable_tool_result(&messages) {
         return Err(format!(
             "No tool call found for function call output with call_id '{call_id}'"
@@ -915,18 +919,45 @@ mod tests {
         );
     }
 
+    /// A Responses request for `model`, from its input items.
+    fn items_request(model: &str, input: serde_json::Value) -> ResponsesRequest {
+        serde_json::from_value(serde_json::json!({"model": model, "input": input}))
+            .expect("a responses request")
+    }
+
+    /// The conversion's refusal of `input` for a model under the DeepSeek
+    /// contract.
+    fn refused_under_deepseek(input: serde_json::Value) -> String {
+        responses_to_chat(&items_request("deepseek-flash", input))
+            .expect_err("a tool result without its call is a malformed history")
+    }
+
+    /// The call ids of the assistant turn at `index` of a converted history.
+    fn issued_call_ids(chat: &ChatCompletionRequest, index: usize) -> Vec<&str> {
+        match &chat.messages[index] {
+            ChatMessage::Assistant {
+                tool_calls: Some(calls),
+                ..
+            } => calls.iter().map(|call| call.id.as_str()).collect(),
+            other => panic!("expected an assistant turn with calls, got {other:?}"),
+        }
+    }
+
+    /// The call id the tool message at `index` of a converted history answers.
+    fn answered_call_id(chat: &ChatCompletionRequest, index: usize) -> &str {
+        match &chat.messages[index] {
+            ChatMessage::Tool { tool_call_id, .. } => tool_call_id,
+            other => panic!("expected a tool message, got {other:?}"),
+        }
+    }
+
     /// A tool result under a call id the previous turn did not issue is a
     /// malformed history under the DeepSeek contract (as under OpenAI's): the
     /// conversion refuses it in the public API's words, naming the id; the
-    /// right id converts, a model under no such contract converts either way,
-    /// and the shapes the gateway's own loaders produce (a result with no call
-    /// before it; a stored turn's result ahead of a later call) convert.
+    /// right id converts, and a model under no such contract converts either
+    /// way.
     #[test]
     fn a_tool_result_under_an_unknown_call_id_does_not_convert_under_the_deepseek_contract() {
-        let request = |model: &str, input: serde_json::Value| -> ResponsesRequest {
-            serde_json::from_value(serde_json::json!({"model": model, "input": input}))
-                .expect("a responses request")
-        };
         let with_call = |call_id: &str| {
             serde_json::json!([
                 {"type": "message", "role": "user", "content": "Add 17 and 25."},
@@ -935,25 +966,108 @@ mod tests {
                 {"type": "function_call_output", "call_id": call_id, "output": "42"}
             ])
         };
-        let refused = responses_to_chat(&request("deepseek-flash", with_call("call_doesnotexist")))
-            .expect_err("an unknown call id is a malformed history");
         assert_eq!(
-            refused,
+            refused_under_deepseek(with_call("call_doesnotexist")),
             "No tool call found for function call output with call_id 'call_doesnotexist'"
         );
-        assert!(responses_to_chat(&request("deepseek-flash", with_call("call_1"))).is_ok());
-        assert!(responses_to_chat(&request("local-model", with_call("call_doesnotexist"))).is_ok());
-        let without_call = serde_json::json!([
+        assert!(responses_to_chat(&items_request("deepseek-flash", with_call("call_1"))).is_ok());
+        assert!(responses_to_chat(&items_request(
+            "local-model",
+            with_call("call_doesnotexist")
+        ))
+        .is_ok());
+    }
+
+    /// A result with no call before it answers nothing: refused in the same
+    /// words after the user's message and as the only item. The stored turns
+    /// a request continues arrive with their calls, and the loader drops a
+    /// stored result whose call did not survive the reload, so such a result
+    /// is the client's, not a reload that lost the call; a model under no
+    /// such contract converts it either way.
+    #[test]
+    fn an_orphan_tool_result_does_not_convert_under_the_deepseek_contract() {
+        let after_user = serde_json::json!([
             {"type": "message", "role": "user", "content": "Add 17 and 25."},
             {"type": "function_call_output", "call_id": "call_a", "output": "42"}
         ]);
-        assert!(responses_to_chat(&request("deepseek-flash", without_call)).is_ok());
-        let loop_turn = serde_json::json!([
+        let alone = serde_json::json!([
+            {"type": "function_call_output", "call_id": "call_a", "output": "42"}
+        ]);
+        for input in [after_user, alone] {
+            assert_eq!(
+                refused_under_deepseek(input.clone()),
+                "No tool call found for function call output with call_id 'call_a'"
+            );
+            assert!(responses_to_chat(&items_request("local-model", input)).is_ok());
+        }
+    }
+
+    /// A result ahead of the call it names, or ahead of a later call and its
+    /// result, has no call before it either.
+    #[test]
+    fn a_tool_result_ahead_of_its_call_does_not_convert_under_the_deepseek_contract() {
+        let before_its_call = serde_json::json!([
+            {"type": "function_call_output", "call_id": "call_a", "output": "42"},
+            {"type": "function_call", "call_id": "call_a", "name": "add_integers",
+             "arguments": "{\"a\":17,\"b\":25}"}
+        ]);
+        let before_a_later_call = serde_json::json!([
             {"type": "function_call_output", "call_id": "call_a", "output": "42"},
             {"type": "function_call", "call_id": "call_m", "name": "lookup", "arguments": "{}"},
             {"type": "function_call_output", "call_id": "call_m", "output": "ok"}
         ]);
-        assert!(responses_to_chat(&request("deepseek-flash", loop_turn)).is_ok());
+        for input in [before_its_call, before_a_later_call] {
+            assert_eq!(
+                refused_under_deepseek(input),
+                "No tool call found for function call output with call_id 'call_a'"
+            );
+        }
+    }
+
+    /// The call and the result that answers it convert to the assistant's
+    /// call and the tool message under its id.
+    #[test]
+    fn a_matching_call_and_result_convert_under_the_deepseek_contract() {
+        let chat = responses_to_chat(&items_request(
+            "deepseek-flash",
+            serde_json::json!([
+                {"type": "message", "role": "user", "content": "Add 17 and 25."},
+                {"type": "function_call", "call_id": "call_a", "name": "add_integers",
+                 "arguments": "{\"a\":17,\"b\":25}"},
+                {"type": "function_call_output", "call_id": "call_a", "output": "42"}
+            ]),
+        ))
+        .expect("a paired result converts");
+        assert_eq!(chat.messages.len(), 3);
+        assert_eq!(issued_call_ids(&chat, 1), ["call_a"]);
+        assert_eq!(answered_call_id(&chat, 2), "call_a");
+    }
+
+    /// Two calls in one turn and a result for one of them: the result answers
+    /// a call the turn issued, so it converts, both calls in the one assistant
+    /// turn (the call still without a result is the model's to answer, not
+    /// this rule's subject); a result for neither call is refused.
+    #[test]
+    fn a_result_for_one_of_two_calls_converts_under_the_deepseek_contract() {
+        let two_calls = |call_id: &str| {
+            serde_json::json!([
+                {"type": "message", "role": "user", "content": "Add 17 and 25, then 3 and 4."},
+                {"type": "function_call", "call_id": "call_a", "name": "add_integers",
+                 "arguments": "{\"a\":17,\"b\":25}"},
+                {"type": "function_call", "call_id": "call_b", "name": "add_integers",
+                 "arguments": "{\"a\":3,\"b\":4}"},
+                {"type": "function_call_output", "call_id": call_id, "output": "7"}
+            ])
+        };
+        let chat = responses_to_chat(&items_request("deepseek-flash", two_calls("call_b")))
+            .expect("a result for one of the turn's calls converts");
+        assert_eq!(chat.messages.len(), 3);
+        assert_eq!(issued_call_ids(&chat, 1), ["call_a", "call_b"]);
+        assert_eq!(answered_call_id(&chat, 2), "call_b");
+        assert_eq!(
+            refused_under_deepseek(two_calls("call_c")),
+            "No tool call found for function call output with call_id 'call_c'"
+        );
     }
 
     #[test]

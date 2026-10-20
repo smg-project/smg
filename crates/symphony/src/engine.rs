@@ -277,13 +277,24 @@ fn assembler(
         Some(CallSyntax::Pythonic(dialect)) => {
             Box::new(pythonic::Assembler::bare(index, ids, dialect))
         }
-        // The list between markers (Llama Nemotron) takes text in place of it as malformed; the
-        // bare list the output starts in (xLAM) takes it for prose.
-        Some(CallSyntax::JsonList) if framed => Box::new(json::list::Assembler::framed(index, ids)),
-        Some(CallSyntax::JsonList) => Box::new(json::list::Assembler::new(index, ids)),
-        Some(CallSyntax::JsonAlone(opener)) => {
-            Box::new(json::list::Assembler::object_or_list(index, ids, opener))
-        }
+        // The list reader takes what frames the calls as one value: the list between markers
+        // (Llama Nemotron) takes text in place of it as malformed; the bare list the output starts
+        // in (xLAM) takes it for prose; the `json` table's output is one object, several with `;`
+        // between them, or a list, behind the family's call marker or not.
+        Some(CallSyntax::JsonList) => Box::new(json::list::Assembler::new(
+            index,
+            ids,
+            if framed {
+                json::list::Framing::Framed
+            } else {
+                json::list::Framing::Bare
+            },
+        )),
+        Some(CallSyntax::JsonAlone(opener)) => Box::new(json::list::Assembler::new(
+            index,
+            ids,
+            json::list::Framing::ObjectOrList { opener },
+        )),
         Some(CallSyntax::Xml) => Box::new(tagged::xml::Assembler::new(index, id())),
         Some(CallSyntax::Attributed(tags)) => {
             Box::new(tagged::attributed::Assembler::new(index, id(), tags))
@@ -295,7 +306,7 @@ fn assembler(
             marker,
             json::named::After::Object,
         )),
-        Some(CallSyntax::NamedArguments(marker)) => Box::new(json::named::Assembler::new(
+        Some(CallSyntax::NamedArguments { marker, .. }) => Box::new(json::named::Assembler::new(
             index,
             id(),
             marker,

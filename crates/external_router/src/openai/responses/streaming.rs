@@ -231,6 +231,54 @@ async fn send_sse_event(
     }
 }
 
+/// The error code of a stream whose upstream request could not be sent: the
+/// connection refused or reset, the name not resolved, the request timed out.
+const UPSTREAM_REQUEST_FAILED: &str = "upstream_request_failed";
+/// The error code of a stream whose upstream body ended with an error before
+/// its natural end, as the gateway's own routers code the same failure.
+const STREAM_ERROR: &str = "stream_error";
+/// The error code of a tool loop stopped at its tool-call limit: the code
+/// and the wording the gateway's own pipelines give the same stop. They end
+/// it with the `response.failed` terminal (and store the failed record);
+/// this loop still ends it with the error event, the frame it always had.
+const MAX_TOOL_CALLS_EXCEEDED: &str = "max_tool_calls_exceeded";
+/// The error code of a failure in the gateway's own processing.
+const INTERNAL_ERROR: &str = "internal_error";
+
+/// End the relayed stream with the `error` event every router writes for a
+/// failure of its own ([`SseEncoder::encode_responses_error`]), at the
+/// stream's next sequence number; nothing follows it. Best-effort: a client
+/// that already left is not told.
+async fn send_error_event(
+    tx: &SseSender,
+    enc: &mut SseEncoder,
+    sequence_number: &mut u64,
+    code: &str,
+    message: &str,
+) {
+    let frame = enc.encode_responses_error(code, message, *sequence_number);
+    *sequence_number += 1;
+    let _ = tx.send(Ok(frame)).await;
+}
+
+/// The error event of an upstream status answered after the stream began:
+/// the upstream's own `code` (else its `type`) and `message` when its
+/// (sanitized) body carries the API's error envelope, else the status's
+/// error type with the status and the body as the message.
+fn upstream_status_error(status: StatusCode, body: &str) -> (String, String) {
+    let envelope: Option<Value> = serde_json::from_str(body).ok();
+    let upstream = envelope.as_ref().and_then(|v| v.get("error"));
+    let field = |name: &str| upstream.and_then(|e| e.get(name).and_then(Value::as_str));
+    let code = field("code")
+        .or_else(|| field("type"))
+        .unwrap_or_else(|| error::error_type_for_status(status))
+        .to_string();
+    let message = field("message")
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("Upstream error {status}: {body}"));
+    (code, message)
+}
+
 /// Map function_call event names to mcp_call event names
 #[inline]
 fn map_event_name(event_name: &str) -> &str {
@@ -759,11 +807,13 @@ pub(super) fn handle_streaming_with_tool_interception(
             let response = match request_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = send_sse_event(
+                    let message = format!("Upstream request failed: {}", e.without_url());
+                    send_error_event(
                         &tx,
                         &mut sse_encoder,
-                        "error",
-                        &json!({"error": {"message": e.to_string()}}),
+                        &mut sequence_number,
+                        UPSTREAM_REQUEST_FAILED,
+                        &message,
                     )
                     .await;
                     return;
@@ -774,13 +824,9 @@ pub(super) fn handle_streaming_with_tool_interception(
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
                 let body = error::sanitize_error_body(&body);
-                let _ = send_sse_event(
-                    &tx,
-                    &mut sse_encoder,
-                    "error",
-                    &json!({"error": {"message": format!("Upstream error {}: {}", status, body)}}),
-                )
-                .await;
+                let (code, message) = upstream_status_error(status, &body);
+                send_error_event(&tx, &mut sse_encoder, &mut sequence_number, &code, &message)
+                    .await;
                 return;
             }
 
@@ -939,11 +985,13 @@ pub(super) fn handle_streaming_with_tool_interception(
                         }
                     }
                     Err(e) => {
-                        let _ = send_sse_event(
+                        let message = format!("Stream error: {}", e.without_url());
+                        send_error_event(
                             &tx,
                             &mut sse_encoder,
-                            "error",
-                            &json!({"error": {"message": format!("Stream error: {}", e)}}),
+                            &mut sequence_number,
+                            STREAM_ERROR,
+                            &message,
                         )
                         .await;
                         return;
@@ -1035,14 +1083,17 @@ pub(super) fn handle_streaming_with_tool_interception(
                     "Reached tool call limit during streaming: {}",
                     effective_limit
                 );
-                send_sse_event(
+                let message = format!(
+                    "Reached the max_tool_calls limit ({effective_limit}) before executing the remaining tool calls."
+                );
+                send_error_event(
                     &tx,
                     &mut sse_encoder,
-                    "error",
-                    &json!({"error": {"message": "Exceeded max_tool_calls limit"}}),
+                    &mut sequence_number,
+                    MAX_TOOL_CALLS_EXCEEDED,
+                    &message,
                 )
                 .await;
-                let _ = tx.send(Ok(Bytes::from_static(SSE_DONE.as_bytes()))).await;
                 return;
             }
 
@@ -1078,13 +1129,15 @@ pub(super) fn handle_streaming_with_tool_interception(
                     is_first_iteration = false;
                 }
                 Err(e) => {
-                    send_sse_event(
+                    let message = format!("Failed to build resume payload: {e}");
+                    send_error_event(
                         &tx,
                         &mut sse_encoder,
-                        "error",
-                        &json!({"error": {"message": format!("Failed to build resume payload: {}", e)}}),
-                    ).await;
-                    let _ = tx.send(Ok(Bytes::from_static(SSE_DONE.as_bytes()))).await;
+                        &mut sequence_number,
+                        INTERNAL_ERROR,
+                        &message,
+                    )
+                    .await;
                     return;
                 }
             }
@@ -1163,4 +1216,80 @@ pub async fn handle_streaming_response(ctx: RequestContext) -> Response {
         mcp_format_registry,
         mcp_servers,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The error event that ends a failed stream is the frame every router
+    /// writes for one, at the stream's own sequence number, which it
+    /// advances; nothing follows it.
+    #[tokio::test]
+    async fn the_error_event_is_the_shared_frame_at_the_streams_sequence_number() {
+        let (tx, mut rx) = sse_channel();
+        let mut enc = SseEncoder::new();
+        let mut sequence_number = 4;
+        send_error_event(
+            &tx,
+            &mut enc,
+            &mut sequence_number,
+            STREAM_ERROR,
+            "Stream error: connection reset",
+        )
+        .await;
+        drop(tx);
+        assert_eq!(sequence_number, 5);
+        let frame = rx.recv().await.expect("the error frame").expect("a frame");
+        assert_eq!(
+            frame,
+            SseEncoder::new().encode_responses_error(
+                "stream_error",
+                "Stream error: connection reset",
+                4
+            )
+        );
+        assert!(rx.recv().await.is_none(), "nothing follows the error event");
+    }
+
+    /// An upstream status answered after the stream began: the body's own
+    /// code (else its type) and message when it carries the error envelope;
+    /// the status's error type, with the status and the body, when it does
+    /// not.
+    #[test]
+    fn an_upstream_status_keeps_the_bodys_code_and_message_when_it_has_them() {
+        let cases = [
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":{"code":"overloaded","type":"server_error","message":"busy"}}"#,
+                "overloaded",
+                "busy",
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#,
+                "rate_limit_error",
+                "slow down",
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":{"message":"bad input"}}"#,
+                "invalid_request_error",
+                "bad input",
+            ),
+            (
+                StatusCode::BAD_GATEWAY,
+                "bad gateway",
+                "server_error",
+                "Upstream error 502 Bad Gateway: bad gateway",
+            ),
+        ];
+        for (status, body, code, message) in cases {
+            assert_eq!(
+                upstream_status_error(status, body),
+                (code.to_string(), message.to_string()),
+                "{status} {body}"
+            );
+        }
+    }
 }

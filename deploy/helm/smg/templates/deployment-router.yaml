@@ -37,6 +37,9 @@ spec:
         {{- if include "smg.historySecretManaged" . }}
         checksum/history-secret: {{ include (print $.Template.BasePath "/secret-history.yaml") . | sha256sum }}
         {{- end }}
+        {{- if include "smg.oracleSecretManaged" . }}
+        checksum/oracle-secret: {{ include (print $.Template.BasePath "/secret-oracle.yaml") . | sha256sum }}
+        {{- end }}
         {{- with .Values.router.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -117,6 +120,16 @@ spec:
                 secretKeyRef:
                   name: {{ . }}
                   key: {{ include "smg.historySecretKey" $ }}
+            {{- end }}
+            {{- with include "smg.oracleSecretName" . }}
+            {{- $secret := . }}
+            {{- range (include "smg.oracleCredentials" $ | fromJsonArray) }}
+            - name: {{ .env }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: {{ .key }}
+            {{- end }}
             {{- end }}
             {{- with .Values.router.extraEnv }}
             {{- toYaml . | nindent 12 }}

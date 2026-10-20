@@ -114,6 +114,35 @@ the reason the syntax names (`NameWithoutACall`, `NameWithoutArguments`), and as
 `UnterminatedRegion` when the stream is cut; an empty header leaves nothing, which is how a thought
 or an answer message reads under the Inkling table.
 
+## The list reader (`json::list`)
+
+A list of call objects is read by one assembler around the JSON assembler, each object going to
+one of its own with the next free index (spent only by an object that starts a call) and its id
+from the engine's `CallIds`. What frames the calls is one value, `Framing`, given at construction
+and mapped from the table's call syntax by the engine's factory: `Bare` (xLAM) is the list alone in
+the output, where anything but a list is prose; `Framed` (Llama Nemotron) is the list between
+markers, where text in place of it is malformed; `ObjectOrList` (the `json` table) also reads a
+`{` at the first byte as one call alone and another call after each `;` that follows it, and
+carries the family's call marker the output may open with (Llama 3.1's `<|python_tag|>`), dropped
+as the template's wrapping where it does. The stages (deciding at the first byte that is not
+whitespace, inside the marker, between objects, inside one, after the `]` or the lone object) and
+what they say of the bytes around the objects (the brackets, the commas, the `;` and the wrapping
+whitespace `Dropped`; text between objects `Malformed`, one run per event, a run ending at
+whitespace, a comma, a brace or the `]`; text after the list or the lone object `Malformed` with
+its whitespace, one event per piece once text follows) are the same under every framing.
+
+The JSON family so reads as one object reader with the framings around it, each stated once:
+none, where a table's markers frame one object (`CallSyntax::Json`, the JSON assembler itself); a
+header (`json::named`, whose `After` says what the JSON after the marker is); a list (`json::list`,
+whose `Framing` says what is around the objects). The lone object between markers is not a framing
+of the list reader: the engine, not the reader, reports what follows the object there
+(`Engine::wrapping`, per piece), where the list reader holds the whitespace after a lone object
+across pieces and reads a `;` or prose after it; folding it in would change those events, or put a
+branch on the busiest JSON path for no reader fewer. The forced call (`json::forced`) reads through
+the value reader (`json::arguments`), which ends where the value is whole and holds the strings a
+caller types, not at an object's brace: a different reader by design, named by the request rather
+than framed.
+
 ## The Qwen tagged assembler (`tagged::assembler`)
 
 Every byte of the call lands in exactly one event. Whitespace between tags is the template's and
@@ -373,16 +402,18 @@ What the syntax says, and what the assembler does with it:
   what makes every chunking say the same.
 - **Every byte lands in exactly one event**, as in the other assemblers: the key, the `=`, the
   value and the separator after it in the fragment they produce.
-- **Two endings.** `Assembler::close` is the region's closing marker (or the next opener):
-  a call still open is closed for the client, an open argument's bytes and a name that never
-  got its `(` come back as `Malformed`, and the list's wrapping before any call is dropped.
-  `Assembler::finish` is a stream that was cut: nothing is closed, and a call that started
-  still ends, with no bytes of its own, as every assembler ends one, after the one `Malformed {
-  UnterminatedRegion }` event that says its arguments are no whole value
-  (`tagged::end_cut_call`): it carries what was held, a key, a value or a separator cut short,
-  or no bytes when the cut came right after the `(`, so that a call the end cut before its `)`
-  is never handed over as finished without a word. Outside a call, what was held, a name that
-  never got its `(` or the list's wrapping, comes back as `Malformed { UnterminatedRegion }` too.
+- **Two endings, one rule for a cut call.** `Assembler::close` is the region's closing marker
+  (or the next opener); `Assembler::finish` is a stream that was cut. A call still open at
+  either is one the model never finished, since every template writes the call's `)` before
+  the marker: nothing is closed for it, the fragments it sent stand, and it ends, with no bytes
+  of its own, after the one `Malformed` event that says its arguments are no whole value
+  (`tagged::end_cut_call`), carrying what was held, a key, a value or a separator cut short, or
+  no bytes when the cut came right after the `(`; so a cut call is never handed over as finished
+  without a word, nor with an object the reader closed for it. The reason is
+  `UnterminatedRegion` at the stream's end, and the engine names it for a region a marker
+  closed. Outside a call the two endings differ: at the close a name that never got its `(`
+  comes back as `Malformed` with its own reason and the list's wrapping before any call is
+  dropped; at the stream's end what was held comes back as `Malformed { UnterminatedRegion }`.
 - **Python's whitespace is allowed** between a name and its `(`, around the `=`, and around a
   value, as the old parser's regular expression allowed it; a name or a key is the text less
   that whitespace.
@@ -403,6 +434,12 @@ What the syntax says, and what the assembler does with it:
   decoded, is typed by the kind the request's tool declares for the parameter, through the value
   module's `json`, or by its text where none is declared; a bare value, a single-quoted Python
   string included, reads as under the other dialects.
+- **A parameter without a value is reported and skipped.** `key=` followed by the comma or the
+  call's `)` is a member Python refuses and the templates never write: its bytes, the separator
+  before it, the key, the `=` and the whitespace around them, come back as
+  `Malformed { KeyWithoutAValue }`, nothing is
+  written for it, and the object closes whole without it, as the Gemma reader leaves a member
+  without a value; no empty string stands for a value the model did not write.
 
 Ported in spirit from the old crate's pythonic parser, which compiled a regular expression per call
 and read the arguments with a Python-literal evaluator at the end; here the arguments are read as

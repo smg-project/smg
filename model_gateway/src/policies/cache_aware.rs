@@ -1558,7 +1558,8 @@ impl CacheAwarePolicy {
         let mut load_sum = 0usize;
         for (idx, worker) in workers.iter().enumerate() {
             let state = worker.routing_state();
-            if cache_trace::enabled() && !state.eligible() {
+            let eligible = info.admits(state);
+            if cache_trace::enabled() && !eligible {
                 cache_trace::gate(serde_json::json!({
                     "phase": "eligibility", "worker": worker.url(),
                     "load": state.load, "overloaded": state.overloaded,
@@ -1567,7 +1568,7 @@ impl CacheAwarePolicy {
             }
             // The overload veto costs nothing here: `state` is the word this
             // pass already loaded for health, circuit breaker and load.
-            if state.eligible() {
+            if eligible {
                 healthy_indices.push(idx);
                 load_sum += state.load;
             }
@@ -1664,7 +1665,7 @@ impl CacheAwarePolicy {
                 continue;
             }
             let state = workers[idx].routing_state();
-            if state.eligible() {
+            if info.admits(state) {
                 sample[sampled] = idx;
                 sampled += 1;
                 load_sum += state.load;
@@ -1950,7 +1951,7 @@ impl CacheAwarePolicy {
                 continue;
             };
             let state = worker.routing_state();
-            if !state.eligible() {
+            if !info.admits(state) {
                 continue;
             }
             let indexed = table.id_at[idx].map(|id| indexer.worker_block_count(id));
@@ -2073,7 +2074,7 @@ impl CacheAwarePolicy {
                 continue;
             };
             let state = worker.routing_state();
-            if !state.eligible() {
+            if !info.admits(state) {
                 continue;
             }
             let indexed = table.id_at[idx].map_or(0, |id| indexer.worker_block_count(id));
@@ -2443,6 +2444,7 @@ impl CacheAwarePolicy {
             block_size,
             &tuning,
             gather,
+            info,
         );
         // Chain hashes are computed only for policies (or accounting) keyed
         // on prefixes; the default decision never pays for them.
@@ -2572,6 +2574,7 @@ impl CacheAwarePolicy {
             &table,
             indexer,
             Gather::All { cap: None },
+            &SelectWorkerInfo::default(),
         );
         candidates.retain(|candidate| healthy_indices.contains(&candidate.idx));
         if !candidates.is_empty() {
@@ -2587,6 +2590,10 @@ impl CacheAwarePolicy {
     }
 
     /// `overlap_candidates` over already-computed block hashes.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the holder gather threads the selection's inputs through"
+    )]
     fn overlap_candidates_for_hashes(
         workers: &[Arc<dyn Worker>],
         content_hashes: &[ContentHash],
@@ -2595,8 +2602,10 @@ impl CacheAwarePolicy {
         block_size: usize,
         tuning: &OverlapTuning<'_>,
         gather: Gather,
+        info: &SelectWorkerInfo,
     ) -> Vec<OverlapCandidate> {
-        let mut candidates = Self::overlap_holders(workers, content_hashes, table, indexer, gather);
+        let mut candidates =
+            Self::overlap_holders(workers, content_hashes, table, indexer, gather, info);
         if candidates.is_empty() {
             return candidates;
         }
@@ -2622,6 +2631,7 @@ impl CacheAwarePolicy {
         table: &PoolTable,
         indexer: &KvIndex,
         gather: Gather,
+        info: &SelectWorkerInfo,
     ) -> Vec<OverlapCandidate> {
         if content_hashes.is_empty() {
             return Vec::new();
@@ -2635,8 +2645,8 @@ impl CacheAwarePolicy {
         }
 
         let mut candidates = match gather {
-            Gather::TopGroup { cap } => Self::top_group(workers, table, &overlap, cap),
-            Gather::All { cap } => Self::all_holders(workers, table, &overlap, cap),
+            Gather::TopGroup { cap } => Self::top_group(workers, table, &overlap, cap, info),
+            Gather::All { cap } => Self::all_holders(workers, table, &overlap, cap, info),
         };
         // Downstream reads candidates in slice order: the all-workers merge
         // in `resolve_selection` and the tie-breaks.
@@ -2655,16 +2665,17 @@ impl CacheAwarePolicy {
         table: &PoolTable,
         overlap: &OverlapScores,
         cap: Option<usize>,
+        info: &SelectWorkerInfo,
     ) -> Vec<OverlapCandidate> {
         let deepest = overlap.scores.values().copied().max().unwrap_or(0);
         if deepest == 0 {
             return Vec::new();
         }
-        let group = Self::holders_at(workers, table, overlap, deepest, cap);
+        let group = Self::holders_at(workers, table, overlap, deepest, cap, info);
         if !group.is_empty() {
             return group;
         }
-        let mut all = Self::all_holders(workers, table, overlap, None);
+        let mut all = Self::all_holders(workers, table, overlap, None, info);
         let best = all
             .iter()
             .map(|candidate| candidate.raw_score)
@@ -2682,6 +2693,7 @@ impl CacheAwarePolicy {
         overlap: &OverlapScores,
         depth: u32,
         cap: Option<usize>,
+        info: &SelectWorkerInfo,
     ) -> Vec<OverlapCandidate> {
         let mut tied: Vec<u32> = overlap
             .scores
@@ -2695,7 +2707,7 @@ impl CacheAwarePolicy {
             let Some(idx) = table.position(id, workers) else {
                 continue;
             };
-            if !workers[idx].routing_state().eligible() {
+            if !info.admits(workers[idx].routing_state()) {
                 continue;
             }
             group.push(OverlapCandidate {
@@ -2730,6 +2742,7 @@ impl CacheAwarePolicy {
         table: &PoolTable,
         overlap: &OverlapScores,
         cap: Option<usize>,
+        info: &SelectWorkerInfo,
     ) -> Vec<OverlapCandidate> {
         let mut candidates: Vec<OverlapCandidate> = Vec::with_capacity(overlap.scores.len());
         for (&id, &score) in &overlap.scores {
@@ -2739,7 +2752,7 @@ impl CacheAwarePolicy {
             let Some(idx) = table.position(id, workers) else {
                 continue;
             };
-            if !workers[idx].routing_state().eligible() {
+            if !info.admits(workers[idx].routing_state()) {
                 continue;
             }
             candidates.push(OverlapCandidate {

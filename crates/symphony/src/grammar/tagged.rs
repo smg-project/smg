@@ -414,6 +414,12 @@ mod tests {
                 "</function>",
             ])
         );
-        assert_eq!(payload["format"]["elements"][1]["type"], "triggered_tags");
+        // The table's layout writes its two newlines after the thought's close, between the
+        // prefix and the calls.
+        assert_eq!(
+            payload["format"]["elements"][1],
+            value!({"type": "const_string", "value": "\n\n"})
+        );
+        assert_eq!(payload["format"]["elements"][2]["type"], "triggered_tags");
     }
 }

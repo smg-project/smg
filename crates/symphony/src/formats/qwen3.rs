@@ -8,15 +8,30 @@
 //! value on a line of its own and MiMo writes it between the tags directly, which the syntax's
 //! [`Placement`](crate::tagged::Placement) says.
 //!
+//! The table carries the one part of its chat template's layout the tags write: after the
+//! thought's close the Qwen3 and Qwen 3.5 templates write two newlines before the content or the
+//! first call (`</think>\n\n<tool_call>`), so a forced call written where the close left the
+//! engine begins with them, as the template writes it, and the call's marker is not the grammar's
+//! first text ([`Format::grammar_for`]). MiMo's template writes what follows right after the
+//! close, so the table under the direct placement carries none; the NVIDIA Nemotron 3 groups and
+//! Step 3.5 Flash, which read with the tagged table, write one newline there, which their entries
+//! in `groups.json` carry in the table's place (`after`). The thought the model opens and closes
+//! itself: a `<tool_call>` inside it is thought text, as the template reads it.
+//!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
-use crate::format::{CallSyntax, Emits, Format};
 #[cfg(test)]
-use crate::tagged::{Placement, Spelling};
+use crate::tagged::Spelling;
+use crate::{
+    format::{CallSyntax, Emits, Format},
+    tagged::Placement,
+};
 
-/// The Qwen3 table, with the call syntax the checkpoint writes.
+/// The Qwen3 table, with the call syntax the checkpoint writes; under the direct placement
+/// (MiMo) without the thought layout, whose two newlines after the close that template does not
+/// write.
 pub fn qwen3(syntax: CallSyntax) -> Format {
-    Format::new("qwen3")
+    let format = Format::new("qwen3")
         .terminal("think_open", "<think>")
         .terminal("think_close", "</think>")
         .terminal("call_open", "<tool_call>")
@@ -30,7 +45,11 @@ pub fn qwen3(syntax: CallSyntax) -> Format {
         .transition("calls", "call_close", "content")
         .transition("calls", "call_open", "calls")
         .calls(syntax)
-        .opens_turn("<|im_start|>assistant")
+        .opens_turn("<|im_start|>assistant");
+    if matches!(syntax, CallSyntax::Tagged(_, Placement::Direct)) {
+        return format;
+    }
+    format.with_layout(super::thought_layout("</think>", "\n\n"))
 }
 
 #[cfg(test)]
@@ -40,7 +59,10 @@ mod tests {
     use super::*;
     use crate::{
         ids::CallIds,
-        testing::{arguments_of, bytes, content, reasoning},
+        testing::{
+            a_forced_tag_begins_with_the_templates_text, arguments_of, bytes, content, drive,
+            reasoning, the_same_at_every_cut, Said,
+        },
     };
 
     fn ids() -> CallIds {
@@ -1663,5 +1685,175 @@ mod tests {
             ),
             Err(ParseError::Lifecycle(_))
         ));
+    }
+
+    /// The tool `get_weather` of [`declared()`] and one without parameters, as a request lists
+    /// them.
+    fn weather_tools() -> Vec<openai_protocol::common::Tool> {
+        use openai_protocol::common::{Function, Tool};
+        use serde_json::json as value;
+        let tool = |name: &str, parameters: serde_json::Value| Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: name.to_string(),
+                description: None,
+                parameters,
+                strict: None,
+                extra: Default::default(),
+            },
+        };
+        vec![
+            tool(
+                "get_weather",
+                value!({"type": "object", "properties": {
+                    "city": {"type": "string"},
+                    "days": {"type": "integer"},
+                }}),
+            ),
+            tool("ping", value!({"type": "object", "properties": {}})),
+        ]
+    }
+
+    /// The two tables that carry the thought layout, each with a call as its syntax writes it.
+    fn tables_with_a_call() -> [(Format, &'static str); 2] {
+        [
+            (qwen3(CallSyntax::Json), CALL_WITH_DAYS),
+            (
+                qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
+                TAGGED_CALL,
+            ),
+        ]
+    }
+
+    const CALL_WITH_DAYS: &str = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": \
+        {\"city\": \"Paris\", \"days\": 3}}\n</tool_call>";
+
+    /// The events of `pieces` after the turn's opener, read by `format` with the weather tool.
+    fn read_with(format: &Format, pieces: &[&str]) -> Vec<Event<'static>> {
+        drive(
+            &mut engine(format.clone(), declared()),
+            "<|im_start|>assistant\n",
+            pieces,
+        )
+    }
+
+    #[test]
+    fn a_prompt_with_thinking_off_has_written_the_templates_two_newlines_itself() {
+        // A request with thinking switched off closes an empty thought in the prompt and writes
+        // the two newlines after it (`<think>\n\n</think>\n\n` at the prompt's end): the table
+        // reads that from the prompt, as the gateway does beside `reasoning_open`, and a forced
+        // call written from there is the calls at once on every start, the newlines not written a
+        // second time. The thinking-on prompt has written nothing, and MiMo's table carries no
+        // layout to have written.
+        use crate::testing::a_forced_tag_after_a_prompt_that_wrote_the_templates_text;
+        let tools = weather_tools();
+        let off = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        for format in [
+            qwen3(CallSyntax::Json),
+            qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
+        ] {
+            a_forced_tag_after_a_prompt_that_wrote_the_templates_text(
+                &format,
+                &tools,
+                off,
+                "<|im_start|>assistant\n",
+                "<tool_call>",
+            );
+        }
+        assert!(!qwen3(CallSyntax::Tagged(Spelling::Json, Placement::Direct)).thought_closed(off));
+    }
+
+    #[test]
+    fn a_forced_call_after_the_thoughts_close_begins_with_the_templates_two_newlines() {
+        // The Qwen3 and Qwen 3.5 templates write two newlines after the thought's close before
+        // the content or the first call, and the table carries that part of its layout. Where the
+        // grammar starts after the close (after the gate of the engine's reasoning parser, with
+        // the prompt's thought closed or open; after the thought a free-text prefix or a tag of
+        // the thought wrote), the calls' tag begins with them, so the call's marker is not the
+        // grammar's first text: an engine that takes a marker the model rehearses inside its
+        // thought for the thought's end cannot start the forced call there once the marker cannot
+        // start the grammar. With the thought closed, at the first token or where the engine does
+        // not say, the calls at once, as before. MiMo's table, the direct placement, carries no
+        // layout: its template writes what follows right after the close.
+        use crate::grammar::{GrammarStart, Options};
+        let tools = weather_tools();
+        for format in [
+            qwen3(CallSyntax::Json),
+            qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
+        ] {
+            a_forced_tag_begins_with_the_templates_text(
+                &format,
+                &tools,
+                "</think>",
+                "\n\n",
+                "<tool_call>",
+            );
+        }
+        let direct = qwen3(CallSyntax::Tagged(Spelling::Json, Placement::Direct));
+        assert!(direct.layout().is_none());
+        let gated = direct
+            .grammar_for(
+                &tools[..1],
+                Options {
+                    at_least_one: true,
+                    reasoning_open: true,
+                    thought_closed: false,
+                    one_call: true,
+                    start: GrammarStart::AfterReasoning,
+                },
+            )
+            .expect("a tag")
+            .payload();
+        assert_eq!(gated["format"]["type"], "triggered_tags", "{gated}");
+    }
+
+    #[test]
+    fn a_forced_call_written_after_the_thoughts_close_reads_as_the_call_with_the_rehearsal_as_thought(
+    ) {
+        // The tag's shape on an engine whose grammar starts after the thought's close: the thought
+        // with the call's format rehearsed inside it, its close, the template's two newlines and
+        // the call. The rehearsal is thought text, the newlines the template's, the call the call;
+        // whole, one character at a time and at every cut, under both syntaxes.
+        for (format, call) in tables_with_a_call() {
+            let rehearsed = format!("\nThe user wants the forecast. The format is {call}. So:\n");
+            let output = format!("<think>{rehearsed}</think>\n\n{call}");
+            assert_eq!(
+                the_same_at_every_cut(|pieces| read_with(&format, pieces), &output),
+                Said {
+                    calls: vec![(
+                        "get_weather".to_string(),
+                        "{\"city\": \"Paris\", \"days\": 3}".to_string()
+                    )],
+                    finish: Some((FinishReason::Stop, 1)),
+                    content: String::new(),
+                    reasoning: rehearsed,
+                },
+                "{call}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_call_marker_inside_the_thought_stays_thought_text() {
+        // An engine whose reasoning gate took the rehearsed marker for the thought's end and
+        // started a forced call there wrote the call inside the thought, the output ending there;
+        // the table reads it as the template does: thought text, no call, `stop`. The tag no
+        // longer lets such an engine start there (its first text after the close is the
+        // template's newlines, not the marker); the reading is pinned here, whole, one character
+        // at a time and at every cut, under both syntaxes.
+        for (format, call) in tables_with_a_call() {
+            let thought = format!("\nThe user wants the forecast. The format is {call}");
+            let output = format!("<think>{thought}");
+            assert_eq!(
+                the_same_at_every_cut(|pieces| read_with(&format, pieces), &output),
+                Said {
+                    calls: Vec::new(),
+                    finish: Some((FinishReason::Stop, 0)),
+                    content: String::new(),
+                    reasoning: thought,
+                },
+                "{call}"
+            );
+        }
     }
 }

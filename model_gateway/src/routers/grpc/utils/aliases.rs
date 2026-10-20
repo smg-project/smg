@@ -69,7 +69,7 @@ pub const ALIASES: [(&str, Table); 19] = [
 /// the next source decides: after a worker's labels the registry's table for a model it
 /// knows, else the gateway's flags, else the legacy parsers (`passthrough` excepted, which
 /// keeps the legacy parsers either way).
-pub const UNANSWERED: [(&str, &str); 13] = [
+pub const UNANSWERED: [(&str, &str); 12] = [
     (
         "passthrough",
         "leaves its channel as written, which no table reads for: the way back to the \
@@ -113,12 +113,6 @@ pub const UNANSWERED: [(&str, &str); 13] = [
         "kimi",
         "a thought between `◁think▷` and `◁/think▷`, which no table reads: the Kimi K2 \
          line's table reads `<think>`",
-    ),
-    (
-        "mistral",
-        "the list of calls after `[TOOL_CALLS]` of Mistral 7B v0.3 and Small 3, another \
-         spelling than mistral_v13's, which no table reads yet; the table that does takes \
-         the name",
     ),
     ("step3", "Step 3's calls and thought: no table"),
     ("sarashina", "Sarashina's calls: no table"),

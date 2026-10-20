@@ -437,7 +437,7 @@ impl PolicyRegistry {
             result
         };
 
-        let healthy = get_healthy_worker_indices(workers);
+        let healthy = get_healthy_worker_indices(workers, info);
         if healthy.is_empty() {
             return finish(None, ExecutionBranch::NoHealthyWorkers);
         }

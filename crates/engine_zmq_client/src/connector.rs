@@ -1086,8 +1086,8 @@ impl<P: EngineProtocol> Client<P> {
     /// Prompt tokens of the in-flight requests that have produced no output
     /// yet: the engine's prefill work in hand, which the servicer puts on its
     /// load record (`EngineLoad.prefill_pending_tokens`) so a gateway can
-    /// allow for it when it judges a token-batch wire's silence, whatever it
-    /// has in flight on the engine itself.
+    /// allow for it when it judges the engine's silence, whatever it has in
+    /// flight on the engine itself.
     pub fn prefill_pending_tokens(&self) -> u64 {
         self.inner.registry.lock().prefill_pending_tokens()
     }

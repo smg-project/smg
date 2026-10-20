@@ -36,11 +36,7 @@ impl PassthroughPolicy {
 }
 
 impl LoadBalancingPolicy for PassthroughPolicy {
-    fn select_worker(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        _info: &SelectWorkerInfo,
-    ) -> Option<usize> {
+    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
         if workers.len() > 1 && !self.warned_multi_worker.swap(true, Ordering::Relaxed) {
             warn!(
                 worker_count = workers.len(),
@@ -49,7 +45,7 @@ impl LoadBalancingPolicy for PassthroughPolicy {
             );
         }
 
-        get_healthy_worker_indices(workers).first().copied()
+        get_healthy_worker_indices(workers, info).first().copied()
     }
 
     fn name(&self) -> &'static str {

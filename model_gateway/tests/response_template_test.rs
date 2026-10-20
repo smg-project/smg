@@ -712,13 +712,16 @@ async fn a_registry_tables_json_answer_follows_the_thought_the_prompt_leaves_ope
 }
 
 /// The kind of the block a tag's format writes after what leads it (the free text or the closed
-/// thought of a prompt that leaves the thought open): the calls' `triggered_tags`, or an answer's
-/// `json_schema`.
+/// thought of a prompt that leaves the thought open, and the text the template writes after the
+/// thought's close where the table carries one): the calls' `triggered_tags`, or an answer's
+/// `json_schema`, the sequence's last element.
 #[expect(clippy::expect_used, reason = "test helper")]
 fn block_of(tag: &str) -> String {
     let tag: Value = serde_json::from_str(tag).expect("a tag");
-    tag["format"]["elements"][1]["type"]
-        .as_str()
+    tag["format"]["elements"]
+        .as_array()
+        .and_then(|elements| elements.last())
+        .and_then(|block| block["type"].as_str())
         .unwrap_or("")
         .to_string()
 }

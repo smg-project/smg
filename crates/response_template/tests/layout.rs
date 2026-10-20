@@ -395,6 +395,7 @@ fn every_mode_has_a_tag(format: &Format, layout: Layout) {
             let options = Options {
                 at_least_one,
                 reasoning_open,
+                thought_closed: false,
                 one_call,
                 start: GrammarStart::Unknown,
             };

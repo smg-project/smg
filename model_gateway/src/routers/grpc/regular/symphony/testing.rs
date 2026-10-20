@@ -111,6 +111,7 @@ pub(super) fn constraint(
         Asks::Chat(request),
         tools,
         reasoning_open,
+        false,
         symphony::GrammarStart::Unknown,
         &templates(),
     )

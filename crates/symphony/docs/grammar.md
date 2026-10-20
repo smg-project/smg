@@ -59,7 +59,13 @@ than it reasons.
 Inkling's named JSON takes the tag the gateway's old Inkling parser writes, the call marker its
 trigger inside whatever message the model is writing. Mistral's named arguments take a tag per tool
 from `[TOOL_CALLS]`, the name and `[ARGS]` to the tool's schema, with no end, as the template writes
-nothing after the object. Llama Nemotron's list takes one tag around it, `<TOOLCALL>`, the tools'
+nothing after the object; where the named-arguments call has a close of its own and sits in a block
+(DeepSeek V3.1's `<｜tool▁call▁begin｜>NAME<｜tool▁sep｜>{…}<｜tool▁call▁end｜>`, V3's fenced call), the
+calls go between the block's ways in and its close, each the call's opener, the name and the marker,
+the tool's schema and the call's close, with what the table says the template writes between two
+calls (V3's newline) before every call after the first, as the tagged syntaxes' calls do. The
+marker itself stays writable in the free text before the calls: it opens no call without the
+opener, and V3's is a code fence a thought may hold. Llama Nemotron's list takes one tag around it, `<TOOLCALL>`, the tools'
 calls as a JSON list, `</TOOLCALL>`; xLAM's bare list is the same list with no tag, alone in the
 turn. A table without calls gives `None`, and the gateway takes the JSON-schema path for it.
 
@@ -129,17 +135,25 @@ there, the layout's `Message::after` of the thought: after the gate of an engine
 grammar back until its reasoning parser has seen the close (`GrammarStart::AfterReasoning`), after
 the thought the prompt closed, and after the thought a free-text prefix or a tag of the thought
 wrote. A registry table may carry that part of its layout alone (Seed-OSS's newline before every
-call, `"\n" + <seed:tool_call>` in its template), and a table without one writes the calls at once,
-as before. Besides writing what the model was trained on, this keeps the call's marker from being
-the grammar's first text: an engine that takes a call marker the model writes inside its thought
-for the thought's end (Seed-OSS rehearses the call format while thinking) would otherwise start the
-forced call there, and an engine that masks such a marker while the model reasons, when the grammar
-cannot start with it, cannot do so when the tag begins with the newline. Where the prompt leaves
-the thought closed and the engine starts the grammar at the first token, or does not say where
-(the grammar may then start at the turn's own start, where nothing stands after a close), such a
-table's tag is still the calls at once (the thought is not admitted before them: the shape MiniMax
-M3's bare-close row gives is the one that would). An answer's tag keeps the schema alone after the
-close, the engine's own constraint, which the registry's tables leave to it.
+call, `"\n" + <seed:tool_call>` in its template; the two newlines of the Qwen3, MiniCPM5 and dots3
+templates and the one of GLM 4.6's: `formats::thought_layout`), and a table without one (MiMo's
+`qwen3_tagged_direct`, whose template writes what follows right after the close) writes the calls at
+once, as before. Besides writing what the model was trained on, this keeps the call's marker from
+being the grammar's first text: an engine that takes a call marker the model writes inside its
+thought for the thought's end (Seed-OSS rehearses the call format while thinking) would otherwise
+start the forced call there, and an engine that masks such a marker while the model reasons, when
+the grammar cannot start with it, cannot do so when the tag begins with the newline. Where the
+prompt leaves the thought closed and the engine starts the grammar at the first token, or does not
+say where (the grammar may then start at the turn's own start, where nothing stands after a close),
+such a table's tag is still the calls at once (the thought is not admitted before them: the shape
+MiniMax M3's bare-close row gives is the one that would). Where the prompt closed the thought itself
+and wrote the template's text after it (a request with thinking switched off: Qwen3's
+`<think>\n\n</think>\n\n`), the tag owes that text on no start, or it would write the newlines a
+second time; the gateway reads it from the rendered prompt as it reads `reasoning_open`
+(`Format::thought_closed`, `Options::thought_closed`), and a thought the model writes anyway carries
+its own. GLM 4.6's thinking-off prompt ends with the bare `<think></think>`, so its newline stays the
+tag's to write. An answer's tag keeps the schema alone after the close, the engine's own constraint,
+which the registry's tables leave to it.
 
 A marker that is one token of the model's vocabulary (`Format::marker_tokens`: a terminal, a
 structural token, one of the syntax's own tags (`CallSyntax::tag_texts`), or a token inside one) is

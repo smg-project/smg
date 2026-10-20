@@ -175,12 +175,18 @@ pub enum CallSyntax {
     /// terminals that leave the state are the message's own; the object's close is the call's end,
     /// and the message's closing terminal is the region's.
     NamedJson(&'static str),
-    /// The tool's name as text, then this marker, then the arguments object alone: Mistral's
-    /// `[TOOL_CALLS]get_weather[ARGS]{"city": "Paris"}`. The terminal that enters the state is the
-    /// call's opener, which also opens the next call; the object's close is the call's end, and
-    /// the region ends at the next call's opener or the end of the turn, since the template writes
-    /// no closing marker.
-    NamedArguments(&'static str),
+    /// The tool's name as text, then `marker`, then the arguments object alone: Mistral's
+    /// `[TOOL_CALLS]get_weather[ARGS]{"city": "Paris"}`, where the terminal that enters the state
+    /// is the call's opener, which also opens the next call, the object's close is the call's end,
+    /// and the region ends at the next call's opener or the end of the turn, since the template
+    /// writes no closing marker; or DeepSeek V3.1's and V3's calls in a block, each with a close
+    /// of its own. `between_calls` is what the template writes between two calls of a block (V3's
+    /// newline; nothing for V3.1 and Mistral), wrapping the table drops and the structural tag
+    /// writes.
+    NamedArguments {
+        marker: &'static str,
+        between_calls: &'static str,
+    },
     /// The arguments object alone, named by the function the request forces
     /// (`Declared::forced`): what the engine writes under the JSON-schema constraint the gateway
     /// builds when `tool_choice` names a function, the one shape known from the request rather
@@ -208,8 +214,11 @@ pub enum CallSyntax {
 
 impl CallSyntax {
     /// The tags the syntax writes inside a call besides the table's terminals: the markers a
-    /// grammar writes inside a call's region, which free text before a call may not write, and
-    /// which a client that shows a call as text has to strip. JSON, Python and xLAM's list have
+    /// grammar writes inside a call's region, which free text before a call may not write (the
+    /// named-arguments marker excepted: it stands only after the call's opener, a terminal the
+    /// text cannot write, and in one table it is ordinary text a thought may hold, so the
+    /// grammar's `excluded_but` leaves it writable), and which a client that shows a call as
+    /// text has to strip. JSON, Python and xLAM's list have
     /// none, their calls being their own text, and neither has MiniMax M3's XML tree, whose
     /// element tags are the arguments' keys. A call given as data has its parameters' (see
     /// [`CallShape::tag_texts`]).
@@ -227,7 +236,7 @@ impl CallSyntax {
                 TagEnd::Marker(marker) => vec![tags.parameter_open, tags.parameter_close, marker],
                 TagEnd::Angle => vec![tags.parameter_open, tags.parameter_close],
             },
-            Self::NamedJson(marker) | Self::NamedArguments(marker) => vec![*marker],
+            Self::NamedJson(marker) | Self::NamedArguments { marker, .. } => vec![*marker],
             Self::Gemma(spelling) => vec![spelling.string],
             Self::Shaped(shape) => shape.tag_texts(),
             Self::Json
@@ -738,6 +747,22 @@ impl Format {
         self
     }
 
+    /// The layout's text after the thought's close replaced by `after`, the close kept: a
+    /// checkpoint group whose template writes other text there than its table's (the registry's
+    /// `after`: the NVIDIA Nemotron 3 groups and Step 3.5 Flash write one newline before a call
+    /// where the Qwen 3.5 template writes two). A table without a thought layout is left as it is.
+    #[must_use]
+    pub fn with_thought_after(mut self, after: &str) -> Self {
+        if let Some(thought) = self
+            .layout
+            .as_mut()
+            .and_then(|layout| layout.thought.as_mut())
+        {
+            thought.after = after.into();
+        }
+        self
+    }
+
     /// The table's layout, if it has one.
     pub fn layout(&self) -> Option<&Layout> {
         self.layout.as_deref()
@@ -1129,6 +1154,26 @@ impl Format {
     /// thinking turned off opens and closes it there.
     pub fn reasoning_open(&self, prompt: &str) -> bool {
         self.emits(self.prompt_state(prompt)) == Emits::Reasoning
+    }
+
+    /// Whether `prompt` closed the thought itself and wrote what the template writes after the
+    /// close (a request with thinking switched off: Qwen3's `<think>\n\n</think>\n\n`), so the
+    /// structural tags owe none of it before their first text
+    /// ([`Options::thought_closed`](crate::grammar::Options::thought_closed)). `false` for a table
+    /// whose layout has no thought, a prompt that leaves the thought open or to the model, and
+    /// one that ends with the bare close (GLM 4.6's `<think></think>`, whose newline the tag still
+    /// writes).
+    pub fn thought_closed(&self, prompt: &str) -> bool {
+        let Some(thought) = self.layout().and_then(|layout| layout.thought.as_ref()) else {
+            return false;
+        };
+        let Some(close) = thought.close.as_deref() else {
+            return false;
+        };
+        !thought.after.is_empty()
+            && prompt
+                .strip_suffix(&*thought.after)
+                .is_some_and(|before| before.ends_with(close))
     }
 
     /// The format's name.
