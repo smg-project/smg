@@ -54,8 +54,9 @@ impl ModelProcessorSpec for KimiK3VisionSpec {
 
     /// The reference renders content parts positionally, so a string
     /// template of the family gets the media parts where the request put
-    /// them; the family's own renderer takes the parts and places them
-    /// itself, whatever this says.
+    /// them. The family's own renderer takes the parts and places them
+    /// itself, whatever this says, and its profile wins over any template,
+    /// so this is read only for a model of the family served without it.
     fn media_part_order(&self) -> MediaPartOrder {
         MediaPartOrder::Authored
     }

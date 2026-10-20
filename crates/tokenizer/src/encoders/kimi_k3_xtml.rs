@@ -50,7 +50,9 @@ use crate::{
 
 /// What this renderer answers around a render (see [`RendererProfile`]).
 pub(crate) const PROFILE: RendererProfile = RendererProfile {
-    // Content parts are rendered positionally, so the gateway passes them through.
+    // Content parts are rendered positionally, so the gateway passes them
+    // through in the request's order (a parts-format renderer: the
+    // multimodal spec's `MediaPartOrder` is not consulted).
     content_format: Some(ChatTemplateContentFormat::OpenAI),
     // No Jinja template; the native renderer defaults thinking ON (the
     // reference's `build_chat_segments(thinking=True)`).

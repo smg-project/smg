@@ -71,10 +71,9 @@ pub const NATIVE_EFFORT_VALUES: &[&str] = &["low", "high", "xhigh", "max"];
 pub(crate) const PROFILE: RendererProfile = RendererProfile {
     // Message parts are preserved (OpenAI wire format) so the gateway passes
     // `image_url` / `image` parts through as a list instead of flattening to
-    // a string; the encoder turns each part into a placeholder at its
-    // position. Part *order* is still the gateway's media-part order (the
-    // multimodal spec declares `Authored`; without a spec the gateway moves
-    // media first).
+    // a string, in the request's order (a parts-format renderer: the
+    // multimodal spec's `MediaPartOrder` is not consulted); the encoder turns
+    // each part into a placeholder at its position.
     content_format: Some(ChatTemplateContentFormat::OpenAI),
     // Thinking defaults ON: `reasoning_effort: "none"` or an explicit
     // `thinking: false` (or the engine's `enable_thinking` alias, see the
