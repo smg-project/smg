@@ -15,11 +15,13 @@
 //!   expected on every output, not counted here;
 //! - `empty`: an output with no text, no reasoning and no call: only bytes the table drops
 //!   (whitespace before any text, the template's markers and separators) or no bytes at all.
-//!   The reader delivers the dropped whitespace of such an output as one content event before
-//!   the finish, the whole answer as the engine's own server streams it (`Reader::end`); the
-//!   output is counted as its own outcome either way, and written like a malformed output, with
-//!   the engine's finish, the dropped bytes by class and the bytes delivered, so a model that
-//!   answers with whitespace under a forced length, or a stream that ended with nothing, is seen;
+//!   The reader releases the dropped whitespace of such an output as one content event before
+//!   the finish (`Reader::end`): the chat stream carries it as the answer, as the engine's own
+//!   server streams it, and a whole response's adapter applies its own rule for whitespace-only
+//!   content; the output is counted as its own outcome either way, and written like a malformed
+//!   output, on a bucket of its own, with the engine's finish, the dropped bytes by class and the
+//!   bytes released, so a model that answers with whitespace under a forced length, or a stream
+//!   that ended with nothing, is seen;
 //! - `forgiven`: a repair that keeps the answer's shape. Of those, the calls after the first
 //!   dropped under `parallel_tool_calls: false` are counted (`suppressed_calls`); the refined
 //!   finish, the empty arguments of a call without an `arguments` member and the chunking rule's
@@ -273,8 +275,9 @@ pub(crate) struct Tally {
     dropped_tokens: u32,
     /// The engine's finish, as the `Finish` event says it.
     finish: &'static str,
-    /// The dropped whitespace the reader delivered as content at the end of an empty output.
-    delivered: u64,
+    /// The dropped whitespace the reader released as content at the end of an empty output;
+    /// whether it reaches the client is the surface's rule (the chat stream carries it).
+    released: u64,
 }
 
 impl Tally {
@@ -359,9 +362,9 @@ impl Tally {
         self.shown == 0 && self.calls_begun == 0 && self.malformed() == 0
     }
 
-    /// `bytes` of the dropped whitespace went out as content at the end of an empty output.
-    pub(super) fn delivered(&mut self, bytes: usize) {
-        self.delivered += bytes as u64;
+    /// `bytes` of the dropped whitespace were released as content at the end of an empty output.
+    pub(super) fn released(&mut self, bytes: usize) {
+        self.released += bytes as u64;
     }
 
     /// The first malformed run, for the reader's tests.
@@ -396,8 +399,9 @@ impl Tally {
 
     /// Records the output under `table`, read to its end: the counters, and the line when the
     /// output has a malformed run, or showed nothing ([`Self::is_empty`]), and the table's bucket
-    /// allows one. Suppressed calls are counted and not written: the request asked for them to be
-    /// dropped.
+    /// for that kind of line allows one (the empty lines have a bucket of their own, so a flow of
+    /// them suppresses no malformed line). Suppressed calls are counted and not written: the
+    /// request asked for them to be dropped.
     pub(crate) fn report(&self, table: &'static str, who: Who<'_>) {
         let series = series(table);
         let malformed = self.malformed();
@@ -411,7 +415,7 @@ impl Tally {
         };
         increment(&series.outputs[outcome], 1);
         if empty {
-            let Some(suppressed_lines) = series.sampler.allow() else {
+            let Some(suppressed_lines) = series.empty_lines.allow() else {
                 return;
             };
             warn!(
@@ -426,7 +430,7 @@ impl Tally {
                 whitespace_bytes = self.dropped_space,
                 wrapper_bytes = self.dropped_wrapping,
                 dropped_tokens = self.dropped_tokens,
-                delivered_bytes = self.delivered,
+                released_bytes = self.released,
                 suppressed_lines,
                 "Symphony read an output with no text, reasoning or call: whitespace and framing alone, or nothing"
             );
@@ -521,7 +525,12 @@ struct Series {
     /// [`FALLBACK`] by reason, in the order of [`FALLBACK_REASONS`]: the series of the table
     /// that had no tag for a forced call, or of `none`, under which the other reasons count.
     fallback: [Key; 5],
+    /// The bucket of the lines on malformed outputs.
     sampler: Sampler,
+    /// The bucket of the lines on empty outputs: their own, so a steady flow of empty outputs (a
+    /// probe with `max_tokens: 1`, a keepalive that finishes with no token) suppresses no
+    /// malformed line and counts on none.
+    empty_lines: Sampler,
 }
 
 impl Series {
@@ -542,6 +551,7 @@ impl Series {
             calls_suppressed: key(CALLS_SUPPRESSED, &[]),
             fallback: FALLBACK_REASONS.map(|reason| key(FALLBACK, &[("reason", reason)])),
             sampler: Sampler::new(),
+            empty_lines: Sampler::new(),
         }
     }
 }
@@ -1281,7 +1291,7 @@ mod tests {
             "Symphony read an output with no text, reasoning or call: whitespace and framing alone, or nothing"
         ));
         assert!(logs_contain("req-empty"));
-        assert!(logs_contain("delivered_bytes=0"));
+        assert!(logs_contain("released_bytes=0"));
         assert!(logs_contain("finish=\"length\""));
         assert!(logs_contain("bytes=11"));
         assert!(logs_contain("whitespace_bytes=3"));
@@ -1310,6 +1320,63 @@ mod tests {
         assert!(logs_contain("req-nothing"));
         assert!(logs_contain("finish=\"stop\""));
         assert!(logs_contain("bytes=0"));
+    }
+
+    /// The empty lines have a bucket of their own: a flow of empty outputs past the burst
+    /// suppresses no malformed line, whose `suppressed_lines` keeps counting malformed lines alone.
+    #[tracing_test::traced_test]
+    #[test]
+    fn empty_lines_take_from_a_bucket_of_their_own() {
+        let empties: u32 = 40;
+        rendered(|| {
+            for choice in 0..empties {
+                let mut tally = Tally::default();
+                tally.see(&finished(FinishReason::Stop), false);
+                tally.report(
+                    "olmo3",
+                    Who {
+                        request_id: "req-empty-flow",
+                        model: "m",
+                        choice,
+                    },
+                );
+            }
+            let mut tally = Tally::default();
+            tally.see(
+                &malformed("<tool_call>{", MalformedReason::UnterminatedRegion),
+                false,
+            );
+            tally.see(&finished(FinishReason::Stop), false);
+            tally.report(
+                "olmo3",
+                Who {
+                    request_id: "req-malformed-after-empties",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+        });
+        logs_assert(|lines: &[&str]| {
+            let empty_lines = lines
+                .iter()
+                .filter(|line| line.contains("req-empty-flow"))
+                .count();
+            if empty_lines >= empties as usize {
+                return Err(format!(
+                    "no empty line was suppressed: {empty_lines} written"
+                ));
+            }
+            match lines
+                .iter()
+                .find(|line| line.contains("req-malformed-after-empties"))
+            {
+                Some(line) if line.contains("suppressed_lines=0") => Ok(()),
+                Some(line) => Err(format!(
+                    "the malformed line counts suppressed empty lines: {line}"
+                )),
+                None => Err("the empty flow suppressed the malformed line".to_string()),
+            }
+        });
     }
 
     #[tracing_test::traced_test]

@@ -176,8 +176,8 @@ pub(crate) struct Reader {
     /// Whether the output showed the client anything yet: text, reasoning or a call.
     shown: bool,
     /// The whitespace the table dropped before the output showed anything: the template's
-    /// spacing when text follows it, the model's whole answer when nothing does, which then goes
-    /// out as one content event before the `Finish` ([`Self::end`]).
+    /// spacing when text follows it, the model's whole answer when nothing does, which is then
+    /// released as one content event before the `Finish` ([`Self::end`]).
     unshown: String,
 }
 
@@ -310,12 +310,15 @@ impl Reader {
 
     /// Ends the output with the engine's finish, once: the events, the last of them the
     /// `Finish`, go into `out`; nothing when the output already ended. An output that showed
-    /// nothing (no text, no reasoning, no call) and dropped whitespace delivers that whitespace
-    /// as one content event right before the `Finish`: it is the whole answer, as the engine's
-    /// own server streams it, not the template's spacing around text that never came. The
-    /// markers and separators dropped with it stay dropped: they are the template's. The output
-    /// is recorded here, under `who`: its counters, and the line when it was not clean
-    /// ([`Tally::report`]); such an output counts as `empty` whether or not whitespace went out.
+    /// nothing (no text, no reasoning, no call) and dropped whitespace releases that whitespace
+    /// as one content event right before the `Finish`: it is the whole answer, not the template's
+    /// spacing around text that never came. The chat stream carries it as the engine's own server
+    /// streams it; a whole response's adapter applies its own rule for whitespace-only content
+    /// (the chat message, the Messages blocks and the Responses items leave it out). The markers
+    /// and separators dropped with it stay dropped: they are the template's. The output is
+    /// recorded here, under `who`: its counters, and the line when it was not clean
+    /// ([`Tally::report`]); such an output counts as `empty` whether or not whitespace was
+    /// released.
     pub(crate) fn end(
         &mut self,
         finish: EngineFinish,
@@ -328,9 +331,9 @@ impl Reader {
         self.ended = true;
         self.feed(Input::End { finish }, out)?;
         if self.tally.is_empty() && !self.unshown.is_empty() {
-            let delivered = std::mem::take(&mut self.unshown);
-            self.tally.delivered(delivered.len());
-            let content = Event::Content(Text::uncounted(delivered));
+            let released = std::mem::take(&mut self.unshown);
+            self.tally.released(released.len());
+            let content = Event::Content(Text::uncounted(released));
             // The `Finish` stays the last event: it makes way for the content and follows it.
             match out.as_mut_slice().last_mut() {
                 Some(last) if matches!(last, Event::Finish { .. }) => {
@@ -494,6 +497,30 @@ mod tests {
         // Whitespace alone from the first byte, under a stop.
         let events = read_pieces(minimax_m3(), "]~b]ai\n", &newlines(3), EngineFinish::Stop);
         assert_eq!(content_events(&events).0, vec!["\n\n\n"]);
+    }
+
+    /// The same output as a whole chat message: the released whitespace folds into the message,
+    /// whose adapter leaves whitespace-only content out, as the Messages and Responses adapters
+    /// do; the output is still counted as `empty`, once.
+    #[test]
+    fn a_whole_chat_message_of_whitespace_alone_has_no_content_and_counts_as_empty() {
+        use symphony::{adapt::chat::message, formats::minimax_m3};
+        let scrape = rendered(|| {
+            let events = read_pieces(minimax_m3(), "]~b]ai\n", &newlines(3), EngineFinish::Stop);
+            assert_eq!(content_events(&events).0, vec!["\n\n\n"]);
+            let choice = message(0, &events);
+            assert_eq!(choice.message.content, None, "{events:?}");
+            assert!(choice.message.tool_calls.is_none());
+            assert!(choice.message.reasoning_content.is_none());
+            assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
+        });
+        let outputs = line_with(
+            &scrape,
+            "smg_symphony_outputs_total",
+            &["table=\"minimax_m3\"", "outcome=\"empty\""],
+        )
+        .expect("the outputs counter");
+        assert!(outputs.ends_with(" 1"), "{outputs}");
     }
 
     #[test]

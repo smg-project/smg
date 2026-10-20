@@ -1021,7 +1021,7 @@ async fn a_malformed_region_in_a_stream_is_counted_and_written_once() {
 /// An output of whitespace alone: the table holds it as the lead of the content and drops it
 /// when nothing follows; the reader delivers it as one content delta before the finish chunk,
 /// so the stream carries the answer the engine's own server would stream. The output is
-/// recorded as `empty`, with the engine's finish and the bytes delivered, once.
+/// recorded as `empty`, with the engine's finish and the bytes released, once.
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn a_stream_of_whitespace_alone_carries_it_as_one_delta_and_is_recorded_empty() {
@@ -1065,7 +1065,7 @@ async fn a_stream_of_whitespace_alone_carries_it_as_one_delta_and_is_recorded_em
     ));
     assert!(logs_contain("finish=\"length\""));
     assert!(logs_contain("whitespace_bytes=24"));
-    assert!(logs_contain("delivered_bytes=24"));
+    assert!(logs_contain("released_bytes=24"));
 }
 
 /// A choice whose first engine output is its `Complete`: the opening chunk, the finish chunk,
@@ -1098,5 +1098,5 @@ async fn a_stream_of_no_tokens_is_recorded_empty_too() {
     assert!(outputs.ends_with(" 1"), "{outputs}");
     assert!(logs_contain("finish=\"stop\""));
     assert!(logs_contain("bytes=0"));
-    assert!(logs_contain("delivered_bytes=0"));
+    assert!(logs_contain("released_bytes=0"));
 }
