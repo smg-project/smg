@@ -10,13 +10,15 @@ use std::{
 };
 
 use engine_zmq_client::{
+    check_engine_layouts,
     codec::OpaqueValue,
     connect_handshake,
     connector::{EngineCoreClient, SglangClient, TokenSpeedClient},
     protocol::{
         handshake::EngineCoreReadyResponse,
-        sglang::request::SglangRequest,
-        vllm::{request::EngineCoreRequest, sampling::EngineCoreSamplingParams},
+        sglang::{request::SglangRequest, SglangProtocol},
+        tokenspeed::TokenSpeedProtocol,
+        vllm::{request::EngineCoreRequest, sampling::EngineCoreSamplingParams, VllmProtocol},
         EngineLoad,
     },
     ConnectedEngine, StartupBudget,
@@ -283,6 +285,16 @@ impl ZmqEngineClient {
             startup,
         )
         .await?;
+        // Once per engine, before its first request: an engine whose request
+        // structs are positional declares their field order at the handshake,
+        // and the protocol compares the prefixes its encoders fill against
+        // it, so a struct that moved under this client is named here instead
+        // of failing every request.
+        match dialect {
+            ZmqDialect::Vllm => check_engine_layouts::<VllmProtocol>(&transport)?,
+            ZmqDialect::TokenSpeed => check_engine_layouts::<TokenSpeedProtocol>(&transport)?,
+            ZmqDialect::Sglang => check_engine_layouts::<SglangProtocol>(&transport)?,
+        }
         let backend = match dialect {
             ZmqDialect::Vllm => ZmqBackend::Vllm(Arc::new(EngineCoreClient::new(transport))),
             ZmqDialect::TokenSpeed => {

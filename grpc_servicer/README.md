@@ -772,8 +772,13 @@ reasoning tokens, sampled-token and prompt logprobs with ranked top logprobs
 when asked, and a scheduler-load tail), an embedding batch, and a control
 reply under the call id. Requests the scheduler cannot serve, `n > 1` for
 example (SMG fans out itself), are answered with a terminal abort rather than
-dropped. SGLang itself is unchanged; the plugin pins the wire of the SGLang
-version it was tested with, and a struct change upstream shows up in
+dropped. SGLang itself is unchanged. The plugin declares the field order of
+the structs it decodes in its ready response, and the Rust servicer checks the
+prefixes it encodes against it once, at the handshake: a release that moves a
+field inside them fails the engine link with the struct and the field named,
+instead of refusing every request. The sampling parameters go out as their API
+prefix (through `custom_params`), so a release that adds a field after it
+decodes them unchanged; a struct change upstream otherwise shows up in
 `grpc_servicer/tests/test_sglang_zmq_msgpack.py`.
 
 

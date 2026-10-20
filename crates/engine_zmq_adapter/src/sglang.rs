@@ -772,7 +772,7 @@ mod tests {
         assert_eq!(params.n, 1);
         assert_eq!(params.json_schema.as_deref(), Some("{}"));
         assert_eq!(params.logit_bias.unwrap()["5"], 1.5);
-        assert!(!params.is_normalized);
+        assert!(params.stop_regex.is_none() && params.custom_params.is_none());
     }
 
     #[test]

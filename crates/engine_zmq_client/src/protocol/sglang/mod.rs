@@ -4,11 +4,15 @@
 //! structs declared `array_like=True`: each rides the wire as a positional
 //! msgpack array whose element 0 is the class-name tag string, followed by
 //! the fields in declaration order (`python/sglang/srt/managers/io_struct.py`).
-//! Field order is the wire contract — append only, never reorder. The request
-//! here is the scheduler's own [`TokenizedGenerateReqInput`]; the encoder
-//! emits the shortest valid prefix (the required fields), since `msgspec`
-//! fills missing trailing fields from their defaults, and the engine
-//! normalizes the nested [`sampling::SamplingParams`] itself.
+//! Field order is the wire contract. The request here is the scheduler's own
+//! [`TokenizedGenerateReqInput`]; the encoder emits the shortest valid prefix
+//! (the required fields), since `msgspec` fills missing trailing fields from
+//! their defaults, and the engine normalizes the nested
+//! [`sampling::SamplingParams`] itself (sent as its API prefix for the same
+//! reason). The plugin declares each struct's field order in its ready
+//! response, and [`SglangProtocol::check_layouts`] compares the prefixes the
+//! encoders fill against it once, at connect time: a release that moved a
+//! field inside a prefix is named there, not refused request by request.
 //!
 //! The scheduler joins SMG's transport through the SGLang plugin that ships
 //! in `smg_grpc_servicer.sglang` (no SGLang change): it dials the handshake,
@@ -33,9 +37,16 @@ use crate::{
     codec::{decode_msgpack, encode_msgpack, OpaqueValue},
     error::Result,
     protocol::{
+        handshake::EngineCoreReadyResponse,
+        positional::check_prefix,
         sglang::{
             output::{SglangOutput, SglangWireOutput},
-            request::{RequestMeta, SglangRequest, SglangRequestType},
+            request::{
+                RequestMeta, SglangRequest, SglangRequestType, EMBEDDING_WIRE_FIELDS,
+                GENERATE_WIRE_FIELDS, TOKENIZED_EMBEDDING_REQ_INPUT_TAG,
+                TOKENIZED_GENERATE_REQ_INPUT_TAG,
+            },
+            sampling::{SAMPLING_PARAMS_NAME, WIRE_FIELDS as SAMPLING_WIRE_FIELDS},
         },
         EngineBatch, EngineLoad, EngineProtocol, UtilityReply,
     },
@@ -98,6 +109,27 @@ impl EngineProtocol for SglangProtocol {
 
     fn validate(_request: &Self::Request) -> Result<()> {
         Ok(())
+    }
+
+    fn check_layouts(ready: &EngineCoreReadyResponse) -> Result<()> {
+        // The plugin declares the scheduler's `__struct_fields__` of the three
+        // structs this wire encodes (a tagged struct's tag, element 0, is not
+        // a field); the prefixes are the slots the encoders fill.
+        check_prefix(
+            TOKENIZED_GENERATE_REQ_INPUT_TAG,
+            &GENERATE_WIRE_FIELDS,
+            &ready.positional_layouts,
+        )?;
+        check_prefix(
+            TOKENIZED_EMBEDDING_REQ_INPUT_TAG,
+            &EMBEDDING_WIRE_FIELDS,
+            &ready.positional_layouts,
+        )?;
+        check_prefix(
+            SAMPLING_PARAMS_NAME,
+            &SAMPLING_WIRE_FIELDS,
+            &ready.positional_layouts,
+        )
     }
 
     fn encode_add(request: &Self::Request) -> Result<(Vec<u8>, Vec<Bytes>)> {
@@ -379,6 +411,80 @@ mod tests {
         assert_eq!(batch.finished_request_ids, vec!["e1".to_string()]);
         assert_eq!(batch.outputs[0].embedding, Some(vec![0.5]));
         assert!(batch.load.is_some());
+    }
+
+    /// The handshake check against the field order each recorded release
+    /// declares, and against releases that moved a field inside a prefix.
+    #[test]
+    fn check_layouts_accepts_the_recorded_releases_and_names_a_moved_field() {
+        use std::collections::BTreeMap;
+
+        use crate::{
+            mock_engine::default_ready_response,
+            protocol::sglang::{request::recorded as request, sampling::recorded as sampling},
+        };
+        let names = |fields: &[&str]| fields.iter().map(|f| f.to_string()).collect::<Vec<_>>();
+        let ready = |params: &[&str], generate: &[&str], embed: &[&str]| EngineCoreReadyResponse {
+            positional_layouts: BTreeMap::from([
+                (SAMPLING_PARAMS_NAME.to_string(), names(params)),
+                (
+                    TOKENIZED_GENERATE_REQ_INPUT_TAG.to_string(),
+                    names(generate),
+                ),
+                (TOKENIZED_EMBEDDING_REQ_INPUT_TAG.to_string(), names(embed)),
+            ]),
+            ..default_ready_response()
+        };
+        assert!(
+            SglangProtocol::check_layouts(&default_ready_response()).is_ok(),
+            "an engine that declares nothing"
+        );
+        assert!(SglangProtocol::check_layouts(&ready(
+            &sampling::SAMPLING_FIELDS_0_5_21,
+            &request::GENERATE_FIELDS_0_5_21,
+            &request::EMBEDDING_FIELDS_0_5_21,
+        ))
+        .is_ok());
+        assert!(SglangProtocol::check_layouts(&ready(
+            &sampling::SAMPLING_FIELDS_0_5_22,
+            &request::GENERATE_FIELDS_0_5_22,
+            &request::EMBEDDING_FIELDS_0_5_22,
+        ))
+        .is_ok());
+        // A release that put its new sampling field before `custom_params`.
+        let mut moved = sampling::SAMPLING_FIELDS_0_5_22.to_vec();
+        moved.swap(25, 26);
+        let error = SglangProtocol::check_layouts(&ready(
+            &moved,
+            &request::GENERATE_FIELDS_0_5_22,
+            &request::EMBEDDING_FIELDS_0_5_22,
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(
+                "`SamplingParams` field 25 is `custom_params` on this side and `watermark` on \
+                 the engine's"
+            ),
+            "{error}"
+        );
+        // A release that inserted a request field before `lora_id`.
+        let mut generate = request::GENERATE_FIELDS_0_5_22.to_vec();
+        generate.insert(21, "session_rank");
+        let error = SglangProtocol::check_layouts(&ready(
+            &sampling::SAMPLING_FIELDS_0_5_22,
+            &generate,
+            &request::EMBEDDING_FIELDS_0_5_22,
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(
+                "`TokenizedGenerateReqInput` field 21 is `lora_id` on this side and \
+                 `session_rank` on the engine's"
+            ),
+            "{error}"
+        );
     }
 
     #[test]

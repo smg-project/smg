@@ -419,6 +419,26 @@ async fn wait_for_input_registrations(
         .collect()
 }
 
+/// Check every connected engine's declared positional layouts against the
+/// prefixes `P`'s encoders fill ([`EngineProtocol::check_layouts`]), once,
+/// before the first request goes out: a mismatch fails the connection with
+/// the engine, the struct and the field named, rather than failing each
+/// request that engine cannot decode.
+pub fn check_engine_layouts<P: EngineProtocol>(transport: &ConnectedTransport) -> Result<()> {
+    for engine in &transport.engines {
+        if let Err(error) = P::check_layouts(&engine.ready_response) {
+            let engine_id = &engine.engine_id;
+            return Err(match error {
+                Error::WireLayoutMismatch { message } => Error::WireLayoutMismatch {
+                    message: format!("engine {engine_id:?}: {message}"),
+                },
+                other => other,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Send an encoded request to one engine over the shared input ROUTER socket.
 /// Frames: `[engine_id, request_type, payload, aux..]`.
 pub async fn send_message(

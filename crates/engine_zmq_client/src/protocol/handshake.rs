@@ -107,6 +107,14 @@ pub struct EngineCoreReadyResponse {
     /// Optional TokenSpeed diagnostic capture identities; absent on older engines.
     #[serde(default)]
     pub cache_trace_epochs: Vec<String>,
+    /// The field order of each positional (array-encoded) struct the engine
+    /// decodes, by struct name, as the engine's own declaration has it (a
+    /// tagged struct's tag is not counted). A protocol whose requests are
+    /// positional checks the prefixes it encodes against it once, at connect
+    /// time ([`EngineProtocol::check_layouts`](crate::protocol::EngineProtocol::check_layouts)).
+    /// Empty from an engine that declares none.
+    #[serde(default)]
+    pub positional_layouts: BTreeMap<String, Vec<String>>,
 }
 
 /// Frontend-owned ZMQ addresses sent to the engine during handshake init.
@@ -176,6 +184,28 @@ mod tests {
         assert_eq!(resp.data_parallel_rank, 0);
         // Optional trailing field defaults when omitted.
         assert!(resp.kv_events_config.is_none());
+        assert!(resp.positional_layouts.is_empty());
+    }
+
+    #[test]
+    fn ready_response_reads_the_declared_positional_layouts() {
+        let json = serde_json::json!({
+            "max_model_len": 4096u64,
+            "num_gpu_blocks": 1000u64,
+            "block_size": 16u64,
+            "dp_stats_address": serde_json::Value::Null,
+            "dtype": "bfloat16",
+            "vllm_version": "engine-1.0",
+            "world_size": 1u64,
+            "data_parallel_size": 1u64,
+            "positional_layouts": {"SamplingParams": ["max_new_tokens", "stop"]},
+        });
+        let bytes = rmp_serde::to_vec_named(&json).unwrap();
+        let resp: EngineCoreReadyResponse = decode_msgpack(&bytes).unwrap();
+        assert_eq!(
+            resp.positional_layouts["SamplingParams"],
+            vec!["max_new_tokens".to_string(), "stop".to_string()]
+        );
     }
 
     #[test]
