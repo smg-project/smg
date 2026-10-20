@@ -1,9 +1,13 @@
-name: E2E Kind Discovery
+name: E2E Discovery
 
 # Run automatically for service-discovery code and test-infrastructure
 # changes, and weekly: the Slurm lane installs Slurm from Ubuntu's archive,
-# whose updates can change it with no change here. GitHub-hosted ubuntu-24.04
-# provides Docker for the kind node and the Slurm cluster. It is pinned, not
+# whose updates can change it with no change here.
+#
+# One job builds smg and mock-worker; each lane is a job of its own on those
+# binaries, so the lanes run side by side and one failing leaves the others'
+# results standing. GitHub-hosted ubuntu-24.04 provides Docker for the kind
+# node, the Slurm cluster and the Consul agent. It is pinned, not
 # ubuntu-latest: the binaries built here run in Ubuntu 24.04 images (the
 # Slurm one for its Slurm 23.11), so they need its glibc or an older one.
 # Manual dispatch keeps the runner selectable for ad-hoc validation.
@@ -16,12 +20,16 @@ on:
       # and `main` owns the CLI -> discovery-config conversion feeding it.
       - model_gateway/src/server.rs
       - model_gateway/src/main.rs
+      - model_gateway/src/config/**
+      # What a discovered worker becomes: its endpoint, and the workflow that
+      # registers it.
+      - model_gateway/src/worker/endpoint.rs
+      - model_gateway/src/workflow/**
+      - crates/protocols/src/worker.rs
+      - crates/mock_worker/**
       - model_gateway/tests/k8s_discovery_test.rs
-      - e2e_test/discovery/kind/**
-      - e2e_test/discovery/file/**
-      - e2e_test/discovery/slurm/**
-      - e2e_test/discovery/common.py
-      - .github/workflows/e2e-kind-discovery.yml
+      - e2e_test/discovery/**
+      - .github/workflows/e2e-discovery.yml
   schedule:
     - cron: '0 6 * * 1'
   workflow_dispatch:
@@ -36,9 +44,9 @@ env:
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
-  kind-discovery:
+  build:
     runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
-    timeout-minutes: 60
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
 
@@ -47,17 +55,42 @@ jobs:
         with:
           sccache-version: 'v0.10.0'
 
-      - name: Install kind and kubectl
-        run: |
-          curl -Lo kind "https://kind.sigs.k8s.io/dl/v0.29.0/kind-linux-amd64"
-          chmod +x kind && sudo mv kind /usr/local/bin/
-          curl -Lo kubectl "https://dl.k8s.io/release/v1.33.0/bin/linux/amd64/kubectl"
-          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
-
       - name: Build smg and mock-worker
         run: |
           source "$HOME/.cargo/env"
           cargo build -p smg -p mock-worker
+          # Most of a debug binary is its debug info, which no lane reads.
+          strip --strip-debug target/debug/smg target/debug/mock-worker
+
+      - name: Upload the binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: discovery-binaries
+          path: |
+            target/debug/smg
+            target/debug/mock-worker
+          retention-days: 1
+
+  kind:
+    needs: build
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download the binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: discovery-binaries
+          path: target/debug
+
+      - name: Install kind and kubectl
+        run: |
+          chmod +x target/debug/smg target/debug/mock-worker
+          curl -Lo kind "https://kind.sigs.k8s.io/dl/v0.29.0/kind-linux-amd64"
+          chmod +x kind && sudo mv kind /usr/local/bin/
+          curl -Lo kubectl "https://dl.k8s.io/release/v1.33.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
 
       - name: Build mock-worker and gateway images
         run: |
@@ -66,10 +99,10 @@ jobs:
           docker build -t smg-gateway:e2e \
             -f e2e_test/discovery/kind/Dockerfile.smg target/debug
           # Fail here (not as CrashLoopBackOff later) on any linkage problem.
-          docker run --rm smg-mock-worker:e2e --help >/dev/null 2>&1 || true
+          docker run --rm smg-mock-worker:e2e --help >/dev/null
           docker run --rm --entrypoint /usr/local/bin/smg smg-gateway:e2e --help >/dev/null
 
-      - name: Run discovery e2e
+      - name: Run Kubernetes discovery e2e
         timeout-minutes: 30
         run: |
           pip install pytest requests
@@ -78,22 +111,47 @@ jobs:
             pytest e2e_test/discovery/kind \
             --confcutdir e2e_test/discovery/kind -m kind -v
 
-      # Host processes only (the smg and mock-worker binaries built above),
-      # so it runs even when the kind lane failed.
+  # Host processes only: the gateway and the engines on the runner.
+  file:
+    needs: build
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download the binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: discovery-binaries
+          path: target/debug
+
       - name: Run file discovery e2e
-        if: ${{ !cancelled() }}
         timeout-minutes: 10
         run: |
+          chmod +x target/debug/smg target/debug/mock-worker
           pip install pytest requests
           SMG_FILE_E2E=1 pytest e2e_test/discovery/file \
             --confcutdir e2e_test/discovery/file -v
 
-      # A real Slurm 23.11 cluster in containers (a controller and six
-      # nodes), with the gateway on the controller polling squeue and scontrol.
+  # A real Slurm 23.11 cluster in containers (a controller and six nodes),
+  # with the gateway on the controller polling squeue and scontrol.
+  slurm:
+    needs: build
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download the binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: discovery-binaries
+          path: target/debug
+
       - name: Run Slurm discovery e2e
-        if: ${{ !cancelled() }}
         timeout-minutes: 20
         run: |
+          chmod +x target/debug/smg target/debug/mock-worker
           pip install pytest requests
           stage=$(mktemp -d)
           cp e2e_test/discovery/slurm/Dockerfile e2e_test/discovery/slurm/slurm.conf \
@@ -101,8 +159,9 @@ jobs:
             target/debug/smg target/debug/mock-worker "$stage"
           docker build -t smg-slurm:e2e "$stage"
           # Fail here, before the cluster starts, if the binaries built above
-          # need a newer glibc than the image's (smg checks for both).
+          # need a newer glibc than the image's.
           docker run --rm --entrypoint smg smg-slurm:e2e --help >/dev/null
+          docker run --rm --entrypoint mock-worker smg-slurm:e2e --help >/dev/null
           SMG_SLURM_E2E=1 SMG_SLURM_IMAGE=smg-slurm:e2e \
             SMG_SLURM_LOGS="$RUNNER_TEMP/slurm-logs" \
             pytest e2e_test/discovery/slurm --confcutdir e2e_test/discovery/slurm -v
@@ -113,4 +172,37 @@ jobs:
         with:
           name: slurm-discovery-logs
           path: ${{ runner.temp }}/slurm-logs
+          if-no-files-found: warn
+
+  # A real Consul agent in a container; the gateway and the engines are
+  # processes on the runner.
+  consul:
+    needs: build
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download the binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: discovery-binaries
+          path: target/debug
+
+      - name: Run Consul discovery e2e
+        timeout-minutes: 15
+        run: |
+          chmod +x target/debug/smg target/debug/mock-worker
+          pip install pytest requests
+          SMG_CONSUL_E2E=1 \
+            SMG_CONSUL_IMAGE=docker.io/hashicorp/consul:2.0.4@sha256:1c59f007df8ea1c21b2558dc73ef8d99047bc895d9e52e635d1e745e35fe9a54 \
+            SMG_CONSUL_LOGS="$RUNNER_TEMP/consul-logs" \
+            pytest e2e_test/discovery/consul --confcutdir e2e_test/discovery/consul -v
+
+      - name: Upload the Consul logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: consul-discovery-logs
+          path: ${{ runner.temp }}/consul-logs
           if-no-files-found: warn
