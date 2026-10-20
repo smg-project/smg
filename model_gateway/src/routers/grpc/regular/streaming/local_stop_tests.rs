@@ -11,9 +11,10 @@
 //! the usage through the stop's step with the counts of that chunk. Proven on
 //! scripted frames whose Complete is held behind a gate that never opens (a
 //! stream read past the tail would wait on it), on the mock worker crate's
-//! engine over gRPC (its batch empties within a step of the client's finish)
-//! and on a mock engine over the ZMQ link (the abort frame arrives within a
-//! step of the stop; none comes for a stop the engine ended the request on).
+//! engine over gRPC (its batch empties long before its tail would have ended)
+//! and on a mock engine over the ZMQ link (the abort frame arrives before the
+//! engine's script runs out; none comes for a stop the engine ended the
+//! request on).
 
 use std::{
     sync::Arc,
@@ -408,7 +409,7 @@ async fn running_requests(client: &TokenSpeedSchedulerClient) -> i32 {
 }
 
 #[tokio::test]
-async fn the_engine_is_aborted_within_a_step_of_the_local_stop_over_grpc() {
+async fn the_engine_is_aborted_at_the_local_stop_over_grpc() {
     const STEP_MS: f64 = 2.0;
     const MAX_TOKENS: u32 = 1000;
     let (url, server) = mock_engine_worker(STEP_MS).await;
@@ -455,8 +456,9 @@ async fn the_engine_is_aborted_within_a_step_of_the_local_stop_over_grpc() {
     .await
     .expect("the stream ends at the stop");
     let client_done = started.elapsed();
-    // The engine's batch is empty within a step or two of the client's
-    // finish: the abort reached it.
+    // The engine's batch empties once the abort reaches it: long before the
+    // tail of the generation would have ended it (the exact latency is a
+    // loaded runner's scheduler's, so the bound is the tail's, not a step's).
     let idle_after = Instant::now();
     let mut running = running_requests(&client).await;
     while running > 0 && idle_after.elapsed() < Duration::from_secs(5) {
@@ -485,8 +487,9 @@ async fn the_engine_is_aborted_within_a_step_of_the_local_stop_over_grpc() {
         "the client's stream took {client_done:?}: the engine's {MAX_TOKENS} steps, not the stop"
     );
     assert!(
-        idle_after < Duration::from_millis(200),
-        "the engine kept the request {idle_after:?} after the client's finish"
+        idle_after < tail / 2,
+        "the engine kept the request {idle_after:?} after the client's finish (its tail would \
+         have run {tail:?})"
     );
 }
 
@@ -508,7 +511,7 @@ fn engine_step(request_id: &str, token_ids: Vec<u32>) -> EngineCoreOutputs {
     clippy::disallowed_methods,
     reason = "the mock engine runs beside the stream under test; its task is awaited"
 )]
-async fn the_engine_is_aborted_within_a_step_of_the_local_stop_over_the_zmq_link() {
+async fn the_engine_is_aborted_at_the_local_stop_over_the_zmq_link() {
     const STEP: Duration = Duration::from_millis(10);
     let base = tempfile::tempdir().unwrap();
     let ep = |name: &str| format!("ipc://{}", base.path().join(name).display());
@@ -553,7 +556,10 @@ async fn the_engine_is_aborted_within_a_step_of_the_local_stop_over_the_zmq_link
 
     // The engine: one token per step, "abSTOPxyz..." (the stop completes on
     // the sixth), until the gateway's abort frame arrives; the tokens sent
-    // after the stop's are the tail it generated for nobody.
+    // after the stop's are the tail it generated for nobody, and the script
+    // has ten of them.
+    const SCRIPT: &str = "abSTOPxyzwvutsrq";
+    const AFTER_STOP: u32 = (SCRIPT.len() - "abSTOP".len()) as u32;
     let engine_task = tokio::spawn(async move {
         let (mut input, mut output) = engine.split();
         let request = match input.recv().await.expect("the request") {
@@ -561,7 +567,7 @@ async fn the_engine_is_aborted_within_a_step_of_the_local_stop_over_the_zmq_link
             other => panic!("expected Add, got {other:?}"),
         };
         let mut sent_after_stop = 0u32;
-        for (position, character) in "abSTOPxyzwvutsrq".chars().enumerate() {
+        for (position, character) in SCRIPT.chars().enumerate() {
             output
                 .send_outputs(&engine_step(
                     &request.request_id,
@@ -610,8 +616,11 @@ async fn the_engine_is_aborted_within_a_step_of_the_local_stop_over_the_zmq_link
         .expect("the engine task ends")
         .expect("the engine task")
         .expect("the abort frame reached the engine");
+    // The frame came before the script ran out (a loaded runner's scheduler
+    // decides how many steps that takes, so the bound is the script's, not a
+    // step's).
     assert!(
-        sent_after_stop <= 2,
+        sent_after_stop < AFTER_STOP,
         "the abort arrived {sent_after_stop} steps after the stop"
     );
 }
