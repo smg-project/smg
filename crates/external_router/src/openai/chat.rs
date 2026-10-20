@@ -22,7 +22,7 @@ use crate::{
     header_utils::{apply_provider_headers, extract_auth_header},
     known,
     metrics::{bool_to_static_str, metrics_labels, Metrics},
-    retry::{is_retryable_response, RetryExecutor},
+    retry::{is_request_timeout, is_retryable_response, request_timeout_response, RetryExecutor},
     sse::SSE_CHANNEL_BUFFER,
     tenant::TenantRequestMeta,
     upstream_body,
@@ -96,8 +96,9 @@ fn relayed_body(resp: reqwest::Response, status: StatusCode) -> Response {
 }
 
 /// The upstream's success body read whole under its status and content type;
-/// a read failure is a 500. A refusal never comes here:
-/// [`upstream_body::answer_error`] answers it.
+/// a read failure is a 500, the request's own timeout running out mid-body
+/// its final 504 (see [`request_timeout_response`]). A refusal never comes
+/// here: [`upstream_body::answer_error`] answers it.
 async fn buffered_body(resp: reqwest::Response, status: StatusCode) -> Response {
     let content_type = resp.headers().get(CONTENT_TYPE).cloned();
     match resp.bytes().await {
@@ -108,6 +109,9 @@ async fn buffered_body(resp: reqwest::Response, status: StatusCode) -> Response 
                 response.headers_mut().insert(CONTENT_TYPE, ct);
             }
             response
+        }
+        Err(e) if is_request_timeout(&e) => {
+            request_timeout_response(format!("Failed to read response: {e}"))
         }
         Err(e) => error::internal_error("upstream_error", format!("Failed to read response: {e}")),
     }
@@ -247,6 +251,14 @@ pub(super) async fn route_chat(
                 .await;
                 let resp = match sent {
                     Ok(r) => r,
+                    // The request's own timeout is its end, not a worker
+                    // fault to route around (see `request_timeout_response`).
+                    Err(e) if is_request_timeout(&e) => {
+                        worker.record_outcome(504);
+                        return request_timeout_response(format!(
+                            "Failed to contact upstream: {e}"
+                        ));
+                    }
                     Err(e) => {
                         worker.record_outcome(503);
                         return error::service_unavailable(
@@ -364,6 +376,61 @@ mod tests {
             Some("application/json")
         );
         assert_eq!(bytes_of(response).await, b"{\"ok\":true}");
+    }
+
+    /// A stub whose answer's head and first chunk leave at once and whose
+    /// body then never ends, as a provider that stalls mid-answer does.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn stalled_upstream() -> String {
+        use futures_util::StreamExt;
+        let app = axum::Router::new().fallback(axum::routing::any(|| async {
+            let head = futures_util::stream::iter([Ok::<_, std::io::Error>(
+                bytes::Bytes::from_static(b"{\"partial\":"),
+            )]);
+            (
+                [(CONTENT_TYPE, "application/json")],
+                Body::from_stream(head.chain(futures_util::stream::pending())),
+            )
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// A client whose budget for a call is `timeout`, the process TLS
+    /// crypto provider installed first.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test binary's client factory; the process TLS crypto provider is installed first"
+    )]
+    fn client_with_timeout(timeout: std::time::Duration) -> reqwest::Client {
+        use rustls::crypto::ring::default_provider;
+        let _ = default_provider().install_default();
+        reqwest::Client::builder().timeout(timeout).build().unwrap()
+    }
+
+    /// The request's own timeout running out while the body is read is the
+    /// request's end: the final 504, not the replayable 500 of a read failure.
+    #[tokio::test]
+    async fn a_buffered_body_the_request_timeout_cuts_is_the_final_504() {
+        let url = stalled_upstream().await;
+        let client = client_with_timeout(std::time::Duration::from_millis(200));
+        let upstream = client.post(url).send().await.unwrap();
+
+        let response = buffered_body(upstream, StatusCode::OK).await;
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            crate::retry::REQUEST_TIMEOUT_CODE
+        );
+        assert!(!is_retryable_response(&response));
     }
 
     #[tokio::test]

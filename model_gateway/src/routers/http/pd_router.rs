@@ -61,7 +61,9 @@ use crate::{
             overload,
             placement::{self, PairFailure, PlacementFailure, PlacementInputs, RefusalSite},
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
-            retry::{is_retryable_response, RetryExecutor},
+            retry::{
+                is_request_timeout, is_retryable_response, request_timeout_response, RetryExecutor,
+            },
             serialize_json_sized,
             sse::SseEncoder,
             trim_serialization_slack,
@@ -1242,9 +1244,32 @@ impl PDRouter {
             .await
     }
 
+    /// A side the request's own timeout cut (see `retry::is_request_timeout`):
+    /// the request's end, whichever side spent its budget. Recorded on the
+    /// side's worker as the timeout, answered as the gateway's 504, which the
+    /// retry layer does not replay on another pair.
+    fn side_timed_out(
+        worker: &dyn Worker,
+        role: &'static str,
+        what: &str,
+        e: &reqwest::Error,
+    ) -> Response {
+        error!("PD {what} timed out: {e}");
+        Self::record_sequential_side(worker, role, StatusCode::GATEWAY_TIMEOUT);
+        request_timeout_response(format!("{what} timed out: {e}"))
+    }
+
     /// A prefill side that failed below HTTP: logged, recorded on its worker
     /// as a 502, answered as one.
     fn prefill_transport_failed(prefill: &dyn Worker, e: &reqwest::Error) -> Response {
+        if is_request_timeout(e) {
+            return Self::side_timed_out(
+                prefill,
+                metrics_labels::WORKER_PREFILL,
+                "Prefill request",
+                e,
+            );
+        }
         error!("PD prefill transport error: {e}");
         Self::record_sequential_side(
             prefill,
@@ -1260,6 +1285,14 @@ impl PDRouter {
     /// A prefill side whose answer could not be read to its end: the same
     /// record and answer shape as a transport failure, under its own code.
     fn prefill_read_failed(prefill: &dyn Worker, e: &reqwest::Error) -> Response {
+        if is_request_timeout(e) {
+            return Self::side_timed_out(
+                prefill,
+                metrics_labels::WORKER_PREFILL,
+                "Prefill response",
+                e,
+            );
+        }
         error!("Failed to read prefill response: {e}");
         Self::record_sequential_side(
             prefill,
@@ -1275,6 +1308,14 @@ impl PDRouter {
     /// A decode side that failed below HTTP: logged, recorded on its worker
     /// as a 502, answered as one.
     fn decode_transport_failed(decode: &dyn Worker, e: &reqwest::Error) -> Response {
+        if is_request_timeout(e) {
+            return Self::side_timed_out(
+                decode,
+                metrics_labels::WORKER_DECODE,
+                "Decode request",
+                e,
+            );
+        }
         error!("PD decode transport error: {e}");
         Self::record_sequential_side(
             decode,
@@ -1427,6 +1468,13 @@ impl PDRouter {
         let (prefill_body, (decode_head_elapsed, decode_response)) = match pd_result {
             Ok(pair) => pair,
             Err(DispatchError::Transport(e)) => {
+                // The request's own timeout on either side is the request's
+                // end (see `retry::request_timeout_response`); the caller
+                // records the 504 on both workers as it records every status.
+                if is_request_timeout(&e) {
+                    error!("PD request timed out, both sides aborted: {e}");
+                    return request_timeout_response(format!("Transport error: {e}"));
+                }
                 error!("PD request transport error, both sides aborted: {e}");
                 // Don't record_outcome here — the caller (execute_dual_dispatch)
                 // records outcomes from the response status after we return.
@@ -2088,6 +2136,10 @@ impl PDRouter {
                         *response.headers_mut() = response_headers;
                         response
                     }
+                    Err(e) if is_request_timeout(&e) => {
+                        error!("Decode response timed out: {e}");
+                        request_timeout_response(format!("Failed to read response: {e}"))
+                    }
                     Err(e) => {
                         error!("Failed to read decode response: {}", e);
                         error::internal_error("read_response_failed", "Failed to read response")
@@ -2305,6 +2357,10 @@ impl PDRouter {
         let response = res.bytes().await;
         let decode_body = match response {
             Ok(decode_body) => decode_body,
+            Err(e) if is_request_timeout(&e) => {
+                error!("Decode response timed out: {e}");
+                return request_timeout_response(format!("Failed to read response: {e}"));
+            }
             Err(e) => {
                 error!("Failed to read decode response: {}", e);
                 return error::internal_error("read_response_failed", "Failed to read response");
@@ -2875,7 +2931,7 @@ mod tests {
         observability::logging::test_support::test_subscriber,
         routers::common::sse::SSE_CHANNEL_BUFFER,
         tenant::TenantKey,
-        worker::{BasicWorkerBuilder, WorkerType},
+        worker::{circuit_breaker::CircuitState, BasicWorkerBuilder, WorkerType},
     };
 
     #[test]
@@ -3383,6 +3439,173 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (format!("http://{addr}"), seen)
+    }
+
+    /// A side that does not answer within the request's timeout ends the
+    /// request, on the concurrent dispatch shape and on the sequential one:
+    /// one attempt on the pair, the 504 `call_upstream_timeout` to the client
+    /// after one timeout, no replay, and the side that timed out charged.
+    #[tokio::test]
+    async fn a_request_timeout_on_a_side_is_answered_once_and_not_replayed() {
+        for runtime in [RuntimeType::Sglang, RuntimeType::Vllm] {
+            let (prefill_url, prefill_arrivals) = spawn_delayed_stub(
+                StatusCode::OK,
+                json!({}),
+                std::time::Duration::from_secs(10),
+            )
+            .await;
+            let (decode_url, decode_seen) = spawn_recording_stub("{}").await;
+            let mut router = create_test_pd_router();
+            router.retry_config = RetryConfig {
+                max_retries: 3,
+                initial_backoff_ms: 1,
+                max_backoff_ms: 2,
+                ..Default::default()
+            };
+            let client = Arc::new(
+                crate::http_client::client_builder()
+                    .timeout(std::time::Duration::from_secs(1))
+                    .build()
+                    .unwrap(),
+            );
+            for (url, worker_type) in [
+                (prefill_url, WorkerType::Prefill),
+                (decode_url, WorkerType::Decode),
+            ] {
+                let worker = BasicWorkerBuilder::new(url)
+                    .worker_type(worker_type)
+                    .runtime_type(runtime)
+                    .http_client(Arc::clone(&client))
+                    .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                        failure_threshold: 1,
+                        success_threshold: 1,
+                        timeout_duration: std::time::Duration::from_secs(60),
+                        window_duration: std::time::Duration::from_secs(60),
+                    })
+                    .build();
+                worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+                router.worker_registry.register_or_replace(Arc::new(worker));
+            }
+            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+            let chat: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .expect("valid chat request");
+
+            let started = Instant::now();
+            let response = router
+                .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+                .await;
+            let elapsed = started.elapsed();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::GATEWAY_TIMEOUT,
+                "{runtime:?}"
+            );
+            assert_eq!(
+                error::extract_error_code_from_response(&response),
+                "call_upstream_timeout",
+                "{runtime:?}"
+            );
+            assert!(!is_retryable_response(&response), "{runtime:?}");
+            assert_eq!(
+                prefill_arrivals.lock().unwrap().len(),
+                1,
+                "{runtime:?}: one attempt on the pair"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_millis(1900),
+                "{runtime:?}: one timeout, not retries x timeout: {elapsed:?}"
+            );
+            // The concurrent shape sent the decode side once with the prefill;
+            // the sequential shape never reached it.
+            assert!(taken(&decode_seen).len() <= 1, "{runtime:?}");
+            let prefill = router
+                .worker_registry
+                .get_all()
+                .into_iter()
+                .find(|worker| *worker.worker_type() == WorkerType::Prefill)
+                .unwrap();
+            assert_eq!(
+                prefill.circuit_breaker_state(),
+                CircuitState::Open,
+                "{runtime:?}: the timeout is the side's failure sample"
+            );
+        }
+    }
+
+    /// A decode side whose answer's head and first bytes leave at once and
+    /// whose body then never ends, as a worker that stalls mid-answer does.
+    async fn spawn_stalled_body_stub() -> String {
+        let app = axum::Router::new().fallback(axum::routing::any(|| async {
+            let head = futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+                b"{\"partial\":",
+            ))]);
+            (
+                [(CONTENT_TYPE, "application/json")],
+                Body::from_stream(head.chain(futures_util::stream::pending())),
+            )
+        }));
+        spawn_stub(app).await
+    }
+
+    /// A decode side whose head arrives and whose body does not end within
+    /// the request's timeout ends the request the same way as a side that
+    /// never answers: the final 504 `call_upstream_timeout`, one attempt on
+    /// the pair, no replay.
+    #[tokio::test]
+    async fn a_decode_body_the_request_timeout_cuts_ends_the_request() {
+        let (prefill_url, prefill_seen) = spawn_recording_stub("{}").await;
+        let decode_url = spawn_stalled_body_stub().await;
+        let mut router = create_test_pd_router();
+        router.retry_config = RetryConfig {
+            max_retries: 3,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 2,
+            ..Default::default()
+        };
+        let client = Arc::new(
+            crate::http_client::client_builder()
+                .timeout(std::time::Duration::from_secs(1))
+                .build()
+                .unwrap(),
+        );
+        for (url, worker_type) in [
+            (prefill_url, WorkerType::Prefill),
+            (decode_url, WorkerType::Decode),
+        ] {
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .runtime_type(RuntimeType::Vllm)
+                .http_client(Arc::clone(&client))
+                .build();
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            router.worker_registry.register_or_replace(Arc::new(worker));
+        }
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid chat request");
+
+        let response = router
+            .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "call_upstream_timeout"
+        );
+        assert!(!is_retryable_response(&response));
+        assert_eq!(
+            taken(&prefill_seen).len(),
+            1,
+            "one attempt on the pair, no replay"
+        );
     }
 
     #[tokio::test]
