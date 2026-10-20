@@ -191,9 +191,10 @@ The servicer relays the engine's publisher into `SubscribeKvEvents` through one 
   until it proves itself: *draining* while its in-flight requests finish or hit their budgets (a
   completion re-admits it, a token alone no longer does), *held* for
   `--worker-wedge-drain-hold-secs` (30) once nothing of the gateway's is in flight on it, then
-  *probing*: routable one tracked request at a time until one completes; a probe that makes no
-  progress wedges the worker back into the drain, and one that ends without completing (its
-  budget, an error, an abort) holds it again for the hold. A connection failure meanwhile turns the veto
+  *probing*: routable one tracked request at a time until one completes (the probe is reserved
+  at the request's selection, so two requests selected in the same instant cannot both be it); a
+  probe that makes no progress wedges the worker back into the drain, and one that ends without
+  completing (its budget, an error, an abort) holds it again for the hold. A connection failure meanwhile turns the veto
   `unreachable` as usual, and the contact that clears it returns the worker to its drain. The
   state is the worker's `wedge_drain` field (`draining`, `held`, `probing`) in `GET /workers`,
   the `smg_worker_wedge_drain{worker,state}` gauge and the `smg_worker_wedge_drains_total`

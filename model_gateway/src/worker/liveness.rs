@@ -739,8 +739,9 @@ fn sweep_full(
     let drain_state = worker.wedge_drain();
     // The probe ended (its budget, an error, an abort) and no completion
     // ended the drain: held again, for the hold, before the next probe. (The
-    // worker has read as vetoed since the probe's dispatch, so no request
-    // landed between its end and this sweep.)
+    // worker has read as vetoed since the probe's reservation at selection,
+    // so no request landed between its end and this sweep; a reservation
+    // not yet dispatched is no probe ended, `Worker::probe_taken`.)
     if drain_state == WedgeDrain::Probing && drain.enabled() && worker.probe_taken() && load == 0 {
         hold(worker, drain, "the probe ended without completing");
         set(
@@ -1249,6 +1250,7 @@ mod tests {
     use super::*;
     use crate::worker::{
         circuit_breaker::CircuitBreakerConfig, event::WorkerConnected, BasicWorkerBuilder,
+        ProbeSlot,
     };
 
     fn worker() -> Arc<dyn Worker> {
@@ -3289,6 +3291,49 @@ mod tests {
         on_completion(&w);
         assert_eq!(w.wedge_drain(), WedgeDrain::Off);
         end_pile(&w, 1);
+    }
+
+    /// A probe reserved at selection and not yet dispatched is no probe
+    /// ended: the sweep leaves the worker probing, out of routing until the
+    /// reservation is dispatched or given back; dispatched, the probe ends
+    /// and the hold follows as before.
+    #[test]
+    fn a_reserved_probe_is_not_held_as_ended() {
+        let w = worker();
+        w.set_status(WorkerStatus::Ready);
+        wedged_by_a_pile(&w, 2, DRAIN);
+        thread::sleep(DRAIN.secs + Duration::from_millis(10));
+        sweep_drain(&w, DRAIN);
+        end_pile(&w, 2);
+        sweep_drain(&w, DRAIN);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Held);
+        thread::sleep(DRAIN.hold + Duration::from_millis(10));
+        sweep_drain(&w, DRAIN);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Probing);
+        assert!(w.is_available(), "routable for a probe");
+        let ProbeSlot::Reserved { epoch } = w.reserve_probe() else {
+            panic!("a free probe");
+        };
+        assert!(!w.is_available(), "reserved: out of routing");
+        assert!(!w.probe_taken(), "not dispatched");
+        sweep_drain(&w, DRAIN);
+        assert_eq!(
+            w.wedge_drain(),
+            WedgeDrain::Probing,
+            "a reservation is no probe ended"
+        );
+        assert!(w.stall_reason().is_none());
+        w.release_probe(epoch);
+        assert!(w.is_available(), "given back: routable for the probe again");
+        tracked_pile(&w, 1);
+        assert!(w.probe_taken(), "dispatched");
+        end_pile(&w, 1);
+        sweep_drain(&w, DRAIN);
+        assert_eq!(
+            w.wedge_drain(),
+            WedgeDrain::Held,
+            "the dispatched probe ended without completing: held again"
+        );
     }
 
     /// A completion ends the drain from any of its states; an operator does

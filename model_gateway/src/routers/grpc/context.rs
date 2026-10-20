@@ -54,7 +54,8 @@ use crate::{
         grpc::regular::symphony::{template::Templates, PreparedConstraint},
     },
     worker::{
-        ConnectionMode, PrefillLoadGuard, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
+        ConnectionMode, PrefillLoadGuard, ProbeReservation, RuntimeType, Worker, WorkerLoadGuard,
+        WorkerRegistry,
     },
     workflow::TokenizerLoadFailures,
 };
@@ -279,6 +280,12 @@ pub(crate) struct ProcessingState {
     // Stage 2: Worker selection outputs
     pub workers: Option<WorkerSelection>,
 
+    /// The one probe of a worker probing its way out of the wedge drain,
+    /// reserved for this request by worker selection (see
+    /// `placement::SinglePlacement`); given back if the request is never
+    /// dispatched.
+    pub probe: Option<ProbeReservation>,
+
     /// Effective sticky key (header wins, rid-derived falls back), recorded by
     /// worker selection so load guards account keyed load identically.
     pub sticky_key: Option<String>,
@@ -386,6 +393,9 @@ pub(crate) struct DispatchContext {
     pub constraint_decided_on: Option<WorkerDecoding>,
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
     pub workers: Option<WorkerSelection>,
+    /// The probe reserved for this attempt's selection (see
+    /// `ProcessingState::probe`); a retry's re-selection replaces it.
+    pub probe: Option<ProbeReservation>,
     pub sticky_key: Option<String>,
     pub clients: Option<ClientSelection>,
     /// Consumed by the first dispatch; retries re-dispatch only the
@@ -1085,6 +1095,7 @@ impl RequestContext {
             constraint_decided_on: state.constraint_decided_on,
             tokenizer: state.tokenizer,
             workers: state.workers,
+            probe: state.probe,
             sticky_key: state.sticky_key,
             clients: state.clients,
             encode_outputs: state.encode_outputs,

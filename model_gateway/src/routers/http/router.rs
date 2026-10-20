@@ -297,6 +297,7 @@ impl Router {
                 cache_namespace,
                 candidate_filter,
                 tried,
+                tracked: false,
             },
         )
     }
@@ -1004,8 +1005,10 @@ impl Router {
                 cache_namespace: None,
                 candidate_filter: None,
                 tried: &[],
+                tracked: false,
             },
-        ) else {
+        )
+        .map(|placement| placement.worker) else {
             // Judged from the same candidates whether the pre-filter emptied
             // or a self-filtering policy missed on an all-overloaded pool, so
             // a shed keeps its Retry-After, retryability and metric.

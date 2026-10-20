@@ -23,7 +23,7 @@ use crate::{
         common::{
             placement::{
                 self, CandidateFilter, PairFailure, PipelinePin, PlacementFailure, PlacementInputs,
-                RefusalSite,
+                RefusalSite, SinglePlacement,
             },
             retry::mark_non_retryable,
         },
@@ -41,8 +41,8 @@ use crate::{
     worker::{
         acquire_prefill, ConnectionMode, ConnectionModeExt, HashRing, ModelWorkerSnapshot,
         PdPairIndex, PdWire, PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection,
-        PrefillCandidateError, PrefillLoadGuard, PrefillSelectionContext, RoutingPool, RuntimeType,
-        Worker, WorkerRegistry, WorkerType,
+        PrefillCandidateError, PrefillLoadGuard, PrefillSelectionContext, ProbeReservation,
+        RoutingPool, RuntimeType, Worker, WorkerRegistry, WorkerType,
     },
 };
 
@@ -462,6 +462,7 @@ impl<'a> SelectionInputs<'a> {
             cache_namespace: self.cache_namespace,
             candidate_filter,
             tried: &[],
+            tracked: false,
         }
     }
 }
@@ -496,7 +497,7 @@ impl WorkerSelectionStage {
             .map(str::to_string);
         ctx.state.routing_snapshot = Some(inputs.snapshot());
 
-        let (workers, prefill_guard) = self.pick(ctx, accepted, &inputs).await?;
+        let (workers, prefill_guard, probe) = self.pick(ctx, accepted, &inputs).await?;
         if let Some(guard) = prefill_guard {
             ctx.state.pd_prefill_guard = Some(guard);
         }
@@ -531,20 +532,32 @@ impl WorkerSelectionStage {
             }
         }
 
+        // (A refusal above drops the probe reservation with the pick, which
+        // gives the probe back.)
+        ctx.state.probe = probe;
         ctx.state.workers = Some(workers);
         Ok(())
     }
 
     /// The mode's pick over the gathered inputs: the single worker that
-    /// meets every demand, or the pair admitted within the queue budget (with
-    /// the encode assignments in EPD mode) and the Prefill admission slot it
-    /// holds.
+    /// meets every demand (with the probe reserved on it when it is probing
+    /// its way out of the wedge drain and the request is to be the probe,
+    /// see `placement::SinglePlacement`), or the pair admitted within the
+    /// queue budget (with the encode assignments in EPD mode) and the
+    /// Prefill admission slot it holds.
     async fn pick(
         &self,
         ctx: &RequestContext,
         accepted: Option<Instant>,
         inputs: &SelectionInputs<'_>,
-    ) -> Result<(WorkerSelection, Option<PrefillLoadGuard>), Response> {
+    ) -> Result<
+        (
+            WorkerSelection,
+            Option<PrefillLoadGuard>,
+            Option<ProbeReservation>,
+        ),
+        Response,
+    > {
         let model_id = inputs.model_id;
         let media = inputs.media;
         let context_requirements = inputs.context_requirements;
@@ -567,8 +580,11 @@ impl WorkerSelectionStage {
                     inputs.cache_namespace,
                     wire,
                     media_filter,
+                    ctx.is_streaming(),
                 ) {
-                    Some(w) => Ok((WorkerSelection::Single { worker: w }, None)),
+                    Some(SinglePlacement { worker, probe }) => {
+                        Ok((WorkerSelection::Single { worker }, None, probe))
+                    }
                     None => Err(self.context_selection_failure(
                         model_id,
                         wire,
@@ -592,7 +608,7 @@ impl WorkerSelectionStage {
                         ),
                     )
                     .await?;
-                Ok((disaggregated(pair), Some(guard)))
+                Ok((disaggregated(pair), Some(guard), None))
             }
             WorkerSelectionMode::EncodePrefillDecode => {
                 // Encode workers never process references: refuse strict
@@ -638,6 +654,7 @@ impl WorkerSelectionStage {
                         runtime_type,
                     },
                     Some(guard),
+                    None,
                 ))
             }
         }
@@ -720,8 +737,15 @@ impl WorkerSelectionStage {
                     wire,
                     Some(&admits_media),
                     &ctx.tried,
+                    ctx.streaming,
                 ) {
-                    Some(w) => WorkerSelection::Single { worker: w },
+                    Some(SinglePlacement { worker, probe }) => {
+                        // The previous attempt's reservation went with its
+                        // dispatch (or is given back here, if it never
+                        // reached one).
+                        ctx.probe = probe;
+                        WorkerSelection::Single { worker }
+                    }
                     None => {
                         return Err(self.context_selection_failure(
                             model_id,
@@ -742,6 +766,7 @@ impl WorkerSelectionStage {
                     cache_namespace,
                     candidate_filter: Some(&pinned),
                     tried: &[],
+                    tracked: false,
                 };
                 let (pair, guard) = self
                     .admit_pd_pair(
@@ -1614,7 +1639,8 @@ impl WorkerSelectionStage {
         cache_namespace: Option<CacheNamespace>,
         wire: Option<WireConstraint>,
         candidate_filter: Option<CandidateFilter<'_>>,
-    ) -> Option<Arc<dyn Worker>> {
+        tracked: bool,
+    ) -> Option<SinglePlacement> {
         self.select_single_worker_for_attempt(
             model_id,
             text,
@@ -1625,12 +1651,15 @@ impl WorkerSelectionStage {
             wire,
             candidate_filter,
             &[],
+            tracked,
         )
     }
 
     /// [`Self::select_single_worker`] for a retry attempt: `tried` are the
     /// engines the request's failed attempts dispatched to, skipped while
-    /// another available candidate is left (see `PlacementInputs::tried`).
+    /// another available candidate is left (see `PlacementInputs::tried`);
+    /// `tracked` says whether the request will be tracked on its worker
+    /// (see `PlacementInputs::tracked`).
     #[expect(
         clippy::too_many_arguments,
         reason = "selection threads every routing input the policy consumes"
@@ -1646,7 +1675,8 @@ impl WorkerSelectionStage {
         wire: Option<WireConstraint>,
         candidate_filter: Option<CandidateFilter<'_>>,
         tried: &[String],
-    ) -> Option<Arc<dyn Worker>> {
+        tracked: bool,
+    ) -> Option<SinglePlacement> {
         // A retry pins the retained wire, and with it the media pin and the
         // pipeline pin, on top of whatever the caller excludes.
         let pipeline = wire.map_or(PipelinePin::Any, |w| w.pipeline);
@@ -1688,6 +1718,7 @@ impl WorkerSelectionStage {
                 cache_namespace,
                 candidate_filter,
                 tried,
+                tracked,
             },
         )
     }
@@ -2159,7 +2190,10 @@ mod tests {
 
     use axum::http::{header::RETRY_AFTER, StatusCode};
     use llm_tokenizer::TokenizerRegistry;
-    use openai_protocol::{generate::GenerateRequest, worker::HealthCheckConfig};
+    use openai_protocol::{
+        generate::GenerateRequest,
+        worker::{HealthCheckConfig, WorkerStatus},
+    };
 
     use super::*;
     use crate::{
@@ -2182,7 +2216,8 @@ mod tests {
         },
         tenant::TenantKey,
         worker::{
-            BasicWorkerBuilder, ConnectionMode, ModelCard, PrefillReservation, WorkerLoadGuard,
+            runtime::WedgeDrain, BasicWorkerBuilder, ConnectionMode, ModelCard, PrefillReservation,
+            WorkerLoadGuard,
         },
     };
 
@@ -2830,7 +2865,9 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             )
+            .map(|placement| placement.worker)
             .unwrap();
         for rid in ["request-2", "request-3", "request-4"] {
             let again = stage
@@ -2843,7 +2880,9 @@ mod tests {
                     None,
                     None,
                     None,
+                    false,
                 )
+                .map(|placement| placement.worker)
                 .unwrap();
             assert_eq!(again.url(), first.url(), "follow-up must pin by header key");
         }
@@ -2882,13 +2921,13 @@ mod tests {
         );
 
         assert!(stage
-            .select_single_worker(model_id, None, None, None, None, None, None, None)
+            .select_single_worker(model_id, None, None, None, None, None, None, None, false)
             .is_some());
 
         worker_registry.set_worker_overloaded(&workers[0], true);
         assert!(
             stage
-                .select_single_worker(model_id, None, None, None, None, None, None, None)
+                .select_single_worker(model_id, None, None, None, None, None, None, None, false)
                 .is_some(),
             "one eligible worker left still serves"
         );
@@ -2896,7 +2935,7 @@ mod tests {
         worker_registry.set_worker_overloaded(&workers[1], true);
         assert!(
             stage
-                .select_single_worker(model_id, None, None, None, None, None, None, None)
+                .select_single_worker(model_id, None, None, None, None, None, None, None, false)
                 .is_none(),
             "the veto empties the candidate pool"
         );
@@ -2912,7 +2951,7 @@ mod tests {
         // genuinely absent model.
         worker_registry.set_worker_overloaded(&workers[0], false);
         assert!(stage
-            .select_single_worker(model_id, None, None, None, None, None, None, None)
+            .select_single_worker(model_id, None, None, None, None, None, None, None, false)
             .is_some());
         assert_eq!(
             stage
@@ -2950,7 +2989,7 @@ mod tests {
         // Any status but Ready is unavailable to routing.
         worker.set_status(WorkerStatus::NotReady);
         assert!(stage
-            .select_single_worker(model_id, None, None, None, None, None, None, None)
+            .select_single_worker(model_id, None, None, None, None, None, None, None, false)
             .is_none());
 
         let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, TEXT);
@@ -3065,6 +3104,7 @@ mod tests {
             constraint_decided_on: None,
             tokenizer: None,
             workers: None,
+            probe: None,
             sticky_key: None,
             clients: None,
             encode_outputs: None,
@@ -3074,6 +3114,76 @@ mod tests {
             pd_prefill_guard: None,
             response: Default::default(),
         }
+    }
+
+    /// A streaming request's selection reserves the probe of a worker probing
+    /// its way out of the wedge drain and holds it in the context; a
+    /// non-streaming request takes no probe; a second streaming request in
+    /// the same instant finds the worker vetoed and, with nothing else
+    /// routable, is refused as a request selected after the probe's dispatch
+    /// is; a context dropped before its dispatch gives the probe back.
+    #[tokio::test]
+    async fn a_streaming_selection_reserves_the_probe_of_a_probing_worker() {
+        let model_id = "probe-model";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = |url: &str| vllm_grpc_worker(url, model_id, WorkerType::Regular, false);
+        let probing = worker("grpc://127.0.0.1:9310");
+        let pending = worker("grpc://127.0.0.1:9311");
+        worker_registry.register(Arc::clone(&probing)).unwrap();
+        worker_registry.register(Arc::clone(&pending)).unwrap();
+        pending.set_status(WorkerStatus::Pending);
+        assert!(probing.set_wedge_drain(WedgeDrain::Probing));
+        assert!(probing.is_available(), "routable for a probe");
+        let stage = WorkerSelectionStage::new(
+            worker_registry,
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::Regular,
+            None,
+        );
+        let wire = WireConstraint {
+            runtime: RuntimeType::Vllm,
+            connection: ConnectionMode::Grpc,
+            requires_media_refs: false,
+            pipeline: PipelinePin::Any,
+        };
+        let selected_url = |ctx: &DispatchContext| {
+            ctx.workers
+                .as_ref()
+                .and_then(WorkerSelection::single)
+                .map(|worker| worker.url().to_string())
+        };
+
+        // A non-streaming request: the worker, and no probe.
+        let mut plain = dispatch_ctx(model_id, wire);
+        stage.reselect(&mut plain).await.unwrap();
+        assert_eq!(selected_url(&plain).as_deref(), Some(probing.url()));
+        assert!(plain.probe.is_none(), "an untracked request is no probe");
+        assert!(probing.is_available(), "and spends none");
+
+        // A streaming request: the worker, and its probe.
+        let mut first = dispatch_ctx(model_id, wire);
+        first.streaming = true;
+        stage.reselect(&mut first).await.unwrap();
+        assert_eq!(selected_url(&first).as_deref(), Some(probing.url()));
+        assert!(first.probe.is_some(), "the probe is the request's");
+        assert!(!probing.is_available(), "reserved: out of routing");
+
+        // A second streaming request before the first is dispatched: the
+        // worker reads as vetoed and nothing else is routable.
+        let mut second = dispatch_ctx(model_id, wire);
+        second.streaming = true;
+        let refused = stage
+            .reselect(&mut second)
+            .await
+            .expect_err("no routable worker while the probe is reserved");
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // The first never dispatches: its probe is open to the second.
+        drop(first);
+        assert!(probing.is_available(), "given back");
+        stage.reselect(&mut second).await.unwrap();
+        assert_eq!(selected_url(&second).as_deref(), Some(probing.url()));
+        assert!(second.probe.is_some());
     }
 
     /// Retry re-selection must never leave the retained plan's wire: the
@@ -3310,7 +3420,7 @@ mod tests {
                 };
                 assert_eq!(selected.url(), workers[2].url());
             }
-            workers[2].set_status(openai_protocol::worker::WorkerStatus::NotReady);
+            workers[2].set_status(WorkerStatus::NotReady);
             let refusal = stage
                 .reselect(&mut ctx)
                 .await
@@ -3775,7 +3885,9 @@ mod tests {
                     None,
                     None,
                     Some(ACCEPTS_MEDIA_REFS),
+                    false,
                 )
+                .map(|placement| placement.worker)
                 .expect("advertising worker is selectable");
             assert_eq!(worker.url(), capable_url);
         }
@@ -3787,14 +3899,26 @@ mod tests {
             pipeline: PipelinePin::Any,
         };
         let worker = stage
-            .select_single_worker(model_id, None, None, None, None, None, Some(wire), None)
+            .select_single_worker(
+                model_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(wire),
+                None,
+                false,
+            )
+            .map(|placement| placement.worker)
             .expect("retry re-selection stays on advertising workers");
         assert_eq!(worker.url(), capable_url);
 
         let mut seen = HashMap::new();
         for _ in 0..4 {
             let worker = stage
-                .select_single_worker(model_id, None, None, None, None, None, None, None)
+                .select_single_worker(model_id, None, None, None, None, None, None, None, false)
+                .map(|placement| placement.worker)
                 .expect("any worker without refs");
             *seen.entry(worker.url().to_string()).or_insert(0) += 1;
         }
@@ -3831,6 +3955,7 @@ mod tests {
                 None,
                 None,
                 Some(ACCEPTS_MEDIA_REFS),
+                false,
             )
             .is_none());
         let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, REFS);
@@ -3851,7 +3976,17 @@ mod tests {
             pipeline: PipelinePin::Any,
         };
         assert!(stage
-            .select_single_worker(model_id, None, None, None, None, None, Some(wire), None)
+            .select_single_worker(
+                model_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(wire),
+                None,
+                false
+            )
             .is_none());
         let response = stage.selection_failure(model_id, &[WorkerType::Regular], Some(wire), TEXT);
         assert_eq!(
@@ -3902,7 +4037,8 @@ mod tests {
         let mut seen = HashMap::new();
         for _ in 0..6 {
             let worker = stage
-                .select_single_worker(model_id, None, None, None, None, None, None, filter)
+                .select_single_worker(model_id, None, None, None, None, None, None, filter, false)
+                .map(|placement| placement.worker)
                 .expect("a worker is selectable");
             *seen.entry(worker.url().to_string()).or_insert(0) += 1;
         }
@@ -4097,6 +4233,7 @@ mod tests {
                 None,
                 None,
                 Some(&vision_capable),
+                false,
             )
             .is_none());
         let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, VISION);
@@ -4151,6 +4288,7 @@ mod tests {
                 None,
                 None,
                 Some(&vision_capable),
+                false,
             )
             .is_none());
         let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, VISION);
@@ -4386,7 +4524,8 @@ mod tests {
             worker_registry.set_worker_overloaded(worker, true);
         }
         let selected = stage
-            .select_single_worker(model_id, None, None, None, None, None, None, None)
+            .select_single_worker(model_id, None, None, None, None, None, None, None, false)
+            .map(|placement| placement.worker)
             .expect("the all-overloaded pool is steered, not refused");
         assert_eq!(
             selected.url(),
@@ -4459,6 +4598,7 @@ mod tests {
                 None,
                 None,
                 Some(ACCEPTS_MEDIA_REFS),
+                false,
             )
             .is_none());
         let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, REFS);

@@ -97,6 +97,44 @@ impl WedgeDrain {
     }
 }
 
+/// Where a probing worker's one probe stands (see
+/// [`WorkerRuntime::reserve_probe`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum ProbeState {
+    /// Open: the worker is routable for a probe.
+    Free = 0,
+    /// Reserved at selection for the request being placed on the worker.
+    Reserved = 1,
+    /// Dispatched: a tracked request is, or was, the probe.
+    Taken = 2,
+}
+
+impl ProbeState {
+    const fn of(word: u64) -> Self {
+        match word & 0b11 {
+            1 => Self::Reserved,
+            2 => Self::Taken,
+            _ => Self::Free,
+        }
+    }
+}
+
+/// The answer to a request that would be a probing worker's one probe (see
+/// [`WorkerRuntime::reserve_probe`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeSlot {
+    /// The worker is not probing: nothing to reserve.
+    Open,
+    /// The probe is the request's, until the request is tracked on the
+    /// worker or gives it back ([`WorkerRuntime::release_probe`] under this
+    /// epoch).
+    Reserved { epoch: u64 },
+    /// Another request holds the probe, reserved or dispatched: the worker
+    /// reads as vetoed.
+    Spent,
+}
+
 /// One-shot routing snapshot — see [`Worker::routing_state`].
 #[derive(Clone, Copy, Debug)]
 pub struct RoutingState {
@@ -168,9 +206,10 @@ pub struct WorkerRuntime {
     stall_since_ms: AtomicU64,
     /// Where the worker stands in the wedge drain, a [`WedgeDrain`] as `u8`.
     wedge_drain: AtomicU8,
-    /// A probing worker's one probe was dispatched (see
-    /// [`Worker::probe_taken`]); cleared with every move of the drain.
-    probe_taken: AtomicBool,
+    /// A probing worker's one probe: a [`ProbeState`] in the low two bits
+    /// under an epoch every move of the drain advances (see
+    /// [`Self::reserve_probe`]).
+    probe: AtomicU64,
     /// The gateway clock at which the drain's hold is over.
     wedge_drain_until_ms: AtomicU64,
     /// Last successful contact and last token or completion, in
@@ -537,7 +576,7 @@ impl WorkerRuntime {
             stall: AtomicU8::new(0),
             stall_since_ms: AtomicU64::new(0),
             wedge_drain: AtomicU8::new(0),
-            probe_taken: AtomicBool::new(false),
+            probe: AtomicU64::new(0),
             wedge_drain_until_ms: AtomicU64::new(0),
             last_contact_ms: AtomicU64::new(super::liveness::now_ms()),
             last_token_ms: AtomicU64::new(super::liveness::now_ms()),
@@ -618,15 +657,66 @@ impl WorkerRuntime {
     }
 
     /// Whether a worker probing its way out of the wedge drain has its one
-    /// probe in flight: routing reads it as vetoed from the probe's dispatch
-    /// on (a probing worker takes one tracked request per hold) until the
-    /// drain moves it on.
+    /// probe in flight: routing reads it as vetoed from the probe's
+    /// reservation at selection on (a probing worker takes one tracked
+    /// request per hold) until the drain moves it on.
     pub fn probe_in_flight(&self) -> bool {
-        self.wedge_drain() == WedgeDrain::Probing && (self.probe_taken() || self.tracked_load() > 0)
+        self.wedge_drain() == WedgeDrain::Probing
+            && (self.probe_state() != ProbeState::Free || self.tracked_load() > 0)
     }
 
+    /// Whether a probing worker's one probe was dispatched (see
+    /// [`Worker::probe_taken`]); a reservation not yet dispatched is not.
     pub fn probe_taken(&self) -> bool {
-        self.probe_taken.load(Ordering::Relaxed)
+        self.probe_state() == ProbeState::Taken
+    }
+
+    fn probe_state(&self) -> ProbeState {
+        ProbeState::of(self.probe.load(Ordering::Acquire))
+    }
+
+    const fn probe_word(epoch: u64, state: ProbeState) -> u64 {
+        (epoch << 2) | state as u64
+    }
+
+    /// Reserve a probing worker's one probe for the request being placed on
+    /// it, so that of two requests selected in the same instant exactly one
+    /// is the probe: the other finds the worker vetoed and is placed again.
+    /// The reservation is the dispatch's once the request is tracked on the
+    /// worker ([`Self::note_tracked_started`]); a request that never gets
+    /// there gives it back ([`Self::release_probe`]). Nothing to reserve on
+    /// a worker that is not probing.
+    pub fn reserve_probe(&self) -> ProbeSlot {
+        if self.wedge_drain() != WedgeDrain::Probing {
+            return ProbeSlot::Open;
+        }
+        let word = self.probe.load(Ordering::Acquire);
+        if ProbeState::of(word) != ProbeState::Free {
+            return ProbeSlot::Spent;
+        }
+        let epoch = word >> 2;
+        match self.probe.compare_exchange(
+            word,
+            Self::probe_word(epoch, ProbeState::Reserved),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => ProbeSlot::Reserved { epoch },
+            Err(_) => ProbeSlot::Spent,
+        }
+    }
+
+    /// Give back a probe reserved under `epoch` ([`Self::reserve_probe`])
+    /// that was never dispatched: the worker is routable for a probe again.
+    /// Nothing when the reservation was dispatched meanwhile or the drain
+    /// has moved on since (the epoch is another's).
+    pub fn release_probe(&self, epoch: u64) {
+        let _ = self.probe.compare_exchange(
+            Self::probe_word(epoch, ProbeState::Reserved),
+            Self::probe_word(epoch, ProbeState::Free),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     /// Set or clear the veto; `true` when it changed. A veto set (or
@@ -657,13 +747,26 @@ impl WorkerRuntime {
     }
 
     /// Move through the wedge drain; `true` when the state changed. Every
-    /// move gives the worker a fresh probe.
+    /// move gives the worker a fresh probe, under an epoch of its own, so a
+    /// reservation from before the move has nothing left to give back; the
+    /// probe is renewed before the move is published, so a reservation taken
+    /// on the published state is never undone by the move itself.
     pub fn set_wedge_drain(&self, state: WedgeDrain) -> bool {
-        let changed = self.wedge_drain.swap(state as u8, Ordering::AcqRel) != state as u8;
-        if changed {
-            self.probe_taken.store(false, Ordering::Relaxed);
+        if self.wedge_drain() == state {
+            return false;
         }
-        changed
+        // The fresh probe comes before the move is published: renewed after
+        // it, the renewal would undo a reservation taken on the new state in
+        // between, and a second request would take the probe.
+        let _ = self
+            .probe
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |word| {
+                Some(Self::probe_word(
+                    (word >> 2).wrapping_add(1),
+                    ProbeState::Free,
+                ))
+            });
+        self.wedge_drain.swap(state as u8, Ordering::AcqRel) != state as u8
     }
 
     pub fn wedge_drain_until_ms(&self) -> u64 {
@@ -906,10 +1009,16 @@ impl WorkerRuntime {
         if self.tracked_in_flight.fetch_add(1, Ordering::Relaxed) == 0 {
             self.note_busy_started();
         }
-        // A probing worker's one probe: from here it reads as vetoed until
-        // the drain moves it on (see [`Worker::probe_taken`]).
+        // A probing worker's one probe, reserved at selection or not (the
+        // all-vetoed steering books none): dispatched from here, so the
+        // worker reads as vetoed until the drain moves it on and the sweep
+        // knows the probe is out (see [`Worker::probe_taken`]).
         if self.wedge_drain() == WedgeDrain::Probing {
-            self.probe_taken.store(true, Ordering::Relaxed);
+            let _ = self
+                .probe
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |word| {
+                    Some(Self::probe_word(word >> 2, ProbeState::Taken))
+                });
         }
     }
     pub fn note_tracked_ended(&self) {
@@ -1102,12 +1211,162 @@ impl WorkerRuntime {
 
 #[cfg(test)]
 mod tests {
-    use std::thread;
+    use std::{sync::Barrier, thread};
 
     use tokio::time;
 
     use super::*;
     use crate::worker::liveness::now_ms;
+
+    /// A probing worker's one probe is handed out once: of two reservations
+    /// the second finds it spent, a reservation given back opens it again,
+    /// a dispatched one is the dispatch's (nothing to give back), and a move
+    /// of the drain leaves a stale reservation nothing to undo.
+    #[test]
+    fn a_probing_workers_probe_is_reserved_once() {
+        let rt = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        assert_eq!(
+            rt.reserve_probe(),
+            ProbeSlot::Open,
+            "not probing: nothing to reserve"
+        );
+        assert!(rt.set_wedge_drain(WedgeDrain::Probing));
+        assert!(!rt.probe_in_flight(), "routable for a probe");
+        let ProbeSlot::Reserved { epoch } = rt.reserve_probe() else {
+            panic!("the first reservation takes the probe");
+        };
+        assert!(rt.probe_in_flight(), "reserved: vetoed for routing");
+        assert!(
+            !rt.probe_taken(),
+            "reserved, not dispatched: nothing for the sweep to judge"
+        );
+        assert_eq!(
+            rt.reserve_probe(),
+            ProbeSlot::Spent,
+            "the second finds it spent"
+        );
+        rt.release_probe(epoch);
+        assert!(!rt.probe_in_flight(), "given back: open again");
+        assert_eq!(
+            rt.reserve_probe(),
+            ProbeSlot::Reserved { epoch },
+            "under the same epoch"
+        );
+        rt.note_tracked_started();
+        assert!(rt.probe_taken(), "dispatched");
+        rt.release_probe(epoch);
+        assert!(rt.probe_taken(), "a dispatched probe is not given back");
+        rt.note_tracked_ended();
+        rt.note_tracked_ended();
+        assert_eq!(rt.tracked_load(), 0, "never below zero");
+        assert!(rt.probe_in_flight(), "spent until the drain moves on");
+        // The drain moves on: a fresh probe under an epoch of its own.
+        assert!(rt.set_wedge_drain(WedgeDrain::Held));
+        assert!(rt.set_wedge_drain(WedgeDrain::Probing));
+        let ProbeSlot::Reserved { epoch: next } = rt.reserve_probe() else {
+            panic!("a fresh probe");
+        };
+        assert_ne!(next, epoch);
+        rt.release_probe(epoch);
+        assert!(rt.probe_in_flight(), "a stale release undoes nothing");
+        rt.release_probe(next);
+        assert!(!rt.probe_in_flight());
+        // Out of the drain: nothing to reserve, and a request tracked on the
+        // worker takes no probe.
+        assert!(rt.set_wedge_drain(WedgeDrain::Off));
+        assert_eq!(rt.reserve_probe(), ProbeSlot::Open);
+        rt.note_tracked_started();
+        assert!(!rt.probe_taken());
+        rt.note_tracked_ended();
+    }
+
+    /// Eight reservations from one barrier, many rounds: one wins, the rest
+    /// find the probe spent.
+    #[test]
+    fn concurrent_reservations_take_one_probe() {
+        const THREADS: usize = 8;
+        for _ in 0..200 {
+            let rt = Arc::new(WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready));
+            rt.set_wedge_drain(WedgeDrain::Probing);
+            let barrier = Arc::new(Barrier::new(THREADS));
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let rt = Arc::clone(&rt);
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        rt.reserve_probe()
+                    })
+                })
+                .collect();
+            let slots: Vec<ProbeSlot> = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect();
+            let reserved = slots
+                .iter()
+                .filter(|slot| matches!(slot, ProbeSlot::Reserved { .. }))
+                .count();
+            assert_eq!(reserved, 1, "{slots:?}");
+            assert_eq!(
+                slots
+                    .iter()
+                    .filter(|slot| **slot == ProbeSlot::Spent)
+                    .count(),
+                THREADS - 1
+            );
+            assert!(rt.probe_in_flight());
+        }
+    }
+
+    /// The move into probing races the reservations: the fresh probe is in
+    /// place before the state is published, so of the reservations that land
+    /// on the new state exactly one wins and stands (a probe renewed after
+    /// the publish would wipe the first reservation and hand the probe out
+    /// twice).
+    #[test]
+    fn a_move_into_probing_hands_out_one_probe() {
+        const RESERVERS: usize = 7;
+        for _ in 0..200 {
+            let rt = Arc::new(WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready));
+            assert!(rt.set_wedge_drain(WedgeDrain::Held));
+            let barrier = Arc::new(Barrier::new(RESERVERS + 1));
+            let mover = {
+                let rt = Arc::clone(&rt);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    assert!(rt.set_wedge_drain(WedgeDrain::Probing));
+                })
+            };
+            let reservers: Vec<_> = (0..RESERVERS)
+                .map(|_| {
+                    let rt = Arc::clone(&rt);
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        loop {
+                            match rt.reserve_probe() {
+                                ProbeSlot::Open => thread::yield_now(),
+                                slot => return slot,
+                            }
+                        }
+                    })
+                })
+                .collect();
+            mover.join().unwrap();
+            let slots: Vec<ProbeSlot> = reservers
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect();
+            let reserved = slots
+                .iter()
+                .filter(|slot| matches!(slot, ProbeSlot::Reserved { .. }))
+                .count();
+            assert_eq!(reserved, 1, "{slots:?}");
+            assert!(rt.probe_in_flight(), "the reservation stands: {slots:?}");
+        }
+    }
 
     #[test]
     fn a_token_within_the_stamped_millisecond_records_nothing_new_and_keeps_the_semantics() {

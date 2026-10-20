@@ -35,7 +35,7 @@ use super::{
 };
 pub use super::{
     load::{WorkerLoadGuard, WorkerRoutingKeyLoad},
-    runtime::{RoutingState, StallReason, WedgeDrain, WorkerRuntime},
+    runtime::{ProbeSlot, RoutingState, StallReason, WedgeDrain, WorkerRuntime},
 };
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
@@ -600,11 +600,24 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     }
 
     /// Whether the worker's one probe out of the wedge drain is in flight
-    /// (see [`super::liveness`]): a veto for routing, not one of the
-    /// liveness rules' ([`Self::stall_reason`]), which judge the probe.
+    /// (see [`super::liveness`]): reserved at selection or dispatched. A
+    /// veto for routing, not one of the liveness rules'
+    /// ([`Self::stall_reason`]), which judge the probe.
     fn probe_in_flight(&self) -> bool {
         false
     }
+
+    /// Reserve the worker's one probe out of the wedge drain for the request
+    /// being placed on it (see [`WorkerRuntime::reserve_probe`]): of two
+    /// requests selected in the same instant exactly one gets it, the other
+    /// finds the worker vetoed and is placed again. `Open` for a worker that
+    /// is not probing. Hold the reservation as a [`ProbeReservation`].
+    fn reserve_probe(&self) -> ProbeSlot {
+        ProbeSlot::Open
+    }
+
+    /// Give back a probe reserved under `epoch` that was never dispatched.
+    fn release_probe(&self, _epoch: u64) {}
 
     /// Whether routing leaves the worker out: the liveness veto
     /// ([`Self::stall_reason`]) or a probe in flight
@@ -1711,6 +1724,31 @@ impl BasicWorker {
     }
 }
 
+/// A probing worker's one probe, reserved for the request being placed on
+/// it (see [`Worker::reserve_probe`]). Dropped before the request is tracked
+/// on the worker (refused after its selection, dropped at build, placed
+/// again for a retry), it gives the probe back; once the request is tracked
+/// there the probe is the dispatch's and the drop is nothing.
+pub(crate) struct ProbeReservation {
+    worker: Arc<dyn Worker>,
+    epoch: u64,
+}
+
+impl ProbeReservation {
+    pub(crate) fn new(worker: &Arc<dyn Worker>, epoch: u64) -> Self {
+        Self {
+            worker: Arc::clone(worker),
+            epoch,
+        }
+    }
+}
+
+impl Drop for ProbeReservation {
+    fn drop(&mut self) {
+        self.worker.release_probe(self.epoch);
+    }
+}
+
 #[async_trait]
 impl Worker for BasicWorker {
     /// [`BasicWorker`] keeps the trait's default `prepare_request`, so the
@@ -1968,6 +2006,14 @@ impl Worker for BasicWorker {
 
     fn probe_in_flight(&self) -> bool {
         self.runtime.load().probe_in_flight()
+    }
+
+    fn reserve_probe(&self) -> ProbeSlot {
+        self.runtime.load().reserve_probe()
+    }
+
+    fn release_probe(&self, epoch: u64) {
+        self.runtime.load().release_probe(epoch);
     }
 
     fn wedge_drain_until_ms(&self) -> u64 {

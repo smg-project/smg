@@ -38,7 +38,8 @@ use crate::{
     worker::{
         overload::{BRANCH_ALL_OVERLOADED_FALLBACK, BRANCH_ALL_STALLED_FALLBACK, STAGE_SELECTION},
         ConnectionMode, ConnectionModeExt, PdPairIndex, PrefillCandidateError,
-        PrefillSelectionContext, RoutingPool, RuntimeType, Worker, WorkerRegistry,
+        PrefillSelectionContext, ProbeReservation, ProbeSlot, RoutingPool, RuntimeType, Worker,
+        WorkerRegistry,
     },
 };
 
@@ -125,6 +126,31 @@ pub(crate) struct PlacementInputs<'a> {
     /// nothing else left is used whole, so a single worker is retried as
     /// before.
     pub tried: &'a [String],
+    /// Whether the request will be tracked on its worker (a streaming
+    /// generation, whose responses the gateway sees one by one: the pile the
+    /// liveness rules count). That is the one kind of request a worker
+    /// probing its way out of the wedge drain takes, so the pick reserves
+    /// the probe for it (see [`SinglePlacement::probe`]).
+    pub tracked: bool,
+}
+
+/// A single-worker placement: the worker, and the one probe of a worker
+/// probing its way out of the wedge drain when the request is to be it
+/// (see [`PlacementInputs::tracked`]). The reservation is held until the
+/// request is tracked on the worker and given back if it never is, so a
+/// request refused or dropped after its selection does not spend the probe.
+pub(crate) struct SinglePlacement {
+    pub worker: Arc<dyn Worker>,
+    pub probe: Option<ProbeReservation>,
+}
+
+impl SinglePlacement {
+    fn unreserved(worker: Arc<dyn Worker>) -> Self {
+        Self {
+            worker,
+            probe: None,
+        }
+    }
 }
 
 /// The pool a placement draws from, before the availability filter.
@@ -234,18 +260,21 @@ pub(crate) fn select_single(
 ) -> Option<Arc<dyn Worker>> {
     let candidates = candidates(registry, model_id, pool, wire);
     select_from(registry, policies, model_id, candidates.as_slice(), inputs)
+        .map(|placement| placement.worker)
 }
 
 /// [`select_single`] over an explicit candidate slice: the entry for a caller
 /// with a candidate rule the pools cannot express, such as dropping DP-aware
-/// workers from a path that cannot pin a rank.
+/// workers from a path that cannot pin a rank. The placement carries the
+/// probe of a probing worker when the request is to be it
+/// ([`PlacementInputs::tracked`]).
 pub(crate) fn select_from(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
     model_id: &str,
     candidates: &[Arc<dyn Worker>],
     inputs: PlacementInputs<'_>,
-) -> Option<Arc<dyn Worker>> {
+) -> Option<SinglePlacement> {
     let policy = policies.get_policy_or_default(model_id);
 
     // The per-request predicate applies to every entry point, so a caller
@@ -263,88 +292,131 @@ pub(crate) fn select_from(
         None => candidates,
     };
 
-    // Most policies already apply the complete availability predicate. Give
-    // them the shared snapshot directly instead of cloning every available
-    // worker into a second per-request Vec. Hash policies use a weaker health
-    // predicate and keep the pre-filter.
-    let filtered;
-    let available: &[Arc<dyn Worker>] = if policy_filters_unavailable_workers(policy.as_ref()) {
-        candidates
-    } else {
-        filtered = candidates
-            .iter()
-            .filter(|worker| worker.is_available())
-            .cloned()
-            .collect::<Vec<_>>();
-        &filtered
-    };
-    // The engines this request already tried step aside for its retry while
-    // another available candidate remains; otherwise the pool is used whole.
-    // An explicit target under consistent hashing indexes this slice and
-    // stays strict (as `admission_prefilters` keeps it), so it is never
-    // narrowed: the retry goes back to the targeted worker.
+    // An explicit target under consistent hashing indexes the available
+    // slice and stays strict (as `admission_prefilters` keeps it), so the
+    // retry narrowing below never applies: the retry goes back to the
+    // targeted worker.
     let strict_target = policy.name() == "consistent_hashing"
         && header_utils::extract_target_worker(inputs.headers).is_some();
-    let untried;
-    let available: &[Arc<dyn Worker>] = if inputs.tried.is_empty() || strict_target {
-        available
-    } else {
-        untried = available
-            .iter()
-            .filter(|worker| {
-                worker.is_available()
-                    && !inputs
-                        .tried
-                        .iter()
-                        .any(|engine| engine == worker.base_url())
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if untried.is_empty() {
-            available
-        } else {
-            &untried
-        }
-    };
-    if available.is_empty() {
-        return overload_fallback(registry, policy.name(), model_id, candidates);
-    }
-
     // Cached hash ring for consistent hashing (O(log n) lookup).
     let hash_ring = registry.get_hash_ring(model_id);
 
-    // The registry applies the routing-key sticky override when enabled and
-    // otherwise delegates to the configured policy.
-    let Some(idx) = policies.select_worker_for_model(
-        &policy,
-        model_id,
-        available,
-        &SelectWorkerInfo {
-            request_text: inputs.text,
-            tokens: inputs.tokens,
-            headers: inputs.headers,
-            routing_key: policies.resolve_routing_key(inputs.headers),
-            rid_key: inputs.rid_key,
-            cache_namespace: inputs.cache_namespace,
-            hash_ring,
-            role: WorkerRole::Single,
-            overload_lifted: false,
-        },
-    ) else {
-        // A policy that filters availability itself misses on an
-        // all-overloaded pool the same way the pre-filter empties.
-        return overload_fallback(registry, policy.name(), model_id, candidates);
-    };
-    let selected = available[idx].clone();
+    // A worker probing its way out of the wedge drain reads as routable
+    // until its one probe is reserved or dispatched, so two requests placed
+    // in the same instant could both pick it. A tracked request's pick
+    // reserves the probe; a pick whose reservation fails (another request's
+    // came first) is made again over a snapshot in which the worker reads
+    // as vetoed. One pass per candidate covers every probing worker's probe
+    // going to another request; past that the pick stands as it did before
+    // the reservation existed.
+    let passes = candidates.len().saturating_add(1);
+    let mut pass = 1;
+    loop {
+        // Most policies already apply the complete availability predicate.
+        // Give them the shared snapshot directly instead of cloning every
+        // available worker into a second per-request Vec. Hash policies use
+        // a weaker health predicate and keep the pre-filter.
+        let filtered;
+        let available: &[Arc<dyn Worker>] = if policy_filters_unavailable_workers(policy.as_ref()) {
+            candidates
+        } else {
+            filtered = candidates
+                .iter()
+                .filter(|worker| worker.is_available())
+                .cloned()
+                .collect::<Vec<_>>();
+            &filtered
+        };
+        // The engines this request already tried step aside for its retry
+        // while another available candidate remains; otherwise the pool is
+        // used whole.
+        let untried;
+        let available: &[Arc<dyn Worker>] = if inputs.tried.is_empty() || strict_target {
+            available
+        } else {
+            untried = available
+                .iter()
+                .filter(|worker| {
+                    worker.is_available()
+                        && !inputs
+                            .tried
+                            .iter()
+                            .any(|engine| engine == worker.base_url())
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if untried.is_empty() {
+                available
+            } else {
+                &untried
+            }
+        };
+        if available.is_empty() {
+            return overload_fallback(registry, policy.name(), model_id, candidates)
+                .map(SinglePlacement::unreserved);
+        }
 
-    Metrics::record_worker_selection(
-        metrics_labels::WORKER_REGULAR,
-        selected.connection_mode().as_metric_label(),
-        model_id,
-        policy.name(),
-    );
+        // The registry applies the routing-key sticky override when enabled
+        // and otherwise delegates to the configured policy.
+        let Some(idx) = policies.select_worker_for_model(
+            &policy,
+            model_id,
+            available,
+            &SelectWorkerInfo {
+                request_text: inputs.text,
+                tokens: inputs.tokens,
+                headers: inputs.headers,
+                routing_key: policies.resolve_routing_key(inputs.headers),
+                rid_key: inputs.rid_key,
+                cache_namespace: inputs.cache_namespace,
+                hash_ring: hash_ring.clone(),
+                role: WorkerRole::Single,
+                overload_lifted: false,
+            },
+        ) else {
+            // A policy that filters availability itself misses on an
+            // all-overloaded pool the same way the pre-filter empties.
+            return overload_fallback(registry, policy.name(), model_id, candidates)
+                .map(SinglePlacement::unreserved);
+        };
+        let selected = available[idx].clone();
 
-    Some(selected)
+        let reservation = if inputs.tracked {
+            selected.reserve_probe()
+        } else {
+            ProbeSlot::Open
+        };
+        let probe = match reservation {
+            ProbeSlot::Open => None,
+            ProbeSlot::Reserved { epoch } => Some(ProbeReservation::new(&selected, epoch)),
+            ProbeSlot::Spent if pass < passes => {
+                debug!(
+                    worker = %selected.url(),
+                    model_id,
+                    pass,
+                    "Probe reserved by another selection since the snapshot; picking again"
+                );
+                // The pick is not dispatched: a policy that booked it at
+                // selection releases it, as the request's end would.
+                policy.on_request_complete(selected.url(), true);
+                pass += 1;
+                continue;
+            }
+            ProbeSlot::Spent => None,
+        };
+
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_REGULAR,
+            selected.connection_mode().as_metric_label(),
+            model_id,
+            policy.name(),
+        );
+
+        return Some(SinglePlacement {
+            worker: selected,
+            probe,
+        });
+    }
 }
 
 /// The steering default for a pool whose every worker is vetoed, by the
@@ -1225,7 +1297,12 @@ pub(crate) fn select_pair(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Mutex, time::Duration};
+    use std::{
+        collections::BTreeMap,
+        sync::{Barrier, Mutex},
+        thread,
+        time::Duration,
+    };
 
     use axum::http::StatusCode;
     use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
@@ -1236,7 +1313,10 @@ mod tests {
         config::types::{PdPairingMode, PolicyConfig},
         observability::logging::test_support::test_subscriber,
         policies::{CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy, RoundRobinPolicy},
-        worker::{runtime::StallReason, BasicWorkerBuilder, ModelCard, PdWire, WorkerType},
+        worker::{
+            runtime::{StallReason, WedgeDrain},
+            BasicWorkerBuilder, ModelCard, PdWire, WorkerType,
+        },
     };
 
     const MODEL: &str = "m";
@@ -1768,7 +1848,7 @@ mod tests {
             PlacementInputs::default(),
         )
         .expect("the narrowed slice still has a worker");
-        assert_eq!(selected.url(), "http://h:2");
+        assert_eq!(selected.worker.url(), "http://h:2");
         assert!(matches!(
             failure_from(&[], MODEL, false),
             PlacementFailure::NoCandidates
@@ -2216,6 +2296,195 @@ mod tests {
         );
     }
 
+    /// The placement of `inputs` over the HTTP regular pool, with the probe
+    /// it holds.
+    fn place(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        inputs: PlacementInputs<'_>,
+    ) -> SinglePlacement {
+        let candidates = candidates(registry, MODEL, RoutingPool::HttpRegular, None);
+        select_from(registry, policies, MODEL, candidates.as_slice(), inputs)
+            .expect("a worker is selectable")
+    }
+
+    const PROBE_TEXT: &str = "the prompt whose prefix the probing worker holds";
+
+    /// Two workers under cache-aware routing, the holder of [`PROBE_TEXT`]'s
+    /// prefix probing its way out of the wedge drain: every selection of
+    /// that text goes to the holder while it reads as routable.
+    fn a_probing_prefix_holder() -> (WorkerRegistry, PolicyRegistry, Arc<dyn Worker>) {
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let policies = PolicyRegistry::new(cache_aware_policy());
+        let inputs = PlacementInputs {
+            text: Some(PROBE_TEXT),
+            ..Default::default()
+        };
+        let holder = pick(&registry, &policies, inputs);
+        assert_eq!(
+            pick(&registry, &policies, inputs).url(),
+            holder.url(),
+            "the prefix pins the prompt to its holder"
+        );
+        assert!(holder.set_wedge_drain(WedgeDrain::Probing));
+        assert!(holder.is_available(), "routable for a probe");
+        (registry, policies, holder)
+    }
+
+    /// Two requests selected on a probing worker before either is dispatched
+    /// (the window between a selection and its booking): exactly one is the
+    /// probe, the other is placed as if the worker read vetoed, and one
+    /// tracked request lands on the worker.
+    #[test]
+    fn two_selections_in_one_instant_take_one_probe() {
+        let (registry, policies, holder) = a_probing_prefix_holder();
+        let inputs = PlacementInputs {
+            text: Some(PROBE_TEXT),
+            tracked: true,
+            ..Default::default()
+        };
+        let first = place(&registry, &policies, inputs);
+        let second = place(&registry, &policies, inputs);
+        assert_eq!(
+            first.worker.url(),
+            holder.url(),
+            "the first selection is the probe"
+        );
+        assert!(first.probe.is_some());
+        assert!(holder.probe_in_flight(), "reserved: out of routing");
+        assert_ne!(
+            second.worker.url(),
+            holder.url(),
+            "the second is placed elsewhere"
+        );
+        assert!(second.probe.is_none());
+        // Both dispatched: one tracked request on the probing worker.
+        first.worker.note_tracked_started();
+        second.worker.note_tracked_started();
+        assert_eq!(holder.tracked_load(), 1, "one probe");
+        assert!(holder.probe_taken());
+        drop(first);
+        assert!(
+            holder.probe_in_flight(),
+            "a dispatched probe is not given back with its placement"
+        );
+        holder.note_tracked_ended();
+        second.worker.note_tracked_ended();
+    }
+
+    /// The same under real concurrency: eight selections racing from one
+    /// barrier, many rounds; every round exactly one is the probe and the
+    /// probing worker never takes a second tracked request.
+    #[test]
+    fn racing_selections_never_take_a_second_probe() {
+        const THREADS: usize = 8;
+        for _ in 0..200 {
+            let (registry, policies, holder) = a_probing_prefix_holder();
+            let registry = Arc::new(registry);
+            let policies = Arc::new(policies);
+            let barrier = Arc::new(Barrier::new(THREADS));
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let registry = Arc::clone(&registry);
+                    let policies = Arc::clone(&policies);
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        let inputs = PlacementInputs {
+                            text: Some(PROBE_TEXT),
+                            tracked: true,
+                            ..Default::default()
+                        };
+                        barrier.wait();
+                        let placement = place(&registry, &policies, inputs);
+                        placement.worker.note_tracked_started();
+                        placement
+                    })
+                })
+                .collect();
+            let placements: Vec<SinglePlacement> = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect();
+            assert_eq!(
+                holder.tracked_load(),
+                1,
+                "one tracked request on the probing worker"
+            );
+            assert_eq!(
+                placements
+                    .iter()
+                    .filter(|placement| placement.probe.is_some())
+                    .count(),
+                1,
+                "one reservation"
+            );
+            assert_eq!(
+                placements
+                    .iter()
+                    .filter(|placement| placement.worker.url() == holder.url())
+                    .count(),
+                1
+            );
+            for placement in &placements {
+                placement.worker.note_tracked_ended();
+            }
+        }
+    }
+
+    /// A placement dropped before its request is dispatched (refused after
+    /// selection, dropped at build) gives the probe back; a request that is
+    /// not tracked on its worker (not streaming) takes no probe and leaves
+    /// the worker routable for one.
+    #[test]
+    fn a_placement_dropped_before_dispatch_gives_the_probe_back() {
+        let (registry, policies, holder) = a_probing_prefix_holder();
+        let tracked = PlacementInputs {
+            text: Some(PROBE_TEXT),
+            tracked: true,
+            ..Default::default()
+        };
+        let untracked = PlacementInputs {
+            tracked: false,
+            ..tracked
+        };
+        let rider = place(&registry, &policies, untracked);
+        assert_eq!(rider.worker.url(), holder.url());
+        assert!(rider.probe.is_none(), "an untracked request is no probe");
+        assert!(holder.is_available(), "and spends none");
+        let reserved = place(&registry, &policies, tracked);
+        assert!(reserved.probe.is_some());
+        assert!(!holder.is_available());
+        drop(reserved);
+        assert!(holder.is_available(), "given back");
+        let again = place(&registry, &policies, tracked);
+        assert_eq!(again.worker.url(), holder.url());
+        assert!(
+            again.probe.is_some(),
+            "the probe is open to the next selection"
+        );
+    }
+
+    /// A lone probing worker whose probe is spent still takes the request:
+    /// the all-vetoed steering stands (a veto steers, it never refuses), and
+    /// that request is no reservation.
+    #[test]
+    fn the_all_vetoed_steering_still_lands_on_a_spent_probe() {
+        let registry = http_registry(&["http://h:9"]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let lone = pick(&registry, &policies, PlacementInputs::default());
+        assert!(lone.set_wedge_drain(WedgeDrain::Probing));
+        let tracked = PlacementInputs {
+            tracked: true,
+            ..Default::default()
+        };
+        let probe = place(&registry, &policies, tracked);
+        assert!(probe.probe.is_some());
+        let steered = place(&registry, &policies, tracked);
+        assert_eq!(steered.worker.url(), lone.url(), "nowhere else to go");
+        assert!(steered.probe.is_none(), "steered, not the probe");
+        assert!(lone.probe_in_flight());
+    }
+
     /// The all-unavailable 503 tells the client when to come back, like the
     /// gateway's other refusals.
     #[test]
@@ -2370,7 +2639,7 @@ mod tests {
         // refusals, the unknown names' line carries the one of theirs. A full
         // window from here: both keys' windows opened before this point, so
         // both are over however long the assertions above took.
-        std::thread::sleep(window + Duration::from_millis(10));
+        thread::sleep(window + Duration::from_millis(10));
         refuse("m1", no_available_workers("every worker is down"));
         assert!(line(4).contains("suppressed=3"), "{:?}", line(4));
         refuse("m5", error::model_not_found("m5"));
@@ -2466,7 +2735,7 @@ mod tests {
         );
 
         // The next window: the unknown names' line carries the one counted.
-        std::thread::sleep(window + Duration::from_millis(10));
+        thread::sleep(window + Duration::from_millis(10));
         refuse("x4");
         assert!(line(3).contains("model_id=x4"), "{:?}", line(3));
         assert!(line(3).contains("suppressed=1"), "{:?}", line(3));

@@ -740,6 +740,7 @@ impl PDRouter {
                     cache_namespace,
                     candidate_filter: None,
                     tried: &[],
+                    tracked: false,
                 },
                 sticky_key,
             )
@@ -2812,6 +2813,7 @@ impl RouterTrait for PDRouter {
                 cache_namespace: None,
                 candidate_filter: None,
                 tried: &[],
+                tracked: false,
             },
         ) else {
             return error::service_unavailable(

@@ -73,9 +73,9 @@ pub use registry::{WorkerOrigin, WorkerRegistry};
 pub use resilience::{resolve_resilience, ResolvedResilience, DEFAULT_RETRYABLE_STATUS_CODES};
 pub use sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL;
 pub use service::WorkerService;
-pub(crate) use worker::ConnectionModeExt;
 pub use worker::{
-    BasicWorker, ConnectionMode, GuardedStream, RequestCompletionSink, RuntimeType, Worker,
-    WorkerLoadGuard, WorkerType, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, MORIIO_CONNECTOR,
-    MORIIO_MODE_LABEL, NIXL_CONNECTOR,
+    BasicWorker, ConnectionMode, GuardedStream, ProbeSlot, RequestCompletionSink, RuntimeType,
+    Worker, WorkerLoadGuard, WorkerType, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR,
+    MORIIO_CONNECTOR, MORIIO_MODE_LABEL, NIXL_CONNECTOR,
 };
+pub(crate) use worker::{ConnectionModeExt, ProbeReservation};
