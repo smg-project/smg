@@ -125,7 +125,7 @@ preprocess) or `worker` (strict: 400 when a request cannot be forwarded, and
 advertises `mm_processor`, answered before any worker is chosen, except a model
 with an encode worker among them: on the encode-prefill-decode pipeline media
 references never travel, a request that would forward them is answered its own
-400, `EncodeNotSupported`, and such a model is not named under
+400 `multimodal_not_supported`, and such a model is not named under
 `models_without_media_processing` either; a family
 without the opt-in forwards when every media-processing worker of the model
 runs `smg`, and its requests are placed on `smg` workers only, so a worker on
